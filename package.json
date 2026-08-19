@@ -1,0 +1,42 @@
+{
+  "name": "kompjutr",
+  "version": "0.0.0",
+  "description": "SQLite-native git backend for Cloudflare Computer: objects, refs and index live in the Durable Object database, the working tree lives in DOFS.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "biome format --write .",
+    "check": "biome check ."
+  },
+  "dependencies": {
+    "pako": "^2.1.0"
+  },
+  "peerDependencies": {
+    "@cloudflare/computer": ">=0.2.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.16",
+    "@cloudflare/computer": "^0.2.1",
+    "@types/node": "^24.0.0",
+    "@types/pako": "^2.0.3",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.4"
+  }
+}
