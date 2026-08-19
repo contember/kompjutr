@@ -4,7 +4,7 @@
 
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -45,6 +45,35 @@ export class GitFixture {
     const full = join(this.dir, path);
     mkdirSync(dirname(full), { recursive: true });
     writeFileSync(full, content);
+    return this;
+  }
+
+  /** A file with the executable bit set, so mode 100755 shows up in trees. */
+  writeExecutable(path: string, content: string): this {
+    this.write(path, content);
+    chmodSync(join(this.dir, path), 0o755);
+    return this;
+  }
+
+  chmod(path: string, mode: number): this {
+    chmodSync(join(this.dir, path), mode);
+    return this;
+  }
+
+  symlink(target: string, path: string): this {
+    const full = join(this.dir, path);
+    mkdirSync(dirname(full), { recursive: true });
+    try {
+      unlinkSync(full);
+    } catch {
+      // absent is the normal case
+    }
+    symlinkSync(target, full);
+    return this;
+  }
+
+  remove(path: string): this {
+    rmSync(join(this.dir, path), { recursive: true, force: true });
     return this;
   }
 

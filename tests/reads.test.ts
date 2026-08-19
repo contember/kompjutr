@@ -60,7 +60,7 @@ describe("rev-parse", () => {
   });
 
   it("reports the current branch", () => {
-    expect(repo.currentBranch()).toBe("refs/heads/main");
+    expect(repo.head().ref).toBe("refs/heads/main");
     expect(repo.branches().sort()).toEqual(["main", "side"]);
     expect(repo.tags()).toEqual(["v1"]);
   });

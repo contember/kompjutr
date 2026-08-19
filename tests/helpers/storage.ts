@@ -30,6 +30,15 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
   #statements = new Map<string, StatementSync>();
   #depth = 0;
 
+  /**
+   * Statements executed and rows returned since the last reset. Statement
+   * counts are deterministic and are the primary metric; row counts are
+   * stable to about three significant figures, so treat them as
+   * approximate.
+   */
+  statementCount = 0;
+  rowCount = 0;
+
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -39,6 +48,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
         // only accepts a single statement.
         if (bindings.length === 0 && /;\s*\S/.test(query)) {
           this.db.exec(query);
+          this.statementCount++;
           return new Cursor<Row>([]);
         }
         let stmt = this.#statements.get(query);
@@ -47,9 +57,16 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
           this.#statements.set(query, stmt);
         }
         const rows = (stmt.all(...(bindings.map(toSQLiteValue) as never[])) as Row[]) ?? [];
+        this.statementCount++;
+        this.rowCount += rows.length;
         return new Cursor<Row>(rows);
       },
     };
+  }
+
+  resetCounters(): void {
+    this.statementCount = 0;
+    this.rowCount = 0;
   }
 
   transactionSync<T>(closure: () => T): T {

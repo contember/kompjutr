@@ -144,11 +144,6 @@ export class Repository {
     return { ref: null, oid: isOid(raw) ? raw : null };
   }
 
-  currentBranch(): string | undefined {
-    const { ref } = this.head();
-    return ref === null ? undefined : ref;
-  }
-
   branches(): string[] {
     return this.store.listRefs("refs/heads/").map((row) => row.name.slice("refs/heads/".length));
   }

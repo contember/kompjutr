@@ -108,6 +108,32 @@ export function hashWorktreePath(
   return { oid, mode: gitModeFor(stat), stat };
 }
 
+/**
+ * Tracked paths whose working-tree content no longer matches the index.
+ * A path recorded in the index but missing from disk counts as dirty.
+ *
+ * This is the worktree-vs-index half of `status`, kept here because
+ * `checkout` needs it to refuse to overwrite local changes without ever
+ * pulling in HEAD comparison.
+ */
+export function dirtyPaths(repo: Repository, worktree: Worktree, paths?: string[]): string[] {
+  const out: string[] = [];
+  for (const entry of repo.store.indexEntries()) {
+    if (entry.stage !== 0) continue;
+    if (paths !== undefined && !withinPathspec(entry.path, paths, false)) continue;
+    const absolute = joinPath(repo.root, entry.path);
+    const stat = worktree.stat(absolute);
+    if (stat === null) {
+      out.push(entry.path);
+      continue;
+    }
+    if (indexMatchesStat(entry, stat)) continue;
+    const hashed = hashWorktreePath(repo, worktree, entry.path, { write: false });
+    if (hashed === null || hashed.oid !== entry.oid) out.push(entry.path);
+  }
+  return out;
+}
+
 /** An index row describing `relative` as it currently exists on disk. */
 export function indexEntryFor(relative: string, hashed: HashedPath): IndexEntry {
   return {

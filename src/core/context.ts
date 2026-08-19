@@ -33,3 +33,17 @@ export function findRepository(context: GitContext, dir = "/"): Repository | nul
   const row = context.database.find(normalizePath(dir));
   return row === null ? null : new Repository(context.database.open(row), row.root);
 }
+
+/**
+ * Roots of other repositories nested inside `root`. Their files belong to
+ * them, so a working-tree walk has to stop there — the one thing a `.git`
+ * directory used to signal for free.
+ */
+export function nestedRoots(context: GitContext, root: string): string[] {
+  const base = normalizePath(root);
+  const prefix = base === "/" ? "/" : `${base}/`;
+  return context.database
+    .list()
+    .map((row) => row.root)
+    .filter((candidate) => candidate !== base && candidate.startsWith(prefix));
+}

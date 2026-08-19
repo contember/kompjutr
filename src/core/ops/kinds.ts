@@ -5,6 +5,16 @@
 // FROZEN SEAM: every command depends on these. Changing one invalidates
 // work in flight elsewhere.
 
+export type { CatFileResult, CommitView, TreeEntryView } from "./reads.js";
+
+/**
+ * `Person.timezoneOffset` is minutes **west** of UTC — `+0100` is `-60`,
+ * the `Date.prototype.getTimezoneOffset` convention. That is what
+ * isomorphic-git returns at runtime and therefore what Computer's
+ * `CommitView` actually carries, whatever its doc comment says. Anything
+ * formatting a commit date has to negate.
+ */
+
 export interface StatusEntry {
   path: string;
   index: " " | "A" | "M" | "D";
