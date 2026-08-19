@@ -469,6 +469,31 @@ export class RepoStore {
     );
   }
 
+  // -- shallow --------------------------------------------------------
+
+  shallow(): Set<string> {
+    return new Set(
+      this.#db
+        .all<{ oid: string }>("SELECT oid FROM git_shallow WHERE repo_id = ?", this.#repoId)
+        .map((row) => row.oid),
+    );
+  }
+
+  setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
+    this.#db.transactionSync(() => {
+      for (const oid of remove) {
+        this.#db.run("DELETE FROM git_shallow WHERE repo_id = ? AND oid = ?", this.#repoId, oid);
+      }
+      for (const oid of add) {
+        this.#db.run(
+          "INSERT OR IGNORE INTO git_shallow (repo_id, oid) VALUES (?, ?)",
+          this.#repoId,
+          oid,
+        );
+      }
+    });
+  }
+
   // -- lifecycle ------------------------------------------------------
 
   /** Drop every row belonging to this repository. */
@@ -478,6 +503,7 @@ export class RepoStore {
         "git_refs",
         "git_config",
         "git_index",
+        "git_shallow",
         "git_objects",
         "git_object_chunks",
         "git_pack_meta",

@@ -34,10 +34,22 @@ export interface ResolvedHead {
 }
 
 export class Repository {
+  #shallow: Set<string> | null = null;
+
   constructor(
     readonly store: RepoStore,
     readonly root: string,
   ) {}
+
+  /** Commits whose parents this repository deliberately does not have. */
+  shallow(): Set<string> {
+    if (this.#shallow === null) this.#shallow = this.store.shallow();
+    return this.#shallow;
+  }
+
+  invalidateShallow(): void {
+    this.#shallow = null;
+  }
 
   // -- objects --------------------------------------------------------
 
@@ -235,10 +247,12 @@ export class Repository {
       queue.splice(index, 0, { oid: candidate, commit });
     };
 
+    const boundary = this.shallow();
     push(this.peel(oid));
     while (queue.length > 0) {
       const next = queue.shift()!;
       yield next;
+      if (boundary.has(next.oid)) continue;
       for (const parent of next.commit.parent) push(parent);
     }
   }

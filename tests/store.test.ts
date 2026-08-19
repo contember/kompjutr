@@ -46,6 +46,7 @@ describe("repository registry", () => {
       "git_pack_pending",
       "git_refs",
       "git_repositories",
+      "git_shallow",
     ]);
   });
 });

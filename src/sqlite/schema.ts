@@ -57,6 +57,14 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, path, stage)
    )`,
 
+  // Shallow boundary commits, the equivalent of .git/shallow. A history
+  // walk stops dead at one of these.
+  `CREATE TABLE IF NOT EXISTS git_shallow (
+     repo_id INTEGER NOT NULL,
+     oid TEXT NOT NULL,
+     PRIMARY KEY (repo_id, oid)
+   )`,
+
   // Loose objects: everything created locally, zlib-deflated and chunked.
   // A future repack folds them into a pack; nothing here depends on that.
   `CREATE TABLE IF NOT EXISTS git_objects (
