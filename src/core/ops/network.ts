@@ -195,8 +195,14 @@ export async function fetchInto(
         repo.store.setRef(ref.name, ref.oid);
       }
     }
-    if (advertisement.headRef !== null) {
-      repo.store.setRef(`${trackingPrefix}HEAD`, `ref: ${advertisement.headRef}`);
+    // The remote's HEAD is a symref into *our* tracking namespace, not into
+    // the local branches, and only once the branch it names has been fetched.
+    const headRef = advertisement.headRef ?? "";
+    if (headRef.startsWith("refs/heads/")) {
+      const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
+      if (repo.store.getRef(tracking) !== null) {
+        repo.store.setRef(`${trackingPrefix}HEAD`, `ref: ${tracking}`);
+      }
     }
   });
 
