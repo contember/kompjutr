@@ -6,6 +6,7 @@
 // interface.
 
 import { utf8 } from "../bytes.js";
+import type { IgnoreMatcher } from "../ignore/index.js";
 import { hashObject } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
@@ -20,6 +21,10 @@ export interface WalkOptions {
   excludeRoots?: string[];
   /** Restrict the walk to these repo-relative path prefixes. */
   paths?: string[];
+  /** Skip ignored paths, and do not descend into ignored directories. */
+  ignores?: IgnoreMatcher;
+  /** Return ignored paths too, marked, instead of skipping them. */
+  includeIgnored?: boolean;
 }
 
 /**
@@ -48,10 +53,18 @@ export function walkWorktree(
       if (relative === null) continue;
       if (entry.type === "directory") {
         if (!withinPathspec(relative, options.paths, true)) continue;
+        // git never descends into an ignored directory, which is also why
+        // a re-include below one cannot take effect.
+        if (options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true) {
+          continue;
+        }
         stack.push(absolute);
         continue;
       }
       if (!withinPathspec(relative, options.paths, false)) continue;
+      if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
+        continue;
+      }
       out.push(relative);
     }
   }
