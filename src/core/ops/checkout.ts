@@ -1,11 +1,11 @@
 // Materialising a tree into the working tree, and keeping the SQL index in
 // step with it.
 
+import type { IndexEntry } from "../../sqlite/store.js";
 import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { fileModeFor, type Worktree } from "../worktree.js";
-import type { IndexEntry } from "../../sqlite/store.js";
 
 export interface TargetEntry {
   path: string;
@@ -27,7 +27,11 @@ export function treeEntries(repo: Repository, treeOid: string | null): Map<strin
 export function matchesPaths(path: string, paths: string[] | undefined): boolean {
   if (paths === undefined || paths.length === 0) return true;
   return paths.some(
-    (spec) => spec === "" || spec === "." || path === spec || path.startsWith(`${spec.replace(/\/+$/, "")}/`),
+    (spec) =>
+      spec === "" ||
+      spec === "." ||
+      path === spec ||
+      path.startsWith(`${spec.replace(/\/+$/, "")}/`),
   );
 }
 
@@ -92,11 +96,7 @@ export function checkoutTree(
 }
 
 /** Write one tree entry to disk and describe the index row it deserves. */
-export function writeEntry(
-  repo: Repository,
-  worktree: Worktree,
-  entry: TargetEntry,
-): IndexEntry {
+export function writeEntry(repo: Repository, worktree: Worktree, entry: TargetEntry): IndexEntry {
   const absolute = joinPath(repo.root, entry.path);
   const data = repo.readBlob(entry.oid);
   if (entry.mode === "120000") {

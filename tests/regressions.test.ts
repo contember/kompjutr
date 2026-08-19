@@ -1,5 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { makeWorkspace, writeWorkFile } from "./helpers/workspace.js";
+import { commit as commitOp } from "../src/core/ops/commit.js";
+import { branch, checkout } from "../src/core/ops/refs.js";
+import { add } from "../src/core/ops/staging.js";
+import { dirtyPaths } from "../src/core/ops/worktree-io.js";
+import {
+  makeRepo,
+  makeWorkspace,
+  type TestRepository,
+  writeWorkFile,
+} from "./helpers/workspace.js";
+
+function stage(ws: TestRepository, path: string): void {
+  add(ws.repo, ws.worktree, { paths: [path] });
+}
+
+function commit(ws: TestRepository, message: string): void {
+  ws.repo.store.configSet("user.name", "Fixture");
+  ws.repo.store.configSet("user.email", "fixture@example.com");
+  ws.tick(1000);
+  commitOp(ws.context, ws.repo, { message });
+}
 
 describe("regressions", () => {
   it("reports a symlink as a symlink from readdir", () => {
@@ -27,5 +47,46 @@ describe("regressions", () => {
     const storeB = ws.database.open(second);
     expect(storeB).not.toBe(storeA);
     expect(storeB.objectCount()).toBe(0);
+  });
+});
+
+describe("checkout refuses what git refuses", () => {
+  function twoBranches() {
+    const ws = makeRepo("/");
+    writeWorkFile(ws, "/a.txt", "one\n");
+    stage(ws, "a.txt");
+    commit(ws, "first");
+    branch(ws.repo, { name: "topic" });
+    writeWorkFile(ws, "/a.txt", "two\n");
+    writeWorkFile(ws, "/new.txt", "added on main\n");
+    stage(ws, "a.txt");
+    stage(ws, "new.txt");
+    commit(ws, "second");
+    return ws;
+  }
+
+  it("refuses when a staged change would be lost, even with a clean worktree", () => {
+    const ws = twoBranches();
+    writeWorkFile(ws, "/a.txt", "staged only\n");
+    stage(ws, "a.txt");
+    // The working tree now matches the index exactly, so a worktree-vs-index
+    // comparison sees nothing — but the staged change is still uncommitted.
+    expect(dirtyPaths(ws.repo, ws.worktree)).toEqual([]);
+    expect(() => checkout(ws.context, ws.repo, ws.worktree, { ref: "topic" })).toThrow(
+      /local changes/,
+    );
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "topic", force: true });
+    expect(ws.repo.head().ref).toBe("refs/heads/topic");
+  });
+
+  it("refuses to write over an untracked file", () => {
+    const ws = twoBranches();
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "topic" });
+    // `new.txt` exists only on main; recreate it by hand and switch back.
+    writeWorkFile(ws, "/new.txt", "mine, not git's\n");
+    expect(() => checkout(ws.context, ws.repo, ws.worktree, { ref: "main" })).toThrow(
+      /untracked working tree files/,
+    );
+    expect(new TextDecoder().decode(ws.worktree.readFile("/new.txt"))).toBe("mine, not git's\n");
   });
 });

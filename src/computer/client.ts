@@ -6,28 +6,48 @@
 // Computer.
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
-import type { GitClient, GitClientFactory, WorkspaceGitClientOptions } from "@cloudflare/computer/git";
+import type {
+  GitClient,
+  GitClientFactory,
+  WorkspaceGitClientOptions,
+} from "@cloudflare/computer/git";
 
 import { type GitContext, type GitIdentity, nestedRoots, openRepository } from "../core/context.js";
 import { UnsupportedOperationError } from "../core/errors.js";
-import { clone as cloneOp, fetchInto } from "../core/ops/network.js";
 import { commit as commitOp } from "../core/ops/commit.js";
 import { configGet, configSet, remoteAdd, remoteList, remoteRemove } from "../core/ops/config.js";
 import { diff as diffOp, diffSummary as diffSummaryOp } from "../core/ops/diff.js";
 import { initRepository } from "../core/ops/init.js";
-import { catFile as catFileOp, hashObject as hashObjectOp, repoRoot as repoRootOp, updateRef as updateRefOp } from "../core/ops/plumbing.js";
-import { catFile as catFileRead, log as logOp, lsFilesAtRef, lsTree as lsTreeOp, show as showOp } from "../core/ops/reads.js";
+import { clone as cloneOp, fetchInto } from "../core/ops/network.js";
 import {
-  branch as branchOp,
+  catFile as catFileOp,
+  hashObject as hashObjectOp,
+  repoRoot as repoRootOp,
+  updateRef as updateRefOp,
+} from "../core/ops/plumbing.js";
+import {
+  catFile as catFileRead,
+  log as logOp,
+  lsFilesAtRef,
+  lsTree as lsTreeOp,
+  show as showOp,
+} from "../core/ops/reads.js";
+import {
   branchDelete as branchDeleteOp,
   branchList as branchListOp,
+  branch as branchOp,
   checkout as checkoutOp,
   currentBranch as currentBranchOp,
-  tag as tagOp,
   tagDelete as tagDeleteOp,
   tagList as tagListOp,
+  tag as tagOp,
 } from "../core/ops/refs.js";
-import { add as addOp, lsFiles as lsFilesOp, reset as resetOp, rm as rmOp } from "../core/ops/staging.js";
+import {
+  add as addOp,
+  lsFiles as lsFilesOp,
+  reset as resetOp,
+  rm as rmOp,
+} from "../core/ops/staging.js";
 import { clean as cleanOp, status as statusOp } from "../core/ops/status.js";
 import type { Repository } from "../core/repository.js";
 import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";

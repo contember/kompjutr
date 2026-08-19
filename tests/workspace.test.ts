@@ -15,9 +15,7 @@ describe("workspace fixture", () => {
     expect(utf8Decoder.decode(workspace.worktree.readFile("/README.md"))).toBe("hello\n");
     expect(workspace.repo.store.head()).toBe("ref: refs/heads/main");
     expect(
-      workspace.storage.sql
-        .exec<{ root: string }>("SELECT root FROM git_repositories")
-        .toArray(),
+      workspace.storage.sql.exec<{ root: string }>("SELECT root FROM git_repositories").toArray(),
     ).toEqual([{ root: "/" }]);
   });
 

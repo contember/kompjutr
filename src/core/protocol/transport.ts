@@ -26,7 +26,10 @@ export interface GitAuth {
   headers?: Record<string, string>;
 }
 
-export type AuthCallback = (url: string, auth: GitAuth) => GitAuth | undefined | Promise<GitAuth | undefined>;
+export type AuthCallback = (
+  url: string,
+  auth: GitAuth,
+) => GitAuth | undefined | Promise<GitAuth | undefined>;
 
 export class HttpError extends GitError {
   constructor(

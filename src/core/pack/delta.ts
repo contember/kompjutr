@@ -1,3 +1,6 @@
+// Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
+// https://github.com/littledivy/dgit — applyDelta is adapted from dgit's src/git/pack.ts.
+//
 import { CorruptError } from "../errors.js";
 
 const MAX_DELTA_TARGET = 512 * 1024 * 1024;

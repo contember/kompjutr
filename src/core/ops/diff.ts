@@ -5,13 +5,13 @@
 // `src/core/diff/`; this file decides *what* is compared and writes the
 // `diff --git` headers around it.
 
+import type { IndexEntry } from "../../sqlite/store.js";
 import { utf8Decoder, ZERO_OID } from "../bytes.js";
 import { diffText } from "../diff/index.js";
 import { isBinary } from "../diff/lines.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import type { IndexEntry } from "../../sqlite/store.js";
 import { matchesPaths, treeEntries } from "./checkout.js";
 import type { DiffSummaryEntry } from "./kinds.js";
 import { treeOf } from "./reads.js";

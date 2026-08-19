@@ -1,3 +1,6 @@
+// Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
+// https://github.com/littledivy/dgit — the three-phase ingest, the rotating offset window, the deferred-delta table and the iterative delta-chain walk all follow dgit's src/git/packstore.ts.
+//
 // Pack-native object storage. A received packfile is written to SQLite
 // verbatim, still compressed, in fixed-size chunk rows, and indexed
 // (oid -> pack, offset, delta base). Reads pull only the chunks an object
@@ -6,14 +9,14 @@
 import { concat, toHex } from "../core/bytes.js";
 import { CorruptError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
-import { applyDelta } from "../core/pack/delta.js";
 import {
   hashObject,
   NUMBER_TYPE,
-  objectHeader,
   type ObjectType,
+  objectHeader,
   type RawObject,
 } from "../core/objects.js";
+import { applyDelta } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
 import { InflateStream, inflatePrefix } from "../core/zlib.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
@@ -313,7 +316,12 @@ export class PackStore {
   }
 
   #deletePack(packId: number): void {
-    for (const table of ["git_pack_data", "git_pack_objects", "git_pack_pending", "git_pack_meta"]) {
+    for (const table of [
+      "git_pack_data",
+      "git_pack_objects",
+      "git_pack_pending",
+      "git_pack_meta",
+    ]) {
       this.#db.run(`DELETE FROM ${table} WHERE repo_id = ? AND pack_id = ?`, this.#repoId, packId);
     }
   }
@@ -450,7 +458,8 @@ export class PackStore {
     }
     const version = reader.uint32();
     const count = reader.uint32();
-    if (version !== 2 && version !== 3) throw new CorruptError(`unsupported pack version ${version}`);
+    if (version !== 2 && version !== 3)
+      throw new CorruptError(`unsupported pack version ${version}`);
 
     const offsets = new OffsetWindow();
     const offsetToOid = (offset: number): string | null => {

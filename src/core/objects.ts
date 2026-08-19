@@ -1,3 +1,6 @@
+// Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
+// https://github.com/littledivy/dgit — the tree, commit and identity-line parsers are adapted from dgit's src/git/objects.ts.
+//
 // Git's four object types and their on-disk encodings. Everything here is
 // pure: bytes in, structures out. Storage and delta resolution live
 // elsewhere.
@@ -15,7 +18,12 @@ export interface RawObject {
 }
 
 export const TYPE_NUMBER: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-export const NUMBER_TYPE: Record<number, ObjectType> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
+export const NUMBER_TYPE: Record<number, ObjectType> = {
+  1: "commit",
+  2: "tree",
+  3: "blob",
+  4: "tag",
+};
 
 export function objectHeader(type: ObjectType, size: number): Uint8Array {
   return utf8.encode(`${type} ${size}\0`);
@@ -107,7 +115,10 @@ export function parsePerson(line: string): Person {
   }
   const name = line.slice(0, open);
   const email = line.slice(open + 2, close);
-  const rest = line.slice(close + 1).trim().split(" ");
+  const rest = line
+    .slice(close + 1)
+    .trim()
+    .split(" ");
   const timestamp = rest.length > 0 ? Number.parseInt(rest[0]!, 10) : 0;
   let timezoneOffset = 0;
   if (rest.length > 1 && /^[+-]\d{4}$/.test(rest[1]!)) {

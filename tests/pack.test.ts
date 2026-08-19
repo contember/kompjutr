@@ -1,12 +1,10 @@
 import { randomBytes } from "node:crypto";
 
 import { afterAll, describe, expect, it } from "vitest";
-
-import { utf8 } from "../src/core/bytes.js";
+import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, parseCommit, parseTree } from "../src/core/objects.js";
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { concat } from "../src/core/bytes.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
@@ -59,7 +57,13 @@ describe("synthetic pack ingest", () => {
     const targetOid = hashObject("blob", target);
     const delta = concat([
       encodeDeltaHeader(base.length, target.length),
-      new Uint8Array([0x80 | 0x01 | 0x02 | 0x10 | 0x20, 0, 0, base.length & 0xff, base.length >> 8]),
+      new Uint8Array([
+        0x80 | 0x01 | 0x02 | 0x10 | 0x20,
+        0,
+        0,
+        base.length & 0xff,
+        base.length >> 8,
+      ]),
       new Uint8Array([6]),
       utf8.encode("extra\n"),
     ]);

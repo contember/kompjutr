@@ -2,8 +2,8 @@
 // copy: a repository is one row in `git_repositories` plus whatever refs
 // and config follow.
 
-import { AlreadyInitializedError } from "../errors.js";
 import type { GitContext } from "../context.js";
+import { AlreadyInitializedError } from "../errors.js";
 import { normalizePath } from "../paths.js";
 import { Repository } from "../repository.js";
 

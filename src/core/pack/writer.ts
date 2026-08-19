@@ -1,3 +1,6 @@
+// Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
+// https://github.com/littledivy/dgit — the entry header encoding and the streaming writer are adapted from dgit's src/git/pack.ts.
+//
 import { fromHex, utf8 } from "../bytes.js";
 import { type ObjectType, TYPE_NUMBER } from "../objects.js";
 import { Sha1 } from "../sha1.js";

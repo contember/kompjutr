@@ -7,14 +7,15 @@
 import { Buffer } from "node:buffer";
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
-
-import type { Worktree, WorktreeDirent, WorktreeEntryType, WorktreeStat } from "../core/worktree.js";
 import { dirnameOf } from "../core/paths.js";
+import type {
+  Worktree,
+  WorktreeDirent,
+  WorktreeEntryType,
+  WorktreeStat,
+} from "../core/worktree.js";
 
-function statType(stats: {
-  isSymbolicLink(): boolean;
-  isDirectory(): boolean;
-}): WorktreeEntryType {
+function statType(stats: { isSymbolicLink(): boolean; isDirectory(): boolean }): WorktreeEntryType {
   if (stats.isSymbolicLink()) return "symlink";
   return stats.isDirectory() ? "directory" : "file";
 }

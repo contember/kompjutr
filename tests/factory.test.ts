@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
 import { Workspace } from "@cloudflare/computer";
 import type { GitClient, GitClientFactory } from "@cloudflare/computer/git";
+import { describe, expect, it } from "vitest";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 describe("phase 0 spike", () => {
@@ -12,7 +12,9 @@ describe("phase 0 spike", () => {
       provider.db.run("CREATE TABLE IF NOT EXISTS git_probe (k TEXT PRIMARY KEY, v TEXT)");
       const client = {
         async init() {
-          provider.db.run("INSERT OR REPLACE INTO git_probe VALUES ('head', 'ref: refs/heads/main')");
+          provider.db.run(
+            "INSERT OR REPLACE INTO git_probe VALUES ('head', 'ref: refs/heads/main')",
+          );
           seen.push("init");
         },
       } as unknown as GitClient;

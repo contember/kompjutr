@@ -1,9 +1,8 @@
 // Read-only queries over the object database. These back `log`, `show`,
 // `rev-parse`, `ls-tree`, `ls-files` and `cat-file`.
 
-import { isTreeMode, type ObjectType, type Person } from "../objects.js";
-import { displayMode, typeForMode } from "../objects.js";
 import { ObjectNotFoundError, RefNotFoundError } from "../errors.js";
+import { displayMode, isTreeMode, type ObjectType, type Person, typeForMode } from "../objects.js";
 import type { Repository } from "../repository.js";
 
 /** Matches `CommitView` on Computer's GitClient surface. */
@@ -36,8 +35,12 @@ export function commitView(repo: Repository, oid: string): CommitView {
   };
 }
 
-export function log(repo: Repository, options: { ref?: string; depth?: number } = {}): CommitView[] {
-  const start = repo.head().oid !== null || options.ref !== undefined ? options.ref ?? "HEAD" : null;
+export function log(
+  repo: Repository,
+  options: { ref?: string; depth?: number } = {},
+): CommitView[] {
+  const start =
+    repo.head().oid !== null || options.ref !== undefined ? (options.ref ?? "HEAD") : null;
   if (start === null) return [];
   const oid = repo.revParse(start);
   const out: CommitView[] = [];

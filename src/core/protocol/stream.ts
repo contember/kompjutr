@@ -1,3 +1,6 @@
+// Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
+// https://github.com/littledivy/dgit — the strict four-byte length parser is adapted from dgit's src/git/pktline.ts.
+//
 // A pull reader over an async byte source. Everything the wire protocol
 // needs is framed in pkt-lines, which are at most 65524 bytes, so the
 // reader never holds more than one frame plus whatever the source handed

@@ -5,6 +5,7 @@
 // tracked-file count is the single `SELECT` over `git_index` — everything
 // after that is bounded by what actually changed.
 
+import type { IndexEntry } from "../../sqlite/store.js";
 import { PathspecNotFoundError } from "../errors.js";
 import { loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath } from "../paths.js";
@@ -12,7 +13,6 @@ import type { Repository } from "../repository.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree, matchesPaths, treeEntries } from "./checkout.js";
 import { hashWorktreePath, indexEntryFor, indexMatchesStat, walkWorktree } from "./worktree-io.js";
-import type { IndexEntry } from "../../sqlite/store.js";
 
 export interface AddOptions {
   /** Repo-relative pathspecs. Empty is a no-op, like `git add` with no arguments. */

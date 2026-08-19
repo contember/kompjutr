@@ -9,12 +9,7 @@ import { utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { FLUSH, pkt } from "./pktline.js";
 import { ByteReader, type Pkt, pktText } from "./stream.js";
-import {
-  HttpError,
-  type RemoteRequestOptions,
-  readAll,
-  requestWithAuth,
-} from "./transport.js";
+import { HttpError, type RemoteRequestOptions, readAll, requestWithAuth } from "./transport.js";
 
 export const AGENT = "kompjutr/0.0.0";
 

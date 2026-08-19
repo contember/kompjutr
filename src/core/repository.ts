@@ -1,6 +1,7 @@
 // The repository: everything reachable from the object store and the refs,
 // with no knowledge of Computer, DOFS or HTTP.
 
+import type { RepoStore } from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
 import { CorruptError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
@@ -14,7 +15,6 @@ import {
   type Tag,
   type TreeEntry,
 } from "./objects.js";
-import type { RepoStore } from "../sqlite/store.js";
 
 /** Where a short ref name is looked up, in git's own order. */
 const REF_SEARCH = [
@@ -71,7 +71,8 @@ export class Repository {
 
   readCommit(oid: string): Commit {
     const object = this.read(oid);
-    if (object.type !== "commit") throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
+    if (object.type !== "commit")
+      throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
     return parseCommit(object.data);
   }
 
@@ -236,7 +237,10 @@ export class Repository {
       seen.add(candidate);
       const commit = this.readCommit(candidate);
       let index = queue.length;
-      while (index > 0 && queue[index - 1]!.commit.committer.timestamp < commit.committer.timestamp) {
+      while (
+        index > 0 &&
+        queue[index - 1]!.commit.committer.timestamp < commit.committer.timestamp
+      ) {
         index--;
       }
       queue.splice(index, 0, { oid: candidate, commit });

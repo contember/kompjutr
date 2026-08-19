@@ -140,6 +140,9 @@ const STATEMENTS = [
 export function initializeGitSchema(db: SqlDatabase): void {
   db.transactionSync(() => {
     for (const statement of STATEMENTS) db.run(statement);
-    db.run("INSERT OR REPLACE INTO git_meta (key, value) VALUES ('schema_version', ?)", String(SCHEMA_VERSION));
+    db.run(
+      "INSERT OR REPLACE INTO git_meta (key, value) VALUES ('schema_version', ?)",
+      String(SCHEMA_VERSION),
+    );
   });
 }

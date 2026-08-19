@@ -6,10 +6,10 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import { AlreadyInitializedError, GitError } from "../errors.js";
 import type { GitContext } from "../context.js";
+import { AlreadyInitializedError, GitError } from "../errors.js";
 import { normalizePath } from "../paths.js";
-import { Repository } from "../repository.js";
+import { type MessageCallback, type ProgressCallback, progressSink } from "../protocol/progress.js";
 import {
   type Advertisement,
   discover,
@@ -17,12 +17,8 @@ import {
   type RemoteRef,
   uploadPack,
 } from "../protocol/remote.js";
-import {
-  type MessageCallback,
-  type ProgressCallback,
-  progressSink,
-} from "../protocol/progress.js";
 import type { AuthCallback } from "../protocol/transport.js";
+import { Repository } from "../repository.js";
 import { checkoutTree } from "./checkout.js";
 
 /** How many commits back from each local tip are offered as `have`s. */
@@ -230,10 +226,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
   const repo = new Repository(context.database.open(row), row.root);
   try {
     repo.store.configSet(`remote.${remote}.url`, url);
-    repo.store.configSet(
-      `remote.${remote}.fetch`,
-      `+refs/heads/*:refs/remotes/${remote}/*`,
-    );
+    repo.store.configSet(`remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
 
     const depth = options.depth ?? 1;
     const result = await fetchInto(context, repo, {

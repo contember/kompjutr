@@ -5,13 +5,13 @@
 // these. Nothing here knows about Computer or DOFS — only the `Worktree`
 // interface.
 
+import type { IndexEntry } from "../../sqlite/store.js";
 import { utf8 } from "../bytes.js";
 import type { IgnoreMatcher } from "../ignore/index.js";
 import { hashObject } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { gitModeFor, type Worktree, type WorktreeStat } from "../worktree.js";
-import type { IndexEntry } from "../../sqlite/store.js";
 
 export interface WalkOptions {
   /**
@@ -75,7 +75,11 @@ export function walkWorktree(
  * Pathspec matching for the walk. A directory is kept when it could still
  * contain a match; a file only when it matches outright.
  */
-function withinPathspec(relative: string, paths: string[] | undefined, isDirectory: boolean): boolean {
+function withinPathspec(
+  relative: string,
+  paths: string[] | undefined,
+  isDirectory: boolean,
+): boolean {
   if (paths === undefined || paths.length === 0) return true;
   for (const raw of paths) {
     const spec = raw.replace(/\/+$/, "");
@@ -88,7 +92,11 @@ function withinPathspec(relative: string, paths: string[] | undefined, isDirecto
 }
 
 /** The bytes git would hash for a working-tree path: a symlink hashes its target. */
-export function worktreeBytes(worktree: Worktree, absolute: string, stat: WorktreeStat): Uint8Array {
+export function worktreeBytes(
+  worktree: Worktree,
+  absolute: string,
+  stat: WorktreeStat,
+): Uint8Array {
   return stat.type === "symlink"
     ? utf8.encode(worktree.readlink(absolute))
     : worktree.readFile(absolute);
@@ -116,8 +124,7 @@ export function hashWorktreePath(
   const stat = worktree.stat(absolute);
   if (stat === null || stat.type === "directory") return null;
   const bytes = worktreeBytes(worktree, absolute, stat);
-  const oid =
-    options.write === false ? hashObject("blob", bytes) : repo.store.write("blob", bytes);
+  const oid = options.write === false ? hashObject("blob", bytes) : repo.store.write("blob", bytes);
   return { oid, mode: gitModeFor(stat), stat };
 }
 

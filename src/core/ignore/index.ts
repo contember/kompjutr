@@ -105,7 +105,10 @@ class WorktreeIgnoreMatcher implements IgnoreMatcher {
   #rulesFor(directory: string): IgnorePattern[] {
     const cached = this.#rules.get(directory);
     if (cached !== undefined) return cached;
-    const absolute = joinPath(this.root, directory === "" ? ".gitignore" : `${directory}/.gitignore`);
+    const absolute = joinPath(
+      this.root,
+      directory === "" ? ".gitignore" : `${directory}/.gitignore`,
+    );
     let patterns: IgnorePattern[] = [];
     const stat = this.worktree.stat(absolute);
     if (stat !== null && stat.type === "file") {

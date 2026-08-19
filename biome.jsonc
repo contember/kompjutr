@@ -8,5 +8,5 @@
       "style": { "noNonNullAssertion": "off", "useNamingConvention": "off" }
     }
   },
-  "files": { "includes": ["**", "!dist/**", "!node_modules/**"] }
+  "files": { "includes": ["**", "!dist", "!node_modules"] }
 }

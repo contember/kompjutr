@@ -1,5 +1,5 @@
 import type { RepoStore } from "../../src/sqlite/store.js";
-import { GitFixture, slices } from "./git.js";
+import { type GitFixture, slices } from "./git.js";
 
 /** Load a fixture repository's pack and refs into a store, with no checkout. */
 export async function importFixture(fixture: GitFixture, store: RepoStore): Promise<void> {

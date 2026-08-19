@@ -51,7 +51,15 @@ const CASES: { name: string; files: Record<string, string>; paths: string[] }[] 
   {
     name: "character classes and question marks",
     files: { ".gitignore": "file?.txt\n*.[oa]\n[!x]ignored.txt\n" },
-    paths: ["file1.txt", "file10.txt", "main.o", "main.a", "main.c", "yignored.txt", "xignored.txt"],
+    paths: [
+      "file1.txt",
+      "file10.txt",
+      "main.o",
+      "main.a",
+      "main.c",
+      "yignored.txt",
+      "xignored.txt",
+    ],
   },
   {
     name: "nested gitignore overrides its parent",
@@ -100,8 +108,7 @@ describe("gitignore", () => {
 
       const matcher = loadIgnoreMatcher(workspace.worktree, "/");
       for (const path of testCase.paths) {
-        const isDirectory =
-          workspace.worktree.stat(`/${path}`)?.type === "directory";
+        const isDirectory = workspace.worktree.stat(`/${path}`)?.type === "directory";
         let expected: boolean;
         try {
           fixture.git("check-ignore", "-q", "--no-index", path);

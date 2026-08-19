@@ -1,5 +1,5 @@
-import { SqliteTestStorage } from "./storage.js";
 import type { SqlDatabase } from "../../src/sqlite/db.js";
+import { SqliteTestStorage } from "./storage.js";
 
 /**
  * Structural stand-in for @cloudflare/dofs's `Database`, so store tests

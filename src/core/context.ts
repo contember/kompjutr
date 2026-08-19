@@ -1,9 +1,9 @@
+import type { SqliteGitDatabase } from "../sqlite/store.js";
 import { NotARepositoryError } from "./errors.js";
 import { normalizePath } from "./paths.js";
+import type { GitHttpClient } from "./protocol/transport.js";
 import { Repository } from "./repository.js";
 import type { Worktree } from "./worktree.js";
-import type { SqliteGitDatabase } from "../sqlite/store.js";
-import type { GitHttpClient } from "./protocol/transport.js";
 
 export interface GitIdentity {
   name: string;

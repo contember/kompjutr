@@ -6,11 +6,12 @@
 // working tree in DOFS. There is no `.git` directory.
 
 export {
-  createSqliteGitClient,
   type CreateSqliteGitClientOptions,
+  createSqliteGitClient,
 } from "./computer/client.js";
 export { ComputerWorktree } from "./computer/worktree.js";
-
+export type { GitContext, GitIdentity } from "./core/context.js";
+export { findRepository, nestedRoots, openRepository } from "./core/context.js";
 export {
   AlreadyInitializedError,
   CorruptError,
@@ -23,12 +24,6 @@ export {
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./core/errors.js";
-
-export type { GitContext, GitIdentity } from "./core/context.js";
-export { findRepository, nestedRoots, openRepository } from "./core/context.js";
-export { Repository } from "./core/repository.js";
-export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";
-
 export type {
   CommitResult,
   DiffSummaryEntry,
@@ -46,13 +41,14 @@ export {
   formatShort,
   type StatusDetail,
 } from "./core/ops/status.js";
-
+export { Repository } from "./core/repository.js";
+export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";
+export type { SqlDatabase } from "./sqlite/db.js";
+export { initializeGitSchema, SCHEMA_VERSION } from "./sqlite/schema.js";
 export {
   type IndexEntry,
-  type RepositoryRow,
   RepoStore,
+  type RepositoryRow,
   SqliteGitDatabase,
   type StoreOptions,
 } from "./sqlite/store.js";
-export { initializeGitSchema, SCHEMA_VERSION } from "./sqlite/schema.js";
-export type { SqlDatabase } from "./sqlite/db.js";

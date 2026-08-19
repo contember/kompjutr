@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { concat, toHex } from "../src/core/bytes.js";
 import { sha1 } from "../src/core/sha1.js";
-import { deflate, inflate, InflateStream, inflatePrefix } from "../src/core/zlib.js";
+import { deflate, InflateStream, inflate, inflatePrefix } from "../src/core/zlib.js";
 
 describe("zlib", () => {
   it("round-trips", () => {

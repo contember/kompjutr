@@ -6,12 +6,12 @@
 // repeated status over an untouched tree therefore reads no file content
 // at all.
 
+import type { IndexEntry } from "../../sqlite/store.js";
 import { ZERO_OID } from "../bytes.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import type { IndexEntry } from "../../sqlite/store.js";
 import { matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
 import { hashWorktreePath, indexMatchesStat, walkWorktree } from "./worktree-io.js";

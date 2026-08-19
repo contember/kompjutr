@@ -1,3 +1,6 @@
+// Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
+// https://github.com/littledivy/dgit — adapted from dgit's src/git/pktline.ts.
+//
 import { concat, utf8 } from "../bytes.js";
 
 export const FLUSH = utf8.encode("0000");

@@ -39,6 +39,13 @@ compressed in SQLite and are read one chunk at a time.
 
 Experimental. See `docs/` for the design notes and the phase plan.
 
+## Credits
+
+The pack-native object store is dgit's idea, and parts of the pack, pkt-line
+and object-codec layers are adapted from it directly — see the file headers
+and `LICENSE`. dgit is a git *server* on Durable Objects; this is a client,
+so the protocol side is ours, but the storage shape is theirs.
+
 ## License
 
 MIT, with one exception: `src/core/diff/` is a port of the xdiff library as it

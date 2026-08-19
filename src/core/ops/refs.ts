@@ -8,7 +8,7 @@ import { GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
 import type { Worktree } from "../worktree.js";
-import { checkoutTree, matchesPaths, treeEntries } from "./checkout.js";
+import { checkoutTree, matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
 import { treeOf } from "./reads.js";
 import { dirtyPaths } from "./worktree-io.js";
 
@@ -132,10 +132,16 @@ export function checkout(
 
   if (options.force !== true) {
     const blocked = localChangesInTheWay(repo, worktree, tree, paths, paths === undefined);
-    if (blocked.length > 0) {
+    if (blocked.tracked.length > 0) {
       throw new GitError(
         "ECHECKOUTFAIL",
-        `local changes to ${blocked.join(", ")} would be overwritten by checkout`,
+        `local changes to ${blocked.tracked.join(", ")} would be overwritten by checkout`,
+      );
+    }
+    if (blocked.untracked.length > 0) {
+      throw new GitError(
+        "ECHECKOUTFAIL",
+        `untracked working tree files would be overwritten by checkout: ${blocked.untracked.join(", ")}`,
       );
     }
   }
@@ -196,36 +202,72 @@ function moveHead(repo: Repository, ref: string, commit: string): void {
  * clobber. A path missing from disk is not one of them: git restores a
  * locally deleted file without complaint.
  */
+interface CheckoutBlockers {
+  /** Tracked paths carrying uncommitted work the checkout would discard. */
+  tracked: string[];
+  /** Untracked files the target tree would write over. */
+  untracked: string[];
+}
+
+/**
+ * What stands between the working tree and `tree`. git refuses a checkout
+ * for two separate reasons and says so in two separate messages, so they
+ * are kept apart here.
+ *
+ * "Uncommitted" covers both halves: a file differing from the index, and an
+ * index entry differing from HEAD. Either would be lost, and only the first
+ * is what `dirtyPaths` can see on its own.
+ */
 function localChangesInTheWay(
   repo: Repository,
   worktree: Worktree,
   tree: string,
   paths: string[] | undefined,
   prune: boolean,
-): string[] {
+): CheckoutBlockers {
   const target = treeEntries(repo, tree);
+  const head = treeEntries(repo, repo.headTree());
   const indexed = new Map<string, IndexEntry>();
   for (const entry of repo.store.indexEntries()) {
     if (entry.stage === 0) indexed.set(entry.path, entry);
   }
 
   const touched = new Set<string>();
+  const staged = new Set<string>();
+  const untracked: string[] = [];
+
   for (const entry of target.values()) {
     if (!matchesPaths(entry.path, paths)) continue;
     const existing = indexed.get(entry.path);
-    if (existing === undefined) continue;
-    if (existing.oid !== entry.oid || existing.mode !== Number.parseInt(entry.mode, 8)) {
-      touched.add(entry.path);
+    if (existing === undefined) {
+      // Not tracked here. If something is already on disk at that path,
+      // writing the target over it would destroy it unasked.
+      if (worktree.stat(joinPath(repo.root, entry.path)) !== null) untracked.push(entry.path);
+      continue;
     }
+    if (existing.oid === entry.oid && existing.mode === Number.parseInt(entry.mode, 8)) continue;
+    touched.add(entry.path);
+    if (differsFromHead(existing, head.get(entry.path))) staged.add(entry.path);
   }
-  if (prune) {
-    for (const path of indexed.keys()) {
-      if (!target.has(path) && matchesPaths(path, paths)) touched.add(path);
-    }
-  }
-  if (touched.size === 0) return [];
 
-  return dirtyPaths(repo, worktree).filter(
-    (path) => touched.has(path) && worktree.stat(joinPath(repo.root, path)) !== null,
-  );
+  if (prune) {
+    for (const [path, existing] of indexed) {
+      if (target.has(path) || !matchesPaths(path, paths)) continue;
+      touched.add(path);
+      if (differsFromHead(existing, head.get(path))) staged.add(path);
+    }
+  }
+
+  const tracked = new Set(staged);
+  if (touched.size > 0) {
+    for (const path of dirtyPaths(repo, worktree)) {
+      if (touched.has(path) && worktree.stat(joinPath(repo.root, path)) !== null) tracked.add(path);
+    }
+  }
+  return { tracked: [...tracked].sort(), untracked: untracked.sort() };
+}
+
+function differsFromHead(entry: IndexEntry, head: TargetEntry | undefined): boolean {
+  if (head === undefined) return true;
+  return entry.oid !== head.oid || entry.mode !== Number.parseInt(head.mode, 8);
 }

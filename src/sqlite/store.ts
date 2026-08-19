@@ -112,7 +112,8 @@ export class SqliteGitDatabase {
   create(root: string, head: string): RepositoryRow {
     const normalized = normalizeRoot(root);
     return this.#db.transactionSync(() => {
-      const nextId = (this.#db.scalar<number | null>("SELECT MAX(id) FROM git_repositories") ?? 0) + 1;
+      const nextId =
+        (this.#db.scalar<number | null>("SELECT MAX(id) FROM git_repositories") ?? 0) + 1;
       this.#db.run(
         "INSERT INTO git_repositories (id, root, head) VALUES (?, ?, ?)",
         nextId,
@@ -160,7 +161,13 @@ export class RepoStore {
       options.objectCacheBytes ?? DEFAULT_OBJECT_CACHE_BYTES,
       (object) => object.data.length,
     );
-    this.#packs = new PackStore(db, repository.id, this.#objects, (oid) => this.#readLoose(oid), options);
+    this.#packs = new PackStore(
+      db,
+      repository.id,
+      this.#objects,
+      (oid) => this.#readLoose(oid),
+      options,
+    );
     this.#hasLoose =
       (this.#db.scalar<number>(
         "SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)",
@@ -227,7 +234,11 @@ export class RepoStore {
         this.#repoId,
         oid,
       );
-      for (let seq = 0, offset = 0; offset < compressed.length || seq === 0; seq++, offset += OBJECT_CHUNK) {
+      for (
+        let seq = 0, offset = 0;
+        offset < compressed.length || seq === 0;
+        seq++, offset += OBJECT_CHUNK
+      ) {
         this.#db.run(
           "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
           this.#repoId,

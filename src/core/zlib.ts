@@ -27,7 +27,12 @@ function isTruncated(error: unknown): boolean {
  * `Buffer` return only, so the shape is checked rather than asserted.
  */
 function readInfoResult(result: unknown): { data: Uint8Array; consumed: number } {
-  if (typeof result !== "object" || result === null || !("buffer" in result) || !("engine" in result)) {
+  if (
+    typeof result !== "object" ||
+    result === null ||
+    !("buffer" in result) ||
+    !("engine" in result)
+  ) {
     throw new Error("node:zlib did not return an info result");
   }
   const { buffer, engine } = result;
