@@ -24,8 +24,13 @@ import { blob, readBlob, type SqlDatabase } from "./db.js";
 /** Bytes per `git_pack_data` row. Comfortably under the DO row limit. */
 export const PACK_CHUNK = 1024 * 1024;
 
-/** Git's default pack depth is 50; 100 rejects a crafted chain without stack overflow. */
-const MAX_DELTA_DEPTH = 100;
+/**
+ * Git's default pack depth is 50, but a pack from another implementation can
+ * legitimately chain deeper. The base walk is iterative and separately
+ * cycle-checked by a seen-set, so this bounds chain *length* rather than
+ * guarding stack depth — which means it can be generous without risk.
+ */
+const MAX_DELTA_DEPTH = 50_000;
 
 /** Recent (offset -> oid) pairs kept in memory for ofs-delta bases. */
 const OFFSET_WINDOW = 100_000;

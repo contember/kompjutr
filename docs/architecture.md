@@ -176,3 +176,25 @@ assembled into a single `Uint8Array`.
 
 The remote wire format is standard git. The local representation deliberately is
 not.
+
+## Known scaling limits
+
+Two are worth stating plainly, because neither is solved here.
+
+**Pack bytes sit in the Durable Object's SQLite.** `git_pack_data` chunk rows
+are charged against the per-object database, so total pack storage is capped by
+it. dgit hit the same wall from the server side and moved the pack bytes to R2
+in v0.0.2, keeping only the index in SQLite — pack storage stops being capped,
+and a cached clone streams from the Worker without loading the cell at all.
+The same split would work here: `git_pack_objects` is already the only table a
+read consults to locate an entry, so the bytes behind `readRaw` could come from
+an R2 mount instead of a chunk row without anything above it noticing. Out of
+scope for the first spike, and agent-scale workspaces are nowhere near the cap.
+
+**Object ids are hashed in JavaScript.** `Sha1` runs at roughly 200 MB/s, which
+is fine for the trailer and for locally created objects but is paid once per
+object during ingest. `crypto.subtle.digest("SHA-1", …)` is native and much
+quicker, and is byte-identical — dgit measured about 24x. It is async, so using
+it means threading a promise through the buffered-entry path in `#indexPack`.
+Worth doing when a clone benchmark says the hash is actually the cost; not
+worth doing blind.

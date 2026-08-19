@@ -10,6 +10,9 @@ import * as zlib from "node:zlib";
 
 import pako from "pako";
 
+/** Output chunk for the streaming inflater. See the note in InflateStream. */
+const INFLATE_CHUNK = 16 * 1024;
+
 function asBytes(buffer: Uint8Array): Uint8Array {
   return buffer.constructor === Uint8Array
     ? buffer
@@ -83,7 +86,13 @@ export class InflateStream {
   #inflated = 0;
 
   constructor(onData: (chunk: Uint8Array) => void) {
-    this.#inflate = new pako.Inflate();
+    // pako's default 64 KiB output chunk is large enough that V8 keeps each
+    // inflate's backing store in its array-buffer arena, so arena use grows
+    // with the number of live streams rather than with the working set.
+    // dgit measured a 53 MB pack peaking near 250 MB of buffers this way.
+    // Only oversized entries stream here, so our exposure is far smaller —
+    // but a tighter chunk costs nothing and keeps the bound honest.
+    this.#inflate = new pako.Inflate({ chunkSize: INFLATE_CHUNK });
     this.#inflate.onData = (chunk) => {
       if (!(chunk instanceof Uint8Array)) throw new Error("inflate produced a non-binary chunk");
       this.#inflated += chunk.length;
