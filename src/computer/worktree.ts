@@ -15,14 +15,20 @@ import type {
   WorktreeStat,
 } from "../core/worktree.js";
 
+const EMPTY = Buffer.alloc(0);
+
 function statType(stats: { isSymbolicLink(): boolean; isDirectory(): boolean }): WorktreeEntryType {
   if (stats.isSymbolicLink()) return "symlink";
   return stats.isDirectory() ? "directory" : "file";
 }
 
+function codeOf(error: unknown): unknown {
+  if (typeof error !== "object" || error === null) return undefined;
+  return "code" in error ? error.code : undefined;
+}
+
 function isMissing(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const code = "code" in error ? error.code : undefined;
+  const code = codeOf(error);
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
@@ -131,5 +137,24 @@ export class ComputerWorktree implements Worktree {
 
   chmod(path: string, mode: number): void {
     this.provider.chmodSync(path, mode);
+  }
+
+  readRange(path: string, offset: number, length: number): Uint8Array {
+    return this.provider.readRangeSync(path, offset, length);
+  }
+
+  createFile(path: string, mode: number): void {
+    this.mkdirp(dirnameOf(path));
+    try {
+      this.provider.createFileSync(path, { mode });
+    } catch (error) {
+      if (codeOf(error) !== "EEXIST") throw error;
+      // createFileSync only creates; truncating an existing path is ours to supply.
+      this.provider.writeFileSync(path, EMPTY, { mode });
+    }
+  }
+
+  writeRange(path: string, data: Uint8Array, offset: number): void {
+    this.provider.writeRangeSync(path, data, offset);
   }
 }

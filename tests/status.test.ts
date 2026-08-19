@@ -10,10 +10,10 @@ import {
   statusMatrix,
 } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../src/core/worktree.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 /**
  * Every expectation here is checked against the real git binary: the same
@@ -395,46 +395,6 @@ describe("status", () => {
     ]);
   });
 });
-
-/** Counts the calls that would mean a file was read to be hashed. */
-class CountingWorktree implements Worktree {
-  reads = 0;
-
-  constructor(private readonly inner: Worktree) {}
-
-  stat(path: string): WorktreeStat | null {
-    return this.inner.stat(path);
-  }
-  readFile(path: string): Uint8Array {
-    this.reads++;
-    return this.inner.readFile(path);
-  }
-  writeFile(path: string, data: Uint8Array, mode: number): void {
-    this.inner.writeFile(path, data, mode);
-  }
-  readlink(path: string): string {
-    this.reads++;
-    return this.inner.readlink(path);
-  }
-  symlink(target: string, path: string): void {
-    this.inner.symlink(target, path);
-  }
-  readdir(path: string): WorktreeDirent[] {
-    return this.inner.readdir(path);
-  }
-  mkdirp(path: string): void {
-    this.inner.mkdirp(path);
-  }
-  unlink(path: string): void {
-    this.inner.unlink(path);
-  }
-  rmdir(path: string): void {
-    this.inner.rmdir(path);
-  }
-  chmod(path: string, mode: number): void {
-    this.inner.chmod(path, mode);
-  }
-}
 
 describe("status cost", () => {
   it("hashes nothing over an untouched tree", async () => {

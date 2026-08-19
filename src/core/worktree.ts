@@ -36,6 +36,12 @@ export interface Worktree {
   unlink(path: string): void;
   rmdir(path: string): void;
   chmod(path: string, mode: number): void;
+  /** Read up to `length` bytes at `offset`. Short only at EOF. */
+  readRange(path: string, offset: number, length: number): Uint8Array;
+  /** Create or truncate `path` with `mode`, ready for writeRange. Creates parents. */
+  createFile(path: string, mode: number): void;
+  /** Write `data` at `offset`. The file must already exist. */
+  writeRange(path: string, data: Uint8Array, offset: number): void;
 }
 
 export const S_IFMT = 0o170000;
