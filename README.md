@@ -41,4 +41,16 @@ Experimental. See `docs/` for the design notes and the phase plan.
 
 ## License
 
-MIT
+MIT, with one exception: `src/core/diff/` is a port of the xdiff library as it
+appears in git — its record-cleanup heuristic and indent-heuristic weights
+included — and is therefore **LGPL-2.1-or-later**, like the original. Nothing
+else in the package derives from it; the rest uses it as a library, which
+LGPL-2.1 section 6 permits.
+
+Matching `git diff` byte for byte is not reachable without that pipeline:
+where a change group lands inside a run of equal lines is decided by those
+heuristics, not by Myers. If the LGPL boundary is unwelcome in your build,
+swapping `src/core/diff/` for any unified-diff generator gives valid patches
+that simply place some hunks differently.
+
+See `LICENSE`, `src/core/diff/LICENSE`, and `LICENSES/LGPL-2.1.txt`.
