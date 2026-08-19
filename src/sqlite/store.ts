@@ -126,7 +126,11 @@ export class SqliteGitDatabase {
   open(repository: RepositoryRow): RepoStore {
     const existing = this.#stores.get(repository.id);
     if (existing !== undefined) return existing;
-    const store = new RepoStore(this.#db, repository, this.#options);
+    // Destroying a repository evicts its store, so a reused id can never
+    // hand back the previous repository's caches.
+    const store = new RepoStore(this.#db, repository, this.#options, () =>
+      this.#stores.delete(repository.id),
+    );
     this.#stores.set(repository.id, store);
     return store;
   }
@@ -140,8 +144,15 @@ export class RepoStore {
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packs: PackStore;
   #hasLoose: boolean;
+  readonly #onDestroy: (() => void) | undefined;
 
-  constructor(db: SqlDatabase, repository: RepositoryRow, options: StoreOptions = {}) {
+  constructor(
+    db: SqlDatabase,
+    repository: RepositoryRow,
+    options: StoreOptions = {},
+    onDestroy?: () => void,
+  ) {
+    this.#onDestroy = onDestroy;
     this.#db = db;
     this.#repoId = repository.id;
     this.#root = repository.root;
@@ -518,6 +529,7 @@ export class RepoStore {
     this.#objects.clear();
     this.#packs.clearCaches();
     this.#hasLoose = false;
+    this.#onDestroy?.();
   }
 }
 

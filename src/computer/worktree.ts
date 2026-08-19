@@ -11,19 +11,38 @@ import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
 import type { Worktree, WorktreeDirent, WorktreeEntryType, WorktreeStat } from "../core/worktree.js";
 import { dirnameOf } from "../core/paths.js";
 
+function statType(stats: {
+  isSymbolicLink(): boolean;
+  isDirectory(): boolean;
+}): WorktreeEntryType {
+  if (stats.isSymbolicLink()) return "symlink";
+  return stats.isDirectory() ? "directory" : "file";
+}
+
 function isMissing(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const code = "code" in error ? error.code : undefined;
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-function entryType(entry: {
+interface DirentLike {
+  name: string;
   isSymbolicLink(): boolean;
   isDirectory(): boolean;
-}): WorktreeEntryType {
+  isFile(): boolean;
+}
+
+/**
+ * dofs's `wrapDirent` hardcodes `isSymbolicLink: () => false` and derives
+ * `isFile` from `type === "file"`, so a symlink answers false to all three
+ * predicates. An inconclusive dirent therefore gets one `lstat` to settle
+ * it — which only happens for symlinks, leaving the walk's hot path alone.
+ */
+function entryType(entry: DirentLike): WorktreeEntryType | null {
   if (entry.isSymbolicLink()) return "symlink";
   if (entry.isDirectory()) return "directory";
-  return "file";
+  if (entry.isFile()) return "file";
+  return null;
 }
 
 export class ComputerWorktree implements Worktree {
@@ -33,7 +52,7 @@ export class ComputerWorktree implements Worktree {
     try {
       const stats = this.provider.lstatSync(path);
       return {
-        type: entryType(stats),
+        type: statType(stats),
         mode: stats.mode,
         size: stats.size,
         mtime: stats.mtimeMs,
@@ -68,21 +87,22 @@ export class ComputerWorktree implements Worktree {
   }
 
   readdir(path: string): WorktreeDirent[] {
-    let entries: string[] | { name: string; isSymbolicLink(): boolean; isDirectory(): boolean }[];
+    let entries: string[] | DirentLike[];
     try {
       entries = this.provider.readdirSync(path, { withFileTypes: true });
     } catch (error) {
       if (isMissing(error)) return [];
       throw error;
     }
+    const prefix = path === "/" ? "" : path;
     const out: WorktreeDirent[] = [];
     for (const entry of entries) {
       if (typeof entry === "string") {
-        const stats = this.stat(`${path === "/" ? "" : path}/${entry}`);
-        out.push({ name: entry, type: stats?.type ?? "file" });
-      } else {
-        out.push({ name: entry.name, type: entryType(entry) });
+        out.push({ name: entry, type: this.stat(`${prefix}/${entry}`)?.type ?? "file" });
+        continue;
       }
+      const type = entryType(entry) ?? this.stat(`${prefix}/${entry.name}`)?.type ?? "file";
+      out.push({ name: entry.name, type });
     }
     return out;
   }
