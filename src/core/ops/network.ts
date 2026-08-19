@@ -17,6 +17,11 @@ import {
   type RemoteRef,
   uploadPack,
 } from "../protocol/remote.js";
+import {
+  type MessageCallback,
+  type ProgressCallback,
+  progressSink,
+} from "../protocol/progress.js";
 import type { AuthCallback } from "../protocol/transport.js";
 import { checkoutTree } from "./checkout.js";
 
@@ -26,8 +31,10 @@ const HAVE_BUDGET = 256;
 export interface RemoteAuthOptions {
   headers?: Record<string, string>;
   onAuth?: AuthCallback;
-  onProgress?: (message: string) => void;
-  onMessage?: (message: string) => void;
+  /** Structured progress, as Computer's interface declares it. */
+  onProgress?: ProgressCallback;
+  /** The remote's side-band text, verbatim. */
+  onMessage?: MessageCallback;
 }
 
 export interface CloneOptions extends RemoteAuthOptions {
@@ -120,10 +127,10 @@ async function ingestPack(
   context: GitContext,
   repo: Repository,
   pack: AsyncIterable<Uint8Array>,
-  onProgress?: (message: string) => void,
+  say: ((text: string) => void) | undefined,
 ): Promise<void> {
   await repo.store.packs.ingest(pack, {
-    onProgress,
+    ...(say === undefined ? {} : { onProgress: say }),
     now: context.now,
     ...(context.yieldNow === undefined ? {} : { yieldNow: context.yieldNow }),
   });
@@ -151,6 +158,7 @@ export async function fetchInto(
     tags: options.tags ?? false,
   });
 
+  const say = progressSink(options.onProgress, options.onMessage);
   const wants = [...new Set(wantedRefs.map((ref) => ref.oid))].filter((oid) => !repo.has(oid));
   const shallows = [...repo.shallow()];
   if (wants.length > 0) {
@@ -163,12 +171,11 @@ export async function fetchInto(
         advertised: advertisement.capabilities,
         ...(options.depth === undefined ? {} : { depth: options.depth }),
         ...(options.tags === true ? { includeTag: true } : {}),
-        ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
-        ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+        ...(say === undefined ? {} : { onProgress: say, onMessage: say }),
       },
       auth,
     );
-    await ingestPack(context, repo, result.pack, options.onProgress);
+    await ingestPack(context, repo, result.pack, say);
     if (result.shallow.length > 0 || result.unshallow.length > 0) {
       repo.store.setShallow(result.shallow, result.unshallow);
       repo.invalidateShallow();
