@@ -109,12 +109,31 @@ throughout.** **[R1]**
 | `src/fs/store/resolve.ts` | `realpath()` — the sole producer of `RealPath` and the choke point §3.6 hangs the design on. Implemented for the same reason. |
 | `src/sqlite/schema.ts` | **`git_blob_ids`, `git_objects.stored` and `git_commits` do not exist in the tree.** All three land here with their migration and migration tests, before any unit depends on them. **[R4]** |
 | `tests/fs/conformance/harness.ts` | **A dofs-shaped conformance adapter**, not just a fixture: it maps dofs' free-function calls (`stat(db, path)`, `readdir(db, path, options)`, `resolveInode`, `readBack`) onto `Filesystem`, so the inherited tests port nearly mechanically and no production code carries dofs' shape. This is what converts four of E2's nine porting blockers from interface decisions into thirty lines of test harness. **[R8]** |
-| `package.json` | The `.`, `./fs`, `./git`, `./compat/computer`, `./testing` export map. |
+| `package.json` | **Deferred to the integration wave, deliberately.** An export map has to point at files that exist; `./fs`, `./git`, `./compat/computer` and `./testing` are barrels the integration wave creates. Adding the entries now would ship a package whose exports resolve to nothing. |
 
 **Deliberately not touched here:** `src/fs/filesystem.ts`, `src/fs/index.ts`,
 `src/core/worktree.ts`, `src/index.ts`, `tests/helpers/*`. Those are the
 integration wave's territory, and freezing them before their implementations
 exist is exactly what broke the first draft.
+
+### Landed
+
+`2846279`. Gates: typecheck green, biome green, **279/279 tests**, including
+six new ones covering the v1→v2 migration, root seeding, idempotence, and the
+BINARY ordering the whole design rests on.
+
+`tests/store.test.ts` asserts the exact table inventory and failed on the two
+new tables. Updated rather than relaxed — the assertion exists to catch tables
+nobody meant to create, and these are intended and documented, so its force is
+unchanged.
+
+**Known pre-existing flake, so no later unit mistakes it for its own doing:**
+the suite intermittently reports one unhandled `EPIPE` from
+`tests/helpers/http-backend.ts:151`, where a truncated-response test writes to
+a `git http-backend` child that has already exited. A negative control at HEAD
+in a scratch worktree reproduced it in **2 of 3** full-suite runs, with none of
+this wave's changes present. It is not in any unit's territory; if it becomes
+load-bearing, it belongs to G5 with the rest of the clone path.
 
 One seam call recorded so it is not re-litigated: **`Filesystem.withReadScope`
 ships declared but as a pass-through.** Its purpose — memoising resolutions and
