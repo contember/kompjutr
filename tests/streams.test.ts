@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
-import { comparePaths, joinSorted, peekable } from "../src/core/streams.js";
+import { comparePaths, joinSorted, joinSorted3, peekable } from "../src/core/streams.js";
 
 /**
  * `comparePaths` claims to be SQLite's BINARY collation. That claim is not
@@ -306,5 +306,49 @@ describe("joinSorted", () => {
       "000000000004",
       "000000000005",
     ]);
+  });
+});
+
+describe("joinSorted3", () => {
+  const keyOf = {
+    a: (item: string) => item,
+    b: (item: string) => item,
+    c: (item: string) => item,
+  };
+  const rows = (a: string[], b: string[], c: string[]) =>
+    [...joinSorted3(a, b, c, keyOf)].map(
+      (row) =>
+        `${row.path}:${row.a === undefined ? "-" : "a"}${row.b === undefined ? "-" : "b"}${
+          row.c === undefined ? "-" : "c"
+        }`,
+    );
+
+  it("yields each path once with whichever streams carried it", () => {
+    expect(rows(["a", "c"], ["b", "c"], ["c", "d"])).toEqual(["a:a--", "b:-b-", "c:abc", "d:--c"]);
+  });
+
+  it("handles empty streams in every combination", () => {
+    expect(rows([], [], [])).toEqual([]);
+    expect(rows(["x"], [], [])).toEqual(["x:a--"]);
+    expect(rows([], ["x"], [])).toEqual(["x:-b-"]);
+    expect(rows([], [], ["x"])).toEqual(["x:--c"]);
+    expect(rows(["x"], ["x"], [])).toEqual(["x:ab-"]);
+  });
+
+  it("orders by UTF-8 bytes, not by UTF-16 code units", () => {
+    const astral = "\u{1F600}";
+    const priv = "";
+    expect(rows([astral], [priv], [])).toEqual([`${priv}:-b-`, `${astral}:a--`]);
+  });
+
+  it("pulls no more than one item ahead of each stream", () => {
+    function* guarded(items: string[], limit: number): Generator<string> {
+      for (const [index, item] of items.entries()) {
+        if (index >= limit) throw new Error("pulled too far");
+        yield item;
+      }
+    }
+    const joined = joinSorted3(guarded(["a", "z"], 2), ["a"], ["a"], keyOf);
+    expect(joined.next().value?.path).toBe("a");
   });
 });

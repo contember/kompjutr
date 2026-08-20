@@ -156,3 +156,66 @@ export function* joinSorted<L, R>(
     };
   }
 }
+
+/** One path, and whichever of the three streams carried it. */
+export interface JoinedRow3<A, B, C> {
+  path: string;
+  a: A | undefined;
+  b: B | undefined;
+  c: C | undefined;
+}
+
+/**
+ * Walk three path-sorted streams together. Live state is one item per stream.
+ *
+ * Fixed at three rather than variadic: the element types are heterogeneous
+ * (a tree entry, an index row, a bare path), and an array form collapses them
+ * to a union and loses the per-side type. Three is also the only arity
+ * anything here needs — `status` compares HEAD, the index and the worktree.
+ *
+ * Nesting two `joinSorted` calls would do the same work, but it allocates two
+ * rows per path on the hottest walk in the package and reaches the HEAD entry
+ * as `row.left?.left`.
+ *
+ * Same assumptions as `joinSorted`: inputs ascending by `comparePaths`,
+ * unchecked, and a repeated key yields once per repeat.
+ */
+export function* joinSorted3<A, B, C>(
+  a: Iterable<A>,
+  b: Iterable<B>,
+  c: Iterable<C>,
+  keyOf: { a: (item: A) => string; b: (item: B) => string; c: (item: C) => string },
+): Generator<JoinedRow3<A, B, C>> {
+  const sideA = peekable(a);
+  const sideB = peekable(b);
+  const sideC = peekable(c);
+
+  for (;;) {
+    const headA = sideA.peek();
+    const headB = sideB.peek();
+    const headC = sideC.peek();
+    if (headA === undefined && headB === undefined && headC === undefined) return;
+
+    const keyA = headA === undefined ? undefined : keyOf.a(headA);
+    const keyB = headB === undefined ? undefined : keyOf.b(headB);
+    const keyC = headC === undefined ? undefined : keyOf.c(headC);
+
+    let path = keyA ?? keyB ?? keyC ?? "";
+    if (keyB !== undefined && comparePaths(keyB, path) < 0) path = keyB;
+    if (keyC !== undefined && comparePaths(keyC, path) < 0) path = keyC;
+
+    const takeA = keyA === path;
+    const takeB = keyB === path;
+    const takeC = keyC === path;
+    if (takeA) sideA.next();
+    if (takeB) sideB.next();
+    if (takeC) sideC.next();
+
+    yield {
+      path,
+      a: takeA ? headA : undefined,
+      b: takeB ? headB : undefined,
+      c: takeC ? headC : undefined,
+    };
+  }
+}
