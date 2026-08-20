@@ -68,7 +68,7 @@ function enoent(path: string): Error {
  * first argument and a clock as the last; we bind a `Filesystem` instead
  * and let the caller pin time through `FilesystemOptions.now`.
  */
-export function conformance(fs: Filesystem) {
+export function conformance(fs: Pick<Filesystem, "stat" | "statTarget" | "readdir" | "readFile">) {
   return {
     /**
      * dofs throws ENOENT; `Filesystem.stat` returns null. Inverting it here
@@ -91,10 +91,16 @@ export function conformance(fs: Filesystem) {
       path: string,
       options: { limit?: number; offset?: number } = {},
     ): WorkspaceDirentResult[] {
-      const all = fs.readdir(path).map(toDirentResult);
+      const limit = options.limit;
+      if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) {
+        throw new TypeError("readdir limit must be a non-negative safe integer");
+      }
       const offset = options.offset ?? 0;
-      const limit = options.limit ?? all.length;
-      return all.slice(offset, offset + limit);
+      if (!Number.isSafeInteger(offset) || offset < 0) {
+        throw new TypeError("readdir offset must be a non-negative safe integer");
+      }
+      const all = fs.readdir(path).map(toDirentResult);
+      return all.slice(offset, limit === undefined ? undefined : offset + limit);
     },
 
     /**
