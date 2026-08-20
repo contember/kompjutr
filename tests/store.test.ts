@@ -2,14 +2,18 @@ import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
+import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject } from "../src/core/objects.js";
+import { PackWriter } from "../src/core/pack/writer.js";
 import { ancestors, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
+import { slices } from "./helpers/git.js";
 
 function open() {
-  const database = new SqliteGitDatabase(new TestDatabase());
+  const db = new TestDatabase();
+  const database = new SqliteGitDatabase(db);
   const repository = database.create("/repo", "ref: refs/heads/main");
-  return { database, store: database.open(repository) };
+  return { db, database, store: database.open(repository) };
 }
 
 describe("path helpers", () => {
@@ -81,6 +85,126 @@ describe("loose objects", () => {
     const oid = store.write("blob", new TextEncoder().encode("a"));
     expect(store.resolvePrefix(oid.slice(0, 7))).toBe(oid);
     expect(store.resolvePrefix("0".repeat(8))).toBeNull();
+  });
+});
+
+describe("object batches", () => {
+  const chunkCount = (store: ReturnType<typeof open>["store"], oid: string) =>
+    store.db.scalar<number>("SELECT COUNT(*) FROM git_object_chunks WHERE oid = ?", oid);
+
+  it("round-trips every payload shape through the ordinary read path", () => {
+    const { store } = open();
+    const shapes: Uint8Array[] = [
+      new Uint8Array(0),
+      utf8.encode("a tree entry or two\n"),
+      // Random, so it neither compresses nor fits in one 1 MiB chunk row.
+      new Uint8Array(randomBytes(3_500_000)),
+      new Uint8Array(randomBytes(200_000)),
+    ];
+    const oids = store.writeObjects((batch) => shapes.map((data) => batch.write("blob", data)));
+    // Identity by length plus hash: a megabyte-scale deep compare costs
+    // more than the whole rest of this file.
+    const same = (actual: Uint8Array, expected: Uint8Array) => {
+      expect(actual.length).toBe(expected.length);
+      expect(hashObject("blob", actual)).toBe(hashObject("blob", expected));
+    };
+    shapes.forEach((data, at) => {
+      const oid = oids[at]!;
+      expect(oid).toBe(hashObject("blob", data));
+      expect(store.has(oid)).toBe(true);
+      expect(store.typeAndSize(oid)).toEqual({ type: "blob", size: data.length });
+      same(store.read(oid)?.data ?? new Uint8Array(1), data);
+      same(concat([...(store.readChunks(oid) ?? [])]), data);
+    });
+    expect(chunkCount(store, oids[2]!)).toBeGreaterThan(1);
+  });
+
+  it("stages an object without writing a row until it is flushed", () => {
+    const { store } = open();
+    const data = utf8.encode("deferred\n");
+    const batch = store.writeBatch();
+    const oid = batch.write("blob", data);
+    expect(oid).toBe(hashObject("blob", data));
+    expect(store.has(oid)).toBe(false);
+    expect(chunkCount(store, oid)).toBe(0);
+    batch.flush();
+    expect(store.has(oid)).toBe(true);
+    expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it("removes the chunks a shorter write of the same oid does not reach", () => {
+    const { store } = open();
+    const data = new Uint8Array(randomBytes(700_000));
+    // writeStream rows at 64 KiB, the batch at 1 MiB, so the same oid goes
+    // from many chunks to one. Content addressing makes that the only way
+    // two writes of one oid can disagree on chunk count.
+    const oid = store.writeStream("blob", data.length, function* () {
+      yield data;
+    });
+    const before = chunkCount(store, oid) ?? 0;
+    expect(before).toBeGreaterThan(1);
+
+    // Drop the metadata row only: an interrupted write leaves exactly this,
+    // chunks with nothing pointing at them, and `has` says no.
+    store.db.run("DELETE FROM git_objects WHERE oid = ?", oid);
+    expect(store.has(oid)).toBe(false);
+
+    store.writeObjects((batch) => batch.write("blob", data));
+    expect(chunkCount(store, oid)).toBe(1);
+    expect(hashObject("blob", store.read(oid)?.data ?? new Uint8Array(1))).toBe(oid);
+  });
+
+  it("writes nothing for an object that is already stored", () => {
+    const { store } = open();
+    const data = utf8.encode("already here\n");
+    const oid = store.write("blob", data);
+    const written = () =>
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_object_chunks WHERE repo_id = ?", 1);
+    const before = written();
+    store.writeObjects((batch) => batch.write("blob", data));
+    expect(written()).toBe(before);
+    expect(store.read(oid)?.data).toEqual(data);
+  });
+});
+
+describe("bulk existence", () => {
+  it("answers for loose, packed, both and absent exactly as has() does", async () => {
+    const { db, store } = open();
+    const looseOnly = utf8.encode("loose only\n");
+    const packedOnly = utf8.encode("packed only\n");
+    const both = utf8.encode("loose and packed\n");
+    const looseOid = store.write("blob", looseOnly);
+    const bothOid = store.write("blob", both);
+    const packedOid = hashObject("blob", packedOnly);
+    const absentOid = "0".repeat(40);
+
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("blob", packedOnly);
+    writer.object("blob", both);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+
+    const oids = [looseOid, packedOid, bothOid, absentOid];
+    const present = store.hasAll(oids);
+    for (const oid of oids) expect(present.has(oid)).toBe(store.has(oid));
+    expect([...present].sort()).toEqual([looseOid, packedOid, bothOid].sort());
+    expect(store.missing(oids)).toEqual([absentOid]);
+
+    // One statement for the whole list, spanning both tables.
+    db.storage.resetCounters();
+    store.hasAll(oids);
+    expect(db.storage.statementCount).toBe(1);
+  });
+
+  it("holds its own against an empty list and against duplicates", () => {
+    const { store } = open();
+    const oid = store.write("blob", utf8.encode("dup\n"));
+    expect(store.hasAll([]).size).toBe(0);
+    expect(store.missing([])).toEqual([]);
+    expect(store.missing([oid, oid])).toEqual([]);
+    expect(store.missing(["1".repeat(40), "1".repeat(40)])).toEqual(["1".repeat(40)]);
   });
 });
 

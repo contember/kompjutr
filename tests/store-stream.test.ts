@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import { concat, toHex } from "../src/core/bytes.js";
+import { concat, toHex, utf8 } from "../src/core/bytes.js";
 import { hashObject } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
@@ -16,29 +16,39 @@ import { TestDatabase } from "./helpers/db.js";
 class WidestDatabase implements SqlDatabase {
   widestRows = 0;
   widestBlob = 0;
+  /** Most bound parameters any one statement carried. The platform cap is 100. */
+  widestBindings = 0;
 
   constructor(private readonly inner: SqlDatabase = new TestDatabase()) {}
 
-  run(query: string, ...bindings: unknown[]): void {
+  #measure(bindings: unknown[]): void {
+    if (bindings.length > this.widestBindings) this.widestBindings = bindings.length;
     for (const binding of bindings) {
       if (binding instanceof Uint8Array && binding.length > this.widestBlob) {
         this.widestBlob = binding.length;
       }
     }
+  }
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.#measure(bindings);
     this.inner.run(query, ...bindings);
   }
 
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    this.#measure(bindings);
     const rows = this.inner.all<Row>(query, ...bindings);
     if (rows.length > this.widestRows) this.widestRows = rows.length;
     return rows;
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    this.#measure(bindings);
     return this.inner.one<Row>(query, ...bindings);
   }
 
   scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    this.#measure(bindings);
     return this.inner.scalar<T>(query, ...bindings);
   }
 
@@ -238,6 +248,104 @@ describe("writeStream", () => {
     const one = new Sha1();
     one.update(new TextEncoder().encode(`blob ${data.length}\0`)).update(data);
     expect(toHex(one.digest())).toBe(expected);
+  });
+});
+
+describe("object batches", () => {
+  /** Tree objects the size a real directory listing produces. */
+  const trees = (count: number): Uint8Array[] =>
+    Array.from({ length: count }, (_, i) =>
+      concat(
+        Array.from({ length: 6 }, (_, entry) =>
+          utf8.encode(`100644 file-${i}-${entry}.ts\0${String(i).padStart(20, "\0")}`),
+        ),
+      ),
+    );
+
+  it("flushes 3,293 objects in a constant number of statements", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    const objects = trees(3293);
+
+    inner.storage.resetCounters();
+    db.widestBindings = 0;
+    const oids = store.writeObjects((batch) => objects.map((data) => batch.write("tree", data)));
+
+    // The whole batch is ~700 KB of tree bytes: one probe, one delete,
+    // one payload, one metadata insert.
+    expect(inner.storage.statementCount).toBeLessThanOrEqual(15);
+    // Four columns of multi-row VALUES would cap at 25 rows; the payload
+    // form binds three parameters whatever the batch holds.
+    expect(db.widestBindings).toBeLessThanOrEqual(100);
+
+    // The count means nothing unless every object actually landed.
+    expect(new Set(oids).size).toBe(objects.length);
+    objects.forEach((data, at) => {
+      expect(oids[at]).toBe(hashObject("tree", data));
+      expect(store.read(oids[at]!)?.data).toEqual(data);
+    });
+    expect(store.objectCount()).toBe(objects.length);
+  });
+
+  it("re-flushing the same objects writes no rows at all", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    const objects = trees(500);
+    store.writeObjects((batch) => {
+      for (const data of objects) batch.write("tree", data);
+    });
+    const chunks = () =>
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_object_chunks WHERE repo_id = ?", 1);
+
+    const before = chunks();
+    inner.storage.resetCounters();
+    store.writeObjects((batch) => {
+      for (const data of objects) batch.write("tree", data);
+    });
+    // The probe alone: nothing is fresh, so no delete and no insert.
+    expect(inner.storage.statementCount).toBe(1);
+    expect(chunks()).toBe(before);
+  });
+
+  it("splits into one payload per budget, and never one row per object", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    // Incompressible, so 40 × 8 KB really is ~320 KB of payload.
+    const objects = Array.from({ length: 40 }, () => new Uint8Array(randomBytes(8192)));
+
+    inner.storage.resetCounters();
+    db.widestBindings = 0;
+    store.writeObjects((batch) => {
+      for (const data of objects) batch.write("blob", data);
+    });
+    // 320 KB fits one default payload, so the object count never shows up
+    // in the statement count at all.
+    expect(inner.storage.statementCount).toBeLessThanOrEqual(15);
+    expect(db.widestBindings).toBeLessThanOrEqual(100);
+    for (const data of objects) {
+      expect(store.read(hashObject("blob", data))?.data).toEqual(data);
+    }
+  });
+
+  it("keeps a payload under the budget the caller set", () => {
+    const db = new WidestDatabase();
+    const store = open(db);
+    const objects = Array.from({ length: 32 }, () => new Uint8Array(randomBytes(16 * 1024)));
+    db.widestBlob = 0;
+    store.writeObjects(
+      (batch) => {
+        for (const data of objects) batch.write("blob", data);
+      },
+      { payloadBytes: 64 * 1024 },
+    );
+    // One object may overshoot the budget, never two: the flush happens
+    // as soon as the buffer reaches it.
+    expect(db.widestBlob).toBeLessThanOrEqual(64 * 1024 + 17 * 1024);
+    for (const data of objects) {
+      expect(store.read(hashObject("blob", data))?.data).toEqual(data);
+    }
   });
 });
 

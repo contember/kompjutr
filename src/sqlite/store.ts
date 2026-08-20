@@ -23,6 +23,17 @@ const STREAM_CHUNK = 64 * 1024;
 /** Compressed bytes fed to the inflater at a time when streaming a read. */
 const INFLATE_FEED = 16 * 1024;
 
+/** Compressed bytes gathered into one `substr()` payload, and the trigger
+ *  that flushes a batch. Well under the 2 MB ceiling on a bound value. */
+const OBJECT_PAYLOAD = 1024 * 1024;
+
+/** Objects buffered before a batch flushes. The JSON arrays are bound
+ *  values too, so the row count is capped as well as the byte count. */
+const DEFAULT_OBJECT_FLUSH = 4096;
+
+/** Oids per existence-probe statement, bounding the same JSON parameter. */
+const OID_PROBE_PAGE = 4096;
+
 /** Index rows per round trip. This is the memory bound of a scan. */
 const DEFAULT_INDEX_PAGE = 512;
 
@@ -72,6 +83,39 @@ export interface IndexScanOptions {
 export interface IndexApplyOptions {
   /** Mutations buffered before a batch is written. */
   flushEvery?: number;
+}
+
+export interface ObjectBatchOptions {
+  /** Compressed bytes buffered before a flush, and the cap on one payload. */
+  payloadBytes?: number;
+  /** Objects buffered before a flush. */
+  flushEvery?: number;
+}
+
+/**
+ * A bounded sink for loose object writes. `write` hashes and deflates, so
+ * the oid it returns is final, but no row exists until `flush`: a staged
+ * object is invisible to `read`, `has` and `readChunks` until then.
+ */
+export interface ObjectBatch {
+  write(type: ObjectType, data: Uint8Array): string;
+  /** Write whatever is staged. Called for you when `writeObjects` returns. */
+  flush(): void;
+}
+
+/** One object staged in a batch, already hashed and deflated. */
+interface StagedObject {
+  oid: string;
+  type: ObjectType;
+  size: number;
+  compressed: Uint8Array;
+}
+
+/** One `substr()` payload: the bytes, and the rows cut out of them. */
+interface ChunkPayload {
+  parts: Uint8Array[];
+  length: number;
+  rows: { o: string; q: number; a: number; n: number }[];
 }
 
 /** A bounded, ordered mutation sink over the index. */
@@ -242,6 +286,44 @@ export class RepoStore {
     return this.#packs.typeAndSize(oid) !== null;
   }
 
+  /**
+   * Which of `oids` this repository already holds, in one statement per
+   * page. Both tables, deliberately: an `ON CONFLICT` on `git_objects`
+   * alone cannot see a packed object, so after a clone an unchanged tree
+   * would be re-written loose and shadow the packed copy.
+   */
+  hasAll(oids: Iterable<string>): Set<string> {
+    const found = new Set<string>();
+    let page: string[] = [];
+    const probe = (): void => {
+      if (page.length === 0) return;
+      for (const row of this.#db.all<{ oid: string }>(
+        `SELECT j.value AS oid FROM json_each(?) j
+          WHERE EXISTS (SELECT 1 FROM git_objects o WHERE o.repo_id = ? AND o.oid = j.value)
+             OR EXISTS (SELECT 1 FROM git_pack_objects p WHERE p.repo_id = ? AND p.oid = j.value)`,
+        JSON.stringify(page),
+        this.#repoId,
+        this.#repoId,
+      )) {
+        found.add(row.oid);
+      }
+      page = [];
+    };
+    for (const oid of oids) {
+      page.push(oid);
+      if (page.length >= OID_PROBE_PAGE) probe();
+    }
+    probe();
+    return found;
+  }
+
+  /** The oids this repository does not hold, in input order, deduplicated. */
+  missing(oids: Iterable<string>): string[] {
+    const wanted = [...new Set(oids)];
+    const present = this.hasAll(wanted);
+    return wanted.filter((oid) => !present.has(oid));
+  }
+
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {
     if (this.#hasLoose) {
       const row = this.#looseRow(oid);
@@ -367,6 +449,119 @@ export class RepoStore {
     });
     this.#hasLoose = true;
     return oid;
+  }
+
+  /**
+   * Open a batch of loose object writes. However many objects go in, a
+   * flush costs one existence probe, one delete, one insert per payload
+   * budget and one metadata insert — not five statements per object.
+   *
+   * The caller owns the lifecycle; `writeObjects` is the scoped form that
+   * cannot forget the final flush.
+   */
+  writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
+    const payloadBytes = options.payloadBytes ?? OBJECT_PAYLOAD;
+    const flushEvery = options.flushEvery ?? DEFAULT_OBJECT_FLUSH;
+    // Keyed by oid: a tree build re-emits identical subtrees, and one
+    // (oid, seq) may appear at most once in a payload.
+    const staged = new Map<string, StagedObject>();
+    let bytes = 0;
+    const flush = (): void => {
+      if (staged.size === 0) return;
+      this.#flushObjects([...staged.values()], payloadBytes);
+      staged.clear();
+      bytes = 0;
+    };
+    return {
+      write: (type: ObjectType, data: Uint8Array): string => {
+        const oid = hashObject(type, data);
+        if (staged.has(oid)) return oid;
+        const compressed = deflate(data);
+        staged.set(oid, { oid, type, size: data.length, compressed });
+        bytes += compressed.length;
+        // After staging, never before: an object's chunks and its metadata
+        // row have to land in the same flush, whatever its size.
+        if (bytes >= payloadBytes || staged.size >= flushEvery) flush();
+        return oid;
+      },
+      flush,
+    };
+  }
+
+  /** Run `body` with a batch, flushing what it staged when it returns. */
+  writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
+    const batch = this.writeBatch(options);
+    const result = body(batch);
+    batch.flush();
+    return result;
+  }
+
+  #flushObjects(staged: StagedObject[], payloadBytes: number): void {
+    const present = this.hasAll(staged.map((object) => object.oid));
+    const fresh = staged.filter((object) => !present.has(object.oid));
+    if (fresh.length === 0) return;
+
+    const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
+    for (const object of fresh) {
+      const compressed = object.compressed;
+      for (
+        let seq = 0, offset = 0;
+        offset < compressed.length || seq === 0;
+        seq++, offset += OBJECT_CHUNK
+      ) {
+        const part = compressed.subarray(offset, offset + OBJECT_CHUNK);
+        let current = payloads[payloads.length - 1]!;
+        if (current.length > 0 && current.length + part.length > payloadBytes) {
+          current = { parts: [], length: 0, rows: [] };
+          payloads.push(current);
+        }
+        // `a` is a 1-based byte offset: substr() counts bytes over a BLOB.
+        current.rows.push({ o: object.oid, q: seq, a: current.length + 1, n: part.length });
+        current.parts.push(part);
+        current.length += part.length;
+      }
+    }
+
+    const oids = JSON.stringify(fresh.map((object) => object.oid));
+    const meta = JSON.stringify(
+      fresh.map((object) => ({ o: object.oid, t: object.type, s: object.size })),
+    );
+    this.#db.transactionSync(() => {
+      // An interrupted earlier write of this oid may have left chunks at a
+      // sequence this one does not reach, which a read would concatenate.
+      this.#db.run(
+        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
+        this.#repoId,
+        oids,
+      );
+      for (const payload of payloads) {
+        this.#db.run(
+          `INSERT INTO git_object_chunks (repo_id, oid, seq, data)
+           SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.q'),
+                  substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.n'))
+             FROM json_each(?) j
+            WHERE true
+           ON CONFLICT(repo_id, oid, seq) DO UPDATE SET data = excluded.data`,
+          this.#repoId,
+          blob(concat(payload.parts)),
+          JSON.stringify(payload.rows),
+        );
+      }
+      // Metadata last: `has` keys on this row, so no object becomes
+      // reachable before every one of its chunks is in.
+      this.#db.run(
+        `INSERT INTO git_objects (repo_id, oid, type, size, stored)
+         SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.t'),
+                json_extract(j.value, '$.s'), 'zlib'
+           FROM json_each(?) j
+          WHERE true
+         ON CONFLICT(repo_id, oid) DO UPDATE SET
+           type = excluded.type, size = excluded.size, stored = excluded.stored`,
+        this.#repoId,
+        meta,
+      );
+    });
+    this.#hasLoose = true;
   }
 
   /**
