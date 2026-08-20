@@ -875,14 +875,17 @@ export interface Filesystem {
 
   /**
    * Create directories, parents included. Existing ones are left alone.
-   * Four statements regardless of count.
+   * Constant in the number of paths: measured at 8 statements for 10 and
+   * for 5,000, and 2 on a repeat call when there is nothing to create.
    */
   makeDirectories(paths: readonly string[]): void;
 
   /**
-   * Remove many paths. Five statements regardless of count. A recursive
-   * removal is a range delete, so removing a 5,000-file tree costs the
-   * same five statements as removing one file.
+   * Remove many paths. Constant in the number of paths: measured at 6 for
+   * one path, for 500, and for a 5,000-file recursive tree. A recursive
+   * removal is a range delete, so removing a tree costs what removing one
+   * file costs. The six are classify, rev bump, orphan chunks, orphan
+   * nodes, nlink recount, path range delete.
    */
   removeFiles(paths: readonly string[], options?: RemoveOptions): void;
 

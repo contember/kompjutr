@@ -24,12 +24,24 @@ leader-owned wave and is never delegated.
 may read anything. Anything you want changed outside your territory, you
 report; you do not do it. Blocked beats creative.
 
-**Done-checks come in pairs. [R11]** A statement-count ceiling on its own is
-beaten by an implementation that does nothing: an empty diff, a no-op `add` and
-a skipped checkout all come in well under budget. **Every performance gate must
-be paired with an output-parity assertion** — same paths, same bytes, same
-modes, same order as the implementation it replaces. A gate that cannot observe
-the bug class is not evidence.
+**Done-checks come in threes.** Originally two; wave C proved a third is
+needed.
+
+1. **A statement ceiling** — the Durable Object metric.
+2. **An output-parity assertion** — same paths, same bytes, same modes, same
+   order as what it replaces. A ceiling alone is beaten by an implementation
+   that does nothing: an empty diff, a no-op `add` and a skipped checkout all
+   come in well under budget. **[R11]**
+3. **A scaling assertion.** F4's first `removeFiles` was constant in statements
+   *and* correct in output, and took **2.7 s for 5,000 paths** — a correlated
+   `EXISTS` over `json_each` re-runs the virtual table per candidate row. The
+   fix, `IN (SELECT value FROM json_each(?))`, is built once and
+   binary-searched: **55 ms**. The count was 6 either way and the output was
+   identical either way, so neither of the first two checks could see it.
+   Measure at two sizes an order of magnitude apart and assert the shape of the
+   curve, not just the endpoint.
+
+A gate that cannot observe the bug class is not evidence.
 
 ---
 
@@ -173,6 +185,23 @@ lifecycle. That caller change is G8, in wave F. **[R2]**
 
 ### Landed
 
+**All five landed. Gates after integration: typecheck 0, biome 0, 382/382
+tests**, up from 273 at baseline. The one reported error is the known
+pre-existing `EPIPE` flake.
+
+| unit | result | commit |
+|---|---|---|
+| F1 — scan | 12,675 rows / **13 statements** | `35b00bf` |
+| F2 — bulk read | 23.9 MB across 9,329 files / **24 statements** | `3aecf75` |
+| F3 — bulk write | 2,000 files / **9**; 9,329 × 2.7 KB / **33** | `3ebfcdb` |
+| F4 — remove, rename | rename **2**; remove **6** at any size | `4b62281` |
+| G6 — object batch | 3,293 objects / **4** (from 16,465) | `273cd6b` |
+
+Every unit ran negative controls against its own gate — deliberately breaking
+its implementation to confirm the check fires. F3 went furthest and temporarily
+implemented the byte-offset trap to prove its non-ASCII fixture was not
+decorative: 9 of 25 tests fired, reproducing both documented failure modes.
+
 **F1 — `35b00bf`.** 12,675 rows in **13 statements**, query plan pinned, order
 asserted on the adversarial cases. It also found a real bug in the plan's own
 P1 SQL: the range predicate started at `root` rather than `root + "/"`, so
@@ -255,6 +284,33 @@ their ceilings even with perfect files of their own. **[R5]**
 G7 moved out of wave F because `status.ts:187` and `staging.ts:64` construct
 the ignore matcher during their walk — G2 and G4 need it finished, not racing
 them. **[R10]**
+
+---
+
+## The integration wave's worklist, as wave C wrote it
+
+Every item was reported by a unit rather than acted on, which is the contract
+working. None is a defect in what landed; all are seams that only become
+decidable once the pieces sit together.
+
+| # | what | found by |
+|---|---|---|
+| 1 | **`Filesystem.scan(root: string)` cannot meet 13 statements as declared.** `realpath` costs a statement, so calling it per page doubles the count and blows §7.1's 15-statement budget for `status`. The wrapper must resolve once and hold the `RealPath` across pages. | F1 |
+| 2 | **No bulk primitive resolves symlinks.** Per-path `realpath` breaks the constant-statement contract outright, so all four take already-real paths. The composing layer must route through `realpath` / `realpathNoFollow`, and it is the only thing standing between a lexical path and §3.6's invariant. | F1–F4 |
+| 3 | **`WriteOptions` has no `now`.** `FilesystemOptions.now` exists so a test can pin `mtime`, but the free-function signature gives it nowhere to go, so F3 defaults to one `Date.now()` per call. Either `WriteOptions` grows a clock or `Filesystem` closes over one. | F3 |
+| 4 | **`rev` is bumped asymmetrically.** `removeFiles` bumps; `rename` does not, because 2 statements leaves no room. If `Filesystem.removeFiles` bumps as well, the counter advances twice per call. | F4 |
+| 5 | **No shared error helper.** F3 and F4 both inlined `Object.assign(new Error(…), { code })` from `resolve.ts:77`. Collapse into `src/fs/errors.ts`. | F3, F4 |
+| 6 | **`bumpRev` costs two statements** — update, then read back. A one-statement variant in `meta.ts` would stop callers inlining their own. | F4 |
+| 7 | **`readFiles`' path lookup is one unpaged result set** proportional to the input list — 9,329 rows at full-repository scale. It carries no BLOBs, but the byte budget does not bound it. | F2 |
+| 8 | **24 statements for a full-repository read is 1 + 23 with zero slack.** Past ~24 MB, or if `readFiles` ever has to resolve symlinks, the ceiling moves rather than the implementation. | F2 |
+| 9 | **`git_objects.stored` has no `'raw'` half**, so §7.3's deflate tax is not removed. The work is in `store.ts`, which G6 has closed. Needs an owner before wave F. | G6 |
+
+**One measurement caveat that affects every number in this document.**
+`TestDatabase.transactionSync` (`tests/helpers/db.ts`) issues its `BEGIN` and
+`COMMIT` through `storage.db.exec` rather than `sql.exec`, so transactions do
+**not** appear in `statementCount`. Every count reported here is statements
+*inside* the transaction. That is the right comparison between our own layers,
+and it is not what a Durable Object would bill.
 
 ---
 
