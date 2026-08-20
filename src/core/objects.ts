@@ -8,6 +8,7 @@
 import { concat, isOid, toHex, utf8, utf8Decoder } from "./bytes.js";
 import { CorruptError } from "./errors.js";
 import { Sha1 } from "./sha1.js";
+import { comparePaths } from "./streams.js";
 
 export type ObjectType = "commit" | "tree" | "blob" | "tag";
 
@@ -284,15 +285,13 @@ export function parseTree(data: Uint8Array): TreeEntry[] {
  * hashes differently from the one real git would write.
  */
 export function compareTreeEntries(a: TreeEntry, b: TreeEntry): number {
-  const left = isTreeMode(a.mode) ? `${a.name}/` : a.name;
-  const right = isTreeMode(b.mode) ? `${b.name}/` : b.name;
-  const leftBytes = utf8.encode(left);
-  const rightBytes = utf8.encode(right);
-  const shared = Math.min(leftBytes.length, rightBytes.length);
-  for (let i = 0; i < shared; i++) {
-    if (leftBytes[i] !== rightBytes[i]) return leftBytes[i]! - rightBytes[i]!;
-  }
-  return leftBytes.length - rightBytes.length;
+  // comparePaths gives the same byte order without encoding anything; this
+  // runs O(w log w) times per tree, so two buffers per call was the cost of
+  // writing one wide directory.
+  return comparePaths(
+    isTreeMode(a.mode) ? `${a.name}/` : a.name,
+    isTreeMode(b.mode) ? `${b.name}/` : b.name,
+  );
 }
 
 export function serializeTree(entries: TreeEntry[]): Uint8Array {
