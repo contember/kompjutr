@@ -1,16 +1,33 @@
 // The repository registry and the per-repository store: objects, refs,
 // config and the index, all as rows.
 
-import { concat } from "../core/bytes.js";
+import pako from "pako";
+
+import { concat, toHex } from "../core/bytes.js";
+import { CorruptError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
-import { hashObject, type ObjectType, type RawObject } from "../core/objects.js";
-import { deflate, inflate } from "../core/zlib.js";
+import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
+import { Sha1 } from "../core/sha1.js";
+import { deflate, InflateStream, inflate } from "../core/zlib.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
 import { type PackCacheOptions, PackStore } from "./packs.js";
 import { initializeGitSchema } from "./schema.js";
 
 /** Bytes per `git_object_chunks` row. */
 const OBJECT_CHUNK = 1024 * 1024;
+
+/** Deflate output chunk, and one row, for a streamed write. Smaller than
+ *  OBJECT_CHUNK so a streamed object's peak is a chunk, not a megabyte. */
+const STREAM_CHUNK = 64 * 1024;
+
+/** Compressed bytes fed to the inflater at a time when streaming a read. */
+const INFLATE_FEED = 16 * 1024;
+
+/** Index rows per round trip. This is the memory bound of a scan. */
+const DEFAULT_INDEX_PAGE = 512;
+
+/** Index mutations buffered before a batch is applied. */
+const DEFAULT_INDEX_FLUSH = 512;
 
 const DEFAULT_OBJECT_CACHE_BYTES = 16 * 1024 * 1024;
 
@@ -41,6 +58,28 @@ export interface IndexEntry {
   size: number | null;
   mtime: number | null;
   ino: number | null;
+}
+
+export interface IndexScanOptions {
+  /** Resume strictly after this (path, stage). */
+  after?: { path: string; stage: number };
+  /** Only the path equal to, or under, this repo-relative prefix. */
+  prefix?: string;
+  /** Rows per round trip. This is the memory bound of the scan. */
+  pageSize?: number;
+}
+
+export interface IndexApplyOptions {
+  /** Mutations buffered before a batch is written. */
+  flushEvery?: number;
+}
+
+/** A bounded, ordered mutation sink over the index. */
+export interface IndexSink {
+  put(entry: IndexEntry): void;
+  remove(path: string): void;
+  /** Apply whatever is buffered. Called for you when `indexApply` returns. */
+  flush(): void;
 }
 
 /** Normalise an absolute workspace path: no trailing slash, always leading. */
@@ -251,6 +290,122 @@ export class RepoStore {
     this.#hasLoose = true;
     this.#objects.set(oid, { type, data });
     return oid;
+  }
+
+  /**
+   * Write a loose object from a stream of chunks. `chunks` is a factory
+   * because the content is read twice: once to hash it, which is how the oid
+   * is known and how `has` can short-circuit before a single row is written,
+   * and once to deflate and store it. Nothing larger than one chunk is ever
+   * live, so the peak does not follow the object's size.
+   */
+  writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
+    const hash = new Sha1().update(objectHeader(type, size));
+    let hashed = 0;
+    for (const chunk of chunks()) {
+      hashed += chunk.length;
+      hash.update(chunk);
+    }
+    if (hashed !== size) {
+      throw new CorruptError(`streamed ${hashed} bytes for a ${type} declared as ${size}`);
+    }
+    const oid = toHex(hash.digest());
+    if (this.has(oid)) return oid;
+
+    const rows: Uint8Array[] = [];
+    const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
+    deflate.onData = (chunk) => {
+      if (!(chunk instanceof Uint8Array))
+        throw new CorruptError("deflate produced a non-binary chunk");
+      rows.push(chunk);
+    };
+
+    this.#db.transactionSync(() => {
+      this.#db.run(
+        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, ?, ?)",
+        this.#repoId,
+        oid,
+        type,
+        size,
+      );
+      this.#db.run(
+        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+        this.#repoId,
+        oid,
+      );
+      let seq = 0;
+      const drain = (): void => {
+        for (const row of rows) {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+            this.#repoId,
+            oid,
+            seq++,
+            blob(row),
+          );
+        }
+        rows.length = 0;
+      };
+      for (const chunk of chunks()) {
+        deflate.push(chunk, false);
+        if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+        drain();
+      }
+      deflate.push(new Uint8Array(0), true);
+      if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+      drain();
+      // An empty object still deserves one row, matching `write`.
+      if (seq === 0) {
+        this.#db.run(
+          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+          this.#repoId,
+          oid,
+          0,
+          blob(new Uint8Array(0)),
+        );
+      }
+    });
+    this.#hasLoose = true;
+    return oid;
+  }
+
+  /**
+   * Inflated object bytes, chunk by chunk. A loose object really streams: its
+   * rows are read one at a time and inflated incrementally. A packed object
+   * yields exactly one chunk holding the whole thing, because a delta cannot
+   * be reconstructed without its full base in memory. Null when unknown.
+   */
+  readChunks(oid: string): Iterable<Uint8Array> | null {
+    const cached = this.#objects.get(oid);
+    if (cached !== undefined) return [cached.data];
+    if (this.#hasLoose && this.#looseRow(oid) !== null) return this.#looseChunks(oid);
+    const packed = this.#packs.read(oid);
+    return packed === null ? null : [packed.data];
+  }
+
+  *#looseChunks(oid: string): Generator<Uint8Array> {
+    const ready: Uint8Array[] = [];
+    const stream = new InflateStream((chunk) => ready.push(chunk));
+    for (let seq = 0; ; seq++) {
+      const row = this.#db.one<{ data: unknown }>(
+        "SELECT data FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq = ?",
+        this.#repoId,
+        oid,
+        seq,
+      );
+      if (row === undefined) break;
+      const compressed = readBlob(row.data);
+      for (let offset = 0; offset < compressed.length; offset += INFLATE_FEED) {
+        stream.push(compressed.subarray(offset, offset + INFLATE_FEED));
+        for (const chunk of ready) yield chunk;
+        ready.length = 0;
+      }
+      if (compressed.length === 0) {
+        for (const chunk of ready) yield chunk;
+        ready.length = 0;
+      }
+    }
+    for (const chunk of ready) yield chunk;
   }
 
   /** Resolve an abbreviated oid. Null when unknown or ambiguous. */
@@ -474,11 +629,113 @@ export class RepoStore {
     this.#db.run("DELETE FROM git_index WHERE repo_id = ?", this.#repoId);
   }
 
-  indexReplace(entries: IndexEntry[]): void {
-    this.#db.transactionSync(() => {
-      this.indexClear();
-      for (const entry of entries) this.indexPut(entry);
-    });
+  /**
+   * Replace the whole index from a stream. Bounded by the flush size, not by
+   * the length of `entries`, so a full reset never materialises the tree.
+   */
+  indexReplace(entries: Iterable<IndexEntry>, options: IndexApplyOptions = {}): void {
+    const flushEvery = options.flushEvery ?? DEFAULT_INDEX_FLUSH;
+    const pending: IndexEntry[] = [];
+    const flush = (clear: boolean): void => {
+      if (!clear && pending.length === 0) return;
+      this.#db.transactionSync(() => {
+        if (clear) this.indexClear();
+        for (const entry of pending) this.indexPut(entry);
+      });
+      pending.length = 0;
+    };
+    let first = true;
+    for (const entry of entries) {
+      pending.push(entry);
+      if (pending.length < flushEvery) continue;
+      flush(first);
+      first = false;
+    }
+    flush(first);
+  }
+
+  /**
+   * Index rows in (path, stage) order, one bounded page at a time.
+   *
+   * Keyset paging must carry the stage: the key is (path, stage), so a page
+   * boundary falling between stage 0 and stage 2 of one path would drop a row
+   * if the cursor were the path alone.
+   *
+   * CONTRACT: a caller may mutate only paths at or behind the frontier it has
+   * already been handed. Each page is a fresh query, so a row written ahead of
+   * the frontier would be observed by this scan; a row written behind it would
+   * not. `indexApply` is the shape that makes obeying this the easy path.
+   */
+  *indexScan(options: IndexScanOptions = {}): Generator<IndexEntry> {
+    const pageSize = options.pageSize ?? DEFAULT_INDEX_PAGE;
+    const prefix = options.prefix;
+    let path = options.after?.path ?? "";
+    let stage = options.after?.stage ?? -1;
+
+    for (;;) {
+      const page =
+        prefix === undefined || prefix === ""
+          ? this.#db.all<IndexEntry>(
+              `SELECT path, stage, mode, oid, size, mtime, ino FROM git_index
+               WHERE repo_id = ? AND (path > ? OR (path = ? AND stage > ?))
+               ORDER BY path, stage LIMIT ?`,
+              this.#repoId,
+              path,
+              path,
+              stage,
+              pageSize,
+            )
+          : this.#db.all<IndexEntry>(
+              `SELECT path, stage, mode, oid, size, mtime, ino FROM git_index
+               WHERE repo_id = ? AND (path > ? OR (path = ? AND stage > ?))
+                 AND (path = ? OR (path >= ? AND path < ?))
+               ORDER BY path, stage LIMIT ?`,
+              this.#repoId,
+              path,
+              path,
+              stage,
+              prefix,
+              `${prefix}/`,
+              nextPrefix(`${prefix}/`),
+              pageSize,
+            );
+      if (page.length === 0) return;
+      for (const entry of page) yield entry;
+      const last = page[page.length - 1]!;
+      path = last.path;
+      stage = last.stage;
+      if (page.length < pageSize) return;
+    }
+  }
+
+  /**
+   * Run `body` with a bounded, ordered mutation sink. Mutations are buffered
+   * and applied in batches of `flushEvery`, each batch one transaction, so a
+   * staging pass over a large index never holds every change it made.
+   */
+  indexApply<T>(body: (sink: IndexSink) => T, options: IndexApplyOptions = {}): T {
+    const flushEvery = options.flushEvery ?? DEFAULT_INDEX_FLUSH;
+    // One ordered list, not a put list and a remove list: a caller that
+    // removes a path and then re-puts it must get that order back.
+    const pending: (IndexEntry | string)[] = [];
+    const flush = (): void => {
+      if (pending.length === 0) return;
+      this.#db.transactionSync(() => {
+        for (const item of pending) {
+          if (typeof item === "string") this.indexRemove(item);
+          else this.indexPut(item);
+        }
+      });
+      pending.length = 0;
+    };
+    const record = (item: IndexEntry | string): void => {
+      pending.push(item);
+      if (pending.length >= flushEvery) flush();
+    };
+    const sink: IndexSink = { put: record, remove: record, flush };
+    const result = body(sink);
+    flush();
+    return result;
   }
 
   /** True when any entry sits at a merge stage. */
