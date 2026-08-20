@@ -7,7 +7,7 @@
 
 import type { SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_meta (
@@ -57,6 +57,19 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, path, stage)
    )`,
 
+  // The working tree's opaque content ids mapped to blob oids. A file whose
+  // `fs_nodes.content_id` is in here is unchanged: `status` and `add` answer
+  // it from the scan statement, without reading the file or hashing it.
+  //
+  // The id is whatever the filesystem chose to record. Nothing here computes
+  // one, and a missing row means "read the file", never "the file differs".
+  `CREATE TABLE IF NOT EXISTS git_blob_ids (
+     repo_id INTEGER NOT NULL,
+     content_id BLOB NOT NULL,
+     oid TEXT NOT NULL,
+     PRIMARY KEY (repo_id, content_id)
+   ) WITHOUT ROWID`,
+
   // Shallow boundary commits, the equivalent of .git/shallow. A history
   // walk stops dead at one of these.
   `CREATE TABLE IF NOT EXISTS git_shallow (
@@ -67,13 +80,29 @@ const STATEMENTS = [
 
   // Loose objects: everything created locally, zlib-deflated and chunked.
   // A future repack folds them into a pack; nothing here depends on that.
+  // `stored` names the encoding of the chunk bytes: 'zlib' or 'raw'.
+  // Deflating an already-incompressible or tiny object costs more than it
+  // saves, and the threshold is a client option.
   `CREATE TABLE IF NOT EXISTS git_objects (
      repo_id INTEGER NOT NULL,
      oid TEXT NOT NULL,
      type TEXT NOT NULL,
      size INTEGER NOT NULL,
+     stored TEXT NOT NULL DEFAULT 'zlib',
      PRIMARY KEY (repo_id, oid)
    )`,
+
+  // Parsed commit headers, so `log` is a graph walk in SQL instead of one
+  // object read per commit. Written by whatever first parses a commit.
+  // Never authoritative: a missing row means "read the object".
+  `CREATE TABLE IF NOT EXISTS git_commits (
+     repo_id INTEGER NOT NULL,
+     oid TEXT NOT NULL,
+     parents TEXT NOT NULL,
+     tree TEXT NOT NULL,
+     time INTEGER NOT NULL,
+     PRIMARY KEY (repo_id, oid)
+   ) WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_object_chunks (
      repo_id INTEGER NOT NULL,
@@ -137,9 +166,29 @@ const STATEMENTS = [
    )`,
 ] as const;
 
+// v1 -> v2 added `git_blob_ids`, `git_commits` and `git_objects.stored`.
+// The first two are CREATE TABLE IF NOT EXISTS and need no migrator; the
+// column does, because IF NOT EXISTS will not alter a table that exists.
+function migrate(db: SqlDatabase, from: number): void {
+  if (from < 2) {
+    db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
+  }
+}
+
 export function initializeGitSchema(db: SqlDatabase): void {
   db.transactionSync(() => {
+    // git_meta first, so the recorded version is readable before the rest
+    // of the CREATEs run and before it gets rewritten below.
+    const [meta] = STATEMENTS;
+    db.run(meta);
+    const recorded = db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'");
+    const previous = recorded === undefined ? 0 : Number(recorded);
+
     for (const statement of STATEMENTS) db.run(statement);
+
+    // 0 means a fresh database: the CREATEs above already carry v2's shape.
+    if (previous > 0 && previous < SCHEMA_VERSION) migrate(db, previous);
+
     db.run(
       "INSERT OR REPLACE INTO git_meta (key, value) VALUES ('schema_version', ?)",
       String(SCHEMA_VERSION),

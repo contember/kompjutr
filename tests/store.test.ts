@@ -35,6 +35,8 @@ describe("repository registry", () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
     );
     expect(tables.map((t) => t.name)).toEqual([
+      "git_blob_ids",
+      "git_commits",
       "git_config",
       "git_index",
       "git_meta",
