@@ -47,6 +47,12 @@ export interface WalkOptions {
   includeIgnored?: boolean;
 }
 
+/** A repo-relative path and the metadata carried by its scan row. */
+export interface WorktreePath {
+  path: string;
+  stat: WorktreeStat;
+}
+
 /**
  * Every file and symlink under the working tree, as sorted repo-relative
  * paths. Directories are not returned — git tracks files.
@@ -77,6 +83,15 @@ export function* walkWorktreeStream(
   root: string,
   options: WalkOptions = {},
 ): Generator<string> {
+  for (const entry of walkWorktreeEntriesStream(worktree, root, options)) yield entry.path;
+}
+
+/** The metadata-preserving worktree walk used by every path-only projection. */
+export function* walkWorktreeEntriesStream(
+  worktree: Worktree,
+  root: string,
+  options: WalkOptions = {},
+): Generator<WorktreePath> {
   const lexicalRoot = root.replace(/\/+$/, "") || "/";
   const base = worktree.realpath(lexicalRoot);
   const excluded = new Set(
@@ -137,7 +152,7 @@ export function* walkWorktreeStream(
       if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
         continue;
       }
-      yield relative;
+      yield { path: relative, stat: statFromScan(entry) };
     }
 
     if (entries.length < SCAN_PAGE) return;
@@ -155,6 +170,20 @@ export function* walkWorktreeStream(
       pruned.pop();
     }
   }
+}
+
+function statFromScan(entry: ScanEntry): WorktreeStat {
+  return {
+    type: entry.type,
+    mode: entry.mode,
+    size: entry.size,
+    mtime: entry.mtime,
+    ino: entry.ino,
+    nlink: entry.nlink,
+    rev: entry.rev,
+    target: entry.target,
+    contentId: entry.contentId,
+  };
 }
 
 function prunedRange(directory: string): { directory: string; lower: string; upper: string } {
@@ -200,12 +229,6 @@ export interface HashedPath {
   oid: string;
   /** Git tree mode: "100644", "100755" or "120000". */
   mode: string;
-  stat: WorktreeStat;
-}
-
-/** A path whose stat came from the same bulk scan that selected it. */
-export interface WorktreePath {
-  path: string;
   stat: WorktreeStat;
 }
 

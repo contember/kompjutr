@@ -8,6 +8,7 @@ import {
   hashWorktreePaths,
   type WorktreePath,
   walkWorktree,
+  walkWorktreeEntriesStream,
   walkWorktreeStream,
 } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -52,6 +53,64 @@ function mutateAfterFirstScan(inner: Worktree, mutate: () => void): Worktree {
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+function countScalarReads(inner: Worktree): {
+  worktree: Worktree;
+  counts: { stats: number; readdirs: number; reads: number };
+} {
+  const counts = { stats: 0, readdirs: 0, reads: 0 };
+  const worktree = new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "stat") {
+        return (path: string): ReturnType<Worktree["stat"]> => {
+          counts.stats++;
+          return target.stat(path);
+        };
+      }
+      if (property === "readdir") {
+        return (path: string): ReturnType<Worktree["readdir"]> => {
+          counts.readdirs++;
+          return target.readdir(path);
+        };
+      }
+      if (property === "readFile") {
+        return (path: string): Uint8Array => {
+          counts.reads++;
+          return target.readFile(path);
+        };
+      }
+      if (property === "readlink") {
+        return (path: string): string => {
+          counts.reads++;
+          return target.readlink(path);
+        };
+      }
+      if (property === "readRange") {
+        return (path: string, offset: number, length: number): Uint8Array => {
+          counts.reads++;
+          return target.readRange(path, offset, length);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { worktree, counts };
+}
+
+function scanStat(entry: ScanEntry): WorktreePath["stat"] {
+  return {
+    type: entry.type,
+    mode: entry.mode,
+    size: entry.size,
+    mtime: entry.mtime,
+    ino: entry.ino,
+    nlink: entry.nlink,
+    rev: entry.rev,
+    target: entry.target,
+    contentId: entry.contentId,
+  };
 }
 
 describe("worktree ranged I/O", () => {
@@ -229,8 +288,27 @@ describe("walkWorktreeStream", () => {
       worktree.writeFile(path, new TextEncoder().encode("x"), { mode: 0o644 });
     }
     const streamed = [...walkWorktreeStream(worktree, "/")];
+    const entries = [...walkWorktreeEntriesStream(worktree, "/")];
     expect(streamed).toEqual([...streamed].sort(comparePaths));
+    expect(entries.map((entry) => entry.path)).toEqual(streamed);
     expect(walkWorktree(worktree, "/")).toEqual(streamed);
+  });
+
+  it("excludes a nested repository without losing scan metadata", () => {
+    const { worktree } = makeWorkspace();
+    worktree.makeDirectories(["/nested", "/outside"]);
+    worktree.writeFiles([
+      { path: "/nested/hidden.txt", bytes: new Uint8Array([1]) },
+      {
+        path: "/outside/kept.txt",
+        bytes: new Uint8Array([2]),
+        contentId: fromHex("12".repeat(20)),
+      },
+    ]);
+
+    const entries = [...walkWorktreeEntriesStream(worktree, "/", { excludeRoots: ["/nested"] })];
+    expect(entries.map((entry) => entry.path)).toEqual(["outside/kept.txt"]);
+    expect(entries[0]?.stat.contentId).toEqual(fromHex("12".repeat(20)));
   });
 
   it("uses the bulk scan instead of reading directories", () => {
@@ -329,7 +407,12 @@ describe("walkWorktreeStream", () => {
     const measure = (
       directoryCount: number,
       fileCount: number,
-    ): { statements: number; paths: string[]; expected: string[] } => {
+    ): {
+      statements: number;
+      entries: WorktreePath[];
+      expected: WorktreePath[];
+      scalarReads: { stats: number; readdirs: number; reads: number };
+    } => {
       const workspace = makeWorkspace();
       const directories = Array.from(
         { length: directoryCount },
@@ -338,7 +421,7 @@ describe("walkWorktreeStream", () => {
       workspace.worktree.makeDirectories(directories);
 
       const byte = new Uint8Array([120]);
-      const expected: string[] = [];
+      const contentId = fromHex("ab".repeat(20));
       workspace.worktree.writeFiles(
         Array.from({ length: fileCount }, (_, index) => {
           const directory = index % directoryCount;
@@ -346,14 +429,24 @@ describe("walkWorktreeStream", () => {
           const path = `d${directory.toString().padStart(4, "0")}/f${generation
             .toString()
             .padStart(4, "0")}.txt`;
-          expected.push(path);
-          return { path: `/${path}`, bytes: byte };
+          const entry = { path: `/${path}`, bytes: byte, mode: index % 2 === 0 ? 0o644 : 0o755 };
+          return index % 3 === 0 ? { ...entry, contentId } : entry;
         }),
       );
 
+      const expected = workspace.worktree
+        .scan("/", { filesOnly: true, limit: fileCount + 1 })
+        .map((entry): WorktreePath => ({ path: entry.path.slice(1), stat: scanStat(entry) }));
+      const counted = countScalarReads(workspace.worktree);
+
       workspace.storage.resetCounters();
-      const paths = walkWorktree(workspace.worktree, "/");
-      return { statements: workspace.storage.statementCount, paths, expected };
+      const entries = [...walkWorktreeEntriesStream(counted.worktree, "/")];
+      return {
+        statements: workspace.storage.statementCount,
+        entries,
+        expected,
+        scalarReads: counted.counts,
+      };
     };
 
     const small = measure(335, 933);
@@ -362,7 +455,27 @@ describe("walkWorktreeStream", () => {
     expect(small.statements).toBe(4);
     expect(large.statements).toBe(15);
     expect(large.statements).toBeLessThanOrEqual(15);
-    expect(large.paths).toEqual(large.expected.sort(comparePaths));
+    expect(large.entries).toEqual(large.expected);
+    expect(large.entries.map((entry) => entry.path)).toEqual(
+      large.expected.map((entry) => entry.path).sort(comparePaths),
+    );
+    expect(large.scalarReads).toEqual({ stats: 0, readdirs: 0, reads: 0 });
+  });
+
+  it("requires scalar stats after scan metadata is stripped", () => {
+    const { worktree } = makeWorkspace();
+    worktree.writeFiles([
+      { path: "/a.txt", bytes: new Uint8Array([1]), contentId: fromHex("34".repeat(20)) },
+      { path: "/b.txt", bytes: new Uint8Array([2]) },
+    ]);
+    const counted = countScalarReads(worktree);
+    const entries = [...walkWorktreeEntriesStream(counted.worktree, "/")];
+    expect(counted.counts).toEqual({ stats: 0, readdirs: 0, reads: 0 });
+
+    const stripped = entries.map((entry) => entry.path);
+    const reconstructed = stripped.map((path) => counted.worktree.stat(`/${path}`));
+    expect(counted.counts.stats).toBe(stripped.length);
+    expect(reconstructed).toEqual(entries.map((entry) => entry.stat));
   });
 
   it("keeps repo-relative paths when the repository root is a symlink", () => {
