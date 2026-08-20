@@ -6,20 +6,18 @@ import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { fileModeFor, type Worktree } from "../worktree.js";
+import { type TargetEntry, treeStream } from "./tree-stream.js";
 
-export interface TargetEntry {
-  path: string;
-  mode: string;
-  oid: string;
-}
+export type { TargetEntry } from "./tree-stream.js";
 
-/** Every blob, symlink and gitlink under a tree, keyed by repo-relative path. */
+/**
+ * Every blob, symlink and gitlink under a tree, keyed by repo-relative path.
+ * O(tree). `treeStream` is the bounded form; this stays for the callers that
+ * genuinely need random access.
+ */
 export function treeEntries(repo: Repository, treeOid: string | null): Map<string, TargetEntry> {
   const out = new Map<string, TargetEntry>();
-  if (treeOid === null) return out;
-  for (const { path, entry } of repo.walkTree(treeOid)) {
-    out.set(path, { path, mode: entry.mode, oid: entry.oid });
-  }
+  for (const entry of treeStream(repo, treeOid)) out.set(entry.path, entry);
   return out;
 }
 

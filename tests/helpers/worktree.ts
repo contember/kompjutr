@@ -9,6 +9,8 @@ export class CountingWorktree implements Worktree {
   rangeReads = 0;
   rangeWrites = 0;
   creates = 0;
+  /** Directory listings, which is how a lazy walk shows it is lazy. */
+  readdirs = 0;
 
   constructor(private readonly inner: Worktree) {}
 
@@ -30,6 +32,7 @@ export class CountingWorktree implements Worktree {
     this.inner.symlink(target, path);
   }
   readdir(path: string): WorktreeDirent[] {
+    this.readdirs++;
     return this.inner.readdir(path);
   }
   mkdirp(path: string): void {

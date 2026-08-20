@@ -6,12 +6,24 @@
 // interface.
 
 import type { IndexEntry } from "../../sqlite/store.js";
-import { utf8 } from "../bytes.js";
+import { toHex, utf8 } from "../bytes.js";
 import type { IgnoreMatcher } from "../ignore/index.js";
-import { hashObject } from "../objects.js";
+import { hashObject, objectHeader } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { Sha1 } from "../sha1.js";
+import { comparePaths } from "../streams.js";
 import { gitModeFor, type Worktree, type WorktreeStat } from "../worktree.js";
+
+/** Bytes pulled from the working tree at a time when a file is streamed. */
+const READ_CHUNK = 64 * 1024;
+
+/**
+ * Below this, a file is read in one go. Streaming costs a second pass over
+ * the content — the hash pass and the store pass — which is a bad trade for
+ * a file that was never going to strain anything.
+ */
+const STREAM_ABOVE = 512 * 1024;
 
 export interface WalkOptions {
   /**
@@ -40,35 +52,68 @@ export function walkWorktree(
   root: string,
   options: WalkOptions = {},
 ): string[] {
-  const excluded = new Set((options.excludeRoots ?? []).map((path) => path.replace(/\/+$/, "")));
-  const out: string[] = [];
-  const stack: string[] = [root.replace(/\/+$/, "") || "/"];
+  return [...walkWorktreeStream(worktree, root, options)];
+}
 
-  while (stack.length > 0) {
-    const directory = stack.pop()!;
-    for (const entry of worktree.readdir(directory)) {
-      const absolute = joinPath(directory, entry.name);
-      if (excluded.has(absolute)) continue;
-      const relative = relativeTo(root, absolute);
-      if (relative === null) continue;
-      if (entry.type === "directory") {
-        if (!withinPathspec(relative, options.paths, true)) continue;
-        // git never descends into an ignored directory, which is also why
-        // a re-include below one cannot take effect.
-        if (options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true) {
-          continue;
-        }
-        stack.push(absolute);
+/**
+ * The same walk, lazily and already in `comparePaths` order, so it can be
+ * merged against the index and a tree without a sort.
+ *
+ * Siblings are ordered the way git orders tree entries — a directory compares
+ * as `name/` — because that, not the bare name, is what makes the emitted full
+ * paths ascend. `a.txt` really does sort before `a/x`, since "." is 0x2E and
+ * "/" is 0x2F.
+ *
+ * Bound: O(sum of the widths of the directories currently open).
+ */
+export function* walkWorktreeStream(
+  worktree: Worktree,
+  root: string,
+  options: WalkOptions = {},
+): Generator<string> {
+  const base = root.replace(/\/+$/, "") || "/";
+  const excluded = new Set((options.excludeRoots ?? []).map((path) => path.replace(/\/+$/, "")));
+  yield* walkDirectory(worktree, base, base, excluded, options);
+}
+
+function* walkDirectory(
+  worktree: Worktree,
+  root: string,
+  directory: string,
+  excluded: Set<string>,
+  options: WalkOptions,
+): Generator<string> {
+  const entries = worktree.readdir(directory);
+  entries.sort((left, right) =>
+    comparePaths(sortKey(left.name, left.type), sortKey(right.name, right.type)),
+  );
+
+  for (const entry of entries) {
+    const absolute = joinPath(directory, entry.name);
+    if (excluded.has(absolute)) continue;
+    const relative = relativeTo(root, absolute);
+    if (relative === null) continue;
+    if (entry.type === "directory") {
+      if (!withinPathspec(relative, options.paths, true)) continue;
+      // git never descends into an ignored directory, which is also why a
+      // re-include below one cannot take effect.
+      if (options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true) {
         continue;
       }
-      if (!withinPathspec(relative, options.paths, false)) continue;
-      if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
-        continue;
-      }
-      out.push(relative);
+      yield* walkDirectory(worktree, root, absolute, excluded, options);
+      continue;
     }
+    if (!withinPathspec(relative, options.paths, false)) continue;
+    if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
+      continue;
+    }
+    yield relative;
   }
-  return out.sort();
+}
+
+/** git's tree-entry rule: a directory sorts as though its name ended in "/". */
+function sortKey(name: string, type: string): string {
+  return type === "directory" ? `${name}/` : name;
 }
 
 /**
@@ -123,9 +168,39 @@ export function hashWorktreePath(
   const absolute = joinPath(repo.root, relative);
   const stat = worktree.stat(absolute);
   if (stat === null || stat.type === "directory") return null;
+  if (stat.type !== "symlink" && stat.size > STREAM_ABOVE) {
+    return hashLargeFile(repo, worktree, absolute, stat, options);
+  }
   const bytes = worktreeBytes(worktree, absolute, stat);
   const oid = options.write === false ? hashObject("blob", bytes) : repo.store.write("blob", bytes);
   return { oid, mode: gitModeFor(stat), stat };
+}
+
+/** Hash, and optionally store, without ever holding the whole file. */
+function hashLargeFile(
+  repo: Repository,
+  worktree: Worktree,
+  absolute: string,
+  stat: WorktreeStat,
+  options: { write?: boolean },
+): HashedPath {
+  const chunks = function* (): Generator<Uint8Array> {
+    for (let offset = 0; offset < stat.size; offset += READ_CHUNK) {
+      const chunk = worktree.readRange(absolute, offset, Math.min(READ_CHUNK, stat.size - offset));
+      if (chunk.length === 0) break;
+      yield chunk;
+    }
+  };
+  if (options.write === false) {
+    const hash = new Sha1().update(objectHeader("blob", stat.size));
+    for (const chunk of chunks()) hash.update(chunk);
+    return { oid: toHex(hash.digest()), mode: gitModeFor(stat), stat };
+  }
+  return {
+    oid: repo.store.writeStream("blob", stat.size, chunks),
+    mode: gitModeFor(stat),
+    stat,
+  };
 }
 
 /**
@@ -137,21 +212,28 @@ export function hashWorktreePath(
  * pulling in HEAD comparison.
  */
 export function dirtyPaths(repo: Repository, worktree: Worktree, paths?: string[]): string[] {
-  const out: string[] = [];
-  for (const entry of repo.store.indexEntries()) {
+  return [...dirtyPathStream(repo, worktree, paths)];
+}
+
+/** The same comparison, lazily, over a paged index scan. */
+export function* dirtyPathStream(
+  repo: Repository,
+  worktree: Worktree,
+  paths?: string[],
+): Generator<string> {
+  for (const entry of repo.store.indexScan()) {
     if (entry.stage !== 0) continue;
     if (paths !== undefined && !withinPathspec(entry.path, paths, false)) continue;
     const absolute = joinPath(repo.root, entry.path);
     const stat = worktree.stat(absolute);
     if (stat === null) {
-      out.push(entry.path);
+      yield entry.path;
       continue;
     }
     if (indexMatchesStat(entry, stat)) continue;
     const hashed = hashWorktreePath(repo, worktree, entry.path, { write: false });
-    if (hashed === null || hashed.oid !== entry.oid) out.push(entry.path);
+    if (hashed === null || hashed.oid !== entry.oid) yield entry.path;
   }
-  return out;
 }
 
 /** An index row describing `relative` as it currently exists on disk. */

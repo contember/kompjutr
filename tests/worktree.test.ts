@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { walkWorktree, walkWorktreeStream } from "../src/core/ops/worktree-io.js";
+import { comparePaths } from "../src/core/streams.js";
 import { makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 /**
  * Ranged working-tree I/O, against a real Computer Workspace over
@@ -164,5 +167,53 @@ describe("worktree ranged I/O", () => {
     worktree.createFile("/link.txt", 0o644);
     expect(worktree.stat("/link.txt")?.type).toBe("symlink");
     expect(worktree.stat("/target.txt")?.size).toBe(0);
+  });
+});
+
+describe("walkWorktreeStream", () => {
+  it("emits full paths in UTF-8 byte order, sorting a directory as name/", () => {
+    const workspace = makeWorkspace();
+    const { worktree } = workspace;
+    // "a.txt" must precede "a/x" — "." is 0x2E and "/" is 0x2F — which only
+    // holds if the directory "a" sorts as "a/" and not as "a".
+    worktree.mkdirp("/a");
+    worktree.mkdirp("/ab");
+    for (const path of ["/a.txt", "/a/x", "/a/y", "/ab/z", "/b.txt"]) {
+      worktree.writeFile(path, new TextEncoder().encode("x"), 0o644);
+    }
+    expect([...walkWorktreeStream(worktree, "/")]).toEqual([
+      "a.txt",
+      "a/x",
+      "a/y",
+      "ab/z",
+      "b.txt",
+    ]);
+  });
+
+  it("agrees with the array form, which sorted afterwards", () => {
+    const { worktree } = makeWorkspace();
+    worktree.mkdirp("/deep/er");
+    for (const path of ["/z.txt", "/deep/b.txt", "/deep/er/c.txt", "/\u{1F600}.txt", "/.txt"]) {
+      worktree.writeFile(path, new TextEncoder().encode("x"), 0o644);
+    }
+    const streamed = [...walkWorktreeStream(worktree, "/")];
+    expect(streamed).toEqual([...streamed].sort(comparePaths));
+    expect(walkWorktree(worktree, "/")).toEqual(streamed);
+  });
+
+  it("reads one directory at a time rather than the whole tree", () => {
+    const { worktree } = makeWorkspace();
+    for (let i = 0; i < 20; i++) {
+      worktree.mkdirp(`/d${i}`);
+      for (let j = 0; j < 10; j++) {
+        worktree.writeFile(`/d${i}/f${j}.txt`, new TextEncoder().encode("x"), 0o644);
+      }
+    }
+    const counting = new CountingWorktree(worktree);
+    const walk = walkWorktreeStream(counting, "/");
+    walk.next();
+    // The root plus the first directory, not all twenty-one.
+    expect(counting.readdirs).toBeLessThanOrEqual(2);
+    expect([...walk]).toHaveLength(199);
   });
 });
