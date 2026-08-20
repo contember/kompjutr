@@ -63,8 +63,34 @@ above ~50 ms or above 2 statements re-opens D2 and possibly the path key
 itself. E2: a mechanical pass rate below ~95% retires the rewrite and the fork
 becomes the plan (§2.1).
 
-E2's output is not thrown away — it becomes the porting worklist for the
-conformance suite in wave D. **[R8]**
+E2's output is not thrown away — `tmp/port-survey/classification.tsv` carries
+411 rows, one per test case with its bucket and `file:line` reason, and is the
+porting worklist for wave D.
+
+### Outcome
+
+**E1 passed.** A 5,000-file directory rename is 2 statements and 5,250 rows,
+17.6 ms in memory and 24.8 ms file-backed, linear at ~3.5 µs/row. R1 does not
+fire; the path key and the two-table split stand. Recorded in §3.7 of the
+design, along with three gaps the probe found in that section — `?oldLen` is
+code points not bytes, `?oldRootSuccessor` was never defined, and the second
+statement was counted but never shown.
+
+**E2 fired its stop condition.** The inherited suite is 55.9% API-shaped
+strictly, 85.6% granting mechanical helper substitution, against a ~95%
+threshold. The plan's three headline figures were all correct; the inference
+from them was not, because coupling concentrates in helpers rather than in line
+mentions. The bulk primitives — the point of the exercise — have **zero**
+inherited coverage.
+
+**Decision: proceed with the rewrite anyway, with the claim corrected.** The
+fork does not win on this evidence: it inherits the same 247 out-of-scope cases
+plus a v5 schema with four migrations, and it keeps inode+dirents, which means
+no bulk writes and therefore no reachable `checkout` or `clone` — the reason
+the dependency is being cut at all. The threshold measured a secondary
+argument and should not have been decisive; that was an error in setting it,
+recorded rather than quietly reinterpreted. §2.3 of the design now carries the
+real numbers and the real budget.
 
 ---
 
@@ -76,13 +102,13 @@ throughout.** **[R1]**
 
 | file | what it fixes |
 |---|---|
-| `src/fs/types.ts` | §4.1 verbatim: `EntryType`, `RealPath`, `Stat`, `Dirent`, `ScanEntry`, `ScanOptions`, `ReadBatch`, `WriteEntry`, `WriteOptions`, `RemoveOptions`, `Filesystem`, `subtreeSuccessor`. **`WriteEntry` gains `mtime`** — without it the importer cannot preserve timestamps and would be blocked on a frozen type. **[R7]** |
+| `src/fs/types.ts` | §4.1 verbatim: `EntryType`, `RealPath`, `Stat`, `Dirent`, `ScanEntry`, `ScanOptions`, `ReadBatch`, `WriteEntry`, `WriteOptions`, `RemoveOptions`, `FilesystemOptions`, `Filesystem`, `subtreeSuccessor`. Three additions the seam must carry before it freezes: **`WriteEntry.mtime`**, or the importer cannot preserve timestamps **[R7]**; **`Stat.rev`**, which six inherited cases assert on and whose column already exists; and **an injected clock** on `FilesystemOptions`, without which every inherited `mtime` assertion has nowhere to pin time. |
 | `src/fs/schema.ts` | The `fs_meta` / `fs_nodes` / `fs_paths` / `fs_chunks` DDL from §3.3, the version row, the migration runner. |
 | `src/fs/path.ts` | Normalisation, join, parent, basename, `subtreeSuccessor`. Pure functions, no SQL. |
 | `src/fs/store/meta.ts` | `rev()`, `fs_meta` accessors, the explicit inode allocator. **Implemented, not stubbed** — a new file with no consumers cannot redden anything. |
 | `src/fs/store/resolve.ts` | `realpath()` — the sole producer of `RealPath` and the choke point §3.6 hangs the design on. Implemented for the same reason. |
 | `src/sqlite/schema.ts` | **`git_blob_ids`, `git_objects.stored` and `git_commits` do not exist in the tree.** All three land here with their migration and migration tests, before any unit depends on them. **[R4]** |
-| `tests/fs/conformance/harness.ts` | The shared fixture the inherited dofs suite runs against, so wave D's two units do not both invent one. **[R8]** |
+| `tests/fs/conformance/harness.ts` | **A dofs-shaped conformance adapter**, not just a fixture: it maps dofs' free-function calls (`stat(db, path)`, `readdir(db, path, options)`, `resolveInode`, `readBack`) onto `Filesystem`, so the inherited tests port nearly mechanically and no production code carries dofs' shape. This is what converts four of E2's nine porting blockers from interface decisions into thirty lines of test harness. **[R8]** |
 | `package.json` | The `.`, `./fs`, `./git`, `./compat/computer`, `./testing` export map. |
 
 **Deliberately not touched here:** `src/fs/filesystem.ts`, `src/fs/index.ts`,
@@ -107,6 +133,12 @@ are different functions in different modules.
 Five disjoint files. F1–F4 are a fresh directory with no existing consumers;
 G6 touches the git object store, which nothing in waves B or C reads.
 
+**Every test in F1–F4 is new.** dofs has no bulk API, so E2 found zero
+inherited coverage for `scan`, `readFiles`, `writeFiles`, `removeFiles` or
+`glob`. These four units carry no inheritance and their gates are the only
+thing standing behind the primitives the whole design rests on. Budget them
+accordingly.
+
 | unit | territory | contract | done-check |
 |---|---|---|---|
 | **F1 — scan** | `src/fs/store/scan.ts`, `tests/fs/scan.test.ts` | `scan(root, options)`, `glob(root, pattern, options)`. P1 from §7.0. | Paged scan equals one-shot scan; order equals `comparePaths` (`src/core/streams.ts:29`); 12,675 rows in 13 statements at a 1,000 page. |
@@ -126,8 +158,8 @@ needs a caller-visible lifecycle. That caller change is G8, in wave F. **[R2]**
 
 | unit | territory | contract | done-check |
 |---|---|---|---|
-| **F5 — single-path ops** | `src/fs/ops.ts`, `tests/fs/conformance/{stat,readdir,readFile,writeFile,mkdir,rm,rename,symlink,chmod,link}.test.ts` | Every single-path method in §4.1 as a thin wrapper over F1–F4. No new SQL. | **Its share of the inherited dofs conformance suite green**, not merely "expressible as a bulk call". Symlink following, POSIX error mapping and mode bits are exactly what a shape-only check misses. **[R8]** |
-| **F6 — compatibility surfaces** | `src/fs/compat/`, `tests/fs/conformance/{fd,errors,provider}.test.ts` | `NodeFsCompat` (node:fs names, the fd table) and the Computer façade (`withReadScope` no-op, `shellQuote`, the provider shape). | Behavioural, not type-level: the fd trio round-trips, `existsSync` swallows errors per §4.3, and the inherited fd and error-mapping tests are green. Compiling is not passing. **[R11]** |
+| **F5 — single-path ops** | `src/fs/ops.ts`, `tests/fs/conformance/{stat,readdir,readFile,writeFile,mkdir,rm,rename,symlink,chmod,link}.test.ts` | Every single-path method in §4.1 as a thin wrapper over F1–F4. No new SQL. | **Its share of the inherited suite green**, ported through wave B's adapter, worklist in `tmp/port-survey/classification.tsv`. Roughly 120 in-scope cases. Not "expressible as a bulk call" — symlink following, POSIX error mapping and mode bits are exactly what a shape-only check misses. Cases E2 marked unportable are discarded with a recorded reason, never silently skipped. **[R8]** |
+| **F6 — compatibility surfaces** | `src/fs/compat/`, `tests/fs/conformance/{fd,errors,provider}.test.ts` | `NodeFsCompat` (node:fs names, the fd table) and the Computer façade (`withReadScope` no-op, `shellQuote`, the provider shape). | Behavioural, not type-level: the fd trio round-trips, `existsSync` swallows errors per §4.3, and the inherited fd and error-mapping tests are green. **`provider.fd.test.ts` is the highest-yield inherited file in the whole suite — 28 of 29 cases API-shaped, 376 lines — and it lands here.** Compiling is not passing. **[R11]** |
 | **F7 — importer and migration** | `src/fs/import.ts`, `src/fs/testing.ts`, `tests/fs/import.test.ts` | `importFromComputer(db)` per §8.2, the divergence latch, and the shadow-read wrapper §8.3 ships from `./testing`. | Round-trips a real Prettier-sized `vfs_*` database: same paths, bytes, modes, symlink targets **and mtimes**; the latch trips on a database Computer wrote to after import. |
 
 The latch is *validated* on every open, which is the filesystem's opening path

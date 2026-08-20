@@ -286,23 +286,62 @@ Measured on the checkout at
   **19 files, 4,672 lines.**
 - Of those 4,672 lines, **82 mention `vfs_` at all** — 1.8%.
 
-The tests drive free functions and the provider, not the tables:
-`readdir.test.ts:16` is `expect(readdir(db, "/")).toEqual([])`;
-`provider.test.ts:13-15` builds a provider over `withDB`. The `vfs_` mentions
-are isolated helpers (`writeFile.test.ts:19`, `:26`, `:52`) and a handful of
-internal assertions.
+**Those three figures are correct. The inference drawn from them was not.**
+E1's sibling probe classified all 517 test cases individually, and the result
+is worse than the line count suggests:
 
-**Therefore: keep DOFS's free-function signatures.** `stat(db, path)`,
-`lstat(db, path)`, `readdir(db, path, options)`, `readFile(db, path, options)`,
-`writeFile(db, path, content, options, now)`, `mkdir(db, path, options, now)`,
-`rm(db, path, options)`, `chmod(db, path, mode, now)`,
-`symlink(db, target, path, now)`, `readlink(db, path)`. Same names, same
-argument order, same return shapes (`WorkspaceStatResult` at `fs/stat.ts:8-23`,
-`WorkspaceDirentResult` at `fs/readdir.ts:7-15`).
+| measure | result |
+|---|---|
+| in-scope cases | 270 |
+| **API-shaped — port against any correct implementation** | **151 = 55.9%** |
+| API-shaped granting mechanical helper substitution | 231 = 85.6% |
+| restricted to the 19 portable files | 61.1% / 91.5% |
+| most generous defensible reading | 93.9% |
 
-That single constraint converts ~4,330 lines of somebody else's conformance
-suite into our compatibility gate, for the price of an argument order we would
-have chosen anyway. Drop `writeBuffer.test.ts` (344 lines) with the buffer.
+**Line mentions are the wrong denominator, because coupling concentrates in
+helpers.** `writeFile.test.ts`'s `readBack` is 27 lines that name `vfs_chunks`
+and `vfs_blob_bytes` exactly twice (`:19`, `:26`) — 2 of the 82 — and it is the
+assertion vehicle for **22 of that file's 36 cases**. Its author says why at
+`:12-13`: *"A deliberately minimal helper so writeFile tests can stand alone
+without depending on readFile."* Two lines couple 61% of the largest portable
+file.
+
+A literal pass rate would be **lower** than 55.9%, not higher: classification
+cannot see behavioural divergence. `readFile.test.ts:97` names no table, reads
+as API-shaped, and would still fail — dofs' open-stream snapshot is an artifact
+of content-addressed blobs plus deferred GC, both of which §3.3 drops.
+
+**And the part that matters most has no inherited coverage at all.** `scan`,
+`readFiles`, `writeFiles`, `removeFiles` and `glob` are, in §4.2's words, the
+point of the exercise. dofs has no such API, so every test for them is new.
+
+### How the inheritance is actually recovered
+
+Not by constraining the production interface. Six of the nine porting blockers
+are interface mismatches, not schema ones — `stat` inverting its error
+contract, the two `Stat` shapes, the missing `readdir` options bag,
+`resolveInode` as the assertion vehicle for 41 cases. Bending `Filesystem` to
+match dofs would be letting a test suite design the product.
+
+Instead: **a dofs-shaped conformance adapter lives in
+`tests/fs/conformance/harness.ts`**, mapping dofs' free-function calls
+(`stat(db, path)`, `readdir(db, path, options)`, `resolveInode`, `readBack`)
+onto `Filesystem`. The ported tests call the adapter; production code never
+carries the shape. That converts blockers 1, 2, 5 and 6 from interface
+decisions into thirty lines of test harness.
+
+Two things the adapter cannot fix, and both are cheap and additive, so §4.1
+takes them: `Stat` gains `rev` (the column already exists in `fs_nodes`), and
+the filesystem takes an injected clock. Together they recover 6 more cases and
+every `mtime` assertion.
+
+Drop `writeBuffer.test.ts` (344 lines) with the buffer — but note the buffer's
+reach is wider than one file: **56 cases across 6 files** test it, including 15
+in `provider.test.ts:669-916`.
+
+**Budgeted honestly: we inherit roughly 230 of 270 in-scope cases after the
+adapter, and hand-port or discard the remaining ~40.** That is a real gate and
+worth having. It is not the free 4,330 lines this section originally claimed.
 
 Attribution: a `LICENSES/` entry and file headers naming
 `cloudflare/computer`, MIT, matching how `src/core/diff/` and the dgit-derived
@@ -677,6 +716,12 @@ export interface Stat {
   mtime: number;
   ino: number;
   nlink: number;
+  /**
+   * `fs_meta.rev` as of this entry's last mutation. Free — the column is
+   * already on `fs_nodes` (§3.3) — and six inherited conformance cases
+   * assert on it.
+   */
+  rev: number;
   /** Symlinks only. */
   target: string | null;
   /**
@@ -749,6 +794,15 @@ export interface RemoveOptions {
 // ---------------------------------------------------------------
 // The interface
 // ---------------------------------------------------------------
+
+export interface FilesystemOptions {
+  /**
+   * Milliseconds. Injected so tests can pin `mtime`; dofs threads the same
+   * thing as a trailing argument on every mutator, and every inherited
+   * timestamp assertion depends on it. Defaults to `Date.now`.
+   */
+  now?: () => number;
+}
 
 export interface Filesystem {
   /** The database this filesystem lives in. Shared with the git layer. */
