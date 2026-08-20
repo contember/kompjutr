@@ -40,6 +40,8 @@ export {
   formatPorcelainV2,
   formatShort,
   type StatusDetail,
+  status,
+  statusStream,
 } from "./core/ops/status.js";
 export { Repository } from "./core/repository.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";

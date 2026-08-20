@@ -11,10 +11,17 @@ import { ZERO_OID } from "../bytes.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
+import { matchesPaths, stageZero, type TargetEntry, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
-import { hashWorktreePath, indexMatchesStat, walkWorktree } from "./worktree-io.js";
+import { treeStream } from "./tree-stream.js";
+import {
+  hashWorktreePath,
+  indexMatchesStat,
+  walkWorktree,
+  walkWorktreeStream,
+} from "./worktree-io.js";
 
 /** A mode column in porcelain v2, and the mode of an absent side. */
 const ABSENT_MODE = "000000";
@@ -55,19 +62,63 @@ export function status(
   worktree: Worktree,
   options: StatusOptions = {},
 ): StatusDetail[] {
-  const head = treeEntries(repo, repo.headTree());
-  const index = stagedIndex(repo);
-  const rows: StatusDetail[] = [];
+  // Sorted over the rows, which is the output — a collapsed `dir/` entry
+  // does not sort where the file that produced it did.
+  return [...statusStream(repo, worktree, options)].sort((left, right) =>
+    left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+  );
+}
 
-  const tracked = new Set<string>([...head.keys(), ...index.keys()]);
-  for (const path of [...tracked].sort()) {
-    if (!matchesPaths(path, options.paths)) continue;
-    const row = trackedRow(repo, worktree, path, head.get(path), index.get(path));
-    if (row !== null) rows.push(row);
-  }
+/**
+ * The same rows, lazily. HEAD, the index and the working tree are all
+ * path-ordered, so one three-way merge answers every path with one item of
+ * state per side instead of two maps and a materialised walk.
+ *
+ * What is still proportional to the repository: the set of directories that
+ * hold something tracked, which `-unormal` collapsing has to know before it
+ * can decide, and which is bounded by directories rather than by files.
+ */
+export function* statusStream(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusOptions = {},
+): Generator<StatusDetail> {
+  const collapse = (options.untrackedFiles ?? "normal") === "normal";
+  const trackedDirs = collapse ? trackedDirectories(repo) : new Set<string>();
+  const tracked = new Set<string>();
+  let collapsed: string | null = null;
 
-  for (const path of untrackedEntries(repo, worktree, index, options)) {
-    rows.push({
+  for (const row of joinSorted3(
+    treeStream(repo, repo.headTree()),
+    stageZero(repo.store.indexScan()),
+    worktreeFiles(repo, worktree, options),
+    { a: (entry) => entry.path, b: (entry) => entry.path, c: (path: string) => path },
+  )) {
+    if (row.a !== undefined || row.b !== undefined) {
+      tracked.add(row.path);
+      if (matchesPaths(row.path, options.paths)) {
+        const detail = trackedRow(repo, worktree, row.path, row.a, row.b);
+        if (detail !== null) yield detail;
+      }
+      // A tracked path is never also untracked, whatever is on disk.
+      continue;
+    }
+    if (row.c === undefined) continue;
+
+    let path = row.path;
+    if (collapse) {
+      if (collapsed !== null && path.startsWith(`${collapsed}/`)) continue;
+      const directory = shallowestUntrackedDirectory(path, trackedDirs);
+      if (directory !== null && matchesPaths(directory, options.paths)) {
+        collapsed = directory;
+        path = `${directory}/`;
+      }
+    }
+    if (!matchesPaths(path, options.paths) && !matchesPaths(row.path, options.paths)) continue;
+    // git hides an untracked entry that names an index path — a tracked file
+    // replaced by a directory is a deletion, not a new directory.
+    if (tracked.has(stripSlash(path))) continue;
+    yield {
       path,
       index: " ",
       worktree: "?",
@@ -76,12 +127,8 @@ export function status(
       worktreeMode: ABSENT_MODE,
       headOid: ZERO_OID,
       indexOid: ZERO_OID,
-    });
+    };
   }
-
-  // Stable, so a path that is both staged-deleted and untracked keeps the
-  // tracked row first, exactly as git orders the two lines.
-  return rows.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
 function trackedRow(
@@ -137,37 +184,12 @@ function worktreeState(
   return { code: " ", mode };
 }
 
-/**
- * Untracked paths, with git's `-unormal` collapsing: a directory holding
- * no tracked path at all is reported as `dir/` rather than file by file.
- */
-function untrackedEntries(
+function worktreeFiles(
   repo: Repository,
   worktree: Worktree,
-  index: Map<string, IndexEntry>,
   options: StatusOptions,
-): string[] {
-  const files = worktreeFiles(repo, worktree, options);
-  const collapse = (options.untrackedFiles ?? "normal") === "normal";
-  const tracked = trackedDirectories(index);
-  const entries = new Set<string>();
-  for (const file of files) {
-    if (index.has(file)) continue;
-    let entry = file;
-    if (collapse) {
-      const directory = shallowestUntrackedDirectory(file, tracked);
-      if (directory !== null && matchesPaths(directory, options.paths)) entry = `${directory}/`;
-    }
-    // git hides an untracked entry that names an index path — a tracked
-    // file replaced by a directory is a deletion, not a new directory.
-    if (index.has(stripSlash(entry))) continue;
-    entries.add(entry);
-  }
-  return [...entries].sort();
-}
-
-function worktreeFiles(repo: Repository, worktree: Worktree, options: StatusOptions): string[] {
-  return walkWorktree(worktree, repo.root, {
+): Generator<string> {
+  return walkWorktreeStream(worktree, repo.root, {
     excludeRoots: options.excludeRoots,
     paths: options.paths,
     ignores: options.ignores ?? loadIgnoreMatcher(worktree, repo.root),
@@ -175,13 +197,19 @@ function worktreeFiles(repo: Repository, worktree: Worktree, options: StatusOpti
   });
 }
 
-/** Every directory that has a tracked path somewhere beneath it. */
-function trackedDirectories(index: Map<string, IndexEntry>): Set<string> {
+/**
+ * Every directory that has a tracked path somewhere beneath it. Collapsing
+ * needs this before it reaches the first untracked file, and the answer can
+ * lie later in path order, so it cannot come from the merge itself. Bounded
+ * by distinct directories, not by tracked files.
+ */
+function trackedDirectories(repo: Repository): Set<string> {
   const directories = new Set<string>();
-  for (const path of index.keys()) {
-    const parts = path.split("/");
-    for (let depth = 1; depth < parts.length; depth++)
+  for (const entry of repo.store.indexScan()) {
+    const parts = entry.path.split("/");
+    for (let depth = 1; depth < parts.length; depth++) {
       directories.add(parts.slice(0, depth).join("/"));
+    }
   }
   return directories;
 }
@@ -199,9 +227,10 @@ function stripSlash(path: string): string {
   return path.endsWith("/") ? path.slice(0, -1) : path;
 }
 
+/** O(tracked). Only `statusMatrix`, which is not on the client surface, still needs it. */
 function stagedIndex(repo: Repository): Map<string, IndexEntry> {
   const index = new Map<string, IndexEntry>();
-  for (const entry of repo.store.indexEntries()) {
+  for (const entry of repo.store.indexScan()) {
     if (entry.stage === 0) index.set(entry.path, entry);
   }
   return index;
@@ -225,7 +254,7 @@ export function statusMatrix(
 ): StatusRow[] {
   const head = treeEntries(repo, repo.headTree());
   const index = stagedIndex(repo);
-  const present = new Set(worktreeFiles(repo, worktree, options));
+  const present = new Set<string>(worktreeFiles(repo, worktree, options));
 
   const paths = new Set<string>([...head.keys(), ...index.keys(), ...present]);
   const rows: StatusRow[] = [];
@@ -333,13 +362,13 @@ export function clean(repo: Repository, worktree: Worktree, options: CleanOption
     excludeRoots: options.excludeRoots,
     ignores,
   };
-  const collapsed = untrackedEntries(repo, worktree, index, statusOptions);
+  const collapsed = untrackedEntries(repo, worktree, statusOptions);
   if (options.directories !== true) {
     const files = collapsed.filter((entry) => !entry.endsWith("/"));
     return removeAll(repo, worktree, files, options);
   }
 
-  const visible = new Set(worktreeFiles(repo, worktree, statusOptions));
+  const visible = new Set<string>(worktreeFiles(repo, worktree, statusOptions));
   const everything = walkWorktree(worktree, repo.root, {
     excludeRoots: options.excludeRoots,
     paths: options.paths,
@@ -349,6 +378,15 @@ export function clean(repo: Repository, worktree: Worktree, options: CleanOption
   const untracked = [...visible].filter((path) => !index.has(path));
   const entries = collapsed.flatMap((entry) => expandAroundIgnored(entry, untracked, ignored));
   return removeAll(repo, worktree, entries.sort(), options);
+}
+
+/** The untracked half of `status`, which is what `clean` acts on. */
+function untrackedEntries(repo: Repository, worktree: Worktree, options: StatusOptions): string[] {
+  const out: string[] = [];
+  for (const row of statusStream(repo, worktree, options)) {
+    if (row.worktree === "?") out.push(row.path);
+  }
+  return out.sort();
 }
 
 /**
