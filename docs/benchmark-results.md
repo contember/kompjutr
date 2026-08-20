@@ -103,7 +103,8 @@ for a 2,000-file commit — which is the price of the bound.
 ## Not measured
 
 - Anything inside a real Durable Object.
-- `clone`/`fetch` against a remote, which the harness can run but this sweep did
-  not.
 - Repositories with large individual files, where the streaming object paths
   matter and where 4 KB fixtures say nothing.
+
+Real repositories and `clone` are in `docs/benchmark-macro.md`, which replays
+the reference experiment's fixtures and operations against both clients.
