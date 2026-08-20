@@ -38,10 +38,38 @@ So `add --all` over a whole repository has an irreducible floor of roughly
 **150 ms** (hashing 24 MB), and today pays another 835 ms deflating small blobs
 that barely compress. Everything else in its 4.80 s is SQL round trips.
 
-**0.1 s is reachable for `status`, `diffSummary`, `commit` and `log`. It is not
-reachable for a cold `add --all` or `clone` of a 24 MB repository** — hashing and
-moving the bytes sets the floor. Targets below say so per operation rather than
-claiming one number.
+**0.1 s is reachable for `status`, `diffSummary` and `log`. It is not reachable
+for a cold `add --all` or `clone` of a 24 MB repository** — hashing and moving
+the bytes sets the floor. `commit` should land near 0.1 s but its floor is
+deflating the tree objects, not SQL. Targets below say so per operation rather
+than claiming one number.
+
+## Statements and wall time are two different levers
+
+Measured: writing 10,000 index rows one statement at a time takes 35 ms in
+`node:sqlite`; the same rows batched through `json_each` take 38 ms in **two**
+statements. A 5,000-fold statement reduction and no time saved at all, because
+`node:sqlite` reuses a prepared statement for about 3.5 µs a call.
+
+That does not make batching pointless — it makes the two targets separate:
+
+- **Statement count is the Durable Object metric.** Every `sql.exec` there
+  crosses into the storage layer and is billed by rows read and written. This is
+  why the reference report treats statements as primary and refuses to treat
+  in-Worker wall time as a duration at all.
+- **Wall time only moves when work disappears.** The `scan` moves it — 1.2 s to
+  36 ms — because it stops resolving 9,329 paths from the root. Batching object
+  writes will move statements from 16,542 to about 30 and wall time much less.
+
+So the plan targets both, separately, and does not claim that batching alone
+makes anything faster in this harness.
+
+Batching also avoids the bound-variable ceiling entirely where the rows carry no
+blobs: `INSERT INTO … SELECT json_extract(j.value, '$.x') … FROM json_each(?) j
+WHERE true ON CONFLICT …` is one statement with two parameters whatever the
+batch size. (`WHERE true` is required — without it SQLite cannot parse the
+`ON CONFLICT`.) Object chunks carry BLOBs, which JSON cannot hold cheaply, so
+they use multi-row `VALUES` under a byte cap instead.
 
 ## Decision that shapes everything
 
