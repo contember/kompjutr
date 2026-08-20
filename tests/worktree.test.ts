@@ -1,8 +1,19 @@
 import { describe, expect, it } from "vitest";
 
-import { walkWorktree, walkWorktreeStream } from "../src/core/ops/worktree-io.js";
+import { fromHex } from "../src/core/bytes.js";
+import { hashObject } from "../src/core/objects.js";
+import { initRepository } from "../src/core/ops/init.js";
+import {
+  dirtyPaths,
+  hashWorktreePaths,
+  type WorktreePath,
+  walkWorktree,
+  walkWorktreeStream,
+} from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
-import { makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
+import type { Worktree } from "../src/core/worktree.js";
+import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
+import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 
 /**
@@ -21,6 +32,26 @@ function pattern(length: number, seed = 0): Uint8Array {
 
 function makeWorktree(): TestWorkspace["worktree"] {
   return makeWorkspace().worktree;
+}
+
+function mutateAfterFirstScan(inner: Worktree, mutate: () => void): Worktree {
+  let armed = true;
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "scan") {
+        return (root: string, options: ScanOptions): ScanEntry[] => {
+          const entries = target.scan(root, options);
+          if (armed) {
+            armed = false;
+            mutate();
+          }
+          return entries;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 describe("worktree ranged I/O", () => {
@@ -202,7 +233,7 @@ describe("walkWorktreeStream", () => {
     expect(walkWorktree(worktree, "/")).toEqual(streamed);
   });
 
-  it("reads one directory at a time rather than the whole tree", () => {
+  it("uses the bulk scan instead of reading directories", () => {
     const { worktree } = makeWorkspace();
     for (let i = 0; i < 20; i++) {
       worktree.makeDirectories([`/d${i}`]);
@@ -213,8 +244,433 @@ describe("walkWorktreeStream", () => {
     const counting = new CountingWorktree(worktree);
     const walk = walkWorktreeStream(counting, "/");
     walk.next();
-    // The root plus the first directory, not all twenty-one.
-    expect(counting.readdirs).toBeLessThanOrEqual(2);
+    expect(counting.readdirs).toBe(0);
     expect([...walk]).toHaveLength(199);
   });
+
+  it("preserves an exact dir0 sibling when pruning a directory", () => {
+    const { worktree } = makeWorkspace();
+    worktree.makeDirectories(["/cut", "/cut0"]);
+    worktree.writeFiles([
+      ...Array.from({ length: 1001 }, (_, index) => ({
+        path: `/cut/hidden-${index.toString().padStart(4, "0")}.txt`,
+        bytes: new Uint8Array([1]),
+      })),
+      { path: "/cut0/kept.txt", bytes: new Uint8Array([2]) },
+    ]);
+
+    expect(walkWorktree(worktree, "/", { excludeRoots: ["/cut"] })).toEqual(["cut0/kept.txt"]);
+    expect(
+      walkWorktree(worktree, "/", {
+        ignores: { ignores: (path) => path === "cut" },
+      }),
+    ).toEqual(["cut0/kept.txt"]);
+    expect(walkWorktree(worktree, "/", { paths: ["cut0"] })).toEqual(["cut0/kept.txt"]);
+  });
+
+  it("prunes 1,001 sibling directories within scan pages", () => {
+    const workspace = makeWorkspace();
+    const directories = Array.from(
+      { length: 1001 },
+      (_, index) => `/s${index.toString().padStart(4, "0")}`,
+    );
+    workspace.worktree.makeDirectories(directories);
+    workspace.worktree.writeFiles(
+      directories.map((directory) => ({
+        path: `${directory}/file.txt`,
+        bytes: new Uint8Array([1]),
+      })),
+    );
+
+    workspace.storage.resetCounters();
+    expect(walkWorktree(workspace.worktree, "/", { paths: ["s1000"] })).toEqual(["s1000/file.txt"]);
+    expect(workspace.storage.statementCount).toBe(5);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1000);
+  });
+
+  it("keeps prefix siblings that sort before a pruned subtree", () => {
+    const { worktree } = makeWorkspace();
+    worktree.makeDirectories(["/cut"]);
+    worktree.writeFiles([
+      { path: "/cut-keep", bytes: new Uint8Array([1]) },
+      { path: "/cut.txt", bytes: new Uint8Array([2]) },
+      { path: "/cut/hidden", bytes: new Uint8Array([3]) },
+      { path: "/cut0", bytes: new Uint8Array([4]) },
+    ]);
+
+    expect(walkWorktree(worktree, "/", { excludeRoots: ["/cut"] })).toEqual([
+      "cut-keep",
+      "cut.txt",
+      "cut0",
+    ]);
+  });
+
+  it("does not jump from a page-ending directory over prefix siblings", () => {
+    const { worktree } = makeWorkspace();
+    worktree.writeFiles(
+      Array.from({ length: 999 }, (_, index) => ({
+        path: `/a${index.toString().padStart(3, "0")}`,
+        bytes: new Uint8Array([1]),
+      })),
+    );
+    worktree.makeDirectories(["/cut"]);
+    worktree.writeFiles([
+      { path: "/cut-keep", bytes: new Uint8Array([2]) },
+      { path: "/cut/hidden", bytes: new Uint8Array([3]) },
+      { path: "/cut0", bytes: new Uint8Array([4]) },
+    ]);
+
+    const paths = walkWorktree(worktree, "/", { excludeRoots: ["/cut"] });
+    expect(paths).toHaveLength(1001);
+    expect(paths.slice(-2)).toEqual(["cut-keep", "cut0"]);
+  });
+
+  it("walks 9,329 files in at most 15 statements with exact path parity", () => {
+    const measure = (
+      directoryCount: number,
+      fileCount: number,
+    ): { statements: number; paths: string[]; expected: string[] } => {
+      const workspace = makeWorkspace();
+      const directories = Array.from(
+        { length: directoryCount },
+        (_, index) => `/d${index.toString().padStart(4, "0")}`,
+      );
+      workspace.worktree.makeDirectories(directories);
+
+      const byte = new Uint8Array([120]);
+      const expected: string[] = [];
+      workspace.worktree.writeFiles(
+        Array.from({ length: fileCount }, (_, index) => {
+          const directory = index % directoryCount;
+          const generation = Math.floor(index / directoryCount);
+          const path = `d${directory.toString().padStart(4, "0")}/f${generation
+            .toString()
+            .padStart(4, "0")}.txt`;
+          expected.push(path);
+          return { path: `/${path}`, bytes: byte };
+        }),
+      );
+
+      workspace.storage.resetCounters();
+      const paths = walkWorktree(workspace.worktree, "/");
+      return { statements: workspace.storage.statementCount, paths, expected };
+    };
+
+    const small = measure(335, 933);
+    const large = measure(3346, 9329);
+    // One canonical-root lookup, scan setup, then one statement per page.
+    expect(small.statements).toBe(4);
+    expect(large.statements).toBe(15);
+    expect(large.statements).toBeLessThanOrEqual(15);
+    expect(large.paths).toEqual(large.expected.sort(comparePaths));
+  });
+
+  it("keeps repo-relative paths when the repository root is a symlink", () => {
+    const workspace = makeWorkspace();
+    workspace.worktree.makeDirectories(["/real"]);
+    workspace.worktree.symlink("/real", "/alias");
+    workspace.worktree.writeFile("/real/file.txt", new TextEncoder().encode("contents\n"));
+    const repo = initRepository(workspace.context, { dir: "/alias" });
+    expect(walkWorktree(workspace.worktree, repo.root)).toEqual(["file.txt"]);
+  });
 });
+
+describe("batched worktree hashing", () => {
+  function candidates(count: number): {
+    workspace: ReturnType<typeof makeRepo>;
+    paths: WorktreePath[];
+  } {
+    const workspace = makeRepo("/");
+    const encoder = new TextEncoder();
+    workspace.worktree.writeFiles(
+      Array.from({ length: count }, (_, index) => ({
+        path: `/f${index.toString().padStart(4, "0")}.txt`,
+        bytes: encoder.encode(`contents ${index}\n`),
+      })),
+    );
+    const paths = workspace.worktree
+      .scan("/", { filesOnly: true, limit: count + 1 })
+      .map((stat) => ({ path: stat.path.slice(1), stat }));
+    return { workspace, paths };
+  }
+
+  it("reads and hashes a growing path set in one bounded batch", () => {
+    const small = candidates(20);
+    small.workspace.storage.resetCounters();
+    const smallHashes = hashWorktreePaths(
+      small.workspace.repo,
+      small.workspace.worktree,
+      small.paths,
+      { write: false },
+    );
+    const smallStatements = small.workspace.storage.statementCount;
+
+    const large = candidates(200);
+    large.workspace.storage.resetCounters();
+    const largeHashes = hashWorktreePaths(
+      large.workspace.repo,
+      large.workspace.worktree,
+      large.paths,
+      { write: false },
+    );
+    const largeStatements = large.workspace.storage.statementCount;
+
+    expect(smallHashes).toHaveLength(20);
+    expect(largeHashes).toHaveLength(200);
+    expect(largeHashes.get("f0123.txt")?.oid).toBe(
+      hashObject("blob", new TextEncoder().encode("contents 123\n")),
+    );
+    expect(smallStatements).toBe(6);
+    expect(largeStatements).toBe(6);
+  });
+
+  it("continues until every readFiles budget page is hashed", () => {
+    const workspace = makeRepo("/");
+    const bodies = Array.from({ length: 4 }, (_, index) => pattern(CHUNK - 1, index));
+    workspace.worktree.writeFiles(
+      bodies.map((bytes, index) => ({ path: `/large-small-${index}.bin`, bytes })),
+    );
+    const paths = workspace.worktree
+      .scan("/", { filesOnly: true, limit: 5 })
+      .map((stat) => ({ path: stat.path.slice(1), stat }));
+    const hashes = hashWorktreePaths(workspace.repo, workspace.worktree, paths, { write: false });
+    expect(hashes).toHaveLength(4);
+    for (let index = 0; index < bodies.length; index++) {
+      expect(hashes.get(`large-small-${index}.bin`)?.oid).toBe(hashObject("blob", bodies[index]!));
+    }
+  });
+
+  it("stores small blobs through one object batch", () => {
+    const { workspace, paths } = candidates(200);
+    workspace.storage.resetCounters();
+    const hashes = hashWorktreePaths(workspace.repo, workspace.worktree, paths);
+    expect(hashes).toHaveLength(200);
+    expect(workspace.storage.statementCount).toBeLessThan(15);
+    expect(workspace.repo.readBlob(hashes.get("f0123.txt")?.oid ?? "")).toEqual(
+      new TextEncoder().encode("contents 123\n"),
+    );
+  });
+
+  it("hashes a symlink from scan metadata without another filesystem read", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.symlink("target.txt", "/link.txt");
+    const stat = workspace.worktree.scan("/", { filesOnly: true, limit: 2 })[0];
+    if (stat === undefined) throw new Error("link.txt was not scanned");
+    const counting = new CountingWorktree(workspace.worktree);
+    const hashes = hashWorktreePaths(workspace.repo, counting, [{ path: "link.txt", stat }], {
+      write: false,
+    });
+    expect(hashes.get("link.txt")?.oid).toBe(
+      hashObject("blob", new TextEncoder().encode("target.txt")),
+    );
+    expect(counting.reads).toBe(0);
+    expect(counting.rangeReads).toBe(0);
+  });
+});
+
+describe("dirtyPaths content identity", () => {
+  it("does no filesystem SQL for an index with no eligible entry", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.indexPut({
+      path: "conflict.txt",
+      stage: 1,
+      mode: 0o100644,
+      oid: "1".repeat(40),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
+    expect(filesystemStatements(workspace.storage.histogram)).toBe(0);
+
+    workspace.repo.store.indexPut({
+      path: "tracked.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid: "2".repeat(40),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree, ["elsewhere"])).toEqual([]);
+    expect(filesystemStatements(workspace.storage.histogram)).toBe(0);
+  });
+
+  it("compares identities under a symlink repository root", () => {
+    const workspace = makeWorkspace();
+    workspace.worktree.makeDirectories(["/real"]);
+    workspace.worktree.symlink("/real", "/alias");
+    const repo = initRepository(workspace.context, { dir: "/alias" });
+    const bytes = new TextEncoder().encode("unchanged\n");
+    const oid = hashObject("blob", bytes);
+    workspace.worktree.writeFiles([{ path: "/real/file.txt", bytes, contentId: fromHex(oid) }]);
+    repo.store.indexPut({
+      path: "file.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(repo, workspace.worktree)).toEqual([]);
+    expect(contentReadStatements(workspace.storage.histogram)).toBe(0);
+  });
+
+  it("bulk-reads unresolved index entries before hashing them", () => {
+    const workspace = makeRepo("/");
+    const encoder = new TextEncoder();
+    for (let index = 0; index < 200; index++) {
+      const path = `f${index.toString().padStart(4, "0")}.txt`;
+      const bytes = encoder.encode(`contents ${index}\n`);
+      workspace.worktree.writeFile(`/${path}`, bytes);
+      workspace.repo.store.indexPut({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: hashObject("blob", bytes),
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
+    expect(workspace.storage.statementCount).toBe(9);
+  });
+
+  it("keeps 9,329 identity and unresolved comparisons below 1,000 statements", () => {
+    const workspace = makeRepo("/");
+    const bytes = new Uint8Array([120]);
+    const oid = hashObject("blob", bytes);
+    const paths = Array.from(
+      { length: 9329 },
+      (_, index) => `f${index.toString().padStart(4, "0")}.txt`,
+    );
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes, contentId: fromHex(oid) })),
+    );
+    workspace.repo.store.indexReplace(
+      paths.map((path) => ({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      })),
+    );
+
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
+    const identities = workspace.storage.statementCount;
+
+    workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
+    const unresolved = workspace.storage.statementCount;
+
+    expect(identities).toBe(96);
+    expect(unresolved).toBe(126);
+  });
+
+  it("reads no content when checkout supplied the indexed blob identity", () => {
+    const workspace = makeRepo("/");
+    const bytes = new TextEncoder().encode("unchanged\n");
+    const oid = hashObject("blob", bytes);
+    workspace.worktree.writeFiles([{ path: "/clean.txt", bytes, contentId: fromHex(oid) }]);
+    const stat = workspace.worktree.stat("/clean.txt");
+    if (stat === null) throw new Error("clean.txt was not written");
+    workspace.repo.store.indexPut({
+      path: "clean.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
+    expect(contentReadStatements(workspace.storage.histogram)).toBe(0);
+
+    // Negative control: a plain write clears the identity and must read the
+    // changed bytes before it can report the path.
+    workspace.worktree.writeFile("/clean.txt", new TextEncoder().encode("changed\n"));
+    workspace.storage.resetCounters();
+    expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual(["clean.txt"]);
+    expect(contentReadStatements(workspace.storage.histogram)).toBeGreaterThan(0);
+  });
+
+  it("does not trust a symlink target after the path disappears", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.symlink("target.txt", "/link.txt");
+    workspace.repo.store.indexPut({
+      path: "link.txt",
+      stage: 0,
+      mode: 0o120000,
+      oid: hashObject("blob", new TextEncoder().encode("target.txt")),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    const racing = mutateAfterFirstScan(workspace.worktree, () =>
+      workspace.worktree.unlink("/link.txt"),
+    );
+    expect(dirtyPaths(workspace.repo, racing)).toEqual(["link.txt"]);
+  });
+
+  it.each(["removed", "grown", "shrunk"])(
+    "reports a %s large file dirty without throwing",
+    (mutation) => {
+      const workspace = makeRepo("/");
+      const original = pattern(CHUNK + 1, 17);
+      const oid = hashObject("blob", original);
+      workspace.worktree.writeFile("/large.bin", original);
+      workspace.repo.store.indexPut({
+        path: "large.bin",
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+      const racing = mutateAfterFirstScan(workspace.worktree, () => {
+        if (mutation === "removed") workspace.worktree.unlink("/large.bin");
+        else if (mutation === "grown") {
+          workspace.worktree.writeRange("/large.bin", new Uint8Array([1]), original.length);
+        } else {
+          workspace.worktree.writeFile("/large.bin", pattern(CHUNK - 1, 23));
+        }
+      });
+      expect(dirtyPaths(workspace.repo, racing)).toEqual(["large.bin"]);
+    },
+  );
+});
+
+function contentReadStatements(histogram: Map<string, number>): number {
+  let count = 0;
+  for (const [statement, calls] of histogram) {
+    if (statement.includes("FROM fs_chunks")) count += calls;
+  }
+  return count;
+}
+
+function filesystemStatements(histogram: Map<string, number>): number {
+  let count = 0;
+  for (const [statement, calls] of histogram) {
+    if (/\bfs_(?:paths|nodes|chunks|meta)\b/.test(statement)) count += calls;
+  }
+  return count;
+}
