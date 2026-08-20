@@ -85,6 +85,26 @@ a 9,329-file tree. Lifting that needs direct `vfs_*` writes, which is a separate
 decision with a real risk of corrupting a user's filesystem, and is proposed as a
 gated wave 4 rather than folded in silently.
 
+## The one behaviour this changes
+
+DOFS keeps an in-memory write buffer, keyed by inode, for files opened through
+the descriptor API (`openSync` / `writeSync`), and a pending entry with a
+negative inode for a file that has been created but not flushed. Its own read
+paths consult it — `statSync`, `readdirSync`, `readFileSync` all check
+`getWriteBuffer` before touching a table. A direct SQL read does not, and cannot:
+the cache is a module-level `WeakMap` with no exported accessor.
+
+So after this change, a file that some other process is holding open with
+unflushed bytes is seen by git in its last committed state, not its buffered one.
+A pending file that has no `vfs_nodes` row yet is not seen at all.
+
+This is a real behaviour difference and it is worth stating rather than
+discovering. It is narrow — `ws.fs.writeFile` writes straight through in a
+transaction and is unaffected; only a descriptor held open across a git command
+is exposed — and a git command racing an open writer is already undefined. But
+it is a difference, and it is the price of the read path. The alternative,
+checking every path through the public API, is the 202,191 statements.
+
 ## The ideal SQL, per command
 
 ### The one primitive everything else uses: `scan`
