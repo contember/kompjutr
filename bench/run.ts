@@ -33,12 +33,25 @@ interface Options {
   smoke: boolean;
   /** Working memory allowed above the runner's own footprint, in MB. 0 disables the cap. */
   budgetMb: number;
+  counts: number[] | null;
+  scenarios: string[] | null;
+}
+
+function listOption(argv: string[], name: string): string[] | null {
+  const found = argv.find((arg) => arg.startsWith(`--${name}=`));
+  if (found === undefined) return null;
+  return found.slice(name.length + 3).split(",");
 }
 
 function parseOptions(argv: string[]): Options {
-  const smoke = argv.includes("--smoke");
   const budgetArg = argv.find((arg) => arg.startsWith("--budget="));
-  return { smoke, budgetMb: budgetArg === undefined ? 0 : Number(budgetArg.split("=")[1]) };
+  const counts = listOption(argv, "counts");
+  return {
+    smoke: argv.includes("--smoke"),
+    budgetMb: budgetArg === undefined ? 0 : Number(budgetArg.split("=")[1]),
+    counts: counts === null ? null : counts.map(Number),
+    scenarios: listOption(argv, "scenarios"),
+  };
 }
 
 /**
@@ -155,10 +168,13 @@ function table(outcomes: Outcome[]): string {
 const options = parseOptions(process.argv.slice(2));
 const backends: Backend[] = ["dofs", "sqlite"];
 const shapes: Shape[] = ["flat", "deep"];
-const counts = options.smoke ? [50, 200] : [100, 250, 500, 1000, 2500, 5000, 10000];
-const scenarios = options.smoke
-  ? ["add-commit", "status-clean"]
-  : ["add-commit", "status-clean", "status-dirty", "checkout", "log"];
+const counts =
+  options.counts ?? (options.smoke ? [50, 200] : [100, 250, 500, 1000, 2500, 5000, 10000]);
+const scenarios =
+  options.scenarios ??
+  (options.smoke
+    ? ["add-commit", "status-clean"]
+    : ["add-commit", "status-clean", "status-dirty", "checkout", "log"]);
 
 const outcomes: Outcome[] = [];
 for (const scenario of scenarios) {
