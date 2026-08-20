@@ -32,6 +32,12 @@ interface Sample {
   /** Workspace path, not the path on disk. */
   path: string;
   content: Uint8Array;
+  /**
+   * Carried explicitly: `writeFile` without a mode resets an existing file to
+   * 0644, and losing the executable bit would leave the tree modified after
+   * the restore.
+   */
+  mode: number;
 }
 
 // One process runs one scenario, so the fixture a scenario resolved in
@@ -55,7 +61,7 @@ function collectSample(dir: string, entries: readonly FixtureEntry[]): Sample[] 
     if (!TEXT_FILE.test(entry.path)) continue;
     const content = new Uint8Array(readFileSync(join(dir, entry.path)));
     if (content.byteLength > MAX_SAMPLE_BYTES) continue;
-    collected.push({ path: `${REPO}/${entry.path}`, content });
+    collected.push({ path: `${REPO}/${entry.path}`, content, mode: entry.mode & 0o777 });
   }
   if (collected.length < SAMPLE_FILES) {
     throw new Error(`fixture has ${collected.length} sampleable files, needs ${SAMPLE_FILES}`);
@@ -71,8 +77,13 @@ function changed(content: Uint8Array, index: number): Uint8Array {
   return out;
 }
 
-function expectClean(rows: readonly unknown[], label: string): void {
-  if (rows.length !== 0) throw new Error(`${label} reported ${rows.length} entries, expected 0`);
+function expectClean(rows: readonly { path: string }[], label: string): void {
+  if (rows.length === 0) return;
+  const shown = rows
+    .slice(0, 5)
+    .map((row) => row.path)
+    .join(", ");
+  throw new Error(`${label} reported ${rows.length} entries, expected 0: ${shown}`);
 }
 
 export const MACRO: Scenario[] = [
@@ -141,7 +152,9 @@ export const MACRO: Scenario[] = [
         name: "git.diffSummary",
         async before({ harness }) {
           for (const [index, entry] of sample.entries()) {
-            await harness.workspace.fs.writeFile(entry.path, changed(entry.content, index));
+            await harness.workspace.fs.writeFile(entry.path, changed(entry.content, index), {
+              mode: entry.mode,
+            });
           }
         },
         async run({ harness }) {
@@ -155,7 +168,7 @@ export const MACRO: Scenario[] = [
         name: "git.status (loose)",
         async before({ harness }) {
           for (const entry of sample) {
-            await harness.workspace.fs.writeFile(entry.path, entry.content);
+            await harness.workspace.fs.writeFile(entry.path, entry.content, { mode: entry.mode });
           }
         },
         async run({ harness }) {
