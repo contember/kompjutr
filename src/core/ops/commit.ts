@@ -38,7 +38,8 @@ export function commit(
   const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
   const { author, committer } = resolveIdentity(context, repo, options, amended);
 
-  const tree = buildTree(repo, repo.store.indexEntries());
+  // A paged scan, so the index never exists as one array alongside the build.
+  const tree = buildTree(repo, repo.store.indexScan());
   const oid = repo.store.write(
     "commit",
     serializeCommit({ tree, parent, author, committer, message: cleanMessage(options.message) }),

@@ -7,10 +7,12 @@ import type { GitContext } from "../context.js";
 import { GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
-import { checkoutTree, matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
+import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
 import { treeOf } from "./reads.js";
-import { dirtyPaths } from "./worktree-io.js";
+import { treeStream } from "./tree-stream.js";
+import { hashWorktreePath, indexMatchesStat } from "./worktree-io.js";
 
 const HEADS = "refs/heads/";
 const TAGS = "refs/tags/";
@@ -221,50 +223,57 @@ interface CheckoutBlockers {
 function localChangesInTheWay(
   repo: Repository,
   worktree: Worktree,
-  tree: string,
+  tree: string | null,
   paths: string[] | undefined,
   prune: boolean,
 ): CheckoutBlockers {
-  const target = treeEntries(repo, tree);
-  const head = treeEntries(repo, repo.headTree());
-  const indexed = new Map<string, IndexEntry>();
-  for (const entry of repo.store.indexEntries()) {
-    if (entry.stage === 0) indexed.set(entry.path, entry);
-  }
-
-  const touched = new Set<string>();
-  const staged = new Set<string>();
+  const tracked: string[] = [];
   const untracked: string[] = [];
 
-  for (const entry of target.values()) {
-    if (!matchesPaths(entry.path, paths)) continue;
-    const existing = indexed.get(entry.path);
-    if (existing === undefined) {
+  // Target tree, HEAD tree and index are all path-ordered, so one merge
+  // answers every question this used to need three maps and a second index
+  // read to answer. What is retained is the blockers themselves.
+  for (const row of joinSorted3(
+    treeStream(repo, tree),
+    treeStream(repo, repo.headTree()),
+    stageZero(repo.store.indexScan()),
+    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
+  )) {
+    const target = row.a;
+    const existing = row.c;
+    if (!matchesPaths(row.path, paths)) continue;
+
+    if (target === undefined) {
+      // Only the checkout that prunes would remove this path.
+      if (!prune || existing === undefined) continue;
+    } else if (existing === undefined) {
       // Not tracked here. If something is already on disk at that path,
       // writing the target over it would destroy it unasked.
-      if (worktree.stat(joinPath(repo.root, entry.path)) !== null) untracked.push(entry.path);
+      if (worktree.stat(joinPath(repo.root, row.path)) !== null) untracked.push(row.path);
+      continue;
+    } else if (existing.oid === target.oid && existing.mode === Number.parseInt(target.mode, 8)) {
       continue;
     }
-    if (existing.oid === entry.oid && existing.mode === Number.parseInt(entry.mode, 8)) continue;
-    touched.add(entry.path);
-    if (differsFromHead(existing, head.get(entry.path))) staged.add(entry.path);
-  }
 
-  if (prune) {
-    for (const [path, existing] of indexed) {
-      if (target.has(path) || !matchesPaths(path, paths)) continue;
-      touched.add(path);
-      if (differsFromHead(existing, head.get(path))) staged.add(path);
+    if (existing === undefined) continue;
+    if (differsFromHead(existing, row.b) || dirtyOnDisk(repo, worktree, existing)) {
+      tracked.push(row.path);
     }
   }
+  // The merge already emits in path order.
+  return { tracked, untracked };
+}
 
-  const tracked = new Set(staged);
-  if (touched.size > 0) {
-    for (const path of dirtyPaths(repo, worktree)) {
-      if (touched.has(path) && worktree.stat(joinPath(repo.root, path)) !== null) tracked.add(path);
-    }
-  }
-  return { tracked: [...tracked].sort(), untracked: untracked.sort() };
+/**
+ * Does the working tree disagree with this index entry? A path missing from
+ * disk does not count: git restores a locally deleted file without complaint.
+ */
+function dirtyOnDisk(repo: Repository, worktree: Worktree, entry: IndexEntry): boolean {
+  const stat = worktree.stat(joinPath(repo.root, entry.path));
+  if (stat === null) return false;
+  if (indexMatchesStat(entry, stat)) return false;
+  const hashed = hashWorktreePath(repo, worktree, entry.path, { write: false });
+  return hashed === null || hashed.oid !== entry.oid;
 }
 
 function differsFromHead(entry: IndexEntry, head: TargetEntry | undefined): boolean {

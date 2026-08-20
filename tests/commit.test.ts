@@ -17,8 +17,13 @@ import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspac
 /** The identity `GitFixture` commits with. */
 const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 
-/** SQL statements one 2,000-file commit costs. Deterministic; see the scale test. */
-const SCALE_STATEMENTS = 1017;
+/**
+ * SQL statements one 2,000-file commit costs. Deterministic; see the scale
+ * test. Four of them are index pages: the scan reads 512 rows at a time so
+ * the index never exists as one array, which is three statements more than
+ * the single unbounded read it replaced.
+ */
+const SCALE_STATEMENTS = 1020;
 
 const fixtures: GitFixture[] = [];
 
@@ -420,8 +425,8 @@ describe("scale", () => {
 
     expect(workspace.repo.readCommit(ours).tree).toBe(fixture.git("rev-parse", "HEAD^{tree}"));
     expect(ours).toBe(theirs);
-    // Deterministic: 201 trees plus the commit, and nothing per tracked
-    // file beyond the single row-per-file index read.
+    // Deterministic: 201 trees plus the commit, and nothing per tracked file
+    // beyond the four paged index reads.
     expect(statements).toBe(SCALE_STATEMENTS);
   });
 });

@@ -5,6 +5,7 @@ import type { IndexEntry } from "../../sqlite/store.js";
 import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { joinSorted } from "../streams.js";
 import { fileModeFor, type Worktree } from "../worktree.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 
@@ -51,46 +52,49 @@ export function checkoutTree(
   treeOid: string | null,
   options: CheckoutOptions = {},
 ): void {
-  const target = treeEntries(repo, treeOid);
-  const current = new Map<string, IndexEntry>();
-  for (const entry of repo.store.indexEntries()) {
-    if (entry.stage === 0) current.set(entry.path, entry);
-  }
-
-  const written: IndexEntry[] = [];
-  for (const entry of target.values()) {
-    if (!matchesPaths(entry.path, options.paths)) continue;
-    if (entry.mode === "160000") continue; // submodules are out of scope
-    const absolute = joinPath(repo.root, entry.path);
-    const existing = current.get(entry.path);
-    const stat = worktree.stat(absolute);
-    const unchanged =
-      existing !== undefined &&
-      existing.oid === entry.oid &&
-      existing.mode === Number.parseInt(entry.mode, 8) &&
-      stat !== null &&
-      stat.size === existing.size &&
-      stat.mtime === existing.mtime;
-    if (unchanged) continue;
-    written.push(writeEntry(repo, worktree, entry));
-  }
-
+  // Target and index are both path-ordered, so one merge answers "what does
+  // this path look like on each side" without either existing as a map.
   const removed: string[] = [];
-  if (options.prune !== false) {
-    for (const [path] of current) {
-      if (target.has(path)) continue;
-      if (!matchesPaths(path, options.paths)) continue;
-      worktree.unlink(joinPath(repo.root, path));
-      removed.push(path);
-    }
-  }
+  repo.store.indexApply((sink) => {
+    for (const row of joinSorted(treeStream(repo, treeOid), stageZero(repo.store.indexScan()), {
+      left: (entry) => entry.path,
+      right: (entry) => entry.path,
+    })) {
+      const entry = row.left;
+      const existing = row.right;
 
-  repo.store.db.transactionSync(() => {
-    for (const path of removed) repo.store.indexRemove(path);
-    for (const entry of written) repo.store.indexPut(entry);
+      if (entry === undefined) {
+        if (existing === undefined || options.prune === false) continue;
+        if (!matchesPaths(existing.path, options.paths)) continue;
+        worktree.unlink(joinPath(repo.root, existing.path));
+        removed.push(existing.path);
+        sink.remove(existing.path);
+        continue;
+      }
+
+      if (!matchesPaths(entry.path, options.paths)) continue;
+      if (entry.mode === "160000") continue; // submodules are out of scope
+      const stat = worktree.stat(joinPath(repo.root, entry.path));
+      const unchanged =
+        existing !== undefined &&
+        existing.oid === entry.oid &&
+        existing.mode === Number.parseInt(entry.mode, 8) &&
+        stat !== null &&
+        stat.size === existing.size &&
+        stat.mtime === existing.mtime;
+      if (unchanged) continue;
+      sink.put(writeEntry(repo, worktree, entry));
+    }
   });
 
   if (removed.length > 0) pruneEmptyDirectories(repo, worktree, removed);
+}
+
+/** Conflict stages are not what a checkout replaces, and never were. */
+export function* stageZero(entries: Iterable<IndexEntry>): Generator<IndexEntry> {
+  for (const entry of entries) {
+    if (entry.stage === 0) yield entry;
+  }
 }
 
 /** Write one tree entry to disk and describe the index row it deserves. */
@@ -130,10 +134,9 @@ function pruneEmptyDirectories(repo: Repository, worktree: Worktree, removed: st
 }
 
 /** Index rows describing a tree exactly, without touching the working tree. */
-export function indexFromTree(repo: Repository, treeOid: string | null): IndexEntry[] {
-  const out: IndexEntry[] = [];
-  for (const entry of treeEntries(repo, treeOid).values()) {
-    out.push({
+export function* indexFromTree(repo: Repository, treeOid: string | null): Generator<IndexEntry> {
+  for (const entry of treeStream(repo, treeOid)) {
+    yield {
       path: entry.path,
       stage: 0,
       mode: Number.parseInt(entry.mode, 8),
@@ -141,9 +144,8 @@ export function indexFromTree(repo: Repository, treeOid: string | null): IndexEn
       size: null,
       mtime: null,
       ino: null,
-    });
+    };
   }
-  return out;
 }
 
 export function isTree(entry: TreeEntry): boolean {

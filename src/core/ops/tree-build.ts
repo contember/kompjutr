@@ -21,13 +21,13 @@ interface OpenDirectory {
  * Write every tree the stage-0 index describes and return the root's oid.
  *
  * `entries` must be in git's byte order over the full path, which is what
- * `RepoStore.indexEntries()` returns: SQLite orders TEXT by UTF-8 bytes,
+ * `RepoStore.indexScan()` yields: SQLite orders TEXT by UTF-8 bytes,
  * and a byte-ordered path list visits each directory contiguously and in
  * exactly the order git's tree rule ("a subtree sorts as `name/`") puts
  * its entries in. Re-sorting here would cost a second full-index pass for
  * nothing.
  */
-export function buildTree(repo: Repository, entries: readonly IndexEntry[]): string {
+export function buildTree(repo: Repository, entries: Iterable<IndexEntry>): string {
   const stack: OpenDirectory[] = [{ name: "", entries: [] }];
   // Segment names of the directories currently open below the root.
   const open: string[] = [];
