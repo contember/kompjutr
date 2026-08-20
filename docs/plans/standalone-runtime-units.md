@@ -164,12 +164,40 @@ accordingly.
 | **F2 — bulk read** | `src/fs/store/read.ts`, `tests/fs/read.test.ts` | `readFiles(paths, {budget})`, `readFile`, `readRange`. P2 from §7.0, paged by `(inode, idx)`. | 24 MB across 9,329 files in ≤ 24 statements; `remaining` set, never a partial file; **an instrumented assertion on maximum result-set size** — "never materialises a 50 MB file whole" is otherwise unobservable. **[R11]** |
 | **F3 — bulk write** | `src/fs/store/write.ts`, `tests/fs/write.test.ts` | `writeFiles(entries, options)`, `makeDirectories(paths)`. P3 from §7.0. | 2,000 files in constant statements plus one per payload budget; round-trip byte-identical; **a non-ASCII path fixture** — §7.0's TEXT/BLOB `substr` trap corrupts silently and only non-ASCII reveals it. |
 | **F4 — remove and rename** | `src/fs/store/remove.ts`, `tests/fs/remove.test.ts` | `removeFiles(paths, options)`, `rename(old, new)`. The range-key rewrite from §3.7. | 5,000-file tree removed in five statements; directory rename in two, `fs_nodes`/`fs_chunks` untouched, **and every descendant path correct afterwards**. |
-| **G6 — git store primitives** | `src/sqlite/store.ts`, `src/sqlite/packs.ts`, `tests/store.test.ts`, `tests/store-stream.test.ts` | A batch write API on `RepoStore` — open, accumulate, flush — plus an existence probe covering loose **and** packed in one query. **Callers are not changed here.** **[R2]** | No statement exceeds 100 bound parameters; a 3,293-object batch flushes in ≤ 15 statements; existing store tests green. |
+| **G6 — git store primitives** | `src/sqlite/store.ts`, `tests/store.test.ts`, `tests/store-stream.test.ts` | A batch write API on `RepoStore` — open, accumulate, flush — plus an existence probe covering loose **and** packed in one query. **Callers are not changed here.** **[R2]** | No statement exceeds 100 bound parameters; a 3,293-object batch flushes in ≤ 15 statements; existing store tests green. |
 
 G6 is deliberately primitives-only. `buildTree` calls `store.write()` once per
 directory close (`src/core/ops/tree-build.ts:59`) and `RepoStore.write()`
-inserts immediately (`src/sqlite/store.ts:259`), so collapsing 3,293 writes
-needs a caller-visible lifecycle. That caller change is G8, in wave F. **[R2]**
+inserts immediately, so collapsing 3,293 writes needs a caller-visible
+lifecycle. That caller change is G8, in wave F. **[R2]**
+
+### Landed
+
+**F1 — `35b00bf`.** 12,675 rows in **13 statements**, query plan pinned, order
+asserted on the adversarial cases. It also found a real bug in the plan's own
+P1 SQL: the range predicate started at `root` rather than `root + "/"`, so
+scanning `/repo/src` returned `/repo/src-extra` and `/repo/src.txt`. Fixed in
+`63c55d0`. The gate was checked against four deliberate mutations of the
+implementation and fires on all four.
+
+**G6 — `273cd6b`.** 3,293 objects in **4 statements**, down from 16,465, with
+a widest binding of 3 parameters. `write()` and `writeStream()` byte-for-byte
+unchanged.
+
+Two things G6 reported rather than did, both correctly:
+
+- **`packs.ts` moved to G5.** `#indexPack` reads `git_pack_objects` back
+  mid-scan through `offsetToOid`, and `#readForBase`/`#drainPending` resolve
+  delta bases from rows just inserted, so deferring those inserts changes
+  ingest semantics. G5 owns the clone path and can batch it together with the
+  base-resolution changes it already needs.
+- **`git_objects.stored` still has no `'raw'` half.** G6 writes the literal
+  `'zlib'` and carries it through the `DO UPDATE` so the column cannot
+  describe bytes it no longer matches, but no compression *choice* exists and
+  `#readLoose` still inflates unconditionally. §7.3's deflate tax is therefore
+  **not** removed, and the work needs an owner — it is in `store.ts`, which
+  G6 has now closed. Assign it before wave F rather than letting G4 discover
+  it mid-flight.
 
 ---
 
