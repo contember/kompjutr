@@ -242,7 +242,9 @@ function minimumHeapMb(
   variant: Variant,
 ): number | null {
   let low = 4;
-  let high = 1024;
+  // A real repository puts the baseline well past a gigabyte, and a ceiling
+  // it cannot reach reports "no number" instead of the number.
+  let high = 4096;
   if (!once(scenario, backend, count, variant, null, high).complete) return null;
   while (low < high) {
     const middle = Math.floor((low + high) / 2);
