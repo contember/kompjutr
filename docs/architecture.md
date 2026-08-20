@@ -98,6 +98,62 @@ bytes go past, so its id is known without ever holding it. That is the one place
 finished stream consumed — pako's incremental `Inflate` can, and is used for
 exactly that.
 
+### Ops read in streams, not in maps
+
+Every op used to open its sources as maps and arrays: the HEAD tree, the target
+tree, the index, the working-tree walk. Four of them were live at once in
+`checkout`, three in `status` and in `diff`. Peak memory followed the number of
+tracked files, and it followed it several times over.
+
+All four sources are ordered by the same key. `git_index` has `(path, stage)` as
+its primary key and SQLite orders TEXT by UTF-8 bytes; git's tree order, where a
+subtree sorts as `name/`, makes a depth-first tree walk emit full paths in that
+same order; the working-tree walk sorts its siblings by the same rule. So they
+can be merged directly, one item of state per side:
+
+| Op | Sources merged |
+| --- | --- |
+| `status` | HEAD tree x index x working tree |
+| `checkout` | target tree x index (blockers also join the HEAD tree) |
+| `add` | working tree x index x HEAD tree (for `commit -a`) |
+| `reset`, `diff` | tree x index, or tree x tree |
+| `commit` | the index alone, straight into the tree builder |
+
+`comparePaths` is the one comparator all of them use. JavaScript's `<` is not
+it: `<` compares UTF-16 code units, so an astral code point sorts before U+E000
+by its leading surrogate, while its UTF-8 encoding sorts after. Getting that
+wrong would desynchronise a merge rather than merely misorder output.
+
+The index is read through `RepoStore.indexScan()`, which pages on `(path,
+stage)` — on the path alone, a page boundary between stage 0 and stage 2 of one
+path silently drops a row. Writes go through `indexApply`, a sink that flushes
+in batches. A scan and a sink can run together as long as mutations stay at or
+behind the frontier the scan has already handed out, which is what every op here
+does.
+
+### What is still proportional to something
+
+Nothing claims constant memory. The honest bound for an optimised op is:
+
+    O(page + widest live directory + output + largest single object)
+
+- **page** — 512 index rows by default.
+- **widest live directory** — `readTree` and `readdir` each hand back one whole
+  directory. A flat tree of 10,000 entries is still 10,000 entries live. Fixing
+  that needs an incremental tree parser and a paged `readdir`, and neither
+  exists here.
+- **output** — `status` returns its rows, `diff` returns its patch. That is the
+  caller's data, not bookkeeping.
+- **largest single object** — a packed delta cannot be reconstructed without its
+  full base in memory. Loose objects stream through `readChunks`; packed ones
+  yield whole, and `readBlob` materialises either. Working-tree files above
+  512 KiB are hashed and stored through `writeStream` without ever being held;
+  below that they are read in one go, because streaming costs a second pass over
+  the content and buys nothing for a small file.
+- **`status` collapsing** — `-unormal` must know which directories hold
+  something tracked before it meets the first untracked file, and the answer can
+  lie later in path order. That set is bounded by directories, not by files.
+
 ## Crash safety
 
 Network ingest is provisional until the whole pack is proven:

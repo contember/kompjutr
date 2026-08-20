@@ -36,6 +36,8 @@ interface Options {
   counts: number[] | null;
   scenarios: string[] | null;
   backends: Backend[] | null;
+  /** Repeats per cell. A resident high-water mark is noisy; the median is reported. */
+  repeat: number;
 }
 
 function listOption(argv: string[], name: string): string[] | null {
@@ -58,6 +60,7 @@ function parseOptions(argv: string[]): Options {
     counts: counts === null ? null : counts.map(Number),
     scenarios: listOption(argv, "scenarios"),
     backends: (listOption(argv, "backends") ?? null)?.map(asBackend) ?? null,
+    repeat: Number(argv.find((arg) => arg.startsWith("--repeat="))?.split("=")[1] ?? "1"),
   };
 }
 
@@ -150,6 +153,31 @@ function parseRun(line: string): Run | null {
   };
 }
 
+/**
+ * The median of `repeat` runs. VmHWM is a high-water mark, so it moves with
+ * when the collector happened to run, not only with what the code allocated —
+ * a single reading of it is not a measurement.
+ */
+function repeated(
+  scenario: string,
+  backend: Backend,
+  count: number,
+  shape: Shape,
+  repeat: number,
+): Outcome {
+  const runs: Outcome[] = [];
+  for (let i = 0; i < repeat; i++) runs.push(once(scenario, backend, count, shape, null));
+  const ok = runs.filter((run): run is Run & { status: "ok" } => run.status === "ok");
+  if (ok.length === 0) return runs[0] ?? { status: "error", detail: "no runs" };
+  ok.sort(
+    (left, right) =>
+      left.peakRssBytes - left.baselineRssBytes - (right.peakRssBytes - right.baselineRssBytes),
+  );
+  const median = ok[Math.floor(ok.length / 2)];
+  if (median === undefined) return runs[0] ?? { status: "error", detail: "no runs" };
+  return median;
+}
+
 const mb = (bytes: number): string => (bytes / 1024 / 1024).toFixed(1);
 
 function table(outcomes: Outcome[]): string {
@@ -190,7 +218,7 @@ for (const scenario of scenarios) {
       for (const backend of backends) {
         // The cap needs the runner's own footprint, which only a real run knows.
         // The uncapped pass supplies it; the capped pass then means something.
-        const probe = once(scenario, backend, count, shape, null);
+        const probe = repeated(scenario, backend, count, shape, options.repeat);
         outcomes.push(probe);
         if (options.budgetMb > 0 && probe.status === "ok") {
           const cap = (probe.baselineRssBytes ?? 0) + options.budgetMb * 1024 * 1024;
