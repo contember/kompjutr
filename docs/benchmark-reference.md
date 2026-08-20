@@ -32,6 +32,23 @@ chunk at a time.
 | `commit` ceiling | 535–985 files | 535–985 files | **the number to beat** |
 | Checkout ceiling | 4,925–7,418 files | ≥ 7,418 files | ≥ 9,329 files |
 
+### How it came out
+
+Measured in `docs/benchmark-macro.md`, same fixtures, both clients in one
+harness.
+
+| Target | Result |
+| --- | --- |
+| `status` bounded by tracked-file count, not pack size | **met.** Prettier costs 203,356 statements packed and 202,234 loose — a 0.6% difference across a completely different object layout. |
+| `add --all` without full-index materialisation | **met.** 88 MB peak against the baseline's 2,550 MB at 9,329 files; 190 MB against 6,634 MB at 24,252. |
+| `commit` must not OOM at 985 files | **met.** The whole loose suite fits in 17 MB of old space at 2,358 files, and 24,252 files complete. |
+| Checkout ceiling ≥ 9,329 files | **met.** `clone`, checkout included, completes at 24,252. |
+
+What the targets did not anticipate: `status` and `add` stay within 1.5x of the
+baseline in *statements*, because 99.98% of a `status` is the working-tree walk
+through stock DOFS and both clients pay it. That is the other axis, and it is
+the one this table's middle column already attacked.
+
 ## Measurement rules inherited
 
 1. **Wall time reported from inside a Worker is not a duration.** Cloudflare only
