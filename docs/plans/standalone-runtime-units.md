@@ -279,6 +279,22 @@ Full gates must pass before wave E starts. **These files are frozen only from
 this point on** — an implementer that needs one changed reports `blocked` and
 the leader decides.
 
+### Outcome
+
+Wave INT landed in `edf7b02`. The standalone `Filesystem` now composes the
+wave-C primitives and wave-D single-path surface, validates the import latch on
+open, and is the worktree used by the repository test harness. The package
+exports `./fs`, `./git`, `./compat/computer` and `./testing`; all four emitted
+entry points pass a package self-import smoke test.
+
+The full gate is green: typecheck, Biome, build, **43 test files / 648 tests**,
+and the export smoke test. The independent review closed three corruption
+paths found only after composition: missing chunk indices, malformed chunk
+lengths, and non-BLOB/non-integer SQLite storage classes can no longer be
+silently normalised by a sparse extension. A 10-chunk extending range write
+now costs **9 statements** because it validates the old layout before exposing
+new bytes.
+
 ---
 
 ## Wave E — the git read paths. 3 agents, parallel.
@@ -320,6 +336,20 @@ decidable once the pieces sit together.
 | 7 | **`readFiles`' path lookup is one unpaged result set** proportional to the input list — 9,329 rows at full-repository scale. It carries no BLOBs, but the byte budget does not bound it. | F2 |
 | 8 | **24 statements for a full-repository read is 1 + 23 with zero slack.** Past ~24 MB, or if `readFiles` ever has to resolve symlinks, the ceiling moves rather than the implementation. | F2 |
 | 9 | **`git_objects.stored` has no `'raw'` half**, so §7.3's deflate tax is not removed. The work is in `store.ts`, which G6 has closed. Needs an owner before wave F. | G6 |
+
+### Integration disposition
+
+| item | disposition |
+|---|---|
+| 1 | Closed. `Filesystem.scan` caches one resolved `RealPath` across pages and invalidates the cache after mutations. |
+| 2 | Closed. The composing layer batch-resolves lexical paths before every bulk primitive, using follow/no-follow semantics appropriate to the operation. |
+| 3 | Closed. `createFilesystem` closes over `FilesystemOptions.now`; every write path uses that clock. |
+| 4 | Closed. Each mutation bumps `rev` exactly once; `removeFiles` does not double-bump. |
+| 5 | Closed. `src/fs/errors.ts` owns stable filesystem error construction and code checks. |
+| 6 | Closed. `bumpRev` uses one `UPDATE ... RETURNING` statement. |
+| 7 | Closed. Path resolution and file lookup are both split by a 1.5 MB binding/result budget; chunk payloads remain separately paged. |
+| 8 | Closed. The default read page is 1.5 MB, leaving statement slack below the 2 MB platform limit. |
+| 9 | **Deferred.** Assign the `git_objects.stored = 'raw'` work before wave F; it remains outside Wave INT. |
 
 **One measurement caveat that affects every number in this document.**
 `TestDatabase.transactionSync` (`tests/helpers/db.ts`) issues its `BEGIN` and
