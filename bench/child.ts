@@ -45,6 +45,9 @@ const scenario = SCENARIOS.find((candidate) => candidate.name === name);
 if (scenario === undefined) throw new Error(`unknown scenario: ${name}`);
 
 const context = { harness: harness(backend), count, variant };
+// Which layer the statements came from, when asked. Written to stderr so the
+// result line stays machine-readable.
+if (process.env.BENCH_QUERIES === "1") context.harness.storage.histogram = new Map();
 await scenario.setup(context);
 
 for (const phase of scenario.phases) {
@@ -72,6 +75,13 @@ for (const phase of scenario.phases) {
       rows: context.harness.storage.rowCount,
     })}\n`,
   );
+  const histogram = context.harness.storage.histogram;
+  if (histogram !== null) {
+    const top = [...histogram.entries()].sort((left, right) => right[1] - left[1]).slice(0, 12);
+    for (const [query, hits] of top) {
+      process.stderr.write(`[queries] ${phase.name} ${String(hits).padStart(8)}  ${query}\n`);
+    }
+  }
 }
 
 await scenario.teardown?.(context);

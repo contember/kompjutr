@@ -39,6 +39,13 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
   statementCount = 0;
   rowCount = 0;
 
+  /**
+   * Statements by query text, when a caller opts in. Off by default: the
+   * benchmark wants to know which layer the statements came from, and
+   * nothing else should pay for a Map write per statement.
+   */
+  histogram: Map<string, number> | null = null;
+
   constructor(path = ":memory:") {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -46,6 +53,7 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
       exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
         // Multi-statement scripts go through exec(); node:sqlite's prepare()
         // only accepts a single statement.
+        this.#record(query);
         if (bindings.length === 0 && /;\s*\S/.test(query)) {
           this.db.exec(query);
           this.statementCount++;
@@ -64,9 +72,16 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
     };
   }
 
+  #record(query: string): void {
+    if (this.histogram === null) return;
+    const fingerprint = query.replace(/\s+/g, " ").trim().slice(0, 120);
+    this.histogram.set(fingerprint, (this.histogram.get(fingerprint) ?? 0) + 1);
+  }
+
   resetCounters(): void {
     this.statementCount = 0;
     this.rowCount = 0;
+    this.histogram?.clear();
   }
 
   transactionSync<T>(closure: () => T): T {
