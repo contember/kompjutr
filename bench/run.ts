@@ -35,12 +35,18 @@ interface Options {
   budgetMb: number;
   counts: number[] | null;
   scenarios: string[] | null;
+  backends: Backend[] | null;
 }
 
 function listOption(argv: string[], name: string): string[] | null {
   const found = argv.find((arg) => arg.startsWith(`--${name}=`));
   if (found === undefined) return null;
   return found.slice(name.length + 3).split(",");
+}
+
+function asBackend(value: string): Backend {
+  if (value === "dofs" || value === "sqlite") return value;
+  throw new Error(`unknown backend: ${value}`);
 }
 
 function parseOptions(argv: string[]): Options {
@@ -51,6 +57,7 @@ function parseOptions(argv: string[]): Options {
     budgetMb: budgetArg === undefined ? 0 : Number(budgetArg.split("=")[1]),
     counts: counts === null ? null : counts.map(Number),
     scenarios: listOption(argv, "scenarios"),
+    backends: (listOption(argv, "backends") ?? null)?.map(asBackend) ?? null,
   };
 }
 
@@ -166,7 +173,7 @@ function table(outcomes: Outcome[]): string {
 }
 
 const options = parseOptions(process.argv.slice(2));
-const backends: Backend[] = ["dofs", "sqlite"];
+const backends: Backend[] = options.backends ?? ["dofs", "sqlite"];
 const shapes: Shape[] = ["flat", "deep"];
 const counts =
   options.counts ?? (options.smoke ? [50, 200] : [100, 250, 500, 1000, 2500, 5000, 10000]);
