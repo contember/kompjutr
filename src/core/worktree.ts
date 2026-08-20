@@ -10,11 +10,14 @@ export type WorktreeDirent = Dirent;
 export type Worktree = Pick<
   Filesystem,
   | "stat"
+  | "realpath"
   | "readFile"
   | "readRange"
   | "readlink"
   | "readdir"
   | "scan"
+  | "discoverFiles"
+  | "readFileHandles"
   | "readFiles"
   | "glob"
   | "writeFile"

@@ -2,7 +2,12 @@
 
 import type { Worktree, WorktreeDirent, WorktreeStat } from "../../src/core/worktree.js";
 import type {
+  DiscoverFilesOptions,
+  DiscoverFilesPage,
+  HandleReadBatch,
   ReadBatch,
+  RealPath,
+  RegularFileHandle,
   RemoveOptions,
   ScanEntry,
   ScanOptions,
@@ -24,6 +29,9 @@ export class CountingWorktree implements Worktree {
 
   stat(path: string): WorktreeStat | null {
     return this.inner.stat(path);
+  }
+  realpath(path: string): RealPath {
+    return this.inner.realpath(path);
   }
   readFile(path: string): Uint8Array {
     this.reads++;
@@ -70,6 +78,20 @@ export class CountingWorktree implements Worktree {
   }
   scan(root: string, options: ScanOptions): ScanEntry[] {
     return this.inner.scan(root, options);
+  }
+  discoverFiles(
+    root: RealPath,
+    pattern: string,
+    options?: DiscoverFilesOptions,
+  ): DiscoverFilesPage {
+    return this.inner.discoverFiles(root, pattern, options);
+  }
+  readFileHandles(
+    handles: readonly RegularFileHandle[],
+    options?: { budget?: number },
+  ): HandleReadBatch {
+    this.reads += handles.length;
+    return this.inner.readFileHandles(handles, options);
   }
   readFiles(paths: readonly string[], options?: { budget?: number }): ReadBatch {
     return this.inner.readFiles(paths, options);

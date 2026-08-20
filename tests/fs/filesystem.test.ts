@@ -82,6 +82,46 @@ describe("Filesystem composition", () => {
     expect(db.storage.statementCount).toBe(2);
   });
 
+  it("keeps an exact successor sibling after pruning a paged subtree", () => {
+    const { db, fs } = open();
+    fs.writeFiles([
+      { path: "/dir/child", bytes: new Uint8Array([1]) },
+      { path: "/dir0", bytes: new Uint8Array([2]) },
+    ]);
+    db.storage.resetCounters();
+
+    expect(fs.scan("/", { limit: 1 }).map((entry) => entry.path)).toEqual(["/dir"]);
+    expect(fs.scan("/", { afterSubtree: "/dir", limit: 1 }).map((entry) => entry.path)).toEqual([
+      "/dir0",
+    ]);
+    expect(db.storage.statementCount).toBe(3);
+  });
+
+  it("discovers and reads regular files in exactly one plus one statements", () => {
+    const { db, fs } = open();
+    fs.writeFiles([
+      { path: "/repo/.gitignore", bytes: new TextEncoder().encode("root") },
+      { path: "/repo/a/.gitignore", bytes: new TextEncoder().encode("nested") },
+      { path: "/target", bytes: new TextEncoder().encode("target") },
+      { path: "/repo/link/.gitignore", target: "/target" },
+    ]);
+    const root = fs.realpath("/repo");
+    db.storage.resetCounters();
+
+    const { handles } = fs.discoverFiles(root, "*/.gitignore");
+    const batch = fs.readFileHandles(handles);
+
+    expect(handles.map((handle) => handle.path)).toEqual([
+      "/repo/.gitignore",
+      "/repo/a/.gitignore",
+    ]);
+    expect([...batch.files.values()].map((bytes) => new TextDecoder().decode(bytes))).toEqual([
+      "root",
+      "nested",
+    ]);
+    expect(db.storage.statementCount).toBe(2);
+  });
+
   it("refuses to open beside an unimported Computer filesystem", () => {
     const db = new TestDatabase();
     db.run("CREATE TABLE vfs_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)");

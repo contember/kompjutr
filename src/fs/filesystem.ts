@@ -3,10 +3,10 @@ import { assertComputerImportCurrent } from "./import.js";
 import { createFilesystemOps } from "./ops.js";
 import { initializeFsSchema } from "./schema.js";
 import { currentRev } from "./store/meta.js";
-import { readFiles as readStoredFiles } from "./store/read.js";
+import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "./store/resolve.js";
-import { glob as scanGlob, scan as scanPage } from "./store/scan.js";
+import { discoverFiles, glob as scanGlob, scan as scanPage } from "./store/scan.js";
 import {
   makeDirectories as makeStoredDirectories,
   writeFiles as writeStoredFiles,
@@ -79,7 +79,10 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     readdir: ops.readdir,
     scan(root: string, scanOptions: ScanOptions): ScanEntry[] {
       let resolved = scanRoots.get(root);
-      if (resolved === undefined || scanOptions.after === undefined) {
+      if (
+        resolved === undefined ||
+        (scanOptions.after === undefined && scanOptions.afterSubtree === undefined)
+      ) {
         resolved = realpath(db, root);
       }
       const page = scanPage(db, resolved, scanOptions);
@@ -87,6 +90,9 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
       else scanRoots.set(root, resolved);
       return page;
     },
+    discoverFiles: (root, pattern, discoverOptions) =>
+      discoverFiles(db, root, pattern, discoverOptions),
+    readFileHandles: (handles, handleOptions) => readFileHandles(db, handles, handleOptions),
     readFiles,
     glob: (root, pattern, globOptions) => scanGlob(db, realpath(db, root), pattern, globOptions),
     writeFiles(entries: readonly WriteEntry[], writeOptions?: WriteOptions): void {

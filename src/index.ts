@@ -48,11 +48,15 @@ export { createFilesystem } from "./fs/filesystem.js";
 export { FS_SCHEMA_VERSION, initializeFsSchema } from "./fs/schema.js";
 export type {
   Dirent,
+  DiscoverFilesOptions,
+  DiscoverFilesPage,
   EntryType,
   Filesystem,
   FilesystemOptions,
+  HandleReadBatch,
   ReadBatch,
   RealPath,
+  RegularFileHandle,
   RemoveOptions,
   ScanEntry,
   ScanOptions,

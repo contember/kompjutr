@@ -9,9 +9,13 @@
 
 import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
 import { comparePaths, subtreeSuccessor } from "../path.js";
+import { CHUNK_SIZE } from "../schema.js";
 import {
+  type DiscoverFilesOptions,
+  type DiscoverFilesPage,
   type EntryType,
   type RealPath,
+  type RegularFileHandle,
   S_IFDIR,
   S_IFLNK,
   S_IFREG,
@@ -21,6 +25,7 @@ import {
 
 /** The DO SQLite ceiling on a GLOB/LIKE pattern. */
 export const GLOB_PATTERN_MAX_BYTES = 50;
+export const DISCOVERY_PAGE_MAX = 1_000;
 
 const PERMISSION_BITS = 0o7777;
 
@@ -60,11 +65,62 @@ const SCAN_FILES_SQL = `${SELECT_PAGE}
  ORDER BY fs_paths.path
  LIMIT ?`;
 
+const SCAN_INCLUSIVE_SQL = `${SELECT_PAGE}
+   AND fs_paths.path >= ?
+ ORDER BY fs_paths.path
+ LIMIT ?`;
+
+const SCAN_FILES_INCLUSIVE_SQL = `${SELECT_PAGE}
+   AND fs_paths.path >= ?
+   AND fs_nodes.type <> 'dir'
+ ORDER BY fs_paths.path
+ LIMIT ?`;
+
 const GLOB_SQL = `SELECT fs_paths.path AS path
   FROM fs_paths
  WHERE fs_paths.path > ? AND fs_paths.path < ? AND fs_paths.path GLOB ?
  ORDER BY fs_paths.path
  LIMIT ?`;
+
+const DISCOVER_FILES_SQL = `WITH candidates AS MATERIALIZED (
+       SELECT fs_paths.path AS path,
+              fs_paths.inode AS inode,
+              fs_nodes.size AS size,
+              fs_nodes.rev AS rev
+         FROM fs_paths
+         JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode
+        WHERE fs_paths.path > ? AND fs_paths.path < ?
+          AND fs_paths.path GLOB ?
+          AND fs_nodes.type = 'file'
+        ORDER BY fs_paths.path
+        LIMIT ?
+     )
+SELECT candidates.path AS path,
+       candidates.inode AS inode,
+       candidates.size AS size,
+       candidates.rev AS rev,
+       count(fs_chunks.idx) AS chunk_count,
+       coalesce(sum(length(fs_chunks.bytes)), 0) AS chunk_bytes,
+       min(fs_chunks.idx) AS first_idx,
+       max(fs_chunks.idx) AS last_idx,
+       coalesce(sum(CASE
+         WHEN fs_chunks.idx IS NOT NULL AND typeof(fs_chunks.idx) <> 'integer' THEN 1
+         ELSE 0
+       END), 0) AS non_integer_indices,
+       coalesce(sum(CASE
+         WHEN fs_chunks.idx IS NOT NULL AND typeof(fs_chunks.bytes) <> 'blob' THEN 1
+         ELSE 0
+       END), 0) AS non_blob_chunks,
+       coalesce(sum(CASE
+         WHEN fs_chunks.idx IS NOT NULL
+          AND length(fs_chunks.bytes) <> min(?, candidates.size - fs_chunks.idx * ?)
+         THEN 1
+         ELSE 0
+       END), 0) AS invalid_chunk_sizes
+  FROM candidates
+  LEFT JOIN fs_chunks ON fs_chunks.inode = candidates.inode
+ GROUP BY candidates.path, candidates.inode, candidates.size, candidates.rev
+ ORDER BY candidates.path`;
 
 interface ScanRow {
   path: string;
@@ -77,6 +133,20 @@ interface ScanRow {
   nlink: number;
   link_target: string | null;
   content_id: Uint8Array | ArrayBuffer | null;
+}
+
+interface FileHandleRow {
+  path: RealPath;
+  inode: number;
+  size: number;
+  rev: number;
+  chunk_count: number;
+  chunk_bytes: number;
+  first_idx: number | null;
+  last_idx: number | null;
+  non_integer_indices: number;
+  non_blob_chunks: number;
+  invalid_chunk_sizes: number;
 }
 
 /** The CHECK constraint guarantees this; the throw keeps the type honest. */
@@ -124,23 +194,103 @@ function subtreeBounds(root: RealPath): { lower: string; upper: string } {
  * page and turn a 13-statement walk into a 26-statement one. It is also the
  * §3.6 invariant — only real paths reach `fs_paths`.
  *
- * Paging is keyset. The caller resumes at the last path returned; to skip an
- * ignored subtree it resumes at `subtreeSuccessor(dir)` instead. There is no
- * server-side prune list because only the caller can evaluate a `.gitignore`.
+ * Paging is keyset. The caller resumes at the last path returned, or names a
+ * pruned directory with `afterSubtree` so its exact successor remains visible.
  */
 export function scan(db: SqlDatabase, root: RealPath, options: ScanOptions): ScanEntry[] {
   const { limit } = options;
   if (!Number.isInteger(limit) || limit < 1) {
     throw new Error(`scan: limit must be a positive integer, got ${limit}`);
   }
+  if (options.after !== undefined && options.afterSubtree !== undefined) {
+    throw new Error("scan: after and afterSubtree are mutually exclusive");
+  }
 
   const { lower, upper } = subtreeBounds(root);
+  if (options.afterSubtree !== undefined) {
+    const resume = subtreeSuccessor(options.afterSubtree);
+    const inclusive = comparePaths(resume, lower) > 0 ? resume : lower;
+    const sql = options.filesOnly === true ? SCAN_FILES_INCLUSIVE_SQL : SCAN_INCLUSIVE_SQL;
+    return db.all<ScanRow>(sql, lower, upper, inclusive, limit).map(toEntry);
+  }
+
   // A resume cursor from outside the subtree must not widen the range.
   const after =
     options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
 
   const sql = options.filesOnly === true ? SCAN_FILES_SQL : SCAN_SQL;
   return db.all<ScanRow>(sql, after, upper, limit).map(toEntry);
+}
+
+function validatePattern(pattern: string, operation: string): void {
+  const bytes = ENCODER.encode(pattern).length;
+  if (bytes > GLOB_PATTERN_MAX_BYTES) {
+    throw new Error(
+      `${operation}: pattern is ${bytes} bytes; the platform caps a GLOB pattern at ${GLOB_PATTERN_MAX_BYTES}`,
+    );
+  }
+}
+
+function corrupt(inode: number, detail: string): Error {
+  return Object.assign(new Error(`EIO: corrupt chunks for inode ${inode}: ${detail}`), {
+    code: "EIO",
+  });
+}
+
+function validateFileHandle(row: FileHandleRow): RegularFileHandle {
+  const chunks = Math.ceil(row.size / CHUNK_SIZE);
+  if (
+    !Number.isSafeInteger(row.inode) ||
+    !Number.isSafeInteger(row.size) ||
+    row.size < 0 ||
+    !Number.isSafeInteger(row.rev) ||
+    row.chunk_count !== chunks ||
+    row.chunk_bytes !== row.size ||
+    row.non_integer_indices !== 0 ||
+    row.non_blob_chunks !== 0 ||
+    row.invalid_chunk_sizes !== 0 ||
+    (chunks === 0
+      ? row.first_idx !== null || row.last_idx !== null
+      : row.first_idx !== 0 || row.last_idx !== chunks - 1)
+  ) {
+    throw corrupt(row.inode, "metadata does not describe contiguous file content");
+  }
+  return { path: row.path, ino: row.inode, size: row.size, rev: row.rev };
+}
+
+/** Discover validated regular files without returning content BLOBs. */
+export function discoverFiles(
+  db: SqlDatabase,
+  root: RealPath,
+  pattern: string,
+  options: DiscoverFilesOptions = {},
+): DiscoverFilesPage {
+  validatePattern(pattern, "discoverFiles");
+  const { lower, upper } = subtreeBounds(root);
+  const limit = options.limit ?? DISCOVERY_PAGE_MAX;
+  if (!Number.isInteger(limit) || limit < 1 || limit > DISCOVERY_PAGE_MAX) {
+    throw new Error(
+      `discoverFiles: limit must be an integer from 1 to ${DISCOVERY_PAGE_MAX}, got ${limit}`,
+    );
+  }
+  const after =
+    options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
+  const found = db
+    .all<FileHandleRow>(
+      DISCOVER_FILES_SQL,
+      after,
+      upper,
+      pattern,
+      limit + 1,
+      CHUNK_SIZE,
+      CHUNK_SIZE,
+    )
+    .map(validateFileHandle);
+  const handles = found.slice(0, limit);
+  return {
+    handles,
+    next: found.length > limit ? (handles[handles.length - 1]?.path ?? null) : null,
+  };
 }
 
 /**
@@ -161,12 +311,7 @@ export function glob(
   pattern: string,
   options: { limit?: number } = {},
 ): string[] {
-  const bytes = ENCODER.encode(pattern).length;
-  if (bytes > GLOB_PATTERN_MAX_BYTES) {
-    throw new Error(
-      `glob: pattern is ${bytes} bytes; the platform caps a GLOB pattern at ${GLOB_PATTERN_MAX_BYTES}`,
-    );
-  }
+  validatePattern(pattern, "glob");
 
   const { lower, upper } = subtreeBounds(root);
   return db

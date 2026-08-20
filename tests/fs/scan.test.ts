@@ -10,10 +10,11 @@
 import { describe, expect, it } from "vitest";
 
 import { comparePaths, subtreeSuccessor } from "../../src/fs/path.js";
-import { initializeFsSchema } from "../../src/fs/schema.js";
+import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
 import { realpath } from "../../src/fs/store/resolve.js";
-import { glob, scan } from "../../src/fs/store/scan.js";
+import { discoverFiles, glob, scan } from "../../src/fs/store/scan.js";
+import { writeFiles } from "../../src/fs/store/write.js";
 import {
   type EntryType,
   type RealPath,
@@ -133,6 +134,9 @@ function misordered(paths: readonly string[]): string[] {
 /** Captures the SQL a call issues, so the plan gate needs no exported query. */
 class RecordingDatabase implements SqlDatabase {
   readonly queries: { query: string; bindings: unknown[] }[] = [];
+  maxResultBytes = 0;
+  maxResultRows = 0;
+  maxBindingBytes = 0;
 
   constructor(private readonly inner: SqlDatabase) {}
 
@@ -143,7 +147,23 @@ class RecordingDatabase implements SqlDatabase {
 
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
     this.queries.push({ query, bindings });
-    return this.inner.all<Row>(query, ...bindings);
+    let bindingBytes = 0;
+    for (const binding of bindings) {
+      if (typeof binding === "string") bindingBytes += new TextEncoder().encode(binding).length;
+      else if (binding instanceof Uint8Array) bindingBytes += binding.byteLength;
+      else if (binding instanceof ArrayBuffer) bindingBytes += binding.byteLength;
+      else bindingBytes += 8;
+    }
+    this.maxBindingBytes = Math.max(this.maxBindingBytes, bindingBytes);
+    const rows = this.inner.all<Row>(query, ...bindings);
+    this.maxResultRows = Math.max(this.maxResultRows, rows.length);
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        if (value instanceof Uint8Array) this.maxResultBytes += value.byteLength;
+        else if (value instanceof ArrayBuffer) this.maxResultBytes += value.byteLength;
+      }
+    }
+    return rows;
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
@@ -169,6 +189,19 @@ function planOf(db: TestDatabase, recorder: RecordingDatabase): string {
     .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
     .map((row) => row.detail)
     .join("\n");
+}
+
+interface BytecodeRow {
+  addr: number;
+  opcode: string;
+  p2: number;
+}
+
+function bytecodeOf(db: TestDatabase, recorder: RecordingDatabase): BytecodeRow[] {
+  expect(recorder.queries).toHaveLength(1);
+  const issued = recorder.queries[0];
+  if (issued === undefined) throw new Error("no statement was issued");
+  return db.all<BytecodeRow>(`EXPLAIN ${issued.query}`, ...issued.bindings);
 }
 
 // ---------------------------------------------------------------------------
@@ -343,11 +376,26 @@ describe("scan — paging", () => {
     // already, so it resumes at the successor rather than at the last path.
     const pruned = [
       skipped,
-      ...pathsOf(scanAll(BIG.db, BIG.root, 1000, { after: subtreeSuccessor(skipped) })),
+      ...pathsOf(scan(BIG.db, BIG.root, { afterSubtree: skipped, limit: BIG_ROWS })),
     ];
 
     expect(pruned).toHaveLength(BIG_ROWS - FILES_PER_DIR);
     expect(pruned).toEqual(full.filter((path) => !path.startsWith(`${skipped}/`)));
+  });
+
+  it("includes an exact successor sibling after pruning across a page boundary", () => {
+    const db = open();
+    writeFiles(db, [
+      { path: "/dir/child", bytes: new Uint8Array([1]) },
+      { path: "/dir0", bytes: new Uint8Array([2]) },
+    ]);
+    const root = realpath(db, "/");
+
+    expect(pathsOf(scan(db, root, { limit: 1 }))).toEqual(["/dir"]);
+    expect(pathsOf(scan(db, root, { afterSubtree: "/dir", limit: 1 }))).toEqual(["/dir0"]);
+    expect(() => scan(db, root, { after: "/dir", afterSubtree: "/dir", limit: 1 })).toThrow(
+      /mutually exclusive/,
+    );
   });
 
   it("rejects a non-positive page size instead of looping forever", () => {
@@ -493,6 +541,16 @@ describe("scan — query plan", () => {
     expect(plan).not.toMatch(/\bSCAN\b/);
     expect(plan).not.toMatch(/TEMP B-TREE/);
   });
+
+  it("stays one indexed range scan with an inclusive subtree resume", () => {
+    const recorder = new RecordingDatabase(BIG.db);
+    scan(recorder, BIG.root, { afterSubtree: "/repo/src/d00", limit: 10 });
+
+    const plan = planOf(BIG.db, recorder);
+    expect(plan).toContain("SEARCH fs_paths USING PRIMARY KEY (path>? AND path<?)");
+    expect(plan).not.toMatch(/\bSCAN\b/);
+    expect(plan).not.toMatch(/TEMP B-TREE/);
+  });
 });
 
 describe("glob", () => {
@@ -541,5 +599,224 @@ describe("glob", () => {
     expect(() => glob(BIG.db, BIG.root, "a".repeat(51))).toThrow(/51 bytes/);
     // 17 characters, 51 bytes — the cap counts bytes.
     expect(() => glob(BIG.db, BIG.root, "日".repeat(17))).toThrow(/51 bytes/);
+  });
+});
+
+describe("discoverFiles", () => {
+  function nested(count: number): { db: TestDatabase; root: RealPath } {
+    const db = open();
+    const entries = [];
+    let directory = "/repo";
+    for (let index = 0; index < count; index++) {
+      directory += `/d${index}`;
+      entries.push({
+        path: `${directory}/.gitignore`,
+        bytes: new TextEncoder().encode(`ignored-${index}`),
+      });
+    }
+    writeFiles(db, entries);
+    return { db, root: realpath(db, "/repo") };
+  }
+
+  it("returns only validated regular files in canonical path order", () => {
+    const db = open();
+    writeFiles(db, [
+      { path: "/repo/.gitignore", bytes: new TextEncoder().encode("root") },
+      { path: "/repo/a/.gitignore", bytes: new TextEncoder().encode("nested") },
+      { path: "/repo/z.txt", bytes: new Uint8Array([1]) },
+      { path: "/target", bytes: new TextEncoder().encode("target") },
+      { path: "/repo/link/.gitignore", target: "/target" },
+    ]);
+    const root = realpath(db, "/repo");
+    const recorder = new RecordingDatabase(db);
+
+    const { handles } = discoverFiles(recorder, root, "*/.gitignore");
+
+    expect(handles.map((handle) => handle.path)).toEqual([
+      "/repo/.gitignore",
+      "/repo/a/.gitignore",
+    ]);
+    expect(handles.every((handle) => handle.ino > 1 && handle.rev > 0)).toBe(true);
+    expect(recorder.queries).toHaveLength(1);
+    expect(recorder.maxResultBytes).toBe(0);
+  });
+
+  it("keeps one statement at ten and one hundred nested files", () => {
+    for (const count of [10, 100]) {
+      const { db, root } = nested(count);
+      db.storage.resetCounters();
+      expect(discoverFiles(db, root, "*/.gitignore").handles).toHaveLength(count);
+      expect(db.storage.statementCount).toBe(1);
+    }
+  });
+
+  it("materializes the bounded candidate page before touching chunks", () => {
+    const { db, root } = nested(100);
+    const recorder = new RecordingDatabase(db);
+
+    discoverFiles(recorder, root, "*/.gitignore", { limit: 10 });
+
+    const plan = planOf(db, recorder);
+    expect(plan).toContain("MATERIALIZE candidates");
+    expect(plan).toContain("SEARCH fs_paths USING PRIMARY KEY (path>? AND path<?)");
+    expect(plan).toContain("SCAN candidates");
+    expect(plan).toContain("SEARCH fs_chunks USING INDEX");
+    const candidateScan = plan.indexOf("SCAN candidates");
+    expect(plan.indexOf("MATERIALIZE candidates")).toBeLessThan(candidateScan);
+    const tempOrder = plan.indexOf("USE TEMP B-TREE FOR ORDER BY");
+    if (tempOrder >= 0) expect(tempOrder).toBeGreaterThan(candidateScan);
+
+    const chunkRootPages = new Set(
+      db
+        .all<{ rootpage: number }>(
+          "SELECT rootpage FROM sqlite_schema WHERE tbl_name = 'fs_chunks' AND rootpage > 0",
+        )
+        .map((row) => row.rootpage),
+    );
+    const bytecode = bytecodeOf(db, recorder);
+    const pageLimit = bytecode.find((row) => row.opcode === "DecrJumpZero");
+    const chunkOpens = bytecode.filter(
+      (row) => row.opcode === "OpenRead" && chunkRootPages.has(row.p2),
+    );
+    expect(pageLimit).toBeDefined();
+    expect(chunkOpens.length).toBeGreaterThan(0);
+    for (const open of chunkOpens) expect(open.addr).toBeGreaterThan(pageLimit?.addr ?? -1);
+  });
+
+  it("keeps candidate and chunk work page-shaped at 10,000 and 100,000 matches", () => {
+    const db = open();
+    db.run(
+      `INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
+       VALUES (2, 'dir', 493, ?, 0, 1, 1)`,
+      MTIME_BASE,
+    );
+    db.run("INSERT INTO fs_paths (path, parent, inode) VALUES ('/repo', '/', 2)");
+
+    const append = (from: number, to: number): void => {
+      db.run(
+        `WITH RECURSIVE seq(i) AS (
+           VALUES (?) UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ?
+         )
+         INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
+         SELECT i + 3, 'file', 420, ?, 0, 1, 1 FROM seq`,
+        from,
+        to,
+        MTIME_BASE,
+      );
+      db.run(
+        `WITH RECURSIVE seq(i) AS (
+           VALUES (?) UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ?
+         )
+         INSERT INTO fs_paths (path, parent, inode)
+         SELECT printf('/repo/d%06d/.gitignore', i), printf('/repo/d%06d', i), i + 3 FROM seq`,
+        from,
+        to,
+      );
+    };
+
+    const root = realpath(db, "/repo");
+    let previous = 0;
+    for (const count of [10_000, 100_000]) {
+      append(previous, count);
+      previous = count;
+      const anchor = discoverFiles(db, root, "*/.gitignore", { limit: 1 }).handles[0];
+      if (anchor === undefined) throw new Error("scaling fixture anchor missing");
+      const recorder = new RecordingDatabase(db);
+
+      const page = discoverFiles(recorder, root, "*/.gitignore", {
+        after: anchor.path,
+        limit: 10,
+      });
+
+      expect(page.handles).toHaveLength(10);
+      expect(page.next).not.toBeNull();
+      expect(recorder.queries).toHaveLength(1);
+      expect(recorder.maxResultRows).toBe(11);
+      expect(recorder.maxResultBytes).toBe(0);
+      const plan = planOf(db, recorder);
+      expect(plan).toContain("MATERIALIZE candidates");
+      expect(plan).toContain("SEARCH fs_paths USING PRIMARY KEY (path>? AND path<?)");
+      expect(plan.indexOf("USE TEMP B-TREE FOR ORDER BY")).toBeGreaterThan(
+        plan.indexOf("SCAN candidates"),
+      );
+    }
+  });
+
+  it("pages by canonical path with bounded rows and exact termination", () => {
+    const db = open();
+    const entries = [];
+    for (let index = 0; index < 1002; index++) {
+      entries.push({
+        path: `/repo/d${String(index).padStart(4, "0")}/.gitignore`,
+        bytes: new Uint8Array([index & 0xff]),
+      });
+    }
+    writeFiles(db, entries);
+    const root = realpath(db, "/repo");
+    const recorder = new RecordingDatabase(db);
+
+    const first = discoverFiles(recorder, root, "*/.gitignore");
+    if (first.next === null) throw new Error("first page did not return a cursor");
+    const second = discoverFiles(recorder, root, "*/.gitignore", { after: first.next });
+
+    expect(first.handles).toHaveLength(1000);
+    expect(second.handles).toHaveLength(2);
+    expect(second.next).toBeNull();
+    expect([...first.handles, ...second.handles].map((handle) => handle.path)).toEqual(
+      entries.map((entry) => entry.path),
+    );
+    expect(recorder.queries).toHaveLength(2);
+    expect(recorder.maxResultRows).toBe(1001);
+    expect(recorder.maxResultBytes).toBe(0);
+    expect(recorder.maxBindingBytes).toBeLessThan(20_000);
+  });
+
+  it("enforces the bounded page limit", () => {
+    const { db, root } = nested(1);
+    expect(() => discoverFiles(db, root, "*/.gitignore", { limit: 0 })).toThrow(/1 to 1000/);
+    expect(() => discoverFiles(db, root, "*/.gitignore", { limit: 1001 })).toThrow(/1 to 1000/);
+  });
+
+  it("rejects corrupt content without returning BLOB payloads", () => {
+    const { db, root } = nested(1);
+    const inode = db.scalar<number>(
+      "SELECT inode FROM fs_paths WHERE path = '/repo/d0/.gitignore'",
+    );
+    db.run("DELETE FROM fs_chunks WHERE inode = ? AND idx = 0", inode ?? -1);
+
+    expect(() => discoverFiles(db, root, "*/.gitignore")).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
+  });
+
+  it.each([
+    ["non-BLOB chunk", "UPDATE fs_chunks SET bytes = 'text' WHERE inode = ? AND idx = 0"],
+    ["non-integer index", "UPDATE fs_chunks SET idx = 0.5 WHERE inode = ? AND idx = 0"],
+  ])("rejects a %s", (_name, sql) => {
+    const { db, root } = nested(1);
+    const inode = db.scalar<number>(
+      "SELECT inode FROM fs_paths WHERE path = '/repo/d0/.gitignore'",
+    );
+    db.run(sql, inode ?? -1);
+
+    expect(() => discoverFiles(db, root, "*/.gitignore")).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
+  });
+
+  it("rejects compensating short and oversized chunks", () => {
+    const db = open();
+    writeFiles(db, [{ path: "/repo/.gitignore", bytes: new Uint8Array(CHUNK_SIZE + 10).fill(7) }]);
+    const root = realpath(db, "/repo");
+    const inode = db.scalar<number>("SELECT inode FROM fs_paths WHERE path = '/repo/.gitignore'");
+    db.run(
+      `UPDATE fs_chunks SET bytes = zeroblob(${CHUNK_SIZE - 1}) WHERE inode = ? AND idx = 0`,
+      inode ?? -1,
+    );
+    db.run("UPDATE fs_chunks SET bytes = zeroblob(11) WHERE inode = ? AND idx = 1", inode ?? -1);
+
+    expect(() => discoverFiles(db, root, "*/.gitignore")).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
   });
 });

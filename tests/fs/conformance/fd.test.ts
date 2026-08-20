@@ -10,10 +10,10 @@ import { NodeFsCompat } from "../../../src/fs/compat/node.js";
 import { createFilesystemOps } from "../../../src/fs/ops.js";
 import { initializeFsSchema } from "../../../src/fs/schema.js";
 import { currentRev } from "../../../src/fs/store/meta.js";
-import { readFiles } from "../../../src/fs/store/read.js";
+import { readFileHandles, readFiles } from "../../../src/fs/store/read.js";
 import { removeFiles } from "../../../src/fs/store/remove.js";
 import { realpath } from "../../../src/fs/store/resolve.js";
-import { glob, scan } from "../../../src/fs/store/scan.js";
+import { discoverFiles, glob, scan } from "../../../src/fs/store/scan.js";
 import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
 import type { Filesystem } from "../../../src/fs/types.js";
 import { TestDatabase } from "../../helpers/db.js";
@@ -29,6 +29,8 @@ function createTestProvider(): NodeFsCompat {
     rev: () => currentRev(db),
     realpath: (path) => realpath(db, path),
     scan: (root, options) => scan(db, realpath(db, root), options),
+    discoverFiles: (root, pattern, options) => discoverFiles(db, root, pattern, options),
+    readFileHandles: (handles, options) => readFileHandles(db, handles, options),
     readFiles: (paths, options) => readFiles(db, paths, options),
     glob: (root, pattern, options) => glob(db, realpath(db, root), pattern, options),
     writeFiles: (entries, options) => writeFiles(db, entries, options),

@@ -54,15 +54,49 @@ export interface ScanEntry extends Stat {
 
 export interface ScanOptions {
   /**
-   * Resume strictly after this path. The caller steers: to skip an ignored
-   * subtree, resume at `subtreeSuccessor(dir)`. There is no server-side
-   * prune list — only the caller can evaluate ignore rules.
+   * Resume strictly after this path.
    */
   after?: string;
+  /**
+   * Resume at the first path after this directory's subtree. Unlike passing
+   * `subtreeSuccessor(dir)` as `after`, this includes an exact sibling at the
+   * successor key. Mutually exclusive with `after`.
+   */
+  afterSubtree?: string;
   /** Hard cap on rows returned. The caller pages. */
   limit: number;
   /** Omit directory rows. Files and symlinks only. */
   filesOnly?: boolean;
+}
+
+/** A regular file proven to have contiguous content at discovery time. */
+export interface RegularFileHandle {
+  /** Absolute, canonical, real path. */
+  path: RealPath;
+  ino: number;
+  size: number;
+  /** Node revision used to reject stale handles before returning bytes. */
+  rev: number;
+}
+
+export interface DiscoverFilesOptions {
+  /** Resume strictly after this canonical handle path. */
+  after?: RealPath;
+  /** Defaults to 1,000 and cannot exceed 1,000. */
+  limit?: number;
+}
+
+export interface DiscoverFilesPage {
+  handles: RegularFileHandle[];
+  /** Re-call with this cursor. `null` proves this was the final page. */
+  next: RealPath | null;
+}
+
+export interface HandleReadBatch {
+  /** Bytes keyed by the canonical path carried by each handle. */
+  files: Map<RealPath, Uint8Array>;
+  /** Handles deferred by the byte budget, in input order. */
+  remaining: RegularFileHandle[];
 }
 
 export interface ReadBatch {
@@ -146,6 +180,18 @@ export interface Filesystem {
    * traversal. The merge joins above this layer consume it directly.
    */
   scan(root: string, options: ScanOptions): ScanEntry[];
+
+  /**
+   * Discover regular files only, without following matching symlinks.
+   * `root` is resolved once by the caller. One indexed statement.
+   */
+  discoverFiles(root: RealPath, pattern: string, options?: DiscoverFilesOptions): DiscoverFilesPage;
+
+  /** Read discovered files without another path-resolution or metadata lookup. */
+  readFileHandles(
+    handles: readonly RegularFileHandle[],
+    options?: { budget?: number },
+  ): HandleReadBatch;
 
   /** Several files in one round trip, under a byte budget. */
   readFiles(paths: readonly string[], options?: { budget?: number }): ReadBatch;

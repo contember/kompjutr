@@ -9,7 +9,16 @@ import { describe, expect, it } from "vitest";
 
 import { normalize } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
-import { DEFAULT_READ_BUDGET, readFile, readFiles, readRange } from "../../src/fs/store/read.js";
+import {
+  DEFAULT_READ_BUDGET,
+  MAX_HANDLE_MATERIALIZE_BYTES,
+  readFile,
+  readFileHandles,
+  readFiles,
+  readRange,
+} from "../../src/fs/store/read.js";
+import { realpath } from "../../src/fs/store/resolve.js";
+import { discoverFiles } from "../../src/fs/store/scan.js";
 import { writeFiles } from "../../src/fs/store/write.js";
 import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
@@ -446,6 +455,163 @@ describe("readFiles — remaining", () => {
     // A budget below one chunk still cannot make a statement carry less
     // than one chunk — that is the floor, and it is well short of 4.5 MB.
     expect(fixture.db.maxResultBytes).toBeLessThanOrEqual(CHUNK_SIZE);
+  });
+});
+
+describe("readFileHandles", () => {
+  function discovered(bytes = pseudoRandom(1000, 71)) {
+    const fixture = new Fixture();
+    fixture.transaction(() => fixture.file("/repo/.gitignore", bytes));
+    const root = realpath(fixture.db, "/repo");
+    const handle = discoverFiles(fixture.db, root, "*/.gitignore").handles[0];
+    if (handle === undefined) throw new Error("fixture handle missing");
+    return { fixture, handle, bytes };
+  }
+
+  it("returns a budget-fitting handle in one bounded statement", () => {
+    const { fixture, handle, bytes } = discovered();
+    fixture.db.reset();
+
+    const batch = readFileHandles(fixture.db, [handle]);
+
+    expectBytes(batch.files.get(handle.path), bytes);
+    expect(batch.remaining).toEqual([]);
+    expect(fixture.db.statementCount).toBe(1);
+    expect(fixture.db.maxResultBytes).toBeLessThanOrEqual(DEFAULT_READ_BUDGET);
+  });
+
+  it("rejects an oversized caller batch before issuing SQL", () => {
+    const { fixture, handle } = discovered();
+    const handles = Array.from({ length: 5_001 }, () => handle);
+    fixture.db.reset();
+
+    expect(() => readFileHandles(fixture.db, handles)).toThrow(/at most 5000 handles/);
+    expect(fixture.db.statementCount).toBe(0);
+  });
+
+  it.each([
+    ["relative", "repo/.gitignore"],
+    ["non-canonical", "/repo/../repo/.gitignore"],
+    ["overlong", `/${"x".repeat(4_096)}`],
+  ])("rejects a %s caller handle path before issuing SQL", (_name, path) => {
+    const { fixture, handle } = discovered();
+    Object.defineProperty(handle, "path", { value: path });
+    fixture.db.reset();
+
+    expect(() => readFileHandles(fixture.db, [handle])).toThrow(/invalid canonical path/);
+    expect(fixture.db.statementCount).toBe(0);
+  });
+
+  it("returns at most one global byte budget and preserves the retry boundary", () => {
+    const fixture = new Fixture();
+    fixture.transaction(() => {
+      fixture.file("/repo/a", pseudoRandom(700, 1));
+      fixture.file("/repo/b", pseudoRandom(700, 2));
+      fixture.file("/repo/c", pseudoRandom(100, 3));
+    });
+    const { handles } = discoverFiles(fixture.db, realpath(fixture.db, "/repo"), "*");
+    fixture.db.reset();
+
+    const batch = readFileHandles(fixture.db, handles, { budget: 1000 });
+
+    expect([...batch.files.keys()]).toEqual(["/repo/a"]);
+    expect(batch.remaining.map((handle) => handle.path)).toEqual(["/repo/b", "/repo/c"]);
+    expect(fixture.db.statementCount).toBe(1);
+  });
+
+  it("rejects a handle after its node changes or path disappears", () => {
+    const changed = discovered();
+    writeFiles(changed.fixture.db, [
+      { path: changed.handle.path, bytes: pseudoRandom(changed.bytes.length, 99) },
+    ]);
+    expect(() => readFileHandles(changed.fixture.db, [changed.handle])).toThrowError(
+      expect.objectContaining({ code: "ESTALE" }),
+    );
+
+    const removed = discovered();
+    removed.fixture.db.run("DELETE FROM fs_paths WHERE path = ?", removed.handle.path);
+    expect(() => readFileHandles(removed.fixture.db, [removed.handle])).toThrowError(
+      expect.objectContaining({ code: "ESTALE" }),
+    );
+  });
+
+  it.each([
+    ["missing chunk", "DELETE FROM fs_chunks WHERE inode = 3 AND idx = 0"],
+    ["extra chunk", "INSERT INTO fs_chunks (inode, idx, bytes) VALUES (3, 1, zeroblob(1))"],
+    ["non-BLOB chunk", "UPDATE fs_chunks SET bytes = 'text' WHERE inode = 3 AND idx = 0"],
+    ["non-integer index", "UPDATE fs_chunks SET idx = 0.5 WHERE inode = 3 AND idx = 0"],
+  ])("rejects a %s added after discovery", (_name, sql) => {
+    const { fixture, handle } = discovered();
+    fixture.db.run(sql);
+
+    expect(() => readFileHandles(fixture.db, [handle])).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
+  });
+
+  it("rejects compensating short and oversized chunks", () => {
+    const bytes = pseudoRandom(CHUNK_SIZE + 10, 81);
+    const { fixture, handle } = discovered(bytes);
+    fixture.db.run(
+      `UPDATE fs_chunks SET bytes = zeroblob(${CHUNK_SIZE - 1}) WHERE inode = ? AND idx = 0`,
+      handle.ino,
+    );
+    fixture.db.run(
+      "UPDATE fs_chunks SET bytes = zeroblob(11) WHERE inode = ? AND idx = 1",
+      handle.ino,
+    );
+
+    expect(() => readFileHandles(fixture.db, [handle])).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
+  });
+
+  it("suppresses every BLOB when one handle in a batch is corrupt", () => {
+    const fixture = new Fixture();
+    fixture.transaction(() => {
+      fixture.streamedFile("/repo/a", 2, CHUNK_SIZE, 101);
+      fixture.file("/repo/b", pseudoRandom(100, 102));
+    });
+    const { handles } = discoverFiles(fixture.db, realpath(fixture.db, "/repo"), "*");
+    const corruptHandle = handles[0];
+    if (corruptHandle === undefined) throw new Error("fixture handle missing");
+    fixture.db.run("DELETE FROM fs_chunks WHERE inode = ? AND idx = 0", corruptHandle.ino);
+    fixture.db.reset();
+
+    expect(() => readFileHandles(fixture.db, handles)).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
+    expect(fixture.db.statementCount).toBe(1);
+    expect(fixture.db.maxResultBytes).toBe(0);
+  });
+
+  it("rejects a forged huge stale handle without returning or allocating its claimed size", () => {
+    const { fixture, handle } = discovered();
+    const forged = { ...handle, size: Number.MAX_SAFE_INTEGER };
+    fixture.db.reset();
+
+    expect(() => readFileHandles(fixture.db, [forged])).toThrowError(
+      expect.objectContaining({ code: "ESTALE" }),
+    );
+    expect(fixture.db.statementCount).toBe(1);
+    expect(fixture.db.maxResultBytes).toBe(0);
+  });
+
+  it("rejects a valid oversized file before returning BLOBs or materializing it", () => {
+    const fixture = new Fixture();
+    const chunks = Math.floor(MAX_HANDLE_MATERIALIZE_BYTES / CHUNK_SIZE) + 1;
+    fixture.transaction(() => fixture.streamedFile("/repo/oversized", chunks, CHUNK_SIZE, 3000));
+    const page = discoverFiles(fixture.db, realpath(fixture.db, "/repo"), "*");
+    const handle = page.handles[0];
+    if (handle === undefined) throw new Error("fixture handle missing");
+    fixture.db.reset();
+
+    expect(() => readFileHandles(fixture.db, [handle])).toThrowError(
+      expect.objectContaining({ code: "EFBIG" }),
+    );
+    expect(fixture.db.statementCount).toBe(1);
+    expect(fixture.db.maxResultBytes).toBe(0);
+    expect(MAX_HANDLE_MATERIALIZE_BYTES + DEFAULT_READ_BUDGET + CHUNK_SIZE).toBeLessThan(100 * MIB);
   });
 });
 
