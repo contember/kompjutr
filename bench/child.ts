@@ -1,9 +1,10 @@
 // One scenario, one process. Never two, so nothing a previous scenario
-// allocated can be mistaken for this one's peak.
+// allocated can be mistaken for this one's peak. A scenario's phases do
+// share the process, and reset the peak between them.
 
 import { readFileSync, writeFileSync } from "node:fs";
 
-import { type Backend, harness, SCENARIOS, type Shape } from "./scenarios.js";
+import { asVariant, type Backend, harness, SCENARIOS } from "./scenarios.js";
 
 /**
  * Reset the kernel's resident high-water mark, so the figure taken after the
@@ -36,41 +37,41 @@ function asBackend(value: string | undefined): Backend {
   throw new Error(`unknown backend: ${String(value)}`);
 }
 
-function asShape(value: string | undefined): Shape {
-  if (value === "flat" || value === "deep") return value;
-  throw new Error(`unknown shape: ${String(value)}`);
-}
-
-const [, , name, backendArg, countArg, shapeArg] = process.argv;
+const [, , name, backendArg, countArg, variantArg] = process.argv;
 const backend = asBackend(backendArg);
-const shape = asShape(shapeArg);
+const variant = asVariant(variantArg);
 const count = Number(countArg);
 const scenario = SCENARIOS.find((candidate) => candidate.name === name);
 if (scenario === undefined) throw new Error(`unknown scenario: ${name}`);
 
-const context = { harness: harness(backend), count, shape };
+const context = { harness: harness(backend), count, variant };
 await scenario.setup(context);
 
-// Taken after setup and after the peak is reset, so the reported figure is
-// what the measured operation itself added, not what the fixture cost.
-const peakWasReset = resetPeakRss();
-const baselineRss = peakRssBytes();
-context.harness.storage.resetCounters();
-const started = performance.now();
-await scenario.run(context);
-const wallMs = performance.now() - started;
+for (const phase of scenario.phases) {
+  await phase.before?.(context);
+  // Taken after setup and after the peak is reset, so the reported figure is
+  // what the measured operation itself added, not what the fixture cost.
+  const peakWasReset = resetPeakRss();
+  const baselineRss = peakRssBytes();
+  context.harness.storage.resetCounters();
+  const started = performance.now();
+  await phase.run(context);
+  const wallMs = performance.now() - started;
+  process.stdout.write(
+    `${JSON.stringify({
+      scenario: name,
+      operation: phase.name,
+      backend,
+      count,
+      variant,
+      wallMs: Math.round(wallMs),
+      baselineRssBytes: baselineRss,
+      peakRssBytes: peakRssBytes(),
+      peakWasReset,
+      statements: context.harness.storage.statementCount,
+      rows: context.harness.storage.rowCount,
+    })}\n`,
+  );
+}
 
-process.stdout.write(
-  `${JSON.stringify({
-    scenario: name,
-    backend,
-    count,
-    shape,
-    wallMs: Math.round(wallMs),
-    baselineRssBytes: baselineRss,
-    peakRssBytes: peakRssBytes(),
-    peakWasReset,
-    statements: context.harness.storage.statementCount,
-    rows: context.harness.storage.rowCount,
-  })}\n`,
-);
+await scenario.teardown?.(context);

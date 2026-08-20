@@ -27,7 +27,8 @@
     "test:watch": "vitest",
     "format": "biome format --write .",
     "check": "biome check .",
-    "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts"
+    "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts",
+    "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose"
   },
   "dependencies": {
     "pako": "^2.1.0"
