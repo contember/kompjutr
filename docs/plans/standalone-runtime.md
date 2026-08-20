@@ -571,14 +571,56 @@ UPDATE fs_paths
  WHERE path >= ?oldRoot || '/' AND path < ?oldRootSuccessor;
 ```
 
-  Statements: 2 (the subtree plus the root row). Rows written: the size of the
-  subtree, each a delete-and-reinsert in a WITHOUT ROWID b-tree. `fs_nodes` and
-  `fs_chunks` are untouched — no content moves.
+  `?oldLen` is **`[...oldRoot].length` — code points, not bytes.** This is a
+  TEXT `substr()`, so it inherits §7.0's trap exactly: with a byte length, a
+  directory whose own name is non-ASCII mis-slices every descendant. Measured
+  on the E1 fixture, the byte-length form corrupts 5,223 of 5,252 paths and
+  silently loses 294 more to primary-key collisions. It does not always raise.
+
+  `?oldRootSuccessor` is `subtreeSuccessor(oldRoot)` — `oldRoot + "0"`, since
+  `'0'` is `0x30` and `'/'` is `0x2F` (§4.1).
+
+  The second statement is the root row itself, whose `parent` also changes when
+  the destination directory differs:
+
+```sql
+UPDATE fs_paths SET path = ?newRoot, parent = ?newParent WHERE path = ?oldRoot;
+```
+
+  `fs_nodes` and `fs_chunks` are untouched — no content moves.
 
 Under an inode+dirent schema this is one row. Under a path key it is N. That is
 the trade, and it is why the two-table split exists: only the key table is
-rewritten. `mv src lib` on a 5,000-file tree is 2 statements and 5,000 row
-writes. Risk R1 in §10 tracks it.
+rewritten.
+
+**Measured (E1), `node:sqlite`, under `cpu-lease -n 2`:**
+
+| files | statements | rows written | in-memory | file-backed (WAL) |
+|---:|---:|---:|---:|---:|
+| 500 | 2 | 525 | 1.5 ms | 3.0 ms |
+| 1,000 | 2 | 1,050 | 2.9 ms | 5.1 ms |
+| **5,000** | **2** | **5,250** | **17.6 ms** | **24.8 ms** |
+| 20,000 | 2 | 21,000 | 75.9 ms | 120.9 ms |
+
+Linear in descendants at ~3.5 µs/row, no knee. The inode+dirents equivalent is
+1 statement and 1 row at every size. Correctness was verified field by field
+against an independently computed expected table, including a six-times
+round-trip returning the table byte-for-byte to its original.
+
+Three things the headline number hides:
+
+- **Rows written is N+1**, not N: the descendants plus the root row. A
+  "5,000-file" tree is 5,250 rows once directories and the root are counted.
+- **Roughly half the wall time is the two secondary indexes.** Each logical row
+  rewrite is three b-tree entries, so a 5,000-file rename moves ~15,750
+  entries. Dropping the indexes takes the same rename from 17.7 ms to 9.4 ms.
+- **Whether Durable Object billing counts secondary-index entries as rows
+  written is not verified.** R1 is stated in billed rows, so the ×3 multiplier
+  is an open question, not a settled cost.
+
+R1 does not fire: 2 statements and 25 ms against a ~50 ms line. But the margin
+is ~2×, not 10×, and at 20,000 descendants it is already spent. Risk R1 in §10
+stays open as a ceiling, not as a blocker.
 
 ### 3.8 Hardlinks and the join
 
