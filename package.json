@@ -26,7 +26,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "format": "biome format --write .",
-    "check": "biome check ."
+    "check": "biome check .",
+    "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts"
   },
   "dependencies": {
     "pako": "^2.1.0"
@@ -37,8 +38,11 @@
   "devDependencies": {
     "@biomejs/biome": "^2.4.16",
     "@cloudflare/computer": "^0.2.1",
+    "@platformatic/vfs": "^0.4.0",
     "@types/node": "^24.0.0",
     "@types/pako": "^2.0.3",
+    "diff": "^9.0.0",
+    "isomorphic-git": "^1.41.7",
     "typescript": "^5.9.0",
     "vitest": "^3.2.4"
   }
