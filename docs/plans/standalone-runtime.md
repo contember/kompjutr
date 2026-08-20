@@ -997,20 +997,10 @@ it, read the pinned tarball.
 
 ### 4.5 `realpath` in one statement
 
-The common case — no symlink anywhere on the path — is a single point lookup:
-
-```sql
-SELECT p.inode, n.type, n.link_target
-  FROM fs_paths p JOIN fs_nodes n ON n.inode = p.inode
- WHERE p.path = ?;
-```
-
-A hit whose type is not `symlink` is the answer. **One statement**, against
-DOFS's per-segment loop (`fs/resolve.ts:225-229`) or its own recursive CTE
-(`fs/resolve.ts:147-170`).
-
-A miss, or a symlink, needs to know where the path breaks. One statement asks
-about every ancestor at once:
+The implementation resolves every component in order. This is required for
+POSIX cases such as `file/../target`: lexical normalization must not erase the
+fact that `file` is not a directory. One indexed statement asks about every
+ancestor at once:
 
 ```sql
 SELECT p.path, n.type, n.link_target
@@ -1019,9 +1009,17 @@ SELECT p.path, n.type, n.link_target
  ORDER BY length(p.path);
 ```
 
-If any ancestor is a symlink, rewrite the path from that point and retry. So:
-**1 statement resolved, 2 for a miss, 2 + 1 per symlink traversed**, with the
-same `SYMLOOP_MAX` of 40 (`fs/resolve.ts:45`).
+The query is driven by `json_each(?)` and probes `fs_paths` through its primary
+key; it does not scan the repository. If an ancestor is a symlink, resolution
+rewrites the remaining component stream at that point and retries. The common
+case, including a miss, is **one statement**; each symlink batch adds one. The
+same `SYMLOOP_MAX` of 40 applies (`src/fs/store/resolve.ts`).
+
+Inputs and expanded symlink paths are capped at 4,096 UTF-16 code units before
+their prefix lists are built. Stored link targets are projected through a
+4,097-code-point sentinel and rejected if they exceed the same bound. This
+keeps the ancestor batch below the 100 MB operation target even for adversarial
+path depth.
 
 There is no resolve cache. `fs/resolveCache.ts` (129 lines) and the
 `inTransaction` gating that makes it rollback-safe (`storage.ts:61-74`,
@@ -1704,20 +1702,26 @@ local history that was never pushed. Stated, not hidden.
 
 ### 8.2 The importer
 
-`kompjutr/compat/computer` exports `importFromComputer(db, options)`. It reads
-`vfs_*` with the reader that already exists — `VfsReader.scan`
-(`src/sqlite/vfs.ts:123`, the recursive-CTE priority queue) and `VfsReader.read`
-(`:150`, the `json_each` chunk join) — and writes through `writeFiles`.
+`kompjutr/compat/computer` exports `importFromComputer(db, options)`. The
+implementation migrates directly from `vfs_*` to `fs_*` inside SQLite. It does
+not materialise file payloads in JavaScript. A successful import is **8 SQL
+statements** for both 933 and 9,329 files, with no BLOB result returned to
+JavaScript and at most two bindings per statement.
 
-Per 1,000-entry page: 1 scan statement, ~1 content statement per 1 MiB, and the
-`writeFiles` statement family. For Prettier: **~60 statements, one request,
-memory bounded by the payload budget.**
+The caller must pass the literal quiescence acknowledgement and must stop using
+the Computer provider in that isolate first. Computer can hold private fd and
+write-buffer state that direct SQL cannot observe. The acknowledgement turns
+that otherwise unverifiable precondition into an explicit API decision.
 
 Carried across: `path`, `type`, `mode`, `mtime`, `link_target`. `size` is
-recomputed. `manifest_hash` becomes `content_id` — it is a content identity in
-exactly our sense, so a subsequent `add` can populate `git_blob_ids` against it
-without re-hashing. `vfs_meta.rev` is copied into `fs_meta.rev` so a poller
-never sees the counter go backwards.
+recomputed. A validated `manifest_hash` becomes `content_id`; valid
+manifestless files produced by Computer's range, truncate, fd and create paths
+import with `content_id = NULL`. Manifest-backed files validate the complete
+manifest and tolerate stale `vfs_nodes.size`. Manifestless files instead
+require contiguous chunks from index zero, present BLOB rows, exact per-chunk
+sizes, and an aggregate byte length equal to `vfs_nodes.size`.
+`vfs_meta.rev` is copied into `fs_meta.rev` so a poller never sees the counter
+go backwards.
 
 Not carried: inode numbers (ours are allocated fresh), `vfs_changes`,
 watermarks, mounts, `stub_size`, `mount_root`.

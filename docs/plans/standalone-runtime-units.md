@@ -234,13 +234,29 @@ Two things G6 reported rather than did, both correctly:
 
 | unit | territory | contract | done-check |
 |---|---|---|---|
-| **F5 — single-path ops** | `src/fs/ops.ts`, `tests/fs/conformance/{stat,readdir,readFile,writeFile,mkdir,rm,rename,symlink,chmod,link}.test.ts` | Every single-path method in §4.1 as a thin wrapper over F1–F4. No new SQL. | **Its share of the inherited suite green**, ported through wave B's adapter, worklist in `tmp/port-survey/classification.tsv`. Roughly 120 in-scope cases. Not "expressible as a bulk call" — symlink following, POSIX error mapping and mode bits are exactly what a shape-only check misses. Cases E2 marked unportable are discarded with a recorded reason, never silently skipped. **[R8]** |
+| **F5 — single-path ops** | `src/fs/ops.ts`, `tests/fs/conformance/{stat,readdir,readFile,writeFile,mkdir,rm,rename,symlink,chmod,link}.test.ts` | Every single-path method in §4.1 as a thin wrapper over F1–F4. No new SQL. | **Its share of the inherited suite green**, ported through wave B's adapter, worklist in `tmp/port-survey/classification.tsv`. Roughly 120 in-scope cases. Not "expressible as a bulk call" — symlink following, POSIX error mapping and mode bits are exactly what a shape-only check misses. Cases E2 marked unportable are discarded with a recorded reason, never silently skipped. The final §4.1 surface supersedes the survey's five stale `recoverable` rows for exclusive writes and stream input; the ported test records why those APIs are excluded. **[R8]** |
 | **F6 — compatibility surfaces** | `src/fs/compat/`, `tests/fs/conformance/{fd,errors,provider}.test.ts` | `NodeFsCompat` (node:fs names, the fd table) and the Computer façade (`withReadScope` no-op, `shellQuote`, the provider shape). | Behavioural, not type-level: the fd trio round-trips, `existsSync` swallows errors per §4.3, and the inherited fd and error-mapping tests are green. **`provider.fd.test.ts` is the highest-yield inherited file in the whole suite — 28 of 29 cases API-shaped, 376 lines — and it lands here.** Compiling is not passing. **[R11]** |
-| **F7 — importer and migration** | `src/fs/import.ts`, `src/fs/testing.ts`, `tests/fs/import.test.ts` | `importFromComputer(db)` per §8.2, the divergence latch, and the shadow-read wrapper §8.3 ships from `./testing`. | Round-trips a real Prettier-sized `vfs_*` database: same paths, bytes, modes, symlink targets **and mtimes**; the latch trips on a database Computer wrote to after import. |
+| **F7 — importer and migration** | `src/fs/import.ts`, `src/fs/testing.ts`, `tests/fs/import.test.ts` | `importFromComputer(db)` per §8.2, the divergence latch, and the shadow-read wrapper §8.3 ships from `./testing`. | Round-trips a real Prettier-sized `vfs_*` database: same paths, bytes, modes, symlink targets **and mtimes**; imports Computer's valid manifestless write states; rejects corrupt sources before mutation; the latch trips on a database Computer wrote to after import. |
 
 The latch is *validated* on every open, which is the filesystem's opening path
 and therefore the integration wave's territory, not F7's. F7 owns writing the
 latch and the check function; the leader wires the call. **[R7]**
+
+### Outcome
+
+Wave D is landed and green:
+
+| unit | result | commit |
+|---|---|---|
+| F5 | 117 inherited single-path cases; production wrappers contain no SQL | `5eec539` |
+| F6 | 69 compatibility, fd and provider cases | `dd4060d` |
+| F7 | 12 importer cases; 8 statements at 933 and 9,329 files; no BLOB payload returned to JavaScript | `2a2ebd5` |
+
+Two owner-approved corrective seams landed before F5: ordered component
+resolution with bounded path expansion (`b03f53a`), and bounded raw store
+operations for the SQL-bearing single-path mutations (`0097969`). This keeps
+`src/fs/ops.ts` as the intended validation and compatibility layer over raw
+store primitives instead of duplicating SQL.
 
 ---
 
