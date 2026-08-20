@@ -468,10 +468,24 @@ Deliberately absent:
 
 ### 3.4 The git tables
 
-**Unchanged.** `src/sqlite/schema.ts:12-153` carries over verbatim:
-`git_meta`, `git_repositories`, `git_refs`, `git_config`, `git_index`,
-`git_blob_ids`, `git_shallow`, `git_objects`, `git_object_chunks`,
+**Almost unchanged.** Twelve tables carry over verbatim from
+`src/sqlite/schema.ts`: `git_meta`, `git_repositories`, `git_refs`,
+`git_config`, `git_index`, `git_shallow`, `git_objects`, `git_object_chunks`,
 `git_pack_meta`, `git_pack_data`, `git_pack_objects`, `git_pack_pending`.
+
+Three additions are needed and **none of them exists in the tree today**.
+An earlier draft of this plan said they did; that draft was written against an
+uncommitted working copy that has since been reverted. Verified against
+`git show HEAD:src/sqlite/schema.ts`:
+
+- `git_blob_ids` — the `content_id` → blob-oid map. This is what makes
+  `status` free (§7.1).
+- `git_objects.stored` — the storage-format column that removes the deflate
+  tax (§7.3).
+- `git_commits` — below.
+
+All three land together with their migration in the seam wave, before any
+unit depends on them.
 
 This is worth stating plainly: **a workspace already running kompjutr as a
 Computer plugin keeps its entire git repository through the switch.** Only the
@@ -498,15 +512,10 @@ And one change of meaning, not of shape: `git_blob_ids.content_id`
 (`src/sqlite/schema.ts:65-70`) was designed against DOFS's `manifest_hash`. It
 now holds `fs_nodes.content_id`.
 
-Two columns in the current git schema are **dead** — declared, migrated, and
-never read or written by any code in `src/`:
-
-- the whole `git_blob_ids` table (`src/sqlite/schema.ts:65-70`)
-- `git_objects.stored` (`src/sqlite/schema.ts:89`, migration at `:167`)
-
-Both were landed as wave-0 seams for `docs/plans/bulk-sql.md` and never wired
-up. Both are load-bearing in this plan: `git_blob_ids` is what makes `status`
-free (§7.1), and `stored` is what removes the deflate tax (§7.3).
+`git_blob_ids` and `git_objects.stored` were drafted as wave-0 seams for
+`docs/plans/bulk-sql.md` and reverted when that plan was superseded. They are
+re-introduced here as part of the seam wave, this time with the code that reads
+them landing in the same run.
 
 ### 3.5 `content_id`: the filesystem does not hash
 
