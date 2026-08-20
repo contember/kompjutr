@@ -8,7 +8,7 @@
       "style": { "noNonNullAssertion": "off", "useNamingConvention": "off" }
     }
   },
-  // bench/.fixtures holds cloned repositories, several of which carry their
-  // own biome.json and would be read as nested roots.
-  "files": { "includes": ["**", "!dist", "!node_modules", "!bench/.fixtures"] }
+  // bench/.fixtures and tmp both hold cloned repositories, several of which
+  // carry their own biome.json and would be read as nested roots.
+  "files": { "includes": ["**", "!dist", "!node_modules", "!bench/.fixtures", "!tmp"] }
 }
