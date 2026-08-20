@@ -1262,7 +1262,7 @@ local runs only and is not a duration inside a Worker
 
 ```sql
 SELECT p.path, p.inode,
-       n.type, n.mode, n.mtime, n.size, n.nlink, n.link_target, n.content_id
+       n.type, n.mode, n.mtime, n.size, n.nlink, n.rev, n.link_target, n.content_id
   FROM fs_paths p
   JOIN fs_nodes n ON n.inode = p.inode
  WHERE p.path > ?after AND p.path < ?rootSuccessor
@@ -1282,6 +1282,17 @@ discarded, costing at most one extra statement per pruned directory. This is
 strictly better than a server-side prune list
 (`src/sqlite/vfs.ts:80`), which could only match literal directory *names* and
 could not evaluate a `.gitignore` pattern.
+
+**The initial cursor is `root + "/"`, not `root`.** This is the bug the
+bounds check exists to catch, and the SQL above is written as if `?after`
+started at `root` itself. It must not: `/repo/src-extra` and `/repo/src.txt`
+both sort above `/repo/src` and below `/repo/src0`, so they land inside the
+range. `'-'` is 0x2D and `'.'` is 0x2E, both below `'/'` at 0x2F, so a lower
+bound of `root + "/"` excludes them and `subtreeSuccessor(root)` still bounds
+the top. Root `/` is special-cased to `/`, since `//` would exclude `/!foo`.
+
+`?root` is an already-resolved `RealPath`, resolved **once** by the caller and
+held across every page. Resolving per page doubles the statement count.
 
 12,675 rows ÷ 1,000 = **13 statements**, plus ~2 for prunes = **15**.
 
