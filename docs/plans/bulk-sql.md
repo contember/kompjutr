@@ -281,6 +281,18 @@ rewrites the results.
 Single tree, no worktree isolation: the territories do not intersect, and each
 green unit is committed as it lands.
 
+## Decided at the gate
+
+- **Reads direct, writes on the public API.** `checkout` and clone's checkout
+  half stay at roughly 45 statements per file written, and the 1,000-statement
+  target does not apply to them. Accepted knowingly.
+- **The compression threshold is an option**, `looseCompressAbove`, default
+  4 KiB. Setting it to 0 restores today's always-deflate behaviour for anyone who
+  would rather pay CPU than Durable Object storage.
+- **The write-buffer difference is accepted and documented** in
+  `docs/architecture.md`, not worked around.
+- **All four waves run**, not a trial slice.
+
 ## Out of scope unless separately approved
 
 - **Direct `vfs_*` writes.** The only way `checkout` and `clone` reach 1,000
