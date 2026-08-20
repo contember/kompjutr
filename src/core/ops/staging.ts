@@ -10,9 +10,16 @@ import { PathspecNotFoundError } from "../errors.js";
 import { loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { joinSorted, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
-import { checkoutTree, indexFromTree, matchesPaths, treeEntries } from "./checkout.js";
-import { hashWorktreePath, indexEntryFor, indexMatchesStat, walkWorktree } from "./worktree-io.js";
+import { checkoutTree, indexFromTree, matchesPaths, stageZero } from "./checkout.js";
+import { treeStream } from "./tree-stream.js";
+import {
+  hashWorktreePath,
+  indexEntryFor,
+  indexMatchesStat,
+  walkWorktreeStream,
+} from "./worktree-io.js";
 
 export interface AddOptions {
   /** Repo-relative pathspecs. Empty is a no-op, like `git add` with no arguments. */
@@ -42,49 +49,55 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
   if (!all && specs.length === 0) return;
 
   const force = options.force === true;
-  const walked = walkWorktree(worktree, repo.root, {
+  const trackedOnly = all && options.trackedOnly === true;
+  if (!all) assertPathspecsMatch(repo, worktree, specs);
+
+  // Conflict stages repeat a path, which a merge join cannot represent, so
+  // they are collected first — and only when there are any at all.
+  const conflicted = new Set<string>();
+  if (repo.store.hasConflicts()) {
+    for (const entry of repo.store.indexScan()) {
+      if (entry.stage !== 0) conflicted.add(entry.path);
+    }
+  }
+
+  const walked = walkWorktreeStream(worktree, repo.root, {
     excludeRoots: options.excludeRoots,
     paths: all ? undefined : specs,
     ignores: force ? undefined : loadIgnoreMatcher(worktree, repo.root),
   });
-
-  const tracked = new Map<string, IndexEntry>();
-  const conflicted = new Set<string>();
-  for (const entry of repo.store.indexEntries()) {
-    if (entry.stage === 0) tracked.set(entry.path, entry);
-    else conflicted.add(entry.path);
-  }
   // `commit -a` never adds a path HEAD does not already have.
-  const headPaths = all && options.trackedOnly === true ? treeEntries(repo, repo.headTree()) : null;
+  const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
 
-  if (!all) assertPathspecsMatch(worktree, repo.root, specs, walked, tracked.keys());
+  repo.store.indexApply((sink) => {
+    for (const row of joinSorted3(walked, stageZero(repo.store.indexScan()), head, {
+      a: (path: string) => path,
+      b: (entry) => entry.path,
+      c: (entry) => entry.path,
+    })) {
+      if (trackedOnly && row.c === undefined) continue;
+      const existing = row.b;
 
-  const seen = new Set(walked);
-  const updates: IndexEntry[] = [];
-  const removals: string[] = [];
+      if (row.a !== undefined) {
+        const update = stage(repo, worktree, row.path, existing, conflicted);
+        if (update !== null) sink.put(update);
+        continue;
+      }
 
-  for (const relative of walked) {
-    if (headPaths !== null && !headPaths.has(relative)) continue;
-    const update = stage(repo, worktree, relative, tracked.get(relative), conflicted);
-    if (update !== null) updates.push(update);
-  }
-
-  for (const [path, existing] of tracked) {
-    if (seen.has(path)) continue;
-    if (!all && !matchesPaths(path, specs)) continue;
-    if (headPaths !== null && !headPaths.has(path)) continue;
-    const stat = worktree.stat(joinPath(repo.root, path));
-    if (stat === null || stat.type === "directory") {
-      removals.push(path);
-      continue;
+      // Tracked but not walked: either gone, or filtered out by an ignore
+      // rule — and git never ignores a path it already tracks.
+      if (existing === undefined) continue;
+      if (!all && !matchesPaths(row.path, specs)) continue;
+      const stat = worktree.stat(joinPath(repo.root, row.path));
+      if (stat === null || stat.type === "directory") {
+        sink.remove(row.path);
+        continue;
+      }
+      if (indexMatchesStat(existing, stat)) continue;
+      const hashed = hashWorktreePath(repo, worktree, row.path);
+      if (hashed !== null) sink.put(indexEntryFor(row.path, hashed));
     }
-    // git never ignores a tracked path, so one the walk filtered out still stages.
-    if (indexMatchesStat(existing, stat)) continue;
-    const hashed = hashWorktreePath(repo, worktree, path);
-    if (hashed !== null) updates.push(indexEntryFor(path, hashed));
-  }
-
-  applyIndex(repo, updates, removals, conflicted);
+  });
 }
 
 export interface RmOptions {
@@ -143,43 +156,37 @@ export function reset(repo: Repository, worktree: Worktree, options: ResetOption
     return;
   }
 
-  const target = treeEntries(repo, tree);
-  const updates: IndexEntry[] = [];
-  for (const entry of target.values()) {
-    if (!matchesPaths(entry.path, specs)) continue;
-    updates.push({
-      path: entry.path,
-      stage: 0,
-      mode: Number.parseInt(entry.mode, 8),
-      oid: entry.oid,
-      size: null,
-      mtime: null,
-      ino: null,
-    });
-  }
-
-  const conflicted = new Set<string>();
-  const removals = new Set<string>();
-  for (const entry of repo.store.indexEntries()) {
-    if (!matchesPaths(entry.path, specs)) continue;
-    if (entry.stage !== 0) conflicted.add(entry.path);
-    if (!target.has(entry.path)) removals.add(entry.path);
-  }
-
-  applyIndex(repo, updates, [...removals], conflicted);
+  // Tree and index are both path-ordered, so one merge decides each path.
+  repo.store.indexApply((sink) => {
+    for (const row of joinSorted(indexFromTree(repo, tree), repo.store.indexScan(), {
+      left: (entry) => entry.path,
+      right: (entry) => entry.path,
+    })) {
+      if (!matchesPaths(row.path, specs)) continue;
+      // A conflicted path repeats across stages; clearing it once is enough,
+      // and indexPut only ever overwrites stage 0.
+      if (row.right !== undefined && row.right.stage !== 0) sink.remove(row.path);
+      if (row.left === undefined) {
+        if (row.right !== undefined) sink.remove(row.path);
+        continue;
+      }
+      sink.put(row.left);
+    }
+  });
 }
 
 /** Paths in the index, sorted. The `--ref` form is `lsFilesAtRef`. */
 export function lsFiles(repo: Repository): string[] {
   const out: string[] = [];
   let previous: string | null = null;
-  for (const entry of repo.store.indexEntries()) {
+  for (const entry of repo.store.indexScan()) {
     // Conflict stages repeat the path; callers want it once.
     if (entry.path === previous) continue;
     out.push(entry.path);
     previous = entry.path;
   }
-  return out.sort();
+  // The scan already returns them in order.
+  return out;
 }
 
 /** Restore index and working tree to `ref`, dragging the current branch along. */
@@ -232,24 +239,6 @@ function stage(
   return hashed === null ? null : indexEntryFor(relative, hashed);
 }
 
-/** One transaction for the whole staging change, however many rows it is. */
-function applyIndex(
-  repo: Repository,
-  updates: IndexEntry[],
-  removals: string[],
-  conflicted: Set<string>,
-): void {
-  if (updates.length === 0 && removals.length === 0) return;
-  repo.store.db.transactionSync(() => {
-    for (const path of removals) repo.store.indexRemove(path);
-    for (const entry of updates) {
-      // indexPut only overwrites stage 0, so a conflict has to be cleared first.
-      if (conflicted.has(entry.path)) repo.store.indexRemove(entry.path);
-      repo.store.indexPut(entry);
-    }
-  });
-}
-
 /** Repo-relative pathspecs, without the "./" and trailing-slash noise. */
 function normalizeSpecs(paths: string[]): string[] {
   const out: string[] = [];
@@ -273,26 +262,17 @@ function noteMatches(matched: Set<string>, specs: string[], path: string): void 
  * Real git exits 128 with `pathspec '<x>' did not match any files`. A path
  * that exists but is ignored is not that case: `add` skips it silently,
  * which is what isomorphic-git does and therefore what Computer promises.
+ *
+ * Checked before the walk, and in O(pathspecs): anything the walk would
+ * match lives under a directory that exists on disk, and anything tracked
+ * shows up in a prefix scan of the index. Neither needs the whole tree.
  */
-function assertPathspecsMatch(
-  worktree: Worktree,
-  root: string,
-  specs: string[],
-  walked: string[],
-  tracked: Iterable<string>,
-): void {
-  const matched = new Set<string>();
-  for (const path of walked) {
-    if (matched.size === specs.length) break;
-    noteMatches(matched, specs, path);
-  }
-  for (const path of tracked) {
-    if (matched.size === specs.length) break;
-    noteMatches(matched, specs, path);
-  }
+function assertPathspecsMatch(repo: Repository, worktree: Worktree, specs: string[]): void {
   for (const spec of specs) {
-    if (matched.has(spec)) continue;
-    if (worktree.stat(joinPath(root, spec)) !== null) continue;
+    if (spec === "") continue;
+    if (worktree.stat(joinPath(repo.root, spec)) !== null) continue;
+    const tracked = repo.store.indexScan({ prefix: spec, pageSize: 1 }).next();
+    if (tracked.done !== true) continue;
     throw new PathspecNotFoundError(spec);
   }
 }

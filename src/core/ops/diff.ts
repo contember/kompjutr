@@ -11,10 +11,12 @@ import { diffText } from "../diff/index.js";
 import { isBinary } from "../diff/lines.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { matchesPaths, treeEntries } from "./checkout.js";
+import { matchesPaths, stageZero } from "./checkout.js";
 import type { DiffSummaryEntry } from "./kinds.js";
 import { treeOf } from "./reads.js";
+import { type TargetEntry, treeStream } from "./tree-stream.js";
 import { hashWorktreePath, indexMatchesStat, worktreeBytes } from "./worktree-io.js";
 
 /** git's default abbreviation for `index` lines in a small repository. */
@@ -48,34 +50,42 @@ interface FileChange {
 
 export function diff(repo: Repository, worktree: Worktree, options: DiffOptions = {}): string {
   const abbrev = options.abbrev ?? DEFAULT_ABBREV;
-  const out: string[] = [];
+  // Appended, not collected and joined: the parts array and the joined
+  // result are alive at the same instant, so joining doubles the patch.
+  let out = "";
   for (const change of collect(repo, worktree, options)) {
     const before = change.before;
     const after = change.after;
     const left = before === null ? "/dev/null" : `a/${change.path}`;
     const right = after === null ? "/dev/null" : `b/${change.path}`;
 
-    const header: string[] = [`diff --git a/${change.path} b/${change.path}\n`];
-    if (before === null && after !== null) header.push(`new file mode ${after.mode}\n`);
-    else if (after === null && before !== null) header.push(`deleted file mode ${before.mode}\n`);
-    else if (before !== null && after !== null && before.mode !== after.mode) {
-      header.push(`old mode ${before.mode}\n`, `new mode ${after.mode}\n`);
+    let header = `diff --git a/${change.path} b/${change.path}\n`;
+    let headerLines = 1;
+    if (before === null && after !== null) {
+      header += `new file mode ${after.mode}\n`;
+      headerLines++;
+    } else if (after === null && before !== null) {
+      header += `deleted file mode ${before.mode}\n`;
+      headerLines++;
+    } else if (before !== null && after !== null && before.mode !== after.mode) {
+      header += `old mode ${before.mode}\nnew mode ${after.mode}\n`;
+      headerLines += 2;
     }
 
     const oldOid = before?.oid ?? ZERO_OID;
     const newOid = after?.oid ?? ZERO_OID;
     if (oldOid !== newOid) {
       const sameMode = before !== null && after !== null && before.mode === after.mode;
-      header.push(
+      header +=
         `index ${oldOid.slice(0, abbrev)}..${newOid.slice(0, abbrev)}` +
-          `${sameMode && before !== null ? ` ${before.mode}` : ""}\n`,
-      );
+        `${sameMode && before !== null ? ` ${before.mode}` : ""}\n`;
+      headerLines++;
     }
 
     const oldBytes = before === null ? new Uint8Array(0) : before.bytes();
     const newBytes = after === null ? new Uint8Array(0) : after.bytes();
     if (isBinary(oldBytes) || isBinary(newBytes)) {
-      out.push(...header, `Binary files ${left} and ${right} differ\n`);
+      out += `${header}Binary files ${left} and ${right} differ\n`;
       continue;
     }
     const text = diffText(utf8Decoder.decode(oldBytes), utf8Decoder.decode(newBytes), {
@@ -83,12 +93,12 @@ export function diff(repo: Repository, worktree: Worktree, options: DiffOptions 
     });
     if (text.hunks === "") {
       // A mode change with identical content still gets its header.
-      if (header.length > 1) out.push(...header);
+      if (headerLines > 1) out += header;
       continue;
     }
-    out.push(...header, `--- ${left}\n`, `+++ ${right}\n`, text.hunks);
+    out += `${header}--- ${left}\n+++ ${right}\n${text.hunks}`;
   }
-  return out.join("");
+  return out;
 }
 
 export function diffSummary(
@@ -117,80 +127,81 @@ export function diffSummary(
   return out;
 }
 
-function collect(repo: Repository, worktree: Worktree, options: DiffOptions): FileChange[] {
-  const before = fromTree(repo, resolveFrom(repo, options));
-  const after =
-    options.to === undefined
-      ? fromWorktree(repo, worktree, before, options)
-      : fromTree(repo, treeOf(repo, repo.revParse(options.to)));
+/**
+ * The changed paths, lazily. Both sides are path-ordered — a tree walk and
+ * either another tree walk or the paged index — so a merge join replaces the
+ * three maps and the sorted union this used to build.
+ */
+function* collect(
+  repo: Repository,
+  worktree: Worktree,
+  options: DiffOptions,
+): Generator<FileChange> {
+  const from = treeStream(repo, resolveFrom(repo, options));
+  const byPath = { left: (entry: TargetEntry) => entry.path };
 
-  const paths = new Set<string>([...before.keys(), ...after.keys()]);
-  const changes: FileChange[] = [];
-  for (const path of [...paths].sort()) {
-    if (!matchesPaths(path, options.paths)) continue;
-    const left = before.get(path) ?? null;
-    const right = after.get(path) ?? null;
-    if (left === null && right === null) continue;
-    if (left !== null && right !== null && left.oid === right.oid && left.mode === right.mode) {
-      continue;
+  if (options.to !== undefined) {
+    const to = treeStream(repo, treeOf(repo, repo.revParse(options.to)));
+    for (const row of joinSorted(from, to, { ...byPath, right: (entry) => entry.path })) {
+      if (!matchesPaths(row.path, options.paths)) continue;
+      const change = compare(row.path, treeEndpoint(repo, row.left), treeEndpoint(repo, row.right));
+      if (change !== null) yield change;
     }
-    changes.push({ path, before: left, after: right });
+    return;
   }
-  return changes;
+
+  // The working-tree side covers only paths git would consider — those in
+  // the "from" tree or in the index — so an untracked file stays out of the
+  // patch, as it does in real `git diff`.
+  for (const row of joinSorted(from, stageZero(repo.store.indexScan()), {
+    ...byPath,
+    right: (entry) => entry.path,
+  })) {
+    if (!matchesPaths(row.path, options.paths)) continue;
+    const indexed = row.right !== undefined && row.right.mode !== 0o160000 ? row.right : undefined;
+    const change = compare(
+      row.path,
+      treeEndpoint(repo, row.left),
+      worktreeEndpoint(repo, worktree, row.path, indexed),
+    );
+    if (change !== null) yield change;
+  }
+}
+
+/** A change, or null when the two sides agree or neither exists. */
+function compare(path: string, before: Endpoint | null, after: Endpoint | null): FileChange | null {
+  if (before === null && after === null) return null;
+  if (before !== null && after !== null && before.oid === after.oid && before.mode === after.mode) {
+    return null;
+  }
+  return { path, before, after };
+}
+
+function treeEndpoint(repo: Repository, entry: TargetEntry | undefined): Endpoint | null {
+  // Submodules are out of scope.
+  if (entry === undefined || entry.mode === "160000") return null;
+  return { mode: entry.mode, oid: entry.oid, bytes: () => repo.readBlob(entry.oid) };
+}
+
+function worktreeEndpoint(
+  repo: Repository,
+  worktree: Worktree,
+  path: string,
+  entry: IndexEntry | undefined,
+): Endpoint | null {
+  const absolute = joinPath(repo.root, path);
+  const stat = worktree.stat(absolute);
+  if (stat === null || stat.type === "directory") return null;
+  // The index caches the oid alongside the stat that produced it, so an
+  // unmodified file never has to be read to be identified.
+  const cached = entry !== undefined && indexMatchesStat(entry, stat) ? entry.oid : null;
+  const oid = cached ?? hashWorktreePath(repo, worktree, path, { write: false })?.oid;
+  if (oid === undefined) return null;
+  return { mode: gitModeFor(stat), oid, bytes: () => worktreeBytes(worktree, absolute, stat) };
 }
 
 /** The "from" tree: an explicit ref, or HEAD — which may be unborn. */
 function resolveFrom(repo: Repository, options: DiffOptions): string | null {
   if (options.ref === undefined) return repo.headTree();
   return treeOf(repo, repo.revParse(options.ref));
-}
-
-function fromTree(repo: Repository, tree: string | null): Map<string, Endpoint> {
-  const out = new Map<string, Endpoint>();
-  for (const entry of treeEntries(repo, tree).values()) {
-    if (entry.mode === "160000") continue; // submodules are out of scope
-    out.set(entry.path, {
-      mode: entry.mode,
-      oid: entry.oid,
-      bytes: () => repo.readBlob(entry.oid),
-    });
-  }
-  return out;
-}
-
-/**
- * The working-tree side. Only paths git would consider — those in the
- * "from" tree or in the index — so an untracked file stays out of the
- * patch, as it does in real `git diff`.
- */
-function fromWorktree(
-  repo: Repository,
-  worktree: Worktree,
-  before: Map<string, Endpoint>,
-  options: DiffOptions,
-): Map<string, Endpoint> {
-  const index = new Map<string, IndexEntry>();
-  for (const entry of repo.store.indexEntries()) {
-    if (entry.stage === 0 && entry.mode !== 0o160000) index.set(entry.path, entry);
-  }
-
-  const out = new Map<string, Endpoint>();
-  for (const path of new Set<string>([...before.keys(), ...index.keys()])) {
-    if (!matchesPaths(path, options.paths)) continue;
-    const absolute = joinPath(repo.root, path);
-    const stat = worktree.stat(absolute);
-    if (stat === null || stat.type === "directory") continue;
-    const entry = index.get(path);
-    // The index caches the oid alongside the stat that produced it, so an
-    // unmodified file never has to be read to be identified.
-    const cached = entry !== undefined && indexMatchesStat(entry, stat) ? entry.oid : null;
-    const oid = cached ?? hashWorktreePath(repo, worktree, path, { write: false })?.oid;
-    if (oid === undefined) continue;
-    out.set(path, {
-      mode: gitModeFor(stat),
-      oid,
-      bytes: () => worktreeBytes(worktree, absolute, stat),
-    });
-  }
-  return out;
 }
