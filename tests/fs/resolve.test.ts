@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
-import { realpath, realpathNoFollow } from "../../src/fs/store/resolve.js";
+import { realpath, realpathNoFollow, realpaths } from "../../src/fs/store/resolve.js";
 import type { EntryType } from "../../src/fs/types.js";
 import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
@@ -238,5 +238,28 @@ describe("resolution query shape", () => {
       .join("\n");
     expect(plan).toContain("SEARCH p USING PRIMARY KEY (path=?)");
     expect(plan).not.toContain("SCAN p");
+  });
+
+  it("batches adversarial aggregate prefix bindings below 1.5 MB", () => {
+    const db = setup([]);
+    const recording = new RecordingDatabase(db);
+    const paths: string[] = [];
+    for (let pathIndex = 0; pathIndex < 30; pathIndex++) {
+      const parts: string[] = [];
+      for (let depth = 0; depth < 200; depth++) parts.push(`p${pathIndex}-${depth}`);
+      paths.push(`/${parts.join("/")}`);
+    }
+    db.storage.resetCounters();
+
+    expect(realpaths(recording, paths)).toEqual(paths);
+    expect(recording.queries.length).toBeGreaterThan(1);
+    expect(recording.queries.length).toBeLessThan(1_000);
+    for (const query of recording.queries) {
+      const binding = query.bindings[0];
+      expect(typeof binding).toBe("string");
+      if (typeof binding === "string") {
+        expect(new TextEncoder().encode(binding).byteLength).toBeLessThanOrEqual(1_500_000);
+      }
+    }
   });
 });

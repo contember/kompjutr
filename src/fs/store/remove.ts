@@ -10,12 +10,9 @@
 // (§3.6), so callers pass paths that already came through `realpath`.
 
 import type { SqlDatabase } from "../../sqlite/db.js";
+import { filesystemError as fsError } from "../errors.js";
 import { codePointLength, dirname, normalize, subtreeSuccessor } from "../path.js";
 import type { RemoveOptions } from "../types.js";
-
-function fsError(code: string, message: string): Error {
-  return Object.assign(new Error(message), { code });
-}
 
 // ---------------------------------------------------------------------------
 // removeFiles

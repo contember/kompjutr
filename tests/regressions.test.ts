@@ -26,9 +26,9 @@ describe("regressions", () => {
     const ws = makeWorkspace();
     writeWorkFile(ws, "/target.txt", "x");
     ws.worktree.symlink("target.txt", "/link.txt");
-    ws.worktree.mkdirp("/dir");
+    ws.worktree.makeDirectories(["/dir"]);
     expect(ws.worktree.readdir("/")).toEqual([
-      { name: "dir", type: "directory" },
+      { name: "dir", type: "dir" },
       { name: "link.txt", type: "symlink" },
       { name: "target.txt", type: "file" },
     ]);

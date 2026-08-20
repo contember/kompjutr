@@ -75,13 +75,14 @@ function mirror(): Mirror {
     },
     writeExecutable(path, content) {
       fixture.writeExecutable(path, content);
-      workspace.worktree.writeFile(`/${path}`, utf8.encode(content), 0o755);
+      workspace.worktree.writeFiles([
+        { path: `/${path}`, bytes: utf8.encode(content), mode: 0o755 },
+      ]);
       return self;
     },
     symlink(target, path) {
       fixture.symlink(target, path);
-      workspace.worktree.unlink(`/${path}`);
-      workspace.worktree.symlink(target, `/${path}`);
+      workspace.worktree.writeFiles([{ path: `/${path}`, target }]);
       return self;
     },
     remove(path) {

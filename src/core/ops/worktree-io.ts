@@ -93,7 +93,7 @@ function* walkDirectory(
     if (excluded.has(absolute)) continue;
     const relative = relativeTo(root, absolute);
     if (relative === null) continue;
-    if (entry.type === "directory") {
+    if (entry.type === "dir") {
       if (!withinPathspec(relative, options.paths, true)) continue;
       // git never descends into an ignored directory, which is also why a
       // re-include below one cannot take effect.
@@ -113,7 +113,7 @@ function* walkDirectory(
 
 /** git's tree-entry rule: a directory sorts as though its name ended in "/". */
 function sortKey(name: string, type: string): string {
-  return type === "directory" ? `${name}/` : name;
+  return type === "dir" ? `${name}/` : name;
 }
 
 /**
@@ -167,7 +167,7 @@ export function hashWorktreePath(
 ): HashedPath | null {
   const absolute = joinPath(repo.root, relative);
   const stat = worktree.stat(absolute);
-  if (stat === null || stat.type === "directory") return null;
+  if (stat === null || stat.type === "dir") return null;
   if (stat.type !== "symlink" && stat.size > STREAM_ABOVE) {
     return hashLargeFile(repo, worktree, absolute, stat, options);
   }

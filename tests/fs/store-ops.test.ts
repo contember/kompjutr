@@ -115,6 +115,64 @@ function expectBytes(actual: Uint8Array, expected: Uint8Array): void {
   expect(Buffer.compare(actual, expected)).toBe(0);
 }
 
+interface ChunkCorruption {
+  name: string;
+  apply(db: SqlDatabase, inode: number): void;
+}
+
+const chunkCorruptions: readonly ChunkCorruption[] = [
+  {
+    name: "missing",
+    apply(db: SqlDatabase, inode: number): void {
+      db.run("DELETE FROM fs_chunks WHERE inode = ? AND idx = 0", inode);
+    },
+  },
+  {
+    name: "short",
+    apply(db: SqlDatabase, inode: number): void {
+      db.run(
+        "UPDATE fs_chunks SET bytes = ? WHERE inode = ? AND idx = 0",
+        new Uint8Array([1]),
+        inode,
+      );
+    },
+  },
+  {
+    name: "oversized",
+    apply(db: SqlDatabase, inode: number): void {
+      db.run(
+        "UPDATE fs_chunks SET bytes = ? WHERE inode = ? AND idx = 0",
+        new Uint8Array([1, 2, 3, 99]),
+        inode,
+      );
+    },
+  },
+  {
+    name: "text storage",
+    apply(db: SqlDatabase, inode: number): void {
+      db.run("UPDATE fs_chunks SET bytes = 'abc' WHERE inode = ? AND idx = 0", inode);
+    },
+  },
+  {
+    name: "orphan",
+    apply(db: SqlDatabase, inode: number): void {
+      db.run(
+        "INSERT INTO fs_chunks (inode, idx, bytes) VALUES (?, 1, ?)",
+        inode,
+        new Uint8Array([0]),
+      );
+    },
+  },
+];
+
+function corruptThreeByteFile(db: SqlDatabase, path: string, kind: ChunkCorruption): number {
+  writeFileFixture(db, path, new Uint8Array([1, 2, 3]));
+  const stat = statRaw(db, realpath(db, path));
+  if (stat === null) throw new Error(`fixture missing at ${path}`);
+  kind.apply(db, stat.ino);
+  return currentRev(db);
+}
+
 describe("raw metadata reads", () => {
   it("returns complete stat metadata and ordered direct children", () => {
     const db = setup();
@@ -193,6 +251,36 @@ describe("writeRangeRaw", () => {
     expect([...actual.subarray(offset)]).toEqual([7, 8, 9]);
   });
 
+  it.each(chunkCorruptions)("rejects a $name chunk layout before sparse extension", (kind) => {
+    const db = setup();
+    const path = realpath(db, "/repo/corrupt.bin");
+    const rev = corruptThreeByteFile(db, path, kind);
+
+    expect(() => writeRangeRaw(db, path, new Uint8Array([9]), 5, 42)).toThrow(/EIO/);
+    expect(statRaw(db, path)?.size).toBe(3);
+    expect(currentRev(db)).toBe(rev);
+  });
+
+  it.each(chunkCorruptions)("rejects a $name chunk layout when extending from EOF", (kind) => {
+    const db = setup();
+    const path = realpath(db, "/repo/corrupt.bin");
+    const rev = corruptThreeByteFile(db, path, kind);
+
+    expect(() => writeRangeRaw(db, path, new Uint8Array([8, 9, 10]), 3, 42)).toThrow(/EIO/);
+    expect(statRaw(db, path)?.size).toBe(3);
+    expect(currentRev(db)).toBe(rev);
+  });
+
+  it.each(chunkCorruptions)("rejects a $name chunk layout when a write crosses EOF", (kind) => {
+    const db = setup();
+    const path = realpath(db, "/repo/corrupt.bin");
+    const rev = corruptThreeByteFile(db, path, kind);
+
+    expect(() => writeRangeRaw(db, path, new Uint8Array([8, 9, 10]), 2, 42)).toThrow(/EIO/);
+    expect(statRaw(db, path)?.size).toBe(3);
+    expect(currentRev(db)).toBe(rev);
+  });
+
   it("treats an empty write as a validated no-op", () => {
     const db = setup();
     writeFileFixture(db, "/repo/empty-write.bin", new Uint8Array([1, 2, 3]));
@@ -218,7 +306,7 @@ describe("writeRangeRaw", () => {
 
     const statements = operationStatements(db, () => writeRangeRaw(measured, path, payload, 3, 55));
 
-    expect(statements).toBe(8);
+    expect(statements).toBe(9);
     expect(measured.maxBlobBindingBytes).toBe(3 * CHUNK_SIZE);
     expect(measured.maxBlobBindingBytes).toBeLessThan(2 * 1024 * 1024);
     expect(measured.maxBlobResultBytes).toBe(CHUNK_SIZE);
@@ -292,6 +380,30 @@ describe("truncateRaw", () => {
       rev: initialRev + 2,
       contentId: null,
     });
+  });
+
+  it.each(chunkCorruptions)("rejects a $name chunk layout before growing a file", (kind) => {
+    const db = setup();
+    const path = realpath(db, "/repo/corrupt.bin");
+    const rev = corruptThreeByteFile(db, path, kind);
+
+    expect(() => truncateRaw(db, path, 5, 42)).toThrow(/EIO/);
+    expect(statRaw(db, path)?.size).toBe(3);
+    expect(currentRev(db)).toBe(rev);
+  });
+
+  it("rejects a REAL chunk index that otherwise matches the aggregate layout", () => {
+    const db = setup();
+    const path = realpath(db, "/repo/real-index.bin");
+    writeFileFixture(db, path, pattern(CHUNK_SIZE * 2 + 3));
+    const stat = statRaw(db, path);
+    if (stat === null) throw new Error(`fixture missing at ${path}`);
+    db.run("UPDATE fs_chunks SET idx = 0.5 WHERE inode = ? AND idx = 1", stat.ino);
+    const rev = currentRev(db);
+
+    expect(() => truncateRaw(db, path, stat.size + 1, 42)).toThrow(/EIO/);
+    expect(statRaw(db, path)?.size).toBe(stat.size);
+    expect(currentRev(db)).toBe(rev);
   });
 
   it("has constant cost when truncating files whose sizes differ by 10x", () => {

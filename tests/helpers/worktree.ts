@@ -1,6 +1,14 @@
 // Worktree decorators shared by the op tests.
 
 import type { Worktree, WorktreeDirent, WorktreeStat } from "../../src/core/worktree.js";
+import type {
+  ReadBatch,
+  RemoveOptions,
+  ScanEntry,
+  ScanOptions,
+  WriteEntry,
+  WriteOptions,
+} from "../../src/fs/types.js";
 
 /** Counts the calls that would mean a file was read to be hashed. */
 export class CountingWorktree implements Worktree {
@@ -21,8 +29,12 @@ export class CountingWorktree implements Worktree {
     this.reads++;
     return this.inner.readFile(path);
   }
-  writeFile(path: string, data: Uint8Array, mode: number): void {
-    this.inner.writeFile(path, data, mode);
+  writeFile(
+    path: string,
+    data: Uint8Array,
+    options?: { mode?: number; contentId?: Uint8Array },
+  ): void {
+    this.inner.writeFile(path, data, options);
   }
   readlink(path: string): string {
     this.reads++;
@@ -34,9 +46,6 @@ export class CountingWorktree implements Worktree {
   readdir(path: string): WorktreeDirent[] {
     this.readdirs++;
     return this.inner.readdir(path);
-  }
-  mkdirp(path: string): void {
-    this.inner.mkdirp(path);
   }
   unlink(path: string): void {
     this.inner.unlink(path);
@@ -58,5 +67,23 @@ export class CountingWorktree implements Worktree {
   writeRange(path: string, data: Uint8Array, offset: number): void {
     this.rangeWrites++;
     this.inner.writeRange(path, data, offset);
+  }
+  scan(root: string, options: ScanOptions): ScanEntry[] {
+    return this.inner.scan(root, options);
+  }
+  readFiles(paths: readonly string[], options?: { budget?: number }): ReadBatch {
+    return this.inner.readFiles(paths, options);
+  }
+  glob(root: string, pattern: string, options?: { limit?: number }): string[] {
+    return this.inner.glob(root, pattern, options);
+  }
+  writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {
+    this.inner.writeFiles(entries, options);
+  }
+  makeDirectories(paths: readonly string[]): void {
+    this.inner.makeDirectories(paths);
+  }
+  removeFiles(paths: readonly string[], options?: RemoveOptions): void {
+    this.inner.removeFiles(paths, options);
   }
 }

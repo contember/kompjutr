@@ -1,7 +1,7 @@
 {
   "name": "kompjutr",
   "version": "0.0.0",
-  "description": "SQLite-native git backend for Cloudflare Computer: objects, refs and index live in the Durable Object database, the working tree lives in DOFS.",
+  "description": "SQLite-native filesystem and git backend for Cloudflare Workers.",
   "license": "MIT AND LGPL-2.1-or-later",
   "type": "module",
   "sideEffects": false,
@@ -9,6 +9,22 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./fs": {
+      "types": "./dist/fs/index.d.ts",
+      "import": "./dist/fs/index.js"
+    },
+    "./git": {
+      "types": "./dist/git/index.d.ts",
+      "import": "./dist/git/index.js"
+    },
+    "./compat/computer": {
+      "types": "./dist/compat/computer.d.ts",
+      "import": "./dist/compat/computer.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
     }
   },
   "main": "./dist/index.js",

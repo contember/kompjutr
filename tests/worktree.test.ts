@@ -45,7 +45,7 @@ describe("worktree ranged I/O", () => {
     const worktree = makeWorktree();
     const size = CHUNK + 200_000;
     const expected = pattern(size, 3);
-    worktree.writeFile("/big.bin", expected, 0o644);
+    worktree.writeFile("/big.bin", expected, { mode: 0o644 });
 
     const collected = new Uint8Array(size);
     let filled = 0;
@@ -64,7 +64,7 @@ describe("worktree ranged I/O", () => {
 
   it("returns a short read at EOF and nothing past it", () => {
     const worktree = makeWorktree();
-    worktree.writeFile("/r.txt", new TextEncoder().encode("0123456789"), 0o644);
+    worktree.writeFile("/r.txt", new TextEncoder().encode("0123456789"), { mode: 0o644 });
 
     expect(Buffer.from(worktree.readRange("/r.txt", 0, 4)).toString()).toBe("0123");
     // Crossing EOF: short, not padded, not an error.
@@ -79,7 +79,7 @@ describe("worktree ranged I/O", () => {
     const body = pattern(CHUNK + 4096, 11);
 
     // writeFile out, readRange in.
-    worktree.writeFile("/a.bin", body, 0o644);
+    worktree.writeFile("/a.bin", body, { mode: 0o644 });
     expect(
       Buffer.from(worktree.readRange("/a.bin", 0, body.byteLength)).equals(Buffer.from(body)),
     ).toBe(true);
@@ -115,7 +115,9 @@ describe("worktree ranged I/O", () => {
 
   it("truncates an existing file and re-modes it, like writeFile does", () => {
     const worktree = makeWorktree();
-    worktree.writeFile("/f.txt", new TextEncoder().encode("the previous contents"), 0o644);
+    worktree.writeFile("/f.txt", new TextEncoder().encode("the previous contents"), {
+      mode: 0o644,
+    });
 
     worktree.createFile("/f.txt", 0o755);
     expect(worktree.stat("/f.txt")?.size).toBe(0);
@@ -128,7 +130,7 @@ describe("worktree ranged I/O", () => {
   it("creates the parent directories a nested path needs", () => {
     const worktree = makeWorktree();
     worktree.createFile("/x/y/z/file.txt", 0o644);
-    expect(worktree.stat("/x/y")?.type).toBe("directory");
+    expect(worktree.stat("/x/y")?.type).toBe("dir");
     worktree.writeRange("/x/y/z/file.txt", new TextEncoder().encode("ok"), 0);
     expect(Buffer.from(worktree.readFile("/x/y/z/file.txt")).toString()).toBe("ok");
   });
@@ -153,7 +155,7 @@ describe("worktree ranged I/O", () => {
 
   it("follows a symlink on both ranged paths, the way readFile and writeFile do", () => {
     const worktree = makeWorktree();
-    worktree.writeFile("/target.txt", new TextEncoder().encode("0123456789"), 0o644);
+    worktree.writeFile("/target.txt", new TextEncoder().encode("0123456789"), { mode: 0o644 });
     worktree.symlink("/target.txt", "/link.txt");
 
     expect(Buffer.from(worktree.readRange("/link.txt", 0, 4)).toString()).toBe("0123");
@@ -176,10 +178,9 @@ describe("walkWorktreeStream", () => {
     const { worktree } = workspace;
     // "a.txt" must precede "a/x" — "." is 0x2E and "/" is 0x2F — which only
     // holds if the directory "a" sorts as "a/" and not as "a".
-    worktree.mkdirp("/a");
-    worktree.mkdirp("/ab");
+    worktree.makeDirectories(["/a", "/ab"]);
     for (const path of ["/a.txt", "/a/x", "/a/y", "/ab/z", "/b.txt"]) {
-      worktree.writeFile(path, new TextEncoder().encode("x"), 0o644);
+      worktree.writeFile(path, new TextEncoder().encode("x"), { mode: 0o644 });
     }
     expect([...walkWorktreeStream(worktree, "/")]).toEqual([
       "a.txt",
@@ -192,9 +193,9 @@ describe("walkWorktreeStream", () => {
 
   it("agrees with the array form, which sorted afterwards", () => {
     const { worktree } = makeWorkspace();
-    worktree.mkdirp("/deep/er");
+    worktree.makeDirectories(["/deep/er"]);
     for (const path of ["/z.txt", "/deep/b.txt", "/deep/er/c.txt", "/\u{1F600}.txt", "/.txt"]) {
-      worktree.writeFile(path, new TextEncoder().encode("x"), 0o644);
+      worktree.writeFile(path, new TextEncoder().encode("x"), { mode: 0o644 });
     }
     const streamed = [...walkWorktreeStream(worktree, "/")];
     expect(streamed).toEqual([...streamed].sort(comparePaths));
@@ -204,9 +205,9 @@ describe("walkWorktreeStream", () => {
   it("reads one directory at a time rather than the whole tree", () => {
     const { worktree } = makeWorkspace();
     for (let i = 0; i < 20; i++) {
-      worktree.mkdirp(`/d${i}`);
+      worktree.makeDirectories([`/d${i}`]);
       for (let j = 0; j < 10; j++) {
-        worktree.writeFile(`/d${i}/f${j}.txt`, new TextEncoder().encode("x"), 0o644);
+        worktree.writeFile(`/d${i}/f${j}.txt`, new TextEncoder().encode("x"), { mode: 0o644 });
       }
     }
     const counting = new CountingWorktree(worktree);

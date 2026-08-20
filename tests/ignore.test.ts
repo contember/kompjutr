@@ -99,7 +99,7 @@ describe("gitignore", () => {
         const isDirectory = testCase.paths.some((other) => other.startsWith(`${path}/`));
         if (isDirectory) {
           fixture.write(`${path}/.keep`, "");
-          workspace.worktree.mkdirp(`/${path}`);
+          workspace.worktree.makeDirectories([`/${path}`]);
           continue;
         }
         fixture.write(path, "x\n");
@@ -108,7 +108,7 @@ describe("gitignore", () => {
 
       const matcher = loadIgnoreMatcher(workspace.worktree, "/");
       for (const path of testCase.paths) {
-        const isDirectory = workspace.worktree.stat(`/${path}`)?.type === "directory";
+        const isDirectory = workspace.worktree.stat(`/${path}`)?.type === "dir";
         let expected: boolean;
         try {
           fixture.git("check-ignore", "-q", "--no-index", path);

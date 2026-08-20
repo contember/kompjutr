@@ -341,7 +341,12 @@ export function assertComputerImportCurrent(db: SqlDatabase): void {
     if (error instanceof Error && error.message.includes("no such table: vfs_meta")) return;
     throw error;
   }
-  if (row === undefined || row.imported_rev === null) return;
+  if (row === undefined) {
+    throw new Error("Computer filesystem metadata is incomplete: vfs_meta.rev is missing");
+  }
+  if (row.imported_rev === null) {
+    throw new Error("Computer filesystem must be imported before opening the standalone runtime");
+  }
   if (row.current_rev !== row.imported_rev) {
     throw new Error(
       `Computer filesystem changed after import: vfs_meta.rev moved from ${row.imported_rev} to ${row.current_rev}`,

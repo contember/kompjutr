@@ -55,7 +55,7 @@ function worktreeTree(worktree: Worktree, root: string, prefix = ""): Map<string
     const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
     const stat = worktree.stat(absolute);
     if (stat === null) throw new Error(`missing stat for ${absolute}`);
-    if (stat.type === "directory") {
+    if (stat.type === "dir") {
       for (const [key, value] of worktreeTree(worktree, absolute, path)) out.set(key, value);
       continue;
     }
@@ -119,7 +119,7 @@ function allSegments(worktree: Worktree, root: string): string[] {
     for (const entry of worktree.readdir(directory)) {
       out.push(entry.name);
       const absolute = directory === "/" ? `/${entry.name}` : `${directory}/${entry.name}`;
-      if (worktree.stat(absolute)?.type === "directory") visit(absolute);
+      if (worktree.stat(absolute)?.type === "dir") visit(absolute);
     }
   };
   visit(root);

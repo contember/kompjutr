@@ -165,7 +165,7 @@ async function open(setup: (fixture: GitFixture) => void): Promise<Pair> {
 function writeBoth(pair: Pair, path: string, content: string | Uint8Array, mode = 0o644): void {
   pair.fixture.write(path, content);
   const bytes = typeof content === "string" ? utf8.encode(content) : content;
-  pair.workspace.worktree.writeFile(`/${path}`, bytes, mode);
+  pair.workspace.worktree.writeFiles([{ path: `/${path}`, bytes, mode }]);
 }
 
 function removeBoth(pair: Pair, path: string): void {

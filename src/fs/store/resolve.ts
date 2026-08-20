@@ -15,6 +15,11 @@ const MAX_FOLLOWS = 40;
 /** Bounds the quadratic prefix set below to comfortably less than 100 MB. */
 const MAX_PATH_CODE_UNITS = 4096;
 
+/** Keeps every `json_each` binding below the platform BLOB/TEXT ceiling. */
+const PATH_BATCH_BYTES = 1_500_000;
+
+const ENCODER = new TextEncoder();
+
 interface NodeRow {
   path: string;
   type: string;
@@ -27,15 +32,34 @@ interface NodeRow {
  * batch because only then is the next set of real prefixes known.
  */
 function nodesOn(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow> {
-  const rows = db.all<NodeRow>(
-    `SELECT p.path AS path, n.type AS type,
-            substr(n.link_target, 1, 4097) AS link_target
-       FROM fs_paths p
-       JOIN fs_nodes n ON n.inode = p.inode
-      WHERE p.path IN (SELECT value FROM json_each(?))`,
-    JSON.stringify(paths),
-  );
-  return new Map(rows.map((row) => [row.path, row]));
+  const out = new Map<string, NodeRow>();
+  let items: string[] = [];
+  let bytes = 2;
+  const flush = (): void => {
+    if (items.length === 0) return;
+    for (const row of db.all<NodeRow>(
+      `SELECT p.path AS path, n.type AS type,
+              substr(n.link_target, 1, 4097) AS link_target
+         FROM fs_paths p
+         JOIN fs_nodes n ON n.inode = p.inode
+        WHERE p.path IN (SELECT value FROM json_each(?))`,
+      `[${items.join(",")}]`,
+    )) {
+      out.set(row.path, row);
+    }
+    items = [];
+    bytes = 2;
+  };
+
+  for (const path of paths) {
+    const item = JSON.stringify(path);
+    const itemBytes = ENCODER.encode(item).byteLength;
+    if (items.length > 0 && bytes + itemBytes + 1 > PATH_BATCH_BYTES) flush();
+    items.push(item);
+    bytes += itemBytes + 1;
+  }
+  flush();
+  return out;
 }
 
 /** Preserve separators and dot segments; their order carries type semantics. */
@@ -122,7 +146,12 @@ function requireDirectory(row: NodeRow | undefined, sourcePath: string): void {
  * Resolve in component order. This matters for `file/..` and for a symlink
  * followed by `..`: lexical normalization before lookup gets both wrong.
  */
-function resolve(db: SqlDatabase, path: string, followFinal: boolean): RealPath {
+function resolve(
+  db: SqlDatabase,
+  path: string,
+  followFinal: boolean,
+  initialNodes?: ReadonlyMap<string, NodeRow>,
+): RealPath {
   requireAcceptedLength(path, path);
   let resolved: string[] = [];
   let pending = componentsOf(path);
@@ -130,7 +159,8 @@ function resolve(db: SqlDatabase, path: string, followFinal: boolean): RealPath 
   let missingPrefix: string | undefined;
 
   for (;;) {
-    const nodes = nodesOn(db, plannedPaths(resolved, pending));
+    const nodes = initialNodes ?? nodesOn(db, plannedPaths(resolved, pending));
+    initialNodes = undefined;
     let expanded = false;
 
     for (let index = 0; index < pending.length; index++) {
@@ -172,6 +202,42 @@ function resolve(db: SqlDatabase, path: string, followFinal: boolean): RealPath 
   }
 }
 
+function resolveMany(db: SqlDatabase, paths: readonly string[], followFinal: boolean): RealPath[] {
+  if (paths.length === 0) return [];
+  const out: RealPath[] = [];
+  let group: string[] = [];
+  const planned = new Set<string>();
+  let plannedBytes = 2;
+
+  const flush = (): void => {
+    if (group.length === 0) return;
+    const initialNodes = nodesOn(db, [...planned]);
+    for (const path of group) out.push(resolve(db, path, followFinal, initialNodes));
+    group = [];
+    planned.clear();
+    plannedBytes = 2;
+  };
+
+  for (const path of paths) {
+    requireAcceptedLength(path, path);
+    const candidates = plannedPaths([], componentsOf(path));
+    let addedBytes = 0;
+    for (const candidate of candidates) {
+      if (!planned.has(candidate))
+        addedBytes += ENCODER.encode(JSON.stringify(candidate)).byteLength + 1;
+    }
+    if (group.length > 0 && plannedBytes + addedBytes > PATH_BATCH_BYTES) flush();
+    group.push(path);
+    for (const candidate of candidates) {
+      if (planned.has(candidate)) continue;
+      planned.add(candidate);
+      plannedBytes += ENCODER.encode(JSON.stringify(candidate)).byteLength + 1;
+    }
+  }
+  flush();
+  return out;
+}
+
 /**
  * Canonicalise `path` and resolve every symlink on the way.
  *
@@ -185,4 +251,14 @@ export function realpath(db: SqlDatabase, path: string): RealPath {
 /** Resolve ancestors through symlinks but leave a final named link alone. */
 export function realpathNoFollow(db: SqlDatabase, path: string): RealPath {
   return resolve(db, path, false);
+}
+
+/** Resolve many paths with one indexed ancestor query in the common case. */
+export function realpaths(db: SqlDatabase, paths: readonly string[]): RealPath[] {
+  return resolveMany(db, paths, true);
+}
+
+/** Resolve many ancestors while leaving every final named symlink intact. */
+export function realpathsNoFollow(db: SqlDatabase, paths: readonly string[]): RealPath[] {
+  return resolveMany(db, paths, false);
 }

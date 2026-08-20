@@ -89,7 +89,7 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
       if (existing === undefined) continue;
       if (!all && !matchesPaths(row.path, specs)) continue;
       const stat = worktree.stat(joinPath(repo.root, row.path));
-      if (stat === null || stat.type === "directory") {
+      if (stat === null || stat.type === "dir") {
         sink.remove(row.path);
         continue;
       }
@@ -231,7 +231,7 @@ function stage(
   conflicted: Set<string>,
 ): IndexEntry | null {
   const stat = worktree.stat(joinPath(repo.root, relative));
-  if (stat === null || stat.type === "directory") return null;
+  if (stat === null || stat.type === "dir") return null;
   if (existing !== undefined && !conflicted.has(relative) && indexMatchesStat(existing, stat)) {
     return null;
   }

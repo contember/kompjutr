@@ -77,7 +77,7 @@ function applyToWorkspace(workspace: TestRepository, step: Step): void {
       worktree.chmod(absolute, step.mode);
       return;
     case "symlink":
-      worktree.unlink(absolute);
+      if (worktree.stat(absolute) !== null) worktree.unlink(absolute);
       worktree.symlink(step.target, absolute);
       return;
     case "remove":

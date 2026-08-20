@@ -20,11 +20,12 @@
 // cannot parse an upsert on a SELECT-fed INSERT without it.
 
 import { blob, type SqlDatabase } from "../../sqlite/db.js";
-import { comparePaths, normalize } from "../path.js";
+import { filesystemError as fsError } from "../errors.js";
+import { comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type { EntryType, WriteEntry, WriteOptions } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
-import { realpathNoFollow } from "./resolve.js";
+import { realpathsNoFollow } from "./resolve.js";
 
 const DEFAULT_FILE_MODE = 0o644;
 const DEFAULT_DIR_MODE = 0o755;
@@ -148,13 +149,6 @@ ON CONFLICT(inode, idx) DO UPDATE SET bytes = excluded.bytes`;
 
 const DELETE_CHUNKS = "DELETE FROM fs_chunks WHERE inode IN (SELECT value FROM json_each(?))";
 
-const SELECT_SYMLINKS = `
-SELECT p.path AS path
-  FROM fs_paths p
-  JOIN fs_nodes n ON n.inode = p.inode
- WHERE p.path IN (SELECT value FROM json_each(?))
-   AND n.type = 'symlink'`;
-
 const SELECT_EXISTING = `
 SELECT p.path AS path, p.inode AS inode, n.type AS type
   FROM fs_paths p
@@ -162,10 +156,6 @@ SELECT p.path AS path, p.inode AS inode, n.type AS type
  WHERE p.path IN (SELECT value FROM json_each(?))`;
 
 // -- helpers ---------------------------------------------------------
-
-function fsError(code: string, message: string, path: string): Error {
-  return Object.assign(new Error(`${code}: ${message}, '${path}'`), { code, path });
-}
 
 /** UTF-8 length, which is what a bound TEXT value actually costs. */
 function utf8Length(value: string): number {
@@ -243,41 +233,6 @@ function selectByPaths<Row extends object>(
   const out: Row[] = [];
   for (const batch of jsonBatches(items, sizes)) out.push(...db.all<Row>(sql, batch));
   return out;
-}
-
-/**
- * Canonicalise every path and resolve every symlink on the way to it, per
- * §3.6 — `fs_paths.path` is a real path, never a lexical one.
- *
- * One statement in the common case. It asks, for the union of every path's
- * strict ancestors, which of them are symlinks. When none is, then for
- * every path `realpathNoFollow` would have returned `normalize(path)`
- * unchanged: it resolves exactly that ancestor set and finds nothing to
- * follow. Only paths that actually sit under a symlink pay a per-path
- * resolve.
- *
- * The final segment is deliberately NOT followed. This primitive has to be
- * able to replace a symlink — with a file, or with another symlink — and a
- * checkout that wrote through the old link instead of replacing it would be
- * wrong.
- *
- * Resolution is against the store as it stands when the call begins, so a
- * batch that creates a symlink and then writes through it in the same call
- * lands the second entry at its literal path.
- */
-function resolveAll(db: SqlDatabase, paths: readonly string[]): string[] {
-  const normalized = paths.map(normalize);
-  const ancestors = new Set<string>();
-  for (const path of normalized) {
-    for (const ancestor of strictAncestors(path)) ancestors.add(ancestor);
-  }
-  const links = selectByPaths<{ path: string }>(db, SELECT_SYMLINKS, [...ancestors]);
-  if (links.length === 0) return normalized;
-
-  const prefixes = links.map((link) => `${link.path}/`);
-  return normalized.map((path) =>
-    prefixes.some((prefix) => path.startsWith(prefix)) ? realpathNoFollow(db, path) : path,
-  );
 }
 
 function toPlanned(path: string, entry: WriteEntry, now: number): Planned {
@@ -468,14 +423,15 @@ export function writeFiles(
   db: SqlDatabase,
   entries: readonly WriteEntry[],
   options: WriteOptions = {},
+  now: () => number = Date.now,
 ): void {
   if (entries.length === 0) return;
   const createParents = options.parents !== false;
   const budget = payloadBudgetOf(options.payloadBudget);
-  const now = Date.now();
+  const timestamp = now();
 
   db.transactionSync(() => {
-    const real = resolveAll(
+    const real = realpathsNoFollow(
       db,
       entries.map((entry) => entry.path),
     );
@@ -485,7 +441,7 @@ export function writeFiles(
       const entry = entries[i];
       const path = real[i];
       if (entry === undefined || path === undefined) continue;
-      planned.set(path, toPlanned(path, entry, now));
+      planned.set(path, toPlanned(path, entry, timestamp));
     }
     // Path order throughout, so the batch is deterministic and a parent is
     // always considered before its children.
@@ -560,7 +516,9 @@ export function writeFiles(
       const inode = firstInode + i;
       const entry = planned.get(path);
       inodes.set(path, inode);
-      nodes.push(entry === undefined ? implicitDirectory(inode, now) : nodeRowOf(entry, inode));
+      nodes.push(
+        entry === undefined ? implicitDirectory(inode, timestamp) : nodeRowOf(entry, inode),
+      );
       paths.push({ path, parent: parentOf(path), inode });
     }
     for (let i = 0; i < overwriting.length; i++) {
@@ -604,10 +562,15 @@ export function writeFiles(
  * however many are asked for. Existing ones are left alone, so a repeat
  * call writes nothing and does not move the revision.
  */
-export function makeDirectories(db: SqlDatabase, paths: readonly string[]): void {
+export function makeDirectories(
+  db: SqlDatabase,
+  paths: readonly string[],
+  now: () => number = Date.now,
+): void {
   writeFiles(
     db,
     paths.map((path) => ({ path })),
     { parents: true },
+    now,
   );
 }

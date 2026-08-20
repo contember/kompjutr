@@ -119,11 +119,9 @@ describe("add", () => {
   it("stages an executable file as 100755", () => {
     const fixture = newFixture();
     const workspace = makeRepo("/");
-    workspace.worktree.writeFile(
-      "/run.sh",
-      new TextEncoder().encode("#!/bin/sh\necho hi\n"),
-      0o755,
-    );
+    workspace.worktree.writeFile("/run.sh", new TextEncoder().encode("#!/bin/sh\necho hi\n"), {
+      mode: 0o755,
+    });
     fixture.writeExecutable("run.sh", "#!/bin/sh\necho hi\n");
 
     add(workspace.repo, workspace.worktree, { paths: ["run.sh"] });

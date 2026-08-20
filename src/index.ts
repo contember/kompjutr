@@ -1,9 +1,7 @@
-// kompjutr — a SQLite-native git backend for Cloudflare Computer.
+// kompjutr — a SQLite-native filesystem and git backend for Cloudflare Workers.
 //
-//   const ws = new Workspace({ storage: ctx.storage, git: createSqliteGitClient() });
-//
-// The git database lives in the Durable Object's SQLite tables and the
-// working tree in DOFS. There is no `.git` directory.
+// The filesystem and git database share one Durable Object SQLite database.
+// The Computer exports below remain only for the compatibility milestone.
 
 export {
   type CreateSqliteGitClientOptions,
@@ -45,6 +43,23 @@ export {
 } from "./core/ops/status.js";
 export { Repository } from "./core/repository.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";
+export { NodeFsCompat } from "./fs/compat/node.js";
+export { createFilesystem } from "./fs/filesystem.js";
+export { FS_SCHEMA_VERSION, initializeFsSchema } from "./fs/schema.js";
+export type {
+  Dirent,
+  EntryType,
+  Filesystem,
+  FilesystemOptions,
+  ReadBatch,
+  RealPath,
+  RemoveOptions,
+  ScanEntry,
+  ScanOptions,
+  Stat,
+  WriteEntry,
+  WriteOptions,
+} from "./fs/types.js";
 export type { SqlDatabase } from "./sqlite/db.js";
 export { initializeGitSchema, SCHEMA_VERSION } from "./sqlite/schema.js";
 export {

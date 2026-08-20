@@ -10,10 +10,11 @@ export function currentRev(db: SqlDatabase): number {
   return db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'") ?? 0;
 }
 
-/** Bump and return the new revision. One statement plus the read. */
+/** Bump and return the new revision in one statement. */
 export function bumpRev(db: SqlDatabase): number {
-  db.run("UPDATE fs_meta SET v = v + 1 WHERE k = 'rev'");
-  return currentRev(db);
+  const revision = db.scalar<number>("UPDATE fs_meta SET v = v + 1 WHERE k = 'rev' RETURNING v");
+  if (revision === undefined) throw new Error("fs schema not initialised");
+  return revision;
 }
 
 /**

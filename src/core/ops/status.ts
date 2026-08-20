@@ -175,7 +175,7 @@ function worktreeState(
   if (entry.mode === 0o160000) return { code: " ", mode: octalMode(entry.mode) };
 
   const stat = worktree.stat(joinPath(repo.root, path));
-  if (stat === null || stat.type === "directory") return { code: "D", mode: ABSENT_MODE };
+  if (stat === null || stat.type === "dir") return { code: "D", mode: ABSENT_MODE };
   const mode = gitModeFor(stat);
   if (indexMatchesStat(entry, stat)) return { code: " ", mode };
   const hashed = hashWorktreePath(repo, worktree, path, { write: false });

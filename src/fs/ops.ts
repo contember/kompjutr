@@ -2,6 +2,7 @@
 // functions add POSIX path resolution, error mapping, and metadata semantics.
 
 import type { SqlDatabase } from "../sqlite/db.js";
+import { filesystemError as fsError, hasErrorCode } from "./errors.js";
 import { basename, dirname, join, normalize } from "./path.js";
 import {
   chmodRaw,
@@ -18,19 +19,11 @@ import { realpath, realpathNoFollow } from "./store/resolve.js";
 import { writeFiles } from "./store/write.js";
 import type { Dirent, FilesystemOptions, RemoveOptions, Stat } from "./types.js";
 
-function fsError(code: string, message: string, path: string): Error {
-  return Object.assign(new Error(`${code}: ${message}, '${path}'`), { code, path });
-}
-
-function hasCode(error: unknown, code: string): boolean {
-  return error instanceof Error && "code" in error && error.code === code;
-}
-
 function asMissing<T>(work: () => T): T | null {
   try {
     return work();
   } catch (error) {
-    if (hasCode(error, "ENOTDIR")) return null;
+    if (hasErrorCode(error, "ENOTDIR")) return null;
     throw error;
   }
 }
@@ -39,7 +32,7 @@ function enotdirAsEnoent<T>(path: string, work: () => T): T {
   try {
     return work();
   } catch (error) {
-    if (hasCode(error, "ENOTDIR")) {
+    if (hasErrorCode(error, "ENOTDIR")) {
       throw fsError("ENOENT", "no such file or directory", path);
     }
     throw error;
@@ -113,10 +106,10 @@ export function writeFile(
         bytes,
         mode: options.mode,
         contentId: options.contentId,
-        mtime: now(),
       },
     ],
     { parents: false },
+    now,
   );
 }
 
@@ -127,9 +120,7 @@ export function createFile(
   now: () => number = Date.now,
 ): void {
   const target = realpath(db, path);
-  writeFiles(db, [{ path: target, bytes: new Uint8Array(0), mode, mtime: now() }], {
-    parents: true,
-  });
+  writeFiles(db, [{ path: target, bytes: new Uint8Array(0), mode }], { parents: true }, now);
 }
 
 export function writeRange(
@@ -168,9 +159,12 @@ export function mkdir(
     throw fsError("EEXIST", "path exists", path);
   }
 
-  writeFiles(db, [{ path: canonical, mode: options.mode, mtime: now() }], {
-    parents: options.recursive === true,
-  });
+  writeFiles(
+    db,
+    [{ path: canonical, mode: options.mode }],
+    { parents: options.recursive === true },
+    now,
+  );
 }
 
 export function symlink(
@@ -183,7 +177,7 @@ export function symlink(
   if (canonical === "/" || stat(db, canonical) !== null) {
     throw fsError("EEXIST", "path exists", path);
   }
-  writeFiles(db, [{ path: canonical, target, mtime: now() }], { parents: false });
+  writeFiles(db, [{ path: canonical, target }], { parents: false }, now);
 }
 
 export function link(db: SqlDatabase, existingPath: string, newPath: string): void {

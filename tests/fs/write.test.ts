@@ -320,9 +320,9 @@ describe("writeFiles — statement cost", () => {
     const target = measure(2_000);
     const large = measure(5_000);
 
-    // Symlink probe, existence probe, bumpRev (2), allocateInodes (2),
+    // Ordered resolve, existence probe, bumpRev, allocateInodes (2),
     // fs_nodes, fs_paths — plus one content payload.
-    expect(target).toBe(9);
+    expect(target).toBe(8);
     expect(small).toBe(target);
     expect(large).toBe(target);
   });
@@ -343,7 +343,7 @@ describe("writeFiles — statement cost", () => {
       });
     };
 
-    const metadata = 8;
+    const metadata = 7;
     expect(cost(1024 * 1024)).toBe(metadata + total / (1024 * 1024));
     expect(cost(256 * 1024)).toBe(metadata + total / (256 * 1024));
     expect(cost(64 * 1024)).toBe(metadata + total / (64 * 1024));
@@ -587,10 +587,10 @@ describe("makeDirectories", () => {
       });
     };
 
-    // Symlink probe, existence probe, bumpRev (2), allocateInodes (2),
+    // Ordered resolve, existence probe, bumpRev, allocateInodes (2),
     // fs_nodes, fs_paths. No content, so no payload statement.
     const hundred = measure(100);
-    expect(hundred).toBe(8);
+    expect(hundred).toBe(7);
     expect(measure(1_000)).toBe(hundred);
     expect(measure(5_000)).toBe(hundred);
   });

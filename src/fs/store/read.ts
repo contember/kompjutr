@@ -14,14 +14,21 @@ import { CHUNK_SIZE } from "../schema.js";
 import type { ReadBatch } from "../types.js";
 import { realpath } from "./resolve.js";
 
-/** Bytes per statement. §7.0: 24 MB ÷ 1 MiB ≈ 24 statements. */
-export const DEFAULT_READ_BUDGET = 1024 * 1024;
+/** Bytes per statement, below the platform's 2 MB bound-value ceiling. */
+export const DEFAULT_READ_BUDGET = 1_500_000;
+
+/** Bounds both the JSON binding and each path-lookup result set. */
+const LOOKUP_BATCH_BYTES = 1_500_000;
 
 interface NodeRow {
   path: string;
   inode: number;
   type: string;
   size: number;
+  chunk_count: number;
+  chunk_bytes: number;
+  first_idx: number | null;
+  last_idx: number | null;
 }
 
 interface ChunkRow {
@@ -48,26 +55,62 @@ interface Planned extends Target {
 
 // `json_each(?)` binds the whole path list as ONE parameter, so the
 // 100-parameter ceiling is never approached however long the list is.
-const LOOKUP_MANY_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type, n.size AS size
+const LOOKUP_MANY_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type, n.size AS size,
+       count(c.idx) AS chunk_count, coalesce(sum(length(c.bytes)), 0) AS chunk_bytes,
+       min(c.idx) AS first_idx, max(c.idx) AS last_idx
      FROM fs_paths p
      JOIN fs_nodes n ON n.inode = p.inode
-    WHERE p.path IN (SELECT value FROM json_each(?))`;
+     LEFT JOIN fs_chunks c ON c.inode = p.inode
+    WHERE p.path IN (SELECT value FROM json_each(?))
+    GROUP BY p.path, p.inode, n.type, n.size`;
 
-const LOOKUP_ONE_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type, n.size AS size
+const LOOKUP_ONE_SQL = `SELECT p.path AS path, p.inode AS inode, n.type AS type, n.size AS size,
+       count(c.idx) AS chunk_count, coalesce(sum(length(c.bytes)), 0) AS chunk_bytes,
+       min(c.idx) AS first_idx, max(c.idx) AS last_idx
      FROM fs_paths p
      JOIN fs_nodes n ON n.inode = p.inode
-    WHERE p.path = ?`;
+     LEFT JOIN fs_chunks c ON c.inode = p.inode
+    WHERE p.path = ?
+    GROUP BY p.path, p.inode, n.type, n.size`;
+
+function utf8Length(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function lookupMany(db: SqlDatabase, paths: readonly string[]): NodeRow[] {
+  const out: NodeRow[] = [];
+  let items: string[] = [];
+  let bytes = 2;
+
+  const flush = (): void => {
+    if (items.length === 0) return;
+    out.push(...db.all<NodeRow>(LOOKUP_MANY_SQL, `[${items.join(",")}]`));
+    items = [];
+    bytes = 2;
+  };
+
+  for (const path of paths) {
+    const item = JSON.stringify(path);
+    const itemBytes = utf8Length(item);
+    if (items.length > 0 && bytes + itemBytes + 1 > LOOKUP_BATCH_BYTES) flush();
+    items.push(item);
+    bytes += itemBytes + 1;
+  }
+  flush();
+  return out;
+}
 
 // Row-value comparison so the resume predicate rides the (inode, idx)
 // primary key rather than turning into a scan with an OR.
-const CHUNK_PAGE_SQL = `SELECT c.inode AS inode, c.idx AS idx, c.bytes AS bytes
+const CHUNK_PAGE_SQL = `SELECT c.inode AS inode, c.idx AS idx,
+       substr(c.bytes, 1, ?) AS bytes
      FROM fs_chunks c
     WHERE c.inode IN (SELECT value FROM json_each(?))
       AND (c.inode, c.idx) > (?, ?)
     ORDER BY c.inode, c.idx
     LIMIT ?`;
 
-const CHUNK_RANGE_SQL = `SELECT c.idx AS idx, c.bytes AS bytes
+const CHUNK_RANGE_SQL = `SELECT c.idx AS idx, substr(c.bytes, 1, ?) AS bytes
      FROM fs_chunks c
     WHERE c.inode = ? AND c.idx > ? AND c.idx <= ?
     ORDER BY c.idx
@@ -83,6 +126,35 @@ function eisdir(path: string): Error {
   return Object.assign(new Error(`EISDIR: illegal operation on a directory, '${path}'`), {
     code: "EISDIR",
   });
+}
+
+function corrupt(inode: number, detail: string): Error {
+  return Object.assign(new Error(`EIO: corrupt chunks for inode ${inode}: ${detail}`), {
+    code: "EIO",
+  });
+}
+
+function expectedChunkCount(size: number): number {
+  return Math.ceil(size / CHUNK_SIZE);
+}
+
+function expectedChunkLength(target: Target, index: number): number {
+  return Math.min(CHUNK_SIZE, target.size - index * CHUNK_SIZE);
+}
+
+function validatedTarget(row: NodeRow): Target {
+  const expected = expectedChunkCount(row.size);
+  if (
+    row.size < 0 ||
+    row.chunk_count !== expected ||
+    row.chunk_bytes !== row.size ||
+    (expected === 0
+      ? row.first_idx !== null || row.last_idx !== null
+      : row.first_idx !== 0 || row.last_idx !== expected - 1)
+  ) {
+    throw corrupt(row.inode, "metadata does not describe contiguous file content");
+  }
+  return { inode: row.inode, size: row.size };
 }
 
 /**
@@ -121,17 +193,26 @@ function readOne(db: SqlDatabase, target: Target, rowLimit: number): Uint8Array 
   const lastIdx = Math.ceil(target.size / CHUNK_SIZE) - 1;
   let afterIdx = -1;
   while (afterIdx < lastIdx) {
-    const rows = db.all<RangeRow>(CHUNK_RANGE_SQL, target.inode, afterIdx, lastIdx, rowLimit);
+    const rows = db.all<RangeRow>(
+      CHUNK_RANGE_SQL,
+      CHUNK_SIZE + 1,
+      target.inode,
+      afterIdx,
+      lastIdx,
+      rowLimit,
+    );
     if (rows.length === 0) break;
     for (const row of rows) {
+      if (row.idx !== afterIdx + 1) throw corrupt(target.inode, `missing chunk ${afterIdx + 1}`);
       afterIdx = row.idx;
       const at = row.idx * CHUNK_SIZE;
-      if (at >= out.length) continue;
       const bytes = readBlob(row.bytes);
-      const take = Math.min(bytes.length, out.length - at);
-      out.set(take === bytes.length ? bytes : bytes.subarray(0, take), at);
+      const expected = expectedChunkLength(target, row.idx);
+      if (bytes.length !== expected) throw corrupt(target.inode, `invalid chunk ${row.idx} size`);
+      out.set(bytes, at);
     }
   }
+  if (afterIdx !== lastIdx) throw corrupt(target.inode, `missing chunk ${afterIdx + 1}`);
   return out;
 }
 
@@ -152,11 +233,15 @@ function readTargets(
 
   const buffers = new Map<number, Uint8Array>();
   const filled = new Map<number, number>();
+  const nextIndex = new Map<number, number>();
+  const targetsByInode = new Map<number, Target>();
   const inodes: number[] = [];
   let outstanding = 0;
   for (const target of targets) {
     buffers.set(target.inode, new Uint8Array(target.size));
     filled.set(target.inode, 0);
+    nextIndex.set(target.inode, 0);
+    targetsByInode.set(target.inode, target);
     inodes.push(target.inode);
     if (target.size > 0) outstanding++;
   }
@@ -166,25 +251,38 @@ function readTargets(
   let afterIdx = -1;
 
   while (outstanding > 0) {
-    const rows = db.all<ChunkRow>(CHUNK_PAGE_SQL, list, afterInode, afterIdx, rowLimit);
+    const rows = db.all<ChunkRow>(
+      CHUNK_PAGE_SQL,
+      CHUNK_SIZE + 1,
+      list,
+      afterInode,
+      afterIdx,
+      rowLimit,
+    );
     if (rows.length === 0) break;
     for (const row of rows) {
       afterInode = row.inode;
       afterIdx = row.idx;
       const buffer = buffers.get(row.inode);
-      if (buffer === undefined) continue;
+      const target = targetsByInode.get(row.inode);
+      if (buffer === undefined || target === undefined) continue;
+      const expectedIndex = nextIndex.get(row.inode) ?? 0;
+      if (row.idx !== expectedIndex) throw corrupt(row.inode, `missing chunk ${expectedIndex}`);
       const at = row.idx * CHUNK_SIZE;
-      if (at >= buffer.length) continue;
       const bytes = readBlob(row.bytes);
-      const take = Math.min(bytes.length, buffer.length - at);
-      buffer.set(take === bytes.length ? bytes : bytes.subarray(0, take), at);
+      const expected = expectedChunkLength(target, row.idx);
+      if (bytes.length !== expected) throw corrupt(row.inode, `invalid chunk ${row.idx} size`);
+      buffer.set(bytes, at);
+      nextIndex.set(row.inode, expectedIndex + 1);
       const before = filled.get(row.inode) ?? 0;
-      const after = before + take;
+      const after = before + bytes.length;
       filled.set(row.inode, after);
       if (before < buffer.length && after >= buffer.length) outstanding--;
     }
     if (rows.length < rowLimit) break;
   }
+
+  if (outstanding > 0) throw corrupt(afterInode, "file content ended before its recorded size");
 
   return buffers;
 }
@@ -195,7 +293,7 @@ function lookupFile(db: SqlDatabase, path: string): Target {
   if (row === undefined) throw enoent(path);
   if (row.type === "dir") throw eisdir(path);
   if (row.type !== "file") throw enoent(path);
-  return { inode: row.inode, size: row.size };
+  return validatedTarget(row);
 }
 
 /**
@@ -237,7 +335,7 @@ export function readFiles(
   if (order.length === 0) return { files, remaining };
 
   const found = new Map<string, NodeRow>();
-  for (const row of db.all<NodeRow>(LOOKUP_MANY_SQL, JSON.stringify(order))) {
+  for (const row of lookupMany(db, order)) {
     found.set(row.path, row);
   }
 
@@ -264,8 +362,9 @@ export function readFiles(
     if (real === undefined) continue;
     const row = found.get(real);
     if (row === undefined || row.type !== "file") continue;
+    const target = validatedTarget(row);
 
-    if (row.size > budget) {
+    if (target.size > budget) {
       // Deferring is only safe while the caller can still make progress by
       // re-calling; if nothing has been read yet, re-calling would loop
       // forever, so page this one file instead.
@@ -273,14 +372,14 @@ export function readFiles(
         stopped = index;
         break;
       }
-      const single: Planned = { real, inode: row.inode, size: row.size };
+      const single: Planned = { real, ...target };
       deliver([single], readTargets(db, [single], rowLimitFor([single], budget)));
       continue;
     }
 
-    if (pendingBytes + row.size > budget) flush();
-    pending.push({ real, inode: row.inode, size: row.size });
-    pendingBytes += row.size;
+    if (pendingBytes + target.size > budget) flush();
+    pending.push({ real, ...target });
+    pendingBytes += target.size;
   }
   flush();
 
@@ -318,17 +417,29 @@ export function readRange(
   let afterIdx = Math.floor(start / CHUNK_SIZE) - 1;
 
   while (afterIdx < lastIdx) {
-    const rows = db.all<RangeRow>(CHUNK_RANGE_SQL, target.inode, afterIdx, lastIdx, rowLimit);
+    const rows = db.all<RangeRow>(
+      CHUNK_RANGE_SQL,
+      CHUNK_SIZE + 1,
+      target.inode,
+      afterIdx,
+      lastIdx,
+      rowLimit,
+    );
     if (rows.length === 0) break;
     for (const row of rows) {
+      if (row.idx !== afterIdx + 1) throw corrupt(target.inode, `missing chunk ${afterIdx + 1}`);
       afterIdx = row.idx;
       const bytes = readBlob(row.bytes);
+      const expected = expectedChunkLength(target, row.idx);
+      if (bytes.length !== expected) throw corrupt(target.inode, `invalid chunk ${row.idx} size`);
       const chunkStart = row.idx * CHUNK_SIZE;
       const from = Math.max(start, chunkStart);
       const to = Math.min(end, chunkStart + bytes.length);
       if (to > from) out.set(bytes.subarray(from - chunkStart, to - chunkStart), from - start);
     }
   }
+
+  if (afterIdx !== lastIdx) throw corrupt(target.inode, `missing chunk ${afterIdx + 1}`);
 
   return out;
 }

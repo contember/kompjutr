@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { normalize } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { DEFAULT_READ_BUDGET, readFile, readFiles, readRange } from "../../src/fs/store/read.js";
+import { writeFiles } from "../../src/fs/store/write.js";
 import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
@@ -499,5 +500,39 @@ describe("readRange", () => {
     expect(bytes.length).toBe(30 * CHUNK_SIZE);
     expectBytes(bytes.slice(29 * CHUNK_SIZE), pseudoRandom(CHUNK_SIZE, 829));
     expect(fixture.db.maxResultBytes).toBeLessThanOrEqual(DEFAULT_READ_BUDGET);
+  });
+});
+
+describe("corrupt chunk detection", () => {
+  const size = CHUNK_SIZE * 2 + 3;
+
+  function corrupted(sql: string): TestDatabase {
+    const db = new TestDatabase();
+    initializeFsSchema(db, () => FIXED_MTIME);
+    writeFiles(db, [{ path: "/f", bytes: new Uint8Array(size).fill(7) }]);
+    db.run(sql);
+    return db;
+  }
+
+  it.each([
+    ["missing first", "DELETE FROM fs_chunks WHERE inode = 2 AND idx = 0"],
+    ["missing middle", "DELETE FROM fs_chunks WHERE inode = 2 AND idx = 1"],
+    ["missing trailing", "DELETE FROM fs_chunks WHERE inode = 2 AND idx = 2"],
+    [
+      "short chunk",
+      `UPDATE fs_chunks SET bytes = zeroblob(${CHUNK_SIZE - 1}) WHERE inode = 2 AND idx = 1`,
+    ],
+    [
+      "oversized chunk",
+      `UPDATE fs_chunks SET bytes = zeroblob(${CHUNK_SIZE + 1}) WHERE inode = 2 AND idx = 1`,
+    ],
+  ])("rejects a %s", (_name, sql) => {
+    const db = corrupted(sql);
+
+    expect(() => readFile(db, "/f")).toThrowError(expect.objectContaining({ code: "EIO" }));
+    expect(() => readFiles(db, ["/f"])).toThrowError(expect.objectContaining({ code: "EIO" }));
+    expect(() => readRange(db, "/f", 0, size)).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
   });
 });

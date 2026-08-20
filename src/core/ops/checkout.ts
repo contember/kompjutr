@@ -2,6 +2,7 @@
 // step with it.
 
 import type { IndexEntry } from "../../sqlite/store.js";
+import { fromHex } from "../bytes.js";
 import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
@@ -102,10 +103,22 @@ export function writeEntry(repo: Repository, worktree: Worktree, entry: TargetEn
   const absolute = joinPath(repo.root, entry.path);
   const data = repo.readBlob(entry.oid);
   if (entry.mode === "120000") {
-    worktree.unlink(absolute);
-    worktree.symlink(new TextDecoder().decode(data), absolute);
+    worktree.writeFiles([
+      {
+        path: absolute,
+        target: new TextDecoder().decode(data),
+        contentId: fromHex(entry.oid),
+      },
+    ]);
   } else {
-    worktree.writeFile(absolute, data, fileModeFor(entry.mode));
+    worktree.writeFiles([
+      {
+        path: absolute,
+        bytes: data,
+        mode: fileModeFor(entry.mode),
+        contentId: fromHex(entry.oid),
+      },
+    ]);
   }
   const stat = worktree.stat(absolute);
   return {

@@ -2,6 +2,7 @@
 // POSIX validation; this layer owns the bounded SQL mutations.
 
 import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
+import { filesystemError as fsError } from "../errors.js";
 import { codePointLength, dirname, subtreeSuccessor } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import {
@@ -51,6 +52,14 @@ interface ChunkRow {
   bytes: unknown;
 }
 
+interface ChunkLayoutRow {
+  chunk_count: number;
+  chunk_bytes: number;
+  first_idx: number | null;
+  last_idx: number | null;
+  invalid_chunks: number;
+}
+
 interface ChunkWrite {
   idx: number;
   bytes: Uint8Array;
@@ -84,6 +93,25 @@ SELECT ?, idx, bytes FROM rows
 WHERE true
 ON CONFLICT(inode, idx) DO UPDATE SET bytes = excluded.bytes`;
 
+const EXTEND_CHUNKS = `WITH RECURSIVE indexes(idx) AS (
+  VALUES (?)
+  UNION ALL
+  SELECT idx + 1 FROM indexes WHERE idx < ?
+), rows AS (
+  SELECT indexes.idx AS idx,
+         min(?, ? - indexes.idx * ?) AS wanted,
+         (SELECT bytes FROM fs_chunks
+           WHERE inode = ? AND idx = indexes.idx) AS existing
+    FROM indexes
+)
+INSERT INTO fs_chunks (inode, idx, bytes)
+SELECT ?, idx,
+       CAST(coalesce(substr(existing, 1, wanted), x'') ||
+            zeroblob(max(0, wanted - length(coalesce(existing, x'')))) AS BLOB)
+  FROM rows
+ WHERE wanted > 0
+ON CONFLICT(inode, idx) DO UPDATE SET bytes = excluded.bytes`;
+
 function entryType(value: string): EntryType {
   if (value === "file" || value === "dir" || value === "symlink") return value;
   throw new Error(`fs_nodes.type is not a known entry type: ${value}`);
@@ -102,10 +130,6 @@ function toStat(row: StatRow): Stat {
     target: row.link_target,
     contentId: row.content_id === null ? null : readBlob(row.content_id),
   };
-}
-
-function fsError(code: string, message: string, path: string): Error {
-  return Object.assign(new Error(`${code}: ${message}, '${path}'`), { code, path });
 }
 
 function fileAt(db: SqlDatabase, path: RealPath): FileRow {
@@ -227,6 +251,48 @@ function writeChunkBatches(db: SqlDatabase, inode: number, writes: readonly Chun
   }
 }
 
+function validateChunkLayout(db: SqlDatabase, file: FileRow, path: RealPath): void {
+  const expected = Math.ceil(file.size / CHUNK_SIZE);
+  const row = db.one<ChunkLayoutRow>(
+    `SELECT count(*) AS chunk_count,
+            coalesce(sum(length(bytes)), 0) AS chunk_bytes,
+            min(idx) AS first_idx,
+            max(idx) AS last_idx,
+            coalesce(sum(CASE
+              WHEN typeof(idx) != 'integer' OR typeof(bytes) != 'blob'
+                OR idx < 0 OR length(bytes) != min(?, ? - idx * ?) THEN 1
+              ELSE 0
+            END), 0) AS invalid_chunks
+       FROM fs_chunks
+      WHERE inode = ?`,
+    CHUNK_SIZE,
+    file.size,
+    CHUNK_SIZE,
+    file.inode,
+  );
+  if (
+    !Number.isSafeInteger(file.size) ||
+    file.size < 0 ||
+    row === undefined ||
+    row.chunk_count !== expected ||
+    row.chunk_bytes !== file.size ||
+    row.invalid_chunks !== 0 ||
+    (expected === 0
+      ? row.first_idx !== null || row.last_idx !== null
+      : row.first_idx !== 0 || row.last_idx !== expected - 1)
+  ) {
+    throw fsError("EIO", `corrupt chunks for inode ${file.inode}`, path);
+  }
+}
+
+function extendChunks(db: SqlDatabase, file: FileRow, newSize: number): void {
+  const oldSize = file.size;
+  if (newSize <= oldSize) return;
+  const firstIdx = Math.floor(oldSize / CHUNK_SIZE);
+  const lastIdx = Math.ceil(newSize / CHUNK_SIZE) - 1;
+  db.run(EXTEND_CHUNKS, firstIdx, lastIdx, CHUNK_SIZE, newSize, CHUNK_SIZE, file.inode, file.inode);
+}
+
 /** Write a byte range without reading or materialising the rest of the file. */
 export function writeRangeRaw(
   db: SqlDatabase,
@@ -243,6 +309,8 @@ export function writeRangeRaw(
     const file = fileAt(db, path);
     if (bytes.length === 0) return;
     const end = offset + bytes.length;
+    if (end > file.size) validateChunkLayout(db, file, path);
+    if (offset > file.size) extendChunks(db, file, end);
     const firstIdx = Math.floor(offset / CHUNK_SIZE);
     const lastIdx = Math.floor((end - 1) / CHUNK_SIZE);
     const existing = boundaryChunks(db, file.inode, firstIdx, lastIdx, offset, end);
@@ -282,6 +350,9 @@ export function truncateRaw(db: SqlDatabase, path: RealPath, length: number, mti
           lastIdx,
         );
       }
+    } else if (length > file.size) {
+      validateChunkLayout(db, file, path);
+      extendChunks(db, file, length);
     }
     db.run(
       `UPDATE fs_nodes

@@ -191,7 +191,7 @@ function worktreeEndpoint(
 ): Endpoint | null {
   const absolute = joinPath(repo.root, path);
   const stat = worktree.stat(absolute);
-  if (stat === null || stat.type === "directory") return null;
+  if (stat === null || stat.type === "dir") return null;
   // The index caches the oid alongside the stat that produced it, so an
   // unmodified file never has to be read to be identified.
   const cached = entry !== undefined && indexMatchesStat(entry, stat) ? entry.oid : null;
