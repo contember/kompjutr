@@ -1,3 +1,14 @@
+> **Superseded by [`standalone-runtime.md`](standalone-runtime.md).**
+>
+> This plan optimises kompjutr *as a plugin into `@cloudflare/computer`*, reading
+> its private `vfs_*` tables directly. That approach fixes reads and cannot fix
+> writes: `checkout` and `clone` stay at roughly 45 statements per file, because
+> every write still goes through a per-path public API. It also has to reason
+> around an in-memory write buffer it cannot see.
+>
+> The decision taken since is to cut the dependency and own the filesystem. The
+> measurements here still stand and are cited by the new plan.
+
 # Plan — one SQL statement where there are now thousands
 
 ## The problem, measured
