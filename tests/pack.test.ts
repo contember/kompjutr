@@ -271,8 +271,8 @@ describe("synthetic pack ingest", () => {
 
     const blobs = await measure("blob");
     const commits = await measure("commit");
-    expect(blobs.statements).toBe(508);
-    expect(commits.statements).toBe(509);
+    expect(blobs.statements).toBe(9);
+    expect(commits.statements).toBe(10);
     expect(commits.cached).toBe(500);
     expect(commits.statements - blobs.statements).toBe(1);
   });
@@ -498,8 +498,41 @@ describe("synthetic pack ingest", () => {
 
     const small = await measure(50);
     const large = await measure(500);
-    expect(small).toBe(60);
-    expect(large).toBe(510);
+    const boundary = await measure(990);
+    const overBoundary = await measure(991);
+    const wide = await measure(3_293);
+    expect(small).toBe(11);
+    expect(large).toBe(11);
+    expect(boundary).toBeLessThanOrEqual(20);
+    expect(overBoundary).toBeLessThanOrEqual(20);
+    expect(wide).toBeLessThanOrEqual(25);
+  });
+
+  it("batches 999 deferred deltas that share a later base", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const base = new Uint8Array(513).fill(0x61);
+    const baseOid = hashObject("blob", base);
+    const targets = Array.from({ length: 999 }, (_, index) => {
+      const data = base.slice();
+      data[0] = index & 0xff;
+      data[1] = index >>> 8;
+      return { data, oid: hashObject("blob", data) };
+    });
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1_000);
+    for (const target of targets) writer.refDelta(baseOid, literalDelta(base.length, target.data));
+    writer.object("blob", base);
+    writer.finish();
+
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(db.storage.statementCount).toBeLessThanOrEqual(40);
+    expect(store.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
+    expect(store.read(targets[998]!.oid)?.data).toEqual(targets[998]!.data);
   });
 
   it("streams oversized full trees into the parsed index", async () => {

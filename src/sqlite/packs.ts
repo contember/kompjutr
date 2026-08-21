@@ -46,8 +46,8 @@ export const MAX_PACK_BLOB_BATCH_BYTES = 4 * 1024 * 1024;
 const MAX_PACK_BLOB_GRAPH_ENTRIES = 4096;
 const MAX_PACK_BLOB_INPUTS = 4096;
 
-/** Recent (offset -> oid) pairs kept in memory for ofs-delta bases. */
-const OFFSET_WINDOW = 100_000;
+/** Recent (offset -> oid) pairs kept in memory for immediate ofs-delta bases. */
+const OFFSET_WINDOW = 4_096;
 
 export interface PackCacheOptions {
   /** Bytes of still-compressed pack rows held hot. */
@@ -70,6 +70,10 @@ const PACK_OBJECT_CACHE_RESERVE_BYTES = 16 * 1024 * 1024;
 const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
+const PACK_INDEX_BATCH_BYTES = 1024 * 1024;
+const PACK_INDEX_BATCH_ROWS = 2048;
+const PACK_INDEX_MEMORY_BYTES = 3 * 1024 * 1024;
+const PACK_OFFSET_WINDOW_BYTES = 2 * 1024 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
 const PACK_EXTERNAL_BASE_BYTES = MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024;
 
@@ -82,6 +86,8 @@ const PACK_MEMORY_MODEL_BYTES =
   PACK_OBJECT_CACHE_RESERVE_BYTES +
   PACK_TREE_BATCH_BYTES +
   MAX_COMMIT_CACHE_BYTES +
+  PACK_INDEX_MEMORY_BYTES +
+  PACK_OFFSET_WINDOW_BYTES +
   2 * MAX_INDEXED_COMMIT_BYTES +
   PACK_INFLATE_HEADROOM_BYTES;
 if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
@@ -160,6 +166,119 @@ interface BulkPackRow extends PackObjectRow {
 interface CompressedEntry {
   bytes: Uint8Array;
   filled: number;
+}
+
+type PackObjectInput = [
+  oid: string,
+  packId: number,
+  offset: number,
+  dataOff: number,
+  dataLen: number,
+  type: ObjectType,
+  size: number,
+  entrySize: number,
+  baseOid: string | null,
+];
+
+type PendingInput = [
+  offset: number,
+  dataOff: number,
+  dataLen: number,
+  entrySize: number,
+  baseOid: string | null,
+  baseOffset: number | null,
+];
+
+const PACK_JSON_ENCODER = new TextEncoder();
+
+class PackObjectBatch {
+  readonly #rows: string[] = [];
+  #bytes = 2;
+
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly repoId: number,
+  ) {}
+
+  add(row: PackObjectInput): void {
+    const json = JSON.stringify(row);
+    const bytes = PACK_JSON_ENCODER.encode(json).length;
+    if (
+      this.#rows.length > 0 &&
+      (this.#rows.length >= PACK_INDEX_BATCH_ROWS ||
+        this.#bytes + 1 + bytes > PACK_INDEX_BATCH_BYTES)
+    ) {
+      this.flush();
+    }
+    if (bytes + 2 > PACK_INDEX_BATCH_BYTES) {
+      throw new GitError("E2BIG", "one pack object index row exceeds the batch limit");
+    }
+    this.#bytes += (this.#rows.length === 0 ? 0 : 1) + bytes;
+    this.#rows.push(json);
+  }
+
+  flush(): void {
+    if (this.#rows.length === 0) return;
+    this.db.run(
+      `INSERT OR IGNORE INTO git_pack_objects
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+       SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+              json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+              json_extract(value, '$[4]'), json_extract(value, '$[5]'),
+              json_extract(value, '$[6]'), json_extract(value, '$[7]'),
+              json_extract(value, '$[8]')
+         FROM json_each(?)`,
+      this.repoId,
+      `[${this.#rows.join(",")}]`,
+    );
+    this.#rows.length = 0;
+    this.#bytes = 2;
+  }
+}
+
+class PackPendingBatch {
+  readonly #rows: string[] = [];
+  #bytes = 2;
+
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly repoId: number,
+    private readonly packId: number,
+  ) {}
+
+  add(row: PendingInput): void {
+    const json = JSON.stringify(row);
+    const bytes = PACK_JSON_ENCODER.encode(json).length;
+    if (
+      this.#rows.length > 0 &&
+      (this.#rows.length >= PACK_INDEX_BATCH_ROWS ||
+        this.#bytes + 1 + bytes > PACK_INDEX_BATCH_BYTES)
+    ) {
+      this.flush();
+    }
+    if (bytes + 2 > PACK_INDEX_BATCH_BYTES) {
+      throw new GitError("E2BIG", "one pending delta row exceeds the batch limit");
+    }
+    this.#bytes += (this.#rows.length === 0 ? 0 : 1) + bytes;
+    this.#rows.push(json);
+  }
+
+  flush(): void {
+    if (this.#rows.length === 0) return;
+    this.db.run(
+      `INSERT OR REPLACE INTO git_pack_pending
+         (repo_id, pack_id, offset, data_off, data_len, entry_size, base_oid, base_offset)
+       SELECT ?, ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+              json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+              json_extract(value, '$[4]'), json_extract(value, '$[5]')
+         FROM json_each(?)`,
+      this.repoId,
+      this.packId,
+      `[${this.#rows.join(",")}]`,
+    );
+    this.#rows.length = 0;
+    this.#bytes = 2;
+  }
 }
 
 /**
@@ -241,6 +360,7 @@ class PackCommitIndex {
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly packId: number,
+    private readonly beforeWrite: () => void,
   ) {}
 
   add(source: CommitCacheSource): void {
@@ -261,6 +381,7 @@ class PackCommitIndex {
 
   /** Flush the final batch after the caller marks the pack complete. */
   finish(): void {
+    this.beforeWrite();
     this.#insert();
     this.#clear();
   }
@@ -268,6 +389,7 @@ class PackCommitIndex {
   /** Persist a full batch while leaving the pack externally pending. */
   #stage(): void {
     this.db.transactionSync(() => {
+      this.beforeWrite();
       this.#setState("complete");
       this.#insert();
       this.#setState("pending");
@@ -1061,18 +1183,15 @@ export class PackStore {
       throw new CorruptError(`unsupported pack version ${version}`);
 
     const offsets = new OffsetWindow();
+    const objectIndex = new PackObjectBatch(this.#db, this.#repoId);
+    const pendingIndex = new PackPendingBatch(this.#db, this.#repoId, packId);
     const treeIndex = new PackTreeIndex(this.#db);
-    const commitIndex = new PackCommitIndex(this.#db, this.#repoId, packId);
+    const commitIndex = new PackCommitIndex(this.#db, this.#repoId, packId, () =>
+      objectIndex.flush(),
+    );
+    const missingBases = new Set<string>();
     const offsetToOid = (offset: number): string | null => {
-      const hit = offsets.get(offset);
-      if (hit !== null) return hit;
-      const row = this.#db.one<{ oid: string }>(
-        "SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ? AND offset = ?",
-        this.#repoId,
-        packId,
-        offset,
-      );
-      return row?.oid ?? null;
+      return offsets.get(offset);
     };
 
     let deferred = 0;
@@ -1084,7 +1203,7 @@ export class PackStore {
       if (header.kind === null) {
         const type = entryType!;
         const oid = entry.data === null ? entry.streamedOid! : hashObject(type, entry.data);
-        const row: (string | number | null)[] = [
+        const row: PackObjectInput = [
           oid,
           packId,
           header.offset,
@@ -1106,20 +1225,25 @@ export class PackStore {
           header.dataOff,
           entry.consumed,
           header.entrySize,
+          objectIndex,
         );
         offsets.set(header.offset, oid);
+        missingBases.delete(oid);
         if (entry.data !== null) this.#cacheObject(packId, oid, { type, data: entry.data });
       } else {
         const baseOid =
           header.kind === "ref" ? header.baseOid! : offsetToOid(header.offset - header.baseDelta!);
         let resolved = false;
         if (entry.data !== null && baseOid !== null) {
-          const base = this.#readForBase(baseOid);
+          const base = missingBases.has(baseOid)
+            ? null
+            : this.#readForBase(baseOid, packId, objectIndex);
+          if (base === null) missingBases.add(baseOid);
           if (base !== null) {
             checkDeltaWorkingSet(base.data, entry.data);
             const data = applyDelta(base.data, entry.data);
             const oid = hashObject(base.type, data);
-            const row: (string | number | null)[] = [
+            const row: PackObjectInput = [
               oid,
               packId,
               header.offset,
@@ -1141,29 +1265,30 @@ export class PackStore {
               header.dataOff,
               entry.consumed,
               data.length,
+              objectIndex,
             );
             offsets.set(header.offset, oid);
+            missingBases.delete(oid);
             this.#cacheObject(packId, oid, { type: base.type, data });
             resolved = true;
           }
         }
         if (!resolved) {
-          this.#db.run(
-            "INSERT OR REPLACE INTO git_pack_pending (repo_id, pack_id, offset, data_off, data_len, entry_size, base_oid, base_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            this.#repoId,
-            packId,
+          pendingIndex.add([
             header.offset,
             header.dataOff,
             entry.consumed,
             header.entrySize,
             header.kind === "ref" ? header.baseOid : null,
             header.kind === "ofs" ? header.offset - header.baseDelta! : null,
-          );
+          ]);
           deferred++;
         }
       }
 
       if ((i & 1023) === 1023) {
+        objectIndex.flush();
+        pendingIndex.flush();
         await yieldNow();
         if ((i & 65535) === 65535) say(`Resolving deltas: ${i + 1}/${count}\n`);
       }
@@ -1172,14 +1297,20 @@ export class PackStore {
     if (reader.position !== total - 20) {
       throw new CorruptError("pack has trailing data or a bad object count");
     }
-    await this.#drainPending(packId, offsets, offsetToOid, treeIndex, commitIndex, yieldNow);
+    objectIndex.flush();
+    pendingIndex.flush();
+    await this.#drainPending(packId, offsets, objectIndex, treeIndex, commitIndex, yieldNow);
+    objectIndex.flush();
     treeIndex.flush();
     if (deferred > 0) say(`Resolved ${deferred} deferred delta(s)\n`);
     return { count, commits: commitIndex };
   }
 
   /** A base that lives in an already-indexed pack, loose storage, or another pack. */
-  #readForBase(oid: string): RawObject | null {
+  #readForBase(oid: string, packId: number, objects: PackObjectBatch): RawObject | null {
+    const current = this.#objects.get(packObjectKey(packId, oid));
+    if (current !== undefined) return current;
+    objects.flush();
     const packed = this.read(oid);
     if (packed !== null) return packed;
     return this.#external(oid);
@@ -1188,7 +1319,7 @@ export class PackStore {
   async #drainPending(
     packId: number,
     offsets: OffsetWindow,
-    offsetToOid: (offset: number) => string | null,
+    objectIndex: PackObjectBatch,
     treeIndex: PackTreeIndex,
     commitIndex: PackCommitIndex,
     yieldNow: () => Promise<void>,
@@ -1210,19 +1341,29 @@ export class PackStore {
           entry_size: number;
           base_oid: string | null;
           base_offset: number | null;
+          resolved_oid: string | null;
         }>(
-          "SELECT offset, data_off, data_len, entry_size, base_oid, base_offset FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset > ? ORDER BY offset LIMIT 256",
+          `SELECT pending.offset, pending.data_off, pending.data_len, pending.entry_size,
+                  pending.base_oid, pending.base_offset,
+                  COALESCE(pending.base_oid, base.oid) AS resolved_oid
+             FROM git_pack_pending pending
+             LEFT JOIN git_pack_objects base
+               ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
+              AND base.offset = pending.base_offset
+            WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
+            ORDER BY pending.offset LIMIT 256`,
           this.#repoId,
           packId,
           after,
         );
         if (page.length === 0) break;
+        const completed: number[] = [];
         for (const row of page) {
           after = row.offset;
           const baseOid =
-            row.base_oid ?? (row.base_offset === null ? null : offsetToOid(row.base_offset));
+            row.resolved_oid ?? (row.base_offset === null ? null : offsets.get(row.base_offset));
           if (baseOid === null) continue;
-          const base = this.#readForBase(baseOid);
+          const base = this.#readForBase(baseOid, packId, objectIndex);
           if (base === null) continue;
           checkDeltaInflateBudget(base.data, row.entry_size);
           const delta = this.#inflateStoredEntry(
@@ -1235,7 +1376,7 @@ export class PackStore {
           checkDeltaWorkingSet(base.data, delta);
           const data = applyDelta(base.data, delta);
           const oid = hashObject(base.type, data);
-          const objectRow: (string | number | null)[] = [
+          const objectRow: PackObjectInput = [
             oid,
             packId,
             row.offset,
@@ -1257,19 +1398,24 @@ export class PackStore {
             row.data_off,
             row.data_len,
             data.length,
+            objectIndex,
           );
-          this.#db.run(
-            "DELETE FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset = ?",
-            this.#repoId,
-            packId,
-            row.offset,
-          );
+          completed.push(row.offset);
           offsets.set(row.offset, oid);
           this.#cacheObject(packId, oid, { type: base.type, data });
           progressed++;
         }
+        if (completed.length > 0) {
+          this.#db.run(
+            "DELETE FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset IN (SELECT value FROM json_each(?))",
+            this.#repoId,
+            packId,
+            JSON.stringify(completed),
+          );
+        }
         await yieldNow();
       }
+      objectIndex.flush();
       remaining -= progressed;
       if (progressed === 0 && remaining > 0) {
         throw new CorruptError(`cannot resolve ${remaining} delta object(s): missing base`);
@@ -1277,19 +1423,8 @@ export class PackStore {
     }
   }
 
-  #insertObject(row: (string | number | null)[]): void {
-    // OR IGNORE, never OR REPLACE: a duplicate object keeps its first
-    // location. Re-pointing it at the incoming pack would make it
-    // unresolvable if this ingest is later reclaimed.
-    this.#db.run(
-      "INSERT OR IGNORE INTO git_pack_objects (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      this.#repoId,
-      ...row,
-    );
-  }
-
   #insertResolved(
-    row: (string | number | null)[],
+    row: PackObjectInput,
     packId: number,
     oid: string,
     type: ObjectType,
@@ -1299,8 +1434,9 @@ export class PackStore {
     dataOff: number,
     dataLen: number,
     objectSize: number,
+    objectIndex: PackObjectBatch,
   ): void {
-    this.#db.transactionSync(() => this.#insertObject(row));
+    objectIndex.add(row);
     if (type === "commit") {
       if (objectSize > MAX_INDEXED_COMMIT_BYTES) {
         throw new GitError(
