@@ -470,6 +470,18 @@ interface ContentIdPage {
   rows: { a: number; n: number }[];
 }
 
+interface ExpectedContentIdPage {
+  payload: Uint8Array;
+  rows: { i: number; a: number; n: number; o: string }[];
+}
+
+export const MAX_BLOB_ID_MISMATCH_RETAINED_BYTES = 16 * 1024 * 1024;
+const BLOB_ID_MISMATCH_ROW_BYTES = 384;
+
+export function blobIdMismatchRetainedBytes(mapping: BlobIdMapping): number {
+  return BLOB_ID_MISMATCH_ROW_BYTES + mapping.contentId.length + mapping.oid.length * 2;
+}
+
 function contentIdPages(contentIds: Iterable<Uint8Array>): ContentIdPage[] {
   const unique = new Map<string, Uint8Array>();
   for (const contentId of contentIds) {
@@ -502,6 +514,33 @@ function contentIdPages(contentIds: Iterable<Uint8Array>): ContentIdPage[] {
   }
   flush();
   return pages;
+}
+
+/** Expected mappings in pages whose BLOB and JSON inputs stay bounded. */
+function* expectedContentIdPages(
+  mappings: readonly BlobIdMapping[],
+): Generator<ExpectedContentIdPage> {
+  let parts: Uint8Array[] = [];
+  let rows: { i: number; a: number; n: number; o: string }[] = [];
+  let length = 0;
+
+  for (let ordinal = 0; ordinal < mappings.length; ordinal++) {
+    const mapping = mappings[ordinal];
+    if (mapping === undefined) continue;
+    if (
+      rows.length > 0 &&
+      (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+    ) {
+      yield { payload: concat(parts), rows };
+      parts = [];
+      rows = [];
+      length = 0;
+    }
+    rows.push({ i: ordinal, a: length + 1, n: mapping.contentId.length, o: mapping.oid });
+    parts.push(mapping.contentId);
+    length += mapping.contentId.length;
+  }
+  if (rows.length > 0) yield { payload: concat(parts), rows };
 }
 
 function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
@@ -810,6 +849,69 @@ export class RepoStore {
       }
     }
     return found;
+  }
+
+  /**
+   * Return the ordinals of expected mappings that are absent or disagree.
+   *
+   * An absent result proves the stored mapping equals the expected oid. A
+   * `null` value means there is no stored mapping, so callers must identify
+   * the content instead of trusting it.
+   */
+  blobIdMismatches(expected: Iterable<BlobIdMapping>): Map<number, string | null> {
+    const retained: BlobIdMapping[] = [];
+    let retainedBytes = 0;
+    for (const mapping of expected) {
+      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+      if (mapping.contentId.length > CONTENT_ID_PAYLOAD) {
+        throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
+      }
+      const bytes = blobIdMismatchRetainedBytes(mapping);
+      if (bytes > MAX_BLOB_ID_MISMATCH_RETAINED_BYTES - retainedBytes) {
+        throw new GitError(
+          "E2BIG",
+          `blob id comparison state exceeds ${MAX_BLOB_ID_MISMATCH_RETAINED_BYTES} bytes`,
+        );
+      }
+      retainedBytes += bytes;
+      retained.push(mapping);
+    }
+
+    const mismatches = new Map<number, string | null>();
+    for (const page of expectedContentIdPages(retained)) {
+      for (const row of this.#db.all<{ ordinal: number; oid: string | null }>(
+        `WITH expected(ordinal, content_id, expected_oid) AS MATERIALIZED (
+           SELECT json_extract(value, '$.i'),
+                  CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
+                       ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
+                   END,
+                  json_extract(value, '$.o')
+             FROM json_each(?)
+         )
+         SELECT expected.ordinal, b.oid
+           FROM expected
+           LEFT JOIN git_blob_ids b
+             ON b.repo_id = ? AND b.content_id = expected.content_id
+          WHERE b.oid IS NULL OR b.oid <> expected.expected_oid`,
+        blob(page.payload),
+        JSON.stringify(page.rows),
+        this.#repoId,
+      )) {
+        if (
+          !Number.isSafeInteger(row.ordinal) ||
+          row.ordinal < 0 ||
+          row.ordinal >= retained.length ||
+          (row.oid !== null && !isOid(row.oid))
+        ) {
+          throw new CorruptError("blob id comparison returned an invalid mapping");
+        }
+        if (mismatches.has(row.ordinal)) {
+          throw new CorruptError("blob id comparison returned a duplicate ordinal");
+        }
+        mismatches.set(row.ordinal, row.oid);
+      }
+    }
+    return mismatches;
   }
 
   /** Upsert opaque content-id mappings in bounded BLOB payloads. */

@@ -223,20 +223,37 @@ class BulkOnlyWorktree extends CountingWorktree {
   }
 }
 
-function buildDiffScale(): { workspace: TestRepository; entries: IndexEntry[] } {
+function buildDiffScale(
+  fileCount = 9_329,
+  directoryCount = 3_346,
+  options: { pathPrefix?: string; mappedContentIds?: boolean } = {},
+): { workspace: TestRepository; entries: IndexEntry[] } {
   const workspace = makeRepo("/");
   workspace.repo.store.configSet("user.name", "Fixture");
   workspace.repo.store.configSet("user.email", "fixture@example.com");
   const bytes = utf8.encode("contents\n");
   const oid = workspace.repo.store.write("blob", bytes);
-  const paths = Array.from({ length: 9_329 }, (_, index) => {
-    const directory = index % 3_346;
-    const generation = Math.floor(index / 3_346);
-    return `d${directory.toString().padStart(4, "0")}/f${generation
+  const paths = Array.from({ length: fileCount }, (_, index) => {
+    const directory = index % directoryCount;
+    const generation = Math.floor(index / directoryCount);
+    return `${options.pathPrefix ?? ""}d${directory.toString().padStart(4, "0")}/f${generation
       .toString()
       .padStart(4, "0")}.txt`;
   });
-  workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+  const contentIds = paths.map((_, index) => {
+    const contentId = new Uint8Array(20);
+    contentId[0] = index & 0xff;
+    contentId[1] = (index >>> 8) & 0xff;
+    contentId[2] = (index >>> 16) & 0xff;
+    return contentId;
+  });
+  workspace.worktree.writeFiles(
+    paths.map((path, index) => ({
+      path: `/${path}`,
+      bytes,
+      contentId: options.mappedContentIds === true ? contentIds[index] : undefined,
+    })),
+  );
   const stats = new Map(
     workspace.worktree
       .scan("/", { filesOnly: true, limit: paths.length + 1 })
@@ -250,12 +267,15 @@ function buildDiffScale(): { workspace: TestRepository; entries: IndexEntry[] } 
       stage: 0,
       mode: 0o100644,
       oid,
-      size: stat.size,
-      mtime: stat.mtime,
-      ino: stat.ino,
+      size: options.mappedContentIds === true ? null : stat.size,
+      mtime: options.mappedContentIds === true ? null : stat.mtime,
+      ino: options.mappedContentIds === true ? null : stat.ino,
     };
   });
   workspace.repo.store.indexReplace(entries);
+  if (options.mappedContentIds === true) {
+    workspace.repo.store.upsertBlobIds(contentIds.map((contentId) => ({ contentId, oid })));
+  }
   commit(workspace.context, workspace.repo, { message: "scale" });
   return { workspace, entries };
 }
@@ -424,6 +444,39 @@ describe("diffSummary", () => {
     expect(summary).toHaveLength(1_000);
     expect(summary.every((entry) => entry.status === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(180);
+    const reads = new Map<string, number>();
+    for (const path of worktree.bulkReadPaths) reads.set(path, (reads.get(path) ?? 0) + 1);
+    expect(reads).toEqual(new Map(changed.map((entry) => [`/${entry.path}`, 2])));
+  });
+
+  it("omits clean identity rows for a 24,252-file checkout", () => {
+    const prefix = `.next/server/app/${"route-segment-".repeat(9)}/`;
+    const { workspace, entries } = buildDiffScale(24_252, 3_346, {
+      pathPrefix: prefix,
+      mappedContentIds: true,
+    });
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+    workspace.storage.histogram = new Map();
+
+    workspace.storage.resetCounters();
+    expect(diffSummary(workspace.repo, worktree)).toEqual([]);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(130);
+    expect(workspace.storage.rowCount).toBeLessThanOrEqual(76_000);
+    expect(worktree.bulkReadPaths).toEqual([]);
+
+    workspace.tick(60_000);
+    const changed = entries.slice(0, 100);
+    workspace.worktree.writeFiles(
+      changed.map((entry) => ({ path: `/${entry.path}`, bytes: utf8.encode("changed\n") })),
+    );
+    worktree.bulkReadPaths.length = 0;
+    workspace.storage.resetCounters();
+
+    const summary = diffSummary(workspace.repo, worktree);
+    expect(summary.map((entry) => entry.path)).toEqual(changed.map((entry) => entry.path));
+    expect(summary.every((entry) => entry.status === "M")).toBe(true);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(130);
+    expect(workspace.storage.rowCount).toBeLessThanOrEqual(76_000);
     const reads = new Map<string, number>();
     for (const path of worktree.bulkReadPaths) reads.set(path, (reads.get(path) ?? 0) + 1);
     expect(reads).toEqual(new Map(changed.map((entry) => [`/${entry.path}`, 2])));

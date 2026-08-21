@@ -7,7 +7,13 @@ import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
 import { readBlob } from "../src/sqlite/db.js";
-import { ancestors, contentIdKey, SqliteGitDatabase } from "../src/sqlite/store.js";
+import {
+  ancestors,
+  blobIdMismatchRetainedBytes,
+  contentIdKey,
+  MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
+  SqliteGitDatabase,
+} from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 
@@ -85,6 +91,90 @@ describe("blob id batches", () => {
     for (const mapping of mappings) {
       expect(found.get(contentIdKey(mapping.contentId))).toBe(mapping.oid);
     }
+
+    db.storage.resetCounters();
+    expect(store.blobIdMismatches(mappings)).toEqual(new Map());
+    expect(db.storage.statementCount).toBeLessThanOrEqual(3);
+    expect(db.storage.rowCount).toBe(0);
+  });
+
+  it("returns only mismatched and missing expected identities", () => {
+    const { db, store } = open();
+    const matching = new Uint8Array([0, 1, 0]);
+    const mismatched = new Uint8Array([0, 2, 0]);
+    const missing = new Uint8Array([0, 3, 0]);
+    const matchingOid = "1".repeat(40);
+    const actualOid = "2".repeat(40);
+    store.upsertBlobIds([
+      { contentId: matching, oid: matchingOid },
+      { contentId: mismatched, oid: actualOid },
+    ]);
+
+    db.storage.resetCounters();
+    const result = store.blobIdMismatches([
+      { contentId: matching, oid: matchingOid },
+      { contentId: mismatched, oid: "3".repeat(40) },
+      { contentId: missing, oid: "4".repeat(40) },
+      // Conflicting expectations for one identity must still expose its actual oid.
+      { contentId: matching, oid: "5".repeat(40) },
+    ]);
+
+    expect(result).toEqual(
+      new Map([
+        [1, actualOid],
+        [2, null],
+        [3, matchingOid],
+      ]),
+    );
+    expect(db.storage.statementCount).toBe(1);
+    expect(db.storage.rowCount).toBe(3);
+  });
+
+  it("bounds all expected and returned identity state before SQL", () => {
+    const { db, store } = open();
+    const oid = "1".repeat(40);
+    const full = new Uint8Array(1024 * 1024);
+    const emptyCost = blobIdMismatchRetainedBytes({ contentId: new Uint8Array(0), oid });
+    const fullCost = blobIdMismatchRetainedBytes({ contentId: full, oid });
+    const prefix = Array.from({ length: 15 }, (_, index) => {
+      const contentId = full.slice();
+      contentId[0] = index;
+      return { contentId, oid };
+    });
+    const lastLength = MAX_BLOB_ID_MISMATCH_RETAINED_BYTES - prefix.length * fullCost - emptyCost;
+    expect(lastLength).toBeGreaterThan(0);
+    expect(lastLength).toBeLessThanOrEqual(1024 * 1024);
+    const exact = [...prefix, { contentId: new Uint8Array(lastLength), oid }];
+    expect(exact.reduce((bytes, mapping) => bytes + blobIdMismatchRetainedBytes(mapping), 0)).toBe(
+      MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
+    );
+
+    db.storage.resetCounters();
+    expect(store.blobIdMismatches(exact).size).toBe(exact.length);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(20);
+
+    db.storage.resetCounters();
+    expect(() =>
+      store.blobIdMismatches([...prefix, { contentId: new Uint8Array(lastLength + 1), oid }]),
+    ).toThrow(/comparison state exceeds/);
+    expect(db.storage.statementCount).toBe(0);
+  });
+
+  it("rejects invalid expected identities and fails closed on corrupt mappings", () => {
+    const { store } = open();
+    const contentId = new Uint8Array([9]);
+    expect(() => store.blobIdMismatches([{ contentId, oid: "not-an-oid" }])).toThrow(
+      /invalid blob oid/,
+    );
+    expect(() =>
+      store.blobIdMismatches([{ contentId: new Uint8Array(1024 * 1024 + 1), oid: "1".repeat(40) }]),
+    ).toThrow(/exceeds the 1 MiB/);
+
+    store.upsertBlobIds([{ contentId, oid: "1".repeat(40) }]);
+    store.db.run("UPDATE git_blob_ids SET oid = 'broken' WHERE repo_id = ?", 1);
+    expect(() => store.blobIdMismatches([{ contentId, oid: "2".repeat(40) }])).toThrow(
+      /invalid mapping/,
+    );
   });
 
   it("isolates mappings and removes them with their repository", () => {

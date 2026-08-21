@@ -294,6 +294,42 @@ describe("walkWorktreeStream", () => {
     expect(walkWorktree(worktree, "/")).toEqual(streamed);
   });
 
+  it("can omit directory rows when the caller needs no pruning", () => {
+    const workspace = makeWorkspace();
+    const directories = Array.from(
+      { length: 1_001 },
+      (_, index) => `/d${index.toString().padStart(4, "0")}`,
+    );
+    workspace.worktree.makeDirectories(directories);
+    workspace.worktree.writeFiles([
+      ...directories.map((directory) => ({
+        path: `${directory}/file.txt`,
+        bytes: new Uint8Array([1]),
+      })),
+      { path: "/link", target: "d0000/file.txt" },
+    ]);
+
+    workspace.storage.resetCounters();
+    const regular = [...walkWorktreeEntriesStream(workspace.worktree, "/")];
+    const regularStatements = workspace.storage.statementCount;
+    workspace.storage.resetCounters();
+    const filesOnly = [...walkWorktreeEntriesStream(workspace.worktree, "/", { filesOnly: true })];
+
+    expect(filesOnly).toEqual(regular);
+    expect(filesOnly.at(-1)?.stat.type).toBe("symlink");
+    expect(workspace.storage.statementCount).toBeLessThan(regularStatements);
+  });
+
+  it("rejects files-only walks that require directory pruning", () => {
+    const { worktree } = makeWorkspace();
+    expect(() => [
+      ...walkWorktreeEntriesStream(worktree, "/", {
+        filesOnly: true,
+        paths: ["src"],
+      }),
+    ]).toThrow(/cannot prune directories/);
+  });
+
   it("excludes a nested repository without losing scan metadata", () => {
     const { worktree } = makeWorkspace();
     worktree.makeDirectories(["/nested", "/outside"]);

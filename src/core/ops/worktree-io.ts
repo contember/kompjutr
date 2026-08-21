@@ -45,6 +45,8 @@ export interface WalkOptions {
   ignores?: IgnoreMatcher;
   /** Return ignored paths too, marked, instead of skipping them. */
   includeIgnored?: boolean;
+  /** Skip directory rows when no directory-level pruning is needed. */
+  filesOnly?: boolean;
 }
 
 /** A repo-relative path and the metadata carried by its scan row. */
@@ -92,6 +94,14 @@ export function* walkWorktreeEntriesStream(
   root: string,
   options: WalkOptions = {},
 ): Generator<WorktreePath> {
+  if (
+    options.filesOnly === true &&
+    ((options.excludeRoots?.length ?? 0) > 0 ||
+      (options.paths?.length ?? 0) > 0 ||
+      options.ignores !== undefined)
+  ) {
+    throw new Error("files-only worktree walks cannot prune directories");
+  }
   const lexicalRoot = root.replace(/\/+$/, "") || "/";
   const base = worktree.realpath(lexicalRoot);
   const excluded = new Set(
@@ -107,8 +117,12 @@ export function* walkWorktreeEntriesStream(
   while (true) {
     const entries =
       afterSubtree === undefined
-        ? worktree.scan(base, { after, limit: SCAN_PAGE })
-        : worktree.scan(base, { afterSubtree, limit: SCAN_PAGE });
+        ? worktree.scan(base, { after, filesOnly: options.filesOnly, limit: SCAN_PAGE })
+        : worktree.scan(base, {
+            afterSubtree,
+            filesOnly: options.filesOnly,
+            limit: SCAN_PAGE,
+          });
     afterSubtree = undefined;
     if (entries.length === 0) return;
 

@@ -5,7 +5,7 @@
 // `src/core/diff/`; this file decides *what* is compared and writes the
 // `diff --git` headers around it.
 
-import { type BlobReadBatch, contentIdKey, type IndexEntry } from "../../sqlite/store.js";
+import type { BlobIdMapping, BlobReadBatch, IndexEntry } from "../../sqlite/store.js";
 import { utf8, utf8Decoder, ZERO_OID } from "../bytes.js";
 import { diffText } from "../diff/index.js";
 import { isBinary } from "../diff/lines.js";
@@ -194,7 +194,13 @@ function* collect(
   for (const row of joinSorted3(
     from,
     stageZero(repo.store.indexScan()),
-    walkWorktreeEntriesStream(worktree, repo.root, { paths: options.paths }),
+    walkWorktreeEntriesStream(
+      worktree,
+      repo.root,
+      options.paths === undefined || options.paths.length === 0
+        ? { filesOnly: true }
+        : { paths: options.paths },
+    ),
     {
       a: (entry) => entry.path,
       b: (entry) => entry.path,
@@ -223,22 +229,26 @@ function* resolveWorkingCandidates(
 ): Generator<FileChange> {
   if (candidates.length === 0) return;
   const rows = candidates.splice(0);
-  const identities = repo.store.lookupBlobIds(
-    rows.flatMap((row) => {
-      if (cachedWorktreeOid(row.index, row.worktree) !== null) return [];
-      const contentId = row.worktree?.stat.contentId;
-      return contentId === null || contentId === undefined ? [] : [contentId];
-    }),
-  );
+  const expected: BlobIdMapping[] = [];
+  for (const row of rows) {
+    const mapping = expectedWorktreeMapping(row);
+    if (mapping !== null) expected.push(mapping);
+  }
+  const mismatches = repo.store.blobIdMismatches(expected);
   const unresolved: WorktreePath[] = [];
   const mapped = new Map<string, string>();
+  let expectedOrdinal = 0;
   for (const row of rows) {
     if (cachedWorktreeOid(row.index, row.worktree) !== null) continue;
-    const contentId = row.worktree?.stat.contentId;
+    const mapping = expectedWorktreeMapping(row);
+    const mismatch = mapping === null ? null : mismatches.get(expectedOrdinal);
     const oid =
-      contentId === null || contentId === undefined
+      mapping === null
         ? undefined
-        : identities.get(contentIdKey(contentId));
+        : mismatches.has(expectedOrdinal)
+          ? (mismatch ?? undefined)
+          : mapping.oid;
+    if (mapping !== null) expectedOrdinal++;
     if (oid !== undefined) mapped.set(row.path, oid);
     else if (row.worktree !== undefined && row.worktree.stat.type !== "dir") {
       unresolved.push(row.worktree);
@@ -269,6 +279,19 @@ function* resolveWorkingCandidates(
     if (change !== null) changes.push(change);
   }
   yield* hydrateChanges(repo, worktree, changes);
+}
+
+function expectedWorktreeOid(row: WorkingCandidate): string | undefined {
+  return row.index?.oid ?? row.before?.oid;
+}
+
+function expectedWorktreeMapping(row: WorkingCandidate): BlobIdMapping | null {
+  if (cachedWorktreeOid(row.index, row.worktree) !== null) return null;
+  const contentId = row.worktree?.stat.contentId;
+  const oid = expectedWorktreeOid(row);
+  return contentId === null || contentId === undefined || oid === undefined
+    ? null
+    : { contentId, oid };
 }
 
 function cachedWorktreeOid(
