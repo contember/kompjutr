@@ -5,21 +5,44 @@
 // tracked-file count is the single `SELECT` over `git_index` — everything
 // after that is bounded by what actually changed.
 
-import type { IndexEntry } from "../../sqlite/store.js";
-import { PathspecNotFoundError } from "../errors.js";
+import { contentIdKey, type IndexEntry, type IndexSink } from "../../sqlite/store.js";
+import { GitError, PathspecNotFoundError } from "../errors.js";
 import { loadIgnoreMatcher } from "../ignore/index.js";
-import { joinPath } from "../paths.js";
+import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { joinSorted, joinSorted3 } from "../streams.js";
-import type { Worktree } from "../worktree.js";
-import { checkoutTree, indexFromTree, matchesPaths, stageZero } from "./checkout.js";
+import { gitModeFor, type Worktree } from "../worktree.js";
+import { checkoutTree, indexFromTree, matchesPaths } from "./checkout.js";
 import { treeStream } from "./tree-stream.js";
 import {
-  hashWorktreePath,
+  hashWorktreePaths,
   indexEntryFor,
   indexMatchesStat,
-  walkWorktreeStream,
+  type WorktreePath,
+  walkWorktreeEntriesStream,
 } from "./worktree-io.js";
+
+const ADD_WINDOW_ROWS = 1000;
+const ADD_RETAINED_BYTES = 16 * 1024 * 1024;
+const INDEX_ROW_FIXED_BYTES = 256;
+const PATH_ENTRY_FIXED_BYTES = 96;
+
+interface AddIndexPath {
+  path: string;
+  entry: IndexEntry | undefined;
+}
+
+interface AddIndexSnapshot {
+  paths: AddIndexPath[];
+  conflicted: Set<string>;
+}
+
+interface StageCandidate {
+  path: string;
+  existing: IndexEntry | undefined;
+  worktree: WorktreePath;
+  conflicted: boolean;
+}
 
 export interface AddOptions {
   /** Repo-relative pathspecs. Empty is a no-op, like `git add` with no arguments. */
@@ -52,52 +75,152 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
   const trackedOnly = all && options.trackedOnly === true;
   if (!all) assertPathspecsMatch(repo, worktree, specs);
 
-  // Conflict stages repeat a path, which a merge join cannot represent, so
-  // they are collected first — and only when there are any at all.
-  const conflicted = new Set<string>();
-  if (repo.store.hasConflicts()) {
-    for (const entry of repo.store.indexScan()) {
-      if (entry.stage !== 0) conflicted.add(entry.path);
-    }
-  }
-
-  const walked = walkWorktreeStream(worktree, repo.root, {
-    excludeRoots: options.excludeRoots,
+  const snapshot = snapshotAddIndex(repo);
+  const ignores = force ? undefined : loadIgnoreMatcher(worktree, repo.root);
+  const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
+  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
     paths: all ? undefined : specs,
-    ignores: force ? undefined : loadIgnoreMatcher(worktree, repo.root),
+    includeIgnored: true,
   });
   // `commit -a` never adds a path HEAD does not already have.
   const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
 
   repo.store.indexApply((sink) => {
-    for (const row of joinSorted3(walked, stageZero(repo.store.indexScan()), head, {
-      a: (path: string) => path,
+    const pending: StageCandidate[] = [];
+    const flush = (): void => stageCandidates(repo, worktree, pending, sink);
+    for (const row of joinSorted3(walked, snapshot.paths, head, {
+      a: (entry) => entry.path,
       b: (entry) => entry.path,
       c: (entry) => entry.path,
     })) {
       if (trackedOnly && row.c === undefined) continue;
-      const existing = row.b;
+      const existing = row.b?.entry;
 
       if (row.a !== undefined) {
-        const update = stage(repo, worktree, row.path, existing, conflicted);
-        if (update !== null) sink.put(update);
+        if (row.b === undefined && isExcluded(row.path, excluded)) continue;
+        if (row.b === undefined && ignores?.ignores(row.path, false) === true) continue;
+        const conflicted = snapshot.conflicted.has(row.path);
+        if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.a.stat)) {
+          continue;
+        }
+        pending.push({ path: row.path, existing, worktree: row.a, conflicted });
+        if (pending.length >= ADD_WINDOW_ROWS) flush();
         continue;
       }
 
-      // Tracked but not walked: either gone, or filtered out by an ignore
-      // rule — and git never ignores a path it already tracks.
-      if (existing === undefined) continue;
+      // A conflict-only path has no stage-zero row but still needs removal.
+      if (row.b === undefined) continue;
       if (!all && !matchesPaths(row.path, specs)) continue;
-      const stat = worktree.stat(joinPath(repo.root, row.path));
-      if (stat === null || stat.type === "dir") {
-        sink.remove(row.path);
-        continue;
-      }
-      if (indexMatchesStat(existing, stat)) continue;
-      const hashed = hashWorktreePath(repo, worktree, row.path);
-      if (hashed !== null) sink.put(indexEntryFor(row.path, hashed));
+      sink.remove(row.path);
     }
+    flush();
   });
+}
+
+function snapshotAddIndex(repo: Repository): AddIndexSnapshot {
+  const paths: AddIndexPath[] = [];
+  const conflicted = new Set<string>();
+  let retained = 0;
+  let current: AddIndexPath | null = null;
+  for (const entry of repo.store.indexScan()) {
+    retained +=
+      INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid);
+    if (retained > ADD_RETAINED_BYTES) {
+      throw new GitError("E2BIG", `add retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
+    }
+    if (current === null || current.path !== entry.path) {
+      current = { path: entry.path, entry: entry.stage === 0 ? entry : undefined };
+      paths.push(current);
+      retained += PATH_ENTRY_FIXED_BYTES + retainedStringBytes(entry.path);
+    } else if (entry.stage === 0) {
+      current.entry = entry;
+    }
+    if (entry.stage !== 0 && !conflicted.has(entry.path)) {
+      retained += PATH_ENTRY_FIXED_BYTES;
+      conflicted.add(entry.path);
+    }
+    if (retained > ADD_RETAINED_BYTES) {
+      throw new GitError("E2BIG", `add retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
+    }
+  }
+  return { paths, conflicted };
+}
+
+function stageCandidates(
+  repo: Repository,
+  worktree: Worktree,
+  candidates: StageCandidate[],
+  sink: IndexSink,
+): void {
+  if (candidates.length === 0) return;
+  const rows = candidates.splice(0);
+  const identities = repo.store.lookupBlobIds(
+    rows.flatMap((row) => {
+      if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat))
+        return [];
+      const contentId = row.worktree.stat.contentId;
+      return contentId === null ? [] : [contentId];
+    }),
+  );
+  const unresolved: WorktreePath[] = [];
+  const mapped = new Map<string, string>();
+  for (const row of rows) {
+    if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat)) continue;
+    const contentId = row.worktree.stat.contentId;
+    const oid = contentId === null ? undefined : identities.get(contentIdKey(contentId));
+    if (oid === undefined) unresolved.push(row.worktree);
+    else mapped.set(row.path, oid);
+  }
+  const hashes = hashWorktreePaths(repo, worktree, unresolved);
+  repo.store.upsertBlobIds(
+    [...hashes.values()].flatMap((hashed) => {
+      const contentId = hashed.stat.contentId;
+      return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
+    }),
+  );
+
+  for (const row of rows) {
+    let update: IndexEntry | null = null;
+    if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat)) {
+      update = indexEntryFor(row.path, {
+        oid: row.existing.oid,
+        mode: row.existing.mode.toString(8).padStart(6, "0"),
+        stat: row.worktree.stat,
+      });
+    } else {
+      const hashed = hashes.get(row.path);
+      const oid = mapped.get(row.path);
+      if (hashed !== undefined) update = indexEntryFor(row.path, hashed);
+      else if (oid !== undefined) {
+        update = indexEntryFor(row.path, {
+          oid,
+          mode: gitModeFor(row.worktree.stat),
+          stat: row.worktree.stat,
+        });
+      }
+    }
+    if (update === null) {
+      if (row.existing !== undefined || row.conflicted) sink.remove(row.path);
+      continue;
+    }
+    if (row.conflicted) sink.remove(row.path);
+    sink.put(update);
+  }
+}
+
+function retainedStringBytes(value: string): number {
+  return 48 + value.length * 2;
+}
+
+function relativeExcludeRoots(root: string, paths: readonly string[] | undefined): string[] {
+  return (paths ?? []).flatMap((path) => {
+    const relative = relativeTo(root, path);
+    return relative === null || relative === "" ? [] : [relative];
+  });
+}
+
+function isExcluded(path: string, roots: readonly string[]): boolean {
+  return roots.some((root) => path === root || path.startsWith(`${root}/`));
 }
 
 export interface RmOptions {
@@ -114,9 +237,16 @@ export function rm(repo: Repository, _worktree: Worktree, options: RmOptions): v
 
   const matched = new Set<string>();
   const removals = new Set<string>();
-  for (const entry of repo.store.indexEntries()) {
+  let retained = 0;
+  for (const entry of repo.store.indexScan()) {
     if (!matchesPaths(entry.path, specs)) continue;
     noteMatches(matched, specs, entry.path);
+    if (!removals.has(entry.path)) {
+      retained += PATH_ENTRY_FIXED_BYTES + retainedStringBytes(entry.path);
+      if (retained > ADD_RETAINED_BYTES) {
+        throw new GitError("E2BIG", `rm retained state exceeds ${ADD_RETAINED_BYTES} bytes`);
+      }
+    }
     removals.add(entry.path);
   }
   for (const spec of specs) {
@@ -124,8 +254,8 @@ export function rm(repo: Repository, _worktree: Worktree, options: RmOptions): v
   }
   if (removals.size === 0) return;
 
-  repo.store.db.transactionSync(() => {
-    for (const path of removals) repo.store.indexRemove(path);
+  repo.store.indexApply((sink) => {
+    for (const path of removals) sink.remove(path);
   });
 }
 
@@ -220,23 +350,6 @@ function targetCommit(repo: Repository, ref?: string): string | null {
 function targetTree(repo: Repository, ref?: string): string | null {
   const commit = targetCommit(repo, ref);
   return commit === null ? null : repo.readCommit(commit).tree;
-}
-
-/** The index row `relative` deserves, or null when it is already current. */
-function stage(
-  repo: Repository,
-  worktree: Worktree,
-  relative: string,
-  existing: IndexEntry | undefined,
-  conflicted: Set<string>,
-): IndexEntry | null {
-  const stat = worktree.stat(joinPath(repo.root, relative));
-  if (stat === null || stat.type === "dir") return null;
-  if (existing !== undefined && !conflicted.has(relative) && indexMatchesStat(existing, stat)) {
-    return null;
-  }
-  const hashed = hashWorktreePath(repo, worktree, relative);
-  return hashed === null ? null : indexEntryFor(relative, hashed);
 }
 
 /** Repo-relative pathspecs, without the "./" and trailing-slash noise. */

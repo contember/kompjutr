@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { utf8Decoder } from "../src/core/bytes.js";
+import { utf8, utf8Decoder } from "../src/core/bytes.js";
 import { PathspecNotFoundError } from "../src/core/errors.js";
+import { hashObject } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { add, lsFiles, reset, rm } from "../src/core/ops/staging.js";
-import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import type { Repository } from "../src/core/repository.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 /**
  * The oracle throughout is `git ls-files -s`, which prints
@@ -197,6 +198,34 @@ describe("add", () => {
     add(workspace.repo, workspace.worktree, { paths: [] });
     expect(lsFiles(workspace.repo)).toEqual([]);
   });
+
+  it("replaces conflict-only stages for present and deleted paths", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/present.txt", "resolved\n");
+    for (const path of ["present.txt", "deleted.txt"]) {
+      for (const stage of [1, 2, 3]) {
+        workspace.repo.store.indexPut({
+          path,
+          stage,
+          mode: 0o100644,
+          oid: String(stage).repeat(40),
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+      }
+    }
+
+    add(workspace.repo, workspace.worktree, { paths: [], all: true });
+
+    expect(workspace.repo.store.indexEntries()).toEqual([
+      expect.objectContaining({
+        path: "present.txt",
+        stage: 0,
+        oid: hashObject("blob", utf8.encode("resolved\n")),
+      }),
+    ]);
+  });
 });
 
 describe("rm", () => {
@@ -304,40 +333,65 @@ describe("reset", () => {
 });
 
 describe("cost", () => {
-  /** Readdir plus one lstat per path: the working-tree scan no design avoids. */
-  function scanCost(workspace: TestRepository): number {
-    workspace.storage.resetCounters();
-    for (const path of walkWorktree(workspace.worktree, "/", {})) {
-      workspace.worktree.stat(`/${path}`);
+  class BulkOnlyWorktree extends CountingWorktree {
+    override stat(path: string): never {
+      throw new Error(`scalar stat is forbidden during add: ${path}`);
     }
-    return workspace.storage.statementCount;
+
+    override readFile(path: string): never {
+      throw new Error(`scalar readFile is forbidden during add: ${path}`);
+    }
+
+    override readlink(path: string): never {
+      throw new Error(`scalar readlink is forbidden during add: ${path}`);
+    }
   }
 
-  it("keeps a repeat add --all proportional to what changed", () => {
+  it("stages 9,329 files and exactly 1,000 changes through bounded bulk calls", () => {
     const workspace = makeRepo("/");
-    for (let i = 0; i < 200; i++) {
-      writeWorkFile(workspace, `/src/dir${i % 10}/file${i}.txt`, `content of file ${i}\n`);
-    }
+    const original = utf8.encode("original\n");
+    const paths = Array.from({ length: 9_329 }, (_, index) => {
+      const directory = index % 3_346;
+      const generation = Math.floor(index / 3_346);
+      return `/d${directory.toString().padStart(4, "0")}/f${generation
+        .toString()
+        .padStart(4, "0")}.txt`;
+    });
+    workspace.worktree.writeFiles(paths.map((path) => ({ path, bytes: original })));
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
 
     workspace.storage.resetCounters();
-    add(workspace.repo, workspace.worktree, { paths: [], all: true });
+    add(workspace.repo, worktree, { paths: [], all: true });
     const first = workspace.storage.statementCount;
+    expect(workspace.repo.store.indexEntries()).toHaveLength(paths.length);
+    expect(first).toBeLessThanOrEqual(230);
+    expect(worktree.bulkReadPaths).toHaveLength(paths.length);
 
-    const scan = scanCost(workspace);
-
-    workspace.tick(1000);
-    writeWorkFile(workspace, "/src/dir0/file0.txt", "a different body entirely\n");
+    workspace.tick(60_000);
+    const changed = paths.slice(0, 1_000);
+    workspace.worktree.writeFiles(
+      changed.map((path) => ({ path, bytes: utf8.encode("changed\n") })),
+    );
+    worktree.bulkReadPaths.length = 0;
 
     workspace.storage.resetCounters();
-    add(workspace.repo, workspace.worktree, { paths: [], all: true });
+    add(workspace.repo, worktree, { paths: [], all: true });
     const second = workspace.storage.statementCount;
 
-    expect(lsFiles(workspace.repo)).toHaveLength(200);
-    // Measured on this fixture: 5,490 statements for the first pass, 1,909 for
-    // the second, of which 1,824 is the scan. Everything above the scan is the
-    // work that has to stay flat as the tree grows.
-    expect(first).toBeGreaterThan(2 * second);
-    expect(second).toBeLessThan(2_100);
-    expect(second - scan).toBeLessThan(150);
+    expect(second).toBeLessThanOrEqual(230);
+    expect(worktree.bulkReadPaths).toHaveLength(changed.length);
+    expect(new Set(worktree.bulkReadPaths)).toEqual(new Set(changed));
+    const changedOid = hashObject("blob", utf8.encode("changed\n"));
+    const stagedChanged = workspace.repo.store
+      .indexEntries()
+      .filter((entry) => entry.oid === changedOid)
+      .map((entry) => `/${entry.path}`);
+    expect(stagedChanged).toHaveLength(changed.length);
+    expect(new Set(stagedChanged)).toEqual(new Set(changed));
+
+    workspace.storage.resetCounters();
+    rm(workspace.repo, worktree, { paths: ["."] });
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
+    expect(workspace.repo.store.indexEntries()).toEqual([]);
   });
 });
