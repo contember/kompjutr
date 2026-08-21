@@ -18,6 +18,10 @@
       "types": "./dist/git/index.d.ts",
       "import": "./dist/git/index.js"
     },
+    "./shell": {
+      "types": "./dist/shell/index.d.ts",
+      "import": "./dist/shell/index.js"
+    },
     "./compat/computer": {
       "types": "./dist/compat/computer.d.ts",
       "import": "./dist/compat/computer.js"

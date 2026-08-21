@@ -2,6 +2,10 @@
 
 A bash-shaped command surface owned by kompjutr, over `Filesystem`.
 
+> **Status: waves A–C shipped**, as `kompjutr/shell`. §11 records what the
+> measurements changed. Two of this document's claims were wrong and are
+> corrected in place; the rest held.
+
 ## The thesis
 
 Every other virtual shell — just-bash included — implements a command as a
@@ -168,21 +172,24 @@ the repo. Published as `kompjutr/shell`.
 The planner rewrites a pipeline into one bounded query. Each rule is keyed to
 the shapes actually observed.
 
-### R1 — limit pushdown (observed 76×)
+### R1 — a trailing `head -N` bounds the source (observed 76×)
 
-```
-grep -r pat . | head -20     →  search(pat, limit: 20)
-find . -name '*.ts' | head   →  glob(pattern, limit: 10)
-ls dir | head -5             →  readdir(dir) sliced at 5
-```
+**The stage stays.** It is the mechanism: execution is pull-based, so a
+`head` that stops pulling stops the search behind it, which stops the reads
+behind that. An earlier draft of this section said `N` became a SQL `LIMIT`
+and the stage was dropped — see §11 for what that actually did.
 
-A trailing `head -N` / `tail -N` never materialises the producer's full
-output. For `head`, `N` becomes the SQL `LIMIT` and discovery stops early.
-`tail -N` cannot push down (it needs the end), so it becomes a bounded ring
-buffer of N lines — memory O(N), not O(output).
+What the planner contributes is the *knowledge* that the pipeline is
+bounded, published as `limitHint`, plus the refusal to publish it when a
+blocking stage (`sort`, `wc`) sits in between and would swallow it.
 
-**This is the headline win.** `grep -r pat . | head -20` over a 9,000-file
-tree must not read 9,000 files.
+`tail -N` is not a limiter: it needs the end of its input. It becomes a
+bounded ring buffer of N lines — memory O(N), not O(output) — and a
+`tail -N file` reads backwards from the end rather than through the file.
+
+**This is the headline win, and it measures.** `grep -rl pat . | head -20`
+costs 8 statements at 2,000 files and 8 at 6,000, while the same search
+without the `head` goes from 11 to 23.
 
 ### R2 — discover/read fusion (observed ~10×)
 
@@ -333,22 +340,29 @@ property of the executor, not of the agent's discipline.
 The done-check numbers. Fixture: Prettier 3.9.6, 9,329 files, as in
 [`bulk-sql.md`](bulk-sql.md).
 
-| operation | statement target |
-|---|---|
-| `ls /repo/src` | 1 |
-| `head -20 file` | 1 |
-| `cat file` (≤1.5 MB) | ≤2 |
-| `find . -name '*.ts' \| head -20` | **1** |
-| `grep -r pat . \| head -20` | **≤5** — must not scale with tree size |
-| `grep -rl pat . --include='*.ts'` (full) | `⌈files/1000⌉ + ⌈bytes/1.5MB⌉` |
-| `rm -rf src` (5,000 files) | O(1) |
-| 3-stage fused pipeline | same as the fused single stage |
-| `cd dir` | 2 — one `statTarget`, one session write |
-| any exec that does not `cd` | +0 for session state after the first |
+Measured in `tests/shell/cost.test.ts`, on a fixture of realistic file sizes
+(~3 KB) with one file in ten matching.
 
-The second-to-last row is the formula, not a constant: assert the *shape* of
-the curve at two tree sizes an order of magnitude apart, per the
-[three-part done-check rule](standalone-runtime-units.md).
+| operation | measured | note |
+|---|---|---|
+| `pwd` | **0** | answered from the session cache |
+| `cat file` (≤ budget) | 3 | |
+| `cd dir` | 3 | one `statTarget`, one row written |
+| `find . -name '*.ts'` | 4 | one indexed GLOB |
+| `ls dir` | 6 | |
+| `grep -rl pat . --include='*.ts' \| head -20` | **8 at 2,000 files, 8 at 6,000** | |
+| the same without `\| head` | 11 at 2,000, **23** at 6,000 | |
+| `rm -r` (200 vs 2,000 files) | 10 either way | a range delete |
+
+The first two rows of the search block are the result that matters, and the
+reason the shape is asserted at two sizes rather than against a constant:
+bounded is flat, unbounded triples.
+
+**These are not 1 apiece, and the original draft of this table said they
+should be.** Roughly half of each figure is resolving a path through every
+symlink on the way before it reaches `fs_paths` — the §3.6 invariant the
+store is built on, not overhead the shell can remove. What the shell owes is
+that the numbers are *constants*, and they are.
 
 ---
 
@@ -399,6 +413,32 @@ cpu-lease run -n 2 -- npm run bench:macro
 ```
 
 ---
+
+## 11. What the measurements changed
+
+Both corrections came from tests that were written to be able to fail.
+
+**R1 cannot remove the `head` stage.** The first implementation lifted the
+limit into a hint and dropped the stage, on the reasoning that laziness
+would bound the source. Nothing then enforced the line count and
+`cat file | head -2` returned the whole file. The stage *is* the mechanism:
+it is what stops pulling. The hint is only advice about page sizing, and §4
+now says so.
+
+**The Wave A probe taught the wrong lesson.** It concluded that a discovery
+page should be seeded at `2 × limitHint`, because a fixed 32 cost a second
+round trip. Its fixture matched every *other* file. At a realistic density —
+one in ten — that seeding made `grep … | head -20` cost **12 statements
+against the unbounded search's 9**: the bounded query was more expensive
+than the thing it was meant to beat. Discovery costs one statement whatever
+the page size (which A1 had already shown), so pages are always full now.
+
+The hint survives in exactly one place it earns: `cat big.log | head -20`
+reads a bounded range instead of the file.
+
+The lesson worth keeping is about fixtures, not about paging. A probe whose
+fixture is too kind produces a confident number that is wrong in the
+direction you were already hoping for.
 
 ## 9. Risks
 
