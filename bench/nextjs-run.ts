@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -62,6 +63,7 @@ function markdown(results: readonly Result[]): string {
     "",
     "Fixture: `vercel/next.js` at `v15.5.2`, rebuilt as one shallow-cloneable commit with 24,252 tracked files.",
     "The local Smart HTTP origin is prepared outside measurement. Clone includes protocol, pack ingest, index, and checkout.",
+    "SQLite uses a temporary file, matching persisted Durable Object storage instead of retaining the database in process memory.",
     "Each operation resets SQLite counters and the process RSS high-water mark.",
     "",
     "| operation | status | wall ms | SQL | rows | peak RSS added | heap delta | external delta | error |",
@@ -79,7 +81,12 @@ function markdown(results: readonly Result[]): string {
   return `${lines.join("\n")}\n`;
 }
 
-const context: ScenarioContext = { harness: harness("sqlite"), count: 0, variant: "nextjs" };
+const databaseDir = mkdtempSync(join(tmpdir(), "kompjutr-nextjs-bench-"));
+const context: ScenarioContext = {
+  harness: harness("sqlite", join(databaseDir, "workspace.sqlite")),
+  count: 0,
+  variant: "nextjs",
+};
 const results: Result[] = [];
 try {
   await NEXTJS_WORKFLOW.setup(context);
@@ -114,10 +121,16 @@ try {
     if (failure !== undefined) result.error = message(failure);
     results.push(result);
     process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (process.env.BENCH_CLONE_ONLY === "1") break;
     if (failure !== undefined && !mayContinue(phase.name, failure)) break;
   }
 } finally {
   await NEXTJS_WORKFLOW.teardown?.(context);
+  if (process.env.BENCH_KEEP_DATABASE === "1") {
+    process.stderr.write(`[benchmark-database] ${databaseDir}\n`);
+  } else {
+    rmSync(databaseDir, { recursive: true, force: true });
+  }
 }
 
 mkdirSync(RESULTS, { recursive: true });

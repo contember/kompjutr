@@ -23,8 +23,8 @@ export interface Harness {
 
 const IDENTITY = { name: "Bench", email: "bench@example.com" };
 
-export function harness(_backend: Backend): Harness {
-  const storage = new SqliteTestStorage();
+export function harness(_backend: Backend, databasePath = ":memory:"): Harness {
+  const storage = new SqliteTestStorage(databasePath);
   const now = (): number => 1_577_836_800_000;
   const workspace = new Workspace({
     storage,
