@@ -54,8 +54,8 @@ function cost(fixture: Fixture, source: string): number {
   return fixture.storage.statementCount - before;
 }
 
-describe("a bounded search does not scale with the tree", () => {
-  it("finds twenty matches at the same cost in a 10x bigger tree", () => {
+describe("a search does not scale with the tree", () => {
+  it("costs the same on a 10x bigger tree", () => {
     const small = tree(200);
     const large = tree(2_000);
 
@@ -69,15 +69,16 @@ describe("a bounded search does not scale with the tree", () => {
     expect(large.shell.run(command).stdout.split("\n").filter(Boolean)).toHaveLength(20);
 
     console.log(`grep|head -20: 200 files -> ${smallCost}, 2,000 files -> ${largeCost}`);
-    // The claim: ten times the tree, the same cost.
     expect(largeCost).toBe(smallCost);
-    expect(largeCost).toBeLessThanOrEqual(10);
+    expect(largeCost).toBeLessThanOrEqual(8);
   });
 
-  it("stops the source when the consumer stops pulling", () => {
-    // The scaling assertion, which is the one that cannot be faked: as the
-    // tree grows the unbounded search costs more and the bounded one does
-    // not. A ratio at a single size would only measure this fixture.
+  it("is flat with or without the head, because the match is a SQL predicate", () => {
+    // Before the content predicate the unbounded search read every candidate
+    // file into the isolate and went 11 -> 23 statements as the tree grew,
+    // and `| head -20` was what saved it. Now `instr` decides in the
+    // database and there is nothing left for the head to save: both are
+    // flat. The `| head` still bounds the *output*, which is its other job.
     const measured = [2_000, 6_000].map((size) => {
       const fixture = tree(size);
       return {
@@ -90,12 +91,35 @@ describe("a bounded search does not scale with the tree", () => {
 
     const [small, large] = measured;
     if (small === undefined || large === undefined) throw new Error("no measurements");
-
-    expect(small.bounded).toBeLessThan(small.unbounded);
-    expect(large.bounded).toBeLessThan(large.unbounded);
-    // Flat where it matters, growing where it must.
     expect(large.bounded).toBe(small.bounded);
-    expect(large.unbounded).toBeGreaterThan(small.unbounded);
+    expect(large.unbounded).toBe(small.unbounded);
+  });
+
+  it("reads only the files that matched, even when it prints lines", () => {
+    // Content mode needs bytes, but only of the files `instr` selected —
+    // one read batch for 200 matches out of 2,000 files, and still one for
+    // 600 out of 6,000.
+    const measured = [2_000, 6_000].map((size) =>
+      cost(tree(size), "grep -rn NEEDLE /repo/src --include=*.ts"),
+    );
+    console.log(`grep -rn: ${JSON.stringify(measured)}`);
+    const [small, large] = measured;
+    if (small === undefined || large === undefined) throw new Error("no measurements");
+    // Three times the tree costs at most one more statement, and that one is
+    // a second read batch for three times the matching *bytes* — the plan's
+    // `⌈bytes/budget⌉` term, not a term in the tree size. The regex fallback
+    // below doubles over the same step.
+    expect(large - small).toBeLessThanOrEqual(1);
+  });
+
+  it("falls back, and visibly scales, when the pattern is a real expression", () => {
+    // The contrast that proves the push-down is doing the work: SQLite has
+    // no regex, so this reads every candidate file exactly as the first
+    // implementation did — and the cost grows with the tree again.
+    const small = cost(tree(2_000), "grep -rl 'NEED.E' /repo/src --include=*.ts");
+    const large = cost(tree(6_000), "grep -rl 'NEED.E' /repo/src --include=*.ts");
+    console.log(`regex fallback: 2,000 -> ${small}, 6,000 -> ${large}`);
+    expect(large).toBeGreaterThan(small);
   });
 });
 

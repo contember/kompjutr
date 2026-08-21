@@ -195,3 +195,23 @@ function readClass(pattern: string, open: number): { text: string; end: number }
   // An unclosed `[` is a literal bracket, as in grep.
   return { text: "\\[", end: open + 1 };
 }
+
+/**
+ * The pattern as a plain substring, or null when it is a real expression.
+ *
+ * A search whose pattern is literal can be answered by a SQL predicate over
+ * the stored bytes instead of by reading every candidate file into the
+ * isolate — which covers most of what agents search for (`grep -r TODO`,
+ * `rg NEEDLE`). The check is deliberately conservative: a pattern that
+ * *might* be an expression is reported as one, because the cost of being
+ * wrong here is a wrong answer rather than a slow one.
+ */
+export function literalNeedle(pattern: string, dialect: Dialect): string | null {
+  if (pattern === "") return null;
+  if (dialect === "fixed") return pattern;
+  // BRE leaves `+ ? ( ) { } |` literal until they are backslashed, and the
+  // backslash is already in the set, so the two dialects differ only in how
+  // much they reject.
+  const metacharacters = dialect === "bre" ? /[\\.*[\]^$]/ : /[\\.*+?[\](){}|^$]/;
+  return metacharacters.test(pattern) ? null : pattern;
+}

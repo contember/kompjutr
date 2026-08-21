@@ -1,10 +1,19 @@
 // The search engine. `grep` and `rg` are two flag surfaces over this one
 // implementation — see docs/plans/shell.md §5.1.
 //
-// The cost model is the whole point. A search is not a walk: it is
-// `discoverFiles` (one indexed statement per page) feeding `readFileHandles`
-// (one statement per byte budget), and because the generator is pulled
-// lazily, a consumer that stops — `| head -20` — stops the pages too.
+// The cost model is the whole point, and there are two of them.
+//
+// When the pattern is a plain substring — which is most of what agents
+// search for — the match itself is a SQL predicate: `discoverFilesContaining`
+// answers "which files contain these bytes" without the other files' content
+// ever reaching the isolate. Over 6,000 files that measured 1 statement
+// against 24, and on a Durable Object the heap it does not touch matters
+// more than the statement it does not run.
+//
+// When the pattern is a real expression, SQLite has no regex to push down to,
+// so it falls back to `discoverFiles` (one indexed statement per page) feeding
+// `readFileHandles` (one statement per byte budget). Either way the generator
+// is pulled lazily, so a consumer that stops — `| head -20` — stops it here.
 
 import type { RealPath, RegularFileHandle } from "../../fs/types.js";
 import { type ByteStream, decode, encode, lines, looksBinary, NEWLINE } from "../exec/bytes.js";
@@ -27,6 +36,12 @@ export interface SearchRequest {
   readonly withFilename: boolean | null;
   readonly before: number;
   readonly after: number;
+  /**
+   * The pattern as plain bytes, when it is a substring rather than an
+   * expression. Null disables the SQL predicate — as `-i` and `-v` must,
+   * since `instr` is case-sensitive and cannot answer an inverted search.
+   */
+  readonly literal: Uint8Array | null;
 }
 
 export interface SearchOutcome {
@@ -73,7 +88,15 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
       }
 
       // A walked directory always labels: the reader cannot tell otherwise.
-      for (const file of walk(fs, root, request, includeMatchers, excludeMatchers)) {
+      // `-l` over a literal pattern needs no content at all: the database
+      // already decided, and reading the file would only confirm it.
+      const needsBytes = request.mode !== "files" || request.literal === null;
+      for (const file of walk(fs, root, request, includeMatchers, excludeMatchers, needsBytes)) {
+        if (file.bytes === null) {
+          noteMatch();
+          yield encode(`${file.path}\n`);
+          continue;
+        }
         yield* emit(file.path, file.bytes, request, request.withFilename ?? true, noteMatch);
       }
     }
@@ -84,7 +107,12 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
 
 interface FoundFile {
   readonly path: string;
-  readonly bytes: Uint8Array;
+  /**
+   * Null when the database proved the file contains the needle and the
+   * caller said it did not need the content — `grep -l` over a literal
+   * pattern never reads a byte of the files it names.
+   */
+  readonly bytes: Uint8Array | null;
 }
 
 /**
@@ -102,9 +130,18 @@ function* walk(
   request: SearchRequest,
   include: ReadonlyArray<{ test(path: string): boolean }>,
   exclude: ReadonlyArray<{ test(path: string): boolean }>,
+  needsBytes: boolean,
 ): Generator<FoundFile, void, undefined> {
   const realRoot = fs.realpath(root);
   const sqlPattern = narrowing(realRoot, request.include);
+
+  // `-c` prints a count for every file searched, zeros included, so it needs
+  // the files the predicate would filter out. Found by the equivalence test
+  // in tests/shell/pushdown.test.ts, which is what that suite is for.
+  if (request.literal !== null && request.mode !== "count") {
+    yield* walkByContent(fs, realRoot, sqlPattern, request, include, exclude, needsBytes);
+    return;
+  }
   // Always a full page.
   //
   // An earlier revision seeded the first page at `2 * limitHint`, on the
@@ -130,18 +167,74 @@ function* walk(
       if (accepted(handle.path, realRoot, request, include, exclude)) wanted.push(handle);
     }
 
-    let pending: readonly RegularFileHandle[] = wanted;
-    while (pending.length > 0) {
-      const batch = fs.readFileHandles(pending, { budget: fs.readBudget });
-      for (const handle of pending) {
-        const bytes = batch.files.get(handle.path);
-        if (bytes !== undefined) yield { path: handle.path, bytes };
-      }
-      pending = batch.remaining;
-    }
+    yield* read(fs, wanted);
 
     if (page.next === null) return;
     after = page.next;
+  }
+}
+
+/**
+ * The pushed-down path: the database decides which files contain the needle.
+ *
+ * `matched` handles are proven and need no read unless the caller wants the
+ * lines. `undecided` handles span more than one chunk, where a needle can
+ * straddle a boundary and `instr` cannot rule them out — those are always
+ * read and checked, so the answer matches what a full pass would give.
+ */
+function* walkByContent(
+  fs: BoundedFs,
+  realRoot: RealPath,
+  sqlPattern: string,
+  request: SearchRequest,
+  include: ReadonlyArray<{ test(path: string): boolean }>,
+  exclude: ReadonlyArray<{ test(path: string): boolean }>,
+  needsBytes: boolean,
+): Generator<FoundFile, void, undefined> {
+  const needle = request.literal;
+  if (needle === null) return;
+  let after: RealPath | undefined;
+
+  for (;;) {
+    const page = fs.discoverFilesContaining(
+      realRoot,
+      sqlPattern,
+      needle,
+      after === undefined ? { limit: PAGE_MAX } : { after, limit: PAGE_MAX },
+    );
+
+    const keep = (handle: RegularFileHandle): boolean =>
+      accepted(handle.path, realRoot, request, include, exclude);
+    const proven = page.matched.filter(keep);
+    const unread = page.undecided.filter(keep);
+
+    if (!needsBytes) {
+      for (const handle of proven) yield { path: handle.path, bytes: null };
+    }
+
+    // A proven file still needs its bytes when the caller wants lines; an
+    // undecided one always does.
+    const toRead = needsBytes ? [...proven, ...unread] : unread;
+    for (const file of read(fs, toRead)) yield file;
+
+    if (page.next === null) return;
+    after = page.next;
+  }
+}
+
+/** Read a set of handles in budget-sized batches. */
+function* read(
+  fs: BoundedFs,
+  handles: readonly RegularFileHandle[],
+): Generator<FoundFile, void, undefined> {
+  let pending: readonly RegularFileHandle[] = handles;
+  while (pending.length > 0) {
+    const batch = fs.readFileHandles(pending, { budget: fs.readBudget });
+    for (const handle of pending) {
+      const bytes = batch.files.get(handle.path);
+      if (bytes !== undefined) yield { path: handle.path, bytes };
+    }
+    pending = batch.remaining;
   }
 }
 

@@ -5,7 +5,7 @@
 import { type Command, fail } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, parseFlags, UsageError } from "./flags.js";
-import { compilePattern, type Dialect, PatternError } from "./regex.js";
+import { compilePattern, type Dialect, literalNeedle, PatternError } from "./regex.js";
 import { type SearchRequest, search } from "./search.js";
 import { searchStream } from "./search-stream.js";
 
@@ -152,6 +152,11 @@ export const grep: Command = (context) => {
     }
 
     const compiled = compilePattern(pattern, { dialect, ignoreCase, wholeWord, wholeLine });
+    // The SQL content predicate only answers a case-sensitive, positive
+    // substring search: `instr` has no case folding and cannot prove the
+    // absence an inverted search asks about.
+    const needle = ignoreCase || invert ? null : literalNeedle(pattern, dialect);
+    const literal = needle === null ? null : new TextEncoder().encode(needle);
     const shared = { invert, mode, lineNumbers, before, after };
 
     // A pipe stage searches its input, not the filesystem — R3. No path is
@@ -171,6 +176,7 @@ export const grep: Command = (context) => {
     const request: SearchRequest = {
       ...shared,
       pattern: compiled,
+      literal,
       roots: operands.map((operand) => resolve(context.cwd, operand)),
       recursive,
       include,

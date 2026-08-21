@@ -16,7 +16,7 @@
 import { type Command, fail } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, parseFlags, UsageError } from "./flags.js";
-import { compilePattern, PatternError } from "./regex.js";
+import { compilePattern, literalNeedle, PatternError } from "./regex.js";
 import { type SearchRequest, search } from "./search.js";
 import { searchStream } from "./search-stream.js";
 
@@ -201,6 +201,11 @@ export const rg: Command = (context) => {
       wholeWord,
       wholeLine,
     });
+    // The SQL content predicate only answers a case-sensitive, positive
+    // substring search: `instr` has no case folding and cannot prove the
+    // absence an inverted search asks about.
+    const needle = ignoreCase || invert ? null : literalNeedle(pattern, fixed ? "fixed" : "ere");
+    const literal = needle === null ? null : new TextEncoder().encode(needle);
     const shared = { invert, mode, lineNumbers, before, after };
 
     if (operands.length === 0 && context.stdin !== null) {
@@ -219,6 +224,7 @@ export const rg: Command = (context) => {
     const outcome = search(context.fs, {
       ...shared,
       pattern: compiled,
+      literal,
       roots,
       recursive: true,
       include,
