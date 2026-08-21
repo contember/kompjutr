@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 import {
   type AsyncFilesystem,
@@ -10,9 +10,16 @@ import {
   type ProcessResult,
   Workspace,
 } from "../src/index.js";
+import { GitFixture } from "./helpers/git.js";
+import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
+const fixtures: GitFixture[] = [];
+
+afterAll(() => {
+  for (const fixture of fixtures) fixture.dispose();
+});
 
 type AsyncMethodsPresent =
   Exclude<keyof Omit<Filesystem, "db" | "withReadScope">, keyof AsyncFilesystem> extends never
@@ -93,6 +100,36 @@ describe("Workspace", () => {
     expect(workspace.db.scalar<number>("SELECT COUNT(*) FROM git_repositories")).toBe(1);
     expect(asyncMethodsPresent).toBe(true);
     expect(asyncDatabaseHidden).toBe(true);
+  });
+
+  it("clones through the native Git client", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("README.md", "# remote\n");
+    fixture.write("src/index.ts", "export const value = 1;\n");
+    fixture.commit("remote work");
+
+    const server = await startGitServer(fixture.dir);
+    try {
+      const workspace = new Workspace({
+        storage: new SqliteTestStorage(),
+        git: createGit(),
+        defaultGitIdentity: IDENTITY,
+      });
+      const phases: string[] = [];
+      await workspace.git.clone({
+        url: server.url,
+        dir: "/",
+        onProgress: (event) => phases.push(event.phase),
+      });
+
+      expect(await workspace.fs.readFile("/README.md", "utf8")).toBe("# remote\n");
+      expect(await workspace.git.revParse({ ref: "HEAD" })).toBe(fixture.git("rev-parse", "HEAD"));
+      expect(await workspace.git.lsFiles()).toEqual(["README.md", "src/index.ts"]);
+      expect(phases.length).toBeGreaterThan(0);
+    } finally {
+      await server.close();
+    }
   });
 
   it("fails clearly when Git or exec is not configured", () => {
