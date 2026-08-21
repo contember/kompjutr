@@ -14,6 +14,7 @@ import { readFileHandles, readFiles } from "../../../src/fs/store/read.js";
 import { removeFiles } from "../../../src/fs/store/remove.js";
 import { realpath } from "../../../src/fs/store/resolve.js";
 import { discoverFiles, glob, scan } from "../../../src/fs/store/scan.js";
+import { discoverFilesContaining } from "../../../src/fs/store/search.js";
 import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
 import type { Filesystem } from "../../../src/fs/types.js";
 import { TestDatabase } from "../../helpers/db.js";
@@ -30,6 +31,8 @@ function createTestProvider(): NodeFsCompat {
     realpath: (path) => realpath(db, path),
     scan: (root, options) => scan(db, realpath(db, root), options),
     discoverFiles: (root, pattern, options) => discoverFiles(db, root, pattern, options),
+    discoverFilesContaining: (root, pattern, needle, options) =>
+      discoverFilesContaining(db, root, pattern, needle, options),
     readFileHandles: (handles, options) => readFileHandles(db, handles, options),
     readFiles: (paths, options) => readFiles(db, paths, options),
     glob: (root, pattern, options) => glob(db, realpath(db, root), pattern, options),

@@ -92,6 +92,30 @@ export interface DiscoverFilesPage {
   next: RealPath | null;
 }
 
+export interface ContentSearchOptions {
+  /** Resume strictly after this canonical handle path. */
+  after?: RealPath;
+  /** Defaults to 1,000 and cannot exceed 1,000. */
+  limit?: number;
+}
+
+export interface ContentSearchPage {
+  /**
+   * Files the database proved contain the needle. Their bytes were never
+   * read into the isolate to decide it.
+   */
+  matched: RegularFileHandle[];
+  /**
+   * Files spanning more than one chunk. A needle can straddle a chunk
+   * boundary, so `instr` cannot rule them out and the caller must read and
+   * check them. Reporting them beats dropping them: a missed file is a
+   * silently wrong search.
+   */
+  undecided: RegularFileHandle[];
+  /** Re-call with this cursor. `null` proves this was the final page. */
+  next: RealPath | null;
+}
+
 export interface HandleReadBatch {
   /** Bytes keyed by the canonical path carried by each handle. */
   files: Map<RealPath, Uint8Array>;
@@ -186,6 +210,22 @@ export interface Filesystem {
    * `root` is resolved once by the caller. One indexed statement.
    */
   discoverFiles(root: RealPath, pattern: string, options?: DiscoverFilesOptions): DiscoverFilesPage;
+
+  /**
+   * Discover regular files whose *content* contains `needle`, as one indexed
+   * statement. The bytes of a file that cannot match never reach the
+   * isolate, which is the difference that matters on a Durable Object.
+   *
+   * `needle` is compared byte for byte against the stored BLOBs, so it
+   * carries no encoding assumption. See `ContentSearchPage.undecided` for
+   * the one case the database cannot settle.
+   */
+  discoverFilesContaining(
+    root: RealPath,
+    pattern: string,
+    needle: Uint8Array,
+    options?: ContentSearchOptions,
+  ): ContentSearchPage;
 
   /** Read discovered files without another path-resolution or metadata lookup. */
   readFileHandles(

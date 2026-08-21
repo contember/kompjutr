@@ -7,11 +7,14 @@ import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "./store/resolve.js";
 import { discoverFiles, glob as scanGlob, scan as scanPage } from "./store/scan.js";
+import { discoverFilesContaining } from "./store/search.js";
 import {
   makeDirectories as makeStoredDirectories,
   writeFiles as writeStoredFiles,
 } from "./store/write.js";
 import type {
+  ContentSearchOptions,
+  ContentSearchPage,
   Filesystem,
   FilesystemOptions,
   ReadBatch,
@@ -92,6 +95,12 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     },
     discoverFiles: (root, pattern, discoverOptions) =>
       discoverFiles(db, root, pattern, discoverOptions),
+    discoverFilesContaining: (
+      root,
+      pattern,
+      needle,
+      searchOptions?: ContentSearchOptions,
+    ): ContentSearchPage => discoverFilesContaining(db, root, pattern, needle, searchOptions),
     readFileHandles: (handles, handleOptions) => readFileHandles(db, handles, handleOptions),
     readFiles,
     glob: (root, pattern, globOptions) => scanGlob(db, realpath(db, root), pattern, globOptions),
