@@ -5,11 +5,11 @@
 // computes the common set from the haves it was given. Nothing here needs
 // multi-ack.
 
-import { utf8Decoder } from "../bytes.js";
+import { isOid, utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { FLUSH, pkt } from "./pktline.js";
-import { ByteReader, type Pkt, pktText } from "./stream.js";
-import { HttpError, type RemoteRequestOptions, readAll, requestWithAuth } from "./transport.js";
+import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt, pktText } from "./stream.js";
+import { HttpError, type RemoteRequestOptions, requestWithAuth } from "./transport.js";
 
 export const AGENT = "kompjutr/0.0.0";
 
@@ -28,6 +28,144 @@ export interface Advertisement {
 }
 
 const ZERO = "0".repeat(40);
+
+/** Retained refs, capabilities, symrefs and shallow boundaries per response. */
+export const MAX_PROTOCOL_RETAINED_BYTES = 4 * 1024 * 1024;
+export const MAX_PROTOCOL_NEGOTIATION_INPUT_BYTES = 16 * 1024 * 1024;
+export const MAX_PROTOCOL_NEGOTIATION_ENTRIES = 16_384;
+export const MAX_PROTOCOL_TEXT_BYTES = MAX_PKT_FRAME_BYTES - 4;
+
+const STRING_FIXED_BYTES = 48;
+const ADVERTISEMENT_FIXED_BYTES = 256;
+const UPLOAD_RESULT_FIXED_BYTES = 192;
+const REF_FIXED_BYTES = 96;
+const CAPABILITY_FIXED_BYTES = 64;
+const HEAD_REF_FIXED_BYTES = 16;
+const BOUNDARY_FIXED_BYTES = 56;
+const ERROR_PREFIX_BYTES = 800;
+const ERROR_PREFIX_CHARACTERS = 200;
+
+export interface ProtocolMemoryLimits {
+  /** Test seam; callers may lower but never raise the production ceiling. */
+  retainedBytes?: number;
+  inputBytes?: number;
+  entries?: number;
+  lineBytes?: number;
+}
+
+interface ResolvedProtocolMemoryLimits {
+  retainedBytes: number;
+  inputBytes: number;
+  entries: number;
+  lineBytes: number;
+}
+
+interface ProtocolRequestOptions extends RemoteRequestOptions {
+  protocolLimits?: ProtocolMemoryLimits;
+}
+
+class NegotiationBudget {
+  #retained: number;
+  #input = 0;
+  #entries = 0;
+
+  constructor(
+    private readonly limits: ResolvedProtocolMemoryLimits,
+    fixedBytes: number,
+  ) {
+    if (fixedBytes > limits.retainedBytes) this.#tooLarge("retained state");
+    this.#retained = fixedBytes;
+  }
+
+  packet(packet: Pkt): void {
+    if (packet.payload.length > this.limits.lineBytes) this.#tooLarge("pkt-line text");
+    const bytes = packet.payload.length + 4;
+    if (bytes > this.limits.inputBytes - this.#input) this.#tooLarge("negotiation input");
+    this.#input += bytes;
+  }
+
+  reserve(bytes: number, entries = 1): void {
+    if (entries > this.limits.entries - this.#entries) this.#tooLarge("entry count");
+    if (bytes > this.limits.retainedBytes - this.#retained) this.#tooLarge("retained state");
+    this.#entries += entries;
+    this.#retained += bytes;
+  }
+
+  #tooLarge(part: string): never {
+    throw new GitError("E2BIG", `protocol ${part} exceeds its bounded limit`);
+  }
+}
+
+class UploadRequestBudget {
+  #bytes = 0;
+
+  constructor(private readonly limits: ResolvedProtocolMemoryLimits) {}
+
+  line(text: string): void {
+    if (text.length > this.limits.lineBytes) this.#tooLarge("pkt-line text");
+    this.frame(text.length + 4);
+  }
+
+  frame(bytes: number): void {
+    if (bytes > this.limits.inputBytes - this.#bytes) this.#tooLarge("negotiation input");
+    this.#bytes += bytes;
+  }
+
+  entries(entries: number): void {
+    if (entries > this.limits.entries) this.#tooLarge("entry count");
+  }
+
+  #tooLarge(part: string): never {
+    throw new GitError("E2BIG", `protocol ${part} exceeds its bounded limit`);
+  }
+}
+
+function stringRetainedBytes(value: string): number {
+  return STRING_FIXED_BYTES + value.length * 2;
+}
+
+function resolvedProtocolLimits(
+  overrides: ProtocolMemoryLimits | undefined,
+): ResolvedProtocolMemoryLimits {
+  return {
+    retainedBytes: boundedLimit(
+      overrides?.retainedBytes,
+      MAX_PROTOCOL_RETAINED_BYTES,
+      "retainedBytes",
+    ),
+    inputBytes: boundedLimit(
+      overrides?.inputBytes,
+      MAX_PROTOCOL_NEGOTIATION_INPUT_BYTES,
+      "inputBytes",
+    ),
+    entries: boundedLimit(overrides?.entries, MAX_PROTOCOL_NEGOTIATION_ENTRIES, "entries"),
+    lineBytes: boundedLimit(overrides?.lineBytes, MAX_PROTOCOL_TEXT_BYTES, "lineBytes"),
+  };
+}
+
+function boundedLimit(value: number | undefined, ceiling: number, name: string): number {
+  if (value === undefined) return ceiling;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${name} must be a positive safe integer`);
+  }
+  return Math.min(value, ceiling);
+}
+
+async function readErrorPrefix(body: AsyncIterable<Uint8Array>): Promise<string> {
+  const prefix = new Uint8Array(ERROR_PREFIX_BYTES);
+  let length = 0;
+  try {
+    for await (const chunk of body) {
+      if (length >= prefix.length) continue;
+      const take = Math.min(chunk.length, prefix.length - length);
+      prefix.set(chunk.subarray(0, take), length);
+      length += take;
+    }
+  } catch {
+    // The retained prefix is still useful when the error body is truncated.
+  }
+  return utf8Decoder.decode(prefix.subarray(0, length)).slice(0, ERROR_PREFIX_CHARACTERS);
+}
 
 /** Accepts what real git accepts over HTTP, and nothing else. */
 export function normalizeRemoteUrl(url: string): string {
@@ -49,8 +187,12 @@ function baseHeaders(): Record<string, string> {
 export async function discover(
   url: string,
   service: Service,
-  options: RemoteRequestOptions = {},
+  options: ProtocolRequestOptions = {},
 ): Promise<Advertisement> {
+  const budget = new NegotiationBudget(
+    resolvedProtocolLimits(options.protocolLimits),
+    ADVERTISEMENT_FIXED_BYTES,
+  );
   const base = normalizeRemoteUrl(url);
   const response = await requestWithAuth(
     {
@@ -61,7 +203,7 @@ export async function discover(
     options,
   );
   if (response.status !== 200) {
-    const body = await readAll(response.body).catch(() => "");
+    const body = await readErrorPrefix(response.body);
     throw new HttpError(
       response.status,
       `${service} discovery failed: ${response.status} ${response.statusText}${body === "" ? "" : ` — ${body.slice(0, 200)}`}`,
@@ -84,6 +226,7 @@ export async function discover(
   try {
     const first = await reader.readPkt();
     if (first === null) throw new CorruptError("empty ref advertisement");
+    budget.packet(first);
     const header = first.kind === "line" ? pktText(first) : "";
     if (header.startsWith("ERR ")) throw new GitError("EFETCHFAIL", header.slice(4));
     if (!header.startsWith("# service=")) {
@@ -93,7 +236,8 @@ export async function discover(
     if (afterHeader === null || afterHeader.kind !== "flush") {
       throw new CorruptError("malformed ref advertisement header");
     }
-    return await parseAdvertisement(reader);
+    budget.packet(afterHeader);
+    return await parseAdvertisement(reader, budget);
   } finally {
     // The advertisement is the whole response; leaving its tail unread
     // would hold the connection open.
@@ -111,7 +255,10 @@ async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
   }
 }
 
-async function parseAdvertisement(reader: ByteReader): Promise<Advertisement> {
+async function parseAdvertisement(
+  reader: ByteReader,
+  budget: NegotiationBudget,
+): Promise<Advertisement> {
   const refs: RemoteRef[] = [];
   const capabilities = new Set<string>();
   let headRef: string | null = null;
@@ -119,7 +266,9 @@ async function parseAdvertisement(reader: ByteReader): Promise<Advertisement> {
 
   for (;;) {
     const line: Pkt | null = await reader.readPkt();
-    if (line === null || line.kind === "flush") break;
+    if (line === null) break;
+    budget.packet(line);
+    if (line.kind === "flush") break;
     if (line.kind !== "line") continue;
     let text = utf8Decoder.decode(line.payload);
     if (text.endsWith("\n")) text = text.slice(0, -1);
@@ -127,12 +276,26 @@ async function parseAdvertisement(reader: ByteReader): Promise<Advertisement> {
       first = false;
       const nul = text.indexOf("\0");
       if (nul >= 0) {
-        for (const capability of text.slice(nul + 1).split(" ")) {
-          if (capability === "") continue;
+        let start = nul + 1;
+        while (start < text.length) {
+          while (text[start] === " ") start++;
+          if (start >= text.length) break;
+          let end = text.indexOf(" ", start);
+          if (end < 0) end = text.length;
+          const capability = text.slice(start, end);
+          const capabilityBytes = capabilities.has(capability)
+            ? 0
+            : CAPABILITY_FIXED_BYTES + stringRetainedBytes(capability);
+          const symref = capability.startsWith("symref=HEAD:")
+            ? capability.slice("symref=HEAD:".length)
+            : null;
+          budget.reserve(
+            capabilityBytes +
+              (symref === null ? 0 : HEAD_REF_FIXED_BYTES + stringRetainedBytes(symref)),
+          );
           capabilities.add(capability);
-          if (capability.startsWith("symref=HEAD:")) {
-            headRef = capability.slice("symref=HEAD:".length);
-          }
+          if (symref !== null) headRef = symref;
+          start = end + 1;
         }
         text = text.slice(0, nul);
       }
@@ -144,6 +307,7 @@ async function parseAdvertisement(reader: ByteReader): Promise<Advertisement> {
     const name = text.slice(space + 1);
     // An empty repository advertises only the capabilities line.
     if (oid === ZERO && name.startsWith("capabilities^{}")) continue;
+    budget.reserve(REF_FIXED_BYTES + stringRetainedBytes(name) + stringRetainedBytes(oid));
     refs.push({ name, oid });
   }
   return { refs, capabilities, headRef };
@@ -177,8 +341,9 @@ function negotiate(advertised: Set<string>, wanted: string[]): string[] {
 
 export async function uploadPack(
   request: UploadPackRequest,
-  options: RemoteRequestOptions = {},
+  options: ProtocolRequestOptions = {},
 ): Promise<UploadPackResult> {
+  const limits = resolvedProtocolLimits(options.protocolLimits);
   const base = normalizeRemoteUrl(request.url);
   const wanted = ["side-band-64k", "thin-pack", "ofs-delta", "no-done"];
   if (request.includeTag === true) wanted.push("include-tag");
@@ -188,16 +353,31 @@ export async function uploadPack(
   const capabilities = negotiate(request.advertised, wanted);
   capabilities.push(`agent=${AGENT}`);
 
+  if (request.wants.length === 0) throw new GitError("ENOWANT", "nothing to fetch");
+  const haves = request.haves ?? [];
+  const requestBudget = new UploadRequestBudget(limits);
+  requestBudget.entries(request.wants.length + shallows.length + haves.length);
+  for (const oid of [...request.wants, ...shallows, ...haves]) {
+    if (!isOid(oid)) throw new CorruptError(`invalid upload-pack object id ${oid}`);
+  }
+  if (request.depth !== undefined && (!Number.isSafeInteger(request.depth) || request.depth <= 0)) {
+    throw new RangeError("upload-pack depth must be a positive safe integer");
+  }
+
   const body: Uint8Array[] = [];
+  const pushLine = (text: string): void => {
+    requestBudget.line(text);
+    body.push(pkt(text));
+  };
   request.wants.forEach((oid, index) => {
-    body.push(pkt(index === 0 ? `want ${oid} ${capabilities.join(" ")}\n` : `want ${oid}\n`));
+    pushLine(index === 0 ? `want ${oid} ${capabilities.join(" ")}\n` : `want ${oid}\n`);
   });
-  if (body.length === 0) throw new GitError("ENOWANT", "nothing to fetch");
-  for (const oid of shallows) body.push(pkt(`shallow ${oid}\n`));
-  if (request.depth !== undefined) body.push(pkt(`deepen ${request.depth}\n`));
+  for (const oid of shallows) pushLine(`shallow ${oid}\n`);
+  if (request.depth !== undefined) pushLine(`deepen ${request.depth}\n`);
+  requestBudget.frame(FLUSH.length);
   body.push(FLUSH);
-  for (const oid of request.haves ?? []) body.push(pkt(`have ${oid}\n`));
-  body.push(pkt("done\n"));
+  for (const oid of haves) pushLine(`have ${oid}\n`);
+  pushLine("done\n");
 
   const response = await requestWithAuth(
     {
@@ -213,7 +393,7 @@ export async function uploadPack(
     options,
   );
   if (response.status !== 200) {
-    const text = await readAll(response.body).catch(() => "");
+    const text = await readErrorPrefix(response.body);
     throw new HttpError(
       response.status,
       `git-upload-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text.slice(0, 200)}`}`,
@@ -223,6 +403,7 @@ export async function uploadPack(
   const reader = new ByteReader(response.body);
   const shallow: string[] = [];
   const unshallow: string[] = [];
+  const budget = new NegotiationBudget(limits, UPLOAD_RESULT_FIXED_BYTES);
   const useSideband = capabilities.includes("side-band-64k");
 
   // Acknowledgement and shallow sections, then the pack. `done` was sent,
@@ -231,6 +412,7 @@ export async function uploadPack(
   for (;;) {
     const line = await reader.readPkt();
     if (line === null) throw new CorruptError("upload-pack response ended before the pack");
+    budget.packet(line);
     if (line.kind !== "line") continue;
     if (useSideband && isBandFrame(line.payload)) {
       return {
@@ -241,11 +423,15 @@ export async function uploadPack(
     }
     const text = pktText(line);
     if (text.startsWith("shallow ")) {
-      shallow.push(text.slice(8).trim());
+      const oid = text.slice(8).trim();
+      budget.reserve(BOUNDARY_FIXED_BYTES + stringRetainedBytes(oid));
+      shallow.push(oid);
       continue;
     }
     if (text.startsWith("unshallow ")) {
-      unshallow.push(text.slice(10).trim());
+      const oid = text.slice(10).trim();
+      budget.reserve(BOUNDARY_FIXED_BYTES + stringRetainedBytes(oid));
+      unshallow.push(oid);
       continue;
     }
     if (text.startsWith("ERR ")) throw new GitError("EFETCHFAIL", text.slice(4));
