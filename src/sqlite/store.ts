@@ -12,11 +12,13 @@ import { deflate, InflateStream, inflate } from "../core/zlib.js";
 import {
   type CommitCacheEntry,
   type CommitCacheWriteResult,
+  type CommitGraphLimits,
   indexCommitSource,
   insertCommitCaches,
   MAX_INDEXED_COMMIT_BYTES,
   prepareCommitCache,
   readCommitCache,
+  readCommitGraph,
 } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
 import { type PackCacheOptions, PackStore } from "./packs.js";
@@ -1628,6 +1630,11 @@ export class RepoStore {
     return readCommitCache(this.#db, this.#repoId, oid);
   }
 
+  /** Validate raw bytes and prepare an opaque point-cache entry without writing it. */
+  prepareCommit(oid: string, data: Uint8Array): CommitCacheEntry {
+    return prepareCommitCache({ repoId: this.#repoId, oid, data });
+  }
+
   /** Lazily add one derived commit row from bytes the caller already read. */
   cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
     return indexCommitSource(this.#db, { repoId: this.#repoId, oid, data });
@@ -1636,6 +1643,11 @@ export class RepoStore {
   /** Insert prepared point misses with the shared row and JSON byte bounds. */
   cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
     return insertCommitCaches(this.#db, entries);
+  }
+
+  /** Parsed commits reachable from `rootOid`, read by one bounded recursive cursor. */
+  commitGraph(rootOid: string, limits: CommitGraphLimits = {}): Iterable<CommitCacheEntry> {
+    return readCommitGraph(this.#db, this.#repoId, rootOid, limits);
   }
 
   // -- shallow --------------------------------------------------------

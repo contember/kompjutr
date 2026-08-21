@@ -6,11 +6,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { concat, utf8Decoder } from "../src/core/bytes.js";
 import { GitError } from "../src/core/errors.js";
 import {
+  type Commit,
   hashObject,
   isTreeMode,
   MODE_FILE,
   MODE_TREE,
   parseTreeStream,
+  serializeCommit,
   serializeTree,
 } from "../src/core/objects.js";
 import { catFile, log, lsFilesAtRef, lsTree, show } from "../src/core/ops/reads.js";
@@ -18,6 +20,7 @@ import { treeStream } from "../src/core/ops/tree-stream.js";
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
+import { commitCacheBytes } from "../src/sqlite/commits.js";
 import { iterateSqlCursor, type SqlDatabase } from "../src/sqlite/db.js";
 import { SqliteGitDatabase, WALK_TREE_SQL } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -150,6 +153,10 @@ describe("log", () => {
 
   it("honours depth", () => {
     expect(log(repo, { depth: 2 })).toHaveLength(2);
+    expect(log(repo, { depth: 0 })).toHaveLength(1);
+    expect(log(repo, { depth: -1 })).toHaveLength(1);
+    expect(log(repo, { depth: 1.5 })).toHaveLength(2);
+    expect(log(repo, { depth: Number.NaN })).toHaveLength(log(repo).length);
   });
 
   it("reads authorship the way git records it", () => {
@@ -159,6 +166,126 @@ describe("log", () => {
     expect(head.author.timestamp).toBe(Number(fixture.git("show", "-s", "--format=%at", "HEAD")));
     expect(head.message.trim()).toBe("merge side");
     expect(head.parent).toHaveLength(2);
+  });
+});
+
+describe("bounded commit graph reads", () => {
+  it("preserves unborn HEAD and explicit missing-ref semantics", () => {
+    const db = new TestDatabase();
+    const repo = new Repository(openScale(db), "/repo");
+
+    expect(log(repo)).toEqual([]);
+    expect(() => log(repo, { ref: "missing" })).toThrow(/unknown revision/);
+  });
+
+  it("fills 256 cold point misses in bounded batches and reuses them warm", () => {
+    const { db, repo } = logFixture(256);
+    db.run("DELETE FROM git_commits WHERE repo_id = ?", 1);
+    db.storage.resetCounters();
+
+    expect(log(repo, { depth: 256 })).toHaveLength(256);
+    const cold = db.storage.statementCount;
+    expect(cold).toBeLessThan(1_000);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits WHERE repo_id = ?", 1)).toBe(256);
+
+    db.storage.resetCounters();
+    expect(log(repo, { depth: 256 })).toHaveLength(256);
+    expect(db.storage.statementCount).toBeLessThan(300);
+  });
+
+  it("uses one graph cursor for depth 257 and preserves every projected field", () => {
+    const { db, repo } = logFixture(257);
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+
+    const entries = log(repo, { depth: 257 });
+
+    expect(entries).toHaveLength(257);
+    expect(entries[0]?.message).toContain("\0tail");
+    expect(entries[0]?.author.name).toBe("Au\0thor");
+    expect(entries[0]?.parent).toHaveLength(1);
+    const statements = [...db.storage.histogram.entries()];
+    expect(
+      statements.filter(([query]) => query.startsWith("WITH RECURSIVE params(repo_id, root_oid")),
+    ).toHaveLength(1);
+    expect(statements.map(([query]) => query).join("\n")).not.toContain("git_object_chunks");
+    expect(db.storage.statementCount).toBeLessThan(20);
+  });
+
+  it("fails an incomplete deep cache without scalar or object fallback", () => {
+    const { db, repo, oids } = logFixture(257);
+    db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oids[0]);
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+
+    expect(() => log(repo, { depth: 257 })).toThrow(/reindex or reclone/);
+    expect([...db.storage.histogram.keys()].join("\n")).not.toContain("git_object_chunks");
+  });
+
+  it("rejects a coordinated cached cycle on point and indexed log paths", () => {
+    const { repo, oids } = logFixture(2);
+    const parent = oids[0];
+    const root = oids[1];
+    if (parent === undefined || root === undefined) throw new Error("cycle fixture is incomplete");
+    const cached = repo.store.cachedCommit(parent);
+    if (cached === null) throw new Error("cycle fixture cache is missing");
+    const parents = [root];
+    const changed: Commit = { ...cached.commit, parent: parents };
+    repo.store.db.run(
+      "UPDATE git_commits SET parents = ?, cache_bytes = ? WHERE repo_id = ? AND oid = ?",
+      JSON.stringify(parents),
+      commitCacheBytes(changed),
+      1,
+      parent,
+    );
+
+    expect(() => log(repo, { depth: 2 })).toThrow(/cycle/);
+    expect(() => log(repo, { depth: 257 })).toThrow(/cycle/);
+  });
+
+  it("accepts DAG reuse on point and indexed log paths", () => {
+    const { repo, oids } = logFixture(1);
+    const base = oids[0];
+    if (base === undefined) throw new Error("DAG fixture base is missing");
+    const write = (message: string, parent: string[], timestamp: number): string =>
+      repo.store.write(
+        "commit",
+        serializeCommit({
+          tree: "1".repeat(40),
+          parent,
+          author: {
+            name: "Author",
+            email: "author@example.test",
+            timestamp,
+            timezoneOffset: 0,
+          },
+          committer: {
+            name: "Committer",
+            email: "committer@example.test",
+            timestamp,
+            timezoneOffset: 0,
+          },
+          message,
+        }),
+      );
+    const left = write("left\n", [base], 1);
+    const right = write("right\n", [base], 2);
+    const root = write("root\n", [left, right], 3);
+    repo.store.setRef("refs/heads/main", root);
+
+    expect(log(repo, { depth: 2 })).toHaveLength(2);
+    expect(log(repo, { depth: 257 }).map((entry) => entry.oid)).toEqual([root, right, left, base]);
+  });
+
+  it("walks 1,000 indexed commits under the working-set wall gate", () => {
+    const { db, repo } = logFixture(1_000);
+    db.storage.resetCounters();
+    const started = performance.now();
+    expect(log(repo)).toHaveLength(1_000);
+    const elapsed = performance.now() - started;
+
+    expect(db.storage.statementCount).toBeLessThan(20);
+    expect(elapsed).toBeLessThan(100);
   });
 });
 
@@ -296,6 +423,44 @@ function reopenScale(db: SqlDatabase): Repository {
   const row = database.find("/repo");
   if (row === null) throw new Error("scale repository is missing");
   return new Repository(database.open(row), "/repo");
+}
+
+function logFixture(count: number): {
+  db: TestDatabase;
+  repo: Repository;
+  oids: string[];
+} {
+  const db = new TestDatabase();
+  const store = openScale(db);
+  const oids = store.writeObjects((batch) => {
+    const written: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const commit: Commit = {
+        tree: "1".repeat(40),
+        parent: written.length === 0 ? [] : [written[written.length - 1]!],
+        author: {
+          name: index === count - 1 ? "Au\0thor" : "Author",
+          email: "author@example.test",
+          timestamp: index,
+          timezoneOffset: -60,
+        },
+        committer: {
+          name: "Committer",
+          email: "committer@example.test",
+          timestamp: index,
+          timezoneOffset: 90,
+        },
+        message: `commit ${index}\0tail\n`,
+        gpgsig: index === count - 1 ? "signature\0tail" : undefined,
+      };
+      written.push(batch.write("commit", serializeCommit(commit)));
+    }
+    return written;
+  });
+  const head = oids[oids.length - 1];
+  if (head === undefined) throw new Error("log fixture needs at least one commit");
+  store.setRef("refs/heads/main", head);
+  return { db, repo: new Repository(store, "/repo"), oids };
 }
 
 function* legacyWalk(

@@ -1,9 +1,16 @@
 // The repository: everything reachable from the object store and the refs,
 // with no knowledge of Computer, DOFS or HTTP.
 
+import {
+  type CommitCacheEntry,
+  type CommitGraphLimits,
+  MAX_COMMIT_CACHE_BYTES,
+  MAX_LOG_COMMITS,
+  MAX_LOG_STATE_BYTES,
+} from "../sqlite/commits.js";
 import type { RepoStore } from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
-import { CorruptError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
+import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
   type Commit,
   isTreeMode,
@@ -31,6 +38,83 @@ export interface ResolvedHead {
   ref: string | null;
   /** The commit HEAD resolves to, or null on an unborn branch. */
   oid: string | null;
+}
+
+interface WalkNode {
+  oid: string;
+  commit: Commit;
+  sequence: number;
+}
+
+function before(left: WalkNode, right: WalkNode): boolean {
+  if (left.commit.committer.timestamp !== right.commit.committer.timestamp) {
+    return left.commit.committer.timestamp > right.commit.committer.timestamp;
+  }
+  return left.sequence < right.sequence;
+}
+
+class CommitHeap {
+  readonly #nodes: WalkNode[] = [];
+
+  get size(): number {
+    return this.#nodes.length;
+  }
+
+  push(node: WalkNode): void {
+    let index = this.#nodes.length;
+    this.#nodes.push(node);
+    while (index > 0) {
+      const parent = (index - 1) >> 1;
+      if (before(this.#nodes[parent]!, node)) break;
+      this.#nodes[index] = this.#nodes[parent]!;
+      index = parent;
+    }
+    this.#nodes[index] = node;
+  }
+
+  pop(): WalkNode | undefined {
+    const first = this.#nodes[0];
+    const tail = this.#nodes.pop();
+    if (first === undefined || tail === undefined || this.#nodes.length === 0) return first;
+    let index = 0;
+    while (true) {
+      const left = index * 2 + 1;
+      if (left >= this.#nodes.length) break;
+      const right = left + 1;
+      const child =
+        right < this.#nodes.length && before(this.#nodes[right]!, this.#nodes[left]!)
+          ? right
+          : left;
+      if (before(tail, this.#nodes[child]!)) break;
+      this.#nodes[index] = this.#nodes[child]!;
+      index = child;
+    }
+    this.#nodes[index] = tail;
+    return first;
+  }
+}
+
+class CommitFillBuffer {
+  readonly #pending: CommitCacheEntry[] = [];
+  #bytes = 0;
+
+  constructor(private readonly store: RepoStore) {}
+
+  add(entry: CommitCacheEntry): void {
+    if (this.#pending.length > 0 && this.#bytes + entry.cacheBytes > MAX_COMMIT_CACHE_BYTES) {
+      this.flush();
+    }
+    this.#pending.push(entry);
+    this.#bytes += entry.cacheBytes;
+    if (this.#bytes >= MAX_COMMIT_CACHE_BYTES) this.flush();
+  }
+
+  flush(): void {
+    if (this.#pending.length === 0) return;
+    this.store.cacheCommits(this.#pending);
+    this.#pending.length = 0;
+    this.#bytes = 0;
+  }
 }
 
 export class Repository {
@@ -70,10 +154,19 @@ export class Repository {
   }
 
   readCommit(oid: string): Commit {
+    return this.#readCommitEntry(oid).commit;
+  }
+
+  #readCommitEntry(oid: string, fill?: CommitFillBuffer): CommitCacheEntry {
+    const cached = this.store.cachedCommit(oid);
+    if (cached !== null) return cached;
     const object = this.read(oid);
     if (object.type !== "commit")
       throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
-    return parseCommit(object.data);
+    const prepared = this.store.prepareCommit(oid, object.data);
+    if (fill === undefined) this.store.cacheCommits([prepared]);
+    else fill.add(prepared);
+    return prepared;
   }
 
   readTree(oid: string): TreeEntry[] {
@@ -229,30 +322,132 @@ export class Repository {
   /** Commits reachable from `oid`, first-parent-first, in commit-date order. */
   *walk(oid: string): Generator<{ oid: string; commit: Commit }> {
     const seen = new Set<string>();
-    // A small priority queue keyed on committer time reproduces git log's
-    // default ordering closely enough for a history walk.
-    const queue: { oid: string; commit: Commit }[] = [];
+    const queue = new CommitHeap();
+    const fill = new CommitFillBuffer(this.store);
+    let sequence = 0;
+    let stateBytes = 0;
     const push = (candidate: string): void => {
       if (seen.has(candidate)) return;
-      seen.add(candidate);
-      const commit = this.readCommit(candidate);
-      let index = queue.length;
-      while (
-        index > 0 &&
-        queue[index - 1]!.commit.committer.timestamp < commit.committer.timestamp
-      ) {
-        index--;
+      if (seen.size >= MAX_LOG_COMMITS) {
+        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
       }
-      queue.splice(index, 0, { oid: candidate, commit });
+      const entry = this.#readCommitEntry(candidate, fill);
+      if (stateBytes + entry.cacheBytes > MAX_LOG_STATE_BYTES) {
+        throw new GitError("E2BIG", "commit graph exceeds the 32 MiB retained-state limit");
+      }
+      stateBytes += entry.cacheBytes;
+      seen.add(candidate);
+      queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
     };
 
+    try {
+      push(this.peel(oid));
+      const boundary = this.shallow();
+      while (queue.size > 0) {
+        const next = queue.pop()!;
+        yield { oid: next.oid, commit: next.commit };
+        if (boundary.has(next.oid)) continue;
+        for (const parent of next.commit.parent) push(parent);
+      }
+    } finally {
+      fill.flush();
+    }
+  }
+
+  /** Fully validated indexed graph walk used by large and unbounded logs. */
+  *walkIndexed(
+    oid: string,
+    limits: CommitGraphLimits = {},
+  ): Generator<{ oid: string; commit: Commit }> {
+    const root = this.peel(oid);
     const boundary = this.shallow();
-    push(this.peel(oid));
-    while (queue.length > 0) {
-      const next = queue.shift()!;
-      yield next;
+    const entries = new Map<string, CommitCacheEntry>();
+    let stateBytes = 0;
+    const maxBytes = Math.min(limits.maxBytes ?? MAX_LOG_STATE_BYTES, MAX_LOG_STATE_BYTES);
+    const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
+    for (const entry of this.store.commitGraph(root, limits)) {
+      if (entries.has(entry.oid)) throw new CorruptError("commit graph yielded a duplicate oid");
+      if (entries.size >= maxCommits) {
+        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+      }
+      if (stateBytes + entry.cacheBytes > maxBytes) {
+        throw new GitError("E2BIG", "commit graph exceeds the 32 MiB retained-state limit");
+      }
+      stateBytes += entry.cacheBytes;
+      entries.set(entry.oid, entry);
+    }
+    if (!entries.has(root)) {
+      throw new GitError(
+        "E2BIG",
+        "commit graph cache is incomplete; reindex or reclone the repository",
+      );
+    }
+    this.#validateCommitGraph(root, entries, boundary, true);
+
+    const seen = new Set<string>();
+    const queue = new CommitHeap();
+    let sequence = 0;
+    const push = (candidate: string): void => {
+      if (seen.has(candidate)) return;
+      const entry = entries.get(candidate);
+      if (entry === undefined) throw new CorruptError("commit graph is missing a parent row");
+      seen.add(candidate);
+      queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
+    };
+    push(root);
+    while (queue.size > 0) {
+      const next = queue.pop()!;
+      yield { oid: next.oid, commit: next.commit };
       if (boundary.has(next.oid)) continue;
       for (const parent of next.commit.parent) push(parent);
+    }
+  }
+
+  /** Validate only edges present in a bounded point walk; the depth frontier is intentional. */
+  validateCommitWalk(entries: readonly { oid: string; commit: Commit }[]): void {
+    const indexed = new Map<string, { commit: Commit }>();
+    for (const entry of entries) {
+      if (indexed.has(entry.oid)) throw new CorruptError("commit walk yielded a duplicate oid");
+      indexed.set(entry.oid, { commit: entry.commit });
+    }
+    const root = entries[0]?.oid;
+    if (root === undefined) return;
+    this.#validateCommitGraph(root, indexed, this.shallow(), false);
+  }
+
+  #validateCommitGraph(
+    root: string,
+    entries: ReadonlyMap<string, { commit: Commit }>,
+    boundary: ReadonlySet<string>,
+    requireComplete: boolean,
+  ): void {
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const stack: { oid: string; parent: number }[] = [{ oid: root, parent: 0 }];
+    visiting.add(root);
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1]!;
+      const entry = entries.get(frame.oid);
+      if (entry === undefined) throw new CorruptError("commit graph is missing a commit row");
+      const parents = boundary.has(frame.oid) ? [] : entry.commit.parent;
+      if (frame.parent >= parents.length) {
+        stack.pop();
+        visiting.delete(frame.oid);
+        visited.add(frame.oid);
+        continue;
+      }
+      const parent = parents[frame.parent++]!;
+      if (!entries.has(parent)) {
+        if (requireComplete) throw new CorruptError("commit graph is missing a parent row");
+        continue;
+      }
+      if (visiting.has(parent)) throw new CorruptError("commit graph contains a cycle");
+      if (visited.has(parent)) continue;
+      visiting.add(parent);
+      stack.push({ oid: parent, parent: 0 });
+    }
+    if (requireComplete && visited.size !== entries.size) {
+      throw new CorruptError("commit graph has unreachable rows");
     }
   }
 

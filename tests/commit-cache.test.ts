@@ -5,10 +5,14 @@ import { GitError } from "../src/core/errors.js";
 import { type Commit, hashObject, parseCommit, serializeCommit } from "../src/core/objects.js";
 import {
   commitCacheBytes,
+  commitGraphBytes,
   indexCommitSource,
   MAX_COMMIT_CACHE_BYTES,
   MAX_INDEXED_COMMIT_BYTES,
+  MAX_LOG_COMMITS,
+  MAX_LOG_STATE_BYTES,
   prepareCommitCache,
+  WALK_COMMIT_GRAPH_SQL,
 } from "../src/sqlite/commits.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -17,6 +21,7 @@ import { TestDatabase } from "./helpers/db.js";
 class MeasuredDatabase implements SqlDatabase {
   widestStringBytes = 0;
   widestCommitRows = 0;
+  widestResultBlob = 0;
   commitStatements = 0;
   readonly #encoder = new TextEncoder();
 
@@ -62,9 +67,16 @@ class MeasuredDatabase implements SqlDatabase {
     return this.inner.scalar<T>(query, ...bindings);
   }
 
-  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
     this.#measure(query, bindings);
-    return this.inner.iterate(query, ...bindings);
+    for (const row of this.inner.iterate(query, ...bindings)) {
+      for (const value of Object.values(row)) {
+        if (value instanceof Uint8Array && value.byteLength > this.widestResultBlob) {
+          this.widestResultBlob = value.byteLength;
+        }
+      }
+      yield row;
+    }
   }
 
   transactionSync<T>(closure: () => T): T {
@@ -103,6 +115,19 @@ function chunks(data: Uint8Array, width: number): () => Iterable<Uint8Array> {
   return function* () {
     for (let at = 0; at < data.length; at += width) yield data.subarray(at, at + width);
   };
+}
+
+function commitChain(store: ReturnType<typeof open>, count: number): string[] {
+  return store.writeObjects((batch) => {
+    const oids: string[] = [];
+    for (let index = 0; index < count; index++) {
+      const commit = fixture(`commit ${index}\n`);
+      commit.parent = oids.length === 0 ? [] : [oids[oids.length - 1]!];
+      commit.committer.timestamp = index;
+      oids.push(batch.write("commit", serializeCommit(commit)));
+    }
+    return oids;
+  });
 }
 
 describe("parsed commit cache", () => {
@@ -166,9 +191,23 @@ describe("parsed commit cache", () => {
     expect(entry.cacheBytes).toBeLessThanOrEqual(MAX_COMMIT_CACHE_BYTES);
   });
 
+  it("charges the documented fixed graph slots before payload and parents", () => {
+    const commit: Commit = {
+      tree: "1".repeat(40),
+      parent: [],
+      author: { name: "", email: "", timestamp: 0, timezoneOffset: 0 },
+      committer: { name: "", email: "", timestamp: 0, timezoneOffset: 0 },
+      message: "",
+    };
+
+    expect(commitCacheBytes(commit)).toBe(592);
+    expect(commitGraphBytes(commit)).toBe(596);
+  });
+
   it("round-trips NUL in every arbitrary text projection field", () => {
     const store = open();
     const commit = fixture("message\0tail\n");
+    commit.parent = [];
     commit.author.name = "Au\0thor";
     commit.author.email = "author\0@example.test";
     commit.committer.name = "Com\0mitter";
@@ -179,6 +218,7 @@ describe("parsed commit cache", () => {
     const oid = store.write("commit", data);
 
     expect(store.cachedCommit(oid)?.commit).toEqual(parsed);
+    expect([...store.commitGraph(oid)][0]?.commit).toEqual(parsed);
     expect(
       store.db.one(
         `SELECT typeof(author_name) AS author_name,
@@ -435,5 +475,174 @@ describe("parsed commit cache", () => {
     store.destroy();
 
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
+  });
+
+  it("walks one source-validated graph cursor without object payload reads", () => {
+    const db = new TestDatabase();
+    const store = open(db);
+    const oids = commitChain(store, 4);
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+
+    const entries = [...store.commitGraph(oids[3]!)];
+
+    expect(new Set(entries.map((entry) => entry.oid))).toEqual(new Set(oids));
+    expect(db.storage.statementCount).toBe(1);
+    expect([...db.storage.histogram.keys()].join("\n")).not.toContain("git_object_chunks");
+    expect(entries[3]?.commit).toEqual(store.cachedCommit(entries[3]!.oid)?.commit);
+  });
+
+  it("enforces the absolute count with an injected 3/4 negative control", () => {
+    const db = new TestDatabase();
+    const store = open(db);
+    const oids = commitChain(store, 4);
+    expect(MAX_LOG_COMMITS).toBe(50_000);
+
+    db.storage.resetCounters();
+    expect(() => [...store.commitGraph(oids[3]!, { maxCommits: 3 })]).toThrow(/50000 commit limit/);
+    expect(db.storage.statementCount).toBe(1);
+    expect([...store.commitGraph(oids[3]!, { maxCommits: 4 })]).toHaveLength(4);
+  });
+
+  it("accepts the exact graph-byte boundary and rejects one byte less", () => {
+    const store = open();
+    const oid = commitChain(store, 1)[0]!;
+    const commit = store.cachedCommit(oid)!.commit;
+    const bytes = commitGraphBytes(commit);
+
+    expect([...store.commitGraph(oid, { maxBytes: bytes })]).toHaveLength(1);
+    expect(() => [...store.commitGraph(oid, { maxBytes: bytes - 1 })]).toThrow(
+      /32 MiB retained-state limit/,
+    );
+  });
+
+  it("rejects understated oversized payload metadata without returning its BLOB", () => {
+    const inner = new TestDatabase();
+    const db = new MeasuredDatabase(inner);
+    const store = open(db);
+    const oid = commitChain(store, 1)[0]!;
+    store.db.run(
+      "UPDATE git_commits SET message = zeroblob(?) WHERE repo_id = ? AND oid = ?",
+      20 * 1024 * 1024,
+      1,
+      oid,
+    );
+    db.widestResultBlob = 0;
+
+    expect(() => [...store.commitGraph(oid)]).toThrow(/32 MiB retained-state limit/);
+    expect(db.widestResultBlob).toBe(0);
+  });
+
+  it("accepts the largest practical graph below 32 MiB and rejects its next row", () => {
+    const store = open();
+    let parent: string | undefined;
+    let accepted: string | undefined;
+    let rejected: string | undefined;
+    let bytes = 0;
+    for (let index = 0; rejected === undefined; index++) {
+      const commit = fixture(`${"m".repeat(500_000)}${index}\n`);
+      commit.parent = parent === undefined ? [] : [parent];
+      commit.committer.timestamp = index;
+      const oid = store.write("commit", serializeCommit(commit));
+      const cached = store.cachedCommit(oid);
+      if (cached === null) throw new Error("large graph cache row is missing");
+      bytes += commitGraphBytes(cached.commit);
+      if (bytes <= MAX_LOG_STATE_BYTES) accepted = oid;
+      else rejected = oid;
+      parent = oid;
+    }
+    if (accepted === undefined) throw new Error("large graph has no accepted root");
+    if (rejected === undefined) throw new Error("large graph has no rejected root");
+
+    expect([...store.commitGraph(accepted)]).not.toHaveLength(0);
+    expect(() => [...store.commitGraph(rejected)]).toThrow(/32 MiB retained-state limit/);
+  }, 30_000);
+
+  it("stops at shallow commits before requiring their parents", () => {
+    const store = open();
+    const [parent, root] = commitChain(store, 2);
+    store.setShallow([root!]);
+    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, parent);
+    store.db.run("DELETE FROM git_objects WHERE repo_id = ? AND oid = ?", 1, parent);
+
+    expect([...store.commitGraph(root!)]).toHaveLength(1);
+  });
+
+  it("fails an incomplete cache before returning a graph row", () => {
+    const store = open();
+    const [parent, root] = commitChain(store, 2);
+    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, parent);
+    const walk = store.commitGraph(root!)[Symbol.iterator]();
+
+    expect(() => walk.next()).toThrow(/reindex or reclone/);
+  });
+
+  it("fails a corrupt tail row before returning the valid root", () => {
+    const store = open();
+    const [parent, root] = commitChain(store, 2);
+    store.db.run(
+      "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
+      1,
+      parent,
+    );
+    const walk = store.commitGraph(root!)[Symbol.iterator]();
+
+    expect(() => walk.next()).toThrow(/cache is corrupt/);
+  });
+
+  it("leaves graph cycles to fail-closed Repository validation", () => {
+    const store = open();
+    const [parent, root] = commitChain(store, 2);
+    const changed = fixture("commit 0\n");
+    changed.parent = [root!];
+    changed.committer.timestamp = 0;
+    store.db.run(
+      "UPDATE git_commits SET parents = ?, cache_bytes = ? WHERE repo_id = ? AND oid = ?",
+      JSON.stringify(changed.parent),
+      commitCacheBytes(changed),
+      1,
+      parent,
+    );
+
+    expect([...store.commitGraph(root!)]).toHaveLength(2);
+  });
+
+  it("uses primary-key graph lookups without an outer sort", () => {
+    const store = open();
+    const oid = commitChain(store, 1)[0]!;
+    const plan = store.db
+      .all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN ${WALK_COMMIT_GRAPH_SQL}`,
+        1,
+        oid,
+        50_000,
+        32 * 1024 * 1024,
+        32 * 1024 * 1024,
+        1024 * 1024,
+        512,
+        64,
+      )
+      .map((row) => row.detail)
+      .join("\n");
+
+    expect(plan).toMatch(/SEARCH c USING PRIMARY KEY \(repo_id=\? AND oid=\?\)/);
+    expect(plan).not.toMatch(/USE TEMP B-TREE FOR ORDER BY/);
+    expect(plan).not.toContain("git_object_chunks");
+  });
+
+  it("isolates identical commit graphs and shallow boundaries by repository", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const first = database.open(database.create("/first", "ref: refs/heads/main"));
+    const second = database.open(database.create("/second", "ref: refs/heads/main"));
+    const firstOids = commitChain(first, 2);
+    const secondOids = commitChain(second, 2);
+    expect(firstOids).toEqual(secondOids);
+    const root = firstOids[1];
+    if (root === undefined) throw new Error("isolated graph root is missing");
+    first.setShallow([root]);
+
+    expect([...first.commitGraph(root)]).toHaveLength(1);
+    expect([...second.commitGraph(root)]).toHaveLength(2);
   });
 });

@@ -2,7 +2,14 @@
 // `rev-parse`, `ls-tree`, `ls-files` and `cat-file`.
 
 import { ObjectNotFoundError, RefNotFoundError } from "../errors.js";
-import { displayMode, isTreeMode, type ObjectType, type Person, typeForMode } from "../objects.js";
+import {
+  type Commit,
+  displayMode,
+  isTreeMode,
+  type ObjectType,
+  type Person,
+  typeForMode,
+} from "../objects.js";
 import type { Repository } from "../repository.js";
 
 /** Matches `CommitView` on Computer's GitClient surface. */
@@ -23,8 +30,7 @@ export interface TreeEntryView {
   type: "blob" | "tree" | "commit";
 }
 
-export function commitView(repo: Repository, oid: string): CommitView {
-  const commit = repo.readCommit(oid);
+function parsedCommitView(oid: string, commit: Commit): CommitView {
   return {
     oid,
     message: commit.message,
@@ -35,6 +41,10 @@ export function commitView(repo: Repository, oid: string): CommitView {
   };
 }
 
+export function commitView(repo: Repository, oid: string): CommitView {
+  return parsedCommitView(oid, repo.readCommit(oid));
+}
+
 export function log(
   repo: Repository,
   options: { ref?: string; depth?: number } = {},
@@ -43,16 +53,19 @@ export function log(
     repo.head().oid !== null || options.ref !== undefined ? (options.ref ?? "HEAD") : null;
   if (start === null) return [];
   const oid = repo.revParse(start);
+  const bounded = options.depth !== undefined && options.depth <= 256;
+  if (bounded) {
+    const collected: { oid: string; commit: Commit }[] = [];
+    for (const entry of repo.walk(oid)) {
+      collected.push(entry);
+      if (options.depth !== undefined && collected.length >= options.depth) break;
+    }
+    repo.validateCommitWalk(collected);
+    return collected.map(({ oid: commitOid, commit }) => parsedCommitView(commitOid, commit));
+  }
   const out: CommitView[] = [];
-  for (const { oid: commitOid, commit } of repo.walk(oid)) {
-    out.push({
-      oid: commitOid,
-      message: commit.message,
-      tree: commit.tree,
-      parent: commit.parent,
-      author: commit.author,
-      committer: commit.committer,
-    });
+  for (const { oid: commitOid, commit } of repo.walkIndexed(oid)) {
+    out.push(parsedCommitView(commitOid, commit));
     if (options.depth !== undefined && out.length >= options.depth) break;
   }
   return out;

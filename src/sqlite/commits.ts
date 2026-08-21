@@ -5,8 +5,11 @@ import { readBlob, type SqlDatabase } from "./db.js";
 
 export const MAX_INDEXED_COMMIT_BYTES = 1024 * 1024;
 export const MAX_COMMIT_CACHE_BYTES = 4 * 1024 * 1024;
+export const MAX_LOG_COMMITS = 50_000;
+export const MAX_LOG_STATE_BYTES = 32 * 1024 * 1024;
 const COMMIT_BATCH_ROWS = 2048;
 const COMMIT_BATCH_JSON_BYTES = 1024 * 1024;
+/** Commit wrappers plus graph map, set, heap, DFS and result slots. */
 const COMMIT_FIXED_CACHE_BYTES = 512;
 const COMMIT_PARENT_CACHE_BYTES = 64;
 const JSON_ENCODER = new TextEncoder();
@@ -69,6 +72,177 @@ interface CommitCacheRow {
   cache_bytes: unknown;
 }
 
+interface CommitGraphRow extends CommitCacheRow {
+  kind: unknown;
+  error_code: unknown;
+  error: unknown;
+  oid: unknown;
+}
+
+export interface CommitGraphLimits {
+  /** Test seam. Production callers cannot raise the absolute ceiling. */
+  maxCommits?: number;
+  /** Test seam. Production callers cannot raise the retained-state ceiling. */
+  maxBytes?: number;
+}
+
+const COMMIT_GRAPH_COLUMNS = `NULL AS parents, NULL AS tree,
+  NULL AS author_name, NULL AS author_email, NULL AS author_time, NULL AS author_timezone,
+  NULL AS committer_name, NULL AS committer_email,
+  NULL AS committer_time, NULL AS committer_timezone,
+  NULL AS message, NULL AS gpgsig, NULL AS object_size, NULL AS cache_bytes`;
+
+/** One recursive graph cursor. Payload columns are projected only after every bound passes. */
+export const WALK_COMMIT_GRAPH_SQL = `WITH RECURSIVE
+  params(repo_id, root_oid, count_cap, byte_cap, cache_cap, parent_cap,
+         fixed_bytes, parent_bytes)
+    AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
+  reachable(oid) AS (
+    SELECT root_oid FROM params
+    UNION
+    SELECT parent.value
+      FROM reachable r
+      JOIN params p
+      JOIN git_commits c ON c.repo_id = p.repo_id AND c.oid = r.oid
+      JOIN json_each(
+        CASE WHEN typeof(c.parents) != 'text' THEN '[]'
+             WHEN length(CAST(c.parents AS BLOB)) > p.parent_cap THEN '[]'
+             WHEN NOT json_valid(c.parents) THEN '[]'
+             WHEN json_type(c.parents) != 'array' THEN '[]'
+             ELSE c.parents END
+      ) parent
+     WHERE NOT EXISTS (
+       SELECT 1 FROM git_shallow s WHERE s.repo_id = p.repo_id AND s.oid = r.oid
+     )
+       AND parent.type = 'text'
+       AND length(parent.value) = 40
+       AND parent.value NOT GLOB '*[^0-9a-f]*'
+     LIMIT (SELECT count_cap + 1 FROM params)
+  ),
+  metadata AS MATERIALIZED (
+    SELECT r.oid,
+           c.oid IS NOT NULL AS cached,
+           EXISTS (
+             SELECT 1 FROM git_objects o
+              WHERE o.repo_id = p.repo_id AND o.oid = r.oid AND o.type = 'commit'
+             UNION ALL
+             SELECT 1 FROM git_pack_objects o
+               JOIN git_pack_meta m ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
+              WHERE o.repo_id = p.repo_id AND o.oid = r.oid AND o.type = 'commit'
+                AND m.state = 'complete'
+           ) AS commit_source,
+           c.oid IS NOT NULL
+             AND length(c.oid) = 40 AND c.oid NOT GLOB '*[^0-9a-f]*'
+             AND CASE WHEN typeof(c.parents) != 'text' THEN 0
+                      WHEN length(CAST(c.parents AS BLOB)) > p.parent_cap THEN 0
+                      WHEN NOT json_valid(c.parents) THEN 0
+                      WHEN json_type(c.parents) != 'array' THEN 0 ELSE 1 END
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(
+                 CASE WHEN typeof(c.parents) != 'text' THEN '[]'
+                      WHEN length(CAST(c.parents AS BLOB)) > p.parent_cap THEN '[]'
+                      WHEN NOT json_valid(c.parents) THEN '[]'
+                      WHEN json_type(c.parents) != 'array' THEN '[]'
+                      ELSE c.parents END
+               ) parent
+                WHERE parent.type != 'text' OR length(parent.value) != 40
+                   OR parent.value GLOB '*[^0-9a-f]*'
+             )
+             AND typeof(c.tree) = 'text' AND length(c.tree) = 40
+             AND c.tree NOT GLOB '*[^0-9a-f]*'
+             AND typeof(c.author_name) = 'blob' AND typeof(c.author_email) = 'blob'
+             AND typeof(c.committer_name) = 'blob' AND typeof(c.committer_email) = 'blob'
+             AND typeof(c.message) = 'blob'
+             AND (c.gpgsig IS NULL OR typeof(c.gpgsig) = 'blob')
+             AND typeof(c.author_time) = 'integer'
+             AND c.author_time BETWEEN -9007199254740991 AND 9007199254740991
+             AND typeof(c.author_timezone) = 'integer'
+             AND c.author_timezone BETWEEN -9007199254740991 AND 9007199254740991
+             AND typeof(c.committer_time) = 'integer'
+             AND c.committer_time BETWEEN -9007199254740991 AND 9007199254740991
+             AND typeof(c.committer_timezone) = 'integer'
+             AND c.committer_timezone BETWEEN -9007199254740991 AND 9007199254740991
+             AND typeof(c.object_size) = 'integer'
+             AND c.object_size BETWEEN 0 AND 1048576
+             AND typeof(c.cache_bytes) = 'integer'
+             AND c.cache_bytes BETWEEN 0 AND p.cache_cap
+             AND (
+               EXISTS (
+                 SELECT 1 FROM git_objects o
+                  WHERE o.repo_id = p.repo_id AND o.oid = r.oid
+                    AND o.type = 'commit' AND o.size = c.object_size
+               ) OR EXISTS (
+                 SELECT 1 FROM git_pack_objects o
+                   JOIN git_pack_meta m
+                     ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
+                  WHERE o.repo_id = p.repo_id AND o.oid = r.oid
+                    AND o.type = 'commit' AND o.size = c.object_size
+                    AND m.state = 'complete'
+               )
+             ) AS valid,
+           CASE WHEN c.oid IS NULL THEN p.byte_cap + 1
+                WHEN typeof(c.parents) != 'text' THEN p.byte_cap + 1
+                WHEN length(CAST(c.parents AS BLOB)) > p.parent_cap THEN p.byte_cap + 1
+                WHEN NOT json_valid(c.parents) THEN p.byte_cap + 1
+                WHEN json_type(c.parents) != 'array' THEN p.byte_cap + 1 ELSE
+             min(
+               p.byte_cap + 1,
+               p.fixed_bytes
+               + 2 * (length(CAST(c.tree AS BLOB)) + length(CAST(c.parents AS BLOB))
+                 + length(c.author_name) + length(c.author_email)
+                 + length(c.committer_name) + length(c.committer_email)
+                 + length(c.message) + COALESCE(length(c.gpgsig), 0))
+               + p.parent_bytes * COALESCE(json_array_length(c.parents), 0)
+             )
+           END AS actual_bytes
+      FROM reachable r
+      CROSS JOIN params p
+      LEFT JOIN git_commits c ON c.repo_id = p.repo_id AND c.oid = r.oid
+  ),
+  summary AS (
+    SELECT count(*) AS rows,
+           COALESCE(sum(actual_bytes), 0) AS bytes,
+           COALESCE(sum(CASE WHEN cached = 0 AND commit_source != 0 THEN 1 ELSE 0 END), 0)
+             AS incomplete,
+           COALESCE(sum(CASE WHEN cached = 0 AND commit_source = 0 THEN 1 ELSE 0 END), 0)
+             AS missing,
+           COALESCE(sum(CASE WHEN cached != 0 AND valid = 0 THEN 1 ELSE 0 END), 0)
+             AS invalid
+      FROM metadata
+  ),
+  verdict AS (
+    SELECT CASE
+      WHEN rows > p.count_cap THEN 'E2BIG'
+      WHEN incomplete > 0 THEN 'E2BIG'
+      WHEN missing > 0 OR invalid > 0 THEN 'ECORRUPT'
+      WHEN bytes > p.byte_cap THEN 'E2BIG'
+      ELSE NULL
+    END AS error_code,
+    CASE
+      WHEN rows > p.count_cap THEN 'commit graph exceeds the 50000 commit limit'
+      WHEN incomplete > 0 THEN 'commit graph cache is incomplete; reindex or reclone the repository'
+      WHEN missing > 0 THEN 'commit graph references a missing commit source'
+      WHEN invalid > 0 THEN 'commit graph cache is corrupt'
+      WHEN bytes > p.byte_cap THEN 'commit graph exceeds the 32 MiB retained-state limit'
+      ELSE NULL
+    END AS error
+    FROM summary CROSS JOIN params p
+  )
+SELECT 'error' AS kind, verdict.error_code, verdict.error, NULL AS oid,
+       ${COMMIT_GRAPH_COLUMNS}
+  FROM verdict WHERE verdict.error_code IS NOT NULL
+UNION ALL
+SELECT 'commit' AS kind, NULL AS error_code, NULL AS error, c.oid,
+       c.parents, c.tree,
+       c.author_name, c.author_email, c.author_time, c.author_timezone,
+       c.committer_name, c.committer_email, c.committer_time, c.committer_timezone,
+       c.message, c.gpgsig, c.object_size, c.cache_bytes
+  FROM verdict
+  CROSS JOIN params p
+  CROSS JOIN reachable r
+  JOIN git_commits c ON c.repo_id = p.repo_id AND c.oid = r.oid
+ WHERE verdict.error_code IS NULL`;
+
 function stringsBytes(commit: Commit): number {
   let codeUnits =
     commit.tree.length +
@@ -88,6 +262,22 @@ export function commitCacheBytes(commit: Commit): number {
     COMMIT_FIXED_CACHE_BYTES +
     stringsBytes(commit) +
     commit.parent.length * COMMIT_PARENT_CACHE_BYTES
+  );
+}
+
+/** SQL-computable upper bound for the same graph row, including UTF-8 expansion. */
+export function commitGraphBytes(commit: Commit): number {
+  const textBytes =
+    JSON_ENCODER.encode(commit.tree).byteLength +
+    JSON_ENCODER.encode(JSON.stringify(commit.parent)).byteLength +
+    JSON_ENCODER.encode(commit.author.name).byteLength +
+    JSON_ENCODER.encode(commit.author.email).byteLength +
+    JSON_ENCODER.encode(commit.committer.name).byteLength +
+    JSON_ENCODER.encode(commit.committer.email).byteLength +
+    JSON_ENCODER.encode(commit.message).byteLength +
+    (commit.gpgsig === undefined ? 0 : JSON_ENCODER.encode(commit.gpgsig).byteLength);
+  return (
+    COMMIT_FIXED_CACHE_BYTES + 2 * textBytes + commit.parent.length * COMMIT_PARENT_CACHE_BYTES
   );
 }
 
@@ -168,6 +358,71 @@ function decodeCommitCacheRow(repoId: number, oid: string, row: CommitCacheRow):
     throw new CorruptError("commit cache has invalid byte charge");
   }
   return immutableCacheEntry(repoId, oid, commit, objectSize, cacheBytes);
+}
+
+function boundedLimit(value: number | undefined, ceiling: number, name: string): number {
+  const selected = value ?? ceiling;
+  if (!Number.isSafeInteger(selected) || selected < 1) {
+    throw new RangeError(`${name} must be a positive safe integer`);
+  }
+  return Math.min(selected, ceiling);
+}
+
+/** Stream validated parsed commits reachable from one root without reading object payloads. */
+export function* readCommitGraph(
+  db: SqlDatabase,
+  repoId: number,
+  rootOid: string,
+  limits: CommitGraphLimits = {},
+): Generator<CommitCacheEntry> {
+  if (!Number.isSafeInteger(repoId) || repoId < 1) {
+    throw new CorruptError("commit graph has an invalid repository id");
+  }
+  if (!isOid(rootOid)) throw new CorruptError("commit graph has an invalid root oid");
+  const maxCommits = boundedLimit(limits.maxCommits, MAX_LOG_COMMITS, "commit graph count limit");
+  const maxBytes = boundedLimit(limits.maxBytes, MAX_LOG_STATE_BYTES, "commit graph byte limit");
+  for (const value of db.iterate(
+    WALK_COMMIT_GRAPH_SQL,
+    repoId,
+    rootOid,
+    maxCommits,
+    maxBytes,
+    MAX_LOG_STATE_BYTES,
+    MAX_INDEXED_COMMIT_BYTES,
+    COMMIT_FIXED_CACHE_BYTES,
+    COMMIT_PARENT_CACHE_BYTES,
+  )) {
+    const row: CommitGraphRow = {
+      kind: value.kind,
+      error_code: value.error_code,
+      error: value.error,
+      oid: value.oid,
+      parents: value.parents,
+      tree: value.tree,
+      author_name: value.author_name,
+      author_email: value.author_email,
+      author_time: value.author_time,
+      author_timezone: value.author_timezone,
+      committer_name: value.committer_name,
+      committer_email: value.committer_email,
+      committer_time: value.committer_time,
+      committer_timezone: value.committer_timezone,
+      message: value.message,
+      gpgsig: value.gpgsig,
+      object_size: value.object_size,
+      cache_bytes: value.cache_bytes,
+    };
+    if (row.kind === "error") {
+      if (typeof row.error_code !== "string" || typeof row.error !== "string") {
+        throw new CorruptError("commit graph yielded an invalid error row");
+      }
+      throw new GitError(row.error_code, row.error);
+    }
+    if (row.kind !== "commit" || typeof row.oid !== "string" || !isOid(row.oid)) {
+      throw new CorruptError("commit graph yielded an invalid commit row");
+    }
+    yield decodeCommitCacheRow(repoId, row.oid, row);
+  }
 }
 
 function validateCommitNumbers(commit: Commit): void {
