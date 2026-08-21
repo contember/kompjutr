@@ -116,6 +116,44 @@ describe("the predicate is not used where it would be wrong", () => {
   });
 });
 
+describe("the modes that reached the fast path later", () => {
+  it("rg -c agrees with itself, since it omits the zero rows", () => {
+    // `grep -c` cannot use the predicate — it prints a row per file
+    // searched, zeros included — but rg lists only matches, which is
+    // exactly what the predicate returns.
+    const fast = shell.run("rg -c NEEDLE /repo").stdout;
+    const slow = shell.run("rg -c '[N]EEDLE' /repo").stdout;
+    expect(fast).toBe(slow);
+    expect(fast).not.toContain(":0");
+  });
+
+  it("rg skips a walked binary file on both paths", () => {
+    fs.writeFiles([
+      { path: "/repo/bin.dat", bytes: new Uint8Array([78, 69, 69, 68, 76, 69, 0, 9]) },
+    ]);
+    const fast = shell.run("rg -l NEEDLE /repo").stdout;
+    const slow = shell.run("rg -l '[N]EEDLE' /repo").stdout;
+    expect(fast).toBe(slow);
+    expect(fast).not.toContain("bin.dat");
+    // grep, whose walk reports them, sees it on both paths too.
+    expect(shell.run("grep -rl NEEDLE /repo").stdout).toContain("bin.dat");
+    expect(shell.run("grep -rl '[N]EEDLE' /repo").stdout).toContain("bin.dat");
+  });
+
+  it("grep -L takes the slow path and still agrees", () => {
+    // The complement of a predicate that returns matches is not something
+    // the predicate can answer, so this always walks. The answer is what
+    // has to match.
+    const [fast, slow] = bothWays("-rL", "NEEDLE");
+    expect(fast).toBe(slow);
+    expect(fast.split("\n").filter(Boolean).sort()).toEqual([
+      "/repo/b.ts",
+      "/repo/dotted.ts",
+      "/repo/upper.ts",
+    ]);
+  });
+});
+
 describe("the case the database cannot decide", () => {
   it("finds a needle straddling a chunk boundary", () => {
     // `instr` sees one chunk at a time and would answer "no". The file comes

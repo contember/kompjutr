@@ -2,9 +2,10 @@
 
 A bash-shaped command surface owned by kompjutr, over `Filesystem`.
 
-> **Status: waves A–C shipped**, as `kompjutr/shell`. §11 records what the
-> measurements changed. Two of this document's claims were wrong and are
-> corrected in place; the rest held.
+> **Status: waves A–D shipped**, as `kompjutr/shell`. §11 records what the
+> measurements changed, §12 the SQL content predicate that came after them,
+> and §13 what running the real `grep` and `rg` corrected. Several of this
+> document's claims were wrong and are fixed in place; the rest held.
 
 ## The thesis
 
