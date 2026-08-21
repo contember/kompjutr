@@ -18,7 +18,7 @@
 import type { RealPath, RegularFileHandle } from "../../fs/types.js";
 import { type ByteStream, decode, encode, firstNul, lines, NEWLINE } from "../exec/bytes.js";
 import type { BoundedFs } from "../exec/context.js";
-import { compileIncludeGlob } from "../exec/glob.js";
+import { compileIncludeGlob, GLOB_PATTERN_MAX_BYTES } from "../exec/glob.js";
 
 export interface SearchRequest {
   readonly pattern: RegExp;
@@ -293,7 +293,7 @@ function narrowing(root: RealPath, include: readonly string[]): string {
   const tail = /[^*?[\]]*$/.exec(only)?.[0] ?? "";
   if (tail === "") return "*";
   const candidate = `${root === "/" ? "" : root}/*${tail}`;
-  return new TextEncoder().encode(candidate).length > 50 ? "*" : candidate;
+  return new TextEncoder().encode(candidate).length > GLOB_PATTERN_MAX_BYTES ? "*" : candidate;
 }
 
 function accepted(

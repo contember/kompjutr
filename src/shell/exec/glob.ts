@@ -5,8 +5,9 @@
 // return `/repo/a/b.ts`. So a SQL GLOB is used to *narrow* — it is always a
 // superset — and the exact answer is decided in JS.
 
-/** The platform's ceiling on a GLOB pattern, from `src/fs/store/scan.ts`. */
-export const GLOB_PATTERN_MAX_BYTES = 50;
+import { GLOB_PATTERN_MAX_BYTES } from "../../fs/store/scan.js";
+
+export { GLOB_PATTERN_MAX_BYTES };
 
 interface Matcher {
   test(path: string): boolean;
@@ -18,7 +19,7 @@ interface Matcher {
  * common in the corpus.
  */
 export function compileGlob(pattern: string): Matcher {
-  return { test: buildRegExp(pattern, false) };
+  return { test: buildRegExp(pattern) };
 }
 
 /**
@@ -27,9 +28,8 @@ export function compileGlob(pattern: string): Matcher {
  * both grep and rg do, and it is why `--include='*.ts'` finds nested files.
  */
 export function compileIncludeGlob(pattern: string): Matcher {
-  const anchored = pattern.includes("/");
-  const test = buildRegExp(pattern, anchored);
-  if (!anchored) {
+  const test = buildRegExp(pattern);
+  if (!pattern.includes("/")) {
     return {
       test: (path: string) => test(path.slice(path.lastIndexOf("/") + 1)),
     };
@@ -37,7 +37,7 @@ export function compileIncludeGlob(pattern: string): Matcher {
   return { test };
 }
 
-function buildRegExp(pattern: string, allowLeadingSlash: boolean): (value: string) => boolean {
+function buildRegExp(pattern: string): (value: string) => boolean {
   let source = "";
   let index = 0;
   while (index < pattern.length) {
@@ -76,8 +76,7 @@ function buildRegExp(pattern: string, allowLeadingSlash: boolean): (value: strin
     source += escapeLiteral(char);
     index++;
   }
-  const prefix = allowLeadingSlash ? "" : "";
-  const regexp = new RegExp(`^${prefix}${source}$`, "u");
+  const regexp = new RegExp(`^${source}$`, "u");
   return (value: string) => regexp.test(value);
 }
 
