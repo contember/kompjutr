@@ -1,5 +1,9 @@
 # Benchmark reference
 
+> Historical snapshot. This document records the pre-standalone Computer
+> comparison that informed the runtime design. The current benchmark harness is
+> standalone-only and does not reproduce the baseline column.
+
 The comparison target and the measurement rules come from an earlier experiment
 that optimised DOFS *underneath* Computer's isomorphic-git client
 (`perf/nextjs-macro-benchmark`). Its report is the baseline this package has to

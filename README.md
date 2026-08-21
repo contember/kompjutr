@@ -1,86 +1,111 @@
 # kompjutr
 
-An experimental replacement for `@cloudflare/computer/git` that keeps the git
-repository in the Durable Object's SQLite database and the working tree in
-DOFS — with no `.git` directory anywhere.
+`kompjutr` is a standalone filesystem and Git runtime for Cloudflare Durable
+Objects. The working tree, Git objects, refs, index, and received packs all live
+in the Durable Object's SQLite database. No `.git` directory or external
+filesystem runtime is required.
 
-Computer's shipped git client runs `isomorphic-git` over a filesystem
-adapter:
+```ts
+import { createGit, Workspace } from "kompjutr";
 
+export function createWorkspace(ctx: DurableObjectState): Workspace {
+  return new Workspace({
+    storage: ctx.storage,
+    git: createGit(),
+    defaultGitIdentity: {
+      name: "Workspace agent",
+      email: "agent@example.com",
+    },
+  });
+}
 ```
-isomorphic-git → filesystem API → @platformatic/vfs → DOFS → SQLite
+
+The workspace exposes:
+
+- `workspace.fs`: a Node-style synchronous filesystem facade.
+- `workspace.filesystem`: the raw bounded filesystem API.
+- `workspace.git`: the lazily created Git client.
+- `workspace.db`: the shared Durable Object SQLite adapter.
+- `workspace.exec()`: an optional seam for a future process host. No shell is
+  bundled.
+
+## Filesystem only
+
+The filesystem can be used without importing the Git runtime:
+
+```ts
+import { Database, createFilesystem, NodeFsCompat } from "kompjutr/fs";
+
+const db = new Database(ctx.storage);
+const filesystem = createFilesystem(db);
+const fs = new NodeFsCompat(filesystem);
+
+fs.mkdirSync("/src", { recursive: true });
+fs.writeFileSync("/src/index.ts", "export const value = 1;\n");
 ```
 
-This package replaces that with:
+## Git
 
-```
-git engine ├── git database → SQLite directly
-           └── working tree → DOFS
+The native client supports repository initialization, clone and fetch, status,
+staging, commit, log, diff, checkout, branches, tags, refs, config, remotes, and
+the plumbing operations exposed by `Git`. Unsupported commands fail with
+`EUNSUPPORTED` instead of falling back to another implementation.
+
+```ts
+await workspace.git.init({ dir: "/" });
+workspace.fs.writeFileSync("/README.md", "# project\n");
+await workspace.git.add({ paths: ["README.md"] });
+const commit = await workspace.git.commit({ message: "Initial commit" });
 ```
 
-It plugs in through the extension point Computer already exposes, so nothing
-in Computer has to change:
+## Compatibility
+
+Applications that still use `@cloudflare/computer` can opt into the migration
+adapter explicitly:
 
 ```ts
 import { Workspace } from "@cloudflare/computer";
-import { createSqliteGitClient } from "kompjutr";
+import { createSqliteGitClient } from "kompjutr/compat/computer";
 
-const ws = new Workspace({ storage: ctx.storage, git: createSqliteGitClient() });
+const workspace = new Workspace({
+  storage: ctx.storage,
+  git: createSqliteGitClient(),
+});
 ```
 
-## Why
+`@cloudflare/computer` is an optional peer dependency. It is not loaded by
+`kompjutr`, `kompjutr/fs`, `kompjutr/git`, or `kompjutr/testing`.
 
-Computer documents its `isomorphic-git` pack/index cache as unbounded: a
-workspace that clones a 1 GB repository holds the parsed pack in Durable
-Object memory. Every cache here is bounded in bytes, and received packs stay
-compressed in SQLite and are read one chunk at a time.
+## Resource model
 
-## Benchmarks
+The storage and traversal layers use byte-bounded caches, paged SQLite queries,
+bounded BLOB results, and fail-closed input limits. Received packs remain
+compressed in SQLite and are read in physical order. Tree walks use a parsed,
+source-qualified edge index and do not read object BLOBs.
 
-Both clients through one harness, on the fixtures the earlier DOFS experiment
-used. Prettier 3.9.6, 9,329 tracked files:
+The universal targets are at most 1,000 SQL statements and less than 100 MiB of
+operation memory. The repository has adversarial gates for these bounds. The
+wall target is below 0.1 seconds for operations touching at most 1,000 changed
+paths. This wall target is not yet met by full-repository `status` and
+`checkout`; they remain bounded by full tree, index, and filesystem scans.
 
-| Operation | `createGitClient()` | kompjutr |
-| --- | --- | --- |
-| `git.add --all` | 16.7 s, 2,550 MB peak | 4.8 s, 88 MB peak |
-| `git.commit` | 2.8 s, 59,433 statements | 0.25 s, 16,542 statements |
-| `git.diffSummary` | 2.9 s | 0.41 s |
-| `git.status` | 1.4 s | 1.3 s |
-
-`git.status` barely moves because 202,191 of its 202,234 statements are the
-working-tree walk through DOFS, which both clients share; only 41 are git.
-
-On the largest fixture, `vercel/next.js` at 24,252 files, `git.add --all` costs
-the shipped client 95 s and **6,634 MB**; it costs kompjutr 22 s and **190 MB**.
-A Durable Object gets 128 MB for the whole isolate.
-
-`docs/benchmark-macro.md` has the full tables and what does not carry from a
-`node:sqlite` harness into a Durable Object. `docs/benchmark-results.md` covers
-the synthetic memory sweep.
+See [the architecture](docs/architecture.md) for the storage model and current
+limits. The benchmark documents are historical design evidence from before the
+standalone runtime cut.
 
 ## Status
 
-Experimental. See `docs/` for the design notes and the phase plan.
+Experimental. The standalone API and compatibility adapter are tested, but the
+remaining wall-time gaps above still block a performance-complete release.
 
 ## Credits
 
-The pack-native object store is dgit's idea, and parts of the pack, pkt-line
-and object-codec layers are adapted from it directly — see the file headers
-and `LICENSE`. dgit is a git *server* on Durable Objects; this is a client,
-so the protocol side is ours, but the storage shape is theirs.
+The pack-native object store is based on ideas from dgit. Adapted files retain
+their source headers and license notices. Files ported from
+`@cloudflare/computer` are covered by `LICENSES/cloudflare-computer.txt`.
 
 ## License
 
-MIT, with one exception: `src/core/diff/` is a port of the xdiff library as it
-appears in git — its record-cleanup heuristic and indent-heuristic weights
-included — and is therefore **LGPL-2.1-or-later**, like the original. Nothing
-else in the package derives from it; the rest uses it as a library, which
-LGPL-2.1 section 6 permits.
-
-Matching `git diff` byte for byte is not reachable without that pipeline:
-where a change group lands inside a run of equal lines is decided by those
-heuristics, not by Myers. If the LGPL boundary is unwelcome in your build,
-swapping `src/core/diff/` for any unified-diff generator gives valid patches
-that simply place some hunks differently.
-
-See `LICENSE`, `src/core/diff/LICENSE`, and `LICENSES/LGPL-2.1.txt`.
+MIT, except `src/core/diff/`, which is a port of Git's xdiff implementation and
+is LGPL-2.1-or-later. See `LICENSE`, `src/core/diff/LICENSE`, and
+`LICENSES/LGPL-2.1.txt`.

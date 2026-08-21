@@ -1,8 +1,11 @@
 # Macro benchmark — kompjutr against the Computer report
 
+> Historical snapshot. These results predate the standalone `Workspace` cut.
+> The current benchmark harness runs only the native runtime; use this document
+> as design evidence, not as a current reproducible comparison.
+
 Measured 2026-08-20 on Linux 6.17, node 24.4, every run under `cpu-lease -n 2` —
-the lease width the reference experiment used. Reproduce with `npm run
-bench:macro`.
+the lease width the reference experiment used.
 
 The target is `docs/benchmark-reference.md`: an earlier experiment that
 optimised DOFS *underneath* Computer's isomorphic-git client. This suite

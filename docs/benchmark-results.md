@@ -1,8 +1,12 @@
 # Benchmark results
 
+> Historical snapshot. These measurements predate the standalone `Workspace`
+> cut and compare an adapter that is no longer the primary runtime. The current
+> benchmark command measures only the native backend.
+
 Measured 2026-08-20 on Linux 6.17, node 24.4, every run under `cpu-lease -n 4`.
 Files are 4,096 bytes. "flat" puts every file in one directory; "deep" fans out
-twenty per directory. Reproduce with `npm run bench`.
+twenty per directory.
 
 **This is `node:sqlite`, not Durable Object SQL.** The curves and the statement
 counts transfer. An absolute Durable Object ceiling does not, and nothing below

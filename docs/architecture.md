@@ -1,256 +1,170 @@
 # Architecture
 
-## The rule
+## Runtime boundary
 
-```
-git objects / refs / index  →  SQLite (the Durable Object database)
-working tree                →  DOFS
-```
+One `Workspace` owns one SQLite adapter. Its filesystem and Git client share
+that adapter:
 
-Never:
-
-```
-git objects → fake .git files → DOFS → SQLite
-```
-
-There is no `.git` directory. HEAD, refs, config, the index, loose objects and
-received packfiles are rows. The working tree is ordinary files.
-
-## Layers
-
-```
-        GitClient (Computer's interface)
-                    │
-        ┌───────────┴───────────┐
-        │                       │
-   Smart HTTP client      git commands
-        │                       │
-        └───────────┬───────────┘
-                    │
-                 Git core
-             ┌──────┴──────┐
-             │             │
-          GitStore      Worktree
-             │             │
-          SQLite         DOFS
+```text
+Workspace
+├── Database                         Durable Object SQLite adapter
+├── Filesystem                       raw synchronous filesystem
+│   └── NodeFsCompat                 Node-style facade
+├── Git                              lazy native client
+│   ├── command operations
+│   ├── repository and object store
+│   └── Smart HTTP client
+└── ProcessHost?                     optional exec seam, no bundled shell
 ```
 
-`src/core/` knows nothing about Computer. `src/sqlite/` is the store. Only
-`src/computer/` names Computer at all, and it holds three things:
-`createSqliteGitClient()`, `ComputerWorktree`, and the facade that maps the
-`GitClient` interface onto the op functions.
+The root package exports the native runtime. `kompjutr/fs` exposes the database
+and filesystem without Git. `kompjutr/git` exposes the native Git interface and
+factory. `kompjutr/compat/computer` is the only production entry point allowed
+to depend on `@cloudflare/computer`.
+
+## Filesystem
+
+The working tree is stored directly in Durable Object SQLite:
+
+```text
+fs_paths   canonical path, inode, revision
+fs_nodes   type, mode, size, timestamps, link count
+fs_chunks  bounded file-content chunks
+```
+
+Paths are resolved component by component. Symlink traversal preserves POSIX
+ordering, detects cycles, enforces a follow limit, and rejects oversized paths
+before constructing large prefix sets. Mutations update path, node, and chunk
+state in one synchronous transaction and bump one revision.
+
+Bulk operations are part of the public seam. Scans use keyset cursors. File
+discovery returns revision-bearing regular-file handles without following final
+symlinks. Handle reads revalidate the whole batch before exposing any BLOB, so a
+stale or corrupt handle cannot amplify a result or allocate from forged size
+metadata.
 
 ## Repository model
 
-A repository is a row:
+Several repositories can share one workspace. The nearest registered ancestor
+of a requested directory selects the repository. Nested repositories are
+excluded from parent working-tree scans.
 
-```sql
-CREATE TABLE git_repositories (
-  id   INTEGER PRIMARY KEY,
-  root TEXT NOT NULL UNIQUE,
-  head TEXT NOT NULL          -- "ref: refs/heads/main", or an oid when detached
-);
+Repository state is relational rather than a fake `.git` tree:
+
+- `git_repositories` stores the root and HEAD.
+- `git_refs`, `git_config`, and `git_shallow` store repository metadata.
+- `git_index` stores one row per path and stage.
+- `git_objects` and `git_object_chunks` store locally created objects.
+- `git_pack_*` stores received pack bytes and their index.
+- `git_tree_*` stores source-qualified parsed tree edges.
+- `git_commits` stores validated parsed commit projections.
+
+No operation depends on a `.git` directory.
+
+## Objects and packs
+
+Small loose objects are stored raw. Larger loose objects are zlib-compressed and
+chunked. A write hashes the exact bytes that become visible; streaming writes
+reject content that changes between the hash and storage passes.
+
+Incoming packs remain compressed. Pack ingestion is provisional:
+
+```text
+pending pack metadata
+  → bounded pack chunks
+  → object and delta index
+  → parsed tree and commit projections
+  → trailer and graph validation
+  → complete state and ref updates
 ```
 
-Several repositories can live in one workspace. A `cwd` resolves to the
-repository whose `root` is its nearest registered ancestor — the walk in
-`SqliteGitDatabase.find()`. `nestedRoots()` gives the inverse, so a working-tree
-walk stops at a nested repository. That is the one job the `.git` directory used
-to do for free.
+Only complete packs are readable. Interrupted or rejected ingest cannot move a
+ref. Packed object reads schedule compressed ranges in physical order, resolve
+delta chains iteratively, preserve packed-base precedence, and use
+provenance-qualified cache keys.
 
-`head` lives on the repository row rather than in `git_refs`, because HEAD is not
-a ref: it is the one piece of state that is always exactly one value.
+The modeled packed-read peak is below 100 MiB. It includes delta inputs and
+result, compressed rows, chunk and object caches, parser batches, and inflater
+headroom. Inputs that cannot fit the model fail before allocation.
 
-## Object database
+## Tree traversal
 
-Pack-native, following dgit. An incoming pack is written **verbatim and still
-compressed** into 1 MiB chunk rows and indexed:
+Tree objects are parsed when they become visible. The index records exact raw
+entry bytes, source identity, ordinal order, and cumulative queue accounting.
+A single recursive SQLite cursor performs a depth-first traversal through
+primary-key lookups. It does not read object BLOBs and has no outer sort.
 
-```
-oid → git_pack_objects → (pack_id, offset, data_off, data_len, base_oid)
-                       → read only the chunks that entry spans
-                       → inflate, then resolve the delta chain
-```
+The cursor accounts for every live queued row. Completed sibling state is
+reclaimed. A directory is expanded only when the exact conservative suffix plus
+the complete child group fits the 16 MiB traversal budget. The emitted path cap
+is 2,200 UTF-8 bytes. Both limits fail closed.
 
-Delta chains are walked through index lookups *first* — bounding the chain length
-and catching cycles before anything is inflated — then applied upward from the
-base, holding at most two inflated buffers at a time.
+Loose sources shadow packed sources. Parsed rows remain source-qualified, so a
+corrupt loose duplicate cannot borrow a valid packed projection and a packed
+delta base cannot accidentally resolve through an unrelated loose cache entry.
 
-Locally created objects start as loose rows (`git_objects` +
-`git_object_chunks`, zlib-deflated and chunked). A future repack can fold them
-into a pack; nothing depends on that happening.
+## Commits and log
 
-### Bounded memory
+New commit objects must produce a valid cache projection atomically with object
+visibility. Malformed, oversized, unsafe-numeric, or otherwise uncacheable new
+commits are rejected. The cache stores identities and messages as bytes so NUL
+and Unicode content round-trip exactly.
 
-Every cache is budgeted in **bytes**, never in entries and never proportional to
-repository size:
+Short bounded logs retain the lazy point-read path. Larger logs use one
+source-validated recursive graph cursor, validate the collected graph for
+cycles, then reproduce Git's stable timestamp order in bounded JavaScript
+state. Shallow boundaries and DAG convergence are handled explicitly.
 
-| Cache | Default | Holds |
-| --- | --- | --- |
-| pack chunk LRU | 4 MiB | still-compressed `git_pack_data` rows |
-| object LRU | 16 MiB | inflated objects, shared by loose and packed reads |
-| single entry admission | 2 MiB | an object larger than this is never cached |
-| buffered pack entry | 8 MiB | above this, an entry is streamed, never held |
+## Ordered operations
 
-An object too large to materialise is inflated incrementally and hashed as the
-bytes go past, so its id is known without ever holding it. That is the one place
-`node:zlib` cannot serve, because it cannot report how much of the input a
-finished stream consumed — pako's incremental `Inflate` can, and is used for
-exactly that.
+Tree, index, and filesystem sources use the same UTF-8/Git path order. Hot
+operations merge their streams instead of issuing scalar reads per path:
 
-### Ops read in streams, not in maps
+- `status` merges HEAD, one bounded index snapshot, and filesystem metadata.
+- `diff` batches unresolved working-tree hashes and loose or packed blob reads.
+- `checkout` batches removals, object reads, writes, and index mutations.
+- `add`, `reset`, and `commit` use bounded index and object sinks.
 
-Every op used to open its sources as maps and arrays: the HEAD tree, the target
-tree, the index, the working-tree walk. Four of them were live at once in
-`checkout`, three in `status` and in `diff`. Peak memory followed the number of
-tracked files, and it followed it several times over.
+`comparePaths` is the shared comparator. JavaScript string order is not valid
+because it compares UTF-16 code units rather than Git's byte order.
 
-All four sources are ordered by the same key. `git_index` has `(path, stage)` as
-its primary key and SQLite orders TEXT by UTF-8 bytes; git's tree order, where a
-subtree sorts as `name/`, makes a depth-first tree walk emit full paths in that
-same order; the working-tree walk sorts its siblings by the same rule. So they
-can be merged directly, one item of state per side:
+## Ignore matching
 
-| Op | Sources merged |
-| --- | --- |
-| `status` | HEAD tree x index x working tree |
-| `checkout` | target tree x index (blockers also join the HEAD tree) |
-| `add` | working tree x index x HEAD tree (for `commit -a`) |
-| `reset`, `diff` | tree x index, or tree x tree |
-| `commit` | the index alone, straight into the tree builder |
+Ignore files are discovered as regular-file handles, so a symlink named
+`.gitignore` is never followed. Loading is paged and fail-closed. Raw rules,
+file count, pattern count, compiled bytes, source index, and dynamic matcher work
+all have explicit caps.
 
-`comparePaths` is the one comparator all of them use. JavaScript's `<` is not
-it: `<` compares UTF-16 code units, so an astral code point sorts before U+E000
-by its leading surrogate, while its UTF-8 encoding sorts after. Getting that
-wrong would desynchronise a merge rather than merely misorder output.
+Patterns compile to byte-oriented deterministic matchers. Git wildmatch edge
+cases, UTF-8 byte semantics, malformed classes, escapes, and globstars are
+checked against real Git. Rule lookup uses a bounded exact source index and
+charges collision comparisons by bytes examined.
 
-The index is read through `RepoStore.indexScan()`, which pages on `(path,
-stage)` — on the path alone, a page boundary between stage 0 and stage 2 of one
-path silently drops a row. Writes go through `indexApply`, a sink that flushes
-in batches. A scan and a sink can run together as long as mutations stay at or
-behind the frontier the scan has already handed out, which is what every op here
-does.
+## Transactions and trust boundaries
 
-### What is still proportional to something
+`Database.transactionSync()` delegates every nesting level to Durable Object
+storage. It never emits SQL transaction statements, which the platform rejects.
+SQL cursors must be truly iterable; traversal never falls back to materializing
+`toArray()`.
 
-Nothing claims constant memory. The honest bound for an optimised op is:
+Every SQL row is untrusted. Numeric, text, BLOB, source, size, revision, ordinal,
+and cumulative fields are validated before use. Derived tree and commit rows are
+validated against an authoritative loose object or complete packed source.
 
-    O(page + widest live directory + output + largest single object)
+## Resource limits and open performance work
 
-- **page** — 512 index rows by default.
-- **widest live directory** — `readTree` and `readdir` each hand back one whole
-  directory. A flat tree of 10,000 entries is still 10,000 entries live. Fixing
-  that needs an incremental tree parser and a paged `readdir`, and neither
-  exists here.
-- **output** — `status` returns its rows, `diff` returns its patch. That is the
-  caller's data, not bookkeeping.
-- **largest single object** — a packed delta cannot be reconstructed without its
-  full base in memory. Loose objects stream through `readChunks`; packed ones
-  yield whole, and `readBlob` materialises either. Working-tree files above
-  512 KiB are hashed and stored through `writeStream` without ever being held;
-  below that they are read in one go, because streaming costs a second pass over
-  the content and buys nothing for a small file.
-- **`status` collapsing** — `-unormal` must know which directories hold
-  something tracked before it meets the first untracked file, and the answer can
-  lie later in path order. That set is bounded by directories, not by files.
+Operations have explicit statement, binding, BLOB-result, retained-state, and
+cache gates. The target is at most 1,000 SQL statements and less than 100 MiB for
+every accepted operation. Operations that exceed an accepted structural limit
+throw a stable error instead of truncating or continuing unbounded.
 
-## Crash safety
+The separate wall target is below 0.1 seconds for operations touching at most
+1,000 changed paths. Full-repository `status` and `checkout` do not yet meet it:
+even when only 1,000 paths changed, exact semantics still traverse the full HEAD
+tree, index, and working tree, and checkout must perform physical writes. These
+are current release blockers, not hidden exceptions.
 
-Network ingest is provisional until the whole pack is proven:
-
-```
-insert git_pack_meta with state='pending'
-  → stream chunks, hashing all but the trailing 20 bytes
-  → verify the trailer
-  → index every entry, drain deferred deltas
-  → mark the pack 'complete'
-  → move refs, in one transactionSync
-```
-
-Reads only see complete packs. An interrupted fetch leaves every existing ref
-valid and one pending pack, which the next ingest reclaims. A clone that fails
-removes its own repository row, because the destination had none before the call.
-
-Local atomic changes go through `Database.transactionSync()`. Computer's wrapper
-reserves transaction handling for that method — a bare `BEGIN` would open a
-transaction its resolve cache cannot see.
-
-## Index
-
-Git's *logical* index, not the `.git/index` binary format:
-
-```sql
-CREATE TABLE git_index (
-  repo_id INTEGER NOT NULL,
-  path    TEXT NOT NULL,
-  stage   INTEGER NOT NULL,
-  mode    INTEGER NOT NULL,
-  oid     TEXT NOT NULL,
-  size    INTEGER,        -- working-tree facts recorded when the entry
-  mtime   INTEGER,        -- was written, so status can skip re-hashing
-  ino     INTEGER,
-  PRIMARY KEY (repo_id, path, stage)
-);
-```
-
-This is the point of the whole experiment. Computer's `git.commit` exhausts the
-isolate memory between 535 and 985 tracked files because isomorphic-git
-materialises the entire index; optimising DOFS underneath did not move that
-ceiling (see `benchmark-reference.md`). A row per path is never materialised
-whole.
-
-`size` / `mtime` / `ino` are a DOFS-shaped optimisation, deliberately kept out of
-the generic core API: `indexMatchesStat()` consumes them, and everything above it
-only knows that a path may or may not need re-hashing.
-
-## Worktree
-
-`Worktree` is a small synchronous interface — `stat`, `readFile`, `writeFile`,
-`readlink`, `symlink`, `readdir`, `mkdirp`, `unlink`, `rmdir`, `chmod`. Synchronous
-because status and checkout walk thousands of paths, and the DOFS provider already
-offers a synchronous surface.
-
-`ComputerWorktree` binds it to `SQLiteWorkspaceProvider` through the provider's
-**public** filesystem methods only. No reaching into `vfs_*` tables: correctness
-first, and a Computer-specific fast path for `status` is a later, measured
-decision — not a starting assumption.
-
-## Protocol
-
-Smart HTTP, protocol v0, client side. One round trip that ends in `done` serves
-both clone and incremental fetch: the server computes the common set from the
-`have`s it was given, so nothing needs multi-ack.
-
-Ingest is streaming end to end:
-
-```
-HTTP body → pkt-line reader → side-band demux → pack parser → SQLite chunks
-```
-
-The pkt-line reader never holds more than one frame. A full pack is never
-assembled into a single `Uint8Array`.
-
-The remote wire format is standard git. The local representation deliberately is
-not.
-
-## Known scaling limits
-
-Two are worth stating plainly, because neither is solved here.
-
-**Pack bytes sit in the Durable Object's SQLite.** `git_pack_data` chunk rows
-are charged against the per-object database, so total pack storage is capped by
-it. dgit hit the same wall from the server side and moved the pack bytes to R2
-in v0.0.2, keeping only the index in SQLite — pack storage stops being capped,
-and a cached clone streams from the Worker without loading the cell at all.
-The same split would work here: `git_pack_objects` is already the only table a
-read consults to locate an entry, so the bytes behind `readRaw` could come from
-an R2 mount instead of a chunk row without anything above it noticing. Out of
-scope for the first spike, and agent-scale workspaces are nowhere near the cap.
-
-**Object ids are hashed in JavaScript.** `Sha1` runs at roughly 200 MB/s, which
-is fine for the trailer and for locally created objects but is paid once per
-object during ingest. `crypto.subtle.digest("SHA-1", …)` is native and much
-quicker, and is byte-identical — dgit measured about 24x. It is async, so using
-it means threading a promise through the buffered-entry path in `#indexPack`.
-Worth doing when a clone benchmark says the hash is actually the cost; not
-worth doing blind.
+Other deliberate limits include the 2,200-byte emitted Git path cap, bounded
+commit projections, bounded ignore inputs, bounded protocol negotiation, and
+fail-closed oversized materialization. The package includes no shell. `RpcHost`
+is a declared future seam only.
