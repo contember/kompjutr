@@ -1,13 +1,14 @@
-// The v1 -> v2 git schema migration, and the filesystem schema's own DDL.
+// Git schema migrations, and the filesystem schema's own DDL.
 //
 // The migration matters because a workspace already running kompjutr as a
 // Computer plugin keeps its whole git repository through the switch. Only
 // the working tree is imported.
 
 import { describe, expect, it } from "vitest";
-
+import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { initializeFsSchema, ROOT_INODE } from "../src/fs/schema.js";
 import { initializeGitSchema, SCHEMA_VERSION } from "../src/sqlite/schema.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
 /** The v1 schema, as it shipped: no git_blob_ids, no git_commits, no `stored`. */
@@ -28,7 +29,7 @@ function columnsOf(db: TestDatabase, table: string): string[] {
 }
 
 describe("git schema", () => {
-  it("creates v2 on a fresh database", () => {
+  it("creates v3 on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -38,6 +39,34 @@ describe("git schema", () => {
     expect(columnsOf(db, "git_objects")).toContain("stored");
     expect(columnsOf(db, "git_blob_ids")).toEqual(["repo_id", "content_id", "oid"]);
     expect(columnsOf(db, "git_commits")).toEqual(["repo_id", "oid", "parents", "tree", "time"]);
+    expect(columnsOf(db, "git_tree_sources")).toEqual([
+      "repo_id",
+      "tree_oid",
+      "storage",
+      "source_id",
+      "object_size",
+      "entry_count",
+      "base_cost",
+    ]);
+    expect(columnsOf(db, "git_tree_entries")).toEqual([
+      "repo_id",
+      "tree_oid",
+      "storage",
+      "source_id",
+      "ordinal",
+      "mode",
+      "name",
+      "name_bytes",
+      "oid",
+      "raw_entry",
+      "cumulative_base",
+    ]);
+    expect(columnsOf(db, "git_tree_effective")).toEqual([
+      "repo_id",
+      "tree_oid",
+      "storage",
+      "source_id",
+    ]);
   });
 
   it("migrates a v1 database without touching its rows", () => {
@@ -55,7 +84,37 @@ describe("git schema", () => {
       // Existing rows inherit the default, which is what they were.
       stored: "zlib",
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("2");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("3");
+  });
+
+  it("creates empty parsed-tree tables when migrating v2", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("DROP TABLE git_tree_entries");
+    db.run("DROP TABLE git_tree_sources");
+    db.run("DROP TABLE git_tree_effective");
+    db.run("UPDATE git_meta SET value = '2' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("3");
+  });
+
+  it("fails an unmarked pre-v3 tree before yielding a path", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const oid = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "file", oid: "1".repeat(40) }]),
+    );
+    db.run("DELETE FROM git_tree_entries WHERE repo_id = 1 AND tree_oid = ?", oid);
+    db.run("DELETE FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?", oid);
+
+    const iterator = store.walkTree(oid);
+    expect(() => iterator.next()).toThrow(/reimport or reclone/);
   });
 
   it("is idempotent", () => {

@@ -50,6 +50,7 @@ import {
 } from "../core/ops/staging.js";
 import { clean as cleanOp, status as statusOp } from "../core/ops/status.js";
 import type { Repository } from "../core/repository.js";
+import { iterateSqlCursor, type SqlDatabase } from "../sqlite/db.js";
 import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
 import { ComputerWorktree } from "./worktree.js";
 
@@ -244,8 +245,29 @@ function buildContext(
   options: CreateSqliteGitClientOptions,
   defaultIdentity: GitIdentity | undefined,
 ): GitContext {
+  const computerDb = provider.db;
+  const db: SqlDatabase = {
+    run(query, ...bindings) {
+      computerDb.run(query, ...bindings);
+    },
+    all(query, ...bindings) {
+      return computerDb.all(query, ...bindings);
+    },
+    one(query, ...bindings) {
+      return computerDb.one(query, ...bindings);
+    },
+    scalar(query, ...bindings) {
+      return computerDb.scalar(query, ...bindings);
+    },
+    iterate(query, ...bindings) {
+      return iterateSqlCursor(computerDb.sql.exec(query, ...bindings));
+    },
+    transactionSync(closure) {
+      return computerDb.transactionSync(closure);
+    },
+  };
   const context: GitContext = {
-    database: new SqliteGitDatabase(provider.db, options),
+    database: new SqliteGitDatabase(db, options),
     worktree: new ComputerWorktree(provider),
     now: options.now ?? Date.now,
     timezoneOffset: options.timezoneOffset ?? (() => 0),

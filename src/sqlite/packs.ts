@@ -18,8 +18,9 @@ import {
 } from "../core/objects.js";
 import { applyDelta } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
-import { InflateStream, inflatePrefix } from "../core/zlib.js";
+import { InflateStream } from "../core/zlib.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
+import { indexTreeSource, indexTreeSources, type TreeSourceInput } from "./schema.js";
 
 /** Bytes per `git_pack_data` row. Comfortably under the DO row limit. */
 export const PACK_CHUNK = 1024 * 1024;
@@ -30,7 +31,7 @@ export const PACK_CHUNK = 1024 * 1024;
  * cycle-checked by a seen-set, so this bounds chain *length* rather than
  * guarding stack depth — which means it can be generous without risk.
  */
-const MAX_DELTA_DEPTH = 50_000;
+export const MAX_DELTA_DEPTH = 50_000;
 
 /** Recent (offset -> oid) pairs kept in memory for ofs-delta bases. */
 const OFFSET_WINDOW = 100_000;
@@ -42,11 +43,36 @@ export interface PackCacheOptions {
   maxBufferedEntry?: number;
   /** Largest object admitted to the shared object cache. */
   cacheEntryLimit?: number;
+  /** Test seam; production uses `MAX_DELTA_DEPTH`. */
+  maxDeltaDepth?: number;
 }
 
 const DEFAULT_CHUNK_BYTES = 4 * PACK_CHUNK;
 const DEFAULT_MAX_BUFFERED_ENTRY = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_LIMIT = 2 * 1024 * 1024;
+const DELTA_WORKING_BYTES = 48 * 1024 * 1024;
+const PACK_READ_BYTES = 1024 * 1024;
+const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
+const PACK_OBJECT_CACHE_RESERVE_BYTES = 16 * 1024 * 1024;
+const PACK_TREE_BATCH_BYTES = 1024 * 1024;
+const PACK_TREE_BATCH_SOURCES = 2048;
+
+// Delta buffers, one compressed row, both caches, the parsed-tree sink and
+// inflater headroom peak below 100 MiB even when their stores do not overlap.
+const PACK_MEMORY_MODEL_BYTES =
+  DELTA_WORKING_BYTES +
+  PACK_READ_BYTES +
+  DEFAULT_CHUNK_BYTES +
+  PACK_OBJECT_CACHE_RESERVE_BYTES +
+  PACK_TREE_BATCH_BYTES +
+  PACK_INFLATE_HEADROOM_BYTES;
+if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
+  throw new Error("pack memory model exceeds 100 MiB");
+}
+
+function packObjectKey(packId: number, oid: string): string {
+  return `pack:${packId}:${oid}`;
+}
 
 export interface PackedEntry {
   oid: string;
@@ -95,8 +121,68 @@ export type ExternalResolver = (oid: string) => RawObject | null;
  * checksum. A sender that pads beyond this still works — the read window
  * grows and retries — but this bound gets the common case in one pass.
  */
-function compressedBound(size: number): number {
-  return size + 5 * Math.ceil((size + 1) / 65535) + 64;
+function checkDeltaWorkingSet(base: Uint8Array, delta: Uint8Array): void {
+  let at = 0;
+  const varint = (): number => {
+    let value = 0;
+    let shift = 0;
+    let byte: number;
+    do {
+      if (at >= delta.length) throw new CorruptError("delta truncated");
+      byte = delta[at++]!;
+      value += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (shift > 56) throw new CorruptError("delta size is invalid");
+    } while ((byte & 0x80) !== 0);
+    return value;
+  };
+  const sourceSize = varint();
+  const targetSize = varint();
+  if (sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
+  if (base.length + delta.length + targetSize > DELTA_WORKING_BYTES) {
+    throw new CorruptError("delta working set exceeds 48 MiB");
+  }
+}
+
+function checkDeltaInflateBudget(base: Uint8Array, deltaSize: number): void {
+  if (
+    !Number.isSafeInteger(deltaSize) ||
+    deltaSize < 0 ||
+    base.length + deltaSize > DELTA_WORKING_BYTES
+  ) {
+    throw new CorruptError("delta input exceeds the bounded working set");
+  }
+}
+
+/** Parsed pack trees pending a bounded, transactional index flush. */
+class PackTreeIndex {
+  readonly #sources: TreeSourceInput[] = [];
+  #bytes = 0;
+
+  constructor(private readonly db: SqlDatabase) {}
+
+  add(source: TreeSourceInput, bufferedBytes: number): void {
+    if (
+      this.#sources.length > 0 &&
+      (this.#sources.length >= PACK_TREE_BATCH_SOURCES ||
+        this.#bytes + bufferedBytes > PACK_TREE_BATCH_BYTES)
+    ) {
+      this.flush();
+    }
+    if (bufferedBytes > PACK_TREE_BATCH_BYTES) {
+      this.db.transactionSync(() => indexTreeSource(this.db, source, source.chunks));
+      return;
+    }
+    this.#sources.push(source);
+    this.#bytes += bufferedBytes;
+  }
+
+  flush(): void {
+    if (this.#sources.length === 0) return;
+    this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
+    this.#sources.length = 0;
+    this.#bytes = 0;
+  }
 }
 
 export class PackStore {
@@ -107,6 +193,7 @@ export class PackStore {
   readonly #chunks: ByteLru<string, Uint8Array>;
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
+  readonly #maxDeltaDepth: number;
 
   constructor(
     db: SqlDatabase,
@@ -119,9 +206,20 @@ export class PackStore {
     this.#repoId = repoId;
     this.#external = external;
     this.#objects = objects;
-    this.#chunks = new ByteLru(options.chunkBytes ?? DEFAULT_CHUNK_BYTES, (c) => c.length);
-    this.#maxBufferedEntry = options.maxBufferedEntry ?? DEFAULT_MAX_BUFFERED_ENTRY;
+    this.#chunks = new ByteLru(
+      Math.min(options.chunkBytes ?? DEFAULT_CHUNK_BYTES, DEFAULT_CHUNK_BYTES),
+      (c) => c.length,
+    );
+    this.#maxBufferedEntry = Math.min(
+      options.maxBufferedEntry ?? DEFAULT_MAX_BUFFERED_ENTRY,
+      DEFAULT_MAX_BUFFERED_ENTRY,
+    );
     this.#cacheEntryLimit = options.cacheEntryLimit ?? DEFAULT_CACHE_ENTRY_LIMIT;
+    const maxDeltaDepth = options.maxDeltaDepth ?? MAX_DELTA_DEPTH;
+    if (!Number.isFinite(maxDeltaDepth) || !Number.isInteger(maxDeltaDepth) || maxDeltaDepth < 0) {
+      throw new RangeError("maxDeltaDepth must be a finite non-negative integer");
+    }
+    this.#maxDeltaDepth = Math.min(maxDeltaDepth, MAX_DELTA_DEPTH);
   }
 
   /** Bytes the chunk cache currently holds. */
@@ -193,11 +291,10 @@ export class PackStore {
    * most two inflated buffers at a time.
    */
   read(oid: string): RawObject | null {
-    const cached = this.#objects.get(oid);
-    if (cached !== undefined) return cached;
-
     const first = this.lookup(oid);
     if (first === null) return null;
+    const cached = this.#objects.get(packObjectKey(first.packId, oid));
+    if (cached !== undefined) return cached;
 
     const chain: PackedEntry[] = [];
     const seen = new Set<string>();
@@ -208,17 +305,13 @@ export class PackStore {
       seen.add(current.oid);
       if (current.baseOid === null) {
         base = { type: current.type, data: this.#inflateEntry(current) };
+        this.#cacheObject(current.packId, current.oid, base);
         break;
       }
-      if (chain.length >= MAX_DELTA_DEPTH) {
-        throw new CorruptError(`delta chain deeper than ${MAX_DELTA_DEPTH} at ${oid}`);
+      if (chain.length >= this.#maxDeltaDepth) {
+        throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
       }
       chain.push(current);
-      const cachedBase = this.#objects.get(current.baseOid);
-      if (cachedBase !== undefined) {
-        base = cachedBase;
-        break;
-      }
       const next = this.lookup(current.baseOid);
       if (next === null) {
         const external = this.#external(current.baseOid);
@@ -228,33 +321,98 @@ export class PackStore {
         base = external;
         break;
       }
+      const cachedBase = this.#objects.get(packObjectKey(next.packId, next.oid));
+      if (cachedBase !== undefined) {
+        base = cachedBase;
+        break;
+      }
       current = next;
     }
 
     let object = base;
     for (let i = chain.length - 1; i >= 0; i--) {
       const entry = chain[i]!;
+      checkDeltaInflateBudget(object.data, entry.entrySize);
       const delta = this.#inflateEntry(entry);
+      checkDeltaWorkingSet(object.data, delta);
       object = { type: base.type, data: applyDelta(object.data, delta) };
-      this.#cacheObject(entry.oid, object);
+      this.#cacheObject(entry.packId, entry.oid, object);
     }
-    if (chain.length === 0) this.#cacheObject(oid, object);
+    if (chain.length === 0) this.#cacheObject(first.packId, oid, object);
     return object;
   }
 
-  #cacheObject(oid: string, object: RawObject): void {
-    if (object.data.length <= this.#cacheEntryLimit) this.#objects.set(oid, object);
+  #cacheObject(packId: number, oid: string, object: RawObject): void {
+    if (object.data.length <= this.#cacheEntryLimit) {
+      this.#objects.set(packObjectKey(packId, oid), object);
+    }
   }
 
   /** Inflate one indexed entry, whose compressed length is already known. */
   #inflateEntry(entry: PackedEntry): Uint8Array {
-    const result = inflatePrefix(this.readRaw(entry.packId, entry.dataOff, entry.dataLen));
-    if (result === null) throw new CorruptError(`truncated pack entry at ${entry.offset}`);
-    return result.data;
+    return this.#inflateStoredEntry(
+      entry.packId,
+      entry.dataOff,
+      entry.dataLen,
+      entry.entrySize,
+      `pack entry at ${entry.offset}`,
+    );
+  }
+
+  #inflateStoredEntry(
+    packId: number,
+    dataOff: number,
+    dataLen: number,
+    expectedSize: number,
+    label: string,
+  ): Uint8Array {
+    if (
+      !Number.isSafeInteger(dataLen) ||
+      !Number.isSafeInteger(expectedSize) ||
+      dataLen < 0 ||
+      expectedSize < 0 ||
+      expectedSize > DELTA_WORKING_BYTES
+    ) {
+      throw new CorruptError(`${label} exceeds the bounded inflate limit`);
+    }
+    const result = new Uint8Array(expectedSize);
+    let produced = 0;
+    const stream = new InflateStream((chunk) => {
+      if (chunk.length > expectedSize - produced) {
+        throw new CorruptError(`${label} exceeds its indexed size`);
+      }
+      result.set(chunk, produced);
+      produced += chunk.length;
+    });
+    let consumed = 0;
+    while (!stream.ended && consumed < dataLen) {
+      const length = Math.min(PACK_READ_BYTES, dataLen - consumed);
+      const input = this.readRaw(packId, dataOff + consumed, length);
+      const used = stream.push(input);
+      consumed += used;
+      if (!stream.ended && used !== input.length) {
+        throw new CorruptError(`${label} inflater stopped before the stream ended`);
+      }
+    }
+    if (!stream.ended || consumed !== dataLen || produced !== expectedSize) {
+      throw new CorruptError(`${label} size does not match its index metadata`);
+    }
+    return result;
   }
 
   /** Still-compressed bytes of a pack region, assembled from chunk rows. */
   readRaw(packId: number, offset: number, length: number): Uint8Array {
+    if (
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(length) ||
+      offset < 0 ||
+      length < 0 ||
+      length > PACK_READ_BYTES ||
+      !Number.isSafeInteger(offset + length)
+    ) {
+      throw new CorruptError("pack read exceeds the bounded region limit");
+    }
+    if (length === 0) return new Uint8Array(0);
     const first = Math.floor(offset / PACK_CHUNK);
     const last = Math.floor((offset + length - 1) / PACK_CHUNK);
     if (first === last) {
@@ -321,6 +479,16 @@ export class PackStore {
   }
 
   #deletePack(packId: number): void {
+    this.#db.run(
+      "DELETE FROM git_tree_entries WHERE repo_id = ? AND storage = 'pack' AND source_id = ?",
+      this.#repoId,
+      packId,
+    );
+    this.#db.run(
+      "DELETE FROM git_tree_sources WHERE repo_id = ? AND storage = 'pack' AND source_id = ?",
+      this.#repoId,
+      packId,
+    );
     for (const table of [
       "git_pack_data",
       "git_pack_objects",
@@ -467,6 +635,7 @@ export class PackStore {
       throw new CorruptError(`unsupported pack version ${version}`);
 
     const offsets = new OffsetWindow();
+    const treeIndex = new PackTreeIndex(this.#db);
     const offsetToOid = (offset: number): string | null => {
       const hit = offsets.get(offset);
       if (hit !== null) return hit;
@@ -488,7 +657,7 @@ export class PackStore {
       if (header.kind === null) {
         const type = entryType!;
         const oid = entry.data === null ? entry.streamedOid! : hashObject(type, entry.data);
-        this.#insertObject([
+        const row: (string | number | null)[] = [
           oid,
           packId,
           header.offset,
@@ -498,19 +667,31 @@ export class PackStore {
           header.entrySize,
           header.entrySize,
           null,
-        ]);
+        ];
+        this.#insertResolved(
+          row,
+          packId,
+          oid,
+          type,
+          entry.data,
+          treeIndex,
+          header.dataOff,
+          entry.consumed,
+          header.entrySize,
+        );
         offsets.set(header.offset, oid);
-        if (entry.data !== null) this.#cacheObject(oid, { type, data: entry.data });
+        if (entry.data !== null) this.#cacheObject(packId, oid, { type, data: entry.data });
       } else {
         const baseOid =
           header.kind === "ref" ? header.baseOid! : offsetToOid(header.offset - header.baseDelta!);
         let resolved = false;
         if (entry.data !== null && baseOid !== null) {
-          const base = this.#objects.get(baseOid) ?? this.#readForBase(baseOid);
+          const base = this.#readForBase(baseOid);
           if (base !== null) {
+            checkDeltaWorkingSet(base.data, entry.data);
             const data = applyDelta(base.data, entry.data);
             const oid = hashObject(base.type, data);
-            this.#insertObject([
+            const row: (string | number | null)[] = [
               oid,
               packId,
               header.offset,
@@ -520,9 +701,20 @@ export class PackStore {
               data.length,
               header.entrySize,
               baseOid,
-            ]);
+            ];
+            this.#insertResolved(
+              row,
+              packId,
+              oid,
+              base.type,
+              data,
+              treeIndex,
+              header.dataOff,
+              entry.consumed,
+              data.length,
+            );
             offsets.set(header.offset, oid);
-            this.#cacheObject(oid, { type: base.type, data });
+            this.#cacheObject(packId, oid, { type: base.type, data });
             resolved = true;
           }
         }
@@ -551,20 +743,16 @@ export class PackStore {
     if (reader.position !== total - 20) {
       throw new CorruptError("pack has trailing data or a bad object count");
     }
-    await this.#drainPending(packId, offsets, offsetToOid, yieldNow);
+    await this.#drainPending(packId, offsets, offsetToOid, treeIndex, yieldNow);
+    treeIndex.flush();
     if (deferred > 0) say(`Resolved ${deferred} deferred delta(s)\n`);
     return count;
   }
 
   /** A base that lives in an already-indexed pack, loose storage, or another pack. */
   #readForBase(oid: string): RawObject | null {
-    try {
-      const packed = this.read(oid);
-      if (packed !== null) return packed;
-    } catch {
-      // A base that itself fails to resolve is treated as absent; the
-      // straggler pass retries once more of the pack is indexed.
-    }
+    const packed = this.read(oid);
+    if (packed !== null) return packed;
     return this.#external(oid);
   }
 
@@ -572,6 +760,7 @@ export class PackStore {
     packId: number,
     offsets: OffsetWindow,
     offsetToOid: (offset: number) => string | null,
+    treeIndex: PackTreeIndex,
     yieldNow: () => Promise<void>,
   ): Promise<void> {
     let remaining =
@@ -603,13 +792,20 @@ export class PackStore {
           const baseOid =
             row.base_oid ?? (row.base_offset === null ? null : offsetToOid(row.base_offset));
           if (baseOid === null) continue;
-          const base = this.#objects.get(baseOid) ?? this.#readForBase(baseOid);
+          const base = this.#readForBase(baseOid);
           if (base === null) continue;
-          const result = inflatePrefix(this.readRaw(packId, row.data_off, row.data_len));
-          if (result === null) throw new CorruptError(`truncated delta at ${row.offset}`);
-          const data = applyDelta(base.data, result.data);
+          checkDeltaInflateBudget(base.data, row.entry_size);
+          const delta = this.#inflateStoredEntry(
+            packId,
+            row.data_off,
+            row.data_len,
+            row.entry_size,
+            `delta at ${row.offset}`,
+          );
+          checkDeltaWorkingSet(base.data, delta);
+          const data = applyDelta(base.data, delta);
           const oid = hashObject(base.type, data);
-          this.#insertObject([
+          const objectRow: (string | number | null)[] = [
             oid,
             packId,
             row.offset,
@@ -619,7 +815,18 @@ export class PackStore {
             data.length,
             row.entry_size,
             baseOid,
-          ]);
+          ];
+          this.#insertResolved(
+            objectRow,
+            packId,
+            oid,
+            base.type,
+            data,
+            treeIndex,
+            row.data_off,
+            row.data_len,
+            data.length,
+          );
           this.#db.run(
             "DELETE FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset = ?",
             this.#repoId,
@@ -627,7 +834,7 @@ export class PackStore {
             row.offset,
           );
           offsets.set(row.offset, oid);
-          this.#cacheObject(oid, { type: base.type, data });
+          this.#cacheObject(packId, oid, { type: base.type, data });
           progressed++;
         }
         await yieldNow();
@@ -650,6 +857,72 @@ export class PackStore {
     );
   }
 
+  #insertResolved(
+    row: (string | number | null)[],
+    packId: number,
+    oid: string,
+    type: ObjectType,
+    data: Uint8Array | null,
+    treeIndex: PackTreeIndex,
+    dataOff: number,
+    dataLen: number,
+    objectSize: number,
+  ): void {
+    this.#db.transactionSync(() => this.#insertObject(row));
+    if (type !== "tree") return;
+    const chunks =
+      data === null ? this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize) : [data];
+    treeIndex.add(
+      {
+        repoId: this.#repoId,
+        treeOid: oid,
+        storage: "pack",
+        sourceId: packId,
+        objectSize,
+        chunks,
+      },
+      data?.length ?? objectSize,
+    );
+  }
+
+  /** Re-inflate a large full tree directly into the streaming parser. */
+  *#inflateEntryChunks(
+    packId: number,
+    dataOff: number,
+    dataLen: number,
+    expectedSize: number,
+  ): Generator<Uint8Array> {
+    if (
+      !Number.isSafeInteger(dataOff) ||
+      !Number.isSafeInteger(dataLen) ||
+      !Number.isSafeInteger(expectedSize) ||
+      dataOff < 0 ||
+      dataLen < 0 ||
+      expectedSize < 0 ||
+      !Number.isSafeInteger(dataOff + dataLen)
+    ) {
+      throw new CorruptError("packed tree has invalid size metadata");
+    }
+    const ready: Uint8Array[] = [];
+    const stream = new InflateStream((chunk) => ready.push(chunk));
+    let consumed = 0;
+    while (!stream.ended && consumed < dataLen) {
+      const length = Math.min(PACK_CHUNK, dataLen - consumed);
+      const input = this.readRaw(packId, dataOff + consumed, length);
+      const used = stream.push(input);
+      consumed += used;
+      for (const chunk of ready) yield chunk;
+      ready.length = 0;
+      if (!stream.ended && used !== input.length) {
+        throw new CorruptError("packed tree inflater stopped before the stream ended");
+      }
+    }
+    for (const chunk of ready) yield chunk;
+    if (!stream.ended || consumed !== dataLen || stream.inflated !== expectedSize) {
+      throw new CorruptError("packed tree size does not match its index metadata");
+    }
+  }
+
   /**
    * Inflate the entry whose compressed bytes start at `dataOff`. Small
    * entries come back whole; anything past the buffer limit is streamed,
@@ -661,30 +934,17 @@ export class PackStore {
     entrySize: number,
     type: ObjectType | null,
   ): { data: Uint8Array | null; consumed: number; streamedOid: string | null } {
-    if (entrySize <= this.#maxBufferedEntry) {
-      let width = Math.min(compressedBound(entrySize), reader.limit - dataOff);
-      for (;;) {
-        const result = inflatePrefix(this.readRaw(reader.packId, dataOff, width));
-        if (result !== null) {
-          if (result.data.length !== entrySize) {
-            throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
-          }
-          reader.seek(dataOff + result.consumed);
-          return { data: result.data, consumed: result.consumed, streamedOid: null };
-        }
-        if (dataOff + width >= reader.limit) {
-          throw new CorruptError(`truncated pack entry at ${dataOff}`);
-        }
-        width = Math.min(width * 2, reader.limit - dataOff);
-      }
-    }
-
-    // Oversized: never hold the object. A full entry still yields its oid
-    // because the hash is fed as the bytes go past; an oversized delta is
-    // deferred and buffered once, at resolution time.
+    const buffered = entrySize <= this.#maxBufferedEntry;
+    const chunks: Uint8Array[] = [];
+    let produced = 0;
     const sha = type === null ? null : new Sha1().update(objectHeader(type, entrySize));
     const stream = new InflateStream((chunk) => {
+      produced += chunk.length;
+      if (produced > entrySize) {
+        throw new CorruptError(`pack entry exceeds its declared size at ${dataOff}`);
+      }
       sha?.update(chunk);
+      if (buffered) chunks.push(chunk);
     });
     reader.seek(dataOff);
     let consumed = 0;
@@ -698,7 +958,11 @@ export class PackStore {
     if (stream.inflated !== entrySize) {
       throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
     }
-    return { data: null, consumed, streamedOid: sha === null ? null : toHex(sha.digest()) };
+    return {
+      data: buffered ? concat(chunks) : null,
+      consumed,
+      streamedOid: buffered || sha === null ? null : toHex(sha.digest()),
+    };
   }
 }
 

@@ -5,9 +5,13 @@
 // Every table except the registry carries `repo_id`, so one workspace can
 // hold several repositories side by side.
 
-import type { SqlDatabase } from "./db.js";
+import { CorruptError } from "../core/errors.js";
+import { parseTreeStream } from "../core/objects.js";
+import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+/** SQLite queue record, four integer fields, and bounded error fields. */
+export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
 const STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_meta (
@@ -164,9 +168,108 @@ const STATEMENTS = [
      base_offset INTEGER,
      PRIMARY KEY (repo_id, pack_id, offset)
    )`,
+
+  `CREATE TABLE IF NOT EXISTS git_tree_sources (
+     repo_id INTEGER NOT NULL,
+     tree_oid TEXT NOT NULL,
+     storage TEXT NOT NULL CHECK (storage IN ('loose', 'pack')),
+     source_id INTEGER NOT NULL,
+     object_size INTEGER NOT NULL,
+     entry_count INTEGER NOT NULL,
+     base_cost INTEGER NOT NULL,
+     PRIMARY KEY (repo_id, tree_oid, storage, source_id)
+   ) WITHOUT ROWID`,
+
+  `CREATE TABLE IF NOT EXISTS git_tree_entries (
+     repo_id INTEGER NOT NULL,
+     tree_oid TEXT NOT NULL,
+     storage TEXT NOT NULL,
+     source_id INTEGER NOT NULL,
+     ordinal INTEGER NOT NULL,
+     mode TEXT NOT NULL,
+     name TEXT COLLATE BINARY NOT NULL,
+     name_bytes BLOB NOT NULL,
+     oid TEXT NOT NULL,
+     raw_entry BLOB NOT NULL,
+     cumulative_base INTEGER NOT NULL,
+     PRIMARY KEY (repo_id, tree_oid, storage, source_id, ordinal),
+     FOREIGN KEY (repo_id, tree_oid, storage, source_id)
+       REFERENCES git_tree_sources (repo_id, tree_oid, storage, source_id)
+       ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+   ) WITHOUT ROWID`,
+
+  // The source selected for traversal. A loose object always shadows its
+  // packed copy, including while its parsed marker is missing or corrupt.
+  `CREATE TABLE IF NOT EXISTS git_tree_effective (
+     repo_id INTEGER NOT NULL,
+     tree_oid TEXT NOT NULL,
+     storage TEXT NOT NULL CHECK (storage IN ('loose', 'pack')),
+     source_id INTEGER NOT NULL,
+     PRIMARY KEY (repo_id, tree_oid)
+   ) WITHOUT ROWID`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_tree_effective_loose_insert
+   AFTER INSERT ON git_objects WHEN NEW.type = 'tree'
+   BEGIN
+     INSERT OR REPLACE INTO git_tree_effective
+       (repo_id, tree_oid, storage, source_id)
+     VALUES (NEW.repo_id, NEW.oid, 'loose', 0);
+   END`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_tree_effective_loose_delete
+   AFTER DELETE ON git_objects WHEN OLD.type = 'tree'
+   BEGIN
+     DELETE FROM git_tree_entries
+      WHERE repo_id = OLD.repo_id AND tree_oid = OLD.oid
+        AND storage = 'loose' AND source_id = 0;
+     DELETE FROM git_tree_sources
+      WHERE repo_id = OLD.repo_id AND tree_oid = OLD.oid
+        AND storage = 'loose' AND source_id = 0;
+     DELETE FROM git_tree_effective
+      WHERE repo_id = OLD.repo_id AND tree_oid = OLD.oid AND storage = 'loose';
+     INSERT OR REPLACE INTO git_tree_effective
+       (repo_id, tree_oid, storage, source_id)
+     SELECT o.repo_id, o.oid, 'pack', o.pack_id
+       FROM git_pack_objects o
+       JOIN git_pack_meta m
+         ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id AND m.state = 'complete'
+      WHERE o.repo_id = OLD.repo_id AND o.oid = OLD.oid AND o.type = 'tree';
+   END`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_tree_effective_pack_complete
+   AFTER UPDATE OF state ON git_pack_meta
+   WHEN NEW.state = 'complete' AND OLD.state != 'complete'
+   BEGIN
+     INSERT OR REPLACE INTO git_tree_effective
+       (repo_id, tree_oid, storage, source_id)
+     SELECT o.repo_id, o.oid, 'pack', o.pack_id
+       FROM git_pack_objects o
+      WHERE o.repo_id = NEW.repo_id AND o.pack_id = NEW.pack_id AND o.type = 'tree'
+        AND NOT EXISTS (
+          SELECT 1 FROM git_objects lo
+           WHERE lo.repo_id = o.repo_id AND lo.oid = o.oid AND lo.type = 'tree'
+        );
+   END`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_tree_effective_pack_delete
+   AFTER DELETE ON git_pack_meta WHEN OLD.state = 'complete'
+   BEGIN
+     DELETE FROM git_tree_effective
+      WHERE repo_id = OLD.repo_id AND storage = 'pack' AND source_id = OLD.pack_id;
+   END`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_tree_effective_pack_hide
+   AFTER UPDATE OF state ON git_pack_meta
+   WHEN OLD.state = 'complete' AND NEW.state != 'complete'
+   BEGIN
+     DELETE FROM git_tree_effective
+      WHERE repo_id = OLD.repo_id AND storage = 'pack' AND source_id = OLD.pack_id;
+   END`,
 ] as const;
 
 // v1 -> v2 added `git_blob_ids`, `git_commits` and `git_objects.stored`.
+// v3 adds parsed tree tables only. Existing tree objects remain deliberately
+// unmarked so reads fail with an explicit reimport/reclone requirement.
 // The first two are CREATE TABLE IF NOT EXISTS and need no migrator; the
 // column does, because IF NOT EXISTS will not alter a table that exists.
 function migrate(db: SqlDatabase, from: number): void {
@@ -194,4 +297,192 @@ export function initializeGitSchema(db: SqlDatabase): void {
       String(SCHEMA_VERSION),
     );
   });
+}
+
+export type TreeStorage = "loose" | "pack";
+
+export interface TreeSource {
+  repoId: number;
+  treeOid: string;
+  storage: TreeStorage;
+  sourceId: number;
+  objectSize: number;
+}
+
+interface PendingTreeEntry {
+  repoId: number;
+  treeOid: string;
+  storage: TreeStorage;
+  sourceId: number;
+  ordinal: number;
+  mode: string;
+  nameBytes: Uint8Array;
+  oid: string;
+  rawEntry: Uint8Array;
+  cumulativeBase: number;
+}
+
+export interface TreeSourceInput extends TreeSource {
+  chunks: Iterable<Uint8Array>;
+}
+
+const TREE_INDEX_ROWS = 2048;
+const TREE_INDEX_BYTES = 1024 * 1024;
+
+/** Write exact parsed-tree sources. The caller owns the transaction. */
+export function indexTreeSources(db: SqlDatabase, sources: Iterable<TreeSourceInput>): void {
+  let rows: PendingTreeEntry[] = [];
+  let bufferedBytes = 0;
+  const markers: {
+    p: number;
+    t: string;
+    s: TreeStorage;
+    x: number;
+    z: number;
+    n: number;
+    b: number;
+  }[] = [];
+  const flush = (): void => {
+    if (rows.length === 0) return;
+    const nameLength = rows.reduce((sum, row) => sum + row.nameBytes.length, 0);
+    const rawLength = rows.reduce((sum, row) => sum + row.rawEntry.length, 0);
+    const names = new Uint8Array(nameLength);
+    const rawEntries = new Uint8Array(rawLength);
+    let at = 0;
+    let rawAt = 0;
+    const json: {
+      p: number;
+      t: string;
+      s: TreeStorage;
+      x: number;
+      q: number;
+      m: string;
+      o: string;
+      a: number;
+      l: number;
+      r: number;
+      z: number;
+      c: number;
+    }[] = [];
+    for (const row of rows) {
+      names.set(row.nameBytes, at);
+      rawEntries.set(row.rawEntry, rawAt);
+      json.push({
+        p: row.repoId,
+        t: row.treeOid,
+        s: row.storage,
+        x: row.sourceId,
+        q: row.ordinal,
+        m: row.mode,
+        o: row.oid,
+        a: at + 1,
+        l: row.nameBytes.length,
+        r: rawAt + 1,
+        z: row.rawEntry.length,
+        c: row.cumulativeBase,
+      });
+      at += row.nameBytes.length;
+      rawAt += row.rawEntry.length;
+    }
+    db.run(
+      `INSERT INTO git_tree_entries
+         (repo_id, tree_oid, storage, source_id, ordinal, mode, name, name_bytes, oid,
+          raw_entry, cumulative_base)
+       SELECT json_extract(j.value, '$.p'), json_extract(j.value, '$.t'),
+              json_extract(j.value, '$.s'), json_extract(j.value, '$.x'),
+              json_extract(j.value, '$.q'), json_extract(j.value, '$.m'),
+              CAST(substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.l')) AS TEXT),
+              substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.l')),
+              json_extract(j.value, '$.o'),
+              substr(?, json_extract(j.value, '$.r'), json_extract(j.value, '$.z')),
+              json_extract(j.value, '$.c')
+         FROM json_each(?) j`,
+      blob(names),
+      blob(names),
+      blob(rawEntries),
+      JSON.stringify(json),
+    );
+    rows = [];
+    bufferedBytes = 0;
+  };
+
+  for (const source of sources) {
+    let count = 0;
+    let observedSize = 0;
+    let baseCost = 0;
+    for (const parsed of parseTreeStream(source.chunks)) {
+      const { entry, nameBytes, rawEntry } = parsed;
+      if (!/^(?:0?40000|100644|100755|120000|160000)$/.test(entry.mode)) {
+        throw new CorruptError(`invalid tree mode ${entry.mode}`);
+      }
+      if (entry.name === "" || entry.name.includes("/")) {
+        throw new CorruptError("invalid tree entry name");
+      }
+      const entryBytes = entry.mode.length + nameBytes.length + 22;
+      baseCost +=
+        TREE_QUEUE_ROW_FIXED_BYTES + nameBytes.length + entry.mode.length + entry.oid.length;
+      const bufferedEntry =
+        nameBytes.length + rawEntry.length + source.treeOid.length + entry.oid.length + 192;
+      if (
+        rows.length > 0 &&
+        (rows.length >= TREE_INDEX_ROWS || bufferedBytes + bufferedEntry > TREE_INDEX_BYTES)
+      ) {
+        flush();
+      }
+      if (bufferedEntry > TREE_INDEX_BYTES) {
+        throw new CorruptError("tree entry exceeds the index buffer limit");
+      }
+      rows.push({
+        repoId: source.repoId,
+        treeOid: source.treeOid,
+        storage: source.storage,
+        sourceId: source.sourceId,
+        ordinal: count,
+        mode: entry.mode,
+        nameBytes,
+        oid: entry.oid,
+        rawEntry,
+        cumulativeBase: baseCost,
+      });
+      bufferedBytes += bufferedEntry;
+      observedSize += entryBytes;
+      count++;
+    }
+    if (observedSize !== source.objectSize) {
+      throw new CorruptError(
+        `tree ${source.treeOid} parsed ${observedSize} bytes, expected ${source.objectSize}`,
+      );
+    }
+    markers.push({
+      p: source.repoId,
+      t: source.treeOid,
+      s: source.storage,
+      x: source.sourceId,
+      z: source.objectSize,
+      n: count,
+      b: baseCost,
+    });
+  }
+  flush();
+  for (let at = 0; at < markers.length; at += TREE_INDEX_ROWS) {
+    db.run(
+      `INSERT INTO git_tree_sources
+         (repo_id, tree_oid, storage, source_id, object_size, entry_count, base_cost)
+       SELECT json_extract(value, '$.p'), json_extract(value, '$.t'),
+              json_extract(value, '$.s'), json_extract(value, '$.x'),
+              json_extract(value, '$.z'), json_extract(value, '$.n'),
+              json_extract(value, '$.b')
+         FROM json_each(?)`,
+      JSON.stringify(markers.slice(at, at + TREE_INDEX_ROWS)),
+    );
+  }
+}
+
+/** Write one exact parsed-tree source. The caller owns the transaction. */
+export function indexTreeSource(
+  db: SqlDatabase,
+  source: TreeSource,
+  chunks: Iterable<Uint8Array>,
+): void {
+  indexTreeSources(db, [{ ...source, chunks }]);
 }

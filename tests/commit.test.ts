@@ -19,11 +19,9 @@ const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 
 /**
  * SQL statements one 2,000-file commit costs. Deterministic; see the scale
- * test. Four of them are index pages: the scan reads 512 rows at a time so
- * the index never exists as one array, which is three statements more than
- * the single unbounded read it replaced.
+ * test. The trees and commit share one bounded object batch.
  */
-const SCALE_STATEMENTS = 1020;
+const SCALE_STATEMENTS = 13;
 
 const fixtures: GitFixture[] = [];
 
@@ -426,8 +424,43 @@ describe("scale", () => {
 
     expect(workspace.repo.readCommit(ours).tree).toBe(fixture.git("rev-parse", "HEAD^{tree}"));
     expect(ours).toBe(theirs);
-    // Deterministic: 201 trees plus the commit, and nothing per tracked file
-    // beyond the four paged index reads.
+    // Deterministic: 201 trees and the commit share one bounded flush.
     expect(statements).toBe(SCALE_STATEMENTS);
+  });
+
+  it("commits 3,293 tree and commit objects within 15 statements", () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    const workspace = makeRepo("/");
+    useIdentity(workspace);
+
+    const path = `${Array.from({ length: 3291 }, () => "a").join("/")}/leaf.txt`;
+    const data = utf8.encode("leaf\n");
+    const blob = workspace.repo.store.write("blob", data);
+    workspace.repo.store.indexPut({
+      path,
+      stage: 0,
+      mode: 0o100644,
+      oid: blob,
+      size: data.length,
+      mtime: 0,
+      ino: 0,
+    });
+
+    fixture.write("leaf.txt", data);
+    const fixtureBlob = fixture.git("hash-object", "-w", "leaf.txt");
+    fixture.git("update-index", "--add", "--cacheinfo", "100644", fixtureBlob, path);
+    const expectedTree = fixture.git("write-tree");
+    const expectedCommit = fixture.git("commit-tree", expectedTree, "-m", "adversarial");
+
+    const before = workspace.repo.store.objectCount();
+    workspace.storage.resetCounters();
+    const oid = commit(workspace.context, workspace.repo, { message: "adversarial" }).oid;
+    const statements = workspace.storage.statementCount;
+
+    expect(workspace.repo.readCommit(oid).tree).toBe(expectedTree);
+    expect(oid).toBe(expectedCommit);
+    expect(workspace.repo.store.objectCount() - before).toBe(3293);
+    expect(statements).toBe(14);
   });
 });

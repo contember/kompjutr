@@ -4,14 +4,19 @@
 import pako from "pako";
 
 import { concat, toHex } from "../core/bytes.js";
-import { CorruptError } from "../core/errors.js";
+import { CorruptError, GitError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
 import { Sha1 } from "../core/sha1.js";
 import { deflate, InflateStream, inflate } from "../core/zlib.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
 import { type PackCacheOptions, PackStore } from "./packs.js";
-import { initializeGitSchema } from "./schema.js";
+import {
+  indexTreeSource,
+  indexTreeSources,
+  initializeGitSchema,
+  TREE_QUEUE_ROW_FIXED_BYTES,
+} from "./schema.js";
 
 /** Bytes per `git_object_chunks` row. */
 const OBJECT_CHUNK = 1024 * 1024;
@@ -41,6 +46,9 @@ const DEFAULT_INDEX_PAGE = 512;
 const DEFAULT_INDEX_FLUSH = 512;
 
 const DEFAULT_OBJECT_CACHE_BYTES = 16 * 1024 * 1024;
+const TREE_WALK_STATE_BYTES = 8 * 1024 * 1024;
+const TREE_WALK_PATH_BYTES = 2_200;
+const TREE_WALK_QUEUE_BYTES = 16 * 1024 * 1024;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Bytes of inflated objects held hot across reads. */
@@ -103,12 +111,293 @@ export interface ObjectBatch {
   flush(): void;
 }
 
+export interface WalkTreeEntry {
+  path: string;
+  mode: string;
+  oid: string;
+}
+
+export const WALK_TREE_SQL = `WITH RECURSIVE
+  params(repo_id, root_oid, path_cap, state_cap, queue_cap, queue_fixed)
+    AS (VALUES (?, ?, ?, ?, ?, ?)),
+  source_valid(repo_id, tree_oid, storage, source_id, object_size,
+               entry_count, base_cost) AS NOT MATERIALIZED (
+    SELECT x.repo_id, x.tree_oid, x.storage, x.source_id, s.object_size,
+           s.entry_count, s.base_cost
+      FROM git_tree_effective x
+      CROSS JOIN params p
+      CROSS JOIN git_tree_sources s
+     WHERE x.repo_id = p.repo_id
+       AND length(x.tree_oid) = 40 AND x.tree_oid NOT GLOB '*[^0-9a-f]*'
+       AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
+       AND s.storage = x.storage AND s.source_id = x.source_id
+       AND s.entry_count >= 0 AND s.object_size >= 0
+       AND s.base_cost = s.object_size + (p.queue_fixed + 18) * s.entry_count
+       AND (
+         (x.storage = 'loose' AND x.source_id = 0 AND EXISTS (
+           SELECT 1 FROM git_objects o
+            WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
+              AND o.type = 'tree' AND o.size = s.object_size
+         ))
+         OR
+         (x.storage = 'pack' AND EXISTS (
+           SELECT 1
+             FROM git_pack_objects o
+             JOIN git_pack_meta m
+               ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
+              AND m.state = 'complete'
+            WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
+              AND o.pack_id = x.source_id AND o.type = 'tree'
+              AND o.size = s.object_size
+         ))
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM git_tree_entries e
+          WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
+            AND e.storage = s.storage AND e.source_id = s.source_id
+            AND e.ordinal IN (-1, s.entry_count)
+       )
+       AND (
+         (s.entry_count = 0 AND s.base_cost = 0)
+         OR EXISTS (
+           SELECT 1 FROM git_tree_entries e
+            WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
+              AND e.storage = s.storage AND e.source_id = s.source_id
+              AND e.ordinal = s.entry_count - 1
+              AND e.cumulative_base = s.base_cost
+         )
+       )
+  ),
+  walk(path, mode, oid, ancestry, sort_key, error, error_code,
+       path_bytes, state_bytes, descend, reserved_bytes) AS (
+    SELECT CASE
+             WHEN length(e.name_bytes) <= p.path_cap
+               AND length(CAST(e.name AS BLOB)) <= p.path_cap THEN e.name
+             ELSE NULL
+           END,
+           CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
+           CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
+           '/' || p.root_oid || '/', printf('%08x', e.ordinal),
+           CASE
+             WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
+               THEN 'tree entries do not match the parsed source marker'
+             WHEN e.ordinal > 0 AND NOT EXISTS (
+               SELECT 1 FROM git_tree_entries previous
+                WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
+                  AND previous.storage = e.storage AND previous.source_id = e.source_id
+                  AND previous.ordinal = e.ordinal - 1
+             ) THEN 'tree entries contain an ordinal gap'
+             WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
+                    + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
+                    + COALESCE((
+                        SELECT previous.cumulative_base FROM git_tree_entries previous
+                         WHERE previous.repo_id = e.repo_id
+                           AND previous.tree_oid = e.tree_oid
+                           AND previous.storage = e.storage
+                           AND previous.source_id = e.source_id
+                           AND previous.ordinal = e.ordinal - 1
+                      ), 0)
+               THEN 'tree queue metadata is inconsistent'
+             WHEN length(e.name_bytes) > p.path_cap
+               OR length(CAST(e.name AS BLOB)) > p.path_cap
+               THEN 'tree path exceeds 2200 bytes'
+             WHEN length(e.raw_entry) > p.path_cap + 64
+               THEN 'tree entry integrity payload is too large'
+             WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
+               THEN 'tree entry has an invalid mode'
+             WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
+               OR CAST(e.name_bytes AS TEXT) != e.name
+               THEN 'tree entry has an invalid name'
+             WHEN length(e.oid) != 40 OR e.oid GLOB '*[^0-9a-f]*'
+               THEN 'tree entry has an invalid oid'
+             WHEN length(e.raw_entry) != length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 22
+               OR CAST(substr(e.raw_entry, 1, length(CAST(e.mode AS BLOB))) AS BLOB)
+                    != CAST(e.mode AS BLOB)
+               OR hex(substr(e.raw_entry, length(CAST(e.mode AS BLOB)) + 1, 1)) != '20'
+               OR CAST(substr(
+                    e.raw_entry, length(CAST(e.mode AS BLOB)) + 2, length(e.name_bytes)
+                  ) AS BLOB) != e.name_bytes
+               OR hex(substr(
+                    e.raw_entry, length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 2, 1
+                  )) != '00'
+               OR lower(hex(substr(e.raw_entry, -20))) != e.oid
+               THEN 'tree entry integrity check failed'
+             WHEN length(e.name_bytes) + 41 + 8 > p.state_cap
+               THEN 'tree traversal state exceeds 8 MiB'
+             ELSE NULL
+           END,
+           CASE WHEN length(e.name_bytes) > p.path_cap
+                  OR length(CAST(e.name AS BLOB)) > p.path_cap
+                THEN 'E2BIG' ELSE 'ECORRUPT' END,
+           length(e.name_bytes), length(e.name_bytes) + 41 + 8,
+           CASE WHEN e.mode IN ('40000', '040000')
+                  AND length(e.oid) = 40 AND e.oid NOT GLOB '*[^0-9a-f]*'
+                  AND EXISTS (
+                    SELECT 1 FROM source_valid child
+                     WHERE child.repo_id = p.repo_id AND child.tree_oid = e.oid
+                  )
+             THEN CASE WHEN EXISTS (
+               SELECT 1 FROM source_valid child
+                WHERE child.repo_id = p.repo_id AND child.tree_oid = e.oid
+                  AND s.base_cost - e.cumulative_base
+                        + (s.entry_count - e.ordinal - 1) * 50
+                        + child.base_cost
+                        + child.entry_count * (length(e.name_bytes) + 49 + 51)
+                      > p.queue_cap
+             ) THEN 2 ELSE 1 END
+             ELSE 0
+           END,
+           s.base_cost - e.cumulative_base
+             + (s.entry_count - e.ordinal - 1) * 50
+      FROM params p
+      CROSS JOIN source_valid s
+      CROSS JOIN git_tree_entries e
+     WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
+       AND s.base_cost + s.entry_count * 50 <= p.queue_cap
+       AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
+       AND e.storage = s.storage AND e.source_id = s.source_id
+    UNION ALL
+    SELECT NULL, NULL, NULL, '/', '',
+           'tree traversal queue exceeds 16 MiB', 'E2BIG', 0, 0, 0, 0
+      FROM params p CROSS JOIN source_valid s
+     WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
+       AND s.base_cost + s.entry_count * 50 > p.queue_cap
+    UNION ALL
+    SELECT NULL, NULL, NULL, '/', '',
+           CASE WHEN length(p.root_oid) = 40 AND p.root_oid NOT GLOB '*[^0-9a-f]*'
+                THEN 'tree source is invalid; reimport or reclone'
+                ELSE 'tree oid is invalid'
+           END,
+           'ECORRUPT', 0, 0, 0, 0
+      FROM params p
+     WHERE NOT EXISTS (
+       SELECT 1 FROM source_valid s
+        WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
+     )
+    UNION ALL
+    SELECT CASE
+             WHEN w.path_bytes + 1 + length(e.name_bytes) <= p.path_cap
+               AND length(CAST(w.path AS BLOB)) + 1 + length(CAST(e.name AS BLOB))
+                     <= p.path_cap
+               THEN w.path || '/' || e.name
+             ELSE NULL
+           END,
+           CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
+           CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
+           w.ancestry || w.oid || '/', w.sort_key || printf('%08x', e.ordinal),
+           CASE
+             WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
+               THEN 'tree entries do not match the parsed source marker'
+             WHEN e.ordinal > 0 AND NOT EXISTS (
+               SELECT 1 FROM git_tree_entries previous
+                WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
+                  AND previous.storage = e.storage AND previous.source_id = e.source_id
+                  AND previous.ordinal = e.ordinal - 1
+             ) THEN 'tree entries contain an ordinal gap'
+             WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
+                    + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
+                    + COALESCE((
+                        SELECT previous.cumulative_base FROM git_tree_entries previous
+                         WHERE previous.repo_id = e.repo_id
+                           AND previous.tree_oid = e.tree_oid
+                           AND previous.storage = e.storage
+                           AND previous.source_id = e.source_id
+                           AND previous.ordinal = e.ordinal - 1
+                      ), 0)
+               THEN 'tree queue metadata is inconsistent'
+             WHEN length(e.name_bytes) > p.path_cap
+               OR length(CAST(e.name AS BLOB)) > p.path_cap
+               THEN 'tree entry name exceeds the path limit'
+             WHEN length(e.raw_entry) > p.path_cap + 64
+               THEN 'tree entry integrity payload is too large'
+             WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
+               THEN 'tree entry has an invalid mode'
+             WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
+               OR CAST(e.name_bytes AS TEXT) != e.name
+               THEN 'tree entry has an invalid name'
+             WHEN length(e.oid) != 40 OR e.oid GLOB '*[^0-9a-f]*'
+               THEN 'tree entry has an invalid oid'
+             WHEN length(e.raw_entry) != length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 22
+               OR CAST(substr(e.raw_entry, 1, length(CAST(e.mode AS BLOB))) AS BLOB)
+                    != CAST(e.mode AS BLOB)
+               OR hex(substr(e.raw_entry, length(CAST(e.mode AS BLOB)) + 1, 1)) != '20'
+               OR CAST(substr(
+                    e.raw_entry, length(CAST(e.mode AS BLOB)) + 2, length(e.name_bytes)
+                  ) AS BLOB) != e.name_bytes
+               OR hex(substr(
+                    e.raw_entry, length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 2, 1
+                  )) != '00'
+               OR lower(hex(substr(e.raw_entry, -20))) != e.oid
+               THEN 'tree entry integrity check failed'
+             WHEN w.path_bytes + 1 + length(e.name_bytes) > p.path_cap
+               THEN 'tree path exceeds 2200 bytes'
+             WHEN w.state_bytes + 1 + length(e.name_bytes) + 41 + 8 > p.state_cap
+               THEN 'tree traversal state exceeds 8 MiB'
+             ELSE NULL
+           END,
+           CASE WHEN w.path_bytes + 1 + length(e.name_bytes) > p.path_cap
+                  OR length(CAST(w.path AS BLOB)) + 1 + length(CAST(e.name AS BLOB))
+                       > p.path_cap
+                THEN 'E2BIG' ELSE 'ECORRUPT' END,
+           w.path_bytes + 1 + length(e.name_bytes),
+           w.state_bytes + 1 + length(e.name_bytes) + 41 + 8,
+           CASE WHEN e.mode IN ('40000', '040000')
+                  AND length(e.oid) = 40 AND e.oid NOT GLOB '*[^0-9a-f]*'
+                  AND EXISTS (
+                    SELECT 1 FROM source_valid child
+                     WHERE child.repo_id = p.repo_id AND child.tree_oid = e.oid
+                  )
+             THEN CASE WHEN EXISTS (
+               SELECT 1 FROM source_valid child
+                WHERE child.repo_id = p.repo_id AND child.tree_oid = e.oid
+                  AND w.reserved_bytes + s.base_cost - e.cumulative_base
+                        + (s.entry_count - e.ordinal - 1) * (w.state_bytes + 51)
+                        + child.base_cost
+                        + child.entry_count
+                          * (w.state_bytes + 1 + length(e.name_bytes) + 49 + 51)
+                      > p.queue_cap
+             ) THEN 2 ELSE 1 END
+             ELSE 0
+           END,
+           w.reserved_bytes + s.base_cost - e.cumulative_base
+             + (s.entry_count - e.ordinal - 1) * (w.state_bytes + 51)
+      FROM walk w
+      CROSS JOIN params p
+      CROSS JOIN source_valid s
+      CROSS JOIN git_tree_entries e
+     WHERE w.error IS NULL AND w.descend = 1
+       AND instr(w.ancestry, '/' || w.oid || '/') = 0
+       AND s.repo_id = p.repo_id AND s.tree_oid = w.oid
+       AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
+       AND e.storage = s.storage AND e.source_id = s.source_id
+     ORDER BY 5
+  )
+SELECT path, mode, oid,
+       CASE
+         WHEN error IS NOT NULL THEN error
+         WHEN mode IN ('40000', '040000') AND instr(ancestry, '/' || oid || '/') != 0
+           THEN 'tree cycle at ' || oid
+         WHEN mode IN ('40000', '040000') AND descend = 2
+           THEN 'tree traversal queue exceeds 16 MiB'
+         WHEN mode IN ('40000', '040000') AND descend = 0
+           THEN 'tree ' || oid || ' has no valid v3 parsed source; reimport or reclone'
+         ELSE NULL
+       END AS error,
+       CASE WHEN error_code = 'E2BIG' OR descend = 2 THEN 'E2BIG'
+            ELSE 'ECORRUPT' END AS error_code
+  FROM walk
+ WHERE error IS NOT NULL
+    OR mode NOT IN ('40000', '040000')
+    OR instr(ancestry, '/' || oid || '/') != 0
+    OR (mode IN ('40000', '040000') AND descend != 1)`;
+
 /** One object staged in a batch, already hashed and deflated. */
 interface StagedObject {
   oid: string;
   type: ObjectType;
   size: number;
   compressed: Uint8Array;
+  treeData?: Uint8Array;
 }
 
 /** One `substr()` payload: the bytes, and the rows cut out of them. */
@@ -241,7 +530,7 @@ export class RepoStore {
     this.#repoId = repository.id;
     this.#root = repository.root;
     this.#objects = new ByteLru(
-      options.objectCacheBytes ?? DEFAULT_OBJECT_CACHE_BYTES,
+      Math.min(options.objectCacheBytes ?? DEFAULT_OBJECT_CACHE_BYTES, DEFAULT_OBJECT_CACHE_BYTES),
       (object) => object.data.length,
     );
     this.#packs = new PackStore(
@@ -333,9 +622,35 @@ export class RepoStore {
   }
 
   read(oid: string): RawObject | null {
-    const cached = this.#objects.get(oid);
+    const cached = this.#objects.get(`loose:${oid}`);
     if (cached !== undefined) return cached;
     return this.#readLoose(oid) ?? this.#packs.read(oid);
+  }
+
+  /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
+  *walkTree(treeOid: string): Generator<WalkTreeEntry> {
+    for (const row of this.#db.iterate(
+      WALK_TREE_SQL,
+      this.#repoId,
+      treeOid,
+      TREE_WALK_PATH_BYTES,
+      TREE_WALK_STATE_BYTES,
+      TREE_WALK_QUEUE_BYTES,
+      TREE_QUEUE_ROW_FIXED_BYTES,
+    )) {
+      const error = row.error;
+      if (typeof error === "string") {
+        if (row.error_code === "E2BIG") throw new GitError("E2BIG", error);
+        throw new CorruptError(error);
+      }
+      const path = row.path;
+      const mode = row.mode;
+      const oid = row.oid;
+      if (typeof path !== "string" || typeof mode !== "string" || typeof oid !== "string") {
+        throw new CorruptError("tree traversal yielded an invalid row");
+      }
+      yield { path, mode, oid };
+    }
   }
 
   write(type: ObjectType, data: Uint8Array): string {
@@ -368,9 +683,22 @@ export class RepoStore {
           blob(compressed.subarray(offset, offset + OBJECT_CHUNK)),
         );
       }
+      if (type === "tree") {
+        indexTreeSource(
+          this.#db,
+          {
+            repoId: this.#repoId,
+            treeOid: oid,
+            storage: "loose",
+            sourceId: 0,
+            objectSize: data.length,
+          },
+          [data],
+        );
+      }
     });
     this.#hasLoose = true;
-    this.#objects.set(oid, { type, data });
+    this.#objects.set(`loose:${oid}`, { type, data });
     return oid;
   }
 
@@ -446,6 +774,19 @@ export class RepoStore {
           blob(new Uint8Array(0)),
         );
       }
+      if (type === "tree") {
+        indexTreeSource(
+          this.#db,
+          {
+            repoId: this.#repoId,
+            treeOid: oid,
+            storage: "loose",
+            sourceId: 0,
+            objectSize: size,
+          },
+          chunks(),
+        );
+      }
     });
     this.#hasLoose = true;
     return oid;
@@ -477,7 +818,9 @@ export class RepoStore {
         const oid = hashObject(type, data);
         if (staged.has(oid)) return oid;
         const compressed = deflate(data);
-        staged.set(oid, { oid, type, size: data.length, compressed });
+        const object: StagedObject = { oid, type, size: data.length, compressed };
+        if (type === "tree") object.treeData = data;
+        staged.set(oid, object);
         bytes += compressed.length;
         // After staging, never before: an object's chunks and its metadata
         // row have to land in the same flush, whatever its size.
@@ -497,38 +840,58 @@ export class RepoStore {
   }
 
   #flushObjects(staged: StagedObject[], payloadBytes: number): void {
-    const present = this.hasAll(staged.map((object) => object.oid));
-    const fresh = staged.filter((object) => !present.has(object.oid));
-    if (fresh.length === 0) return;
-
-    const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
-    for (const object of fresh) {
-      const compressed = object.compressed;
-      for (
-        let seq = 0, offset = 0;
-        offset < compressed.length || seq === 0;
-        seq++, offset += OBJECT_CHUNK
-      ) {
-        const part = compressed.subarray(offset, offset + OBJECT_CHUNK);
-        let current = payloads[payloads.length - 1]!;
-        if (current.length > 0 && current.length + part.length > payloadBytes) {
-          current = { parts: [], length: 0, rows: [] };
-          payloads.push(current);
-        }
-        // `a` is a 1-based byte offset: substr() counts bytes over a BLOB.
-        current.rows.push({ o: object.oid, q: seq, a: current.length + 1, n: part.length });
-        current.parts.push(part);
-        current.length += part.length;
-      }
-    }
-
-    const oids = JSON.stringify(fresh.map((object) => object.oid));
+    const byOid = new Map(staged.map((object) => [object.oid, object]));
     const meta = JSON.stringify(
-      fresh.map((object) => ({ o: object.oid, t: object.type, s: object.size })),
+      staged.map((object) => ({ o: object.oid, t: object.type, s: object.size })),
     );
     this.#db.transactionSync(() => {
-      // An interrupted earlier write of this oid may have left chunks at a
-      // sequence this one does not reach, which a read would concatenate.
+      const fresh: StagedObject[] = [];
+      for (const row of this.#db.iterate(
+        `INSERT INTO git_objects (repo_id, oid, type, size, stored)
+         SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.t'),
+                json_extract(j.value, '$.s'), 'zlib'
+           FROM json_each(?) j
+          WHERE true
+         ON CONFLICT(repo_id, oid) DO NOTHING
+         RETURNING oid`,
+        this.#repoId,
+        meta,
+      )) {
+        if (typeof row.oid !== "string") {
+          throw new CorruptError("object metadata insert returned an invalid oid");
+        }
+        const object = byOid.get(row.oid);
+        if (object === undefined) {
+          throw new CorruptError("object metadata insert returned an unknown oid");
+        }
+        fresh.push(object);
+      }
+      if (fresh.length === 0) return;
+
+      const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
+      for (const object of fresh) {
+        const compressed = object.compressed;
+        for (
+          let seq = 0, offset = 0;
+          offset < compressed.length || seq === 0;
+          seq++, offset += OBJECT_CHUNK
+        ) {
+          const part = compressed.subarray(offset, offset + OBJECT_CHUNK);
+          let current = payloads[payloads.length - 1]!;
+          if (current.length > 0 && current.length + part.length > payloadBytes) {
+            current = { parts: [], length: 0, rows: [] };
+            payloads.push(current);
+          }
+          // `a` is a 1-based byte offset: substr() counts bytes over a BLOB.
+          current.rows.push({ o: object.oid, q: seq, a: current.length + 1, n: part.length });
+          current.parts.push(part);
+          current.length += part.length;
+        }
+      }
+
+      const oids = JSON.stringify(fresh.map((object) => object.oid));
+      // The transaction keeps metadata invisible until all chunks and parsed
+      // tree rows are ready, while RETURNING replaces a separate probe.
       this.#db.run(
         "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
         this.#repoId,
@@ -547,18 +910,21 @@ export class RepoStore {
           JSON.stringify(payload.rows),
         );
       }
-      // Metadata last: `has` keys on this row, so no object becomes
-      // reachable before every one of its chunks is in.
-      this.#db.run(
-        `INSERT INTO git_objects (repo_id, oid, type, size, stored)
-         SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.t'),
-                json_extract(j.value, '$.s'), 'zlib'
-           FROM json_each(?) j
-          WHERE true
-         ON CONFLICT(repo_id, oid) DO UPDATE SET
-           type = excluded.type, size = excluded.size, stored = excluded.stored`,
-        this.#repoId,
-        meta,
+      indexTreeSources(
+        this.#db,
+        fresh.flatMap((object) => {
+          if (object.type !== "tree" || object.treeData === undefined) return [];
+          return [
+            {
+              repoId: this.#repoId,
+              treeOid: object.oid,
+              storage: "loose",
+              sourceId: 0,
+              objectSize: object.size,
+              chunks: [object.treeData],
+            },
+          ];
+        }),
       );
     });
     this.#hasLoose = true;
@@ -571,7 +937,7 @@ export class RepoStore {
    * be reconstructed without its full base in memory. Null when unknown.
    */
   readChunks(oid: string): Iterable<Uint8Array> | null {
-    const cached = this.#objects.get(oid);
+    const cached = this.#objects.get(`loose:${oid}`);
     if (cached !== undefined) return [cached.data];
     if (this.#hasLoose && this.#looseRow(oid) !== null) return this.#looseChunks(oid);
     const packed = this.#packs.read(oid);
@@ -652,7 +1018,7 @@ export class RepoStore {
       type: row.type,
       data: inflate(concat(chunks.map((chunk) => readBlob(chunk.data)))),
     };
-    this.#objects.set(oid, object);
+    this.#objects.set(`loose:${oid}`, object);
     return object;
   }
 
@@ -978,6 +1344,9 @@ export class RepoStore {
         "git_config",
         "git_index",
         "git_shallow",
+        "git_tree_effective",
+        "git_tree_entries",
+        "git_tree_sources",
         "git_objects",
         "git_object_chunks",
         "git_pack_meta",

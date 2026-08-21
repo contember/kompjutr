@@ -1,10 +1,17 @@
 import { randomBytes } from "node:crypto";
 
 import { afterAll, describe, expect, it } from "vitest";
-import { concat, utf8 } from "../src/core/bytes.js";
-import { hashObject, parseCommit, parseTree } from "../src/core/objects.js";
+import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
+import {
+  hashObject,
+  MODE_FILE,
+  parseCommit,
+  parseTree,
+  serializeTree,
+} from "../src/core/objects.js";
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { MAX_DELTA_DEPTH } from "../src/sqlite/packs.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
@@ -12,6 +19,50 @@ import { GitFixture, slices } from "./helpers/git.js";
 function open() {
   const database = new SqliteGitDatabase(new TestDatabase(), { objectCacheBytes: 1024 * 1024 });
   return database.open(database.create("/repo", "ref: refs/heads/main"));
+}
+
+function syntheticTree(count: number): Uint8Array {
+  const entryBytes = 36;
+  const out = new Uint8Array(count * entryBytes);
+  const mode = utf8.encode("100644 ");
+  for (let index = 0; index < count; index++) {
+    const at = index * entryBytes;
+    out.set(mode, at);
+    out[at + 7] = 0x66;
+    const digits = String(index).padStart(7, "0");
+    for (let digit = 0; digit < digits.length; digit++) {
+      out[at + 8 + digit] = digits.charCodeAt(digit);
+    }
+    out[at + 15] = 0;
+    out[at + 32] = (index >>> 24) & 0xff;
+    out[at + 33] = (index >>> 16) & 0xff;
+    out[at + 34] = (index >>> 8) & 0xff;
+    out[at + 35] = index & 0xff;
+  }
+  return out;
+}
+
+function deltaPack(depth: number): { bytes: Uint8Array; target: Uint8Array; targetOid: string } {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(depth + 1);
+  let target = utf8.encode("a");
+  let targetOid = hashObject("blob", target);
+  writer.object("blob", target);
+  for (let at = 0; at < depth; at++) {
+    const base = target;
+    const baseOid = targetOid;
+    target = utf8.encode(`${utf8Decoder.decode(base)}a`);
+    targetOid = hashObject("blob", target);
+    const delta = concat([
+      encodeDeltaHeader(base.length, target.length),
+      new Uint8Array([target.length]),
+      target,
+    ]);
+    writer.refDelta(baseOid, delta);
+  }
+  writer.finish();
+  return { bytes: concat(chunks), target, targetOid };
 }
 
 describe("delta", () => {
@@ -49,6 +100,174 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
+  it("batches 500 parsed trees below the operation statement ceiling", async () => {
+    const measure = async (count: number) => {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const chunks: Uint8Array[] = [];
+      const writer = new PackWriter((chunk) => chunks.push(chunk));
+      writer.header(count);
+      for (let at = 0; at < count; at++) {
+        writer.object(
+          "tree",
+          serializeTree([
+            { mode: MODE_FILE, name: `f-${at}`, oid: at.toString(16).padStart(40, "0") },
+          ]),
+        );
+      }
+      writer.finish();
+      db.storage.resetCounters();
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+      return db.storage.statementCount;
+    };
+
+    const small = await measure(50);
+    const large = await measure(500);
+    expect(small).toBe(60);
+    expect(large).toBe(510);
+  });
+
+  it("streams oversized full trees into the parsed index", async () => {
+    const ingest = async (data: Uint8Array, maxBufferedEntry?: number) => {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db, { maxBufferedEntry });
+      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const chunks: Uint8Array[] = [];
+      const writer = new PackWriter((chunk) => chunks.push(chunk));
+      writer.header(1);
+      writer.object("tree", data);
+      writer.finish();
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+      return { db, store, oid: hashObject("tree", data) };
+    };
+
+    const small = syntheticTree(2_000);
+    const indexedSmall = await ingest(small, 64 * 1024);
+    expect(
+      indexedSmall.db.scalar<number>(
+        "SELECT entry_count FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
+        indexedSmall.oid,
+      ),
+    ).toBe(2_000);
+
+    const count = Math.ceil((8 * 1024 * 1024 + 1) / 36);
+    const large = syntheticTree(count);
+    const indexedLarge = await ingest(large);
+    expect(indexedLarge.store.typeAndSize(indexedLarge.oid)).toEqual({
+      type: "tree",
+      size: large.length,
+    });
+    expect(
+      indexedLarge.db.scalar<number>(
+        "SELECT entry_count FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
+        indexedLarge.oid,
+      ),
+    ).toBe(count);
+  }, 30_000);
+
+  it("rejects a corrupt pack region before allocating it", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    db.storage.resetCounters();
+    expect(() => store.packs.readRaw(1, 0, 100 * 1024 * 1024)).toThrow(/bounded region/);
+    expect(db.storage.statementCount).toBe(0);
+  });
+
+  it("keeps the production delta limit and enforces its exact boundary", async () => {
+    expect(MAX_DELTA_DEPTH).toBe(50_000);
+    const readAt = async (depth: number, limit: number) => {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db, { maxDeltaDepth: limit });
+      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const fixture = deltaPack(depth);
+      await store.packs.ingest(slices(fixture.bytes, 64));
+      const coldDatabase = new SqliteGitDatabase(db, { maxDeltaDepth: limit });
+      const row = coldDatabase.find("/repo");
+      if (row === null) throw new Error("repository missing after pack ingest");
+      return { actual: coldDatabase.open(row).read(fixture.targetOid), fixture };
+    };
+
+    const accepted = await readAt(3, 3);
+    expect(accepted.actual?.data).toEqual(accepted.fixture.target);
+    await expect(readAt(4, 3)).rejects.toThrow(/deeper than 3/);
+
+    const openWithLimit = (maxDeltaDepth: number) => {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db, { maxDeltaDepth });
+      return database.open(database.create("/repo", "ref: refs/heads/main"));
+    };
+    expect(() => openWithLimit(MAX_DELTA_DEPTH + 1)).not.toThrow();
+    for (const invalid of [-1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => openWithLimit(invalid)).toThrow(/finite non-negative integer/);
+    }
+  });
+
+  it("keeps pending trees invisible and selects them only on completion", () => {
+    const store = open();
+    const oid = "1".repeat(40);
+    store.db.run(
+      "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (1, 7, 0, 1, 'pending', 0)",
+    );
+    store.db.run(
+      `INSERT INTO git_pack_objects
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+       VALUES (1, ?, 7, 0, 0, 0, 'tree', 0, 0, NULL)`,
+      oid,
+    );
+
+    expect(
+      store.db.one(
+        "SELECT storage FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        oid,
+      ),
+    ).toBeUndefined();
+    store.db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = 1 AND pack_id = 7");
+    expect(
+      store.db.one(
+        "SELECT storage, source_id FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        oid,
+      ),
+    ).toEqual({ storage: "pack", source_id: 7 });
+  });
+
+  it("removes the selected source when a pack is reclaimed", async () => {
+    const store = open();
+    const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: "1".repeat(40) }]);
+    const oid = hashObject("tree", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", data);
+    writer.finish();
+    const { packId } = await store.packs.ingest(slices(concat(chunks), 64));
+    expect(
+      store.db.one(
+        "SELECT storage FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        oid,
+      ),
+    ).toEqual({ storage: "pack" });
+
+    store.db.run(
+      "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = 1 AND pack_id = ?",
+      packId,
+    );
+    expect(
+      store.db.one(
+        "SELECT storage FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        oid,
+      ),
+    ).toBeUndefined();
+    expect(store.packs.reclaimPending()).toBe(1);
+    expect(
+      store.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND storage = 'pack' AND source_id = ?",
+        packId,
+      ),
+    ).toBe(0);
+  });
+
   it("indexes full entries and ref-deltas", async () => {
     const store = open();
     const base = utf8.encode("base content\n".repeat(20));

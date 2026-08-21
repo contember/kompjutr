@@ -274,13 +274,22 @@ export class Repository {
 
   /** Every blob and submodule entry under a tree, as repo-relative paths. */
   *walkTree(treeOid: string, prefix = ""): Generator<{ path: string; entry: TreeEntry }> {
-    for (const entry of this.readTree(treeOid)) {
-      const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-      if (isTreeMode(entry.mode)) {
-        yield* this.walkTree(entry.oid, path);
-      } else {
-        yield { path, entry };
-      }
+    const type = this.store.typeAndSize(treeOid)?.type;
+    if (type === undefined) throw new ObjectNotFoundError(treeOid);
+    const oid = type === "commit" ? parseCommit(this.read(treeOid).data).tree : treeOid;
+    if (type !== "commit" && type !== "tree")
+      throw new CorruptError(`${treeOid} is a ${type}, not a tree`);
+    for (const entry of this.store.walkTree(oid)) {
+      const path = prefix === "" ? entry.path : `${prefix}/${entry.path}`;
+      const slash = entry.path.lastIndexOf("/");
+      yield {
+        path,
+        entry: {
+          mode: entry.mode,
+          name: entry.path.slice(slash + 1),
+          oid: entry.oid,
+        },
+      };
     }
   }
 

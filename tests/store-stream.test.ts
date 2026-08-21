@@ -52,6 +52,11 @@ class WidestDatabase implements SqlDatabase {
     return this.inner.scalar<T>(query, ...bindings);
   }
 
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.#measure(bindings);
+    return this.inner.iterate(query, ...bindings);
+  }
+
   transactionSync<T>(closure: () => T): T {
     return this.inner.transactionSync(closure);
   }
@@ -272,9 +277,8 @@ describe("object batches", () => {
     db.widestBindings = 0;
     const oids = store.writeObjects((batch) => objects.map((data) => batch.write("tree", data)));
 
-    // The whole batch is ~700 KB of tree bytes: one probe, one delete,
-    // one payload, one metadata insert.
-    expect(inner.storage.statementCount).toBeLessThanOrEqual(15);
+    // Object storage and the parsed-tree index both stay constant in statements.
+    expect(inner.storage.statementCount).toBe(15);
     // Four columns of multi-row VALUES would cap at 25 rows; the payload
     // form binds three parameters whatever the batch holds.
     expect(db.widestBindings).toBeLessThanOrEqual(100);

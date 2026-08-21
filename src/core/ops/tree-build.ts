@@ -7,7 +7,7 @@
 // bottom-up pass, so the only thing held live is the directory stack of
 // the path currently being visited.
 
-import type { IndexEntry } from "../../sqlite/store.js";
+import type { IndexEntry, ObjectBatch } from "../../sqlite/store.js";
 import { MODE_TREE, serializeTree, type TreeEntry } from "../objects.js";
 import type { Repository } from "../repository.js";
 
@@ -28,6 +28,11 @@ interface OpenDirectory {
  * nothing.
  */
 export function buildTree(repo: Repository, entries: Iterable<IndexEntry>): string {
+  return repo.store.writeObjects((batch) => buildTreeInBatch(batch, entries));
+}
+
+/** Build trees in a caller-owned batch so a commit can share the same flush. */
+export function buildTreeInBatch(batch: ObjectBatch, entries: Iterable<IndexEntry>): string {
   const stack: OpenDirectory[] = [{ name: "", entries: [] }];
   // Segment names of the directories currently open below the root.
   const open: string[] = [];
@@ -39,7 +44,7 @@ export function buildTree(repo: Repository, entries: Iterable<IndexEntry>): stri
 
     let shared = 0;
     while (shared < depth && shared < open.length && open[shared] === segments[shared]) shared++;
-    while (open.length > shared) closeTop(repo, stack, open);
+    while (open.length > shared) closeTop(batch, stack, open);
     for (let level = shared; level < depth; level++) {
       stack.push({ name: segments[level]!, entries: [] });
       open.push(segments[level]!);
@@ -52,21 +57,21 @@ export function buildTree(repo: Repository, entries: Iterable<IndexEntry>): stri
     });
   }
 
-  while (open.length > 0) closeTop(repo, stack, open);
-  return writeTree(repo, stack[0]!.entries);
+  while (open.length > 0) closeTop(batch, stack, open);
+  return writeTree(batch, stack[0]!.entries);
 }
 
-function closeTop(repo: Repository, stack: OpenDirectory[], open: string[]): void {
+function closeTop(batch: ObjectBatch, stack: OpenDirectory[], open: string[]): void {
   const finished = stack.pop()!;
   open.pop();
   stack[stack.length - 1]!.entries.push({
     mode: MODE_TREE,
     name: finished.name,
-    oid: writeTree(repo, finished.entries),
+    oid: writeTree(batch, finished.entries),
   });
 }
 
-/** `RepoStore.write` hashes first and returns early when the tree already exists, which is the reuse. */
-function writeTree(repo: Repository, entries: TreeEntry[]): string {
-  return repo.store.write("tree", serializeTree(entries));
+/** The batch hashes before flushing, and its insert ignores objects already present. */
+function writeTree(batch: ObjectBatch, entries: TreeEntry[]): string {
+  return batch.write("tree", serializeTree(entries));
 }

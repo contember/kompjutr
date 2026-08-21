@@ -56,6 +56,11 @@ class RecordingDatabase implements SqlDatabase {
     return row === undefined ? undefined : Object.values(row)[0];
   }
 
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.record(bindings);
+    return this.inner.iterate(query, ...bindings);
+  }
+
   transactionSync<T>(closure: () => T): T {
     return this.inner.transactionSync(closure);
   }

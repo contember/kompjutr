@@ -1,15 +1,90 @@
+import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
+
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { utf8Decoder } from "../src/core/bytes.js";
+import { concat, utf8Decoder } from "../src/core/bytes.js";
+import { GitError } from "../src/core/errors.js";
+import {
+  hashObject,
+  isTreeMode,
+  MODE_FILE,
+  MODE_TREE,
+  parseTreeStream,
+  serializeTree,
+} from "../src/core/objects.js";
 import { catFile, log, lsFilesAtRef, lsTree, show } from "../src/core/ops/reads.js";
+import { treeStream } from "../src/core/ops/tree-stream.js";
+import { encodeDeltaHeader } from "../src/core/pack/delta.js";
+import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { iterateSqlCursor, type SqlDatabase } from "../src/sqlite/db.js";
+import { SqliteGitDatabase, WALK_TREE_SQL } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
-import { GitFixture } from "./helpers/git.js";
+import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 
 let fixture: GitFixture;
 let repo: Repository;
+
+describe("SQL cursor adapter", () => {
+  const populated = () => {
+    const storage = new SqliteTestStorage();
+    storage.sql.exec("CREATE TABLE numbers (value INTEGER PRIMARY KEY)");
+    for (let value = 1; value <= 5; value++) {
+      storage.sql.exec("INSERT INTO numbers (value) VALUES (?)", value);
+    }
+    storage.resetCounters();
+    return storage;
+  };
+
+  it("prefetches one row and toArray consumes only the remainder", () => {
+    const storage = populated();
+    const cursor = storage.sql.exec<{ value: number }>("SELECT value FROM numbers ORDER BY value");
+
+    expect(storage.statementCount).toBe(1);
+    expect(storage.rowCount).toBe(1);
+    expect(cursor.next()).toEqual({ done: false, value: { value: 1 } });
+    expect(storage.rowCount).toBe(1);
+    expect(cursor.toArray()).toEqual([{ value: 2 }, { value: 3 }, { value: 4 }, { value: 5 }]);
+    expect(storage.rowCount).toBe(5);
+  });
+
+  it("interleaves identical native cursors without sharing statement state", () => {
+    const storage = populated();
+    const first = storage.sql.exec<{ value: number }>("SELECT value FROM numbers ORDER BY value");
+    const second = storage.sql.exec<{ value: number }>("SELECT value FROM numbers ORDER BY value");
+
+    expect(first.next().value).toEqual({ value: 1 });
+    expect(second.next().value).toEqual({ value: 1 });
+    expect(first.next().value).toEqual({ value: 2 });
+    expect(second.next().value).toEqual({ value: 2 });
+
+    const firstWalk = storage
+      .iterate("SELECT value FROM numbers ORDER BY value")
+      [Symbol.iterator]();
+    const secondWalk = storage
+      .iterate("SELECT value FROM numbers ORDER BY value")
+      [Symbol.iterator]();
+    expect(firstWalk.next().value).toEqual({ value: 1 });
+    expect(secondWalk.next().value).toEqual({ value: 1 });
+    expect(firstWalk.next().value).toEqual({ value: 2 });
+    expect(secondWalk.next().value).toEqual({ value: 2 });
+  });
+
+  it("executes an unconsumed write and never falls back to toArray iteration", () => {
+    const storage = populated();
+    storage.sql.exec("INSERT INTO numbers (value) VALUES (6)");
+    expect(
+      storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM numbers").toArray(),
+    ).toEqual([{ count: 6 }]);
+
+    const cursor = storage.sql.exec<{ value: number }>("SELECT value FROM numbers");
+    Object.defineProperty(cursor, Symbol.iterator, { value: undefined });
+    expect(() => [...iterateSqlCursor(cursor)]).toThrow(/not iterable/);
+  });
+});
 
 beforeAll(async () => {
   fixture = new GitFixture().init();
@@ -110,5 +185,701 @@ describe("ls-tree and cat-file", () => {
     const result = catFile(repo, "HEAD:src/a.ts");
     expect(utf8Decoder.decode(result.bytes)).toBe("export const a = 2;\n");
     expect(result.type).toBe("blob");
+  });
+});
+
+interface TreeScale {
+  root: string;
+  objects: Uint8Array[];
+}
+
+function numberedOid(value: number): string {
+  return value.toString(16).padStart(40, "0");
+}
+
+/** Unique trees spread over the same 13 generations as the target fixture. */
+function treeScale(leafCount = 3_334): TreeScale {
+  const internalCount = 12;
+  const leaves: { oid: string; data: Uint8Array }[] = [];
+  for (let i = 0; i < leafCount; i++) {
+    const data = serializeTree([
+      { mode: MODE_FILE, name: `file-${i}.txt`, oid: numberedOid(i + 1) },
+    ]);
+    leaves.push({ oid: hashObject("tree", data), data });
+  }
+
+  const internal: Uint8Array[] = [];
+  let child: string | null = null;
+  for (let level = internalCount - 1; level >= 0; level--) {
+    const start = Math.floor((level * leafCount) / internalCount);
+    const end = Math.floor(((level + 1) * leafCount) / internalCount);
+    const entries = leaves.slice(start, end).map((leaf, at) => ({
+      mode: MODE_TREE,
+      name: `leaf-${String(start + at).padStart(4, "0")}`,
+      oid: leaf.oid,
+    }));
+    if (child !== null) entries.push({ mode: MODE_TREE, name: "spine", oid: child });
+    const data = serializeTree(entries);
+    internal.unshift(data);
+    child = hashObject("tree", data);
+  }
+  if (child === null) throw new Error("tree scale has no root");
+  return { root: child, objects: [...leaves.map((leaf) => leaf.data), ...internal] };
+}
+
+class BindingDatabase implements SqlDatabase {
+  widestBindings = 0;
+  maxResultBytes = 0;
+
+  constructor(readonly inner = new TestDatabase()) {}
+
+  #measure(bindings: unknown[]): void {
+    this.widestBindings = Math.max(this.widestBindings, bindings.length);
+  }
+
+  #measureResult(rows: readonly object[]): void {
+    let bytes = 0;
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        if (value instanceof Uint8Array) bytes += value.byteLength;
+        else if (value instanceof ArrayBuffer) bytes += value.byteLength;
+      }
+    }
+    this.maxResultBytes = Math.max(this.maxResultBytes, bytes);
+  }
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.#measure(bindings);
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    this.#measure(bindings);
+    const rows = this.inner.all<Row>(query, ...bindings);
+    this.#measureResult(rows);
+    return rows;
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    this.#measure(bindings);
+    const row = this.inner.one<Row>(query, ...bindings);
+    if (row !== undefined) this.#measureResult([row]);
+    return row;
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    this.#measure(bindings);
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    this.#measure(bindings);
+    for (const row of this.inner.iterate(query, ...bindings)) {
+      this.#measureResult([row]);
+      yield row;
+    }
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+function openScale(db: SqlDatabase) {
+  const database = new SqliteGitDatabase(db);
+  const row = database.create("/repo", "ref: refs/heads/main");
+  return database.open(row);
+}
+
+function reopenScale(db: SqlDatabase): Repository {
+  const database = new SqliteGitDatabase(db);
+  const row = database.find("/repo");
+  if (row === null) throw new Error("scale repository is missing");
+  return new Repository(database.open(row), "/repo");
+}
+
+function* legacyWalk(
+  repo: Repository,
+  oid: string,
+  prefix = "",
+): Generator<{ path: string; mode: string; oid: string }> {
+  for (const entry of repo.readTree(oid)) {
+    const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (isTreeMode(entry.mode)) yield* legacyWalk(repo, entry.oid, path);
+    else yield { path, mode: entry.mode, oid: entry.oid };
+  }
+}
+
+describe("batched tree reads", () => {
+  it("does no work before first next and yields no BLOB column", () => {
+    const db = new BindingDatabase();
+    const store = openScale(db);
+    const oid = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "file", oid: numberedOid(1) }]),
+    );
+    db.inner.storage.resetCounters();
+    db.maxResultBytes = 0;
+    const iterator = store.walkTree(oid);
+
+    expect(db.inner.storage.statementCount).toBe(0);
+    expect(iterator.next()).toEqual({
+      done: false,
+      value: { path: "file", mode: MODE_FILE, oid: numberedOid(1) },
+    });
+    expect(db.inner.storage.statementCount).toBe(1);
+    expect(db.maxResultBytes).toBe(0);
+  });
+
+  it("preserves walkTree's packed traversal order", () => {
+    const tree = repo.headTree();
+    if (tree === null) throw new Error("fixture has no HEAD tree");
+    const expected = [...repo.walkTree(tree)].map(({ path, entry }) => ({
+      path,
+      mode: entry.mode,
+      oid: entry.oid,
+    }));
+    expect([...treeStream(repo, tree)]).toEqual(expected);
+  });
+
+  it("preserves walkTree's commit-oid shorthand", () => {
+    const head = repo.head().oid;
+    if (head === null) throw new Error("fixture has no HEAD");
+    const expected = [...repo.walkTree(head)].map(({ path, entry }) => ({
+      path,
+      mode: entry.mode,
+      oid: entry.oid,
+    }));
+    expect([...treeStream(repo, head)]).toEqual(expected);
+  });
+
+  it("prefers a packed delta base over a corrupt loose duplicate", async () => {
+    const base = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
+    const baseOid = hashObject("tree", base);
+    const target = serializeTree([
+      { mode: MODE_FILE, name: "a", oid: numberedOid(1) },
+      { mode: MODE_FILE, name: "b", oid: numberedOid(2) },
+    ]);
+    const targetOid = hashObject("tree", target);
+    const delta = concat([
+      encodeDeltaHeader(base.length, target.length),
+      new Uint8Array([target.length]),
+      target,
+    ]);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("tree", base);
+    writer.refDelta(baseOid, delta);
+    writer.finish();
+
+    const db = new TestDatabase();
+    const store = openScale(db);
+    await store.packs.ingest(slices(concat(chunks), 64));
+    db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, ?, 'tree', ?)",
+      baseOid,
+      base.length,
+    );
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (1, ?, 0, ?)",
+      baseOid,
+      new Uint8Array([0]),
+    );
+    const cold = reopenScale(db);
+    db.storage.resetCounters();
+
+    expect([...treeStream(cold, targetOid)]).toEqual([
+      { path: "a", mode: MODE_FILE, oid: numberedOid(1) },
+      { path: "b", mode: MODE_FILE, oid: numberedOid(2) },
+    ]);
+    expect(db.storage.statementCount).toBe(3);
+  });
+
+  it("does not fall through a corrupt loose-shadowed requested object", async () => {
+    const tree = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
+    const oid = hashObject("tree", tree);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", tree);
+    writer.finish();
+    const db = new TestDatabase();
+    const store = openScale(db);
+    await store.packs.ingest(slices(concat(chunks), 64));
+    db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, ?, 'tree', ?)",
+      oid,
+      tree.length,
+    );
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (1, ?, 0, ?)",
+      oid,
+      new Uint8Array([0]),
+    );
+
+    expect(() => [...treeStream(reopenScale(db), oid)]).toThrow();
+  });
+
+  it("reads shuffled trees from a 16 MB pack in physical order", async () => {
+    const count = 500;
+    const children = Array.from({ length: count }, (_, index) => {
+      const data = serializeTree([
+        { mode: MODE_FILE, name: `file-${index}`, oid: numberedOid(index + 1) },
+      ]);
+      return { index, data, oid: hashObject("tree", data) };
+    });
+    const root = serializeTree(
+      children.map((child) => ({
+        mode: MODE_TREE,
+        name: `dir-${String(child.index).padStart(3, "0")}`,
+        oid: child.oid,
+      })),
+    );
+    const rootOid = hashObject("tree", root);
+    const physical = Array.from({ length: 8 }, (_, group) =>
+      children.filter((child) => child.index % 8 === group),
+    ).flat();
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(count * 2 + 1);
+    for (const child of physical) {
+      writer.object("tree", child.data);
+      writer.object("blob", new Uint8Array(randomBytes(32 * 1024)));
+    }
+    writer.object("tree", root);
+    writer.finish();
+
+    const db = new BindingDatabase();
+    const store = openScale(db);
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    const cold = reopenScale(db);
+    db.inner.storage.resetCounters();
+    db.widestBindings = 0;
+    db.maxResultBytes = 0;
+
+    const actual = [...treeStream(cold, rootOid)];
+    expect(actual).toEqual(
+      children.map((child) => ({
+        path: `dir-${String(child.index).padStart(3, "0")}/file-${child.index}`,
+        mode: MODE_FILE,
+        oid: numberedOid(child.index + 1),
+      })),
+    );
+    expect(db.inner.storage.statementCount).toBeLessThanOrEqual(25);
+    expect(db.widestBindings).toBeLessThanOrEqual(100);
+    expect(db.maxResultBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(cold.store.cacheBytes().chunks).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(cold.store.cacheBytes().objects).toBeLessThanOrEqual(16 * 1024 * 1024);
+  }, 90_000);
+
+  it.each(["loose", "packed"])(
+    "reads a 3,346-tree %s HEAD in at most 25 statements with exact parity",
+    async (storage) => {
+      const scale = treeScale();
+      const db = new TestDatabase();
+      const store = openScale(db);
+      if (storage === "loose") {
+        store.writeObjects((batch) => {
+          for (const data of scale.objects) batch.write("tree", data);
+        });
+      } else {
+        const chunks: Uint8Array[] = [];
+        const writer = new PackWriter((chunk) => chunks.push(chunk));
+        writer.header(scale.objects.length);
+        for (const data of scale.objects) writer.object("tree", data);
+        writer.finish();
+        await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+      }
+
+      const scalar = reopenScale(db);
+      db.storage.resetCounters();
+      const expected = [...legacyWalk(scalar, scale.root)];
+      const scalarStatements = db.storage.statementCount;
+
+      const batched = reopenScale(db);
+      db.storage.resetCounters();
+      const actual = [...treeStream(batched, scale.root)];
+      const statements = db.storage.statementCount;
+
+      expect(actual).toEqual(expected);
+      expect(actual).toHaveLength(3_334);
+      expect(statements).toBeLessThanOrEqual(25);
+      expect(statements).toBe(2);
+      // Negative control: the scalar walk must fail the same statement gate.
+      expect(scalarStatements).toBeGreaterThan(25);
+
+      db.storage.resetCounters();
+      expect([...treeStream(batched, scale.root)]).toEqual(actual);
+      expect(db.storage.statementCount).toBe(2);
+    },
+    30_000,
+  );
+
+  it("scales by depth rather than tree count", () => {
+    const measure = (leafCount: number): number => {
+      const scale = treeScale(leafCount);
+      const db = new TestDatabase();
+      const store = openScale(db);
+      store.writeObjects((batch) => {
+        for (const data of scale.objects) batch.write("tree", data);
+      });
+      const cold = reopenScale(db);
+      db.storage.resetCounters();
+      expect([...treeStream(cold, scale.root)]).toHaveLength(leafCount);
+      return db.storage.statementCount;
+    };
+
+    expect(measure(322)).toBe(2);
+    expect(measure(3_334)).toBe(2);
+  });
+
+  const deepTree = (depth: number, leaf: string) => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const leafOid = "f".repeat(40);
+    let child = store.write("tree", serializeTree([{ mode: MODE_FILE, name: leaf, oid: leafOid }]));
+    for (let at = 0; at < depth; at++) {
+      child = store.write("tree", serializeTree([{ mode: MODE_TREE, name: "d", oid: child }]));
+    }
+    return { db, store, root: child, leafOid };
+  };
+
+  const packedDeepTree = async (depth: number, leaf: string) => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const leafOid = "f".repeat(40);
+    const objects: Uint8Array[] = [];
+    let data = serializeTree([{ mode: MODE_FILE, name: leaf, oid: leafOid }]);
+    objects.push(data);
+    let root = hashObject("tree", data);
+    for (let at = 0; at < depth; at++) {
+      data = serializeTree([{ mode: MODE_TREE, name: "d", oid: root }]);
+      objects.push(data);
+      root = hashObject("tree", data);
+    }
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(objects.length);
+    for (const object of objects) writer.object("tree", object);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    return { db, store, root, leafOid };
+  };
+
+  it("accepts a 2,200-byte path repeatedly under the working-set wall gate", () => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { db, store, root, leafOid } = deepTree(1_098, "leaf");
+      db.storage.resetCounters();
+      const started = performance.now();
+      const entries = [...store.walkTree(root)];
+      const elapsed = performance.now() - started;
+
+      expect(entries).toEqual([
+        { path: `${"d/".repeat(1_098)}leaf`, mode: MODE_FILE, oid: leafOid },
+      ]);
+      expect(db.storage.statementCount).toBe(1);
+      expect(elapsed).toBeLessThan(100);
+    }
+  }, 30_000);
+
+  it("accepts a packed 2,200-byte path repeatedly under the wall gate", async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const { db, store, root, leafOid } = await packedDeepTree(1_098, "leaf");
+      db.storage.resetCounters();
+      const started = performance.now();
+      const entries = [...store.walkTree(root)];
+      const elapsed = performance.now() - started;
+
+      expect(entries).toEqual([
+        { path: `${"d/".repeat(1_098)}leaf`, mode: MODE_FILE, oid: leafOid },
+      ]);
+      expect(db.storage.statementCount).toBe(1);
+      expect(elapsed).toBeLessThan(100);
+    }
+  }, 30_000);
+
+  it("fails a 2,201-byte path with E2BIG before traversing deeper", () => {
+    const { db, store, root } = deepTree(5_000, "leaff");
+    db.storage.resetCounters();
+    const started = performance.now();
+    let error: unknown;
+    try {
+      for (const _entry of store.walkTree(root)) {
+        // The single leaf is past the path cap.
+      }
+    } catch (caught) {
+      error = caught;
+    }
+    const elapsed = performance.now() - started;
+
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("E2BIG");
+    expect(db.storage.statementCount).toBe(1);
+    expect(elapsed).toBeLessThan(100);
+  }, 30_000);
+
+  const longQueue = (count: number) => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const root = store.write(
+      "tree",
+      serializeTree(
+        Array.from({ length: count }, (_, at) => ({
+          mode: MODE_FILE,
+          name: `${String(at).padStart(4, "0")}-${"x".repeat(1_995)}`,
+          oid: numberedOid(at + 1),
+        })),
+      ),
+    );
+    return { db, store, root };
+  };
+
+  it("bounds the whole priority queue at the exact long-row suffix boundary", () => {
+    const accepted = longQueue(7_332);
+    accepted.db.storage.resetCounters();
+    expect([...accepted.store.walkTree(accepted.root)]).toHaveLength(7_332);
+    expect(accepted.db.storage.statementCount).toBe(1);
+
+    const rejected = longQueue(7_333);
+    rejected.db.storage.resetCounters();
+    expect(() => [...rejected.store.walkTree(rejected.root)]).toThrow(/queue exceeds 16 MiB/);
+    expect(rejected.db.storage.statementCount).toBe(1);
+  }, 30_000);
+
+  it("reclaims queue bytes independently of which deep sibling sorts last", () => {
+    const walk = (reverse: boolean) => {
+      const db = new TestDatabase();
+      const store = openScale(db);
+      const branch = (leafOid: string) => {
+        let oid = store.write(
+          "tree",
+          serializeTree([{ mode: MODE_FILE, name: "leaf", oid: leafOid }]),
+        );
+        for (let depth = 0; depth < 100; depth++) {
+          oid = store.write("tree", serializeTree([{ mode: MODE_TREE, name: "d", oid }]));
+        }
+        return oid;
+      };
+      const first = branch(numberedOid(1));
+      const second = branch(numberedOid(2));
+      const root = store.write(
+        "tree",
+        serializeTree([
+          { mode: MODE_TREE, name: "a", oid: reverse ? second : first },
+          { mode: MODE_TREE, name: "z", oid: reverse ? first : second },
+        ]),
+      );
+      db.storage.resetCounters();
+      const entries = [...store.walkTree(root)];
+      expect(db.storage.statementCount).toBe(1);
+      return entries.map((entry) => entry.path);
+    };
+
+    expect(walk(false)).toEqual(walk(true));
+  });
+
+  it("rejects an active-stack tree cycle but permits DAG reuse", () => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const leafOid = "e".repeat(40);
+    const child = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "leaf", oid: leafOid }]),
+    );
+    const root = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_TREE, name: "a", oid: child },
+        { mode: MODE_TREE, name: "b", oid: child },
+      ]),
+    );
+    expect([...store.walkTree(root)]).toEqual([
+      { path: "a/leaf", mode: MODE_FILE, oid: leafOid },
+      { path: "b/leaf", mode: MODE_FILE, oid: leafOid },
+    ]);
+
+    const cycle = [
+      ...parseTreeStream([serializeTree([{ mode: MODE_TREE, name: "a", oid: root }])]),
+    ][0];
+    if (cycle === undefined) throw new Error("cycle fixture did not produce a tree entry");
+    db.run(
+      `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
+        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0`,
+      root,
+      cycle.rawEntry,
+      root,
+    );
+    expect(() => [...store.walkTree(root)]).toThrow(/tree cycle/);
+  });
+
+  it("fails closed on ordinal gaps, extra rows and understated loose metadata", () => {
+    const make = () => {
+      const db = new TestDatabase();
+      const store = openScale(db);
+      const data = serializeTree([
+        { mode: MODE_FILE, name: "a", oid: numberedOid(1) },
+        { mode: MODE_FILE, name: "b", oid: numberedOid(2) },
+        { mode: MODE_FILE, name: "c", oid: numberedOid(3) },
+      ]);
+      return { db, store, oid: store.write("tree", data) };
+    };
+
+    const gap = make();
+    gap.db.run(
+      "DELETE FROM git_tree_entries WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 1",
+      gap.oid,
+    );
+    expect(() => [...gap.store.walkTree(gap.oid)]).toThrow(/ordinal gap/);
+
+    const extra = make();
+    extra.db.run(
+      "UPDATE git_tree_sources SET entry_count = 2 WHERE repo_id = 1 AND tree_oid = ?",
+      extra.oid,
+    );
+    expect(() => [...extra.store.walkTree(extra.oid)]).toThrow(/reimport or reclone/);
+
+    const size = make();
+    size.db.run(
+      "UPDATE git_tree_sources SET object_size = object_size - 1 WHERE repo_id = 1 AND tree_oid = ?",
+      size.oid,
+    );
+    expect(() => [...size.store.walkTree(size.oid)]).toThrow(/reimport or reclone/);
+  });
+
+  it("rejects understated queue metadata without returning a BLOB", () => {
+    const make = () => {
+      const db = new BindingDatabase();
+      const store = openScale(db);
+      const oid = store.write(
+        "tree",
+        serializeTree([
+          { mode: MODE_FILE, name: "a", oid: numberedOid(1) },
+          { mode: MODE_FILE, name: "b", oid: numberedOid(2) },
+          { mode: MODE_FILE, name: "c", oid: numberedOid(3) },
+        ]),
+      );
+      db.maxResultBytes = 0;
+      return { db, store, oid };
+    };
+
+    const marker = make();
+    marker.db.run(
+      "UPDATE git_tree_sources SET base_cost = base_cost - 1 WHERE repo_id = 1 AND tree_oid = ?",
+      marker.oid,
+    );
+    expect(() => [...marker.store.walkTree(marker.oid)]).toThrow(/reimport or reclone/);
+    expect(marker.db.maxResultBytes).toBe(0);
+
+    const entry = make();
+    entry.db.run(
+      `UPDATE git_tree_entries SET cumulative_base = cumulative_base - 1
+        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 1`,
+      entry.oid,
+    );
+    expect(() => [...entry.store.walkTree(entry.oid)]).toThrow(/queue metadata is inconsistent/);
+    expect(entry.db.maxResultBytes).toBe(0);
+  });
+
+  it("rejects a valid-looking oid changed after the tree was indexed", () => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
+    const oid = store.write("tree", data);
+    db.run(
+      "UPDATE git_tree_entries SET oid = ? WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0",
+      numberedOid(2),
+      oid,
+    );
+
+    expect(() => [...store.walkTree(oid)]).toThrow(/integrity check failed/);
+  });
+
+  it("returns no corrupt BLOB or unbounded path cell on an error row", () => {
+    const db = new BindingDatabase();
+    const store = openScale(db);
+    const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
+    const oid = store.write("tree", data);
+    db.run(
+      `UPDATE git_tree_entries
+          SET name = 'oversized', name_bytes = zeroblob(10000000),
+              raw_entry = zeroblob(10000000), oid = printf('%.*c', 10000000, 'a')
+        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0`,
+      oid,
+    );
+    db.maxResultBytes = 0;
+
+    expect(() => [...store.walkTree(oid)]).toThrow();
+    expect(db.maxResultBytes).toBe(0);
+  });
+
+  it("uses the tree-entry primary key without an outer temporary sort", () => {
+    const db = new TestDatabase();
+    openScale(db);
+    const plan = db
+      .all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN ${WALK_TREE_SQL}`,
+        1,
+        "0".repeat(40),
+        2_200,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        192,
+      )
+      .map((row) => row.detail);
+
+    expect(plan.some((detail) => /SEARCH e USING PRIMARY KEY/.test(detail))).toBe(true);
+    expect(plan.some((detail) => /TEMP B-TREE FOR ORDER BY/.test(detail))).toBe(false);
+  });
+
+  it("streams 50,002 packed entries with one SQL statement", async () => {
+    const count = 50_002;
+    const data = serializeTree(
+      Array.from({ length: count }, (_, at) => ({
+        mode: MODE_FILE,
+        name: `f-${String(at).padStart(5, "0")}`,
+        oid: numberedOid(at + 1),
+      })),
+    );
+    const oid = hashObject("tree", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", data);
+    writer.finish();
+    const db = new TestDatabase();
+    const store = openScale(db);
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    db.storage.resetCounters();
+
+    let seen = 0;
+    for (const entry of store.walkTree(oid)) {
+      expect(entry.path).toBe(`f-${String(seen).padStart(5, "0")}`);
+      seen++;
+    }
+    expect(seen).toBe(count);
+    expect(db.storage.statementCount).toBe(1);
+  }, 30_000);
+
+  it("streams 1,000 entries under the working-set wall gate", () => {
+    const count = 1_000;
+    const data = serializeTree(
+      Array.from({ length: count }, (_, at) => ({
+        mode: MODE_FILE,
+        name: `f-${String(at).padStart(4, "0")}`,
+        oid: numberedOid(at + 1),
+      })),
+    );
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const oid = store.write("tree", data);
+    db.storage.resetCounters();
+    const started = performance.now();
+    expect([...store.walkTree(oid)]).toHaveLength(count);
+    const elapsed = performance.now() - started;
+
+    expect(db.storage.statementCount).toBe(1);
+    expect(elapsed).toBeLessThan(100);
   });
 });

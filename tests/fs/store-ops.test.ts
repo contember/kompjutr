@@ -70,6 +70,11 @@ class MeasuringDatabase implements SqlDatabase {
     return this.inner.scalar<T>(query, ...bindings);
   }
 
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.measureBindings(bindings);
+    return this.inner.iterate(query, ...bindings);
+  }
+
   transactionSync<T>(closure: () => T): T {
     return this.inner.transactionSync(closure);
   }

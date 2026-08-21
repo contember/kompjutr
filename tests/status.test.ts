@@ -459,7 +459,8 @@ describe("status cost", () => {
     expect(entries.map((entry) => `${entry.index}${entry.worktree} ${entry.path}`)).toEqual([
       " M file3.txt",
     ]);
-    expect(counting.reads).toBe(1);
+    expect(counting.bulkReadPaths).toEqual(["/file3.txt"]);
+    expect(counting.reads).toBe(0);
   });
 });
 

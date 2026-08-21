@@ -28,6 +28,10 @@ export class TestDatabase implements SqlDatabase {
     return Object.values(row)[0];
   }
 
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    return this.storage.iterate(query, ...bindings);
+  }
+
   transactionSync<T>(closure: () => T): T {
     if (this.#depth > 0) return closure();
     this.#depth++;

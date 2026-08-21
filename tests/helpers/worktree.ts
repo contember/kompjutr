@@ -18,6 +18,7 @@ import type {
 /** Counts the calls that would mean a file was read to be hashed. */
 export class CountingWorktree implements Worktree {
   reads = 0;
+  bulkReadPaths: string[] = [];
   /** Ranged reads, which hash a file without ever holding all of it. */
   rangeReads = 0;
   rangeWrites = 0;
@@ -94,7 +95,9 @@ export class CountingWorktree implements Worktree {
     return this.inner.readFileHandles(handles, options);
   }
   readFiles(paths: readonly string[], options?: { budget?: number }): ReadBatch {
-    return this.inner.readFiles(paths, options);
+    const batch = this.inner.readFiles(paths, options);
+    this.bulkReadPaths.push(...batch.files.keys());
+    return batch;
   }
   glob(root: string, pattern: string, options?: { limit?: number }): string[] {
     return this.inner.glob(root, pattern, options);

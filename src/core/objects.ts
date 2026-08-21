@@ -71,6 +71,12 @@ export interface TreeEntry {
   oid: string;
 }
 
+export interface ParsedTreeEntry {
+  entry: TreeEntry;
+  nameBytes: Uint8Array;
+  rawEntry: Uint8Array;
+}
+
 export const MODE_FILE = "100644";
 export const MODE_EXECUTABLE = "100755";
 export const MODE_SYMLINK = "120000";
@@ -277,6 +283,88 @@ export function parseTree(data: Uint8Array): TreeEntry[] {
     pos = nul + 21;
   }
   return entries;
+}
+
+class ByteField {
+  #bytes = new Uint8Array(64);
+  #length = 0;
+
+  constructor(
+    private readonly limit: number,
+    private readonly label: string,
+  ) {}
+
+  get length(): number {
+    return this.#length;
+  }
+
+  push(byte: number): void {
+    if (this.#length >= this.limit) throw new CorruptError(`tree ${this.label} is too long`);
+    if (this.#length === this.#bytes.length) {
+      const grown = new Uint8Array(Math.min(this.#bytes.length * 2, this.limit));
+      grown.set(this.#bytes);
+      this.#bytes = grown;
+    }
+    this.#bytes[this.#length++] = byte;
+  }
+
+  take(): Uint8Array {
+    const value = this.#bytes.slice(0, this.#length);
+    this.#length = 0;
+    return value;
+  }
+}
+
+/** Parse raw tree chunks while retaining only the current entry. */
+export function* parseTreeStream(chunks: Iterable<Uint8Array>): Generator<ParsedTreeEntry> {
+  const mode = new ByteField(6, "mode");
+  const name = new ByteField(2_200, "entry name");
+  const oid = new Uint8Array(20);
+  let state: "mode" | "name" | "oid" = "mode";
+  let modeText = "";
+  let nameBytes: Uint8Array = new Uint8Array(0);
+  let oidAt = 0;
+  for (const chunk of chunks) {
+    for (const byte of chunk) {
+      if (state === "mode") {
+        if (byte === 0x20) {
+          modeText = utf8Decoder.decode(mode.take());
+          state = "name";
+        } else {
+          mode.push(byte);
+        }
+      } else if (state === "name") {
+        if (byte === 0) {
+          nameBytes = name.take();
+          state = "oid";
+          oidAt = 0;
+        } else {
+          name.push(byte);
+        }
+      } else {
+        oid[oidAt++] = byte;
+        if (oidAt === oid.length) {
+          yield {
+            entry: {
+              mode: modeText,
+              name: utf8Decoder.decode(nameBytes),
+              oid: toHex(oid),
+            },
+            nameBytes,
+            rawEntry: concat([
+              utf8.encode(modeText),
+              new Uint8Array([0x20]),
+              nameBytes,
+              new Uint8Array([0]),
+              oid.slice(),
+            ]),
+          };
+          state = "mode";
+        }
+      }
+    }
+  }
+  if (state !== "mode" || mode.length !== 0) throw new CorruptError("malformed tree entry");
 }
 
 /**

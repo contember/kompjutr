@@ -6,7 +6,7 @@ import { GitError, MissingIdentityError } from "../errors.js";
 import { type Commit, type Person, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import type { CommitResult } from "./kinds.js";
-import { buildTree } from "./tree-build.js";
+import { buildTreeInBatch } from "./tree-build.js";
 
 /** Mirrors Computer's `GitCommitOptions`, minus `dir` — the repository is already resolved. */
 export interface CommitOptions {
@@ -39,11 +39,13 @@ export function commit(
   const { author, committer } = resolveIdentity(context, repo, options, amended);
 
   // A paged scan, so the index never exists as one array alongside the build.
-  const tree = buildTree(repo, repo.store.indexScan());
-  const oid = repo.store.write(
-    "commit",
-    serializeCommit({ tree, parent, author, committer, message: cleanMessage(options.message) }),
-  );
+  const oid = repo.store.writeObjects((batch) => {
+    const tree = buildTreeInBatch(batch, repo.store.indexScan({ pageSize: 2048 }));
+    return batch.write(
+      "commit",
+      serializeCommit({ tree, parent, author, committer, message: cleanMessage(options.message) }),
+    );
+  });
 
   repo.store.db.transactionSync(() => {
     // A symbolic HEAD on an unborn branch creates the branch here.

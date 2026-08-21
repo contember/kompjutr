@@ -1,33 +1,82 @@
 // node:sqlite-backed DurableObjectStorageLike, so the whole stack can run
 // under plain vitest. Workers' DO SQL surface is a subset of this.
 
-import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 
 import type { DurableObjectStorageLike, SQLCursorLike } from "./types.js";
 
-class Cursor<Row extends object> implements SQLCursorLike<Row> {
-  constructor(private readonly rows: Row[]) {}
+function isObjectRow<Row extends object>(value: unknown): value is Row {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+class Cursor<Row extends object> implements SQLCursorLike<Row>, IterableIterator<Row> {
+  #prefetched: IteratorResult<unknown> | null;
+  #finished = false;
+
+  constructor(
+    private readonly iterator: Iterator<unknown>,
+    private readonly onRow: () => void,
+    private readonly onDone: () => void,
+  ) {
+    // Advancing once executes writes while keeping reads lazy.
+    this.#prefetched = this.#pull();
+  }
+
+  #pull(): IteratorResult<unknown> {
+    const step = this.iterator.next();
+    if (step.done === true && !this.#finished) {
+      this.#finished = true;
+      this.onDone();
+    } else this.onRow();
+    return step;
+  }
+
+  next(): IteratorResult<Row> {
+    if (this.#finished && this.#prefetched === null) return { done: true, value: undefined };
+    const step = this.#prefetched ?? this.#pull();
+    this.#prefetched = null;
+    if (step.done === true) return { done: true, value: undefined };
+    if (!isObjectRow<Row>(step.value)) throw new Error("SQLite yielded a non-row value");
+    return { done: false, value: step.value };
+  }
+
+  [Symbol.iterator](): IterableIterator<Row> {
+    return this;
+  }
+
   toArray(): Row[] {
-    return this.rows;
+    return Array.from(this);
   }
 }
 
-function toSQLiteValue(value: unknown): unknown {
+function toSQLiteValue(value: unknown): SQLInputValue {
   if (value instanceof ArrayBuffer) return new Uint8Array(value);
   if (ArrayBuffer.isView(value) && !(value instanceof Uint8Array)) {
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   }
   if (value === undefined) return null;
   if (typeof value === "boolean") return value ? 1 : 0;
-  return value;
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "bigint" ||
+    typeof value === "string" ||
+    value instanceof Uint8Array
+  ) {
+    return value;
+  }
+  throw new Error("unsupported SQLite binding");
 }
 
 export class SqliteTestStorage implements DurableObjectStorageLike {
   readonly db: DatabaseSync;
   readonly sql: {
-    exec: <Row extends object>(query: string, ...bindings: unknown[]) => SQLCursorLike<Row>;
+    exec: <Row extends object>(
+      query: string,
+      ...bindings: unknown[]
+    ) => SQLCursorLike<Row> & IterableIterator<Row>;
   };
-  #statements = new Map<string, StatementSync>();
+  #idleStatements = new Map<string, StatementSync[]>();
   #depth = 0;
 
   /**
@@ -50,24 +99,33 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.sql = {
-      exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
+      exec: <Row extends object>(
+        query: string,
+        ...bindings: unknown[]
+      ): SQLCursorLike<Row> & IterableIterator<Row> => {
         // Multi-statement scripts go through exec(); node:sqlite's prepare()
         // only accepts a single statement.
         this.#record(query);
         if (bindings.length === 0 && /;\s*\S/.test(query)) {
           this.db.exec(query);
           this.statementCount++;
-          return new Cursor<Row>([]);
+          return new Cursor<Row>(
+            [][Symbol.iterator](),
+            () => {
+              this.rowCount++;
+            },
+            () => {},
+          );
         }
-        let stmt = this.#statements.get(query);
-        if (stmt === undefined) {
-          stmt = this.db.prepare(query);
-          this.#statements.set(query, stmt);
-        }
-        const rows = (stmt.all(...(bindings.map(toSQLiteValue) as never[])) as Row[]) ?? [];
+        const stmt = this.#acquire(query);
         this.statementCount++;
-        this.rowCount += rows.length;
-        return new Cursor<Row>(rows);
+        return new Cursor<Row>(
+          stmt.iterate(...bindings.map(toSQLiteValue)),
+          () => {
+            this.rowCount++;
+          },
+          () => this.#release(query, stmt),
+        );
       },
     };
   }
@@ -78,10 +136,38 @@ export class SqliteTestStorage implements DurableObjectStorageLike {
     this.histogram.set(fingerprint, (this.histogram.get(fingerprint) ?? 0) + 1);
   }
 
+  #acquire(query: string): StatementSync {
+    const idle = this.#idleStatements.get(query);
+    return idle?.pop() ?? this.db.prepare(query);
+  }
+
+  #release(query: string, stmt: StatementSync): void {
+    const idle = this.#idleStatements.get(query);
+    if (idle === undefined) this.#idleStatements.set(query, [stmt]);
+    else if (idle.length === 0) idle.push(stmt);
+  }
+
   resetCounters(): void {
     this.statementCount = 0;
     this.rowCount = 0;
     this.histogram?.clear();
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    this.#record(query);
+    const stmt = this.#acquire(query);
+    this.statementCount++;
+    try {
+      for (const value of stmt.iterate(...bindings.map(toSQLiteValue))) {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+          throw new Error("SQLite yielded a non-row value");
+        }
+        this.rowCount++;
+        yield Object.fromEntries(Object.entries(value));
+      }
+    } finally {
+      this.#release(query, stmt);
+    }
   }
 
   transactionSync<T>(closure: () => T): T {

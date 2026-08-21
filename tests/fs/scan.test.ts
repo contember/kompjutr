@@ -176,6 +176,11 @@ class RecordingDatabase implements SqlDatabase {
     return this.inner.scalar<T>(query, ...bindings);
   }
 
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.queries.push({ query, bindings });
+    return this.inner.iterate(query, ...bindings);
+  }
+
   transactionSync<T>(closure: () => T): T {
     return this.inner.transactionSync(closure);
   }

@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
-import { hashObject } from "../src/core/objects.js";
+import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { ancestors, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -53,11 +53,26 @@ describe("repository registry", () => {
       "git_refs",
       "git_repositories",
       "git_shallow",
+      "git_tree_effective",
+      "git_tree_entries",
+      "git_tree_sources",
     ]);
   });
 });
 
 describe("loose objects", () => {
+  it("rejects an oversized tree name while the parser field is growing", () => {
+    const { store } = open();
+    const data = concat([
+      utf8.encode("100644 "),
+      new Uint8Array(2_201).fill(0x61),
+      new Uint8Array([0]),
+      new Uint8Array(20),
+    ]);
+    expect(() => store.write("tree", data)).toThrow(/entry name is too long/);
+    expect(store.objectCount()).toBe(0);
+  });
+
   it("round-trips through chunked storage", () => {
     const { store } = open();
     const data = new TextEncoder().encode("hello world\n");
@@ -85,6 +100,74 @@ describe("loose objects", () => {
     const oid = store.write("blob", new TextEncoder().encode("a"));
     expect(store.resolvePrefix(oid.slice(0, 7))).toBe(oid);
     expect(store.resolvePrefix("0".repeat(8))).toBeNull();
+  });
+});
+
+describe("effective tree sources", () => {
+  const effective = (db: TestDatabase, repoId: number, oid: string) =>
+    db.one<{ storage: string; source_id: number }>(
+      "SELECT storage, source_id FROM git_tree_effective WHERE repo_id = ? AND tree_oid = ?",
+      repoId,
+      oid,
+    );
+
+  it("tracks single and batch loose tree writes", () => {
+    const { db, store } = open();
+    const first = serializeTree([{ mode: MODE_FILE, name: "a", oid: "1".repeat(40) }]);
+    const second = serializeTree([{ mode: MODE_FILE, name: "b", oid: "2".repeat(40) }]);
+    const firstOid = store.write("tree", first);
+    const secondOid = store.writeObjects((batch) => batch.write("tree", second));
+
+    expect(effective(db, 1, firstOid)).toEqual({ storage: "loose", source_id: 0 });
+    expect(effective(db, 1, secondOid)).toEqual({ storage: "loose", source_id: 0 });
+  });
+
+  it("removes stale parsed rows before rewriting a deleted loose tree", () => {
+    const { db, store } = open();
+    const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: "1".repeat(40) }]);
+    const oid = store.write("tree", data);
+    db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", oid);
+    expect(
+      db.scalar<number>(
+        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
+        oid,
+      ),
+    ).toBe(0);
+
+    expect(store.write("tree", data)).toBe(oid);
+    expect([...store.walkTree(oid)]).toEqual([{ path: "a", mode: MODE_FILE, oid: "1".repeat(40) }]);
+  });
+
+  it("falls back to a complete packed copy when the loose tree is deleted", async () => {
+    const { db, store } = open();
+    const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: "1".repeat(40) }]);
+    const oid = store.write("tree", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", data);
+    writer.finish();
+    const { packId } = await store.packs.ingest(slices(concat(chunks), 64));
+
+    expect(effective(db, 1, oid)).toEqual({ storage: "loose", source_id: 0 });
+    db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", oid);
+    expect(effective(db, 1, oid)).toEqual({ storage: "pack", source_id: packId });
+    expect([...store.walkTree(oid)]).toEqual([{ path: "a", mode: MODE_FILE, oid: "1".repeat(40) }]);
+  });
+
+  it("isolates identical tree ids between repositories", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const first = database.open(database.create("/one", "ref: refs/heads/main"));
+    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    const data = serializeTree([{ mode: MODE_FILE, name: "same", oid: "1".repeat(40) }]);
+    const oid = first.write("tree", data);
+    expect(second.write("tree", data)).toBe(oid);
+
+    db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", oid);
+    expect(effective(db, 1, oid)).toBeUndefined();
+    expect(effective(db, 2, oid)).toEqual({ storage: "loose", source_id: 0 });
+    expect([...second.walkTree(oid)]).toHaveLength(1);
   });
 });
 
