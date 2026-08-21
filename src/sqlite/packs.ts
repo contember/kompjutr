@@ -41,6 +41,11 @@ export const PACK_CHUNK = 1024 * 1024;
  */
 export const MAX_DELTA_DEPTH = 50_000;
 
+/** Output and compressed graph bytes admitted by one bulk blob read. */
+export const MAX_PACK_BLOB_BATCH_BYTES = 4 * 1024 * 1024;
+const MAX_PACK_BLOB_GRAPH_ENTRIES = 4096;
+const MAX_PACK_BLOB_INPUTS = 4096;
+
 /** Recent (offset -> oid) pairs kept in memory for ofs-delta bases. */
 const OFFSET_WINDOW = 100_000;
 
@@ -58,18 +63,20 @@ export interface PackCacheOptions {
 const DEFAULT_CHUNK_BYTES = 4 * PACK_CHUNK;
 const DEFAULT_MAX_BUFFERED_ENTRY = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_LIMIT = 2 * 1024 * 1024;
-const DELTA_WORKING_BYTES = 48 * 1024 * 1024;
+export const MAX_PACK_DELTA_WORKING_BYTES = 48 * 1024 * 1024;
 const PACK_READ_BYTES = 1024 * 1024;
 const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
 const PACK_OBJECT_CACHE_RESERVE_BYTES = 16 * 1024 * 1024;
 const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
+const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
+const PACK_EXTERNAL_BASE_BYTES = MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024;
 
 // Delta buffers, one compressed row, both caches, both parsed-object sinks,
 // bounded commit re-inflation and inflater headroom peak below 100 MiB.
 const PACK_MEMORY_MODEL_BYTES =
-  DELTA_WORKING_BYTES +
+  MAX_PACK_DELTA_WORKING_BYTES +
   PACK_READ_BYTES +
   DEFAULT_CHUNK_BYTES +
   PACK_OBJECT_CACHE_RESERVE_BYTES +
@@ -81,8 +88,27 @@ if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
   throw new Error("pack memory model exceeds 100 MiB");
 }
 
+// Delta buffers, the lazy chunk row, both shared caches, compressed graph,
+// an external base stream, returned blobs, metadata and inflater headroom stay below 100 MiB.
+const PACK_BLOB_MEMORY_MODEL_BYTES =
+  MAX_PACK_DELTA_WORKING_BYTES +
+  PACK_READ_BYTES +
+  DEFAULT_CHUNK_BYTES +
+  PACK_OBJECT_CACHE_RESERVE_BYTES +
+  MAX_PACK_BLOB_BATCH_BYTES * 2 +
+  PACK_EXTERNAL_BASE_BYTES +
+  PACK_BLOB_GRAPH_METADATA_BYTES +
+  PACK_INFLATE_HEADROOM_BYTES;
+if (PACK_BLOB_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
+  throw new Error("packed blob batch memory model exceeds 100 MiB");
+}
+
 function packObjectKey(packId: number, oid: string): string {
   return `pack:${packId}:${oid}`;
+}
+
+function isObjectType(value: string): value is ObjectType {
+  return value === "blob" || value === "tree" || value === "commit" || value === "tag";
 }
 
 export interface PackedEntry {
@@ -125,6 +151,16 @@ export interface PackIngestResult {
 
 /** Resolves an oid the pack index does not hold (loose storage, thin-pack bases). */
 export type ExternalResolver = (oid: string) => RawObject | null;
+export type ExternalBatchResolver = (oids: readonly string[]) => Map<string, RawObject>;
+
+interface BulkPackRow extends PackObjectRow {
+  oid: string;
+}
+
+interface CompressedEntry {
+  bytes: Uint8Array;
+  filled: number;
+}
 
 /**
  * The largest a valid deflate stream can be for `size` bytes of input:
@@ -150,7 +186,7 @@ function checkDeltaWorkingSet(base: Uint8Array, delta: Uint8Array): void {
   const sourceSize = varint();
   const targetSize = varint();
   if (sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
-  if (base.length + delta.length + targetSize > DELTA_WORKING_BYTES) {
+  if (base.length + delta.length + targetSize > MAX_PACK_DELTA_WORKING_BYTES) {
     throw new CorruptError("delta working set exceeds 48 MiB");
   }
 }
@@ -159,7 +195,7 @@ function checkDeltaInflateBudget(base: Uint8Array, deltaSize: number): void {
   if (
     !Number.isSafeInteger(deltaSize) ||
     deltaSize < 0 ||
-    base.length + deltaSize > DELTA_WORKING_BYTES
+    base.length + deltaSize > MAX_PACK_DELTA_WORKING_BYTES
   ) {
     throw new CorruptError("delta input exceeds the bounded working set");
   }
@@ -268,6 +304,7 @@ export class PackStore {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
   readonly #external: ExternalResolver;
+  readonly #externalBatch: ExternalBatchResolver;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #chunks: ByteLru<string, Uint8Array>;
   readonly #maxBufferedEntry: number;
@@ -279,11 +316,13 @@ export class PackStore {
     repoId: number,
     objects: ByteLru<string, RawObject>,
     external: ExternalResolver,
+    externalBatch: ExternalBatchResolver,
     options: PackCacheOptions = {},
   ) {
     this.#db = db;
     this.#repoId = repoId;
     this.#external = external;
+    this.#externalBatch = externalBatch;
     this.#objects = objects;
     this.#chunks = new ByteLru(
       Math.min(options.chunkBytes ?? DEFAULT_CHUNK_BYTES, DEFAULT_CHUNK_BYTES),
@@ -421,6 +460,313 @@ export class PackStore {
     return object;
   }
 
+  /** Resolve packed blobs with one graph query and one physical chunk cursor. */
+  readBlobs(oids: readonly string[]): Map<string, Uint8Array> {
+    const wanted = [...new Set(oids)];
+    if (wanted.length === 0) return new Map();
+    if (wanted.length > MAX_PACK_BLOB_INPUTS) {
+      throw new GitError("E2BIG", `blob batch exceeds ${MAX_PACK_BLOB_INPUTS} packed inputs`);
+    }
+
+    const rows = this.#db.all<BulkPackRow>(
+      `WITH RECURSIVE
+         roots(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
+         reachable(oid) AS (
+           SELECT o.oid
+             FROM roots r
+             CROSS JOIN git_pack_objects o
+             CROSS JOIN git_pack_meta m
+            WHERE o.repo_id = ? AND o.oid = r.oid
+              AND m.repo_id = o.repo_id AND m.pack_id = o.pack_id AND m.state = 'complete'
+           UNION
+           SELECT base.oid
+             FROM reachable r
+             CROSS JOIN git_pack_objects child
+             CROSS JOIN git_pack_meta child_meta
+             CROSS JOIN git_pack_objects base
+             CROSS JOIN git_pack_meta base_meta
+            WHERE child.repo_id = ? AND child.oid = r.oid
+              AND child_meta.repo_id = child.repo_id
+              AND child_meta.pack_id = child.pack_id AND child_meta.state = 'complete'
+              AND base.repo_id = child.repo_id AND base.oid = child.base_oid
+              AND base_meta.repo_id = base.repo_id
+              AND base_meta.pack_id = base.pack_id AND base_meta.state = 'complete'
+         )
+       SELECT o.oid, o.pack_id, o.offset, o.data_off, o.data_len, o.type,
+              o.size, o.entry_size, o.base_oid
+         FROM reachable r
+         CROSS JOIN git_pack_objects o
+        WHERE o.repo_id = ? AND o.oid = r.oid
+        LIMIT ${MAX_PACK_BLOB_GRAPH_ENTRIES + 1}`,
+      JSON.stringify(wanted),
+      this.#repoId,
+      this.#repoId,
+      this.#repoId,
+    );
+    if (rows.length > MAX_PACK_BLOB_GRAPH_ENTRIES) {
+      throw new GitError("E2BIG", "packed blob dependency graph exceeds the bounded entry limit");
+    }
+
+    const entries = new Map<string, PackedEntry>();
+    for (const row of rows) {
+      if (
+        typeof row.oid !== "string" ||
+        row.oid.length !== 40 ||
+        !isObjectType(row.type) ||
+        !Number.isSafeInteger(row.pack_id) ||
+        !Number.isSafeInteger(row.offset) ||
+        !Number.isSafeInteger(row.data_off) ||
+        !Number.isSafeInteger(row.data_len) ||
+        !Number.isSafeInteger(row.size) ||
+        !Number.isSafeInteger(row.entry_size) ||
+        row.pack_id < 0 ||
+        row.offset < 0 ||
+        row.data_off < 0 ||
+        row.data_len < 0 ||
+        !Number.isSafeInteger(row.data_off + row.data_len) ||
+        row.size < 0 ||
+        row.entry_size < 0 ||
+        (row.base_oid !== null && (typeof row.base_oid !== "string" || row.base_oid.length !== 40))
+      ) {
+        throw new CorruptError("packed blob index contains invalid metadata");
+      }
+      entries.set(row.oid, {
+        oid: row.oid,
+        packId: row.pack_id,
+        offset: row.offset,
+        dataOff: row.data_off,
+        dataLen: row.data_len,
+        type: row.type,
+        size: row.size,
+        entrySize: row.entry_size,
+        baseOid: row.base_oid,
+      });
+    }
+    for (const oid of wanted) {
+      const entry = entries.get(oid);
+      if (entry === undefined) throw new CorruptError(`packed blob ${oid} has no complete source`);
+      if (entry.type !== "blob") throw new CorruptError(`${oid} is a ${entry.type}, not a blob`);
+    }
+
+    const needed = new Map<string, PackedEntry>();
+    const externalOids = new Set<string>();
+    for (const oid of wanted) {
+      let current = entries.get(oid)!;
+      if (this.#objects.get(packObjectKey(current.packId, oid)) !== undefined) continue;
+      const seen = new Set<string>();
+      let depth = 0;
+      for (;;) {
+        if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
+        seen.add(current.oid);
+        needed.set(current.oid, current);
+        if (current.baseOid === null) break;
+        if (depth >= this.#maxDeltaDepth) {
+          throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
+        }
+        depth++;
+        const next = entries.get(current.baseOid);
+        if (next === undefined) {
+          externalOids.add(current.baseOid);
+          break;
+        }
+        if (this.#objects.get(packObjectKey(next.packId, next.oid)) !== undefined) break;
+        current = next;
+      }
+    }
+
+    let compressedBytes = 0;
+    const compressed = new Map<string, CompressedEntry>();
+    const consumers = new Map<string, { entry: PackedEntry; output: CompressedEntry }[]>();
+    for (const entry of needed.values()) {
+      compressedBytes += entry.dataLen;
+      if (!Number.isSafeInteger(compressedBytes) || compressedBytes > MAX_PACK_BLOB_BATCH_BYTES) {
+        throw new GitError("E2BIG", "packed blob compressed graph exceeds the 4 MiB batch limit");
+      }
+      const output = { bytes: new Uint8Array(entry.dataLen), filled: 0 };
+      compressed.set(entry.oid, output);
+      if (entry.dataLen === 0) continue;
+      const first = Math.floor(entry.dataOff / PACK_CHUNK);
+      const last = Math.floor((entry.dataOff + entry.dataLen - 1) / PACK_CHUNK);
+      for (let seq = first; seq <= last; seq++) {
+        const key = `${entry.packId}:${seq}`;
+        const list = consumers.get(key);
+        const consumer = { entry, output };
+        if (list === undefined) consumers.set(key, [consumer]);
+        else list.push(consumer);
+      }
+    }
+
+    const copyChunk = (packId: number, seq: number, chunk: Uint8Array): void => {
+      for (const { entry, output } of consumers.get(`${packId}:${seq}`) ?? []) {
+        const chunkStart = seq * PACK_CHUNK;
+        const from = Math.max(entry.dataOff, chunkStart);
+        const to = Math.min(entry.dataOff + entry.dataLen, chunkStart + chunk.length);
+        if (to <= from) continue;
+        const target = from - entry.dataOff;
+        output.bytes.set(chunk.subarray(from - chunkStart, to - chunkStart), target);
+        output.filled += to - from;
+      }
+    };
+
+    const missingChunks: { p: number; q: number }[] = [];
+    for (const key of consumers.keys()) {
+      const separator = key.indexOf(":");
+      const packId = Number(key.slice(0, separator));
+      const seq = Number(key.slice(separator + 1));
+      const hit = this.#chunks.get(key);
+      if (hit === undefined) missingChunks.push({ p: packId, q: seq });
+      else copyChunk(packId, seq, hit);
+    }
+    missingChunks.sort((left, right) => left.p - right.p || left.q - right.q);
+    const returned = new Set<string>();
+    if (missingChunks.length > 0) {
+      for (const row of this.#db.iterate(
+        `WITH requested(pack_id, seq) AS (
+           SELECT json_extract(value, '$.p'), json_extract(value, '$.q') FROM json_each(?)
+         )
+         SELECT d.pack_id, d.seq, d.data
+           FROM requested r
+           JOIN git_pack_data d
+             ON d.repo_id = ? AND d.pack_id = r.pack_id AND d.seq = r.seq
+          WHERE length(d.data) <= ${PACK_CHUNK}
+          ORDER BY d.pack_id, d.seq`,
+        JSON.stringify(missingChunks),
+        this.#repoId,
+      )) {
+        if (!Number.isSafeInteger(row.pack_id) || !Number.isSafeInteger(row.seq)) {
+          throw new CorruptError("pack chunk query returned invalid coordinates");
+        }
+        const packId = Number(row.pack_id);
+        const seq = Number(row.seq);
+        const data = readBlob(row.data);
+        const key = `${packId}:${seq}`;
+        returned.add(key);
+        this.#chunks.set(key, data);
+        copyChunk(packId, seq, data);
+      }
+    }
+    for (const chunk of missingChunks) {
+      if (!returned.has(`${chunk.p}:${chunk.q}`)) {
+        throw new CorruptError(`pack ${chunk.p}: missing chunk ${chunk.q}`);
+      }
+    }
+    for (const [oid, value] of compressed) {
+      if (value.filled !== value.bytes.length) {
+        throw new CorruptError(`packed blob entry ${oid} exceeds its stored chunks`);
+      }
+    }
+
+    const external = this.#externalBatch([...externalOids]);
+    const result = new Map<string, Uint8Array>();
+    for (const oid of wanted) {
+      const first = entries.get(oid)!;
+      const cached = this.#objects.get(packObjectKey(first.packId, oid));
+      if (cached !== undefined) {
+        if (cached.type !== "blob") throw new CorruptError(`${oid} is not a blob`);
+        result.set(oid, cached.data);
+        continue;
+      }
+      const chain: PackedEntry[] = [];
+      const seen = new Set<string>();
+      let current = first;
+      let object: RawObject | undefined;
+      for (;;) {
+        if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
+        seen.add(current.oid);
+        if (current.baseOid === null) {
+          if (current.entrySize !== current.size) {
+            throw new CorruptError(
+              `pack entry at ${current.offset} has inconsistent size metadata`,
+            );
+          }
+          object = {
+            type: current.type,
+            data: this.#inflateCompressed(current, compressed.get(current.oid)?.bytes),
+          };
+          this.#cacheObject(current.packId, current.oid, object);
+          break;
+        }
+        if (chain.length >= this.#maxDeltaDepth) {
+          throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
+        }
+        chain.push(current);
+        const next = entries.get(current.baseOid);
+        if (next === undefined) {
+          object = external.get(current.baseOid);
+          if (object === undefined) {
+            throw new CorruptError(`missing delta base ${current.baseOid} for ${current.oid}`);
+          }
+          break;
+        }
+        const cachedBase = this.#objects.get(packObjectKey(next.packId, next.oid));
+        if (cachedBase !== undefined) {
+          object = cachedBase;
+          break;
+        }
+        current = next;
+      }
+      for (let index = chain.length - 1; index >= 0; index--) {
+        const entry = chain[index]!;
+        checkDeltaInflateBudget(object.data, entry.entrySize);
+        const delta = this.#inflateCompressed(entry, compressed.get(entry.oid)?.bytes);
+        checkDeltaWorkingSet(object.data, delta);
+        object = { type: object.type, data: applyDelta(object.data, delta) };
+        if (object.data.length !== entry.size || object.type !== entry.type) {
+          throw new CorruptError(`pack entry at ${entry.offset} has inconsistent type or size`);
+        }
+        this.#cacheObject(entry.packId, entry.oid, object);
+      }
+      if (object.type !== "blob" || object.data.length !== first.size) {
+        throw new CorruptError(`packed blob ${oid} has inconsistent type or size`);
+      }
+      result.set(oid, object.data);
+    }
+    return result;
+  }
+
+  #inflateCompressed(entry: PackedEntry, compressed: Uint8Array | undefined): Uint8Array {
+    if (compressed === undefined) {
+      throw new CorruptError(`packed blob entry ${entry.oid} was not loaded`);
+    }
+    return this.#inflateBytes(compressed, entry.entrySize, `pack entry at ${entry.offset}`);
+  }
+
+  #inflateBytes(input: Uint8Array, expectedSize: number, label: string): Uint8Array {
+    if (
+      !Number.isSafeInteger(expectedSize) ||
+      expectedSize < 0 ||
+      expectedSize > MAX_PACK_DELTA_WORKING_BYTES
+    ) {
+      throw new CorruptError(`${label} exceeds the bounded inflate limit`);
+    }
+    const result = new Uint8Array(expectedSize);
+    let produced = 0;
+    const stream = new InflateStream((chunk) => {
+      if (chunk.length > expectedSize - produced) {
+        throw new CorruptError(`${label} exceeds its indexed size`);
+      }
+      result.set(chunk, produced);
+      produced += chunk.length;
+    });
+    let consumed = 0;
+    try {
+      while (!stream.ended && consumed < input.length) {
+        const used = stream.push(input.subarray(consumed));
+        consumed += used;
+        if (!stream.ended && used === 0) {
+          throw new CorruptError(`${label} inflater made no progress`);
+        }
+      }
+    } catch (error) {
+      if (error instanceof CorruptError) throw error;
+      throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+    }
+    if (!stream.ended || consumed !== input.length || produced !== expectedSize) {
+      throw new CorruptError(`${label} size does not match its index metadata`);
+    }
+    return result;
+  }
+
   #cacheObject(packId: number, oid: string, object: RawObject): void {
     if (object.data.length <= this.#cacheEntryLimit) {
       this.#objects.set(packObjectKey(packId, oid), object);
@@ -450,7 +796,7 @@ export class PackStore {
       !Number.isSafeInteger(expectedSize) ||
       dataLen < 0 ||
       expectedSize < 0 ||
-      expectedSize > DELTA_WORKING_BYTES
+      expectedSize > MAX_PACK_DELTA_WORKING_BYTES
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
     }

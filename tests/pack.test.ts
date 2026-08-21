@@ -132,6 +132,126 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
+  it("bulk-reads 1,000 shuffled packed and delta blobs without scalar fallback", async () => {
+    const store = open();
+    const objects = Array.from({ length: 1_000 }, (_, index) => {
+      const data = new Uint8Array(513).fill(index & 0xff);
+      data[0] = index & 0xff;
+      data[1] = index >>> 8;
+      return { data, oid: hashObject("blob", data) };
+    });
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(objects.length * 2);
+    const base = objects[0]!;
+    for (const object of objects) {
+      if (object === base) writer.object("blob", object.data);
+      else writer.refDelta(base.oid, literalDelta(base.data.length, object.data));
+      writer.object("blob", new Uint8Array(randomBytes(8 * 1024)));
+    }
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    const wanted = objects.map((object) => object.oid).reverse();
+    const db = store.db;
+    if (!(db instanceof TestDatabase)) throw new Error("expected test database");
+    const coldDatabase = new SqliteGitDatabase(db, { objectCacheBytes: 1024 * 1024 });
+    const repository = coldDatabase.find("/repo");
+    if (repository === null) throw new Error("repository missing after pack ingest");
+    const cold = coldDatabase.open(repository);
+    db.storage.resetCounters();
+
+    const started = performance.now();
+    const first = cold.readBlobs([wanted[0]!, ...wanted, wanted[0]!], {
+      budgetBytes: 1024 * 1024,
+    });
+    const elapsed = performance.now() - started;
+    expect(first.remaining).toEqual([]);
+    expect(first.blobs.size).toBe(1_000);
+    for (const object of objects) expect(first.blobs.get(object.oid)).toEqual(object.data);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(5);
+    expect(elapsed).toBeLessThan(100);
+
+    db.storage.resetCounters();
+    const second = cold.readBlobs(wanted, { budgetBytes: 1024 * 1024 });
+    expect(second.blobs).toEqual(first.blobs);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(2);
+  });
+
+  it("does not write a loose shadow for an existing packed object", async () => {
+    const store = open();
+    const data = utf8.encode("packed only\n");
+    const oid = hashObject("blob", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("blob", data);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+    store.writeObjects((batch) => {
+      expect(batch.write("blob", data)).toBe(oid);
+      expect(batch.write("blob", data)).toBe(oid);
+    });
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_objects WHERE oid = ?", oid)).toBe(0);
+    expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it("bulk-resolves packed deltas before a corrupt loose base duplicate", async () => {
+    const store = open();
+    const base = utf8.encode("base content\n".repeat(20));
+    const baseOid = hashObject("blob", base);
+    const target = utf8.encode(`${utf8Decoder.decode(base)}extra\n`);
+    const targetOid = hashObject("blob", target);
+    const delta = literalDelta(base.length, target);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("blob", base);
+    writer.refDelta(baseOid, delta);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+    store.db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, ?, 'blob', ?, 'raw')",
+      baseOid,
+      base.length,
+    );
+    store.db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (1, ?, 0, ?)",
+      baseOid,
+      new Uint8Array([0]),
+    );
+    const db = store.db;
+    if (!(db instanceof TestDatabase)) throw new Error("expected test database");
+    const coldDatabase = new SqliteGitDatabase(db);
+    const repository = coldDatabase.find("/repo");
+    if (repository === null) throw new Error("repository missing after pack ingest");
+    expect(coldDatabase.open(repository).readBlobs([targetOid]).blobs.get(targetOid)).toEqual(
+      target,
+    );
+  });
+
+  it("fails a corrupt loose shadow instead of falling through to the pack", async () => {
+    const store = open();
+    const data = utf8.encode("shadowed\n");
+    const oid = hashObject("blob", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("blob", data);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+    store.db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, ?, 'blob', ?, 'raw')",
+      oid,
+      data.length,
+    );
+    store.db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (1, ?, 0, ?)",
+      oid,
+      new Uint8Array([0]),
+    );
+    expect(() => store.readBlobs([oid])).toThrow(/size/);
+  });
+
   it("adds at most two statements when indexing 500 commits", async () => {
     const measure = async (type: "blob" | "commit") => {
       const db = new TestDatabase();
@@ -427,6 +547,24 @@ describe("synthetic pack ingest", () => {
     db.storage.resetCounters();
     expect(() => store.packs.readRaw(1, 0, 100 * 1024 * 1024)).toThrow(/bounded region/);
     expect(db.storage.statementCount).toBe(0);
+  });
+
+  it("stops bulk inflate when output exceeds the indexed size", async () => {
+    const store = open();
+    const data = new Uint8Array(2 * 1024 * 1024);
+    const oid = hashObject("blob", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("blob", data);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    store.db.run(
+      "UPDATE git_pack_objects SET size = 1, entry_size = 1 WHERE repo_id = 1 AND oid = ?",
+      oid,
+    );
+
+    expect(() => store.readBlobs([oid])).toThrow(/exceeds its indexed size/);
   });
 
   it("keeps the production delta limit and enforces its exact boundary", async () => {

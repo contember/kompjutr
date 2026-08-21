@@ -3,8 +3,8 @@
 
 import pako from "pako";
 
-import { concat, toHex } from "../core/bytes.js";
-import { CorruptError, GitError } from "../core/errors.js";
+import { concat, isOid, toHex } from "../core/bytes.js";
+import { CorruptError, GitError, ObjectNotFoundError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
 import { Sha1 } from "../core/sha1.js";
@@ -21,7 +21,12 @@ import {
   readCommitGraph,
 } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
-import { type PackCacheOptions, PackStore } from "./packs.js";
+import {
+  MAX_PACK_BLOB_BATCH_BYTES,
+  MAX_PACK_DELTA_WORKING_BYTES,
+  type PackCacheOptions,
+  PackStore,
+} from "./packs.js";
 import {
   indexTreeSource,
   indexTreeSources,
@@ -52,6 +57,14 @@ const DEFAULT_OBJECT_FLUSH = 4096;
 
 /** Oids per existence-probe statement, bounding the same JSON parameter. */
 const OID_PROBE_PAGE = 4096;
+
+/** Opaque content ids encoded into one SQL BLOB parameter per statement. */
+const CONTENT_ID_PAYLOAD = 1024 * 1024;
+const CONTENT_ID_PAGE = 4096;
+
+/** A blob batch shares the pack reader's conservative memory budget. */
+export const MAX_BLOB_BATCH_BYTES = MAX_PACK_BLOB_BATCH_BYTES;
+const MAX_BLOB_BATCH_OIDS = 4096;
 
 /** Index rows per round trip. This is the memory bound of a scan. */
 const DEFAULT_INDEX_PAGE = 512;
@@ -118,6 +131,25 @@ export interface ObjectBatchOptions {
   payloadBytes?: number;
   /** Objects buffered before a flush. */
   flushEvery?: number;
+}
+
+export interface BlobIdMapping {
+  contentId: Uint8Array;
+  oid: string;
+}
+
+export interface BlobReadBatch {
+  /** Complete blob contents, keyed by oid in first-occurrence input order. */
+  blobs: Map<string, Uint8Array>;
+  /** Deduplicated oids deferred to the next call. */
+  remaining: string[];
+  /** Sum of the returned blob sizes. */
+  bytes: number;
+}
+
+/** Stable, collision-free key for an opaque binary content id. */
+export function contentIdKey(contentId: Uint8Array): string {
+  return toHex(contentId);
 }
 
 /**
@@ -431,6 +463,45 @@ interface ChunkPayload {
   rows: { o: string; q: number; a: number; n: number }[];
 }
 
+interface ContentIdPage {
+  payload: Uint8Array;
+  rows: { a: number; n: number }[];
+}
+
+function contentIdPages(contentIds: Iterable<Uint8Array>): ContentIdPage[] {
+  const unique = new Map<string, Uint8Array>();
+  for (const contentId of contentIds) {
+    if (contentId.length > CONTENT_ID_PAYLOAD) {
+      throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
+    }
+    unique.set(contentIdKey(contentId), contentId);
+  }
+  const pages: ContentIdPage[] = [];
+  let parts: Uint8Array[] = [];
+  let rows: { a: number; n: number }[] = [];
+  let length = 0;
+  const flush = (): void => {
+    if (rows.length === 0) return;
+    pages.push({ payload: concat(parts), rows });
+    parts = [];
+    rows = [];
+    length = 0;
+  };
+  for (const contentId of unique.values()) {
+    if (
+      rows.length > 0 &&
+      (rows.length >= CONTENT_ID_PAGE || length + contentId.length > CONTENT_ID_PAYLOAD)
+    ) {
+      flush();
+    }
+    rows.push({ a: length + 1, n: contentId.length });
+    parts.push(contentId);
+    length += contentId.length;
+  }
+  flush();
+  return pages;
+}
+
 function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
   if (result.written !== expected || result.eligible !== expected || result.skipped !== 0) {
     throw new CorruptError(`commit cache wrote ${result.written} of ${expected} required rows`);
@@ -647,6 +718,7 @@ export class RepoStore {
       repository.id,
       this.#objects,
       (oid) => this.#readLoose(oid),
+      (oids) => this.#readLooseObjects(oids),
       options,
     );
     this.#hasLoose =
@@ -679,6 +751,83 @@ export class RepoStore {
 
   // -- objects --------------------------------------------------------
 
+  /** Look up opaque filesystem content ids without interpreting their bytes. */
+  lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
+    const found = new Map<string, string>();
+    for (const page of contentIdPages(contentIds)) {
+      for (const row of this.#db.all<{ content_key: string; oid: string }>(
+        `WITH ids(content_id) AS MATERIALIZED (
+           SELECT CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
+                       ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
+                   END
+             FROM json_each(?)
+         )
+         SELECT lower(hex(ids.content_id)) AS content_key, b.oid
+           FROM ids
+           JOIN git_blob_ids b ON b.repo_id = ? AND b.content_id = ids.content_id`,
+        blob(page.payload),
+        JSON.stringify(page.rows),
+        this.#repoId,
+      )) {
+        if (typeof row.content_key !== "string" || !isOid(row.oid)) {
+          throw new CorruptError("blob id lookup returned an invalid mapping");
+        }
+        found.set(row.content_key, row.oid);
+      }
+    }
+    return found;
+  }
+
+  /** Upsert opaque content-id mappings in bounded BLOB payloads. */
+  upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
+    const unique = new Map<string, BlobIdMapping>();
+    for (const mapping of mappings) {
+      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+      if (mapping.contentId.length > CONTENT_ID_PAYLOAD) {
+        throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
+      }
+      unique.set(contentIdKey(mapping.contentId), mapping);
+    }
+    if (unique.size === 0) return;
+    this.#db.transactionSync(() => {
+      let parts: Uint8Array[] = [];
+      let rows: { a: number; n: number; o: string }[] = [];
+      let length = 0;
+      const flush = (): void => {
+        if (rows.length === 0) return;
+        this.#db.run(
+          `INSERT INTO git_blob_ids (repo_id, content_id, oid)
+         SELECT ?,
+                CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
+                     ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
+                 END,
+                json_extract(value, '$.o')
+           FROM json_each(?)
+          WHERE true
+         ON CONFLICT(repo_id, content_id) DO UPDATE SET oid = excluded.oid`,
+          this.#repoId,
+          blob(concat(parts)),
+          JSON.stringify(rows),
+        );
+        parts = [];
+        rows = [];
+        length = 0;
+      };
+      for (const mapping of unique.values()) {
+        if (
+          rows.length > 0 &&
+          (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+        ) {
+          flush();
+        }
+        rows.push({ a: length + 1, n: mapping.contentId.length, o: mapping.oid });
+        parts.push(mapping.contentId);
+        length += mapping.contentId.length;
+      }
+      flush();
+    });
+  }
+
   has(oid: string): boolean {
     if (this.#hasLoose && this.#looseRow(oid) !== null) return true;
     return this.#packs.typeAndSize(oid) !== null;
@@ -698,7 +847,12 @@ export class RepoStore {
       for (const row of this.#db.all<{ oid: string }>(
         `SELECT j.value AS oid FROM json_each(?) j
           WHERE EXISTS (SELECT 1 FROM git_objects o WHERE o.repo_id = ? AND o.oid = j.value)
-             OR EXISTS (SELECT 1 FROM git_pack_objects p WHERE p.repo_id = ? AND p.oid = j.value)`,
+             OR EXISTS (
+               SELECT 1 FROM git_pack_objects p
+               JOIN git_pack_meta m
+                 ON m.repo_id = p.repo_id AND m.pack_id = p.pack_id AND m.state = 'complete'
+                WHERE p.repo_id = ? AND p.oid = j.value
+             )`,
         JSON.stringify(page),
         this.#repoId,
         this.#repoId,
@@ -734,6 +888,97 @@ export class RepoStore {
     const cached = this.#objects.get(`loose:${oid}`);
     if (cached !== undefined) return cached;
     return this.#readLoose(oid) ?? this.#packs.read(oid);
+  }
+
+  /** Read a deduplicated prefix of blobs under an explicit byte budget. */
+  readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
+    const budget = options.budgetBytes ?? MAX_BLOB_BATCH_BYTES;
+    if (!Number.isSafeInteger(budget) || budget <= 0 || budget > MAX_BLOB_BATCH_BYTES) {
+      throw new RangeError(`blob read budget must be an integer from 1 to ${MAX_BLOB_BATCH_BYTES}`);
+    }
+    const wanted = [...new Set(oids)];
+    if (wanted.length > MAX_BLOB_BATCH_OIDS) {
+      throw new GitError("E2BIG", `blob batch exceeds ${MAX_BLOB_BATCH_OIDS} inputs`);
+    }
+    for (const oid of wanted) {
+      if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
+    }
+    if (wanted.length === 0) return { blobs: new Map(), remaining: [], bytes: 0 };
+
+    const metadata = this.#db.all<{
+      ordinal: number;
+      oid: string;
+      source: string | null;
+      type: string | null;
+      size: number | null;
+      stored: string | null;
+    }>(
+      `WITH wanted(ordinal, oid) AS (
+         SELECT CAST(key AS INTEGER), value FROM json_each(?)
+       )
+       SELECT w.ordinal, w.oid,
+              CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+                   WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.type
+                   WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.size
+                   WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
+              loose.stored
+         FROM wanted w
+         LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
+         LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
+         LEFT JOIN git_pack_meta pack
+           ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
+          AND pack.state = 'complete'
+        ORDER BY w.ordinal`,
+      JSON.stringify(wanted),
+      this.#repoId,
+      this.#repoId,
+    );
+    if (metadata.length !== wanted.length) {
+      throw new CorruptError("blob metadata lookup returned the wrong row count");
+    }
+
+    const selected: typeof metadata = [];
+    let bytes = 0;
+    for (let index = 0; index < metadata.length; index++) {
+      const row = metadata[index]!;
+      if (
+        row.ordinal !== index ||
+        row.oid !== wanted[index] ||
+        (row.source !== "loose" && row.source !== "pack")
+      ) {
+        if (row.source === null) throw new ObjectNotFoundError(wanted[index]!);
+        throw new CorruptError("blob metadata lookup returned an invalid source");
+      }
+      if (row.type !== "blob") throw new CorruptError(`${row.oid} is a ${row.type}, not a blob`);
+      const size = row.size;
+      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
+        throw new CorruptError(`blob ${row.oid} has an invalid indexed size`);
+      }
+      if (bytes + size > budget) {
+        if (selected.length === 0) {
+          throw new GitError("EFBIG", `blob ${row.oid} exceeds the ${budget}-byte read budget`);
+        }
+        break;
+      }
+      selected.push(row);
+      bytes += size;
+    }
+
+    const looseRows = selected.filter((row) => row.source === "loose");
+    const packedOids = selected.filter((row) => row.source === "pack").map((row) => row.oid);
+    const loose = this.#readLooseBlobRows(looseRows);
+    const packed = this.#packs.readBlobs(packedOids);
+    const blobs = new Map<string, Uint8Array>();
+    for (const row of selected) {
+      const data = (row.source === "loose" ? loose : packed).get(row.oid);
+      if (data === undefined || data.length !== row.size) {
+        throw new CorruptError(`blob ${row.oid} did not produce its indexed bytes`);
+      }
+      blobs.set(row.oid, data);
+    }
+    return { blobs, remaining: wanted.slice(selected.length), bytes };
   }
 
   /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
@@ -1096,6 +1341,7 @@ export class RepoStore {
     const meta = JSON.stringify(
       staged.map((object) => ({ o: object.oid, t: object.type, s: object.size, e: object.stored })),
     );
+    let wroteLoose = false;
     this.#db.transactionSync(() => {
       const fresh: StagedObject[] = [];
       for (const row of this.#db.iterate(
@@ -1103,11 +1349,20 @@ export class RepoStore {
          SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.t'),
                 json_extract(j.value, '$.s'), json_extract(j.value, '$.e')
            FROM json_each(?) j
-          WHERE true
+          WHERE NOT EXISTS (
+            SELECT 1
+              FROM git_pack_objects packed
+              JOIN git_pack_meta pack
+                ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
+               AND pack.state = 'complete'
+             WHERE packed.repo_id = ?
+               AND packed.oid = json_extract(j.value, '$.o')
+          )
          ON CONFLICT(repo_id, oid) DO NOTHING
          RETURNING oid`,
         this.#repoId,
         meta,
+        this.#repoId,
       )) {
         if (typeof row.oid !== "string") {
           throw new CorruptError("object metadata insert returned an invalid oid");
@@ -1122,6 +1377,7 @@ export class RepoStore {
         requireCommitCacheWrites(insertCommitCaches(this.#db, commitEntries), commitEntries.length);
         return;
       }
+      wroteLoose = true;
 
       const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
       for (const object of fresh) {
@@ -1185,7 +1441,7 @@ export class RepoStore {
       );
       requireCommitCacheWrites(insertCommitCaches(this.#db, commitEntries), commitEntries.length);
     });
-    this.#hasLoose = true;
+    if (wroteLoose) this.#hasLoose = true;
   }
 
   /**
@@ -1296,6 +1552,125 @@ export class RepoStore {
     };
     this.#objects.set(`loose:${oid}`, object);
     return object;
+  }
+
+  #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {
+    if (oids.length === 0) return new Map();
+    const rows = this.#db.all<{
+      oid: string;
+      type: string;
+      size: number;
+      stored: string;
+    }>(
+      `SELECT wanted.value AS oid, object.type, object.size, object.stored
+         FROM json_each(?) wanted
+         JOIN git_objects object ON object.repo_id = ? AND object.oid = wanted.value`,
+      JSON.stringify(oids),
+      this.#repoId,
+    );
+    return new Map(
+      [...this.#readLooseBlobRows(rows)].map(([oid, data]) => [oid, { type: "blob", data }]),
+    );
+  }
+
+  #readLooseBlobRows(
+    rows: readonly {
+      oid: string;
+      type: string | null;
+      size: number | null;
+      stored: string | null;
+    }[],
+  ): Map<string, Uint8Array> {
+    if (rows.length === 0) return new Map();
+    const wanted = rows.map((row) => row.oid);
+    const gate = this.#db.all<{
+      oid: string;
+      chunks: number;
+      first_seq: number | null;
+      last_seq: number | null;
+      largest_chunk: number;
+      stored_bytes: number;
+    }>(
+      `WITH wanted(ordinal, oid) AS (
+         SELECT CAST(key AS INTEGER), value FROM json_each(?)
+       )
+       SELECT w.oid, COUNT(c.seq) AS chunks, MIN(c.seq) AS first_seq,
+              MAX(c.seq) AS last_seq, COALESCE(MAX(length(c.data)), 0) AS largest_chunk,
+              COALESCE(SUM(length(c.data)), 0) AS stored_bytes
+         FROM wanted w
+         LEFT JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
+        GROUP BY w.ordinal, w.oid
+        ORDER BY w.ordinal`,
+      JSON.stringify(wanted),
+      this.#repoId,
+    );
+    let storedBytes = 0;
+    if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
+    for (let index = 0; index < gate.length; index++) {
+      const checked = gate[index]!;
+      const source = rows[index]!;
+      const chunks = Number(checked.chunks);
+      if (
+        checked.oid !== source.oid ||
+        !Number.isSafeInteger(chunks) ||
+        chunks <= 0 ||
+        checked.first_seq !== 0 ||
+        checked.last_seq !== chunks - 1 ||
+        !Number.isSafeInteger(checked.largest_chunk) ||
+        checked.largest_chunk < 0 ||
+        checked.largest_chunk > OBJECT_CHUNK ||
+        !Number.isSafeInteger(checked.stored_bytes) ||
+        checked.stored_bytes < 0
+      ) {
+        throw new CorruptError(`loose blob ${source.oid} has invalid chunk metadata`);
+      }
+      storedBytes += checked.stored_bytes;
+      if (!Number.isSafeInteger(storedBytes) || storedBytes > MAX_BLOB_BATCH_BYTES + 64 * 1024) {
+        throw new GitError("E2BIG", "loose blob storage exceeds the bounded batch limit");
+      }
+    }
+
+    const parts = new Map<string, Uint8Array[]>();
+    for (const row of this.#db.iterate(
+      `WITH wanted(ordinal, oid) AS (
+         SELECT CAST(key AS INTEGER), value FROM json_each(?)
+       )
+       SELECT w.oid, c.seq, c.data
+         FROM wanted w
+         JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
+        ORDER BY w.ordinal, c.seq`,
+      JSON.stringify(wanted),
+      this.#repoId,
+    )) {
+      if (typeof row.oid !== "string" || !Number.isSafeInteger(row.seq)) {
+        throw new CorruptError("loose blob query returned invalid chunk metadata");
+      }
+      const list = parts.get(row.oid);
+      if (list === undefined) parts.set(row.oid, [readBlob(row.data)]);
+      else list.push(readBlob(row.data));
+    }
+
+    const result = new Map<string, Uint8Array>();
+    for (const row of rows) {
+      if (row.type !== "blob") throw new CorruptError(`${row.oid} is not a blob`);
+      const size = row.size;
+      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
+        throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
+      }
+      if (size > MAX_PACK_DELTA_WORKING_BYTES) {
+        throw new GitError("E2BIG", `loose blob ${row.oid} exceeds the bounded inflate limit`);
+      }
+      const stored = parseLooseEncoding(row.stored ?? "");
+      const encoded = concat(parts.get(row.oid) ?? []);
+      const data = stored === "raw" ? encoded : inflate(encoded);
+      if (data.length !== size) {
+        throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
+      }
+      const object: RawObject = { type: "blob", data };
+      this.#objects.set(`loose:${row.oid}`, object);
+      result.set(row.oid, data);
+    }
+    return result;
   }
 
   // -- refs -----------------------------------------------------------
@@ -1682,6 +2057,7 @@ export class RepoStore {
     this.#db.transactionSync(() => {
       for (const table of [
         "git_refs",
+        "git_blob_ids",
         "git_config",
         "git_index",
         "git_shallow",

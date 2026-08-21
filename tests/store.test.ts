@@ -7,7 +7,7 @@ import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
 import { readBlob } from "../src/sqlite/db.js";
-import { ancestors, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { ancestors, contentIdKey, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 
@@ -59,6 +59,46 @@ describe("repository registry", () => {
       "git_tree_entries",
       "git_tree_sources",
     ]);
+  });
+});
+
+describe("blob id batches", () => {
+  it("round-trips 9,329 opaque binary ids in bounded statements", () => {
+    const { db, store } = open();
+    const mappings = Array.from({ length: 9_329 }, (_, index) => {
+      const contentId = new Uint8Array(20);
+      contentId[0] = index & 0xff;
+      contentId[1] = (index >>> 8) & 0xff;
+      contentId[2] = 0;
+      return { contentId, oid: index.toString(16).padStart(40, "0") };
+    });
+    mappings.push({ contentId: new Uint8Array(0), oid: "f".repeat(40) });
+    db.storage.resetCounters();
+    store.upsertBlobIds(mappings);
+    const writtenStatements = db.storage.statementCount;
+    const found = store.lookupBlobIds(mappings.map((mapping) => mapping.contentId));
+    const totalStatements = db.storage.statementCount;
+
+    expect(writtenStatements).toBeLessThanOrEqual(10);
+    expect(totalStatements).toBeLessThanOrEqual(20);
+    expect(found.size).toBe(mappings.length);
+    for (const mapping of mappings) {
+      expect(found.get(contentIdKey(mapping.contentId))).toBe(mapping.oid);
+    }
+  });
+
+  it("isolates mappings and removes them with their repository", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const first = database.open(database.create("/one", "ref: refs/heads/main"));
+    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    const contentId = new Uint8Array([0, 255, 0]);
+    first.upsertBlobIds([{ contentId, oid: "1".repeat(40) }]);
+    second.upsertBlobIds([{ contentId, oid: "2".repeat(40) }]);
+    expect(first.lookupBlobIds([contentId]).get(contentIdKey(contentId))).toBe("1".repeat(40));
+    expect(second.lookupBlobIds([contentId]).get(contentIdKey(contentId))).toBe("2".repeat(40));
+    first.destroy();
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids")).toBe(1);
   });
 });
 
@@ -122,6 +162,40 @@ describe("loose objects", () => {
     const oid = store.write("blob", new TextEncoder().encode("a"));
     expect(store.resolvePrefix(oid.slice(0, 7))).toBe(oid);
     expect(store.resolvePrefix("0".repeat(8))).toBeNull();
+  });
+
+  it("reads 1,000 loose blobs in one bounded batch", () => {
+    const { db, store } = open();
+    const expected = new Map<string, Uint8Array>();
+    store.writeObjects((batch) => {
+      for (let index = 0; index < 1_000; index++) {
+        const data = new Uint8Array(257).fill(index & 0xff);
+        data[0] = index & 0xff;
+        data[1] = index >>> 8;
+        expected.set(batch.write("blob", data), data);
+      }
+    });
+    const wanted = [...expected.keys()];
+    db.storage.resetCounters();
+    const read = store.readBlobs([wanted[0]!, ...wanted, wanted[0]!], {
+      budgetBytes: 1024 * 1024,
+    });
+    expect(read.remaining).toEqual([]);
+    expect(read.blobs.size).toBe(expected.size);
+    for (const [oid, data] of expected) expect(read.blobs.get(oid)).toEqual(data);
+    expect(db.storage.statementCount).toBe(3);
+  });
+
+  it("returns remaining at object boundaries and rejects no-progress reads", () => {
+    const { store } = open();
+    const first = store.write("blob", new Uint8Array(10));
+    const second = store.write("blob", new Uint8Array(20));
+    expect(store.readBlobs([first, second], { budgetBytes: 10 })).toEqual({
+      blobs: new Map([[first, new Uint8Array(10)]]),
+      remaining: [second],
+      bytes: 10,
+    });
+    expect(() => store.readBlobs([second], { budgetBytes: 10 })).toThrow(/EFBIG|exceeds/);
   });
 });
 

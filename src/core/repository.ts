@@ -8,7 +8,7 @@ import {
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
 } from "../sqlite/commits.js";
-import type { RepoStore } from "../sqlite/store.js";
+import type { BlobReadBatch, RepoStore } from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
@@ -180,6 +180,11 @@ export class Repository {
     const object = this.read(oid);
     if (object.type !== "blob") throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
     return object.data;
+  }
+
+  /** Read a bounded prefix of blobs without scalar object lookups. */
+  readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
+    return this.store.readBlobs(oids, options);
   }
 
   readTag(oid: string): Tag {

@@ -3,7 +3,7 @@ import { performance } from "node:perf_hooks";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { concat, utf8Decoder } from "../src/core/bytes.js";
+import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
 import { GitError } from "../src/core/errors.js";
 import {
   type Commit,
@@ -290,6 +290,18 @@ describe("bounded commit graph reads", () => {
 });
 
 describe("ls-tree and cat-file", () => {
+  it("exposes bounded blob batches through Repository", () => {
+    const firstData = utf8.encode("first\n");
+    const secondData = utf8.encode("second\n");
+    const first = repo.store.write("blob", firstData);
+    const second = repo.store.write("blob", secondData);
+    expect(repo.readBlobs([first, second, first], { budgetBytes: firstData.length })).toEqual({
+      blobs: new Map([[first, firstData]]),
+      remaining: [second],
+      bytes: firstData.length,
+    });
+  });
+
   it("lists one level like git", () => {
     const ours = lsTree(repo, "HEAD").map((e) => `${e.mode} ${e.type} ${e.oid}\t${e.path}`);
     const theirs = fixture.git("ls-tree", "HEAD").split("\n");
