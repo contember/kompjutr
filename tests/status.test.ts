@@ -14,6 +14,7 @@ import {
   statusMatrix,
 } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
+import { comparePaths } from "../src/core/streams.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -143,6 +144,7 @@ class BulkOnlyWorktree extends CountingWorktree {
 function buildStatusScale(
   fileCount = 9_329,
   directoryCount = 3_346,
+  pathPrefix = "",
 ): {
   workspace: TestRepository;
   entries: IndexEntry[];
@@ -156,7 +158,7 @@ function buildStatusScale(
   const paths = Array.from({ length: fileCount }, (_, index) => {
     const directory = index % directoryCount;
     const generation = Math.floor(index / directoryCount);
-    return `d${directory.toString().padStart(4, "0")}/f${generation
+    return `${pathPrefix}d${directory.toString().padStart(4, "0")}/f${generation
       .toString()
       .padStart(4, "0")}.txt`;
   });
@@ -573,15 +575,15 @@ describe("status cost", () => {
     expect(counting.reads).toBe(0);
   });
 
-  it("uses one bounded index pass and bulk worktree reads at repository scale", () => {
+  it("uses bounded index pages and bulk worktree reads at repository scale", () => {
     const { workspace, entries } = buildStatusScale();
     const worktree = new BulkOnlyWorktree(workspace.worktree);
     workspace.storage.histogram = new Map();
 
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(170);
-    expect(indexScanStatements(workspace)).toBe(19);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
+    expect(indexScanStatements(workspace)).toBe(38);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -595,12 +597,48 @@ describe("status cost", () => {
     const result = status(workspace.repo, worktree);
     expect(result).toHaveLength(1_000);
     expect(result.every((entry) => entry.worktree === "M")).toBe(true);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(170);
-    expect(indexScanStatements(workspace)).toBe(19);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
+    expect(indexScanStatements(workspace)).toBe(38);
     expect(worktree.bulkReadPaths).toHaveLength(1_000);
     expect(new Set(worktree.bulkReadPaths)).toEqual(
       new Set(changed.map((entry) => `/${entry.path}`)),
     );
+  });
+
+  it("streams a 24,252-file index and reports all 100 modifications", () => {
+    const prefix = `.next/server/app/${"route-segment-".repeat(9)}/`;
+    const { workspace, entries } = buildStatusScale(24_252, 3_346, prefix);
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+    workspace.storage.histogram = new Map();
+    // The former full-row snapshot rejects this exact index before the merge.
+    const materializedIndexBytes = entries.reduce(
+      (bytes, entry) =>
+        bytes + 256 + (48 + entry.path.length * 2) + (48 + entry.oid.length * 2) + 48,
+      0,
+    );
+    expect(materializedIndexBytes).toBeGreaterThan(STATUS_RETAINED_BYTES);
+
+    workspace.storage.resetCounters();
+    expect(status(workspace.repo, worktree)).toEqual([]);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(indexScanStatements(workspace)).toBe(96);
+    expect(worktree.bulkReadPaths).toEqual([]);
+
+    workspace.tick(60_000);
+    const changed = entries.slice(0, 100);
+    workspace.worktree.writeFiles(
+      changed.map((entry) => ({ path: `/${entry.path}`, bytes: utf8.encode("changed\n") })),
+    );
+    worktree.bulkReadPaths.length = 0;
+    workspace.storage.resetCounters();
+
+    const result = status(workspace.repo, worktree);
+    const expectedPaths = changed.map((entry) => entry.path).sort(comparePaths);
+    expect(result.map((entry) => entry.path)).toEqual(expectedPaths);
+    expect(result.every((entry) => entry.index === " " && entry.worktree === "M")).toBe(true);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(indexScanStatements(workspace)).toBe(96);
+    expect(worktree.bulkReadPaths).toEqual(expectedPaths.map((path) => `/${path}`));
   });
 
   it("does not infer an oid-shaped content identity and learns it after hashing", () => {
@@ -653,11 +691,11 @@ describe("status cost", () => {
     expect(large).toBeLessThanOrEqual(small + 2);
   });
 
-  it("fails before one retained index row crosses the status memory cap", () => {
+  it("fails before one retained tracked path and directory crosses the memory cap", () => {
     const workspace = makeRepo("/");
-    const suffix = "x".repeat(2_041);
+    const suffix = "x".repeat(2_030);
     const entry = (index: number): IndexEntry => ({
-      path: `${index.toString().padStart(7, "0")}${suffix}`,
+      path: `${index.toString().padStart(7, "0")}${suffix}/f`,
       stage: 0,
       mode: 0o100644,
       oid: "ab".repeat(20),
@@ -669,13 +707,11 @@ describe("status cost", () => {
     const accepted = Math.floor(STATUS_RETAINED_BYTES / retainedPerEntry);
     workspace.repo.store.indexReplace(Array.from({ length: accepted }, (_, index) => entry(index)));
 
-    expect(status(workspace.repo, workspace.worktree, { untrackedFiles: "all" })).toHaveLength(
-      accepted,
-    );
+    expect(status(workspace.repo, workspace.worktree)).toHaveLength(accepted);
     workspace.repo.store.indexPut(entry(accepted));
-    expect(() =>
-      status(workspace.repo, workspace.worktree, { untrackedFiles: "all" }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() => status(workspace.repo, workspace.worktree)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
   });
 });
 

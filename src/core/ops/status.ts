@@ -1,10 +1,10 @@
 // `status`, its three formatters, and `clean`.
 //
 // The cost model is the point: one `treeEntries` walk answers HEAD for
-// every path, one `indexEntries` read answers the index, and a file is
-// hashed only when the stat data cached in `git_index` no longer holds. A
-// repeated status over an untouched tree therefore reads no file content
-// at all.
+// every path, a bounded index prepass answers tracked-directory membership,
+// and a paged index stream answers the merge. A file is hashed only when the
+// stat data cached in `git_index` no longer holds. A repeated status over an
+// untouched tree therefore reads no file content at all.
 
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import { ZERO_OID } from "../bytes.js";
@@ -14,7 +14,7 @@ import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
+import { matchesPaths, stageZero, type TargetEntry, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
 import { treeStream } from "./tree-stream.js";
 import {
@@ -33,15 +33,14 @@ const ABSENT_MODE = "000000";
 /** Retained index, directory and tracked-path state for one status call. */
 export const STATUS_RETAINED_BYTES = 16 * 1024 * 1024;
 const STATUS_WINDOW_ROWS = 1000;
-const INDEX_ENTRY_FIXED_BYTES = 256;
 const DIRECTORY_FIXED_BYTES = 96;
 const SET_ENTRY_BYTES = 48;
 
 interface StatusIndexSnapshot {
-  entries: IndexEntry[];
   trackedDirs: Set<string>;
   trackedPaths: Set<string>;
   budget: RetainedStatusBudget;
+  retainsTrackedPaths: boolean;
 }
 
 class RetainedStatusBudget {
@@ -119,9 +118,9 @@ export function status(
  * path-ordered, so one three-way merge answers every path with one item of
  * state per side instead of two maps and a materialised walk.
  *
- * What is still proportional to the repository: the set of directories that
- * hold something tracked, which `-unormal` collapsing has to know before it
- * can decide, and which is bounded by directories rather than by files.
+ * What is still proportional to the repository: tracked path keys and the set
+ * of directories that hold something tracked, which `-unormal` collapsing
+ * has to know before it can decide. Full index rows remain paged.
  */
 export function* statusStream(
   repo: Repository,
@@ -129,9 +128,9 @@ export function* statusStream(
   options: StatusOptions = {},
 ): Generator<StatusDetail> {
   const collapse = (options.untrackedFiles ?? "normal") === "normal";
-  const snapshot = snapshotStatusIndex(repo, collapse);
-  const ignores = options.ignores ?? loadIgnoreMatcher(worktree, repo.root);
   const excluded = excludedRoots(repo.root, options.excludeRoots);
+  const snapshot = snapshotStatusIndex(repo, collapse, collapse || excluded.length > 0);
+  const ignores = options.ignores ?? loadIgnoreMatcher(worktree, repo.root);
   const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
   const buffered: BufferedStatusRow[] = [];
   let sourceRows = 0;
@@ -139,13 +138,13 @@ export function* statusStream(
 
   for (const row of joinSorted3(
     treeStream(repo, repo.headTree()),
-    snapshot.entries,
+    stageZero(repo.store.indexScan()),
     worktreeEntries(repo, worktree, options, ignores, prunable),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
     sourceRows++;
     if (row.a !== undefined || row.b !== undefined) {
-      retainTrackedPath(snapshot, row.path);
+      if (snapshot.retainsTrackedPaths) retainTrackedPath(snapshot, row.path);
       if (matchesPaths(row.path, options.paths)) {
         const detail = trackedRow(row.path, row.a, row.b, row.c);
         if (detail !== null) buffered.push(detail);
@@ -174,7 +173,7 @@ export function* statusStream(
       if (
         (matchesPaths(path, options.paths) || matchesPaths(row.path, options.paths)) &&
         // A tracked file replaced by a directory is a deletion, not a new directory.
-        !snapshot.trackedPaths.has(stripSlash(path))
+        (!collapse || !snapshot.trackedPaths.has(stripSlash(path)))
       ) {
         buffered.push({ kind: "ready", detail: untrackedRow(path) });
       }
@@ -404,19 +403,26 @@ function worktreeWalkOptions(
 }
 
 /**
- * Snapshot stage zero once. Normal untracked collapsing needs all tracked
- * directories before the merge reaches its first worktree path.
+ * Snapshot only stage-zero path keys. Normal untracked collapsing needs all
+ * tracked directories before the merge reaches its first worktree path.
  */
-function snapshotStatusIndex(repo: Repository, includeDirectories: boolean): StatusIndexSnapshot {
+function snapshotStatusIndex(
+  repo: Repository,
+  includeDirectories: boolean,
+  includeTrackedPaths: boolean,
+): StatusIndexSnapshot {
   const budget = new RetainedStatusBudget(STATUS_RETAINED_BYTES);
-  const entries: IndexEntry[] = [];
   const trackedDirs = new Set<string>();
   const trackedPaths = new Set<string>();
+  if (!includeDirectories && !includeTrackedPaths) {
+    return { trackedDirs, trackedPaths, budget, retainsTrackedPaths: false };
+  }
   for (const entry of repo.store.indexScan()) {
     if (entry.stage !== 0) continue;
-    budget.add(statusIndexRetainedBytes(entry));
-    entries.push(entry);
-    trackedPaths.add(entry.path);
+    if (includeTrackedPaths) {
+      budget.add(trackedPathRetainedBytes(entry.path));
+      trackedPaths.add(entry.path);
+    }
     if (!includeDirectories) continue;
     for (
       let slash = entry.path.indexOf("/");
@@ -429,7 +435,7 @@ function snapshotStatusIndex(repo: Repository, includeDirectories: boolean): Sta
       trackedDirs.add(directory);
     }
   }
-  return { entries, trackedDirs, trackedPaths, budget };
+  return { trackedDirs, trackedPaths, budget, retainsTrackedPaths: includeTrackedPaths };
 }
 
 function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
@@ -438,14 +444,21 @@ function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
   snapshot.trackedPaths.add(path);
 }
 
-/** @internal Conservative charge for one retained stage-zero index row. */
+/** @internal Charge when one path and all its directory prefixes are new. */
 export function statusIndexRetainedBytes(entry: IndexEntry): number {
-  return (
-    INDEX_ENTRY_FIXED_BYTES +
-    retainedStringBytes(entry.path) +
-    retainedStringBytes(entry.oid) +
-    SET_ENTRY_BYTES
-  );
+  let bytes = trackedPathRetainedBytes(entry.path);
+  for (
+    let slash = entry.path.indexOf("/");
+    slash !== -1;
+    slash = entry.path.indexOf("/", slash + 1)
+  ) {
+    bytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(entry.path.slice(0, slash));
+  }
+  return bytes;
+}
+
+function trackedPathRetainedBytes(path: string): number {
+  return SET_ENTRY_BYTES + retainedStringBytes(path);
 }
 
 function retainedStringBytes(value: string): number {
