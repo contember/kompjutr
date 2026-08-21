@@ -70,7 +70,10 @@ export function inflatePrefix(
   maxOutputLength: number,
 ): { data: Uint8Array; consumed: number } | null {
   try {
+    // workerd's info path otherwise retains output slabs and concatenates them.
+    const chunkSize = Math.max(64, maxOutputLength + 1);
     const result: unknown = zlib.inflateSync(input, {
+      chunkSize,
       info: true,
       maxOutputLength: Math.max(1, maxOutputLength),
     });
@@ -78,6 +81,61 @@ export function inflatePrefix(
   } catch (error) {
     if (isTruncated(error)) return null;
     throw error;
+  }
+}
+
+export class InflateSizeError extends Error {}
+
+/** Incremental inflate directly into one caller-sized output allocation. */
+export class InflateInto {
+  readonly #inflate: pako.Inflate;
+  readonly #target: Uint8Array;
+  #inflated = 0;
+
+  constructor(expectedSize: number) {
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) {
+      throw new RangeError("invalid inflate output size");
+    }
+    this.#target = new Uint8Array(expectedSize);
+    const output = expectedSize === 0 ? new Uint8Array(1) : this.#target;
+    this.#inflate = new pako.Inflate({ chunkSize: INFLATE_CHUNK });
+    this.#inflate.strm.output = output;
+    this.#inflate.strm.next_out = 0;
+    this.#inflate.strm.avail_out = output.length;
+    this.#inflate.onData = (chunk) => {
+      if (!(chunk instanceof Uint8Array)) throw new Error("inflate produced a non-binary chunk");
+      if (
+        expectedSize === 0 ||
+        chunk.buffer !== this.#target.buffer ||
+        chunk.byteOffset !== this.#target.byteOffset + this.#inflated ||
+        chunk.length > expectedSize - this.#inflated
+      ) {
+        throw new InflateSizeError("inflate exceeded its expected size");
+      }
+      this.#inflated += chunk.length;
+    };
+  }
+
+  get ended(): boolean {
+    return this.#inflate.ended;
+  }
+
+  get inflated(): number {
+    return this.#inflated;
+  }
+
+  push(chunk: Uint8Array): number {
+    if (this.#inflate.ended) return 0;
+    this.#inflate.push(chunk, false);
+    if (this.#inflate.err) throw new Error(`inflate failed: ${this.#inflate.msg}`);
+    return this.#inflate.ended ? chunk.length - this.#inflate.strm.avail_in : chunk.length;
+  }
+
+  finish(): Uint8Array {
+    if (!this.#inflate.ended || this.#inflated !== this.#target.length) {
+      throw new Error("inflate output size does not match its expected size");
+    }
+    return this.#target;
   }
 }
 

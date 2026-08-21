@@ -18,7 +18,7 @@ import {
 } from "../core/objects.js";
 import { applyDelta } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
-import { InflateStream, inflatePrefix } from "../core/zlib.js";
+import { InflateInto, InflateSizeError, InflateStream, inflatePrefix } from "../core/zlib.js";
 import {
   type CommitCacheEntry,
   type CommitCacheSource,
@@ -114,6 +114,17 @@ if (PACK_BLOB_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
 
 function packObjectKey(packId: number, oid: string): string {
   return `pack:${packId}:${oid}`;
+}
+
+function pushExactInflate(stream: InflateInto, input: Uint8Array, label: string): number {
+  try {
+    return stream.push(input);
+  } catch (error) {
+    if (error instanceof InflateSizeError) {
+      throw new CorruptError(`${label} exceeds its indexed size`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 function isObjectType(value: string): value is ObjectType {
@@ -977,19 +988,11 @@ export class PackStore {
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
     }
-    const result = new Uint8Array(expectedSize);
-    let produced = 0;
-    const stream = new InflateStream((chunk) => {
-      if (chunk.length > expectedSize - produced) {
-        throw new CorruptError(`${label} exceeds its indexed size`);
-      }
-      result.set(chunk, produced);
-      produced += chunk.length;
-    });
+    const stream = new InflateInto(expectedSize);
     let consumed = 0;
     try {
       while (!stream.ended && consumed < input.length) {
-        const used = stream.push(input.subarray(consumed));
+        const used = pushExactInflate(stream, input.subarray(consumed), label);
         consumed += used;
         if (!stream.ended && used === 0) {
           throw new CorruptError(`${label} inflater made no progress`);
@@ -999,10 +1002,14 @@ export class PackStore {
       if (error instanceof CorruptError) throw error;
       throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
     }
-    if (!stream.ended || consumed !== input.length || produced !== expectedSize) {
+    if (!stream.ended || consumed !== input.length) {
       throw new CorruptError(`${label} size does not match its index metadata`);
     }
-    return result;
+    try {
+      return stream.finish();
+    } catch (error) {
+      throw new CorruptError(`${label} size does not match its index metadata`, { cause: error });
+    }
   }
 
   #cacheObject(packId: number, oid: string, object: RawObject): void {
@@ -1038,29 +1045,25 @@ export class PackStore {
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
     }
-    const result = new Uint8Array(expectedSize);
-    let produced = 0;
-    const stream = new InflateStream((chunk) => {
-      if (chunk.length > expectedSize - produced) {
-        throw new CorruptError(`${label} exceeds its indexed size`);
-      }
-      result.set(chunk, produced);
-      produced += chunk.length;
-    });
+    const stream = new InflateInto(expectedSize);
     let consumed = 0;
     while (!stream.ended && consumed < dataLen) {
       const length = Math.min(PACK_READ_BYTES, dataLen - consumed);
       const input = this.readRaw(packId, dataOff + consumed, length);
-      const used = stream.push(input);
+      const used = pushExactInflate(stream, input, label);
       consumed += used;
       if (!stream.ended && used !== input.length) {
         throw new CorruptError(`${label} inflater stopped before the stream ended`);
       }
     }
-    if (!stream.ended || consumed !== dataLen || produced !== expectedSize) {
+    if (!stream.ended || consumed !== dataLen) {
       throw new CorruptError(`${label} size does not match its index metadata`);
     }
-    return result;
+    try {
+      return stream.finish();
+    } catch (error) {
+      throw new CorruptError(`${label} size does not match its index metadata`, { cause: error });
+    }
   }
 
   /** Still-compressed bytes of a pack region, assembled from chunk rows. */
@@ -1905,23 +1908,27 @@ export class PackStore {
         return { data: exact.data, consumed: exact.consumed, streamedOid: null };
       }
     }
-    const chunks: Uint8Array[] = [];
+    const exactInflater = buffered ? new InflateInto(entrySize) : null;
     let produced = 0;
     const sha = type === null ? null : new Sha1().update(objectHeader(type, entrySize));
-    const stream = new InflateStream((chunk) => {
-      produced += chunk.length;
-      if (produced > entrySize) {
-        throw new CorruptError(`pack entry exceeds its declared size at ${dataOff}`);
-      }
-      sha?.update(chunk);
-      if (buffered) chunks.push(chunk);
-    });
+    const stream =
+      exactInflater ??
+      new InflateStream((chunk) => {
+        produced += chunk.length;
+        if (produced > entrySize) {
+          throw new CorruptError(`pack entry exceeds its declared size at ${dataOff}`);
+        }
+        sha?.update(chunk);
+      });
     reader.seek(dataOff);
     let consumed = 0;
     while (!stream.ended) {
       const window = reader.window();
       if (window.length === 0) throw new CorruptError(`truncated pack entry at ${dataOff}`);
-      const used = stream.push(window);
+      const used =
+        exactInflater === null
+          ? stream.push(window)
+          : pushExactInflate(exactInflater, window, `pack entry at ${dataOff}`);
       consumed += used;
       reader.seek(reader.position + (stream.ended ? used : window.length));
     }
@@ -1929,7 +1936,7 @@ export class PackStore {
       throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
     }
     return {
-      data: buffered ? concat(chunks) : null,
+      data: exactInflater?.finish() ?? null,
       consumed,
       streamedOid: buffered || sha === null ? null : toHex(sha.digest()),
     };

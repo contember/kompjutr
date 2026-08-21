@@ -8,7 +8,7 @@ import { CorruptError, GitError, ObjectNotFoundError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
 import { Sha1 } from "../core/sha1.js";
-import { deflate, InflateStream, inflate } from "../core/zlib.js";
+import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
 import {
   type CommitCacheEntry,
   type CommitCacheWriteResult,
@@ -1844,26 +1844,35 @@ export class RepoStore {
       if (stored === "raw") {
         data = encoded;
       } else {
-        data = new Uint8Array(size);
-        let produced = 0;
-        const stream = new InflateStream((chunk) => {
-          if (chunk.length > size - produced) {
-            throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`);
-          }
-          data.set(chunk, produced);
-          produced += chunk.length;
-        });
+        const stream = new InflateInto(size);
         let consumed = 0;
         while (!stream.ended && consumed < encoded.length) {
           const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
-          const used = stream.push(input);
+          let used: number;
+          try {
+            used = stream.push(input);
+          } catch (error) {
+            if (error instanceof InflateSizeError) {
+              throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
+                cause: error,
+              });
+            }
+            throw error;
+          }
           consumed += used;
           if (!stream.ended && used !== input.length) {
             throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
           }
         }
-        if (!stream.ended || consumed !== encoded.length || produced !== size) {
+        if (!stream.ended || consumed !== encoded.length) {
           throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
+        }
+        try {
+          data = stream.finish();
+        } catch (error) {
+          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`, {
+            cause: error,
+          });
         }
       }
       if (data.length !== size) {

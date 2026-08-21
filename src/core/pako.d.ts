@@ -8,6 +8,11 @@ export {};
 declare module "pako" {
   interface Inflate {
     readonly ended: boolean;
-    readonly strm: { readonly avail_in: number };
+    readonly strm: {
+      readonly avail_in: number;
+      output: Uint8Array;
+      next_out: number;
+      avail_out: number;
+    };
   }
 }
