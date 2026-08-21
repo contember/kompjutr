@@ -19,9 +19,9 @@ const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 
 /**
  * SQL statements one 2,000-file commit costs. Deterministic; see the scale
- * test. The trees and commit share one bounded object batch.
+ * test. The trees and commit share one bounded object batch and cache write.
  */
-const SCALE_STATEMENTS = 13;
+const SCALE_STATEMENTS = 14;
 
 const fixtures: GitFixture[] = [];
 
@@ -461,6 +461,6 @@ describe("scale", () => {
     expect(workspace.repo.readCommit(oid).tree).toBe(expectedTree);
     expect(oid).toBe(expectedCommit);
     expect(workspace.repo.store.objectCount() - before).toBe(3293);
-    expect(statements).toBe(14);
+    expect(statements).toBe(15);
   });
 });

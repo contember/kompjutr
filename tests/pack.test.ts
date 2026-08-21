@@ -2,15 +2,18 @@ import { randomBytes } from "node:crypto";
 
 import { afterAll, describe, expect, it } from "vitest";
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
+import { GitError } from "../src/core/errors.js";
 import {
   hashObject,
   MODE_FILE,
   parseCommit,
   parseTree,
+  serializeCommit,
   serializeTree,
 } from "../src/core/objects.js";
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { MAX_INDEXED_COMMIT_BYTES } from "../src/sqlite/commits.js";
 import { MAX_DELTA_DEPTH } from "../src/sqlite/packs.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -40,6 +43,35 @@ function syntheticTree(count: number): Uint8Array {
     out[at + 35] = index & 0xff;
   }
   return out;
+}
+
+function syntheticCommit(index: number, message = `commit ${index}\n`): Uint8Array {
+  return serializeCommit({
+    tree: index.toString(16).padStart(40, "0"),
+    parent: index === 0 ? [] : [(index - 1).toString(16).padStart(40, "0")],
+    author: {
+      name: "Pack Author",
+      email: "author@example.com",
+      timestamp: 1_700_000_000 + index,
+      timezoneOffset: 60,
+    },
+    committer: {
+      name: "Pack Committer",
+      email: "committer@example.com",
+      timestamp: 1_700_000_000 + index,
+      timezoneOffset: 60,
+    },
+    message,
+  });
+}
+
+function literalDelta(baseSize: number, target: Uint8Array): Uint8Array {
+  const chunks = [encodeDeltaHeader(baseSize, target.length)];
+  for (let offset = 0; offset < target.length; offset += 127) {
+    const part = target.subarray(offset, offset + 127);
+    chunks.push(new Uint8Array([part.length]), part);
+  }
+  return concat(chunks);
 }
 
 function deltaPack(depth: number): { bytes: Uint8Array; target: Uint8Array; targetOid: string } {
@@ -100,6 +132,228 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
+  it("adds at most two statements when indexing 500 commits", async () => {
+    const measure = async (type: "blob" | "commit") => {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const chunks: Uint8Array[] = [];
+      const writer = new PackWriter((chunk) => chunks.push(chunk));
+      writer.header(500);
+      for (let index = 0; index < 500; index++) writer.object(type, syntheticCommit(index));
+      writer.finish();
+      db.storage.resetCounters();
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+      const statements = db.storage.statementCount;
+      const cached = db.scalar<number>("SELECT COUNT(*) FROM git_commits") ?? 0;
+      return { statements, cached };
+    };
+
+    const blobs = await measure("blob");
+    const commits = await measure("commit");
+    expect(blobs.statements).toBe(508);
+    expect(commits.statements).toBe(509);
+    expect(commits.cached).toBe(500);
+    expect(commits.statements - blobs.statements).toBe(1);
+  });
+
+  it("indexes full, immediate-delta and deferred-delta commits", async () => {
+    const store = open();
+    const baseFirst = syntheticCommit(10, "base first\n");
+    const targetFirst = syntheticCommit(11, "resolved immediately\n");
+    const baseLater = syntheticCommit(20, "base later\n");
+    const targetLater = syntheticCommit(21, "resolved after its base\n");
+    const baseFirstOid = hashObject("commit", baseFirst);
+    const targetFirstOid = hashObject("commit", targetFirst);
+    const baseLaterOid = hashObject("commit", baseLater);
+    const targetLaterOid = hashObject("commit", targetLater);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(4);
+    writer.object("commit", baseFirst);
+    writer.refDelta(baseFirstOid, literalDelta(baseFirst.length, targetFirst));
+    writer.refDelta(baseLaterOid, literalDelta(baseLater.length, targetLater));
+    writer.object("commit", baseLater);
+    writer.finish();
+
+    await store.packs.ingest(slices(concat(chunks), 64));
+
+    for (const item of [
+      { oid: baseFirstOid, data: baseFirst },
+      { oid: targetFirstOid, data: targetFirst },
+      { oid: baseLaterOid, data: baseLater },
+      { oid: targetLaterOid, data: targetLater },
+    ]) {
+      expect(store.cachedCommit(item.oid)?.commit).toEqual(parseCommit(item.data));
+    }
+  });
+
+  it("re-inflates a buffered-limit commit and rejects an over-limit commit", async () => {
+    const database = new SqliteGitDatabase(new TestDatabase(), { maxBufferedEntry: 64 * 1024 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const bounded = syntheticCommit(1, `${"a".repeat(70 * 1024)}\n`);
+    const boundedOid = hashObject("commit", bounded);
+    const boundedChunks: Uint8Array[] = [];
+    const boundedWriter = new PackWriter((chunk) => boundedChunks.push(chunk));
+    boundedWriter.header(1);
+    boundedWriter.object("commit", bounded);
+    boundedWriter.finish();
+    await store.packs.ingest(slices(concat(boundedChunks), 4096));
+    expect(store.cachedCommit(boundedOid)?.commit).toEqual(parseCommit(bounded));
+
+    const oversized = syntheticCommit(2, "x".repeat(MAX_INDEXED_COMMIT_BYTES));
+    expect(oversized.length).toBeGreaterThan(MAX_INDEXED_COMMIT_BYTES);
+    const oversizedChunks: Uint8Array[] = [];
+    const oversizedWriter = new PackWriter((chunk) => oversizedChunks.push(chunk));
+    oversizedWriter.header(1);
+    oversizedWriter.object("commit", oversized);
+    oversizedWriter.finish();
+    let error: unknown;
+    try {
+      await store.packs.ingest(slices(concat(oversizedChunks), 64 * 1024));
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("E2BIG");
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(1);
+    expect(store.packs.reclaimPending()).toBe(1);
+  });
+
+  it("matches loose caching for a commit above the SQL page byte limit", async () => {
+    const data = syntheticCommit(9, "p".repeat(600_096));
+    const oid = hashObject("commit", data);
+
+    const loose = open();
+    expect(loose.write("commit", data)).toBe(oid);
+    const looseCache = loose.cachedCommit(oid);
+    expect(looseCache).not.toBeNull();
+    expect(looseCache?.cacheBytes).toBeGreaterThan(1024 * 1024);
+
+    const packed = open();
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("commit", data);
+    writer.finish();
+    await packed.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(
+      packed.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(1);
+    expect(packed.cachedCommit(oid)).toEqual(looseCache);
+  });
+
+  it("rolls pack completion back when final source validation writes short", async () => {
+    const store = open();
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1_024);
+    for (let index = 0; index < 1_024; index++) writer.object("commit", syntheticCommit(index));
+    writer.finish();
+
+    let error: unknown;
+    let removedOid = "";
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
+        yieldNow: async () => {
+          if (removedOid !== "") return;
+          const count =
+            store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_objects WHERE pack_id = 1") ?? 0;
+          if (count !== 1_024) return;
+          removedOid =
+            store.db.scalar<string>(
+              "SELECT oid FROM git_pack_objects WHERE pack_id = 1 ORDER BY offset DESC LIMIT 1",
+            ) ?? "";
+          store.db.run("DELETE FROM git_pack_objects WHERE pack_id = 1 AND oid = ?", removedOid);
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("ECORRUPT");
+    expect(removedOid).not.toBe("");
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(0);
+    expect(store.cachedCommit(removedOid)).toBeNull();
+    expect(store.packs.reclaimPending()).toBe(1);
+  });
+
+  it("makes staged commit batches visible on final completion", async () => {
+    const store = open();
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(500);
+    let firstOid = "";
+    for (let index = 0; index < 500; index++) {
+      const data = syntheticCommit(index, `${"s".repeat(10_000)} ${index}\n`);
+      if (index === 0) firstOid = hashObject("commit", data);
+      writer.object("commit", data);
+    }
+    writer.finish();
+
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(500);
+    expect(store.cachedCommit(firstOid)).not.toBeNull();
+  });
+
+  it("keeps staged cache rows hidden through failed ingest and orphan reclaim", async () => {
+    const store = open();
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(501);
+    const first = syntheticCommit(0, `${"m".repeat(10_000)} 0\n`);
+    const firstOid = hashObject("commit", first);
+    writer.object("commit", first);
+    for (let index = 1; index < 500; index++) {
+      writer.object("commit", syntheticCommit(index, `${"m".repeat(10_000)} ${index}\n`));
+    }
+    const missingBase = "f".repeat(40);
+    writer.refDelta(missingBase, literalDelta(1, syntheticCommit(501)));
+    writer.finish();
+
+    await expect(store.packs.ingest(slices(concat(chunks), 64 * 1024))).rejects.toThrow(
+      /missing base/,
+    );
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBeGreaterThan(0);
+    expect(store.cachedCommit(firstOid)).toBeNull();
+    store.db.run("DELETE FROM git_pack_meta WHERE state = 'pending'");
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBeGreaterThan(0);
+    expect(store.packs.reclaimPending()).toBe(1);
+    expect(store.cachedCommit(firstOid)).toBeNull();
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBe(0);
+  });
+
+  it("does not validate a duplicate against a pack whose object row lost OR IGNORE", async () => {
+    const store = open();
+    const data = syntheticCommit(1);
+    const oid = hashObject("commit", data);
+    const pack = (): Uint8Array => {
+      const chunks: Uint8Array[] = [];
+      const writer = new PackWriter((chunk) => chunks.push(chunk));
+      writer.header(1);
+      writer.object("commit", data);
+      writer.finish();
+      return concat(chunks);
+    };
+
+    const first = await store.packs.ingest(slices(pack(), 64));
+    await store.packs.ingest(slices(pack(), 64));
+    expect(store.cachedCommit(oid)?.commit).toEqual(parseCommit(data));
+    store.db.run(
+      "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = 1 AND pack_id = ?",
+      first.packId,
+    );
+    expect(store.packs.reclaimPending()).toBe(1);
+    expect(store.cachedCommit(oid)).toBeNull();
+  });
+
   it("batches 500 parsed trees below the operation statement ceiling", async () => {
     const measure = async (count: number) => {
       const db = new TestDatabase();

@@ -29,7 +29,7 @@ function columnsOf(db: TestDatabase, table: string): string[] {
 }
 
 describe("git schema", () => {
-  it("creates v3 on a fresh database", () => {
+  it("creates v4 on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -38,7 +38,24 @@ describe("git schema", () => {
     );
     expect(columnsOf(db, "git_objects")).toContain("stored");
     expect(columnsOf(db, "git_blob_ids")).toEqual(["repo_id", "content_id", "oid"]);
-    expect(columnsOf(db, "git_commits")).toEqual(["repo_id", "oid", "parents", "tree", "time"]);
+    expect(columnsOf(db, "git_commits")).toEqual([
+      "repo_id",
+      "oid",
+      "parents",
+      "tree",
+      "author_name",
+      "author_email",
+      "author_time",
+      "author_timezone",
+      "committer_name",
+      "committer_email",
+      "committer_time",
+      "committer_timezone",
+      "message",
+      "gpgsig",
+      "object_size",
+      "cache_bytes",
+    ]);
     expect(columnsOf(db, "git_tree_sources")).toEqual([
       "repo_id",
       "tree_oid",
@@ -84,7 +101,7 @@ describe("git schema", () => {
       // Existing rows inherit the default, which is what they were.
       stored: "zlib",
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("3");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("4");
   });
 
   it("creates empty parsed-tree tables when migrating v2", () => {
@@ -99,7 +116,56 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("3");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("4");
+  });
+
+  it("replaces the incomplete v3 commit cache without touching raw objects", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("DROP TABLE git_commits");
+    db.run(`CREATE TABLE git_commits (
+      repo_id INTEGER NOT NULL, oid TEXT NOT NULL, parents TEXT NOT NULL,
+      tree TEXT NOT NULL, time INTEGER NOT NULL, PRIMARY KEY (repo_id, oid)
+    ) WITHOUT ROWID`);
+    db.run("INSERT INTO git_commits VALUES (1, 'cached', '', 'tree', 123)");
+    db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, 'raw', 'commit', 7, 'raw')",
+    );
+    db.run("UPDATE git_meta SET value = '3' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
+    expect(db.one("SELECT oid, type, size, stored FROM git_objects")).toEqual({
+      oid: "raw",
+      type: "commit",
+      size: 7,
+      stored: "raw",
+    });
+    expect(columnsOf(db, "git_commits")).toContain("committer_timezone");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("4");
+  });
+
+  it("fails closed on a schema newer than this runtime", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("UPDATE git_meta SET value = '5' WHERE key = 'schema_version'");
+
+    expect(() => initializeGitSchema(db)).toThrow(/newer than supported/);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+  });
+
+  it("accepts only canonical positive decimal schema versions", () => {
+    for (const version of ["", " ", "4.0", "04", "0", "-1", "9007199254740993"]) {
+      const db = new TestDatabase();
+      initializeGitSchema(db);
+      db.run("UPDATE git_meta SET value = ? WHERE key = 'schema_version'", version);
+
+      expect(() => initializeGitSchema(db)).toThrow(/invalid version/);
+      expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+        version,
+      );
+    }
   });
 
   it("fails an unmarked pre-v3 tree before yielding a path", () => {

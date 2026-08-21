@@ -9,6 +9,15 @@ import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
 import { Sha1 } from "../core/sha1.js";
 import { deflate, InflateStream, inflate } from "../core/zlib.js";
+import {
+  type CommitCacheEntry,
+  type CommitCacheWriteResult,
+  indexCommitSource,
+  insertCommitCaches,
+  MAX_INDEXED_COMMIT_BYTES,
+  prepareCommitCache,
+  readCommitCache,
+} from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
 import { type PackCacheOptions, PackStore } from "./packs.js";
 import {
@@ -50,6 +59,9 @@ const DEFAULT_INDEX_FLUSH = 512;
 
 /** Bound JSON stays below the Durable Object SQLite 2 MiB value ceiling. */
 const INDEX_MUTATION_PAYLOAD = 1024 * 1024;
+
+/** Parsed commits staged beside encoded object bytes before a batch flush. */
+const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 
 const DEFAULT_OBJECT_CACHE_BYTES = 16 * 1024 * 1024;
 const TREE_WALK_STATE_BYTES = 8 * 1024 * 1024;
@@ -407,6 +419,7 @@ interface StagedObject {
   stored: LooseEncoding;
   storedData: Uint8Array;
   treeData?: Uint8Array;
+  commitEntry?: CommitCacheEntry;
 }
 
 /** One `substr()` payload: the bytes, and the rows cut out of them. */
@@ -414,6 +427,12 @@ interface ChunkPayload {
   parts: Uint8Array[];
   length: number;
   rows: { o: string; q: number; a: number; n: number }[];
+}
+
+function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
+  if (result.written !== expected || result.eligible !== expected || result.skipped !== 0) {
+    throw new CorruptError(`commit cache wrote ${result.written} of ${expected} required rows`);
+  }
 }
 
 interface BufferedIndexMutation {
@@ -743,7 +762,14 @@ export class RepoStore {
 
   write(type: ObjectType, data: Uint8Array): string {
     const oid = hashObject(type, data);
-    if (this.has(oid)) return oid;
+    const commitEntry =
+      type === "commit" ? prepareCommitCache({ repoId: this.#repoId, oid, data }) : undefined;
+    if (this.has(oid)) {
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+      }
+      return oid;
+    }
     const stored = looseEncoding(data.length);
     const storedData = encodeLoose(data, stored);
     this.#db.transactionSync(() => {
@@ -796,6 +822,9 @@ export class RepoStore {
           [data],
         );
       }
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+      }
     });
     this.#hasLoose = true;
     this.#objects.set(`loose:${oid}`, { type, data });
@@ -810,9 +839,15 @@ export class RepoStore {
    * live, so the peak does not follow the object's size.
    */
   writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
+    if (type === "commit" && size > MAX_INDEXED_COMMIT_BYTES) {
+      throw new GitError("E2BIG", "commit exceeds the 1 MiB cache limit");
+    }
     const hash = new Sha1().update(objectHeader(type, size));
+    const commitData =
+      type === "commit" && size <= MAX_INDEXED_COMMIT_BYTES ? new Uint8Array(size) : undefined;
     let hashed = 0;
     for (const chunk of chunks()) {
+      if (hashed + chunk.length <= size) commitData?.set(chunk, hashed);
       hashed += chunk.length;
       hash.update(chunk);
     }
@@ -820,11 +855,20 @@ export class RepoStore {
       throw new CorruptError(`streamed ${hashed} bytes for a ${type} declared as ${size}`);
     }
     const oid = toHex(hash.digest());
-    if (this.has(oid)) return oid;
+    const commitEntry =
+      commitData === undefined
+        ? undefined
+        : prepareCommitCache({ repoId: this.#repoId, oid, data: commitData });
+    if (this.has(oid)) {
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+      }
+      return oid;
+    }
 
     const stored = looseEncoding(size);
     if (stored === "raw") {
-      const data = new Uint8Array(size);
+      const data = commitData ?? new Uint8Array(size);
       const storageHash = new Sha1().update(objectHeader(type, size));
       let offset = 0;
       for (const chunk of chunks()) {
@@ -879,6 +923,9 @@ export class RepoStore {
             [data],
           );
         }
+        if (commitEntry !== undefined) {
+          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+        }
       });
       this.#hasLoose = true;
       return oid;
@@ -922,8 +969,10 @@ export class RepoStore {
         const storageHash = new Sha1().update(objectHeader(type, size));
         let streamed = 0;
         for (const chunk of chunks()) {
+          const offset = streamed;
           streamed += chunk.length;
           if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
+          commitData?.set(chunk, offset);
           storageHash.update(chunk);
           deflate.push(chunk, false);
           if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
@@ -965,6 +1014,9 @@ export class RepoStore {
           blob(new Uint8Array(0)),
         );
       }
+      if (commitEntry !== undefined) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+      }
     });
     this.#hasLoose = true;
     return oid;
@@ -985,11 +1037,13 @@ export class RepoStore {
     // (oid, seq) may appear at most once in a payload.
     const staged = new Map<string, StagedObject>();
     let bytes = 0;
+    let commitBytes = 0;
     const flush = (): void => {
       if (staged.size === 0) return;
       this.#flushObjects([...staged.values()], payloadBytes);
       staged.clear();
       bytes = 0;
+      commitBytes = 0;
     };
     return {
       write: (type: ObjectType, data: Uint8Array): string => {
@@ -999,14 +1053,25 @@ export class RepoStore {
         const storedData = stored === "raw" ? data.slice() : encodeLoose(data, stored);
         const object: StagedObject = { oid, type, size: data.length, stored, storedData };
         if (type === "tree") object.treeData = stored === "raw" ? storedData : data.slice();
+        if (type === "commit") {
+          const commitEntry = prepareCommitCache({ repoId: this.#repoId, oid, data });
+          object.commitEntry = commitEntry;
+        }
         staged.set(oid, object);
         bytes += storedData.length;
         if (object.treeData !== undefined && object.treeData !== storedData) {
           bytes += object.treeData.length;
         }
+        if (object.commitEntry !== undefined) commitBytes += object.commitEntry.cacheBytes;
         // After staging, never before: an object's chunks and its metadata
         // row have to land in the same flush, whatever its size.
-        if (bytes >= payloadBytes || staged.size >= flushEvery) flush();
+        if (
+          bytes >= payloadBytes ||
+          commitBytes >= COMMIT_STAGE_CACHE_BYTES ||
+          staged.size >= flushEvery
+        ) {
+          flush();
+        }
         return oid;
       },
       flush,
@@ -1023,6 +1088,9 @@ export class RepoStore {
 
   #flushObjects(staged: StagedObject[], payloadBytes: number): void {
     const byOid = new Map(staged.map((object) => [object.oid, object]));
+    const commitEntries = staged.flatMap((object) =>
+      object.commitEntry === undefined ? [] : [object.commitEntry],
+    );
     const meta = JSON.stringify(
       staged.map((object) => ({ o: object.oid, t: object.type, s: object.size, e: object.stored })),
     );
@@ -1048,7 +1116,10 @@ export class RepoStore {
         }
         fresh.push(object);
       }
-      if (fresh.length === 0) return;
+      if (fresh.length === 0) {
+        requireCommitCacheWrites(insertCommitCaches(this.#db, commitEntries), commitEntries.length);
+        return;
+      }
 
       const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
       for (const object of fresh) {
@@ -1110,6 +1181,7 @@ export class RepoStore {
           ];
         }),
       );
+      requireCommitCacheWrites(insertCommitCaches(this.#db, commitEntries), commitEntries.length);
     });
     this.#hasLoose = true;
   }
@@ -1551,6 +1623,21 @@ export class RepoStore {
     );
   }
 
+  /** Read a complete parsed commit while its exact raw source remains valid. */
+  cachedCommit(oid: string): CommitCacheEntry | null {
+    return readCommitCache(this.#db, this.#repoId, oid);
+  }
+
+  /** Lazily add one derived commit row from bytes the caller already read. */
+  cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
+    return indexCommitSource(this.#db, { repoId: this.#repoId, oid, data });
+  }
+
+  /** Insert prepared point misses with the shared row and JSON byte bounds. */
+  cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
+    return insertCommitCaches(this.#db, entries);
+  }
+
   // -- shallow --------------------------------------------------------
 
   shallow(): Set<string> {
@@ -1586,6 +1673,7 @@ export class RepoStore {
         "git_config",
         "git_index",
         "git_shallow",
+        "git_commits",
         "git_tree_effective",
         "git_tree_entries",
         "git_tree_sources",

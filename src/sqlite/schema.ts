@@ -9,9 +9,29 @@ import { CorruptError } from "../core/errors.js";
 import { parseTreeStream } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
+
+const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
+  repo_id INTEGER NOT NULL,
+  oid TEXT NOT NULL,
+  parents TEXT NOT NULL,
+  tree TEXT NOT NULL,
+  author_name BLOB NOT NULL,
+  author_email BLOB NOT NULL,
+  author_time INTEGER NOT NULL,
+  author_timezone INTEGER NOT NULL,
+  committer_name BLOB NOT NULL,
+  committer_email BLOB NOT NULL,
+  committer_time INTEGER NOT NULL,
+  committer_timezone INTEGER NOT NULL,
+  message BLOB NOT NULL,
+  gpgsig BLOB,
+  object_size INTEGER NOT NULL,
+  cache_bytes INTEGER NOT NULL,
+  PRIMARY KEY (repo_id, oid)
+) WITHOUT ROWID`;
 
 const STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_meta (
@@ -96,17 +116,9 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, oid)
    )`,
 
-  // Parsed commit headers, so `log` is a graph walk in SQL instead of one
-  // object read per commit. Written by whatever first parses a commit.
-  // Never authoritative: a missing row means "read the object".
-  `CREATE TABLE IF NOT EXISTS git_commits (
-     repo_id INTEGER NOT NULL,
-     oid TEXT NOT NULL,
-     parents TEXT NOT NULL,
-     tree TEXT NOT NULL,
-     time INTEGER NOT NULL,
-     PRIMARY KEY (repo_id, oid)
-   ) WITHOUT ROWID`,
+  // Full parsed commits for graph walks and reads. This remains a derived
+  // cache: source metadata is validated before a row can be returned.
+  COMMIT_TABLE,
 
   `CREATE TABLE IF NOT EXISTS git_object_chunks (
      repo_id INTEGER NOT NULL,
@@ -268,13 +280,15 @@ const STATEMENTS = [
 ] as const;
 
 // v1 -> v2 added `git_blob_ids`, `git_commits` and `git_objects.stored`.
-// v3 adds parsed tree tables only. Existing tree objects remain deliberately
-// unmarked so reads fail with an explicit reimport/reclone requirement.
-// The first two are CREATE TABLE IF NOT EXISTS and need no migrator; the
-// column does, because IF NOT EXISTS will not alter a table that exists.
+// v3 added parsed tree tables. v4 replaces the incomplete, unused commit
+// projection; raw objects remain authoritative and are preserved.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
+  }
+  if (from < 4) {
+    db.run("DROP TABLE git_commits");
+    db.run(COMMIT_TABLE);
   }
 }
 
@@ -284,13 +298,24 @@ export function initializeGitSchema(db: SqlDatabase): void {
     // of the CREATEs run and before it gets rewritten below.
     const [meta] = STATEMENTS;
     db.run(meta);
-    const recorded = db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'");
-    const previous = recorded === undefined ? 0 : Number(recorded);
+    const recorded = db.scalar<unknown>("SELECT value FROM git_meta WHERE key = 'schema_version'");
+    if (recorded !== undefined && (typeof recorded !== "string" || !/^[1-9]\d*$/.test(recorded))) {
+      throw new CorruptError("git schema has an invalid version");
+    }
+    const previous = recorded === undefined ? undefined : Number(recorded);
+    if (previous !== undefined && !Number.isSafeInteger(previous)) {
+      throw new CorruptError("git schema has an invalid version");
+    }
+    if (previous !== undefined && previous > SCHEMA_VERSION) {
+      throw new CorruptError(
+        `git schema version ${previous} is newer than supported version ${SCHEMA_VERSION}`,
+      );
+    }
 
     for (const statement of STATEMENTS) db.run(statement);
 
-    // 0 means a fresh database: the CREATEs above already carry v2's shape.
-    if (previous > 0 && previous < SCHEMA_VERSION) migrate(db, previous);
+    // 0 means a fresh database: the CREATEs above already carry the current shape.
+    if (previous !== undefined && previous < SCHEMA_VERSION) migrate(db, previous);
 
     db.run(
       "INSERT OR REPLACE INTO git_meta (key, value) VALUES ('schema_version', ?)",

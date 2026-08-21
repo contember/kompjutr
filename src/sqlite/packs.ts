@@ -7,7 +7,7 @@
 // actually spans, so nothing ever inflates a whole repository.
 
 import { concat, toHex } from "../core/bytes.js";
-import { CorruptError } from "../core/errors.js";
+import { CorruptError, GitError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import {
   hashObject,
@@ -19,6 +19,14 @@ import {
 import { applyDelta } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
 import { InflateStream } from "../core/zlib.js";
+import {
+  type CommitCacheEntry,
+  type CommitCacheSource,
+  insertCommitCaches,
+  MAX_COMMIT_CACHE_BYTES,
+  MAX_INDEXED_COMMIT_BYTES,
+  prepareCommitCache,
+} from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
 import { indexTreeSource, indexTreeSources, type TreeSourceInput } from "./schema.js";
 
@@ -56,15 +64,18 @@ const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
 const PACK_OBJECT_CACHE_RESERVE_BYTES = 16 * 1024 * 1024;
 const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;
+const PACK_COMMIT_BATCH_SOURCES = 2048;
 
-// Delta buffers, one compressed row, both caches, the parsed-tree sink and
-// inflater headroom peak below 100 MiB even when their stores do not overlap.
+// Delta buffers, one compressed row, both caches, both parsed-object sinks,
+// bounded commit re-inflation and inflater headroom peak below 100 MiB.
 const PACK_MEMORY_MODEL_BYTES =
   DELTA_WORKING_BYTES +
   PACK_READ_BYTES +
   DEFAULT_CHUNK_BYTES +
   PACK_OBJECT_CACHE_RESERVE_BYTES +
   PACK_TREE_BATCH_BYTES +
+  MAX_COMMIT_CACHE_BYTES +
+  2 * MAX_INDEXED_COMMIT_BYTES +
   PACK_INFLATE_HEADROOM_BYTES;
 if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
   throw new Error("pack memory model exceeds 100 MiB");
@@ -181,6 +192,74 @@ class PackTreeIndex {
     if (this.#sources.length === 0) return;
     this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
     this.#sources.length = 0;
+    this.#bytes = 0;
+  }
+}
+
+/** Parsed pack commits pending a bounded, transactionally hidden flush. */
+class PackCommitIndex {
+  readonly #entries: CommitCacheEntry[] = [];
+  #bytes = 0;
+
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly repoId: number,
+    private readonly packId: number,
+  ) {}
+
+  add(source: CommitCacheSource): void {
+    const entry = prepareCommitCache(source);
+    if (entry.cacheBytes > MAX_COMMIT_CACHE_BYTES) {
+      throw new GitError("E2BIG", `packed commit ${source.oid} exceeds the cache batch limit`);
+    }
+    if (
+      this.#entries.length > 0 &&
+      (this.#entries.length >= PACK_COMMIT_BATCH_SOURCES ||
+        this.#bytes + entry.cacheBytes > MAX_COMMIT_CACHE_BYTES)
+    ) {
+      this.#stage();
+    }
+    this.#entries.push(entry);
+    this.#bytes += entry.cacheBytes;
+  }
+
+  /** Flush the final batch after the caller marks the pack complete. */
+  finish(): void {
+    this.#insert();
+    this.#clear();
+  }
+
+  /** Persist a full batch while leaving the pack externally pending. */
+  #stage(): void {
+    this.db.transactionSync(() => {
+      this.#setState("complete");
+      this.#insert();
+      this.#setState("pending");
+    });
+    this.#clear();
+  }
+
+  #setState(state: "complete" | "pending"): void {
+    this.db.run(
+      "UPDATE git_pack_meta SET state = ? WHERE repo_id = ? AND pack_id = ?",
+      state,
+      this.repoId,
+      this.packId,
+    );
+  }
+
+  #insert(): void {
+    if (this.#entries.length === 0) return;
+    const result = insertCommitCaches(this.db, this.#entries);
+    if (result.eligible !== this.#entries.length || result.written !== this.#entries.length) {
+      throw new CorruptError(
+        `packed commit cache wrote ${result.written} of ${this.#entries.length} required rows`,
+      );
+    }
+  }
+
+  #clear(): void {
+    this.#entries.length = 0;
     this.#bytes = 0;
   }
 }
@@ -529,7 +608,7 @@ export class PackStore {
     );
 
     const total = await this.#writeChunks(source, packId, maxBytes, say, yieldNow);
-    const count = await this.#indexPack(packId, total, say, yieldNow);
+    const { count, commits } = await this.#indexPack(packId, total, say, yieldNow);
 
     this.#db.transactionSync(() => {
       this.#db.run(
@@ -539,6 +618,7 @@ export class PackStore {
         this.#repoId,
         packId,
       );
+      commits.finish();
     });
     return { packId, count, bytes: total };
   }
@@ -623,7 +703,7 @@ export class PackStore {
     total: number,
     say: (message: string) => void,
     yieldNow: () => Promise<void>,
-  ): Promise<number> {
+  ): Promise<{ count: number; commits: PackCommitIndex }> {
     const reader = new PackReader(this, packId, total);
     const magic = reader.take(4);
     if (magic[0] !== 0x50 || magic[1] !== 0x41 || magic[2] !== 0x43 || magic[3] !== 0x4b) {
@@ -636,6 +716,7 @@ export class PackStore {
 
     const offsets = new OffsetWindow();
     const treeIndex = new PackTreeIndex(this.#db);
+    const commitIndex = new PackCommitIndex(this.#db, this.#repoId, packId);
     const offsetToOid = (offset: number): string | null => {
       const hit = offsets.get(offset);
       if (hit !== null) return hit;
@@ -675,6 +756,7 @@ export class PackStore {
           type,
           entry.data,
           treeIndex,
+          commitIndex,
           header.dataOff,
           entry.consumed,
           header.entrySize,
@@ -709,6 +791,7 @@ export class PackStore {
               base.type,
               data,
               treeIndex,
+              commitIndex,
               header.dataOff,
               entry.consumed,
               data.length,
@@ -743,10 +826,10 @@ export class PackStore {
     if (reader.position !== total - 20) {
       throw new CorruptError("pack has trailing data or a bad object count");
     }
-    await this.#drainPending(packId, offsets, offsetToOid, treeIndex, yieldNow);
+    await this.#drainPending(packId, offsets, offsetToOid, treeIndex, commitIndex, yieldNow);
     treeIndex.flush();
     if (deferred > 0) say(`Resolved ${deferred} deferred delta(s)\n`);
-    return count;
+    return { count, commits: commitIndex };
   }
 
   /** A base that lives in an already-indexed pack, loose storage, or another pack. */
@@ -761,6 +844,7 @@ export class PackStore {
     offsets: OffsetWindow,
     offsetToOid: (offset: number) => string | null,
     treeIndex: PackTreeIndex,
+    commitIndex: PackCommitIndex,
     yieldNow: () => Promise<void>,
   ): Promise<void> {
     let remaining =
@@ -823,6 +907,7 @@ export class PackStore {
             base.type,
             data,
             treeIndex,
+            commitIndex,
             row.data_off,
             row.data_len,
             data.length,
@@ -864,11 +949,23 @@ export class PackStore {
     type: ObjectType,
     data: Uint8Array | null,
     treeIndex: PackTreeIndex,
+    commitIndex: PackCommitIndex,
     dataOff: number,
     dataLen: number,
     objectSize: number,
   ): void {
     this.#db.transactionSync(() => this.#insertObject(row));
+    if (type === "commit") {
+      if (objectSize > MAX_INDEXED_COMMIT_BYTES) {
+        throw new GitError(
+          "E2BIG",
+          `packed commit ${oid} exceeds the ${MAX_INDEXED_COMMIT_BYTES}-byte index limit`,
+        );
+      }
+      const commitData =
+        data ?? concat([...this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize)]);
+      commitIndex.add({ repoId: this.#repoId, oid, data: commitData });
+    }
     if (type !== "tree") return;
     const chunks =
       data === null ? this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize) : [data];

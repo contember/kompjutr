@@ -131,7 +131,7 @@ export function parsePerson(line: string): Person {
   if (rest.length > 1 && /^[+-]\d{4}$/.test(rest[1]!)) {
     const zone = rest[1]!;
     const minutes = Number.parseInt(zone.slice(1, 3), 10) * 60 + Number.parseInt(zone.slice(3), 10);
-    timezoneOffset = zone[0] === "-" ? minutes : -minutes;
+    timezoneOffset = minutes === 0 ? 0 : zone[0] === "-" ? minutes : -minutes;
   }
   return {
     name,
