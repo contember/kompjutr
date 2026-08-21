@@ -97,13 +97,16 @@ export function equals(left: Uint8Array, right: Uint8Array): boolean {
 }
 
 /**
- * True when a buffer looks like a binary file, using the same cheap test
- * grep uses: a NUL byte in the first 8 KiB.
+ * Where a buffer first looks binary, or -1.
+ *
+ * A NUL byte anywhere makes the file binary, not one in a leading window:
+ * both real greps report a NUL that appears well past any prefix they might
+ * have sniffed, and rg prints the offset. The buffer is already in memory,
+ * so scanning all of it costs no I/O.
  */
-export function looksBinary(bytes: Uint8Array): boolean {
-  const limit = Math.min(bytes.length, 8192);
-  for (let index = 0; index < limit; index++) {
-    if (bytes[index] === 0) return true;
+export function firstNul(bytes: Uint8Array): number {
+  for (let index = 0; index < bytes.length; index++) {
+    if (bytes[index] === 0) return index;
   }
-  return false;
+  return -1;
 }

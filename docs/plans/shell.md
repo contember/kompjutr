@@ -236,8 +236,8 @@ cannot name one, it does not belong here.
 
 | command | flags that ship | lowers to |
 |---|---|---|
-| `grep` | `-r -i -n -l -v -E -F -c -w -A -B -C --include --exclude` | `discoverFiles` + `readFileHandles` |
-| `rg` | `-i -S -n -l -v -F -c -w -A -B -C -g -t --hidden --no-filename` | same engine, own surface — §5.1 |
+| `grep` | `-r -R -i -n -l -L -v -E -F -c -w -x -h -H -s -e -A -B -C --include --exclude` | `discoverFilesContaining`, else `discoverFiles` + `readFileHandles` |
+| `rg` | `-i -S -s -n -N -l -v -F -c -w -x -e -A -B -C -g -t --hidden --no-filename --no-heading` | same engine, own surface — §5.1 |
 | `find` | `-name -type -maxdepth` | `glob`, else `scan` |
 | `ls` | `-l -a -1 -R` | `readdir` / `scan` |
 | `cat` | — | `readFiles` (batched when several args) |
@@ -272,6 +272,20 @@ sets, two dialect mappings on top of it. What differs:
 | dotfiles | searched | **skipped**; `--hidden` to include |
 | pattern | BRE by default, ERE with `-E` | ERE-shaped, always |
 | filename prefix | when >1 file | when >1 file; `--no-filename` |
+| `-c` on a file with no match | prints `path:0` | **omits the file** |
+| a binary file a walk found | reported | **skipped silently** |
+| the binary notice | `grep: <path>: binary file matches`, on **stderr** | `<path>: binary file matches (found "\0" byte around offset N)`, on **stdout** |
+| a hidden file matching `-g`/`-t` | n/a — dotfiles are searched | **whitelisted**, overriding the dotfile skip |
+
+The last four rows are not from the documentation. They came out of the
+parity suite, which is the point of running the real binaries — see §13.
+
+Two of them reach further than their row suggests. `rg -c` listing only
+matches means the SQL predicate answers it exactly, so `rg -c` keeps the
+push-down that `grep -c` cannot have. And rg skipping walked binaries would
+have forced a read of every candidate to find the NUL — giving the
+push-down straight back — so the NUL test goes into the same statement as
+the needle: `instr(bytes, X'00')`.
 
 `-t ts` needs a small built-in type map (`ts`, `js`, `md`, `json`, `css`,
 `html`, `py`, `go`, `rust`, `sh`). Lower it to the same GLOB predicate `-g`
@@ -287,8 +301,8 @@ and no lookaround, and POSIX classes (`[:alpha:]`) exist in both greps but
 not in JS.
 
 The tty-dependent defaults (heading, line numbers) resolve to the **piped**
-form in both surfaces — there is no terminal here. Verify against real `rg`
-in the parity tests; do not infer it from documentation.
+form in both surfaces — there is no terminal here. Verified against real
+`rg` in the parity tests rather than inferred from documentation.
 
 ### 5.2 The shell owns `cwd`
 
@@ -397,7 +411,7 @@ Territories are disjoint. Waves are barriers.
 | **C1 — executor + budgets** | `src/shell/exec/**` | Output truncation, statement ceiling, stderr elision. A command that ignores the budget fails the test. |
 | **C2 — search engine + `find`** | `src/shell/commands/{search,find}.ts` | The §7 statement targets, asserted at two tree sizes an order of magnitude apart. Surface-agnostic: no flag tables in this territory. |
 | **C2a — `grep` surface** | `src/shell/commands/grep.ts` | Parity against **real GNU grep** on a fixture corpus, one case per shipped flag. BRE→JS translation, with a named error for every construct that does not map. |
-| **C2b — `rg` surface** | `src/shell/commands/rg.ts` | Parity against **real `rg`**, same discipline. The six divergences in §5.1 each asserted explicitly, including the deliberate ignore-file one. |
+| **C2b — `rg` surface** | `src/shell/commands/rg.ts` | Parity against **real `rg`**, same discipline. Every divergence in §5.1 asserted explicitly, including the deliberate ignore-file one. |
 | **C6 — session state** | `src/shell/{session,schema}.ts` | `cd` persists and survives a simulated eviction (drop the in-memory shell, rebuild from the row). Missing or non-directory target fails loudly and does not persist. §7 cost. |
 | **C3 — read/list** | `src/shell/commands/{read,list}.ts` | `cat`, `head`, `tail`, `wc`, `ls`, `stat`. `head -20` = 1 statement. |
 | **C4 — write** | `src/shell/commands/write.ts` | `cp`, `mv`, `rm`, `mkdir`, `touch`. `rm -rf` on 5,000 files stays O(1). |
@@ -419,6 +433,76 @@ cpu-lease run -n 2 -- npm run bench:macro
 ```
 
 ---
+
+## 9. Risks
+
+**R1 might not hold.** If keyset paging forces a full 1,000-row page before
+the executor can stop, `grep | head -20` costs a page regardless. Wave A2
+answers this first, on purpose. Mitigation if it fails: a small first page
+(`limit: 32`) that grows geometrically — trades one extra statement on large
+result sets for a bounded cost on the common truncated one.
+
+**The 50-byte GLOB ceiling.** `--include='**/*.{ts,tsx}'` does not lower to
+one GLOB. The planner must split it into several `discoverFiles` calls or
+fall back to `scan` + filter. Both are correct; the split is faster and the
+fallback is simpler. Measure before choosing.
+
+**`grep` flag parity is the real work.** Not the grammar. GNU grep's `-A/-B/-C`
+context, `-w` word boundaries and `-E` vs `-F` semantics are where a
+plausible-looking implementation silently returns wrong answers. Parity tests
+against real grep on a fixture corpus, per flag, are non-negotiable.
+
+**Scope creep from `sed`.** Ship two forms, error on the rest. The moment
+`sed` grows a script parser this becomes a bash port and the thesis is lost.
+
+---
+
+## 10. Decisions taken
+
+1. **`rg` gets its own flag surface**, not an alias. One `search()` engine,
+   two surfaces over it. §5.1 records the behavioural divergences and the
+   regex-dialect policy; C2a and C2b own one surface each and both test
+   against the real binary.
+2. **No ignore-file handling**, in either surface. A workspace is a checkout,
+   not a build tree — there is no `node_modules` to skip. Recorded as an
+   explicit non-goal in §2, and as a stated `rg` divergence in §5.1, so it
+   reads as a decision rather than as a gap someone should close.
+3. **The shell owns `cwd`**, persisted in a `shell_sessions` row so it
+   survives eviction, cached in memory for the isolate's lifetime. §5.2.
+   One write per `cd`, nothing on any other exec.
+
+### Still open
+
+- **Where `sed` stops.** §2 says `s///` and `-n Np`. The first agent that
+  hits the wall will ask for one more form, and that is how a shell becomes a
+  bash port. Worth deciding now that the answer is no, and that the escape
+  hatch is the container.
+
+## 11. What the measurements changed
+
+Both corrections came from tests that were written to be able to fail.
+
+**R1 cannot remove the `head` stage.** The first implementation lifted the
+limit into a hint and dropped the stage, on the reasoning that laziness
+would bound the source. Nothing then enforced the line count and
+`cat file | head -2` returned the whole file. The stage *is* the mechanism:
+it is what stops pulling. The hint is only advice about page sizing, and §4
+now says so.
+
+**The Wave A probe taught the wrong lesson.** It concluded that a discovery
+page should be seeded at `2 × limitHint`, because a fixed 32 cost a second
+round trip. Its fixture matched every *other* file. At a realistic density —
+one in ten — that seeding made `grep … | head -20` cost **12 statements
+against the unbounded search's 9**: the bounded query was more expensive
+than the thing it was meant to beat. Discovery costs one statement whatever
+the page size (which A1 had already shown), so pages are always full now.
+
+The hint survives in exactly one place it earns: `cat big.log | head -20`
+reads a bounded range instead of the file.
+
+The lesson worth keeping is about fixtures, not about paging. A probe whose
+fixture is too kind produces a confident number that is wrong in the
+direction you were already hoping for.
 
 ## 12. The content predicate
 
@@ -451,72 +535,36 @@ The equivalence suite runs every search twice — once where the predicate
 decides it, once forced down the read-and-match path — and demands identical
 bytes. It found the `-c` divergence on its first run.
 
-## 11. What the measurements changed
+## 13. What parity changed
 
-Both corrections came from tests that were written to be able to fail.
+C2a and C2b called for parity against the real binaries. Running them found
+eight things this implementation had wrong, none of which a hand-written
+expectation would have caught, because every one of them was written the way
+I assumed it worked:
 
-**R1 cannot remove the `head` stage.** The first implementation lifted the
-limit into a hint and dropped the stage, on the reasoning that laziness
-would bound the source. Nothing then enforced the line count and
-`cat file | head -2` returned the whole file. The stage *is* the mechanism:
-it is what stops pulling. The hint is only advice about page sizing, and §4
-now says so.
+| what | was | is |
+|---|---|---|
+| `-L` | in grep's flag table, absent from its switch — accepted, then rejected as unknown | implemented; exit status follows the *pattern*, not the listing |
+| adjacent matches under `-C` | the second printed as a context line (`3-HIT`) | a match line (`3:HIT`), whoever's window emitted it |
+| the binary notice | `Binary file X matches` on stdout | GNU's stderr form for `grep`, rg's stdout form for `rg` |
+| a binary file under `-l`/`-c` | replaced by the notice | listed and counted like any other file |
+| binary detection | a NUL in the first 8 KiB | a NUL anywhere; both binaries find a late one |
+| `rg -c` | printed `path:0` rows | omits them, and therefore keeps the push-down |
+| walked binaries in `rg` | reported | skipped, decided in SQL |
+| a missing or unreadable path | silent, exit 2 | GNU's diagnostic, and `-s` to silence it |
+| context groups over a pipe | no `--` between them | `--`, as both binaries print |
 
-**The Wave A probe taught the wrong lesson.** It concluded that a discovery
-page should be seeded at `2 × limitHint`, because a fixed 32 cost a second
-round trip. Its fixture matched every *other* file. At a realistic density —
-one in ten — that seeding made `grep … | head -20` cost **12 statements
-against the unbounded search's 9**: the bounded query was more expensive
-than the thing it was meant to beat. Discovery costs one statement whatever
-the page size (which A1 had already shown), so pages are always full now.
+The suite lives in `tests/shell/parity-{grep,rg}.test.ts` over
+`tests/helpers/parity.ts`, and it skips loudly rather than passing quietly
+when a binary is missing. Three dimensions are controlled rather than
+compared, because neither implementation specifies them: `LC_ALL=C`, rg's
+ignore files (the deliberate divergence, switched off on rg's side so the
+rest is comparable), and walk order — `rg --sort path` fixes it, GNU grep
+has no equivalent, so its recursive cases compare as sets. That the shell's
+own order is sorted is asserted separately: it is a property of the shell,
+not something inherited.
 
-The hint survives in exactly one place it earns: `cat big.log | head -20`
-reads a bounded range instead of the file.
-
-The lesson worth keeping is about fixtures, not about paging. A probe whose
-fixture is too kind produces a confident number that is wrong in the
-direction you were already hoping for.
-
-## 9. Risks
-
-**R1 might not hold.** If keyset paging forces a full 1,000-row page before
-the executor can stop, `grep | head -20` costs a page regardless. Wave A2
-answers this first, on purpose. Mitigation if it fails: a small first page
-(`limit: 32`) that grows geometrically — trades one extra statement on large
-result sets for a bounded cost on the common truncated one.
-
-**The 50-byte GLOB ceiling.** `--include='**/*.{ts,tsx}'` does not lower to
-one GLOB. The planner must split it into several `discoverFiles` calls or
-fall back to `scan` + filter. Both are correct; the split is faster and the
-fallback is simpler. Measure before choosing.
-
-**`grep` flag parity is the real work.** Not the grammar. GNU grep's `-A/-B/-C`
-context, `-w` word boundaries and `-E` vs `-F` semantics are where a
-plausible-looking implementation silently returns wrong answers. Parity tests
-against real grep on a fixture corpus, per flag, are non-negotiable.
-
-**Scope creep from `sed`.** Ship two forms, error on the rest. The moment
-`sed` grows a script parser this becomes a bash port and the thesis is lost.
-
----
-
-## 10. Decisions taken
-
-1. **`rg` gets its own flag surface**, not an alias. One `search()` engine,
-   two surfaces over it. §5.1 records the six behavioural divergences and the
-   regex-dialect policy; C2a and C2b own one surface each and both test
-   against the real binary.
-2. **No ignore-file handling**, in either surface. A workspace is a checkout,
-   not a build tree — there is no `node_modules` to skip. Recorded as an
-   explicit non-goal in §2, and as a stated `rg` divergence in §5.1, so it
-   reads as a decision rather than as a gap someone should close.
-3. **The shell owns `cwd`**, persisted in a `shell_sessions` row so it
-   survives eviction, cached in memory for the isolate's lifetime. §5.2.
-   One write per `cd`, nothing on any other exec.
-
-### Still open
-
-- **Where `sed` stops.** §2 says `s///` and `-n Np`. The first agent that
-  hits the wall will ask for one more form, and that is how a shell becomes a
-  bash port. Worth deciding now that the answer is no, and that the escape
-  hatch is the container.
+One trap worth naming: on a developer machine `grep` is often aliased to
+something else — ugrep here. The harness spawns without a shell, so the
+alias cannot substitute itself, and it checks `--version` says GNU before
+believing anything.

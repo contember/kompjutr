@@ -30,6 +30,7 @@ const SPEC = {
     "--ignore-case",
     "--line-number",
     "--files-with-matches",
+    "--files-without-match",
     "--invert-match",
     "--extended-regexp",
     "--fixed-strings",
@@ -55,6 +56,8 @@ export const grep: Command = (context) => {
     let wholeWord = false;
     let wholeLine = false;
     let withFilename: boolean | null = null;
+    /** `-s`: an unreadable path stops being a diagnostic, but still fails. */
+    let suppressErrors = false;
     let before = 0;
     let after = 0;
     const include: string[] = [];
@@ -79,6 +82,10 @@ export const grep: Command = (context) => {
         case "-l":
         case "--files-with-matches":
           mode = "files";
+          break;
+        case "-L":
+        case "--files-without-match":
+          mode = "files-without-match";
           break;
         case "-v":
         case "--invert-match":
@@ -113,7 +120,8 @@ export const grep: Command = (context) => {
           withFilename = true;
           break;
         case "-s":
-          break; // Diagnostics are already suppressed per command.
+          suppressErrors = true;
+          break;
         case "-A":
           after = count(flag.value ?? "", "-A");
           break;
@@ -183,6 +191,18 @@ export const grep: Command = (context) => {
       exclude,
       skipHidden: false,
       withFilename,
+      walkedBinaries: "report",
+      // GNU prints `path:0` for every file it searched.
+      zeroCounts: true,
+      warn: (message: string) => {
+        if (!suppressErrors) context.warn(message);
+      },
+      // GNU grep 3.x reports a binary file on *stderr*, which is the right
+      // stream for it: the line is a notice about the data, not the data.
+      reportBinary: (path: string) => {
+        context.warn(`${path}: binary file matches`);
+        return null;
+      },
     };
 
     const outcome = search(context.fs, request);

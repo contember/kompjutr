@@ -16,7 +16,7 @@
 // is pulled lazily, so a consumer that stops — `| head -20` — stops it here.
 
 import type { RealPath, RegularFileHandle } from "../../fs/types.js";
-import { type ByteStream, decode, encode, lines, looksBinary, NEWLINE } from "../exec/bytes.js";
+import { type ByteStream, decode, encode, firstNul, lines, NEWLINE } from "../exec/bytes.js";
 import type { BoundedFs } from "../exec/context.js";
 import { compileIncludeGlob } from "../exec/glob.js";
 
@@ -30,7 +30,7 @@ export interface SearchRequest {
   /** Skip dotfiles and dot-directories. rg's default, grep's never. */
   readonly skipHidden: boolean;
   readonly invert: boolean;
-  readonly mode: "content" | "files" | "count";
+  readonly mode: SearchMode;
   readonly lineNumbers: boolean;
   /** null lets the engine decide: on when more than one file is searched. */
   readonly withFilename: boolean | null;
@@ -42,7 +42,32 @@ export interface SearchRequest {
    * since `instr` is case-sensitive and cannot answer an inverted search.
    */
   readonly literal: Uint8Array | null;
+  /**
+   * Whether `-c` names files with no matches. GNU grep prints `path:0` for
+   * every file it searched; rg lists only files that matched. The flag is
+   * spelled the same and the output is not, which is why the engine is told
+   * rather than left to guess.
+   */
+  readonly zeroCounts: boolean;
+  /** A diagnostic for the surface's stderr — an unreadable path, so far. */
+  warn(message: string): void;
+  /**
+   * Report a matching binary file, returning the stdout line if the surface
+   * writes one. The two greps disagree about both text and stream: GNU
+   * sends `grep: <path>: binary file matches` to stderr, rg writes its own
+   * form to stdout. Neither ever lets the bytes themselves through, which
+   * is the part that matters for an agent reading the pipe.
+   */
+  reportBinary(path: string, offset: number, withFilename: boolean): Uint8Array | null;
+  /**
+   * What to do with a binary file a *walk* turned up. rg drops it silently;
+   * grep reports it. A file named on the command line is always searched by
+   * both, so this only governs the walked ones.
+   */
+  readonly walkedBinaries: "report" | "skip";
 }
+
+export type SearchMode = "content" | "files" | "files-without-match" | "count";
 
 export interface SearchOutcome {
   readonly stream: ByteStream;
@@ -73,17 +98,20 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
       const stat = fs.stat(root);
       if (stat === null) {
         failed = true;
+        request.warn(`${root}: No such file or directory`);
         continue;
       }
 
       if (stat.type !== "dir") {
         const bytes = fs.readFile(root);
-        yield* emit(root, bytes, request, request.withFilename ?? several, noteMatch);
+        // Named on the command line: searched whatever it holds.
+        yield* emit(root, bytes, request, request.withFilename ?? several, noteMatch, "report");
         continue;
       }
 
       if (!request.recursive) {
         failed = true;
+        request.warn(`${root}: Is a directory`);
         continue;
       }
 
@@ -97,7 +125,14 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
           yield encode(`${file.path}\n`);
           continue;
         }
-        yield* emit(file.path, file.bytes, request, request.withFilename ?? true, noteMatch);
+        yield* emit(
+          file.path,
+          file.bytes,
+          request,
+          request.withFilename ?? true,
+          noteMatch,
+          request.walkedBinaries,
+        );
       }
     }
   })();
@@ -135,10 +170,15 @@ function* walk(
   const realRoot = fs.realpath(root);
   const sqlPattern = narrowing(realRoot, request.include);
 
-  // `-c` prints a count for every file searched, zeros included, so it needs
-  // the files the predicate would filter out. Found by the equivalence test
-  // in tests/shell/pushdown.test.ts, which is what that suite is for.
-  if (request.literal !== null && request.mode !== "count") {
+  // The predicate returns the files that match, so a mode whose output
+  // depends on the files that do *not* cannot use it: GNU's `-c` prints
+  // `path:0` for every file searched, and `-L` is the complement outright.
+  // rg's `-c` lists only matches, so it keeps the fast path. The first of
+  // those was found by the equivalence test in tests/shell/pushdown.test.ts,
+  // which is what that suite is for.
+  const complementary =
+    request.mode === "files-without-match" || (request.mode === "count" && request.zeroCounts);
+  if (request.literal !== null && !complementary) {
     yield* walkByContent(fs, realRoot, sqlPattern, request, include, exclude, needsBytes);
     return;
   }
@@ -195,12 +235,19 @@ function* walkByContent(
   if (needle === null) return;
   let after: RealPath | undefined;
 
+  // rg skips a binary file a walk turned up. Asking the database to drop
+  // them keeps that free: finding out in the isolate would mean reading
+  // every candidate, which is the cost the predicate exists to avoid.
+  const excludeBinary = request.walkedBinaries === "skip";
+
   for (;;) {
     const page = fs.discoverFilesContaining(
       realRoot,
       sqlPattern,
       needle,
-      after === undefined ? { limit: PAGE_MAX } : { after, limit: PAGE_MAX },
+      after === undefined
+        ? { limit: PAGE_MAX, excludeBinary }
+        : { after, limit: PAGE_MAX, excludeBinary },
     );
 
     const keep = (handle: RegularFileHandle): boolean =>
@@ -257,8 +304,14 @@ function accepted(
   exclude: ReadonlyArray<{ test(path: string): boolean }>,
 ): boolean {
   if (request.skipHidden) {
-    const relative = path.slice(root === "/" ? 1 : root.length + 1);
-    if (relative.split("/").some((segment) => segment.startsWith("."))) return false;
+    const segments = path.slice(root === "/" ? 1 : root.length + 1).split("/");
+    const name = segments.pop() ?? "";
+    // A hidden directory is pruned outright: rg never descends into it, so
+    // no glob can whitelist what is inside. A hidden *file* is a different
+    // case — an explicit `-g`/`-t` filter overrides the skip, and matching
+    // that filter is checked below.
+    if (segments.some((segment) => segment.startsWith("."))) return false;
+    if (name.startsWith(".") && request.include.length === 0) return false;
   }
   if (exclude.some((matcher) => matcher.test(path))) return false;
   if (include.length > 0 && !include.some((matcher) => matcher.test(path))) return false;
@@ -272,33 +325,45 @@ function* emit(
   request: SearchRequest,
   withFilename: boolean,
   noteMatch: () => void,
+  binary: "report" | "skip",
 ): Generator<Uint8Array, void, undefined> {
-  if (looksBinary(bytes)) {
-    // Match GNU grep: report, never dump bytes into an agent's context.
-    if (!matchesAnywhere(bytes, request)) return;
-    noteMatch();
-    if (request.mode !== "count") yield encode(`Binary file ${path} matches\n`);
-    return;
+  // Only the line-printing mode substitutes a notice for the content. Both
+  // real greps count and list a binary file exactly as they would a text
+  // one — `-l` names it and `-c` counts it — because neither answer would
+  // put a raw byte on stdout.
+  if (request.mode === "content" || binary === "skip") {
+    const nul = firstNul(bytes);
+    if (nul >= 0) {
+      if (binary === "skip") return;
+      if (!matchesAnywhere(bytes, request)) return;
+      noteMatch();
+      const notice = request.reportBinary(path, nul, withFilename);
+      if (notice !== null) yield notice;
+      return;
+    }
   }
 
-  if (request.mode === "files") {
-    if (!matchesAnywhere(bytes, request)) return;
-    noteMatch();
-    yield encode(`${path}\n`);
+  if (request.mode === "files" || request.mode === "files-without-match") {
+    const hit = matchesAnywhere(bytes, request);
+    // `-L` still exits 0 when the pattern was found: it changes which files
+    // are named, not what counts as a match.
+    if (hit) noteMatch();
+    if (hit === (request.mode === "files")) yield encode(`${path}\n`);
     return;
   }
 
   const all = [...lines(chunk(bytes))];
-  const hits: number[] = [];
+  const hits = new Set<number>();
   for (let index = 0; index < all.length; index++) {
     const text = all[index];
-    if (text !== undefined && test(text, request)) hits.push(index);
+    if (text !== undefined && test(text, request)) hits.add(index);
   }
 
-  if (hits.length > 0) noteMatch();
+  if (hits.size > 0) noteMatch();
 
   if (request.mode === "count") {
-    yield encode(withFilename ? `${path}:${hits.length}\n` : `${hits.length}\n`);
+    if (hits.size === 0 && !request.zeroCounts) return;
+    yield encode(withFilename ? `${path}:${hits.size}\n` : `${hits.size}\n`);
     return;
   }
 
@@ -315,7 +380,10 @@ function* emit(
       emitted.add(at);
       const text = all[at];
       if (text === undefined) continue;
-      yield render(path, at + 1, text, at === index, request, withFilename);
+      // `:` marks a line that matches, whoever's context window emitted it.
+      // Keying on the hit being iterated printed the second of two adjacent
+      // matches as a context line.
+      yield render(path, at + 1, text, hits.has(at), request, withFilename);
       previous = at;
     }
   }

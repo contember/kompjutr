@@ -13,6 +13,7 @@
 // tty-dependent defaults resolve to the piped form: no heading, and line
 // numbers only with `-n`. There is no terminal here.
 
+import { encode } from "../exec/bytes.js";
 import { type Command, fail } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, parseFlags, UsageError } from "./flags.js";
@@ -231,6 +232,21 @@ export const rg: Command = (context) => {
       exclude,
       skipHidden,
       withFilename,
+      // rg drops a binary file a walk turned up; a named one it searches.
+      walkedBinaries: "skip",
+      // rg lists only files that matched, where GNU prints `path:0` for all
+      // of them. That is why `rg -c` keeps the SQL predicate and `grep -c`
+      // cannot: the predicate returns matches, which is exactly rg's answer.
+      zeroCounts: false,
+      warn: (message: string) => {
+        context.warn(message);
+      },
+      // rg puts its notice on stdout, with the offset of the byte that
+      // decided it.
+      reportBinary: (path: string, offset: number, withName: boolean) =>
+        encode(
+          `${withName ? `${path}: ` : ""}binary file matches (found "\\0" byte around offset ${offset})\n`,
+        ),
     });
     return { stdout: outcome.stream, status: outcome.status };
   } catch (error) {

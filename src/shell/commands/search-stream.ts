@@ -8,11 +8,12 @@
 
 import { type ByteStream, decode, encode, lines, NEWLINE } from "../exec/bytes.js";
 import type { CommandResult } from "../exec/context.js";
+import type { SearchMode } from "./search.js";
 
 export interface StreamSearch {
   readonly pattern: RegExp;
   readonly invert: boolean;
-  readonly mode: "content" | "files" | "count";
+  readonly mode: SearchMode;
   readonly lineNumbers: boolean;
   readonly before: number;
   readonly after: number;
@@ -27,9 +28,19 @@ export function searchStream(stdin: ByteStream, options: StreamSearch): CommandR
   const stream = (function* (): ByteStream {
     const label = options.name ?? "(standard input)";
     const history: Uint8Array[] = [];
+    const context = options.before > 0 || options.after > 0;
     let number = 0;
     let hits = 0;
     let pendingAfter = 0;
+    /** The last line number put out, so a gap can be marked. 0 = none yet. */
+    let emitted = 0;
+
+    function* put(at: number, text: Uint8Array, isMatch: boolean): ByteStream {
+      // A gap between context groups is marked, as both greps do.
+      if (context && emitted > 0 && at > emitted + 1) yield encode("--\n");
+      emitted = at;
+      yield render(label, at, text, isMatch, options);
+    }
 
     for (const text of lines(stdin)) {
       number++;
@@ -42,12 +53,12 @@ export function searchStream(stdin: ByteStream, options: StreamSearch): CommandR
         if (options.mode === "content") {
           // `-B n`: the lines held back, oldest first.
           for (let index = 0; index < history.length; index++) {
-            const context = history[index];
-            if (context === undefined) continue;
-            yield render(label, number - history.length + index, context, false, options);
+            const held = history[index];
+            if (held === undefined) continue;
+            yield* put(number - history.length + index, held, false);
           }
           history.length = 0;
-          yield render(label, number, text, true, options);
+          yield* put(number, text, true);
           pendingAfter = options.after;
         }
         continue;
@@ -57,7 +68,7 @@ export function searchStream(stdin: ByteStream, options: StreamSearch): CommandR
 
       if (pendingAfter > 0) {
         pendingAfter--;
-        yield render(label, number, text, false, options);
+        yield* put(number, text, false);
         continue;
       }
 
@@ -68,8 +79,10 @@ export function searchStream(stdin: ByteStream, options: StreamSearch): CommandR
     }
 
     if (options.mode === "count") yield encode(`${hits}\n`);
-    // `-l` over a pipe names the stream once, as grep does.
+    // `-l` over a pipe names the stream once, as grep does; `-L` names it
+    // exactly when nothing matched.
     if (options.mode === "files" && matched) yield encode(`${label}\n`);
+    if (options.mode === "files-without-match" && !matched) yield encode(`${label}\n`);
   })();
 
   return { stdout: stream, status: () => (matched ? 0 : 1) };
