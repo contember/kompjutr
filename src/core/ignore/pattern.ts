@@ -25,19 +25,23 @@ interface NfaState {
 }
 
 type Compiled =
-  | { kind: "literalBasename"; literal: Uint8Array; wildcardSegments: 0; nfaStates: 0 }
-  | { kind: "literalPath"; literal: Uint8Array; wildcardSegments: 0; nfaStates: 0 }
+  | { kind: "literalBasename"; literal: Uint8Array; wildcardSegments: number; nfaStates: 0 }
+  | { kind: "literalPath"; literal: Uint8Array; wildcardSegments: number; nfaStates: 0 }
   | {
       kind: "deterministic";
       anchored: boolean;
       tokens: readonly Token[];
+      literalPrefix: Uint8Array;
+      literalSuffix: Uint8Array;
       wildcardSegments: number;
       nfaStates: 0;
       hasStar: boolean;
+      targetSegments: number;
     }
   | {
       kind: "nfa";
       states: readonly NfaState[];
+      literalPrefix: Uint8Array;
       wildcardSegments: number;
       nfaStates: number;
     }
@@ -249,6 +253,29 @@ function literalOf(tokens: readonly Token[]): Uint8Array | null {
   return literal;
 }
 
+function literalEdge(tokens: readonly Token[], fromStart: boolean): Uint8Array {
+  let length = 0;
+  while (length < tokens.length) {
+    const index = fromStart ? length : tokens.length - length - 1;
+    if (tokens[index]?.kind !== "literal") break;
+    length++;
+  }
+  const edge = new Uint8Array(length);
+  for (let index = 0; index < length; index++) {
+    const token = tokens[fromStart ? index : tokens.length - length + index];
+    edge[index] = token?.byte ?? 0;
+  }
+  return edge;
+}
+
+function targetSegments(tokens: readonly Token[]): number {
+  let segments = 1;
+  for (const token of tokens) {
+    if (token.kind === "literal" && token.byte === SLASH) segments++;
+  }
+  return segments;
+}
+
 function wildcardSegments(bytes: Uint8Array): number {
   let count = 0;
   let wildcard = false;
@@ -283,6 +310,17 @@ function hasGlobstar(bytes: Uint8Array): boolean {
   return false;
 }
 
+function leadingGlobstarBasename(bytes: Uint8Array): Uint8Array | null {
+  let slash = 0;
+  while (slash < bytes.byteLength && (bytes[slash] !== SLASH || escaped(bytes, slash))) slash++;
+  if (slash < 2 || slash >= bytes.byteLength) return null;
+  for (let index = 0; index < slash; index++) if (bytes[index] !== STAR) return null;
+  for (let index = slash + 1; index < bytes.byteLength; index++) {
+    if (bytes[index] === SLASH && !escaped(bytes, index)) return null;
+  }
+  return bytes.subarray(slash + 1);
+}
+
 function compileNfa(bytes: Uint8Array): NfaState[] | null {
   const states: NfaState[] = [];
   let segmentStart = 0;
@@ -312,6 +350,14 @@ function compileNfa(bytes: Uint8Array): NfaState[] | null {
   return states;
 }
 
+function nfaLiteralPrefix(states: readonly NfaState[]): Uint8Array {
+  let length = 0;
+  while (states[length]?.kind === "literal") length++;
+  const prefix = new Uint8Array(length);
+  for (let index = 0; index < length; index++) prefix[index] = states[index]?.byte ?? 0;
+  return prefix;
+}
+
 function matchToken(token: Token, byte: number): boolean {
   if (token.kind === "literal") return token.byte === byte;
   if (token.kind === "any") return byte !== SLASH;
@@ -324,12 +370,16 @@ function matchDeterministic(
   bytes: Uint8Array,
   start: number,
   end: number,
-): boolean {
+  maxWork = Number.MAX_SAFE_INTEGER,
+): { matched: boolean; work: number } {
   let tokenIndex = 0;
   let byteIndex = start;
   let starIndex = -1;
   let retry = start;
+  let work = 0;
   while (byteIndex < end) {
+    work++;
+    if (work > maxWork) return { matched: false, work };
     const token = tokens[tokenIndex];
     const byte = bytes[byteIndex];
     if (
@@ -347,57 +397,98 @@ function matchDeterministic(
       tokenIndex = starIndex + 1;
       byteIndex = ++retry;
     } else {
-      return false;
+      return { matched: false, work };
     }
   }
-  while (tokens[tokenIndex]?.kind === "star") tokenIndex++;
-  return tokenIndex === tokens.length;
+  while (tokens[tokenIndex]?.kind === "star") {
+    work++;
+    if (work > maxWork) return { matched: false, work };
+    tokenIndex++;
+  }
+  return { matched: tokenIndex === tokens.length, work };
 }
 
-function epsilon(states: readonly NfaState[], mask: number): number {
-  let expanded = mask >>> 0;
-  for (;;) {
-    const before = expanded;
-    for (let index = 0; index < states.length; index++) {
-      if ((expanded & (1 << index)) === 0) continue;
+function maskHas(mask: Uint32Array, index: number): boolean {
+  return ((mask[index >>> 5] ?? 0) & (1 << (index & 31))) !== 0;
+}
+
+function maskSet(mask: Uint32Array, index: number): void {
+  const word = index >>> 5;
+  mask[word] = (mask[word] ?? 0) | (1 << (index & 31));
+}
+
+function epsilon(
+  states: readonly NfaState[],
+  mask: Uint32Array,
+  maxWork = Number.MAX_SAFE_INTEGER,
+): number {
+  let work = 0;
+  for (let word = 0; word < mask.length; word++) {
+    let pending = mask[word] ?? 0;
+    while (pending !== 0) {
+      const bit = pending & -pending;
+      pending = (pending & ~bit) >>> 0;
+      work++;
+      if (work > maxWork) return work;
+      const index = word * 32 + (31 - Math.clz32(bit));
       const kind = states[index]?.kind;
-      if (kind === "star" || kind === "starAny") expanded |= 1 << (index + 1);
-      else if (kind === "globBoundary") expanded |= 1 << (index + 2);
+      const target =
+        kind === "star" || kind === "starAny"
+          ? index + 1
+          : kind === "globBoundary"
+            ? index + 2
+            : -1;
+      if (target < 0 || maskHas(mask, target)) continue;
+      maskSet(mask, target);
+      if (target >>> 5 === word) pending = (pending | (1 << (target & 31))) >>> 0;
     }
-    expanded >>>= 0;
-    if (expanded === before) return expanded;
   }
+  return work;
 }
 
-function nfaStep(states: readonly NfaState[], mask: number, byte: number): number {
-  let next = 0;
-  for (let index = 0; index < states.length; index++) {
-    if ((mask & (1 << index)) === 0) continue;
-    const state = states[index];
-    if (state === undefined) continue;
-    if (state.kind === "star") {
-      if (byte !== SLASH) next |= 1 << index;
-    } else if (state.kind === "starAny") {
-      next |= 1 << index;
-    } else if (state.kind === "globBoundary") {
-      if (byte === SLASH) next |= 1 << index;
-      else next |= 1 << (index + 1);
-    } else if (state.kind === "globBody") {
-      if (byte === SLASH) next |= 1 << (index - 1);
-      else next |= 1 << index;
-    } else if (
-      state.kind === "literal"
-        ? state.byte === byte
-        : state.kind === "any"
-          ? byte !== SLASH
-          : state.kind === "class" && state.bits !== null
-            ? bitHas(state.bits, byte)
-            : false
-    ) {
-      next |= 1 << (index + 1);
+function nfaStep(
+  states: readonly NfaState[],
+  current: Uint32Array,
+  next: Uint32Array,
+  byte: number,
+  maxWork = Number.MAX_SAFE_INTEGER,
+): number {
+  let work = 0;
+  next.fill(0);
+  for (let word = 0; word < current.length; word++) {
+    let pending = current[word] ?? 0;
+    while (pending !== 0) {
+      const bit = pending & -pending;
+      pending = (pending & ~bit) >>> 0;
+      work++;
+      if (work > maxWork) return work;
+      const index = word * 32 + (31 - Math.clz32(bit));
+      const state = states[index];
+      if (state === undefined) continue;
+      if (state.kind === "star") {
+        if (byte !== SLASH) maskSet(next, index);
+      } else if (state.kind === "starAny") {
+        maskSet(next, index);
+      } else if (state.kind === "globBoundary") {
+        if (byte === SLASH) maskSet(next, index);
+        else maskSet(next, index + 1);
+      } else if (state.kind === "globBody") {
+        if (byte === SLASH) maskSet(next, index - 1);
+        else maskSet(next, index);
+      } else if (
+        state.kind === "literal"
+          ? state.byte === byte
+          : state.kind === "any"
+            ? byte !== SLASH
+            : state.kind === "class" && state.bits !== null
+              ? bitHas(state.bits, byte)
+              : false
+      ) {
+        maskSet(next, index + 1);
+      }
     }
   }
-  return epsilon(states, next >>> 0);
+  return work + epsilon(states, next, maxWork - work);
 }
 
 function equalBytes(
@@ -411,6 +502,63 @@ function equalBytes(
     if (left[leftStart + index] !== right[index]) return false;
   }
   return true;
+}
+
+function prefixMatch(
+  prefix: Uint8Array,
+  bytes: Uint8Array,
+  start: number,
+  maxWork = Number.MAX_SAFE_INTEGER,
+): { matched: boolean; work: number } {
+  let work = 1;
+  if (work > maxWork || bytes.byteLength - start < prefix.byteLength) {
+    return { matched: false, work };
+  }
+  for (let index = 0; index < prefix.byteLength; index++) {
+    work++;
+    if (work > maxWork) return { matched: false, work };
+    if (bytes[start + index] !== prefix[index]) return { matched: false, work };
+  }
+  return { matched: true, work };
+}
+
+function suffixMatch(
+  suffix: Uint8Array,
+  bytes: Uint8Array,
+  end: number,
+  maxWork = Number.MAX_SAFE_INTEGER,
+): { matched: boolean; work: number } {
+  let work = 1;
+  if (work > maxWork || end < suffix.byteLength) return { matched: false, work };
+  const start = end - suffix.byteLength;
+  for (let index = 0; index < suffix.byteLength; index++) {
+    work++;
+    if (work > maxWork) return { matched: false, work };
+    if (bytes[start + index] !== suffix[index]) return { matched: false, work };
+  }
+  return { matched: true, work };
+}
+
+function deterministicMatch(
+  compiled: Extract<Compiled, { kind: "deterministic" }>,
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+  maxWork = Number.MAX_SAFE_INTEGER,
+): { matched: boolean; work: number } {
+  let work = 0;
+  if (compiled.literalPrefix.byteLength > 0) {
+    const prefix = prefixMatch(compiled.literalPrefix, bytes, start, maxWork);
+    work += prefix.work;
+    if (!prefix.matched || work > maxWork) return { matched: false, work };
+  }
+  if (compiled.literalSuffix.byteLength > 0) {
+    const suffix = suffixMatch(compiled.literalSuffix, bytes, end, maxWork - work);
+    work += suffix.work;
+    if (!suffix.matched || work > maxWork) return { matched: false, work };
+  }
+  const result = matchDeterministic(compiled.tokens, bytes, start, end, maxWork - work);
+  return { matched: result.matched, work: work + result.work };
 }
 
 export function encodePath(path: string, maxSegments = 128): EncodedPath {
@@ -442,12 +590,22 @@ function finalMatch(compiled: Compiled, path: EncodedPath): boolean {
     return equalBytes(path.bytes, 0, path.bytes.length, compiled.literal);
   if (compiled.kind === "deterministic") {
     return compiled.anchored
-      ? matchDeterministic(compiled.tokens, path.bytes, 0, path.bytes.length)
-      : matchDeterministic(compiled.tokens, path.bytes, start, end);
+      ? deterministicMatch(compiled, path.bytes, 0, path.bytes.length).matched
+      : deterministicMatch(compiled, path.bytes, start, end).matched;
   }
-  let mask = epsilon(compiled.states, 1);
-  for (const byte of path.bytes) mask = nfaStep(compiled.states, mask, byte);
-  return (mask & (1 << compiled.states.length)) !== 0;
+  const prefix = prefixMatch(compiled.literalPrefix, path.bytes, 0);
+  if (!prefix.matched) return false;
+  let current = new Uint32Array(2);
+  let next = new Uint32Array(2);
+  maskSet(current, 0);
+  epsilon(compiled.states, current);
+  for (const byte of path.bytes) {
+    nfaStep(compiled.states, current, next, byte);
+    const swap = current;
+    current = next;
+    next = swap;
+  }
+  return maskHas(current, compiled.states.length);
 }
 
 /** Compile one physical rule line without decoding or re-encoding it. */
@@ -485,22 +643,41 @@ export function compilePatternBytes(line: Uint8Array): IgnorePattern | null {
   const body = line.subarray(start, end);
   const wildcards = wildcardSegments(body);
   let compiled: Compiled;
-  if (anchored && hasGlobstar(body)) {
+  const globstarBasename = anchored ? leadingGlobstarBasename(body) : null;
+  if (globstarBasename !== null) {
+    const parsed = tokensOf(globstarBasename);
+    if (!parsed.valid) {
+      compiled = { kind: "never", wildcardSegments: wildcards, nfaStates: 0 };
+    } else {
+      const literal = literalOf(parsed.tokens);
+      compiled =
+        literal !== null
+          ? { kind: "literalBasename", literal, wildcardSegments: wildcards, nfaStates: 0 }
+          : {
+              kind: "deterministic",
+              anchored: false,
+              tokens: parsed.tokens,
+              literalPrefix: literalEdge(parsed.tokens, true),
+              literalSuffix: literalEdge(parsed.tokens, false),
+              wildcardSegments: wildcards,
+              nfaStates: 0,
+              hasStar: parsed.hasStar,
+              targetSegments: 1,
+            };
+    }
+  } else if (anchored && hasGlobstar(body)) {
     const states = compileNfa(body);
-    const aggregateStates = states?.reduce(
-      (count, state) => count + (state.kind === "literal" ? 0 : 1),
-      0,
-    );
     compiled =
       states === null
         ? { kind: "never", wildcardSegments: wildcards, nfaStates: 0 }
-        : states.length > 31
+        : states.length >= 64
           ? { kind: "never", wildcardSegments: wildcards, nfaStates: states.length + 1 }
           : {
               kind: "nfa",
               states,
+              literalPrefix: nfaLiteralPrefix(states),
               wildcardSegments: wildcards,
-              nfaStates: aggregateStates ?? 0,
+              nfaStates: states.length + 1,
             };
   } else {
     const parsed = tokensOf(body);
@@ -511,15 +688,18 @@ export function compilePatternBytes(line: Uint8Array): IgnorePattern | null {
       compiled =
         literal !== null
           ? anchored
-            ? { kind: "literalPath", literal, wildcardSegments: 0, nfaStates: 0 }
-            : { kind: "literalBasename", literal, wildcardSegments: 0, nfaStates: 0 }
+            ? { kind: "literalPath", literal, wildcardSegments: wildcards, nfaStates: 0 }
+            : { kind: "literalBasename", literal, wildcardSegments: wildcards, nfaStates: 0 }
           : {
               kind: "deterministic",
               anchored,
               tokens: parsed.tokens,
+              literalPrefix: literalEdge(parsed.tokens, true),
+              literalSuffix: literalEdge(parsed.tokens, false),
               wildcardSegments: wildcards,
               nfaStates: 0,
               hasStar: parsed.hasStar,
+              targetSegments: targetSegments(parsed.tokens),
             };
     }
   }
@@ -561,27 +741,28 @@ export function patternLiteral(
   return null;
 }
 
-export function bytesEqual(
+export function patternMatchesNever(pattern: IgnorePattern): boolean {
+  return compiledPatterns.get(pattern)?.kind === "never";
+}
+
+export function compareLiteralBytes(
   path: Uint8Array,
   start: number,
   end: number,
   literal: Uint8Array,
-): boolean {
-  return equalBytes(path, start, end, literal);
+  maxWork = Number.MAX_SAFE_INTEGER,
+): { matched: boolean; work: number } {
+  let work = 1;
+  if (work > maxWork || end - start !== literal.byteLength) return { matched: false, work };
+  for (let index = 0; index < literal.byteLength; index++) {
+    work++;
+    if (work > maxWork) return { matched: false, work };
+    if (path[start + index] !== literal[index]) return { matched: false, work };
+  }
+  return { matched: true, work };
 }
 
 export type MatchDepth = (depth: number) => void;
-
-/** Cost charged before `matchPatternDepths` executes. */
-export function patternWork(pattern: IgnorePattern, bytes: number, _segments: number): number {
-  const compiled = compiledPatterns.get(pattern);
-  if (compiled === undefined || compiled.kind === "never") return 1;
-  if (compiled.kind === "literalBasename" || compiled.kind === "literalPath") return 1;
-  if (compiled.kind === "nfa") return Math.max(1, bytes * (compiled.states.length + 1));
-  return compiled.hasStar
-    ? Math.max(1, bytes * Math.min(8, compiled.tokens.length))
-    : Math.max(1, bytes);
-}
 
 /** Evaluate one applicable rule once and report every matched candidate depth. */
 export function matchPatternDepths(
@@ -590,11 +771,12 @@ export function matchPatternDepths(
   sourceDepth: number,
   isDirectory: boolean,
   matched: MatchDepth,
-): void {
+  maxWork = Number.MAX_SAFE_INTEGER,
+): number {
   const compiled = compiledPatterns.get(pattern);
-  if (compiled === undefined || compiled.kind === "never") return;
+  if (compiled === undefined || compiled.kind === "never") return 0;
   const firstDepth = sourceDepth + 1;
-  if (firstDepth > path.segments) return;
+  if (firstDepth > path.segments) return 0;
 
   const accepts = (depth: number): void => {
     if (!pattern.directoryOnly || depth < path.segments || isDirectory) matched(depth);
@@ -608,7 +790,7 @@ export function matchPatternDepths(
         accepts(depth);
       }
     }
-    return;
+    return 0;
   }
 
   const start = path.starts[sourceDepth] ?? 0;
@@ -617,44 +799,66 @@ export function matchPatternDepths(
       sourceDepth + compiled.literal.reduce((count, byte) => count + (byte === SLASH ? 1 : 0), 1);
     const end = path.ends[depth - 1];
     if (end !== undefined && equalBytes(path.bytes, start, end, compiled.literal)) accepts(depth);
-    return;
+    return 0;
   }
   if (compiled.kind === "deterministic") {
+    let work = 0;
     if (!compiled.anchored) {
       for (let depth = firstDepth; depth <= path.segments; depth++) {
         const index = depth - 1;
-        if (
-          matchDeterministic(
-            compiled.tokens,
-            path.bytes,
-            path.starts[index] ?? 0,
-            path.ends[index] ?? 0,
-          )
-        ) {
+        const result = deterministicMatch(
+          compiled,
+          path.bytes,
+          path.starts[index] ?? 0,
+          path.ends[index] ?? 0,
+          maxWork - work,
+        );
+        work += result.work;
+        if (work > maxWork) return work;
+        if (result.matched) {
           accepts(depth);
         }
       }
-      return;
+      return work;
     }
-    let slashes = 0;
-    for (const token of compiled.tokens)
-      if (token.kind === "literal" && token.byte === SLASH) slashes++;
-    const depth = sourceDepth + slashes + 1;
+    const depth = sourceDepth + compiled.targetSegments;
     const end = path.ends[depth - 1];
-    if (end !== undefined && matchDeterministic(compiled.tokens, path.bytes, start, end))
-      accepts(depth);
-    return;
+    if (end === undefined) return 0;
+    const result = deterministicMatch(compiled, path.bytes, start, end, maxWork);
+    if (result.matched) accepts(depth);
+    return result.work;
   }
 
-  let mask = epsilon(compiled.states, 1);
+  let work = 0;
+  const prefix = prefixMatch(compiled.literalPrefix, path.bytes, start, maxWork);
+  work += prefix.work;
+  if (!prefix.matched || work > maxWork) return work;
+  let current = new Uint32Array(2);
+  let next = new Uint32Array(2);
+  maskSet(current, 0);
+  work += epsilon(compiled.states, current, maxWork - work);
+  if (work > maxWork) return work;
   for (let depth = firstDepth; depth <= path.segments; depth++) {
     const end = path.ends[depth - 1] ?? path.bytes.length;
     const from = depth === firstDepth ? start : (path.starts[depth - 1] ?? end);
-    if (depth > firstDepth) mask = nfaStep(compiled.states, mask, SLASH);
+    if (depth > firstDepth) {
+      work += nfaStep(compiled.states, current, next, SLASH, maxWork - work);
+      if (work > maxWork) return work;
+      const swap = current;
+      current = next;
+      next = swap;
+    }
     for (let index = from; index < end; index++) {
       const byte = path.bytes[index];
-      if (byte !== undefined) mask = nfaStep(compiled.states, mask, byte);
+      if (byte !== undefined) {
+        work += nfaStep(compiled.states, current, next, byte, maxWork - work);
+        if (work > maxWork) return work;
+        const swap = current;
+        current = next;
+        next = swap;
+      }
     }
-    if ((mask & (1 << compiled.states.length)) !== 0) accepts(depth);
+    if (maskHas(current, compiled.states.length)) accepts(depth);
   }
+  return work;
 }

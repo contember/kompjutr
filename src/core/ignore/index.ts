@@ -4,14 +4,14 @@ import type { RealPath, RegularFileHandle } from "../../fs/types.js";
 import { relativeTo } from "../paths.js";
 import type { Worktree } from "../worktree.js";
 import {
-  bytesEqual,
+  compareLiteralBytes,
   compilePatternBytes,
   encodePath,
   type IgnorePattern,
   matchPatternDepths,
   patternLimits,
   patternLiteral,
-  patternWork,
+  patternMatchesNever,
 } from "./pattern.js";
 
 export type { IgnorePattern } from "./pattern.js";
@@ -20,14 +20,15 @@ export const IGNORE_LIMITS = {
   rawBytes: 1_000_000,
   fileBytes: 250_000,
   files: 1_024,
-  patterns: 1_024,
-  compiledBytes: 40_000,
+  patterns: 8_192,
+  compiledBytes: 256_000,
   patternBytes: 4_096,
-  nfaStates: 32,
-  wildcardSegments: 64,
+  nfaStates: 64,
+  totalNfaStates: 4_096,
+  wildcardSegments: 4_096,
   queryBytes: 16_384,
   querySegments: 128,
-  matcherWork: 16_384,
+  matcherWork: 4_096,
   discoveryPage: 128,
   discoveryStatements: 8,
   readStatements: 8,
@@ -41,6 +42,7 @@ export type IgnoreLimitResource =
   | "compiledBytes"
   | "patternBytes"
   | "nfaStates"
+  | "totalNfaStates"
   | "wildcardSegments"
   | "queryBytes"
   | "querySegments"
@@ -79,7 +81,7 @@ class IgnoreBudget {
   files = 0;
   patterns = 0;
   compiledBytes = 0;
-  nfaStates = 0;
+  totalNfaStates = 0;
   wildcardSegments = 0;
   discoveryStatements = 0;
   readStatements = 0;
@@ -123,11 +125,19 @@ class IgnoreBudget {
     }
     this.compiledBytes = compiledBytes;
     const limits = patternLimits(pattern);
-    const nfaStates = this.nfaStates + limits.nfaStates;
-    if (nfaStates > IGNORE_LIMITS.nfaStates) {
-      throw new IgnoreLimitError("nfaStates", IGNORE_LIMITS.nfaStates, nfaStates, path);
+    if (limits.nfaStates > IGNORE_LIMITS.nfaStates) {
+      throw new IgnoreLimitError("nfaStates", IGNORE_LIMITS.nfaStates, limits.nfaStates, path);
     }
-    this.nfaStates = nfaStates;
+    const totalNfaStates = this.totalNfaStates + limits.nfaStates;
+    if (totalNfaStates > IGNORE_LIMITS.totalNfaStates) {
+      throw new IgnoreLimitError(
+        "totalNfaStates",
+        IGNORE_LIMITS.totalNfaStates,
+        totalNfaStates,
+        path,
+      );
+    }
+    this.totalNfaStates = totalNfaStates;
     const wildcardSegments = this.wildcardSegments + limits.wildcardSegments;
     if (wildcardSegments > IGNORE_LIMITS.wildcardSegments) {
       throw new IgnoreLimitError(
@@ -243,7 +253,6 @@ interface RuleSource {
   basenames: ReadonlyMap<number, readonly IndexedRule[]>;
   paths: ReadonlyMap<number, readonly IndexedRule[]>;
   dynamic: readonly IndexedRule[];
-  priorityBase: number;
 }
 
 interface IndexedRule {
@@ -278,7 +287,6 @@ function compileRuleSource(
   bytes: Uint8Array,
   depth: number,
   patterns: readonly IgnorePattern[],
-  priorityBase: number,
 ): RuleSource {
   const basenames = new Map<number, IndexedRule[]>();
   const paths = new Map<number, IndexedRule[]>();
@@ -286,6 +294,7 @@ function compileRuleSource(
   for (let line = 0; line < patterns.length; line++) {
     const pattern = patterns[line];
     if (pattern === undefined) continue;
+    if (patternMatchesNever(pattern)) continue;
     const literal = patternLiteral(pattern);
     if (literal === null) {
       dynamic.push({ pattern, literal: new Uint8Array(0), line });
@@ -298,7 +307,7 @@ function compileRuleSource(
       rule,
     );
   }
-  return { bytes, depth, parent: null, basenames, paths, dynamic, priorityBase };
+  return { bytes, depth, parent: null, basenames, paths, dynamic };
 }
 
 export interface IgnoreSourceIndexStats {
@@ -343,6 +352,7 @@ class SourceIndex {
   applicable(bytes: Uint8Array, addWork: (amount: number) => void): RuleSource[] {
     const sources: RuleSource[] = [];
     const verified = new Set<RuleSource>();
+    if (this.#buckets.size > 0) addWork(bytes.byteLength);
     let hash = SOURCE_HASH_INITIAL;
     for (let index = 0; index < bytes.byteLength; index++) {
       hash = this.hashStep(hash, bytes[index] ?? 0) >>> 0;
@@ -387,7 +397,7 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
     extra: readonly IgnorePattern[],
     hashStep: IgnoreSourceHashStep = sourceHashStep,
   ) {
-    this.#extraSource = compileRuleSource(new Uint8Array(0), 0, extra, 0);
+    this.#extraSource = compileRuleSource(new Uint8Array(0), 0, extra);
     let rootSource: RuleSource | null = null;
     const sources: RuleSource[] = [];
     const sourceDirectories: { directory: string; source: RuleSource }[] = [];
@@ -397,7 +407,7 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
       let depth = 0;
       for (const byte of bytes) if (byte === 0x2f) depth++;
       if (bytes.length > 0) depth++;
-      const source = compileRuleSource(bytes, depth, patterns, (depth + 1) * 2_048);
+      const source = compileRuleSource(bytes, depth, patterns);
       if (bytes.length === 0) rootSource = source;
       else {
         sources.push(source);
@@ -443,49 +453,74 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
       }
       work = observed;
     };
-    addWork(encoded.bytes.byteLength);
-    if (this.#extraSource.basenames.size > 0) addWork(encoded.segments);
     if (this.#extraSource.paths.size > 0) addWork(encoded.bytes.byteLength);
-    for (const rule of this.#extraSource.dynamic) {
-      addWork(patternWork(rule.pattern, encoded.bytes.byteLength, encoded.segments));
-    }
     const applicable: RuleSource[] = [];
     if (this.#rootSource !== null) applicable.push(this.#rootSource);
     applicable.push(...this.#sourceIndex.applicable(encoded.bytes, addWork));
     for (const source of applicable) {
       const relativeBytes = encoded.bytes.byteLength - source.bytes.byteLength;
-      const relativeSegments = encoded.segments - source.depth;
-      if (source.basenames.size > 0) addWork(relativeSegments);
       if (source.paths.size > 0) addWork(relativeBytes);
-      for (const rule of source.dynamic) {
-        addWork(patternWork(rule.pattern, relativeBytes, relativeSegments));
+    }
+    const segmentHashes = new Uint32Array(encoded.segments);
+    if (
+      this.#extraSource.basenames.size > 0 ||
+      applicable.some((source) => source.basenames.size > 0)
+    ) {
+      addWork(encoded.bytes.byteLength);
+      for (let depth = 1; depth <= encoded.segments; depth++) {
+        segmentHashes[depth - 1] = hashBytes(
+          encoded.bytes,
+          encoded.starts[depth - 1] ?? 0,
+          encoded.ends[depth - 1] ?? 0,
+        );
       }
     }
 
     const decisions = new Uint8Array(encoded.segments);
-    const priorities = new Uint32Array(encoded.segments);
-    const decide = (rule: IndexedRule, depth: number, priorityBase: number): void => {
+    const sourceRanks = new Uint16Array(encoded.segments);
+    const lineRanks = new Uint16Array(encoded.segments);
+    const decide = (rule: IndexedRule, depth: number, sourceRank: number): void => {
       if (rule.pattern.directoryOnly && depth === encoded.segments && !isDirectory) return;
-      const priority = priorityBase + rule.line + 1;
-      if (priority < (priorities[depth - 1] ?? 0)) return;
-      priorities[depth - 1] = priority;
+      const lineRank = rule.line + 1;
+      const currentSource = sourceRanks[depth - 1] ?? 0;
+      const currentLine = lineRanks[depth - 1] ?? 0;
+      if (sourceRank < currentSource || (sourceRank === currentSource && lineRank < currentLine)) {
+        return;
+      }
+      sourceRanks[depth - 1] = sourceRank;
+      lineRanks[depth - 1] = lineRank;
       decisions[depth - 1] = rule.pattern.negated ? 1 : 2;
     };
-    const apply = (source: RuleSource): void => {
+    const apply = (source: RuleSource, sourceRank: number): void => {
       for (const rule of source.dynamic) {
-        matchPatternDepths(rule.pattern, encoded, source.depth, isDirectory, (depth) => {
-          decide(rule, depth, source.priorityBase);
-        });
+        const patternWork = matchPatternDepths(
+          rule.pattern,
+          encoded,
+          source.depth,
+          isDirectory,
+          (depth) => {
+            decide(rule, depth, sourceRank);
+          },
+          IGNORE_LIMITS.matcherWork - work,
+        );
+        addWork(patternWork);
       }
       if (source.basenames.size > 0) {
         for (let depth = source.depth + 1; depth <= encoded.segments; depth++) {
           const start = encoded.starts[depth - 1] ?? 0;
           const end = encoded.ends[depth - 1] ?? 0;
-          const bucket = source.basenames.get(hashBytes(encoded.bytes, start, end));
+          const bucket = source.basenames.get(segmentHashes[depth - 1] ?? 0);
           if (bucket === undefined) continue;
           for (const rule of bucket) {
-            if (bytesEqual(encoded.bytes, start, end, rule.literal))
-              decide(rule, depth, source.priorityBase);
+            const compared = compareLiteralBytes(
+              encoded.bytes,
+              start,
+              end,
+              rule.literal,
+              IGNORE_LIMITS.matcherWork - work,
+            );
+            addWork(compared.work);
+            if (compared.matched) decide(rule, depth, sourceRank);
           }
         }
       }
@@ -502,14 +537,22 @@ export class WorktreeIgnoreMatcher implements IgnoreMatcher {
           const bucket = source.paths.get(hash);
           if (bucket === undefined) continue;
           for (const rule of bucket) {
-            if (bytesEqual(encoded.bytes, start, end, rule.literal))
-              decide(rule, depth, source.priorityBase);
+            const compared = compareLiteralBytes(
+              encoded.bytes,
+              start,
+              end,
+              rule.literal,
+              IGNORE_LIMITS.matcherWork - work,
+            );
+            addWork(compared.work);
+            if (compared.matched) decide(rule, depth, sourceRank);
           }
         }
       }
     };
-    apply(this.#extraSource);
-    for (const source of applicable) apply(source);
+    let sourceRank = 1;
+    apply(this.#extraSource, sourceRank++);
+    for (const source of applicable) apply(source, sourceRank++);
 
     for (let depth = 1; depth <= encoded.segments; depth++) {
       if (decisions[depth - 1] === 2) return true;
