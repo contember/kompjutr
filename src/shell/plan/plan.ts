@@ -145,11 +145,21 @@ function applyRedirection(redirection: Redirection, sink: RedirectionSink): void
 }
 
 /**
- * R1 — a trailing `head -N` becomes demand rather than a stage.
+ * R1 — a trailing `head -N` publishes its demand to the source.
  *
- * The limit is dropped when a blocking stage sits between the source and the
- * limiter: `find | sort | head -20` genuinely needs all of find's output, and
- * pretending otherwise would return the wrong 20 lines.
+ * The stage stays. It is the mechanism: because the executor is pull-based,
+ * a `head` that stops pulling after N lines stops the search behind it,
+ * which stops the discovery pages behind that. Removing the stage and
+ * trusting the hint would leave nothing to enforce the count at all — the
+ * first draft did exactly that and returned whole files.
+ *
+ * What the hint buys is the *first* page size. The Wave A probe showed a
+ * fixed page costs a second round trip as soon as match density drops
+ * below 2/3, so a source seeds at `2 * limitHint`.
+ *
+ * No hint is published when a blocking stage sits between the source and the
+ * limiter: `find | sort | head -20` genuinely needs all of find's output, so
+ * sizing the first page to 40 would only cost extra round trips.
  */
 function liftTrailingLimit(
   commands: readonly PlannedCommand[],
@@ -169,9 +179,9 @@ function liftTrailingLimit(
   }
 
   return {
-    commands: upstream,
+    commands: [...commands],
     limit,
-    note: `head -${limit} lifted into a demand hint`,
+    note: `head -${limit} published as a demand hint`,
   };
 }
 

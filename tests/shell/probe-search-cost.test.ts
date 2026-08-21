@@ -37,10 +37,7 @@ function tree(fileCount: number, needleEvery: number): Fixture {
   return { fs, storage };
 }
 
-function measure<T>(
-  storage: SqliteTestStorage,
-  fn: () => T,
-): { value: T; statements: number } {
+function measure<T>(storage: SqliteTestStorage, fn: () => T): { value: T; statements: number } {
   const before = storage.statementCount;
   const value = fn();
   return { value, statements: storage.statementCount - before };
@@ -79,7 +76,11 @@ describe("A2 — early stop", () => {
       // Geometric page growth, seeded at 2x the wanted count: a fixed 32
       // costs a second page as soon as fewer than 2 in 3 candidates match.
       for (let limit = 40; found.length < 20 && pages < 20; limit = Math.min(limit * 2, 1_000)) {
-        const page = fs.discoverFiles(root, "*.ts", after === undefined ? { limit } : { after, limit });
+        const page = fs.discoverFiles(
+          root,
+          "*.ts",
+          after === undefined ? { limit } : { after, limit },
+        );
         pages++;
         if (page.handles.length === 0) break;
         const batch = fs.readFileHandles(page.handles);

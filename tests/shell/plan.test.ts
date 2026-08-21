@@ -34,11 +34,13 @@ function rejects(source: string): ShellSyntaxError {
 }
 
 describe("R1 — a trailing head becomes demand", () => {
-  it("lifts the most common corpus shape", () => {
+  it("publishes the most common corpus shape as a hint", () => {
+    // The stage stays: it is what stops pulling, and therefore what stops
+    // the discovery pages. The hint only sizes the first page.
     const pipeline = planOne("grep -rn pattern . | head -20");
-    expect(names(pipeline)).toEqual(["grep"]);
+    expect(names(pipeline)).toEqual(["grep", "head"]);
     expect(pipeline.limitHint).toBe(20);
-    expect(pipeline.fusions).toContain("head -20 lifted into a demand hint");
+    expect(pipeline.fusions).toContain("head -20 published as a demand hint");
   });
 
   it("reads every spelling of the count", () => {
@@ -107,7 +109,7 @@ describe("R2 — find | xargs grep is one search", () => {
 
   it("composes with R1", () => {
     const pipeline = planOne("find /repo -name '*.ts' | xargs grep -l x | head -20");
-    expect(names(pipeline)).toEqual(["grep"]);
+    expect(names(pipeline)).toEqual(["grep", "head"]);
     expect(pipeline.limitHint).toBe(20);
     expect(pipeline.fusions).toHaveLength(2);
   });
