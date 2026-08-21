@@ -3,6 +3,7 @@
 // real repositories.
 
 import { MACRO } from "./macro.js";
+import { NEXTJS_WORKFLOW } from "./nextjs-workflow.js";
 import { SYNTHETIC } from "./synthetic.js";
 
 export type {
@@ -17,4 +18,4 @@ export type {
 export { asVariant, fixtureNameOf, harness, isShape, shapeOf } from "./harness.js";
 export { FILE_BYTES, pathFor, writeFiles } from "./synthetic.js";
 
-export const SCENARIOS = [...SYNTHETIC, ...MACRO];
+export const SCENARIOS = [...SYNTHETIC, ...MACRO, NEXTJS_WORKFLOW];

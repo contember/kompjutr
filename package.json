@@ -44,7 +44,8 @@
     "format": "biome format --write .",
     "check": "biome check .",
     "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts",
-    "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose"
+    "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose",
+    "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts"
   },
   "dependencies": {
     "pako": "^2.1.0"
