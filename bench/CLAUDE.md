@@ -7,6 +7,7 @@ inside a cgroup with a hard memory limit, and writes to `bench/results/`.
 npm run bench          # every scenario
 npm run bench:macro    # macro-packed, macro-loose
 npm run bench:nextjs   # the Next.js workflow
+npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
 ```
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
@@ -39,6 +40,8 @@ targets and how they came out are in `docs/benchmark-reference.md` and
    object layouts and call the difference a result.
 6. A `vitest-pool-workers` run needs a `compatibility_date` the bundled
    `workerd` supports. A date set to "today" makes the benchmark unrunnable.
+7. Local workerd has no isolate memory limiter. Its process RSS is a regression
+   signal, not proof that the production 128 MB isolate limit is satisfied.
 
 Benchmark numbers taken on a loaded machine are noise. Reserve CPU before a run
 and say in the write-up how it was reserved.

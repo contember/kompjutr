@@ -49,10 +49,11 @@
     "check": "biome check .",
     "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts",
     "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose",
-    "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts"
+    "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts",
+    "bench:workerd:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/workerd/run.ts"
   },
   "dependencies": {
-    "pako": "^2.1.0"
+    "pako": "2.2.0"
   },
   "peerDependencies": {
     "@cloudflare/computer": ">=0.2.1"
@@ -68,7 +69,9 @@
     "@types/node": "^24.0.0",
     "@types/pako": "^2.0.3",
     "diff": "^9.0.0",
+    "esbuild": "0.28.2",
     "isomorphic-git": "^1.41.7",
+    "miniflare": "5.20260820.0-alpha",
     "typescript": "^5.9.0",
     "vitest": "^3.2.4"
   }
