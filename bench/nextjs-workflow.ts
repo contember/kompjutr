@@ -77,12 +77,12 @@ function expectClean(rows: readonly { path: string }[], label: string): void {
   throw new Error(`${label} returned ${rows.length} entries, expected none`);
 }
 
-function traceCloneMemory(message: string): void {
+function traceCloneMemory(message: string, statements: number): void {
   if (process.env.BENCH_MEMORY_TRACE !== "1") return;
   if (!message.startsWith("Receiving objects:") && !message.startsWith("Resolved ")) return;
   const memory = process.memoryUsage();
   process.stderr.write(
-    `[clone-memory] ${message.trim()} rss=${memory.rss} heap=${memory.heapUsed} external=${memory.external}\n`,
+    `[clone-memory] ${message.trim()} statements=${statements} rss=${memory.rss} heap=${memory.heapUsed} external=${memory.external}\n`,
   );
 }
 
@@ -106,7 +106,7 @@ export const NEXTJS_WORKFLOW: Scenario = {
           ref: ORIGIN_BRANCH,
           depth: 1,
           singleBranch: true,
-          onMessage: traceCloneMemory,
+          onMessage: (message) => traceCloneMemory(message, harness.storage.statementCount),
         });
       },
     },
