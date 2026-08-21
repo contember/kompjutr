@@ -1,3 +1,10 @@
+export {
+  Database,
+  type DurableObjectStorageLike,
+  type SQLCursorLike,
+  type SQLStorageLike,
+  type SqlDatabase,
+} from "../sqlite/db.js";
 export type {
   CompatWriteFilesEntry,
   CompatWriteFilesOptions,

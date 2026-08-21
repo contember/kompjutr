@@ -1,0 +1,325 @@
+import { type GitContext, type GitIdentity, nestedRoots, openRepository } from "../core/context.js";
+import { UnsupportedOperationError } from "../core/errors.js";
+import { type CommitOptions, commit as commitOp } from "../core/ops/commit.js";
+import {
+  type ConfigGetOptions,
+  type ConfigSetOptions,
+  configGet,
+  configSet,
+  type RemoteAddOptions,
+  type RemoteRemoveOptions,
+  remoteAdd,
+  remoteList,
+  remoteRemove,
+} from "../core/ops/config.js";
+import {
+  type DiffOptions,
+  diff as diffOp,
+  diffSummary as diffSummaryOp,
+} from "../core/ops/diff.js";
+import { type InitOptions, initRepository } from "../core/ops/init.js";
+import type { CommitResult, DiffSummaryEntry, RemoteView, StatusEntry } from "../core/ops/kinds.js";
+import {
+  type CloneOptions,
+  clone as cloneOp,
+  type FetchOptions,
+  type FetchResult,
+  fetchInto,
+} from "../core/ops/network.js";
+import {
+  type CatFileOptions,
+  catFile as catFileOp,
+  type HashObjectOptions,
+  hashObject as hashObjectOp,
+  repoRoot as repoRootOp,
+  type UpdateRefOptions,
+  updateRef as updateRefOp,
+} from "../core/ops/plumbing.js";
+import {
+  type CommitView,
+  catFile as catFileRead,
+  log as logOp,
+  lsFilesAtRef,
+  lsTree as lsTreeOp,
+  show as showOp,
+  type TreeEntryView,
+} from "../core/ops/reads.js";
+import {
+  type BranchDeleteOptions,
+  type BranchOptions,
+  branchDelete as branchDeleteOp,
+  branchList as branchListOp,
+  branch as branchOp,
+  type CheckoutOptions,
+  type CurrentBranchOptions,
+  checkout as checkoutOp,
+  currentBranch as currentBranchOp,
+  type TagDeleteOptions,
+  type TagOptions,
+  tagDelete as tagDeleteOp,
+  tagList as tagListOp,
+  tag as tagOp,
+} from "../core/ops/refs.js";
+import {
+  type AddOptions,
+  add as addOp,
+  lsFiles as lsFilesOp,
+  type ResetOptions,
+  type RmOptions,
+  reset as resetOp,
+  rm as rmOp,
+} from "../core/ops/staging.js";
+import { type CleanOptions, clean as cleanOp, status as statusOp } from "../core/ops/status.js";
+import type { GitHttpClient } from "../core/protocol/transport.js";
+import type { Repository } from "../core/repository.js";
+import type { Worktree } from "../core/worktree.js";
+import type { SqliteGitDatabase } from "../sqlite/store.js";
+
+export interface GitDirOptions {
+  dir?: string;
+}
+
+export type GitCloneOptions = CloneOptions;
+export type GitFetchOptions = FetchOptions;
+export type GitInitOptions = InitOptions;
+export type GitDiffOptions = DiffOptions & GitDirOptions;
+export type GitCleanOptions = Omit<CleanOptions, "excludeRoots" | "ignores"> & GitDirOptions;
+export type GitAddOptions = Omit<AddOptions, "excludeRoots"> & GitDirOptions;
+export type GitRmOptions = RmOptions & GitDirOptions;
+export type GitResetOptions = ResetOptions & GitDirOptions;
+export type GitCommitOptions = CommitOptions & GitDirOptions;
+export type GitBranchOptions = BranchOptions & GitDirOptions;
+export type GitBranchDeleteOptions = BranchDeleteOptions & GitDirOptions;
+export type GitTagOptions = TagOptions & GitDirOptions;
+export type GitTagDeleteOptions = TagDeleteOptions & GitDirOptions;
+export type GitCheckoutOptions = CheckoutOptions & GitDirOptions;
+export type GitConfigGetOptions = ConfigGetOptions & GitDirOptions;
+export type GitConfigSetOptions = ConfigSetOptions & GitDirOptions;
+export type GitRemoteAddOptions = RemoteAddOptions & GitDirOptions;
+export type GitRemoteRemoveOptions = RemoteRemoveOptions & GitDirOptions;
+export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
+export type GitCatFileOptions = CatFileOptions & GitDirOptions;
+export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
+
+export interface GitCatFileResult {
+  oid: string;
+  bytes: Uint8Array;
+}
+
+export interface Git {
+  clone(input: GitCloneOptions): Promise<void>;
+  fetch(input?: GitFetchOptions): Promise<FetchResult>;
+  init(input?: GitInitOptions): Promise<void>;
+  status(input?: GitDirOptions): Promise<StatusEntry[]>;
+  diff(input?: GitDiffOptions): Promise<string>;
+  diffSummary(input?: GitDiffOptions): Promise<DiffSummaryEntry[]>;
+  clean(input?: GitCleanOptions): Promise<string[]>;
+  add(input: GitAddOptions): Promise<void>;
+  rm(input: GitRmOptions): Promise<void>;
+  reset(input?: GitResetOptions): Promise<void>;
+  commit(input: GitCommitOptions): Promise<CommitResult>;
+  log(input?: GitDirOptions & { ref?: string; depth?: number }): Promise<CommitView[]>;
+  show(input: GitDirOptions & { ref: string }): Promise<CommitView>;
+  revParse(input: GitDirOptions & { ref: string }): Promise<string>;
+  repoRoot(input?: GitDirOptions): Promise<string>;
+  currentBranch(input?: GitDirOptions & CurrentBranchOptions): Promise<string | undefined>;
+  lsFiles(input?: GitDirOptions & { ref?: string }): Promise<string[]>;
+  lsTree(input: GitDirOptions & { ref: string; path?: string }): Promise<TreeEntryView[]>;
+  branch(input: GitBranchOptions): Promise<void>;
+  branchDelete(input: GitBranchDeleteOptions): Promise<void>;
+  branchList(input?: GitDirOptions): Promise<string[]>;
+  tag(input: GitTagOptions): Promise<void>;
+  tagDelete(input: GitTagDeleteOptions): Promise<void>;
+  tagList(input?: GitDirOptions): Promise<string[]>;
+  checkout(input: GitCheckoutOptions): Promise<void>;
+  remoteAdd(input: GitRemoteAddOptions): Promise<void>;
+  remoteRemove(input: GitRemoteRemoveOptions): Promise<void>;
+  remoteList(input?: GitDirOptions): Promise<RemoteView[]>;
+  configGet(input: GitConfigGetOptions): Promise<string | string[] | undefined>;
+  configSet(input: GitConfigSetOptions): Promise<void>;
+  hashObject(input: GitHashObjectOptions): Promise<string>;
+  catFile(input: GitCatFileOptions): Promise<GitCatFileResult>;
+  updateRef(input: GitUpdateRefOptions): Promise<void>;
+  push(input?: GitDirOptions): Promise<never>;
+  pull(input?: GitDirOptions): Promise<never>;
+  merge(input: GitDirOptions & { theirs: string }): Promise<never>;
+  stashPush(input?: GitDirOptions): Promise<never>;
+  stashList(input?: GitDirOptions): Promise<never>;
+  stashPop(input?: GitDirOptions): Promise<never>;
+  cli(input: GitDirOptions & { argv: string[] }): Promise<never>;
+}
+
+export interface GitWorkspaceBinding {
+  database: SqliteGitDatabase;
+  worktree: Worktree;
+  now: () => number;
+  timezoneOffset: () => number;
+  defaultIdentity?: GitIdentity;
+  http?: GitHttpClient;
+  yieldNow?: () => Promise<void>;
+}
+
+export interface CreateGitOptions {
+  now?: () => number;
+  timezoneOffset?: () => number;
+  yieldNow?: () => Promise<void>;
+}
+
+export type GitFactory = (binding: GitWorkspaceBinding) => Git;
+
+/** Create a Git factory that binds lazily to one Workspace database. */
+export function createGit(options: CreateGitOptions = {}): GitFactory {
+  return (binding) => createGitClient(binding, options);
+}
+
+function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions): Git {
+  const context: GitContext = {
+    database: binding.database,
+    worktree: binding.worktree,
+    now: options.now ?? binding.now,
+    timezoneOffset: options.timezoneOffset ?? binding.timezoneOffset,
+  };
+  if (binding.defaultIdentity !== undefined) context.defaultIdentity = binding.defaultIdentity;
+  if (binding.http !== undefined) context.http = binding.http;
+  const yieldNow = options.yieldNow ?? binding.yieldNow;
+  if (yieldNow !== undefined) context.yieldNow = yieldNow;
+
+  const at = (dir?: string): Repository => openRepository(context, dir ?? "/");
+  const excludeRoots = (repo: Repository): string[] => nestedRoots(context, repo.root);
+
+  return {
+    async clone(input) {
+      await cloneOp(context, input);
+    },
+    async fetch(input = {}) {
+      return fetchInto(context, at(input.dir), input);
+    },
+    async init(input = {}) {
+      initRepository(context, input);
+    },
+    async status(input = {}) {
+      const repo = at(input.dir);
+      return statusOp(repo, context.worktree, { excludeRoots: excludeRoots(repo) }).map((row) => ({
+        path: row.path,
+        index: row.index,
+        worktree: row.worktree,
+      }));
+    },
+    async diff(input = {}) {
+      return diffOp(at(input.dir), context.worktree, input);
+    },
+    async diffSummary(input = {}) {
+      return diffSummaryOp(at(input.dir), context.worktree, input);
+    },
+    async clean(input = {}) {
+      const repo = at(input.dir);
+      return cleanOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+    },
+    async add(input) {
+      const repo = at(input.dir);
+      addOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+    },
+    async rm(input) {
+      rmOp(at(input.dir), context.worktree, input);
+    },
+    async reset(input = {}) {
+      resetOp(at(input.dir), context.worktree, input);
+    },
+    async commit(input) {
+      return commitOp(context, at(input.dir), input);
+    },
+    async log(input = {}) {
+      return logOp(at(input.dir), input);
+    },
+    async show(input) {
+      return showOp(at(input.dir), input.ref);
+    },
+    async revParse(input) {
+      return at(input.dir).revParse(input.ref);
+    },
+    async repoRoot(input = {}) {
+      return repoRootOp(context, input);
+    },
+    async currentBranch(input = {}) {
+      return currentBranchOp(at(input.dir), input);
+    },
+    async lsFiles(input = {}) {
+      const repo = at(input.dir);
+      return input.ref === undefined ? lsFilesOp(repo) : lsFilesAtRef(repo, input.ref);
+    },
+    async lsTree(input) {
+      return lsTreeOp(at(input.dir), input.ref, input.path);
+    },
+    async branch(input) {
+      branchOp(at(input.dir), input);
+    },
+    async branchDelete(input) {
+      branchDeleteOp(at(input.dir), input);
+    },
+    async branchList(input = {}) {
+      return branchListOp(at(input.dir));
+    },
+    async tag(input) {
+      tagOp(at(input.dir), input);
+    },
+    async tagDelete(input) {
+      tagDeleteOp(at(input.dir), input);
+    },
+    async tagList(input = {}) {
+      return tagListOp(at(input.dir));
+    },
+    async checkout(input) {
+      checkoutOp(context, at(input.dir), context.worktree, input);
+    },
+    async remoteAdd(input) {
+      remoteAdd(at(input.dir), input);
+    },
+    async remoteRemove(input) {
+      remoteRemove(at(input.dir), input);
+    },
+    async remoteList(input = {}) {
+      return remoteList(at(input.dir));
+    },
+    async configGet(input) {
+      return configGet(at(input.dir), input);
+    },
+    async configSet(input) {
+      configSet(at(input.dir), input);
+    },
+    async hashObject(input) {
+      return hashObjectOp(at(input.dir), input);
+    },
+    async catFile(input) {
+      const repo = at(input.dir);
+      const result =
+        input.filepath === undefined
+          ? catFileOp(repo, input)
+          : catFileRead(repo, input.oid, input.filepath);
+      return { oid: result.oid, bytes: result.bytes };
+    },
+    async updateRef(input) {
+      updateRefOp(at(input.dir), input);
+    },
+    async push() {
+      throw new UnsupportedOperationError("push");
+    },
+    async pull() {
+      throw new UnsupportedOperationError("pull");
+    },
+    async merge() {
+      throw new UnsupportedOperationError("merge");
+    },
+    async stashPush() {
+      throw new UnsupportedOperationError("stash push");
+    },
+    async stashList() {
+      throw new UnsupportedOperationError("stash list");
+    },
+    async stashPop() {
+      throw new UnsupportedOperationError("stash pop");
+    },
+    async cli() {
+      throw new UnsupportedOperationError("the argv entry point");
+    },
+  };
+}

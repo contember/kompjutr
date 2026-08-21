@@ -64,7 +64,34 @@ export type {
   WriteEntry,
   WriteOptions,
 } from "./fs/types.js";
-export type { SqlDatabase } from "./sqlite/db.js";
+export {
+  type CreateGitOptions,
+  createGit,
+  type Git,
+  type GitFactory,
+} from "./git/client.js";
+export {
+  type Async,
+  type AsyncFilesystem,
+  type ExitStatus,
+  type GitCliInput,
+  type GitCliResult,
+  type ProcessEvent,
+  type ProcessExecOptions,
+  type ProcessHandle,
+  type ProcessHost,
+  type ProcessResult,
+  type RpcHost,
+  Workspace,
+  type WorkspaceOptions,
+} from "./runtime/index.js";
+export {
+  Database,
+  type DurableObjectStorageLike,
+  type SQLCursorLike,
+  type SQLStorageLike,
+  type SqlDatabase,
+} from "./sqlite/db.js";
 export { initializeGitSchema, SCHEMA_VERSION } from "./sqlite/schema.js";
 export {
   type IndexEntry,
