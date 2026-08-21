@@ -8,7 +8,10 @@
       "style": { "noNonNullAssertion": "off", "useNamingConvention": "off" }
     }
   },
-  // bench/.fixtures and tmp both hold cloned repositories, several of which
-  // carry their own biome.json and would be read as nested roots.
-  "files": { "includes": ["**", "!dist", "!node_modules", "!bench/.fixtures", "!tmp"] }
+  // bench/.fixtures, tmp and .claude all hold checkouts of other repositories
+  // — cloned fixtures and agent worktrees — several of which carry their own
+  // biome.json and would be read as nested roots.
+  "files": {
+    "includes": ["**", "!dist", "!node_modules", "!bench/.fixtures", "!tmp", "!.claude"]
+  }
 }
