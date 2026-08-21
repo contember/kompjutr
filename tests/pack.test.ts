@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { afterAll, describe, expect, it } from "vitest";
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
@@ -6,6 +6,7 @@ import { GitError } from "../src/core/errors.js";
 import {
   hashObject,
   MODE_FILE,
+  type ObjectType,
   parseCommit,
   parseTree,
   serializeCommit,
@@ -14,7 +15,7 @@ import {
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { MAX_INDEXED_COMMIT_BYTES } from "../src/sqlite/commits.js";
-import { MAX_DELTA_DEPTH } from "../src/sqlite/packs.js";
+import { MAX_DELTA_DEPTH, MAX_PACK_DELTA_WORKING_BYTES, PACK_CHUNK } from "../src/sqlite/packs.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
@@ -527,12 +528,359 @@ describe("synthetic pack ingest", () => {
     writer.object("blob", base);
     writer.finish();
 
+    db.storage.histogram = new Map();
     db.storage.resetCounters();
     await store.packs.ingest(slices(concat(chunks), 64 * 1024));
 
-    expect(db.storage.statementCount).toBeLessThanOrEqual(40);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+    expect(
+      [...db.storage.histogram].filter(([query]) =>
+        query.startsWith("SELECT pack_id, offset, data_off, data_len, type, size"),
+      ),
+    ).toEqual([]);
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("INSERT OR IGNORE INTO git_pack_objects"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBeLessThanOrEqual(5);
     expect(store.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
     expect(store.read(targets[998]!.oid)?.data).toEqual(targets[998]!.data);
+  });
+
+  it("resolves a same-page deferred chain without one pass per delta", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(301);
+    let data = utf8.encode("a");
+    let oid = hashObject("blob", data);
+    writer.object("blob", data);
+    for (let index = 0; index < 300; index++) {
+      const base = data;
+      const baseOid = oid;
+      data = utf8.encode(`${utf8Decoder.decode(data)}a`);
+      oid = hashObject("blob", data);
+      writer.refDelta(baseOid, literalDelta(base.length, data));
+    }
+    writer.finish();
+
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+    expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it("resolves 999 child-before-base deltas in bounded statements", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const objects = Array.from({ length: 1_000 }, (_, index) => {
+      const data = new Uint8Array(64).fill(index & 0xff);
+      data[0] = index & 0xff;
+      data[1] = index >>> 8;
+      return { data, oid: hashObject("blob", data) };
+    });
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(objects.length);
+    for (let index = objects.length - 1; index > 0; index--) {
+      const target = objects[index]!;
+      const base = objects[index - 1]!;
+      writer.refDelta(base.oid, literalDelta(base.data.length, target.data));
+    }
+    writer.object("blob", objects[0]!.data);
+    writer.finish();
+
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+    expect(store.read(objects[999]!.oid)?.data).toEqual(objects[999]!.data);
+  });
+
+  it("checkpoints a reverse delta chain across three pending pages", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const objects = Array.from({ length: 8_194 }, (_, index) => {
+      const data = new Uint8Array(8);
+      const view = new DataView(data.buffer);
+      view.setUint32(0, index);
+      view.setUint32(4, index ^ 0x5a5a5a5a);
+      return { data, oid: hashObject("blob", data) };
+    });
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(objects.length);
+    for (let index = objects.length - 1; index > 0; index--) {
+      const target = objects[index]!;
+      const base = objects[index - 1]!;
+      writer.refDelta(base.oid, literalDelta(base.data.length, target.data));
+    }
+    writer.object("blob", objects[0]!.data);
+    writer.finish();
+
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(db.storage.statementCount).toBeLessThanOrEqual(100);
+    expect(store.read(objects[8_193]!.oid)?.data).toEqual(objects[8_193]!.data);
+  });
+
+  it("resolves thin deltas from every loose object type in one bounded batch", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const treeBase = serializeTree(
+      Array.from({ length: 150 }, (_, index) => ({
+        mode: MODE_FILE,
+        name: `a${index.toString().padStart(3, "0")}`,
+        oid: "1".repeat(40),
+      })),
+    );
+    const treeTarget = serializeTree(
+      Array.from({ length: 150 }, (_, index) => ({
+        mode: MODE_FILE,
+        name: `b${index.toString().padStart(3, "0")}`,
+        oid: "2".repeat(40),
+      })),
+    );
+    const inputs: { type: ObjectType; base: Uint8Array; target: Uint8Array }[] = [
+      { type: "blob", base: utf8.encode("base blob\n"), target: utf8.encode("target blob\n") },
+      { type: "tree", base: treeBase, target: treeTarget },
+      {
+        type: "commit",
+        base: syntheticCommit(0, `${"b".repeat(5_000)}\n`),
+        target: syntheticCommit(1, `${"t".repeat(5_000)}\n`),
+      },
+      {
+        type: "tag",
+        base: utf8.encode(`${"1".repeat(40)}\n${"b".repeat(5_000)}\n`),
+        target: utf8.encode(`${"2".repeat(40)}\n${"t".repeat(5_000)}\n`),
+      },
+    ];
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(inputs.length);
+    const expected: { type: ObjectType; oid: string; data: Uint8Array }[] = [];
+    for (const input of inputs) {
+      const baseOid = store.write(input.type, input.base);
+      writer.refDelta(baseOid, literalDelta(input.base.length, input.target));
+      expected.push({
+        type: input.type,
+        oid: hashObject(input.type, input.target),
+        data: input.target,
+      });
+    }
+    writer.finish();
+
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+    expect(
+      [...db.storage.histogram].filter(([query]) =>
+        query.includes("SELECT data FROM git_object_chunks WHERE repo_id = ? AND oid = ?"),
+      ),
+    ).toEqual([]);
+    for (const object of expected) {
+      expect(store.read(object.oid)).toEqual({ type: object.type, data: object.data });
+    }
+  });
+
+  it("keeps every scalar pack API blind to the pack being indexed", async () => {
+    const store = open();
+    const objects = Array.from({ length: 1_024 }, (_, index) => {
+      const data = new Uint8Array([index & 0xff, index >>> 8, 0x61]);
+      return { data, oid: hashObject("blob", data) };
+    });
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(objects.length);
+    for (const object of objects) writer.object("blob", object.data);
+    writer.finish();
+
+    const first = objects[0]!;
+    let observed:
+      | {
+          lookup: unknown;
+          typeAndSize: unknown;
+          count: number;
+          prefix: string[];
+          oids: string[];
+          read: unknown;
+        }
+      | undefined;
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
+      yieldNow: async () => {
+        if (observed !== undefined) return;
+        const indexed =
+          store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_objects WHERE repo_id = 1") ?? 0;
+        if (indexed !== objects.length) return;
+        observed = {
+          lookup: store.packs.lookup(first.oid),
+          typeAndSize: store.typeAndSize(first.oid),
+          count: store.packs.count(),
+          prefix: store.packs.findPrefix(first.oid.slice(0, 8), 2),
+          oids: store.packs.oids(),
+          read: store.read(first.oid),
+        };
+      },
+    });
+
+    expect(observed).toEqual({
+      lookup: null,
+      typeAndSize: null,
+      count: 0,
+      prefix: [],
+      oids: [],
+      read: null,
+    });
+    expect(store.read(first.oid)?.data).toEqual(first.data);
+    expect(store.packs.count()).toBe(objects.length);
+  });
+
+  it("rejects multiple oversized ingest bases before bulk inflation", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const size = 2 * 1024 * 1024 + 1;
+    const bases = [new Uint8Array(size), new Uint8Array(size).fill(1)];
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(4);
+    writer.refDelta(hashObject("blob", bases[0]!), literalDelta(size, new Uint8Array([1])));
+    writer.refDelta(hashObject("blob", bases[1]!), literalDelta(size, new Uint8Array([2])));
+    for (const base of bases) writer.object("blob", base);
+    writer.finish();
+
+    db.storage.histogram = new Map();
+    await expect(store.packs.ingest(slices(concat(chunks), 64 * 1024))).rejects.toThrow(
+      /bases exceed the 4 MiB batch limit/,
+    );
+    expect(
+      [...db.storage.histogram].filter(([query]) => query.includes("roots(oid) AS MATERIALIZED")),
+    ).toEqual([]);
+  });
+
+  it("rejects mixed packed and loose bases before either source is materialized", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const packedBase = utf8.encode("packed base\n");
+    const packedChunks: Uint8Array[] = [];
+    const packedWriter = new PackWriter((chunk) => packedChunks.push(chunk));
+    packedWriter.header(1);
+    packedWriter.object("blob", packedBase);
+    packedWriter.finish();
+    await store.packs.ingest(slices(concat(packedChunks), 64 * 1024));
+
+    const looseChunk = new Uint8Array(64 * 1024).fill(0x61);
+    const looseChunks = function* (): Generator<Uint8Array> {
+      for (let offset = 0; offset < MAX_PACK_DELTA_WORKING_BYTES; offset += looseChunk.length) {
+        yield looseChunk.subarray(
+          0,
+          Math.min(looseChunk.length, MAX_PACK_DELTA_WORKING_BYTES - offset),
+        );
+      }
+    };
+    const looseOid = store.writeStream("blob", MAX_PACK_DELTA_WORKING_BYTES, looseChunks);
+
+    const thinChunks: Uint8Array[] = [];
+    const thinWriter = new PackWriter((chunk) => thinChunks.push(chunk));
+    thinWriter.header(2);
+    thinWriter.refDelta(
+      hashObject("blob", packedBase),
+      literalDelta(packedBase.length, new Uint8Array([1])),
+    );
+    thinWriter.refDelta(looseOid, literalDelta(MAX_PACK_DELTA_WORKING_BYTES, new Uint8Array([2])));
+    thinWriter.finish();
+
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    await expect(store.packs.ingest(slices(concat(thinChunks), 64 * 1024))).rejects.toThrow(
+      /bases exceed the 4 MiB batch limit/,
+    );
+    expect(db.storage.statementCount).toBe(11);
+    expect(
+      [...db.storage.histogram].filter(([query]) => query.includes("git_object_chunks")),
+    ).toEqual([]);
+    expect(
+      [...db.storage.histogram].filter(([query]) => query.includes("roots(oid) AS MATERIALIZED")),
+    ).toEqual([]);
+  });
+
+  it("does not resolve a base from an unrelated pending pack", async () => {
+    const store = open();
+    const base = utf8.encode("pending base\n");
+    const baseOid = hashObject("blob", base);
+    const firstChunks: Uint8Array[] = [];
+    const firstWriter = new PackWriter((chunk) => firstChunks.push(chunk));
+    firstWriter.header(1);
+    firstWriter.object("blob", base);
+    firstWriter.finish();
+    const first = await store.packs.ingest(slices(concat(firstChunks), 64));
+
+    const target = utf8.encode("pending base plus delta\n");
+    const secondChunks: Uint8Array[] = [];
+    const secondWriter = new PackWriter((chunk) => secondChunks.push(chunk));
+    secondWriter.header(1);
+    secondWriter.refDelta(baseOid, literalDelta(base.length, target));
+    secondWriter.finish();
+
+    let hidden = false;
+    await expect(
+      store.packs.ingest(slices(concat(secondChunks), 64), {
+        yieldNow: async () => {
+          if (hidden) return;
+          hidden = true;
+          store.db.run(
+            "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = 1 AND pack_id = ?",
+            first.packId,
+          );
+        },
+      }),
+    ).rejects.toThrow(/missing base/);
+  });
+
+  it("preserves exact entry boundaries on buffered and streaming inflate paths", async () => {
+    const store = open();
+    const first = utf8.encode("first buffered entry\n");
+    const crossing = new Uint8Array(randomBytes(PACK_CHUNK + 64 * 1024));
+    const last = utf8.encode("last buffered entry\n");
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(3);
+    writer.object("blob", first);
+    writer.object("blob", crossing);
+    writer.object("blob", last);
+    writer.finish();
+
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    expect(store.read(hashObject("blob", first))?.data).toEqual(first);
+    expect(store.read(hashObject("blob", crossing))?.data).toEqual(crossing);
+    expect(store.read(hashObject("blob", last))?.data).toEqual(last);
+  });
+
+  it("bounds native inflate by the declared entry size", async () => {
+    const store = open();
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("blob", new Uint8Array(randomBytes(1_024)));
+    writer.finish();
+    const pack = concat(chunks);
+    expect(pack[12]! & 0x80).not.toBe(0);
+    expect(pack[13]).toBe(64);
+    pack[13] = 1;
+    pack.set(createHash("sha1").update(pack.subarray(0, -20)).digest(), pack.length - 20);
+
+    await expect(store.packs.ingest(slices(pack, 64 * 1024))).rejects.toThrow(/invalid pack entry/);
   });
 
   it("streams oversized full trees into the parsed index", async () => {

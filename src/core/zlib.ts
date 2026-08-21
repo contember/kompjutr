@@ -65,9 +65,15 @@ export function inflate(data: Uint8Array): Uint8Array {
  * follows it. Returns `null` when `input` stops mid-stream — the caller
  * should widen the window and retry. Any other malformed input throws.
  */
-export function inflatePrefix(input: Uint8Array): { data: Uint8Array; consumed: number } | null {
+export function inflatePrefix(
+  input: Uint8Array,
+  maxOutputLength: number,
+): { data: Uint8Array; consumed: number } | null {
   try {
-    const result: unknown = zlib.inflateSync(input, { info: true });
+    const result: unknown = zlib.inflateSync(input, {
+      info: true,
+      maxOutputLength: Math.max(1, maxOutputLength),
+    });
     return readInfoResult(result);
   } catch (error) {
     if (isTruncated(error)) return null;

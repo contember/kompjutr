@@ -529,6 +529,10 @@ function parseLooseEncoding(stored: string): LooseEncoding {
   throw new CorruptError(`loose object has unknown storage encoding '${stored}'`);
 }
 
+function isObjectType(value: string | null): value is ObjectType {
+  return value === "blob" || value === "tree" || value === "commit" || value === "tag";
+}
+
 const JSON_ENCODER = new TextEncoder();
 const JSON_BATCH_ROWS = 2_048;
 const JSON_BATCH_BYTES = 1024 * 1024;
@@ -748,6 +752,7 @@ export class RepoStore {
       this.#objects,
       (oid) => this.#readLoose(oid),
       (oids) => this.#readLooseObjects(oids),
+      (oids) => this.#looseObjectMetadata(oids),
       options,
     );
     this.#hasLoose =
@@ -997,7 +1002,12 @@ export class RepoStore {
 
     const looseRows = selected.filter((row) => row.source === "loose");
     const packedOids = selected.filter((row) => row.source === "pack").map((row) => row.oid);
-    const loose = this.#readLooseBlobRows(looseRows);
+    const looseObjects = this.#readLooseObjectRows(looseRows);
+    const loose = new Map<string, Uint8Array>();
+    for (const [oid, object] of looseObjects) {
+      if (object.type !== "blob") throw new CorruptError(`${oid} is not a blob`);
+      loose.set(oid, object.data);
+    }
     const packed = this.#packs.readBlobs(packedOids);
     const blobs = new Map<string, Uint8Array>();
     for (const row of selected) {
@@ -1597,19 +1607,42 @@ export class RepoStore {
       JSON.stringify(oids),
       this.#repoId,
     );
-    return new Map(
-      [...this.#readLooseBlobRows(rows)].map(([oid, data]) => [oid, { type: "blob", data }]),
-    );
+    return this.#readLooseObjectRows(rows);
   }
 
-  #readLooseBlobRows(
+  #looseObjectMetadata(oids: readonly string[]): Map<string, { type: ObjectType; size: number }> {
+    if (oids.length === 0) return new Map();
+    const result = new Map<string, { type: ObjectType; size: number }>();
+    for (const row of this.#db.all<{ oid: string; type: string; size: number }>(
+      `SELECT wanted.value AS oid, object.type, object.size
+         FROM json_each(?) wanted
+         JOIN git_objects object ON object.repo_id = ? AND object.oid = wanted.value`,
+      JSON.stringify(oids),
+      this.#repoId,
+    )) {
+      if (
+        !isOid(row.oid) ||
+        !isObjectType(row.type) ||
+        !Number.isSafeInteger(row.size) ||
+        row.size < 0 ||
+        row.size > MAX_PACK_DELTA_WORKING_BYTES ||
+        result.has(row.oid)
+      ) {
+        throw new CorruptError("loose object metadata query returned an invalid row");
+      }
+      result.set(row.oid, { type: row.type, size: row.size });
+    }
+    return result;
+  }
+
+  #readLooseObjectRows(
     rows: readonly {
       oid: string;
       type: string | null;
       size: number | null;
       stored: string | null;
     }[],
-  ): Map<string, Uint8Array> {
+  ): Map<string, RawObject> {
     if (rows.length === 0) return new Map();
     const wanted = rows.map((row) => row.oid);
     const gate = this.#db.all<{
@@ -1634,13 +1667,20 @@ export class RepoStore {
       this.#repoId,
     );
     let storedBytes = 0;
+    let outputBytes = 0;
     if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
     for (let index = 0; index < gate.length; index++) {
       const checked = gate[index]!;
       const source = rows[index]!;
       const chunks = Number(checked.chunks);
+      const size = source.size;
       if (
         checked.oid !== source.oid ||
+        !isObjectType(source.type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        size > MAX_PACK_DELTA_WORKING_BYTES ||
         !Number.isSafeInteger(chunks) ||
         chunks <= 0 ||
         checked.first_seq !== 0 ||
@@ -1656,6 +1696,13 @@ export class RepoStore {
       storedBytes += checked.stored_bytes;
       if (!Number.isSafeInteger(storedBytes) || storedBytes > MAX_BLOB_BATCH_BYTES + 64 * 1024) {
         throw new GitError("E2BIG", "loose blob storage exceeds the bounded batch limit");
+      }
+      outputBytes += size;
+      if (
+        !Number.isSafeInteger(outputBytes) ||
+        (rows.length > 1 && outputBytes > MAX_BLOB_BATCH_BYTES)
+      ) {
+        throw new GitError("E2BIG", "loose object output exceeds the bounded batch limit");
       }
     }
 
@@ -1679,9 +1726,9 @@ export class RepoStore {
       else list.push(readBlob(row.data));
     }
 
-    const result = new Map<string, Uint8Array>();
+    const result = new Map<string, RawObject>();
     for (const row of rows) {
-      if (row.type !== "blob") throw new CorruptError(`${row.oid} is not a blob`);
+      if (!isObjectType(row.type)) throw new CorruptError(`${row.oid} has an invalid object type`);
       const size = row.size;
       if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
         throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
@@ -1691,13 +1738,38 @@ export class RepoStore {
       }
       const stored = parseLooseEncoding(row.stored ?? "");
       const encoded = concat(parts.get(row.oid) ?? []);
-      const data = stored === "raw" ? encoded : inflate(encoded);
+      let data: Uint8Array;
+      if (stored === "raw") {
+        data = encoded;
+      } else {
+        data = new Uint8Array(size);
+        let produced = 0;
+        const stream = new InflateStream((chunk) => {
+          if (chunk.length > size - produced) {
+            throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`);
+          }
+          data.set(chunk, produced);
+          produced += chunk.length;
+        });
+        let consumed = 0;
+        while (!stream.ended && consumed < encoded.length) {
+          const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
+          const used = stream.push(input);
+          consumed += used;
+          if (!stream.ended && used !== input.length) {
+            throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
+          }
+        }
+        if (!stream.ended || consumed !== encoded.length || produced !== size) {
+          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
+        }
+      }
       if (data.length !== size) {
         throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
       }
-      const object: RawObject = { type: "blob", data };
+      const object: RawObject = { type: row.type, data };
       this.#objects.set(`loose:${row.oid}`, object);
-      result.set(row.oid, data);
+      result.set(row.oid, object);
     }
     return result;
   }

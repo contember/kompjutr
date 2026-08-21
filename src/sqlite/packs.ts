@@ -6,7 +6,7 @@
 // (oid -> pack, offset, delta base). Reads pull only the chunks an object
 // actually spans, so nothing ever inflates a whole repository.
 
-import { concat, toHex } from "../core/bytes.js";
+import { concat, isOid, toHex } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import {
@@ -18,7 +18,7 @@ import {
 } from "../core/objects.js";
 import { applyDelta } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
-import { InflateStream } from "../core/zlib.js";
+import { InflateStream, inflatePrefix } from "../core/zlib.js";
 import {
   type CommitCacheEntry,
   type CommitCacheSource,
@@ -72,6 +72,8 @@ const PACK_TREE_BATCH_SOURCES = 2048;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
 const PACK_INDEX_BATCH_BYTES = 1024 * 1024;
 const PACK_INDEX_BATCH_ROWS = 2048;
+const PACK_PENDING_PAGE_ROWS = 4096;
+const PACK_PENDING_PAGE_MEMORY_BYTES = PACK_PENDING_PAGE_ROWS * 512;
 const PACK_INDEX_MEMORY_BYTES = 3 * 1024 * 1024;
 const PACK_OFFSET_WINDOW_BYTES = 2 * 1024 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
@@ -87,6 +89,7 @@ const PACK_MEMORY_MODEL_BYTES =
   PACK_TREE_BATCH_BYTES +
   MAX_COMMIT_CACHE_BYTES +
   PACK_INDEX_MEMORY_BYTES +
+  PACK_PENDING_PAGE_MEMORY_BYTES +
   PACK_OFFSET_WINDOW_BYTES +
   2 * MAX_INDEXED_COMMIT_BYTES +
   PACK_INFLATE_HEADROOM_BYTES;
@@ -158,6 +161,13 @@ export interface PackIngestResult {
 /** Resolves an oid the pack index does not hold (loose storage, thin-pack bases). */
 export type ExternalResolver = (oid: string) => RawObject | null;
 export type ExternalBatchResolver = (oids: readonly string[]) => Map<string, RawObject>;
+export interface ExternalObjectMetadata {
+  type: ObjectType;
+  size: number;
+}
+export type ExternalMetadataResolver = (
+  oids: readonly string[],
+) => Map<string, ExternalObjectMetadata>;
 
 interface BulkPackRow extends PackObjectRow {
   oid: string;
@@ -188,6 +198,36 @@ type PendingInput = [
   baseOid: string | null,
   baseOffset: number | null,
 ];
+
+interface PendingRow {
+  offset: number;
+  data_off: number;
+  data_len: number;
+  entry_size: number;
+  base_oid: string | null;
+  base_offset: number | null;
+  resolved_oid: string | null;
+}
+
+function validatePendingRow(row: PendingRow): void {
+  if (
+    !Number.isSafeInteger(row.offset) ||
+    !Number.isSafeInteger(row.data_off) ||
+    !Number.isSafeInteger(row.data_len) ||
+    !Number.isSafeInteger(row.entry_size) ||
+    row.offset < 0 ||
+    row.data_off < 0 ||
+    row.data_len < 0 ||
+    row.entry_size < 0 ||
+    !Number.isSafeInteger(row.data_off + row.data_len) ||
+    (row.base_oid === null) === (row.base_offset === null) ||
+    (row.base_oid !== null && !isOid(row.base_oid)) ||
+    (row.base_offset !== null && (!Number.isSafeInteger(row.base_offset) || row.base_offset < 0)) ||
+    (row.resolved_oid !== null && !isOid(row.resolved_oid))
+  ) {
+    throw new CorruptError("pending pack delta has invalid metadata");
+  }
+}
 
 const PACK_JSON_ENCODER = new TextEncoder();
 
@@ -427,6 +467,7 @@ export class PackStore {
   readonly #repoId: number;
   readonly #external: ExternalResolver;
   readonly #externalBatch: ExternalBatchResolver;
+  readonly #externalMetadata: ExternalMetadataResolver;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #chunks: ByteLru<string, Uint8Array>;
   readonly #maxBufferedEntry: number;
@@ -439,12 +480,14 @@ export class PackStore {
     objects: ByteLru<string, RawObject>,
     external: ExternalResolver,
     externalBatch: ExternalBatchResolver,
+    externalMetadata: ExternalMetadataResolver,
     options: PackCacheOptions = {},
   ) {
     this.#db = db;
     this.#repoId = repoId;
     this.#external = external;
     this.#externalBatch = externalBatch;
+    this.#externalMetadata = externalMetadata;
     this.#objects = objects;
     this.#chunks = new ByteLru(
       Math.min(options.chunkBytes ?? DEFAULT_CHUNK_BYTES, DEFAULT_CHUNK_BYTES),
@@ -469,7 +512,13 @@ export class PackStore {
 
   lookup(oid: string): PackedEntry | null {
     const row = this.#db.one<PackObjectRow>(
-      "SELECT pack_id, offset, data_off, data_len, type, size, entry_size, base_oid FROM git_pack_objects WHERE repo_id = ? AND oid = ?",
+      `SELECT object.pack_id, object.offset, object.data_off, object.data_len,
+              object.type, object.size, object.entry_size, object.base_oid
+         FROM git_pack_objects object
+         JOIN git_pack_meta pack
+           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+          AND pack.state = 'complete'
+        WHERE object.repo_id = ? AND object.oid = ?`,
       this.#repoId,
       oid,
     );
@@ -489,7 +538,12 @@ export class PackStore {
 
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {
     const row = this.#db.one<{ type: ObjectType; size: number }>(
-      "SELECT type, size FROM git_pack_objects WHERE repo_id = ? AND oid = ?",
+      `SELECT object.type, object.size
+         FROM git_pack_objects object
+         JOIN git_pack_meta pack
+           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+          AND pack.state = 'complete'
+        WHERE object.repo_id = ? AND object.oid = ?`,
       this.#repoId,
       oid,
     );
@@ -499,7 +553,12 @@ export class PackStore {
   count(): number {
     return (
       this.#db.scalar<number>(
-        "SELECT COUNT(*) FROM git_pack_objects WHERE repo_id = ?",
+        `SELECT COUNT(*)
+           FROM git_pack_objects object
+           JOIN git_pack_meta pack
+             ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+            AND pack.state = 'complete'
+          WHERE object.repo_id = ?`,
         this.#repoId,
       ) ?? 0
     );
@@ -508,7 +567,13 @@ export class PackStore {
   findPrefix(prefix: string, limit: number): string[] {
     return this.#db
       .all<{ oid: string }>(
-        "SELECT oid FROM git_pack_objects WHERE repo_id = ? AND oid >= ? AND oid < ? LIMIT ?",
+        `SELECT object.oid
+           FROM git_pack_objects object
+           JOIN git_pack_meta pack
+             ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+            AND pack.state = 'complete'
+          WHERE object.repo_id = ? AND object.oid >= ? AND object.oid < ?
+          ORDER BY object.oid LIMIT ?`,
         this.#repoId,
         prefix,
         `${prefix.slice(0, -1)}${String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1)}`,
@@ -520,7 +585,16 @@ export class PackStore {
   /** Every oid the pack index holds, in index order. */
   oids(): string[] {
     return this.#db
-      .all<{ oid: string }>("SELECT oid FROM git_pack_objects WHERE repo_id = ?", this.#repoId)
+      .all<{ oid: string }>(
+        `SELECT object.oid
+           FROM git_pack_objects object
+           JOIN git_pack_meta pack
+             ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+            AND pack.state = 'complete'
+          WHERE object.repo_id = ?
+          ORDER BY object.oid`,
+        this.#repoId,
+      )
       .map((row) => row.oid);
   }
 
@@ -584,6 +658,23 @@ export class PackStore {
 
   /** Resolve packed blobs with one graph query and one physical chunk cursor. */
   readBlobs(oids: readonly string[]): Map<string, Uint8Array> {
+    const objects = this.#readObjects(oids, null, "blob", false);
+    const blobs = new Map<string, Uint8Array>();
+    for (const [oid, object] of objects) {
+      if (object.type !== "blob") throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
+      blobs.set(oid, object.data);
+    }
+    return blobs;
+  }
+
+  /** Resolve ingest bases in bounded graph and physical pack order. */
+  #readObjects(
+    oids: readonly string[],
+    pendingPackId: number | null,
+    expectedType: ObjectType | null,
+    allowMissing: boolean,
+    seeds: ReadonlyMap<string, RawObject> = new Map(),
+  ): Map<string, RawObject> {
     const wanted = [...new Set(oids)];
     if (wanted.length === 0) return new Map();
     if (wanted.length > MAX_PACK_BLOB_INPUTS) {
@@ -593,13 +684,15 @@ export class PackStore {
     const rows = this.#db.all<BulkPackRow>(
       `WITH RECURSIVE
          roots(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
+         seeds(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
          reachable(oid) AS (
            SELECT o.oid
              FROM roots r
              CROSS JOIN git_pack_objects o
              CROSS JOIN git_pack_meta m
             WHERE o.repo_id = ? AND o.oid = r.oid
-              AND m.repo_id = o.repo_id AND m.pack_id = o.pack_id AND m.state = 'complete'
+              AND m.repo_id = o.repo_id AND m.pack_id = o.pack_id
+              AND (m.state = 'complete' OR o.pack_id = ?)
            UNION
            SELECT base.oid
              FROM reachable r
@@ -609,10 +702,13 @@ export class PackStore {
              CROSS JOIN git_pack_meta base_meta
             WHERE child.repo_id = ? AND child.oid = r.oid
               AND child_meta.repo_id = child.repo_id
-              AND child_meta.pack_id = child.pack_id AND child_meta.state = 'complete'
+              AND child_meta.pack_id = child.pack_id
+              AND (child_meta.state = 'complete' OR child.pack_id = ?)
               AND base.repo_id = child.repo_id AND base.oid = child.base_oid
               AND base_meta.repo_id = base.repo_id
-              AND base_meta.pack_id = base.pack_id AND base_meta.state = 'complete'
+              AND base_meta.pack_id = base.pack_id
+              AND (base_meta.state = 'complete' OR base.pack_id = ?)
+              AND NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
          )
        SELECT o.oid, o.pack_id, o.offset, o.data_off, o.data_len, o.type,
               o.size, o.entry_size, o.base_oid
@@ -621,8 +717,12 @@ export class PackStore {
         WHERE o.repo_id = ? AND o.oid = r.oid
         LIMIT ${MAX_PACK_BLOB_GRAPH_ENTRIES + 1}`,
       JSON.stringify(wanted),
+      JSON.stringify([...seeds.keys()]),
       this.#repoId,
+      pendingPackId ?? -1,
       this.#repoId,
+      pendingPackId ?? -1,
+      pendingPackId ?? -1,
       this.#repoId,
     );
     if (rows.length > MAX_PACK_BLOB_GRAPH_ENTRIES) {
@@ -664,15 +764,31 @@ export class PackStore {
         baseOid: row.base_oid,
       });
     }
+    const available: string[] = [];
+    let outputBytes = 0;
+    const outputLimit =
+      pendingPackId !== null && wanted.length === 1
+        ? MAX_PACK_DELTA_WORKING_BYTES
+        : MAX_PACK_BLOB_BATCH_BYTES;
     for (const oid of wanted) {
       const entry = entries.get(oid);
-      if (entry === undefined) throw new CorruptError(`packed blob ${oid} has no complete source`);
-      if (entry.type !== "blob") throw new CorruptError(`${oid} is a ${entry.type}, not a blob`);
+      if (entry === undefined) {
+        if (allowMissing) continue;
+        throw new CorruptError(`packed object ${oid} has no visible source`);
+      }
+      if (expectedType !== null && entry.type !== expectedType) {
+        throw new CorruptError(`${oid} is a ${entry.type}, not a ${expectedType}`);
+      }
+      outputBytes += entry.size;
+      if (!Number.isSafeInteger(outputBytes) || outputBytes > outputLimit) {
+        throw new GitError("E2BIG", "packed object output exceeds the bounded batch limit");
+      }
+      available.push(oid);
     }
 
     const needed = new Map<string, PackedEntry>();
     const externalOids = new Set<string>();
-    for (const oid of wanted) {
+    for (const oid of available) {
       let current = entries.get(oid)!;
       if (this.#objects.get(packObjectKey(current.packId, oid)) !== undefined) continue;
       const seen = new Set<string>();
@@ -688,6 +804,7 @@ export class PackStore {
         depth++;
         const next = entries.get(current.baseOid);
         if (next === undefined) {
+          if (seeds.has(current.baseOid)) break;
           externalOids.add(current.baseOid);
           break;
         }
@@ -779,13 +896,12 @@ export class PackStore {
     }
 
     const external = this.#externalBatch([...externalOids]);
-    const result = new Map<string, Uint8Array>();
-    for (const oid of wanted) {
+    const result = new Map<string, RawObject>();
+    for (const oid of available) {
       const first = entries.get(oid)!;
       const cached = this.#objects.get(packObjectKey(first.packId, oid));
       if (cached !== undefined) {
-        if (cached.type !== "blob") throw new CorruptError(`${oid} is not a blob`);
-        result.set(oid, cached.data);
+        result.set(oid, cached);
         continue;
       }
       const chain: PackedEntry[] = [];
@@ -814,7 +930,7 @@ export class PackStore {
         chain.push(current);
         const next = entries.get(current.baseOid);
         if (next === undefined) {
-          object = external.get(current.baseOid);
+          object = seeds.get(current.baseOid) ?? external.get(current.baseOid);
           if (object === undefined) {
             throw new CorruptError(`missing delta base ${current.baseOid} for ${current.oid}`);
           }
@@ -838,10 +954,10 @@ export class PackStore {
         }
         this.#cacheObject(entry.packId, entry.oid, object);
       }
-      if (object.type !== "blob" || object.data.length !== first.size) {
-        throw new CorruptError(`packed blob ${oid} has inconsistent type or size`);
+      if (object.type !== first.type || object.data.length !== first.size) {
+        throw new CorruptError(`packed object ${oid} has inconsistent type or size`);
       }
-      result.set(oid, object.data);
+      result.set(oid, object);
     }
     return result;
   }
@@ -1236,10 +1352,10 @@ export class PackStore {
         let resolved = false;
         if (entry.data !== null && baseOid !== null) {
           const base = missingBases.has(baseOid)
-            ? null
-            : this.#readForBase(baseOid, packId, objectIndex);
-          if (base === null) missingBases.add(baseOid);
-          if (base !== null) {
+            ? undefined
+            : this.#objects.get(packObjectKey(packId, baseOid));
+          if (base === undefined) missingBases.add(baseOid);
+          if (base !== undefined) {
             checkDeltaWorkingSet(base.data, entry.data);
             const data = applyDelta(base.data, entry.data);
             const oid = hashObject(base.type, data);
@@ -1306,16 +1422,6 @@ export class PackStore {
     return { count, commits: commitIndex };
   }
 
-  /** A base that lives in an already-indexed pack, loose storage, or another pack. */
-  #readForBase(oid: string, packId: number, objects: PackObjectBatch): RawObject | null {
-    const current = this.#objects.get(packObjectKey(packId, oid));
-    if (current !== undefined) return current;
-    objects.flush();
-    const packed = this.read(oid);
-    if (packed !== null) return packed;
-    return this.#external(oid);
-  }
-
   async #drainPending(
     packId: number,
     offsets: OffsetWindow,
@@ -1334,15 +1440,7 @@ export class PackStore {
       let progressed = 0;
       let after = -1;
       for (;;) {
-        const page = this.#db.all<{
-          offset: number;
-          data_off: number;
-          data_len: number;
-          entry_size: number;
-          base_oid: string | null;
-          base_offset: number | null;
-          resolved_oid: string | null;
-        }>(
+        const page = this.#db.all<PendingRow>(
           `SELECT pending.offset, pending.data_off, pending.data_len, pending.entry_size,
                   pending.base_oid, pending.base_offset,
                   COALESCE(pending.base_oid, base.oid) AS resolved_oid
@@ -1351,20 +1449,109 @@ export class PackStore {
                ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
               AND base.offset = pending.base_offset
             WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
-            ORDER BY pending.offset LIMIT 256`,
+            ORDER BY pending.offset LIMIT ${PACK_PENDING_PAGE_ROWS}`,
           this.#repoId,
           packId,
           after,
         );
         if (page.length === 0) break;
-        const completed: number[] = [];
+        for (const row of page) validatePendingRow(row);
+        const last = page[page.length - 1]!;
+        after = last.offset;
+
+        const byBaseOid = new Map<string, PendingRow[]>();
+        const byBaseOffset = new Map<number, PendingRow[]>();
+        const resolvedOffsets = new Map<number, string>();
+        const baseOidSet = new Set<string>();
         for (const row of page) {
-          after = row.offset;
-          const baseOid =
-            row.resolved_oid ?? (row.base_offset === null ? null : offsets.get(row.base_offset));
-          if (baseOid === null) continue;
-          const base = this.#readForBase(baseOid, packId, objectIndex);
-          if (base === null) continue;
+          if (row.base_oid !== null) {
+            baseOidSet.add(row.base_oid);
+            const children = byBaseOid.get(row.base_oid);
+            if (children === undefined) byBaseOid.set(row.base_oid, [row]);
+            else children.push(row);
+            continue;
+          }
+          if (row.base_offset === null) continue;
+          const children = byBaseOffset.get(row.base_offset);
+          if (children === undefined) byBaseOffset.set(row.base_offset, [row]);
+          else children.push(row);
+          const oid = row.resolved_oid ?? offsets.get(row.base_offset);
+          if (oid !== null) {
+            baseOidSet.add(oid);
+            resolvedOffsets.set(row.base_offset, oid);
+          }
+        }
+        const baseOids = [...baseOidSet];
+        const packedMetadata = this.#packedBaseMetadata(baseOids, packId);
+        const externalOids = baseOids.filter((oid) => !packedMetadata.has(oid));
+        const externalMetadata = this.#externalMetadata(externalOids);
+        this.#checkBaseAdmission(packedMetadata, externalMetadata);
+        const bases = this.#readBaseBatch([...packedMetadata.keys()], packId);
+        for (const [oid, object] of bases) {
+          const metadata = packedMetadata.get(oid);
+          if (
+            metadata === undefined ||
+            metadata.type !== object.type ||
+            metadata.size !== object.data.length
+          ) {
+            throw new CorruptError("materialized pack base disagrees with its admitted metadata");
+          }
+        }
+        for (const [oid, object] of this.#externalBatch([...externalMetadata.keys()])) {
+          const metadata = externalMetadata.get(oid);
+          if (
+            metadata === undefined ||
+            metadata.type !== object.type ||
+            metadata.size !== object.data.length
+          ) {
+            throw new CorruptError("materialized loose base disagrees with its admitted metadata");
+          }
+          bases.set(oid, object);
+        }
+        let retainedBaseBytes = 0;
+        for (const object of bases.values()) retainedBaseBytes += object.data.length;
+        if (
+          !Number.isSafeInteger(retainedBaseBytes) ||
+          (bases.size > 1 && retainedBaseBytes > MAX_PACK_BLOB_BATCH_BYTES) ||
+          retainedBaseBytes > MAX_PACK_DELTA_WORKING_BYTES
+        ) {
+          throw new GitError("E2BIG", "pack ingest bases exceed the bounded live-set limit");
+        }
+        const remainingUses = new Map<string, number>();
+        for (const [oid, children] of byBaseOid) {
+          remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + children.length);
+        }
+        for (const [offset, oid] of resolvedOffsets) {
+          remainingUses.set(
+            oid,
+            (remainingUses.get(oid) ?? 0) + (byBaseOffset.get(offset)?.length ?? 0),
+          );
+        }
+
+        const ready: { row: PendingRow; baseOid: string }[] = [];
+        const queued = new Set<number>();
+        const enqueue = (row: PendingRow, baseOid: string): void => {
+          if (queued.has(row.offset)) return;
+          queued.add(row.offset);
+          ready.push({ row, baseOid });
+        };
+        for (const [oid, children] of byBaseOid) {
+          if (bases.has(oid)) for (const row of children) enqueue(row, oid);
+        }
+        for (const [offset, oid] of resolvedOffsets) {
+          if (bases.has(oid)) {
+            for (const row of byBaseOffset.get(offset) ?? []) enqueue(row, oid);
+          }
+        }
+
+        const completed: number[] = [];
+        for (let cursor = 0; cursor < ready.length; cursor++) {
+          const { row, baseOid } = ready[cursor]!;
+          const base = bases.get(baseOid);
+          if (base === undefined) continue;
+          const uses = (remainingUses.get(baseOid) ?? 1) - 1;
+          remainingUses.set(baseOid, uses);
+          if (uses === 0 && bases.delete(baseOid)) retainedBaseBytes -= base.data.length;
           checkDeltaInflateBudget(base.data, row.entry_size);
           const delta = this.#inflateStoredEntry(
             packId,
@@ -1402,10 +1589,32 @@ export class PackStore {
           );
           completed.push(row.offset);
           offsets.set(row.offset, oid);
-          this.#cacheObject(packId, oid, { type: base.type, data });
+          const object = { type: base.type, data };
+          const offsetChildren = byBaseOffset.get(row.offset) ?? [];
+          if (offsetChildren.length > 0) {
+            remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + offsetChildren.length);
+          }
+          const oidChildren = byBaseOid.get(oid) ?? [];
+          const hasChildren = oidChildren.length > 0 || offsetChildren.length > 0;
+          if (hasChildren && !bases.has(oid)) {
+            if (
+              data.length > MAX_PACK_DELTA_WORKING_BYTES ||
+              (retainedBaseBytes > 0 && retainedBaseBytes + data.length > MAX_PACK_BLOB_BATCH_BYTES)
+            ) {
+              throw new GitError("E2BIG", "pack ingest bases exceed the bounded live-set limit");
+            }
+            bases.set(oid, object);
+            retainedBaseBytes += data.length;
+          }
+          if (hasChildren) {
+            for (const child of oidChildren) enqueue(child, oid);
+            for (const child of offsetChildren) enqueue(child, oid);
+          }
+          this.#cacheObject(packId, oid, object);
           progressed++;
         }
         if (completed.length > 0) {
+          objectIndex.flush();
           this.#db.run(
             "DELETE FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset IN (SELECT value FROM json_each(?))",
             this.#repoId,
@@ -1421,6 +1630,165 @@ export class PackStore {
         throw new CorruptError(`cannot resolve ${remaining} delta object(s): missing base`);
       }
     }
+  }
+
+  #packedBaseMetadata(
+    oids: readonly string[],
+    packId: number,
+  ): Map<string, ExternalObjectMetadata> {
+    const wanted = [...new Set(oids)];
+    if (wanted.length === 0) return new Map();
+    const result = new Map<string, ExternalObjectMetadata>();
+    for (const row of this.#db.all<{ oid: string; type: string; size: number }>(
+      `SELECT object.oid, object.type, object.size
+         FROM json_each(?) wanted
+         JOIN git_pack_objects object
+           ON object.repo_id = ? AND object.oid = wanted.value
+         JOIN git_pack_meta pack
+           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+          AND (pack.state = 'complete' OR object.pack_id = ?)`,
+      JSON.stringify(wanted),
+      this.#repoId,
+      packId,
+    )) {
+      if (
+        !isOid(row.oid) ||
+        !isObjectType(row.type) ||
+        !Number.isSafeInteger(row.size) ||
+        row.size < 0 ||
+        row.size > MAX_PACK_DELTA_WORKING_BYTES ||
+        result.has(row.oid)
+      ) {
+        throw new CorruptError("pack ingest base has invalid size metadata");
+      }
+      result.set(row.oid, { type: row.type, size: row.size });
+    }
+    return result;
+  }
+
+  #checkBaseAdmission(
+    packed: ReadonlyMap<string, ExternalObjectMetadata>,
+    external: ReadonlyMap<string, ExternalObjectMetadata>,
+  ): void {
+    let bytes = 0;
+    const sources = packed.size + external.size;
+    for (const metadata of [...packed.values(), ...external.values()]) {
+      bytes += metadata.size;
+      if (!Number.isSafeInteger(bytes) || (sources > 1 && bytes > MAX_PACK_BLOB_BATCH_BYTES)) {
+        throw new GitError("E2BIG", "pack ingest bases exceed the 4 MiB batch limit");
+      }
+    }
+  }
+
+  #readBaseBatch(oids: readonly string[], packId: number): Map<string, RawObject> {
+    const wanted = [...new Set(oids)];
+    if (wanted.length === 0) return new Map();
+    const result = new Map<string, RawObject>();
+    const uncached: string[] = [];
+    for (const oid of wanted) {
+      const cached = this.#objects.get(packObjectKey(packId, oid));
+      if (cached === undefined) uncached.push(oid);
+      else result.set(oid, cached);
+    }
+    for (const [oid, object] of this.#readBaseBatchParts(uncached, packId)) {
+      result.set(oid, object);
+    }
+    return result;
+  }
+
+  #readBaseBatchParts(oids: readonly string[], packId: number): Map<string, RawObject> {
+    if (oids.length === 0) return new Map();
+    try {
+      return this.#readObjects(oids, packId, null, true);
+    } catch (error) {
+      if (!(error instanceof GitError) || error.code !== "E2BIG") throw error;
+      if (oids.length === 1) {
+        const oid = oids[0]!;
+        const object = this.#readBasePaged(oid, packId);
+        return object === null ? new Map() : new Map([[oid, object]]);
+      }
+      const middle = Math.ceil(oids.length / 2);
+      const result = this.#readBaseBatchParts(oids.slice(0, middle), packId);
+      for (const [oid, object] of this.#readBaseBatchParts(oids.slice(middle), packId)) {
+        result.set(oid, object);
+      }
+      return result;
+    }
+  }
+
+  /** Resolve a deep ingest base as bounded graph segments joined by one live checkpoint. */
+  #readBasePaged(oid: string, packId: number): RawObject | null {
+    const roots: string[] = [];
+    let current = oid;
+    let depth = 0;
+    for (;;) {
+      const tail = this.#db.one<{ oid: string; base_oid: string | null; depth: number }>(
+        `WITH RECURSIVE chain(oid, base_oid, depth) AS (
+           SELECT object.oid, object.base_oid, 0
+             FROM git_pack_objects object
+             JOIN git_pack_meta pack
+               ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+              AND (pack.state = 'complete' OR object.pack_id = ?)
+            WHERE object.repo_id = ? AND object.oid = ?
+           UNION ALL
+           SELECT base.oid, base.base_oid, chain.depth + 1
+             FROM chain
+             JOIN git_pack_objects base ON base.repo_id = ? AND base.oid = chain.base_oid
+             JOIN git_pack_meta pack
+               ON pack.repo_id = base.repo_id AND pack.pack_id = base.pack_id
+              AND (pack.state = 'complete' OR base.pack_id = ?)
+            WHERE chain.depth < ${MAX_PACK_BLOB_GRAPH_ENTRIES - 1}
+         )
+         SELECT oid, base_oid, depth FROM chain ORDER BY depth DESC LIMIT 1`,
+        packId,
+        this.#repoId,
+        current,
+        this.#repoId,
+        packId,
+      );
+      if (tail === undefined) return null;
+      if (
+        !isOid(tail.oid) ||
+        (tail.base_oid !== null && !isOid(tail.base_oid)) ||
+        !Number.isSafeInteger(tail.depth) ||
+        tail.depth < 0 ||
+        tail.depth >= MAX_PACK_BLOB_GRAPH_ENTRIES
+      ) {
+        throw new CorruptError("paged pack base traversal returned invalid metadata");
+      }
+      roots.push(current);
+      if (tail.base_oid === null || tail.depth < MAX_PACK_BLOB_GRAPH_ENTRIES - 1) {
+        depth += tail.depth + (tail.base_oid === null ? 0 : 1);
+        break;
+      }
+      depth += tail.depth + 1;
+      if (depth > this.#maxDeltaDepth) {
+        throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
+      }
+      current = tail.base_oid;
+    }
+    if (depth > this.#maxDeltaDepth) {
+      throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
+    }
+
+    let checkpoint: { oid: string; object: RawObject } | null = null;
+    for (let index = roots.length - 1; index >= 0; index--) {
+      const root = roots[index]!;
+      const seeds: ReadonlyMap<string, RawObject> =
+        checkpoint === null
+          ? new Map<string, RawObject>()
+          : new Map<string, RawObject>([[checkpoint.oid, checkpoint.object]]);
+      const object: RawObject | undefined = this.#readObjects(
+        [root],
+        packId,
+        null,
+        true,
+        seeds,
+      ).get(root);
+      if (object === undefined) return null;
+      checkpoint = { oid: root, object };
+    }
+    return checkpoint?.object ?? null;
   }
 
   #insertResolved(
@@ -1514,6 +1882,29 @@ export class PackStore {
     type: ObjectType | null,
   ): { data: Uint8Array | null; consumed: number; streamedOid: string | null } {
     const buffered = entrySize <= this.#maxBufferedEntry;
+    reader.seek(dataOff);
+    if (buffered) {
+      const window = reader.window();
+      if (window.length === 0) throw new CorruptError(`truncated pack entry at ${dataOff}`);
+      let exact: { data: Uint8Array; consumed: number } | null;
+      try {
+        exact = inflatePrefix(window, entrySize);
+      } catch (error) {
+        throw new CorruptError(`invalid pack entry at ${dataOff}`, { cause: error });
+      }
+      if (exact !== null) {
+        if (
+          exact.data.length !== entrySize ||
+          !Number.isSafeInteger(exact.consumed) ||
+          exact.consumed <= 0 ||
+          exact.consumed > window.length
+        ) {
+          throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
+        }
+        reader.seek(dataOff + exact.consumed);
+        return { data: exact.data, consumed: exact.consumed, streamedOid: null };
+      }
+    }
     const chunks: Uint8Array[] = [];
     let produced = 0;
     const sha = type === null ? null : new Sha1().update(objectHeader(type, entrySize));

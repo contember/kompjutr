@@ -17,15 +17,22 @@ describe("zlib", () => {
     const data = new TextEncoder().encode("hello world ".repeat(50));
     const compressed = deflateSync(data);
     const padded = concat([compressed, new Uint8Array(64)]);
-    const result = inflatePrefix(padded);
+    const result = inflatePrefix(padded, data.length);
     expect(result).not.toBeNull();
     expect(result?.consumed).toBe(compressed.length);
     expect(result?.data).toEqual(data);
   });
 
   it("signals a truncated window instead of throwing", () => {
-    const compressed = deflateSync(new Uint8Array(randomBytes(50_000)));
-    expect(inflatePrefix(compressed.subarray(0, 100))).toBeNull();
+    const data = new Uint8Array(randomBytes(50_000));
+    const compressed = deflateSync(data);
+    expect(inflatePrefix(compressed.subarray(0, 100), data.length)).toBeNull();
+  });
+
+  it("rejects output above the caller's bound", () => {
+    const data = new Uint8Array(randomBytes(50_000));
+    const compressed = deflateSync(data);
+    expect(() => inflatePrefix(compressed, data.length - 1)).toThrow();
   });
 
   it("streams large input in bounded slices and reports consumption", () => {
