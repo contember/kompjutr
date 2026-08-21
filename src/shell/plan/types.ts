@@ -69,37 +69,35 @@ export interface Plan {
  * of the query.
  */
 export interface CommandTraits {
-  /** Reads the filesystem when it is first in the pipeline. */
-  readonly reads: boolean;
   /** Must see all of its input before it can emit anything. */
   readonly blocking: boolean;
   /** Emits a bounded prefix of its input: `head`. */
   readonly limiter: boolean;
 }
 
-const DEFAULT_TRAITS: CommandTraits = { reads: false, blocking: false, limiter: false };
+const DEFAULT_TRAITS: CommandTraits = { blocking: false, limiter: false };
 
 const TRAITS: ReadonlyMap<string, CommandTraits> = new Map([
-  ["grep", { reads: true, blocking: false, limiter: false }],
-  ["rg", { reads: true, blocking: false, limiter: false }],
-  ["find", { reads: true, blocking: false, limiter: false }],
-  ["ls", { reads: true, blocking: false, limiter: false }],
-  ["cat", { reads: true, blocking: false, limiter: false }],
-  ["stat", { reads: true, blocking: false, limiter: false }],
-  ["head", { reads: true, blocking: false, limiter: true }],
+  ["grep", { blocking: false, limiter: false }],
+  ["rg", { blocking: false, limiter: false }],
+  ["find", { blocking: false, limiter: false }],
+  ["ls", { blocking: false, limiter: false }],
+  ["cat", { blocking: false, limiter: false }],
+  ["stat", { blocking: false, limiter: false }],
+  ["head", { blocking: false, limiter: true }],
   // `tail` is not a limiter: it needs the end of its input, so it cannot
   // bound what the source produces. Bounded in memory, not in demand.
-  ["tail", { reads: true, blocking: true, limiter: false }],
-  ["sort", { reads: false, blocking: true, limiter: false }],
-  ["uniq", { reads: false, blocking: false, limiter: false }],
-  ["wc", { reads: true, blocking: true, limiter: false }],
-  ["sed", { reads: true, blocking: false, limiter: false }],
-  ["xargs", { reads: false, blocking: true, limiter: false }],
-  ["cp", { reads: true, blocking: false, limiter: false }],
-  ["mv", { reads: true, blocking: false, limiter: false }],
-  ["rm", { reads: true, blocking: false, limiter: false }],
-  ["mkdir", { reads: true, blocking: false, limiter: false }],
-  ["touch", { reads: true, blocking: false, limiter: false }],
+  ["tail", { blocking: true, limiter: false }],
+  ["sort", { blocking: true, limiter: false }],
+  ["uniq", { blocking: false, limiter: false }],
+  ["wc", { blocking: true, limiter: false }],
+  ["sed", { blocking: false, limiter: false }],
+  ["xargs", { blocking: true, limiter: false }],
+  ["cp", { blocking: false, limiter: false }],
+  ["mv", { blocking: false, limiter: false }],
+  ["rm", { blocking: false, limiter: false }],
+  ["mkdir", { blocking: false, limiter: false }],
+  ["touch", { blocking: false, limiter: false }],
   ["echo", DEFAULT_TRAITS],
   ["pwd", DEFAULT_TRAITS],
   ["true", DEFAULT_TRAITS],

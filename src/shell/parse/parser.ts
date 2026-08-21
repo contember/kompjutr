@@ -18,6 +18,30 @@ export function parse(source: string): Script {
   return new Parser(tokenize(source)).script();
 }
 
+/**
+ * Words that would open a compound command, rejected in §2 of the plan.
+ *
+ * Checked here rather than in the lexer because they are reserved *in
+ * command position only*: `echo done` and `xargs echo for` are ordinary
+ * lines, and a lexer that rejected the word wherever it appeared broke both.
+ */
+const RESERVED = new Set([
+  "if",
+  "then",
+  "else",
+  "elif",
+  "fi",
+  "for",
+  "while",
+  "until",
+  "do",
+  "done",
+  "case",
+  "esac",
+  "select",
+  "function",
+]);
+
 class Parser {
   #index = 0;
 
@@ -91,8 +115,15 @@ class Parser {
       break; // `|`, `&&`, `||`, `;` end the command.
     }
 
-    if (words.length === 0) {
+    const name = words[0];
+    if (name === undefined) {
       throw new ShellSyntaxError("command", "missing command name", start);
+    }
+    if (name.parts.every((part) => part.kind === "Literal")) {
+      const text = name.parts.map((part) => part.value).join("");
+      if (RESERVED.has(text)) {
+        throw new ShellSyntaxError(`\`${text}\``, `\`${text}\` is not supported`, start);
+      }
     }
     return { kind: "SimpleCommand", words, redirections };
   }

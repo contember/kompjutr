@@ -15,6 +15,7 @@ import {
   BoundedFs,
   type Command,
   type CommandContext,
+  type CommandResult,
   DEFAULT_LIMITS,
   type Limits,
   ShellLimitError,
@@ -148,7 +149,7 @@ function commandContext(
   limitHint: number | null,
   env: PipelineEnvironment,
 ): CommandContext {
-  return {
+  const context: CommandContext = {
     fs: env.fs,
     cwd: env.cwd,
     argv,
@@ -162,7 +163,15 @@ function commandContext(
       else env.errors.push(bytes);
     },
     chdir: env.chdir,
+    invoke: (name: string, subArgv: readonly string[]): CommandResult | null => {
+      const command = env.commands.get(name);
+      if (command === undefined) return null;
+      // No stdin and no demand hint: the sub-invocation's arguments already
+      // carry everything it is meant to see.
+      return command({ ...context, argv: subArgv, stdin: null, limitHint: null });
+    },
   };
+  return context;
 }
 
 /**

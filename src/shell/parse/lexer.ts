@@ -38,25 +38,6 @@ const REJECTED: ReadonlyArray<{ prefix: string; construct: string }> = [
   { prefix: "${", construct: "parameter expansion" },
 ];
 
-/** Reserved words that would start a compound command. */
-const RESERVED = new Set([
-  "if",
-  "then",
-  "else",
-  "elif",
-  "fi",
-  "for",
-  "while",
-  "until",
-  "do",
-  "done",
-  "case",
-  "esac",
-  "select",
-  "function",
-  "time",
-]);
-
 /** Longest first, so `>>` wins over `>` and `||` over `|`. */
 const OPERATORS: ReadonlyArray<Operator | "&"> = [">>", ">&", "&&", "||", "|", ";", ">", "<", "&"];
 
@@ -115,10 +96,6 @@ export function tokenize(source: string): Token[] {
     const word = readWord(source, index);
     if (word.parts.length === 0) {
       throw new ShellSyntaxError("word", "empty word", index);
-    }
-    const flat = word.parts.map((part) => part.value).join("");
-    if (word.parts.every((part) => part.kind === "Literal") && RESERVED.has(flat)) {
-      reject(`\`${flat}\``, index);
     }
     tokens.push({ type: "word", word: { kind: "Word", parts: word.parts }, offset: index });
     index = word.end;

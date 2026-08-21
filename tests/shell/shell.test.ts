@@ -267,7 +267,7 @@ describe("sed ships two forms", () => {
 describe("rejections", () => {
   it("names an unsupported construct", () => {
     expect(shell.run("echo $(date)").stderr).toContain("command substitution");
-    expect(shell.run("for f in *; do echo x; done").stderr).toContain("`for`");
+    expect(shell.run("for f in a b; do echo x; done").stderr).toContain("`for`");
   });
 
   it("reports an unknown command", () => {

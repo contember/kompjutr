@@ -161,7 +161,7 @@ describe("rejections name the construct", () => {
     ["diff <(ls a) <(ls b)", "process substitution"],
     ["cat <<EOF", "here-document"],
     ["[[ -f x ]]", "conditional expression"],
-    ["for f in *; do echo $f; done", "`for`"],
+    ["for f in a b; do echo x; done", "`for`"],
     ["if true; then ls; fi", "`if`"],
     ["while true; do ls; done", "`while`"],
     ["ls &", "background execution"],

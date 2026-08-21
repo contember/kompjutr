@@ -12,11 +12,13 @@ import { listCommands } from "./list.js";
 import { readCommands } from "./read.js";
 import { rg } from "./rg.js";
 import { registerKnownCommands, textCommands } from "./text.js";
+import { xargs } from "./xargs.js";
 
 export function builtinCommands(): Map<string, Command> {
   const commands = new Map<string, Command>([
     ["grep", grep],
     ["rg", rg],
+    ["xargs", xargs],
     ...readCommands,
     ...listCommands,
     ...fileCommands,
@@ -26,4 +28,4 @@ export function builtinCommands(): Map<string, Command> {
   return commands;
 }
 
-export { grep, rg };
+export { grep, rg, xargs };

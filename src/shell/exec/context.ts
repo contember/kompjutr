@@ -7,6 +7,8 @@
 // written.
 
 import type {
+  ContentSearchOptions,
+  ContentSearchPage,
   Dirent,
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -127,6 +129,16 @@ export class BoundedFs {
     return this.fs.discoverFiles(root, pattern, options);
   }
 
+  discoverFilesContaining(
+    root: RealPath,
+    pattern: string,
+    needle: Uint8Array,
+    options?: ContentSearchOptions,
+  ): ContentSearchPage {
+    this.#charge();
+    return this.fs.discoverFilesContaining(root, pattern, needle, options);
+  }
+
   readFileHandles(
     handles: readonly RegularFileHandle[],
     options?: { budget?: number },
@@ -180,6 +192,18 @@ export interface CommandContext {
   warn(message: string): void;
   /** Change the session's working directory. Only `cd` uses it. */
   chdir(path: string): void;
+  /**
+   * Run another registered command. Only `xargs` uses it, and it exists as
+   * a named seam rather than a registry handed to every command so that the
+   * set of commands able to invoke others stays one grep away.
+   *
+   * The sub-invocation shares this context's `fs`, so its filesystem calls
+   * count against the same ceiling — a `xargs` over ten thousand paths
+   * cannot escape the budget by spreading the work across invocations.
+   *
+   * Returns null when no such command is registered.
+   */
+  invoke(name: string, argv: readonly string[]): CommandResult | null;
 }
 
 export interface CommandResult {
