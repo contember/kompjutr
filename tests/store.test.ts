@@ -540,6 +540,38 @@ describe("refs, config and index", () => {
     expect(store.getRef("HEAD")).toBe("c".repeat(40));
   });
 
+  it("updates 9,329 refs and shallow boundaries in bounded statements", () => {
+    const { db, store } = open();
+    const refs = Array.from({ length: 9_329 }, (_, index) => ({
+      name: `refs/remotes/origin/branch-${index.toString().padStart(4, "0")}`,
+      target: index.toString(16).padStart(40, "0"),
+    }));
+    const oids = refs.map((ref) => ref.target);
+
+    db.storage.resetCounters();
+    store.updateRefs(refs);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(5);
+    expect(store.listRefs("refs/remotes/origin/")).toHaveLength(refs.length);
+
+    db.storage.resetCounters();
+    store.updateRefs(
+      refs.slice(0, 1_000),
+      refs.slice(-1_000).map((ref) => ref.name),
+    );
+    expect(db.storage.statementCount).toBeLessThanOrEqual(2);
+    expect(store.listRefs("refs/remotes/origin/")).toHaveLength(refs.length - 1_000);
+
+    db.storage.resetCounters();
+    store.setShallow(oids);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(5);
+    expect(store.shallow().size).toBe(oids.length);
+
+    db.storage.resetCounters();
+    store.setShallow([], oids.slice(0, 1_000));
+    expect(db.storage.statementCount).toBeLessThanOrEqual(1);
+    expect(store.shallow().size).toBe(oids.length - 1_000);
+  });
+
   it("keeps multi-valued config in order", () => {
     const { store } = open();
     store.configSet("user.email", "a@example.com");

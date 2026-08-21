@@ -528,6 +528,32 @@ function parseLooseEncoding(stored: string): LooseEncoding {
 }
 
 const JSON_ENCODER = new TextEncoder();
+const JSON_BATCH_ROWS = 2_048;
+const JSON_BATCH_BYTES = 1024 * 1024;
+
+function* jsonPages<T>(items: Iterable<T>, label: string): Generator<string> {
+  let rows: string[] = [];
+  let bytes = 2;
+  for (const item of items) {
+    const row = JSON.stringify(item);
+    const rowBytes = JSON_ENCODER.encode(row).byteLength;
+    const separator = rows.length === 0 ? 0 : 1;
+    if (
+      rows.length > 0 &&
+      (rows.length >= JSON_BATCH_ROWS || bytes + separator + rowBytes > JSON_BATCH_BYTES)
+    ) {
+      yield `[${rows.join(",")}]`;
+      rows = [];
+      bytes = 2;
+    }
+    if (2 + rowBytes > JSON_BATCH_BYTES) {
+      throw new GitError("E2BIG", `one ${label} exceeds the 1 MiB JSON batch limit`);
+    }
+    bytes += (rows.length === 0 ? 0 : 1) + rowBytes;
+    rows.push(row);
+  }
+  if (rows.length > 0) yield `[${rows.join(",")}]`;
+}
 
 function serializeIndexMutation(
   item: IndexEntry | string,
@@ -1704,6 +1730,37 @@ export class RepoStore {
     this.#db.run("DELETE FROM git_refs WHERE repo_id = ? AND name = ?", this.#repoId, name);
   }
 
+  /** Apply bounded ref deletions and updates atomically. */
+  updateRefs(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
+    const checkedPuts = function* (): Generator<RefRow> {
+      for (const row of puts) {
+        if (row.name === "HEAD") throw new GitError("EINVAL", "HEAD is not a git_refs row");
+        yield row;
+      }
+    };
+    this.#db.transactionSync(() => {
+      for (const page of jsonPages(deletes, "ref deletion")) {
+        this.#db.run(
+          `DELETE FROM git_refs
+            WHERE repo_id = ? AND name IN (SELECT value FROM json_each(?))`,
+          this.#repoId,
+          page,
+        );
+      }
+      for (const page of jsonPages(checkedPuts(), "ref update")) {
+        this.#db.run(
+          `INSERT INTO git_refs (repo_id, name, target)
+           SELECT ?, json_extract(value, '$.name'), json_extract(value, '$.target')
+             FROM json_each(?)
+            WHERE true
+           ON CONFLICT(repo_id, name) DO UPDATE SET target = excluded.target`,
+          this.#repoId,
+          page,
+        );
+      }
+    });
+  }
+
   listRefs(prefix = ""): RefRow[] {
     if (prefix === "") {
       return this.#db.all<RefRow>(
@@ -2036,15 +2093,26 @@ export class RepoStore {
   }
 
   setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
-    this.#db.transactionSync(() => {
-      for (const oid of remove) {
-        this.#db.run("DELETE FROM git_shallow WHERE repo_id = ? AND oid = ?", this.#repoId, oid);
+    const checked = function* (oids: Iterable<string>): Generator<string> {
+      for (const oid of oids) {
+        if (!isOid(oid)) throw new CorruptError(`invalid shallow object id ${oid}`);
+        yield oid;
       }
-      for (const oid of add) {
+    };
+    this.#db.transactionSync(() => {
+      for (const page of jsonPages(checked(remove), "shallow deletion")) {
         this.#db.run(
-          "INSERT OR IGNORE INTO git_shallow (repo_id, oid) VALUES (?, ?)",
+          "DELETE FROM git_shallow WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
           this.#repoId,
-          oid,
+          page,
+        );
+      }
+      for (const page of jsonPages(checked(add), "shallow update")) {
+        this.#db.run(
+          `INSERT OR IGNORE INTO git_shallow (repo_id, oid)
+           SELECT ?, value FROM json_each(?)`,
+          this.#repoId,
+          page,
         );
       }
     });

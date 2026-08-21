@@ -180,34 +180,40 @@ export async function fetchInto(
 
   // One transaction: either every tracking ref moves or none does.
   const trackingPrefix = `refs/remotes/${remote}/`;
-  repo.store.db.transactionSync(() => {
-    if (options.prune === true) {
-      const advertised = new Set(
-        advertisement.refs
-          .filter((ref) => ref.name.startsWith("refs/heads/"))
-          .map((ref) => `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`),
-      );
-      for (const existing of repo.store.listRefs(trackingPrefix)) {
-        if (!advertised.has(existing.name)) repo.store.deleteRef(existing.name);
-      }
+  const deletes: string[] = [];
+  if (options.prune === true) {
+    const advertised = new Set(
+      advertisement.refs
+        .filter((ref) => ref.name.startsWith("refs/heads/"))
+        .map((ref) => `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`),
+    );
+    for (const existing of repo.store.listRefs(trackingPrefix)) {
+      if (!advertised.has(existing.name)) deletes.push(existing.name);
     }
-    for (const ref of wantedRefs) {
-      if (ref.name.startsWith("refs/heads/")) {
-        repo.store.setRef(`${trackingPrefix}${ref.name.slice("refs/heads/".length)}`, ref.oid);
-      } else if (ref.name.startsWith("refs/tags/")) {
-        repo.store.setRef(ref.name, ref.oid);
-      }
+  }
+  const updates = [];
+  for (const ref of wantedRefs) {
+    if (ref.name.startsWith("refs/heads/")) {
+      updates.push({
+        name: `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`,
+        target: ref.oid,
+      });
+    } else if (ref.name.startsWith("refs/tags/")) {
+      updates.push({ name: ref.name, target: ref.oid });
     }
-    // The remote's HEAD is a symref into *our* tracking namespace, not into
-    // the local branches, and only once the branch it names has been fetched.
-    const headRef = advertisement.headRef ?? "";
-    if (headRef.startsWith("refs/heads/")) {
-      const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
-      if (repo.store.getRef(tracking) !== null) {
-        repo.store.setRef(`${trackingPrefix}HEAD`, `ref: ${tracking}`);
-      }
+  }
+  // The remote's HEAD is a symref into *our* tracking namespace, not into
+  // the local branches, and only once the branch it names has been fetched.
+  const headRef = advertisement.headRef ?? "";
+  if (headRef.startsWith("refs/heads/")) {
+    const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
+    const updated = updates.some((ref) => ref.name === tracking);
+    const retained = !deletes.includes(tracking) && repo.store.getRef(tracking) !== null;
+    if (updated || retained) {
+      updates.push({ name: `${trackingPrefix}HEAD`, target: `ref: ${tracking}` });
     }
-  });
+  }
+  repo.store.updateRefs(updates, deletes);
 
   const first = wantedRefs[0];
   return {
