@@ -14,13 +14,19 @@ Workspace
 │   ├── command operations
 │   ├── repository and object store
 │   └── Smart HTTP client
-└── ProcessHost?                     optional exec seam, no bundled shell
+└── ProcessHost?                     optional exec seam, not wired to the shell
 ```
 
 The root package exports the native runtime. `kompjutr/fs` exposes the database
 and filesystem without Git. `kompjutr/git` exposes the native Git interface and
-factory. `kompjutr/compat/computer` is the only production entry point allowed
-to depend on `@cloudflare/computer`.
+factory. `kompjutr/shell` exposes the command surface over a `Filesystem`; it is
+constructed separately and is not reachable from `Workspace`.
+`kompjutr/compat/computer` is the only production entry point allowed to depend
+on `@cloudflare/computer`.
+
+Dependencies run one way. `shell` and `git` may depend on `fs`; neither may be
+depended on by it, and `shell` never imports `git` — a consumer that wants
+`git` in the shell registers it as a command.
 
 ## Filesystem
 
@@ -166,5 +172,14 @@ are current release blockers, not hidden exceptions.
 
 Other deliberate limits include the 2,200-byte emitted Git path cap, bounded
 commit projections, bounded ignore inputs, bounded protocol negotiation, and
-fail-closed oversized materialization. The package includes no shell. `RpcHost`
-is a declared future seam only.
+fail-closed oversized materialization. `RpcHost` is a declared future seam only.
+
+## Shell
+
+`kompjutr/shell` applies the same cost model to a command surface: a command is
+a bounded query over `Filesystem`, not a walk over a tree. Parsing and planning
+are pure — `src/shell/plan/` imports nothing from `src/fs/` — and every
+filesystem call the executor makes is counted against an operation ceiling, so a
+command written without a limiter still returns a bounded result. The command
+set, the ceilings, and the deliberate divergences from bash are specified in
+[`plans/shell.md`](plans/shell.md).

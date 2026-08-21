@@ -26,8 +26,8 @@ The workspace exposes:
 - `workspace.filesystem`: the raw bounded filesystem API.
 - `workspace.git`: the lazily created Git client.
 - `workspace.db`: the shared Durable Object SQLite adapter.
-- `workspace.exec()`: an optional seam for a future process host. No shell is
-  bundled.
+- `workspace.exec()`: an optional seam for a process host. It requires an
+  injected `ProcessHost` and is not wired to the shell.
 
 ## Filesystem only
 
@@ -57,6 +57,25 @@ workspace.fs.writeFileSync("/README.md", "# project\n");
 await workspace.git.add({ paths: ["README.md"] });
 const commit = await workspace.git.commit({ message: "Initial commit" });
 ```
+
+## Shell
+
+`kompjutr/shell` is a bash-shaped command surface over `Filesystem`, in which a
+command compiles to a bounded query rather than a tree walk: `find -name` is one
+`glob`, `grep -rl` on a literal is one indexed content search, `ls` is one
+`readdir`. It is a separate entry point, not part of `Workspace`.
+
+```ts
+import { createShell } from "kompjutr/shell";
+
+const shell = createShell({ fs: workspace.filesystem });
+const { stdout, operations } = shell.run("grep -rl createShell /src");
+```
+
+Output bytes and filesystem operations are bounded by the executor, so a command
+without `| head` still returns a bounded result. `git` is not a built-in; a
+consumer injects it through `commands`. See [the plan](docs/plans/shell.md) for
+the command set and the deliberate divergences from bash.
 
 ## Compatibility
 
