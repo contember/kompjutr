@@ -109,6 +109,13 @@ Deliberately not implemented. Each is a decision, not an omission:
 - **Network commands.** `curl` is 6 lines and belongs to the host's fetch
   seam, not to the filesystem. If it ships, it ships as an injected command.
 - **`bun`, `bunx`, `python3`, `node`.** Real binaries. Container's problem.
+- **Ignore files.** No `.gitignore` / `.ignore` handling, in either surface.
+  A kompjutr workspace is a checkout, not a build tree — `node_modules` is
+  not there to be skipped, so the default costs nothing and the machinery
+  costs a per-directory read on the discovery path. This is a deliberate
+  divergence from real `rg`; §5.1 records it so nobody later "fixes" it by
+  accident. If it is ever wanted, it comes from the git layer as a
+  discovery-query predicate, never as a post-filter.
 
 `git` is **not** a shell command in this package. It is injected by the
 consumer as a registered command, exactly like Computer does it — otherwise
@@ -143,9 +150,13 @@ src/shell/
   parse/     lexer.ts  parser.ts  ast.ts
   plan/      plan.ts  fuse.ts  types.ts
   exec/      execute.ts  budget.ts  bytes.ts
-  commands/  search.ts  read.ts  list.ts  write.ts  text.ts  misc.ts
-  index.ts   createShell({ fs, commands, cwd })
+  commands/  search.ts  grep.ts  rg.ts  read.ts  list.ts  write.ts  text.ts  misc.ts
+  session.ts schema.ts   -- the persistent cwd, §5.2
+  index.ts   createShell({ fs, commands, sessionId })
 ```
+
+`search.ts` is the engine; `grep.ts` and `rg.ts` are the two flag surfaces
+over it (§5.1).
 
 Dependencies run one way: `src/shell/` imports `src/fs/` and nothing else in
 the repo. Published as `kompjutr/shell`.
@@ -215,7 +226,8 @@ cannot name one, it does not belong here.
 
 | command | flags that ship | lowers to |
 |---|---|---|
-| `grep` / `rg` | `-r -i -n -l -v -E -F -c -w -A -B -C --include --exclude` | `discoverFiles` + `readFileHandles` |
+| `grep` | `-r -i -n -l -v -E -F -c -w -A -B -C --include --exclude` | `discoverFiles` + `readFileHandles` |
+| `rg` | `-i -S -n -l -v -F -c -w -A -B -C -g -t --hidden --no-filename` | same engine, own surface — §5.1 |
 | `find` | `-name -type -maxdepth` | `glob`, else `scan` |
 | `ls` | `-l -a -1 -R` | `readdir` / `scan` |
 | `cat` | — | `readFiles` (batched when several args) |
@@ -231,8 +243,66 @@ cannot name one, it does not belong here.
 | `echo` / `pwd` / `true` / `which` | — | none |
 | `xargs` | `-n -I` | usually fused away by R2 |
 
-`cd` is a builtin, and the session keeps `cwd` between calls — that alone
-removes the `cd X &&` prefix from 60 % of observed lines.
+`cd` is a builtin and the shell owns `cwd` across calls — §5.2.
+
+### 5.1 `grep` and `rg` are two surfaces over one engine
+
+`rg` is **not** an alias. Agents used both (130 vs 98) and their defaults
+differ in ways that produce visibly different output, so aliasing would be a
+lie that surfaces as wrong results.
+
+One `search()` core in `plan/` and `exec/`. Two flag tables, two default
+sets, two dialect mappings on top of it. What differs:
+
+| | `grep` | `rg` |
+|---|---|---|
+| recursion | opt-in (`-r`) | **default** |
+| path filter | `--include='*.ts'` | `-g '*.ts'`, `-t ts` |
+| case | sensitive; `-i` | sensitive; `-i`, plus `-S` smart-case |
+| dotfiles | searched | **skipped**; `--hidden` to include |
+| pattern | BRE by default, ERE with `-E` | ERE-shaped, always |
+| filename prefix | when >1 file | when >1 file; `--no-filename` |
+
+`-t ts` needs a small built-in type map (`ts`, `js`, `md`, `json`, `css`,
+`html`, `py`, `go`, `rust`, `sh`). Lower it to the same GLOB predicate `-g`
+produces, not to a post-filter.
+
+**Regex dialect is the sharp edge.** The engine is JS `RegExp`, which is
+neither GNU BRE/ERE nor Rust's `regex`. Policy: translate what maps
+mechanically (BRE's `\(` `\)` `\{` `\}`, character classes, anchors), and
+**reject with an error naming the construct** for anything that does not —
+rather than silently running a pattern that means something else. Real
+divergences to reject rather than fake: Rust `regex` has no backreferences
+and no lookaround, and POSIX classes (`[:alpha:]`) exist in both greps but
+not in JS.
+
+The tty-dependent defaults (heading, line numbers) resolve to the **piped**
+form in both surfaces — there is no terminal here. Verify against real `rg`
+in the parity tests; do not infer it from documentation.
+
+### 5.2 The shell owns `cwd`
+
+Persistent across calls. This removes the `cd X &&` prefix from 60 % of
+observed lines, and with it a whole class of "the agent forgot where it was"
+errors.
+
+It has to survive Durable Object eviction, so it is a row, not a field:
+
+```
+shell_sessions(session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, rev INTEGER)
+```
+
+`initializeShellSchema(db, now)`, mirroring `initializeFsSchema`. The shell
+reaches the database through `Filesystem.db`, which the interface already
+exposes — no new dependency, and the one-way rule in
+[`architecture.md`](../architecture.md) holds.
+
+Cost: **one write statement per `cd`**, and one read per isolate — the value
+is cached in memory for the isolate's lifetime, which is exactly the lifetime
+that eviction invalidates anyway. An exec that does not `cd` costs nothing.
+
+`cd` validates against `fs.statTarget` and fails loudly on a missing or
+non-directory path; a session must never persist a `cwd` that is not there.
 
 ---
 
@@ -272,7 +342,9 @@ The done-check numbers. Fixture: Prettier 3.9.6, 9,329 files, as in
 | `grep -r pat . \| head -20` | **≤5** — must not scale with tree size |
 | `grep -rl pat . --include='*.ts'` (full) | `⌈files/1000⌉ + ⌈bytes/1.5MB⌉` |
 | `rm -rf src` (5,000 files) | O(1) |
-| `cd` + 3-stage fused pipeline | same as the fused single stage |
+| 3-stage fused pipeline | same as the fused single stage |
+| `cd dir` | 2 — one `statTarget`, one session write |
+| any exec that does not `cd` | +0 for session state after the first |
 
 The second-to-last row is the formula, not a constant: assert the *shape* of
 the curve at two tree sizes an order of magnitude apart, per the
@@ -303,7 +375,10 @@ Territories are disjoint. Waves are barriers.
 | unit | territory | done-check |
 |---|---|---|
 | **C1 — executor + budgets** | `src/shell/exec/**` | Output truncation, statement ceiling, stderr elision. A command that ignores the budget fails the test. |
-| **C2 — search** | `src/shell/commands/search.ts` | `grep`, `rg`, `find`. The §7 targets. Parity against GNU grep on a fixture corpus for every shipped flag. |
+| **C2 — search engine + `find`** | `src/shell/commands/{search,find}.ts` | The §7 statement targets, asserted at two tree sizes an order of magnitude apart. Surface-agnostic: no flag tables in this territory. |
+| **C2a — `grep` surface** | `src/shell/commands/grep.ts` | Parity against **real GNU grep** on a fixture corpus, one case per shipped flag. BRE→JS translation, with a named error for every construct that does not map. |
+| **C2b — `rg` surface** | `src/shell/commands/rg.ts` | Parity against **real `rg`**, same discipline. The six divergences in §5.1 each asserted explicitly, including the deliberate ignore-file one. |
+| **C6 — session state** | `src/shell/{session,schema}.ts` | `cd` persists and survives a simulated eviction (drop the in-memory shell, rebuild from the row). Missing or non-directory target fails loudly and does not persist. §7 cost. |
 | **C3 — read/list** | `src/shell/commands/{read,list}.ts` | `cat`, `head`, `tail`, `wc`, `ls`, `stat`. `head -20` = 1 statement. |
 | **C4 — write** | `src/shell/commands/write.ts` | `cp`, `mv`, `rm`, `mkdir`, `touch`. `rm -rf` on 5,000 files stays O(1). |
 | **C5 — text** | `src/shell/commands/{text,misc}.ts` | `sort`, `uniq`, `sed`, `echo`, `pwd`, `true`, `which`, `xargs`. Bounded memory asserted. |
@@ -348,20 +423,23 @@ against real grep on a fixture corpus, per flag, are non-negotiable.
 
 ---
 
-## 10. Open decisions
+## 10. Decisions taken
 
-1. **`rg` as an alias for `grep`, or its own flag surface?** Agents used both
-   (`grep` 130, `rg` 98) and rg's defaults differ — recursive by default,
-   respects ignore files, different regex dialect. Aliasing is a lie that
-   will surface as wrong output; a second flag table is real work.
-   *Leaning: alias with rg's defaults applied, one shared engine.*
-2. **Ignore files.** Does `grep -r` skip `node_modules` and `.gitignore`d
-   paths by default? rg does, grep does not. On a 9,000-file tree this is the
-   difference between a useful default and an unusable one.
-   *Leaning: skip by default, `--no-ignore` to opt out — and lower it into the
-   discovery query, not into a post-filter.*
-3. **Does the shell own `cwd`, or does the caller pass it every time?** The
-   corpus says a persistent `cwd` removes 370 `cd` prefixes. But a persistent
-   cwd is session state that has to survive Durable Object eviction.
-   *Leaning: caller-owned, passed in, with the session storing it — the shell
-   itself stays stateless.*
+1. **`rg` gets its own flag surface**, not an alias. One `search()` engine,
+   two surfaces over it. §5.1 records the six behavioural divergences and the
+   regex-dialect policy; C2a and C2b own one surface each and both test
+   against the real binary.
+2. **No ignore-file handling**, in either surface. A workspace is a checkout,
+   not a build tree — there is no `node_modules` to skip. Recorded as an
+   explicit non-goal in §2, and as a stated `rg` divergence in §5.1, so it
+   reads as a decision rather than as a gap someone should close.
+3. **The shell owns `cwd`**, persisted in a `shell_sessions` row so it
+   survives eviction, cached in memory for the isolate's lifetime. §5.2.
+   One write per `cd`, nothing on any other exec.
+
+### Still open
+
+- **Where `sed` stops.** §2 says `s///` and `-n Np`. The first agent that
+  hits the wall will ask for one more form, and that is how a shell becomes a
+  bash port. Worth deciding now that the answer is no, and that the escape
+  hatch is the container.
