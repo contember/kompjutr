@@ -1,7 +1,7 @@
 import { Workspace } from "@cloudflare/computer";
 import { describe, expect, it } from "vitest";
 
-import { ComputerWorktree } from "../src/computer/worktree.js";
+import { ComputerWorktree } from "../src/compat/computer/worktree.js";
 import { initializeFsSchema } from "../src/fs/schema.js";
 import { MAX_HANDLE_MATERIALIZE_BYTES } from "../src/fs/store/read.js";
 import { realpath } from "../src/fs/store/resolve.js";

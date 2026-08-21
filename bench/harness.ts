@@ -9,7 +9,7 @@ import { Workspace } from "@cloudflare/computer";
 import type { GitClient, GitClientFactory } from "@cloudflare/computer/git";
 import { createGitClient } from "@cloudflare/computer/git";
 
-import { createSqliteGitClient } from "../src/index.js";
+import { createSqliteGitClient } from "../src/compat/computer.js";
 import { SqliteTestStorage } from "../tests/helpers/storage.js";
 import { type FixtureName, isFixtureName } from "./fixtures.js";
 

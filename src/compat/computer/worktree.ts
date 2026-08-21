@@ -1,4 +1,4 @@
-// The working tree, backed by Computer's DOFS provider.
+// The optional working tree adapter, backed by Computer's DOFS provider.
 //
 // Only the provider's public filesystem surface is used — no reaching into
 // the vfs_* tables. Everything is synchronous, which is what makes a
@@ -7,17 +7,17 @@
 import { Buffer } from "node:buffer";
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
-import { dirnameOf } from "../core/paths.js";
+import { dirnameOf } from "../../core/paths.js";
 import type {
   Worktree,
   WorktreeDirent,
   WorktreeEntryType,
   WorktreeStat,
-} from "../core/worktree.js";
-import { comparePaths, normalize, subtreeSuccessor } from "../fs/path.js";
-import { CHUNK_SIZE } from "../fs/schema.js";
-import { MAX_HANDLE_MATERIALIZE_BYTES } from "../fs/store/read.js";
-import { DISCOVERY_PAGE_MAX, GLOB_PATTERN_MAX_BYTES } from "../fs/store/scan.js";
+} from "../../core/worktree.js";
+import { comparePaths, normalize, subtreeSuccessor } from "../../fs/path.js";
+import { CHUNK_SIZE } from "../../fs/schema.js";
+import { MAX_HANDLE_MATERIALIZE_BYTES } from "../../fs/store/read.js";
+import { DISCOVERY_PAGE_MAX, GLOB_PATTERN_MAX_BYTES } from "../../fs/store/scan.js";
 import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -30,7 +30,7 @@ import type {
   ScanOptions,
   WriteEntry,
   WriteOptions,
-} from "../fs/types.js";
+} from "../../fs/types.js";
 
 const MAX_PATH_CODE_UNITS = 4096;
 const MAX_HANDLE_COUNT = 5_000;

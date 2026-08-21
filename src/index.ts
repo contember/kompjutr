@@ -1,13 +1,6 @@
 // kompjutr — a SQLite-native filesystem and git backend for Cloudflare Workers.
 //
 // The filesystem and git database share one Durable Object SQLite database.
-// The Computer exports below remain only for the compatibility milestone.
-
-export {
-  type CreateSqliteGitClientOptions,
-  createSqliteGitClient,
-} from "./computer/client.js";
-export { ComputerWorktree } from "./computer/worktree.js";
 export type { GitContext, GitIdentity } from "./core/context.js";
 export { findRepository, nestedRoots, openRepository } from "./core/context.js";
 export {

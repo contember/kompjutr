@@ -1,8 +1,3 @@
-export {
-  type CreateSqliteGitClientOptions,
-  createSqliteGitClient,
-} from "../computer/client.js";
-export { ComputerWorktree } from "../computer/worktree.js";
 export type {
   CompatWriteFilesEntry,
   CompatWriteFilesOptions,
@@ -24,3 +19,8 @@ export {
   type ImportFromComputerOptions,
   importFromComputer,
 } from "../fs/import.js";
+export {
+  type CreateSqliteGitClientOptions,
+  createSqliteGitClient,
+} from "./computer/client.js";
+export { ComputerWorktree } from "./computer/worktree.js";

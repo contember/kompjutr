@@ -1,9 +1,9 @@
-// Mirrors the error hierarchy of @cloudflare/computer/git: same class
+// Mirrors the legacy compatibility error hierarchy: same class
 // names, same `code` values, same messages. `code` is the documented
 // contract the CLI dispatcher and external callers branch on.
 //
 // The classes are re-declared rather than imported from
-// @cloudflare/computer/git so a workspace using this client never loads
+// the optional compatibility package, so a native workspace never loads
 // the isomorphic-git implementation it exists to replace. `instanceof`
 // against Computer's classes therefore does not hold; `error.code` does.
 

@@ -5,7 +5,7 @@
 import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { createSqliteGitClient } from "../src/index.js";
+import { createSqliteGitClient } from "../src/compat/computer.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";

@@ -1,4 +1,4 @@
-// The Computer-facing surface: one `GitClient` bound to one Workspace.
+// The optional Computer-facing surface: one `GitClient` bound to one Workspace.
 //
 // This file is the only place that knows both worlds. It resolves a `dir`
 // to a repository, hands the ops what they need, and returns the shapes
@@ -12,26 +12,37 @@ import type {
   WorkspaceGitClientOptions,
 } from "@cloudflare/computer/git";
 
-import { type GitContext, type GitIdentity, nestedRoots, openRepository } from "../core/context.js";
-import { UnsupportedOperationError } from "../core/errors.js";
-import { commit as commitOp } from "../core/ops/commit.js";
-import { configGet, configSet, remoteAdd, remoteList, remoteRemove } from "../core/ops/config.js";
-import { diff as diffOp, diffSummary as diffSummaryOp } from "../core/ops/diff.js";
-import { initRepository } from "../core/ops/init.js";
-import { clone as cloneOp, fetchInto } from "../core/ops/network.js";
+import {
+  type GitContext,
+  type GitIdentity,
+  nestedRoots,
+  openRepository,
+} from "../../core/context.js";
+import { UnsupportedOperationError } from "../../core/errors.js";
+import { commit as commitOp } from "../../core/ops/commit.js";
+import {
+  configGet,
+  configSet,
+  remoteAdd,
+  remoteList,
+  remoteRemove,
+} from "../../core/ops/config.js";
+import { diff as diffOp, diffSummary as diffSummaryOp } from "../../core/ops/diff.js";
+import { initRepository } from "../../core/ops/init.js";
+import { clone as cloneOp, fetchInto } from "../../core/ops/network.js";
 import {
   catFile as catFileOp,
   hashObject as hashObjectOp,
   repoRoot as repoRootOp,
   updateRef as updateRefOp,
-} from "../core/ops/plumbing.js";
+} from "../../core/ops/plumbing.js";
 import {
   catFile as catFileRead,
   log as logOp,
   lsFilesAtRef,
   lsTree as lsTreeOp,
   show as showOp,
-} from "../core/ops/reads.js";
+} from "../../core/ops/reads.js";
 import {
   branchDelete as branchDeleteOp,
   branchList as branchListOp,
@@ -41,17 +52,17 @@ import {
   tagDelete as tagDeleteOp,
   tagList as tagListOp,
   tag as tagOp,
-} from "../core/ops/refs.js";
+} from "../../core/ops/refs.js";
 import {
   add as addOp,
   lsFiles as lsFilesOp,
   reset as resetOp,
   rm as rmOp,
-} from "../core/ops/staging.js";
-import { clean as cleanOp, status as statusOp } from "../core/ops/status.js";
-import type { Repository } from "../core/repository.js";
-import { iterateSqlCursor, type SqlDatabase } from "../sqlite/db.js";
-import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
+} from "../../core/ops/staging.js";
+import { clean as cleanOp, status as statusOp } from "../../core/ops/status.js";
+import type { Repository } from "../../core/repository.js";
+import { iterateSqlCursor, type SqlDatabase } from "../../sqlite/db.js";
+import { SqliteGitDatabase, type StoreOptions } from "../../sqlite/store.js";
 import { ComputerWorktree } from "./worktree.js";
 
 export interface CreateSqliteGitClientOptions extends StoreOptions {
