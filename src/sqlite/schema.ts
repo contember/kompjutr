@@ -9,7 +9,7 @@ import { CorruptError } from "../core/errors.js";
 import { parseTreeStream } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -78,6 +78,7 @@ const STATEMENTS = [
      size INTEGER,
      mtime INTEGER,
      ino INTEGER,
+     rev INTEGER,
      PRIMARY KEY (repo_id, path, stage)
    )`,
 
@@ -281,7 +282,7 @@ const STATEMENTS = [
 
 // v1 -> v2 added `git_blob_ids`, `git_commits` and `git_objects.stored`.
 // v3 added parsed tree tables. v4 replaces the incomplete, unused commit
-// projection; raw objects remain authoritative and are preserved.
+// projection. v5 records the monotonic filesystem revision in index stat data.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
@@ -289,6 +290,12 @@ function migrate(db: SqlDatabase, from: number): void {
   if (from < 4) {
     db.run("DROP TABLE git_commits");
     db.run(COMMIT_TABLE);
+  }
+  if (from < 5) {
+    const hasRevision = db
+      .all<{ name: string }>("PRAGMA table_info(git_index)")
+      .some((column) => column.name === "rev");
+    if (!hasRevision) db.run("ALTER TABLE git_index ADD COLUMN rev INTEGER");
   }
 }
 

@@ -82,7 +82,9 @@ describe("Workspace", () => {
     const first = await workspace.git.commit({ message: "first" });
     expect(await workspace.git.status()).toEqual([]);
 
-    await workspace.fs.writeFile("/src/a.ts", "export const a = 20;\n");
+    // The clock is fixed and the replacement has the same size. Filesystem
+    // revision, not mtime, must invalidate the index stat cache.
+    await workspace.fs.writeFile("/src/a.ts", "export const a = 2;\n");
     expect(await workspace.git.diff()).toContain("-export const a = 1;");
     await workspace.git.add({ paths: ["src/a.ts"] });
     await workspace.git.commit({ message: "second" });

@@ -29,7 +29,7 @@ function columnsOf(db: TestDatabase, table: string): string[] {
 }
 
 describe("git schema", () => {
-  it("creates v4 on a fresh database", () => {
+  it("creates v5 on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -38,6 +38,17 @@ describe("git schema", () => {
     );
     expect(columnsOf(db, "git_objects")).toContain("stored");
     expect(columnsOf(db, "git_blob_ids")).toEqual(["repo_id", "content_id", "oid"]);
+    expect(columnsOf(db, "git_index")).toEqual([
+      "repo_id",
+      "path",
+      "stage",
+      "mode",
+      "oid",
+      "size",
+      "mtime",
+      "ino",
+      "rev",
+    ]);
     expect(columnsOf(db, "git_commits")).toEqual([
       "repo_id",
       "oid",
@@ -101,7 +112,7 @@ describe("git schema", () => {
       // Existing rows inherit the default, which is what they were.
       stored: "zlib",
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("4");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
   });
 
   it("creates empty parsed-tree tables when migrating v2", () => {
@@ -116,7 +127,7 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("4");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
   });
 
   it("replaces the incomplete v3 commit cache without touching raw objects", () => {
@@ -143,20 +154,48 @@ describe("git schema", () => {
       stored: "raw",
     });
     expect(columnsOf(db, "git_commits")).toContain("committer_timezone");
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("4");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+  });
+
+  it("adds the filesystem revision to a v4 index without changing rows", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("ALTER TABLE git_index RENAME TO git_index_v5");
+    db.run(`CREATE TABLE git_index (
+      repo_id INTEGER NOT NULL, path TEXT NOT NULL, stage INTEGER NOT NULL,
+      mode INTEGER NOT NULL, oid TEXT NOT NULL, size INTEGER, mtime INTEGER, ino INTEGER,
+      PRIMARY KEY (repo_id, path, stage)
+    )`);
+    db.run(
+      "INSERT INTO git_index SELECT repo_id,path,stage,mode,oid,size,mtime,ino FROM git_index_v5",
+    );
+    db.run("DROP TABLE git_index_v5");
+    db.run("INSERT INTO git_index VALUES (1, 'a.txt', 0, 33188, 'abc', 1, 2, 3)");
+    db.run("UPDATE git_meta SET value = '4' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(db.one("SELECT path,size,mtime,ino,rev FROM git_index")).toEqual({
+      path: "a.txt",
+      size: 1,
+      mtime: 2,
+      ino: 3,
+      rev: null,
+    });
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
   });
 
   it("fails closed on a schema newer than this runtime", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("UPDATE git_meta SET value = '5' WHERE key = 'schema_version'");
+    db.run("UPDATE git_meta SET value = '6' WHERE key = 'schema_version'");
 
     expect(() => initializeGitSchema(db)).toThrow(/newer than supported/);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
   });
 
   it("accepts only canonical positive decimal schema versions", () => {
-    for (const version of ["", " ", "4.0", "04", "0", "-1", "9007199254740993"]) {
+    for (const version of ["", " ", "5.0", "05", "0", "-1", "9007199254740993"]) {
       const db = new TestDatabase();
       initializeGitSchema(db);
       db.run("UPDATE git_meta SET value = ? WHERE key = 'schema_version'", version);

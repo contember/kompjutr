@@ -523,6 +523,7 @@ export function indexEntryFor(relative: string, hashed: HashedPath): IndexEntry 
     size: hashed.stat.size,
     mtime: hashed.stat.mtime,
     ino: hashed.stat.ino,
+    rev: hashed.stat.rev,
   };
 }
 
@@ -537,5 +538,6 @@ export function indexMatchesStat(entry: IndexEntry, stat: WorktreeStat): boolean
   if (entry.size === null || entry.mtime === null) return false;
   if (entry.size !== stat.size || entry.mtime !== stat.mtime) return false;
   if (entry.ino !== null && stat.ino !== 0 && entry.ino !== stat.ino) return false;
+  if (entry.rev !== undefined && entry.rev !== null && entry.rev !== stat.rev) return false;
   return entry.mode === Number.parseInt(gitModeFor(stat), 8);
 }

@@ -186,7 +186,7 @@ function buildStatusScale(
 
 function indexScanStatements(workspace: TestRepository): number {
   for (const [query, count] of workspace.storage.histogram ?? []) {
-    if (query.startsWith("SELECT path, stage, mode, oid, size, mtime, ino FROM git_index")) {
+    if (query.startsWith("SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index")) {
       return count;
     }
   }

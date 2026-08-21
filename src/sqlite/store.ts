@@ -110,6 +110,8 @@ export interface IndexEntry {
   size: number | null;
   mtime: number | null;
   ino: number | null;
+  /** Monotonic filesystem revision, absent on indexes created before schema v5. */
+  rev?: number | null;
 }
 
 export interface IndexScanOptions {
@@ -573,6 +575,7 @@ function serializeIndexMutation(
           s: item.size,
           t: item.mtime,
           i: item.ino,
+          r: item.rev ?? null,
         },
   );
   return { kind, json, bytes: JSON_ENCODER.encode(json).byteLength };
@@ -1855,7 +1858,7 @@ export class RepoStore {
 
   indexEntries(): IndexEntry[] {
     return this.#db.all<IndexEntry>(
-      "SELECT path, stage, mode, oid, size, mtime, ino FROM git_index WHERE repo_id = ? ORDER BY path, stage",
+      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE repo_id = ? ORDER BY path, stage",
       this.#repoId,
     );
   }
@@ -1863,7 +1866,7 @@ export class RepoStore {
   indexGet(path: string, stage = 0): IndexEntry | null {
     return (
       this.#db.one<IndexEntry>(
-        "SELECT path, stage, mode, oid, size, mtime, ino FROM git_index WHERE repo_id = ? AND path = ? AND stage = ?",
+        "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE repo_id = ? AND path = ? AND stage = ?",
         this.#repoId,
         path,
         stage,
@@ -1873,11 +1876,11 @@ export class RepoStore {
 
   indexPut(entry: IndexEntry): void {
     this.#db.run(
-      `INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(repo_id, path, stage) DO UPDATE SET
          mode = excluded.mode, oid = excluded.oid, size = excluded.size,
-         mtime = excluded.mtime, ino = excluded.ino`,
+         mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
       this.#repoId,
       entry.path,
       entry.stage,
@@ -1886,6 +1889,7 @@ export class RepoStore {
       entry.size,
       entry.mtime,
       entry.ino,
+      entry.rev ?? null,
     );
   }
 
@@ -1926,7 +1930,8 @@ export class RepoStore {
                 json_extract(j.value, '$.o') AS oid,
                 json_extract(j.value, '$.s') AS size,
                 json_extract(j.value, '$.t') AS mtime,
-                json_extract(j.value, '$.i') AS ino
+                json_extract(j.value, '$.i') AS ino,
+                json_extract(j.value, '$.r') AS rev
            FROM json_each(?) j
        ), ranked AS (
          SELECT mutation.*,
@@ -1936,9 +1941,9 @@ export class RepoStore {
                   OVER (PARTITION BY path, stage) AS last_put
            FROM mutation
        )
-       INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino)
+       INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev)
        SELECT ?, current.path, current.stage, current.mode, current.oid,
-              current.size, current.mtime, current.ino
+              current.size, current.mtime, current.ino, current.rev
          FROM ranked current
         WHERE current.kind = 'p'
           AND current.q = current.last_put
@@ -1946,7 +1951,7 @@ export class RepoStore {
         ORDER BY current.q
        ON CONFLICT(repo_id, path, stage) DO UPDATE SET
          mode = excluded.mode, oid = excluded.oid, size = excluded.size,
-         mtime = excluded.mtime, ino = excluded.ino`,
+         mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
       mutations,
       this.#repoId,
     );
@@ -1993,7 +1998,7 @@ export class RepoStore {
       const page =
         prefix === undefined || prefix === ""
           ? this.#db.all<IndexEntry>(
-              `SELECT path, stage, mode, oid, size, mtime, ino FROM git_index
+              `SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index
                WHERE repo_id = ? AND (path > ? OR (path = ? AND stage > ?))
                ORDER BY path, stage LIMIT ?`,
               this.#repoId,
@@ -2003,7 +2008,7 @@ export class RepoStore {
               pageSize,
             )
           : this.#db.all<IndexEntry>(
-              `SELECT path, stage, mode, oid, size, mtime, ino FROM git_index
+              `SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index
                WHERE repo_id = ? AND (path > ? OR (path = ? AND stage > ?))
                  AND (path = ? OR (path >= ? AND path < ?))
                ORDER BY path, stage LIMIT ?`,

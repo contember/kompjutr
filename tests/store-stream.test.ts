@@ -73,7 +73,7 @@ function open(db: SqlDatabase = new TestDatabase()) {
 }
 
 function entry(path: string, stage = 0, oid = "0".repeat(40)): IndexEntry {
-  return { path, stage, mode: 0o100644, oid, size: null, mtime: null, ino: null };
+  return { path, stage, mode: 0o100644, oid, size: null, mtime: null, ino: null, rev: null };
 }
 
 describe("indexScan", () => {
