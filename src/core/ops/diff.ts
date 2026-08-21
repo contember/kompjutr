@@ -5,22 +5,31 @@
 // `src/core/diff/`; this file decides *what* is compared and writes the
 // `diff --git` headers around it.
 
-import type { IndexEntry } from "../../sqlite/store.js";
-import { utf8Decoder, ZERO_OID } from "../bytes.js";
+import { type BlobReadBatch, contentIdKey, type IndexEntry } from "../../sqlite/store.js";
+import { utf8, utf8Decoder, ZERO_OID } from "../bytes.js";
 import { diffText } from "../diff/index.js";
 import { isBinary } from "../diff/lines.js";
+import { CorruptError, GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted } from "../streams.js";
+import { joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { matchesPaths, stageZero } from "./checkout.js";
 import type { DiffSummaryEntry } from "./kinds.js";
 import { treeOf } from "./reads.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
-import { hashWorktreePath, indexMatchesStat, worktreeBytes } from "./worktree-io.js";
+import {
+  hashWorktreePaths,
+  indexMatchesStat,
+  type WorktreePath,
+  walkWorktreeEntriesStream,
+} from "./worktree-io.js";
 
 /** git's default abbreviation for `index` lines in a small repository. */
 const DEFAULT_ABBREV = 7;
+const DIFF_WINDOW_ROWS = 1000;
+const DIFF_REPOSITORY_BYTES = 8 * 1024 * 1024;
+const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
 
 export interface DiffOptions {
   /** The "from" side. Defaults to HEAD. */
@@ -39,13 +48,32 @@ export interface DiffOptions {
 interface Endpoint {
   mode: string;
   oid: string;
-  bytes(): Uint8Array;
+  bytes: Uint8Array | null;
 }
 
 interface FileChange {
   path: string;
   before: Endpoint | null;
   after: Endpoint | null;
+}
+
+interface EndpointIdentity {
+  mode: string;
+  oid: string;
+  worktree: WorktreePath | null;
+}
+
+interface PendingChange {
+  path: string;
+  before: EndpointIdentity | null;
+  after: EndpointIdentity | null;
+}
+
+interface WorkingCandidate {
+  path: string;
+  before: TargetEntry | undefined;
+  index: IndexEntry | undefined;
+  worktree: WorktreePath | undefined;
 }
 
 export function diff(repo: Repository, worktree: Worktree, options: DiffOptions = {}): string {
@@ -82,8 +110,12 @@ export function diff(repo: Repository, worktree: Worktree, options: DiffOptions 
       headerLines++;
     }
 
-    const oldBytes = before === null ? new Uint8Array(0) : before.bytes();
-    const newBytes = after === null ? new Uint8Array(0) : after.bytes();
+    if (oldOid === newOid) {
+      if (headerLines > 1) out += header;
+      continue;
+    }
+    const oldBytes = before === null ? new Uint8Array(0) : endpointBytes(before);
+    const newBytes = after === null ? new Uint8Array(0) : endpointBytes(after);
     if (isBinary(oldBytes) || isBinary(newBytes)) {
       out += `${header}Binary files ${left} and ${right} differ\n`;
       continue;
@@ -92,8 +124,6 @@ export function diff(repo: Repository, worktree: Worktree, options: DiffOptions 
       context: options.context,
     });
     if (text.hunks === "") {
-      // A mode change with identical content still gets its header.
-      if (headerLines > 1) out += header;
       continue;
     }
     out += `${header}--- ${left}\n+++ ${right}\n${text.hunks}`;
@@ -109,8 +139,12 @@ export function diffSummary(
   const out: DiffSummaryEntry[] = [];
   for (const change of collect(repo, worktree, options)) {
     const status = change.before === null ? "A" : change.after === null ? "D" : "M";
-    const oldBytes = change.before === null ? new Uint8Array(0) : change.before.bytes();
-    const newBytes = change.after === null ? new Uint8Array(0) : change.after.bytes();
+    if (change.before?.oid === change.after?.oid) {
+      out.push({ path: change.path, status, insertions: 0, deletions: 0 });
+      continue;
+    }
+    const oldBytes = change.before === null ? new Uint8Array(0) : endpointBytes(change.before);
+    const newBytes = change.after === null ? new Uint8Array(0) : endpointBytes(change.after);
     if (isBinary(oldBytes) || isBinary(newBytes)) {
       // git prints "-" for a binary file; there is no line count to give.
       out.push({ path: change.path, status, insertions: 0, deletions: 0 });
@@ -142,34 +176,115 @@ function* collect(
 
   if (options.to !== undefined) {
     const to = treeStream(repo, treeOf(repo, repo.revParse(options.to)));
+    const pending: PendingChange[] = [];
     for (const row of joinSorted(from, to, { ...byPath, right: (entry) => entry.path })) {
       if (!matchesPaths(row.path, options.paths)) continue;
-      const change = compare(row.path, treeEndpoint(repo, row.left), treeEndpoint(repo, row.right));
-      if (change !== null) yield change;
+      const change = compareIdentities(row.path, treeIdentity(row.left), treeIdentity(row.right));
+      if (change !== null) pending.push(change);
+      if (pending.length >= DIFF_WINDOW_ROWS) yield* hydrateChanges(repo, worktree, pending);
     }
+    yield* hydrateChanges(repo, worktree, pending);
     return;
   }
 
   // The working-tree side covers only paths git would consider — those in
   // the "from" tree or in the index — so an untracked file stays out of the
   // patch, as it does in real `git diff`.
-  for (const row of joinSorted(from, stageZero(repo.store.indexScan()), {
-    ...byPath,
-    right: (entry) => entry.path,
-  })) {
+  const candidates: WorkingCandidate[] = [];
+  for (const row of joinSorted3(
+    from,
+    stageZero(repo.store.indexScan()),
+    walkWorktreeEntriesStream(worktree, repo.root, { paths: options.paths }),
+    {
+      a: (entry) => entry.path,
+      b: (entry) => entry.path,
+      c: (entry) => entry.path,
+    },
+  )) {
     if (!matchesPaths(row.path, options.paths)) continue;
-    const indexed = row.right !== undefined && row.right.mode !== 0o160000 ? row.right : undefined;
-    const change = compare(
-      row.path,
-      treeEndpoint(repo, row.left),
-      worktreeEndpoint(repo, worktree, row.path, indexed),
-    );
-    if (change !== null) yield change;
+    if (row.a === undefined && row.b === undefined) continue;
+    candidates.push({
+      path: row.path,
+      before: row.a,
+      index: row.b !== undefined && row.b.mode !== 0o160000 ? row.b : undefined,
+      worktree: row.c,
+    });
+    if (candidates.length >= DIFF_WINDOW_ROWS) {
+      yield* resolveWorkingCandidates(repo, worktree, candidates);
+    }
   }
+  yield* resolveWorkingCandidates(repo, worktree, candidates);
 }
 
-/** A change, or null when the two sides agree or neither exists. */
-function compare(path: string, before: Endpoint | null, after: Endpoint | null): FileChange | null {
+function* resolveWorkingCandidates(
+  repo: Repository,
+  worktree: Worktree,
+  candidates: WorkingCandidate[],
+): Generator<FileChange> {
+  if (candidates.length === 0) return;
+  const rows = candidates.splice(0);
+  const identities = repo.store.lookupBlobIds(
+    rows.flatMap((row) => {
+      if (cachedWorktreeOid(row.index, row.worktree) !== null) return [];
+      const contentId = row.worktree?.stat.contentId;
+      return contentId === null || contentId === undefined ? [] : [contentId];
+    }),
+  );
+  const unresolved: WorktreePath[] = [];
+  const mapped = new Map<string, string>();
+  for (const row of rows) {
+    if (cachedWorktreeOid(row.index, row.worktree) !== null) continue;
+    const contentId = row.worktree?.stat.contentId;
+    const oid =
+      contentId === null || contentId === undefined
+        ? undefined
+        : identities.get(contentIdKey(contentId));
+    if (oid !== undefined) mapped.set(row.path, oid);
+    else if (row.worktree !== undefined && row.worktree.stat.type !== "dir") {
+      unresolved.push(row.worktree);
+    }
+  }
+  const hashes = hashWorktreePaths(repo, worktree, unresolved, { write: false });
+  repo.store.upsertBlobIds(
+    [...hashes.values()].flatMap((hashed) => {
+      const contentId = hashed.stat.contentId;
+      return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
+    }),
+  );
+
+  const changes: PendingChange[] = [];
+  for (const row of rows) {
+    const cached = cachedWorktreeOid(row.index, row.worktree);
+    const hashed = hashes.get(row.path);
+    const oid = cached ?? mapped.get(row.path) ?? hashed?.oid;
+    const after =
+      oid === undefined || row.worktree === undefined || row.worktree.stat.type === "dir"
+        ? null
+        : {
+            mode: hashed?.mode ?? gitModeFor(row.worktree.stat),
+            oid,
+            worktree: row.worktree,
+          };
+    const change = compareIdentities(row.path, treeIdentity(row.before), after);
+    if (change !== null) changes.push(change);
+  }
+  yield* hydrateChanges(repo, worktree, changes);
+}
+
+function cachedWorktreeOid(
+  entry: IndexEntry | undefined,
+  worktree: WorktreePath | undefined,
+): string | null {
+  if (entry === undefined || worktree === undefined || worktree.stat.type === "dir") return null;
+  return indexMatchesStat(entry, worktree.stat) ? entry.oid : null;
+}
+
+/** A change, or null when the two identities agree or neither exists. */
+function compareIdentities(
+  path: string,
+  before: EndpointIdentity | null,
+  after: EndpointIdentity | null,
+): PendingChange | null {
   if (before === null && after === null) return null;
   if (before !== null && after !== null && before.oid === after.oid && before.mode === after.mode) {
     return null;
@@ -177,27 +292,152 @@ function compare(path: string, before: Endpoint | null, after: Endpoint | null):
   return { path, before, after };
 }
 
-function treeEndpoint(repo: Repository, entry: TargetEntry | undefined): Endpoint | null {
+function treeIdentity(entry: TargetEntry | undefined): EndpointIdentity | null {
   // Submodules are out of scope.
   if (entry === undefined || entry.mode === "160000") return null;
-  return { mode: entry.mode, oid: entry.oid, bytes: () => repo.readBlob(entry.oid) };
+  return { mode: entry.mode, oid: entry.oid, worktree: null };
 }
 
-function worktreeEndpoint(
+function* hydrateChanges(
   repo: Repository,
   worktree: Worktree,
-  path: string,
-  entry: IndexEntry | undefined,
+  changes: PendingChange[],
+): Generator<FileChange> {
+  if (changes.length === 0) return;
+  const pending = changes.splice(0);
+  const root = worktree.realpath(repo.root);
+  let offset = 0;
+
+  while (offset < pending.length) {
+    let end = offset;
+    let worktreeBytes = 0;
+    while (end < pending.length && end - offset < DIFF_WINDOW_ROWS) {
+      const change = pending[end]!;
+      const size = requiredWorktreeBytes(change);
+      if (size > DIFF_WORKTREE_BYTES) {
+        throw new GitError("EFBIG", `diff path ${change.path} exceeds the working-tree byte limit`);
+      }
+      if (end > offset && worktreeBytes + size > DIFF_WORKTREE_BYTES) break;
+      worktreeBytes += size;
+      end++;
+    }
+
+    const proposed = pending.slice(offset, end);
+    const wanted = repositoryOids(proposed);
+    const stored = new Map<string, Uint8Array>();
+    let remaining = wanted;
+    let storedBytes = 0;
+    while (remaining.length > 0 && storedBytes < DIFF_REPOSITORY_BYTES) {
+      const budget = Math.min(4 * 1024 * 1024, DIFF_REPOSITORY_BYTES - storedBytes);
+      let batch: BlobReadBatch;
+      try {
+        batch = repo.readBlobs(remaining, { budgetBytes: budget });
+      } catch (error) {
+        if (error instanceof GitError && error.code === "EFBIG") break;
+        throw error;
+      }
+      for (const [oid, bytes] of batch.blobs) stored.set(oid, bytes);
+      storedBytes += batch.bytes;
+      if (batch.remaining.length >= remaining.length) {
+        throw new CorruptError("bulk blob reader did not make progress");
+      }
+      remaining = batch.remaining;
+    }
+
+    let ready = 0;
+    for (const change of proposed) {
+      if (!repositoryOids([change]).every((oid) => stored.has(oid))) break;
+      ready++;
+    }
+    if (ready === 0) {
+      throw new GitError(
+        "EFBIG",
+        `diff path ${pending[offset]?.path ?? ""} exceeds the blob limit`,
+      );
+    }
+    const group = proposed.slice(0, ready);
+    const worktreeContents = readWorktreeContents(worktree, root, group);
+    for (const change of group) {
+      yield {
+        path: change.path,
+        before: hydrateEndpoint(change.before, stored, worktreeContents),
+        after: hydrateEndpoint(change.after, stored, worktreeContents),
+      };
+    }
+    offset += ready;
+  }
+}
+
+function requiredWorktreeBytes(change: PendingChange): number {
+  if (!contentDiffers(change) || change.after === null || change.after.worktree === null) return 0;
+  return change.after.worktree.stat.size;
+}
+
+function repositoryOids(changes: readonly PendingChange[]): string[] {
+  const oids = new Set<string>();
+  for (const change of changes) {
+    if (!contentDiffers(change)) continue;
+    if (change.before !== null && change.before.worktree === null) oids.add(change.before.oid);
+    if (change.after !== null && change.after.worktree === null) oids.add(change.after.oid);
+  }
+  return [...oids];
+}
+
+function contentDiffers(change: PendingChange): boolean {
+  return change.before?.oid !== change.after?.oid;
+}
+
+function readWorktreeContents(
+  worktree: Worktree,
+  root: string,
+  changes: readonly PendingChange[],
+): Map<string, Uint8Array> {
+  const contents = new Map<string, Uint8Array>();
+  const files: string[] = [];
+  for (const change of changes) {
+    const endpoint = change.after;
+    if (!contentDiffers(change) || endpoint === null || endpoint.worktree === null) continue;
+    if (endpoint.worktree.stat.type === "symlink") {
+      const target = endpoint.worktree.stat.target;
+      if (target === null) throw new CorruptError(`symlink ${change.path} has no target`);
+      contents.set(change.path, utf8.encode(target));
+    } else {
+      files.push(joinPath(root, change.path));
+    }
+  }
+
+  let remaining = files;
+  while (remaining.length > 0) {
+    const batch = worktree.readFiles(remaining);
+    for (const [absolute, bytes] of batch.files) {
+      const prefix = root === "/" ? "/" : `${root}/`;
+      if (!absolute.startsWith(prefix)) {
+        throw new CorruptError(`worktree read returned a path outside ${root}`);
+      }
+      contents.set(absolute.slice(prefix.length), bytes);
+    }
+    if (batch.remaining.length >= remaining.length) {
+      throw new CorruptError("bulk worktree reader did not make progress");
+    }
+    remaining = batch.remaining;
+  }
+  return contents;
+}
+
+function hydrateEndpoint(
+  identity: EndpointIdentity | null,
+  stored: ReadonlyMap<string, Uint8Array>,
+  worktree: ReadonlyMap<string, Uint8Array>,
 ): Endpoint | null {
-  const absolute = joinPath(repo.root, path);
-  const stat = worktree.stat(absolute);
-  if (stat === null || stat.type === "dir") return null;
-  // The index caches the oid alongside the stat that produced it, so an
-  // unmodified file never has to be read to be identified.
-  const cached = entry !== undefined && indexMatchesStat(entry, stat) ? entry.oid : null;
-  const oid = cached ?? hashWorktreePath(repo, worktree, path, { write: false })?.oid;
-  if (oid === undefined) return null;
-  return { mode: gitModeFor(stat), oid, bytes: () => worktreeBytes(worktree, absolute, stat) };
+  if (identity === null) return null;
+  const bytes =
+    identity.worktree === null ? stored.get(identity.oid) : worktree.get(identity.worktree.path);
+  return { mode: identity.mode, oid: identity.oid, bytes: bytes ?? null };
+}
+
+function endpointBytes(endpoint: Endpoint): Uint8Array {
+  if (endpoint.bytes === null) throw new CorruptError(`diff bytes missing for ${endpoint.oid}`);
+  return endpoint.bytes;
 }
 
 /** The "from" tree: an explicit ref, or HEAD — which may be unborn. */

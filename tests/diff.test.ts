@@ -8,10 +8,13 @@ import { afterAll, describe, expect, it } from "vitest";
 import { utf8 } from "../src/core/bytes.js";
 import { diffText } from "../src/core/diff/index.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
+import { commit } from "../src/core/ops/commit.js";
 import { diff, diffSummary } from "../src/core/ops/diff.js";
+import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 const scratch = mkdtempSync(join(tmpdir(), "kompjutr-diff-"));
 const fixtures: GitFixture[] = [];
@@ -206,6 +209,57 @@ async function workingTreeFixture(): Promise<Pair> {
   return pair;
 }
 
+class BulkOnlyWorktree extends CountingWorktree {
+  override stat(path: string): never {
+    throw new Error(`scalar stat is forbidden during diff: ${path}`);
+  }
+
+  override readFile(path: string): never {
+    throw new Error(`scalar readFile is forbidden during diff: ${path}`);
+  }
+
+  override readlink(path: string): never {
+    throw new Error(`scalar readlink is forbidden during diff: ${path}`);
+  }
+}
+
+function buildDiffScale(): { workspace: TestRepository; entries: IndexEntry[] } {
+  const workspace = makeRepo("/");
+  workspace.repo.store.configSet("user.name", "Fixture");
+  workspace.repo.store.configSet("user.email", "fixture@example.com");
+  const bytes = utf8.encode("contents\n");
+  const oid = workspace.repo.store.write("blob", bytes);
+  const paths = Array.from({ length: 9_329 }, (_, index) => {
+    const directory = index % 3_346;
+    const generation = Math.floor(index / 3_346);
+    return `d${directory.toString().padStart(4, "0")}/f${generation
+      .toString()
+      .padStart(4, "0")}.txt`;
+  });
+  workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+  const stats = new Map(
+    workspace.worktree
+      .scan("/", { filesOnly: true, limit: paths.length + 1 })
+      .map((entry) => [entry.path.slice(1), entry]),
+  );
+  const entries = paths.map((path): IndexEntry => {
+    const stat = stats.get(path);
+    if (stat === undefined) throw new Error(`scale path was not written: ${path}`);
+    return {
+      path,
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: stat.size,
+      mtime: stat.mtime,
+      ino: stat.ino,
+    };
+  });
+  workspace.repo.store.indexReplace(entries);
+  commit(workspace.context, workspace.repo, { message: "scale" });
+  return { workspace, entries };
+}
+
 describe("diff", () => {
   it("matches git diff over the working tree", async () => {
     const pair = await workingTreeFixture();
@@ -348,5 +402,30 @@ describe("diffSummary", () => {
     expect(summary.map((entry) => `${entry.status}\t${entry.path}`)).toEqual(
       nameStatus(pair, "HEAD~1", "HEAD"),
     );
+  });
+
+  it("uses bounded bulk reads for exactly 1,000 changed files", () => {
+    const { workspace, entries } = buildDiffScale();
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+    workspace.storage.resetCounters();
+    expect(diffSummary(workspace.repo, worktree)).toEqual([]);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(180);
+    expect(worktree.bulkReadPaths).toEqual([]);
+
+    workspace.tick(60_000);
+    const changed = entries.slice(0, 1_000);
+    workspace.worktree.writeFiles(
+      changed.map((entry) => ({ path: `/${entry.path}`, bytes: utf8.encode("changed\n") })),
+    );
+    worktree.bulkReadPaths.length = 0;
+    workspace.storage.resetCounters();
+    const summary = diffSummary(workspace.repo, worktree);
+
+    expect(summary).toHaveLength(1_000);
+    expect(summary.every((entry) => entry.status === "M")).toBe(true);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(180);
+    const reads = new Map<string, number>();
+    for (const path of worktree.bulkReadPaths) reads.set(path, (reads.get(path) ?? 0) + 1);
+    expect(reads).toEqual(new Map(changed.map((entry) => [`/${entry.path}`, 2])));
   });
 });
