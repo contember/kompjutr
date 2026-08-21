@@ -137,18 +137,26 @@ function flushWrites(
   if (entries.length === 0) return;
   let pending = entries.splice(0, entries.length);
   while (pending.length > 0) {
-    const batch = repo.readBlobs(
-      pending.map((entry) => entry.oid),
-      {
-        budgetBytes: CHECKOUT_BLOB_BYTES,
-      },
-    );
+    let blobs: Map<string, Uint8Array>;
+    try {
+      blobs = repo.readBlobs(
+        pending.map((entry) => entry.oid),
+        {
+          budgetBytes: CHECKOUT_BLOB_BYTES,
+        },
+      ).blobs;
+    } catch (error) {
+      if (!(error instanceof GitError) || error.code !== "EFBIG") throw error;
+      const first = pending[0];
+      if (first === undefined) throw new CorruptError("checkout blob batch is empty");
+      blobs = new Map([[first.oid, repo.readBlob(first.oid)]]);
+    }
     const writes = [];
     const indexEntries: IndexEntry[] = [];
     const mappings: BlobIdMapping[] = [];
     const deferred: TargetEntry[] = [];
     for (const entry of pending) {
-      const data = batch.blobs.get(entry.oid);
+      const data = blobs.get(entry.oid);
       if (data === undefined) {
         deferred.push(entry);
         continue;

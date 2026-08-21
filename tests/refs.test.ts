@@ -258,6 +258,26 @@ describe("checkout", () => {
     expect(ws.worktree.stat("/only")).toBeNull();
   });
 
+  it("materialises a blob larger than the checkout batch budget", async () => {
+    const largeFixture = new GitFixture().init("main");
+    const workspace = makeRepo("/");
+    const bytes = new Uint8Array(3 * 1024 * 1024 + 1).fill(0x61);
+    try {
+      largeFixture.write("large.bin", bytes);
+      largeFixture.commit("large");
+      await importFixture(largeFixture, workspace.repo.store);
+
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+      const written = workspace.worktree.readFile("/large.bin");
+      expect(written.length).toBe(bytes.length);
+      expect(written[0]).toBe(0x61);
+      expect(written[written.length - 1]).toBe(0x61);
+    } finally {
+      largeFixture.dispose();
+    }
+  });
+
   it("updates only the given paths and leaves HEAD alone", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "side" });
     fixture.git("checkout", "-q", "side");
