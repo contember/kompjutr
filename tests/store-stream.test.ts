@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { concat, toHex, utf8 } from "../src/core/bytes.js";
-import { hashObject } from "../src/core/objects.js";
+import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -16,6 +16,7 @@ import { TestDatabase } from "./helpers/db.js";
 class WidestDatabase implements SqlDatabase {
   widestRows = 0;
   widestBlob = 0;
+  widestStringBytes = 0;
   /** Most bound parameters any one statement carried. The platform cap is 100. */
   widestBindings = 0;
 
@@ -24,6 +25,10 @@ class WidestDatabase implements SqlDatabase {
   #measure(bindings: unknown[]): void {
     if (bindings.length > this.widestBindings) this.widestBindings = bindings.length;
     for (const binding of bindings) {
+      if (typeof binding === "string") {
+        const bytes = new TextEncoder().encode(binding).byteLength;
+        if (bytes > this.widestStringBytes) this.widestStringBytes = bytes;
+      }
       if (binding instanceof Uint8Array && binding.length > this.widestBlob) {
         this.widestBlob = binding.length;
       }
@@ -136,10 +141,13 @@ describe("indexApply", () => {
   it("keeps a remove and a re-put of one path in the order they were made", () => {
     const store = open();
     store.indexPut(entry("a.txt", 1));
-    store.indexApply((sink) => {
-      sink.remove("a.txt");
-      sink.put(entry("a.txt", 0, "1".repeat(40)));
-    });
+    store.indexApply(
+      (sink) => {
+        sink.remove("a.txt");
+        sink.put(entry("a.txt", 0, "1".repeat(40)));
+      },
+      { flushEvery: 1 },
+    );
     expect(store.indexEntries()).toEqual([entry("a.txt", 0, "1".repeat(40))]);
   });
 
@@ -159,6 +167,95 @@ describe("indexApply", () => {
     expect(visible).toBeGreaterThan(0);
     expect(visible).toBeLessThan(100);
     expect(store.indexEntries()).toHaveLength(100);
+  });
+
+  it("batches ordered remove and put pairs into constant statements", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    for (let index = 0; index < 500; index++) {
+      store.indexPut(entry(`f${String(index).padStart(3, "0")}.txt`, 1));
+    }
+    inner.storage.resetCounters();
+    db.widestBindings = 0;
+
+    store.indexApply((sink) => {
+      for (let index = 0; index < 500; index++) {
+        const path = `f${String(index).padStart(3, "0")}.txt`;
+        sink.remove(path);
+        sink.put(entry(path, 0, String(index).padStart(40, "0")));
+      }
+    });
+
+    expect(inner.storage.statementCount).toBe(4);
+    expect(db.widestBindings).toBeLessThanOrEqual(2);
+    expect(store.indexEntries()).toEqual(
+      Array.from({ length: 500 }, (_, index) => {
+        const path = `f${String(index).padStart(3, "0")}.txt`;
+        return entry(path, 0, String(index).padStart(40, "0"));
+      }),
+    );
+  });
+
+  it("keeps the last ordered mutation for every path and stage", () => {
+    const store = open();
+    store.indexPut(entry("a.txt", 1, "1".repeat(40)));
+    store.indexPut(entry("a.txt", 2, "2".repeat(40)));
+    store.indexApply((sink) => {
+      sink.put(entry("a.txt", 3, "3".repeat(40)));
+      sink.remove("a.txt");
+      sink.put(entry("a.txt", 0, "4".repeat(40)));
+      sink.put(entry("a.txt", 0, "5".repeat(40)));
+      sink.put(entry("b.txt", 0, "6".repeat(40)));
+      sink.remove("b.txt");
+    });
+
+    expect(store.indexEntries()).toEqual([entry("a.txt", 0, "5".repeat(40))]);
+  });
+
+  it("scales put-only flushes by pages rather than rows", () => {
+    const measure = (count: number): number => {
+      const inner = new TestDatabase();
+      const store = open(inner);
+      inner.storage.resetCounters();
+      store.indexApply((sink) => {
+        for (let index = 0; index < count; index++) {
+          sink.put(entry(`f${String(index).padStart(4, "0")}.txt`));
+        }
+      });
+      const statements = inner.storage.statementCount;
+      expect(store.indexEntries()).toHaveLength(count);
+      return statements;
+    };
+
+    expect(measure(100)).toBe(1);
+    expect(measure(1_000)).toBe(2);
+    expect(measure(9_329)).toBe(19);
+  });
+
+  it("bounds UTF-8 JSON bindings even when flushEvery is larger", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    const paths = Array.from({ length: 512 }, (_, index) => {
+      const prefix = `${String(index).padStart(4, "0")}-`;
+      return `${prefix}${"é".repeat(4_096 - prefix.length)}`;
+    });
+    inner.storage.resetCounters();
+    db.widestStringBytes = 0;
+
+    store.indexApply(
+      (sink) => {
+        for (const path of paths) sink.put(entry(path));
+      },
+      { flushEvery: 10_000 },
+    );
+    const statements = inner.storage.statementCount;
+    const stored = store.indexEntries();
+
+    expect(statements).toBe(5);
+    expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(stored.map((row) => row.path)).toEqual(paths);
   });
 });
 
@@ -180,6 +277,39 @@ describe("indexReplace", () => {
     store.indexPut(entry("old.txt"));
     store.indexReplace([]);
     expect(store.indexEntries()).toEqual([]);
+  });
+
+  it("clears once and inserts replacement pages in bounded statements", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    store.indexPut(entry("old.txt"));
+    inner.storage.resetCounters();
+    db.widestBindings = 0;
+
+    store.indexReplace(
+      Array.from({ length: 1_000 }, (_, index) =>
+        entry(`new${String(index).padStart(4, "0")}.txt`, index % 4),
+      ),
+    );
+
+    expect(inner.storage.statementCount).toBe(3);
+    expect(db.widestBindings).toBeLessThanOrEqual(2);
+    expect(store.indexEntries()).toHaveLength(1_000);
+    expect(store.indexGet("old.txt")).toBeNull();
+  });
+
+  it("keeps a full-repository replacement below the statement ceiling", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    inner.storage.resetCounters();
+
+    store.indexReplace(
+      Array.from({ length: 9_329 }, (_, index) => entry(`f${String(index).padStart(4, "0")}.txt`)),
+    );
+
+    expect(inner.storage.statementCount).toBe(20);
+    expect(store.indexEntries()).toHaveLength(9_329);
   });
 });
 
@@ -240,6 +370,76 @@ describe("writeStream", () => {
     const oid = store.writeStream("blob", 0, function* () {});
     expect(oid).toBe(hashObject("blob", new Uint8Array(0)));
     expect(store.read(oid)?.data).toEqual(new Uint8Array(0));
+  });
+
+  it("uses raw storage through 4 KiB and zlib immediately above it", () => {
+    for (const size of [4_096, 4_097]) {
+      const store = open();
+      const data = new Uint8Array(randomBytes(size));
+      const oid = store.writeStream("blob", data.length, slice(data, 7));
+      expect(
+        store.db.scalar<string>(
+          "SELECT stored FROM git_objects WHERE repo_id = ? AND oid = ?",
+          1,
+          oid,
+        ),
+      ).toBe(size === 4_096 ? "raw" : "zlib");
+      expect(oid).toBe(hashObject("blob", data));
+      expect(store.read(oid)?.data).toEqual(data);
+      expect(concat([...(store.readChunks(oid) ?? [])])).toEqual(data);
+    }
+  });
+
+  it("rejects changed same-size storage passes at 4 KiB and 4 KiB plus one", () => {
+    for (const size of [4_096, 4_097]) {
+      const store = open();
+      const first = new Uint8Array(randomBytes(size));
+      const second = first.slice();
+      second[second.length - 1] = (second[second.length - 1] ?? 0) ^ 0xff;
+      let pass = 0;
+      const chunks = () => {
+        const data = pass++ === 0 ? first : second;
+        return slice(data, 113)();
+      };
+      const oid = hashObject("blob", first);
+
+      expect(() => store.writeStream("blob", size, chunks)).toThrow(/stream changed after hashing/);
+      expect(store.has(oid)).toBe(false);
+      expect(
+        store.db.scalar<number>(
+          "SELECT COUNT(*) FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+          1,
+          oid,
+        ),
+      ).toBe(0);
+    }
+  });
+
+  it("rolls back a changed tree storage pass and its parsed index", () => {
+    const store = open();
+    const entries = Array.from({ length: 160 }, (_, index) => ({
+      mode: MODE_FILE,
+      name: `file-${String(index).padStart(3, "0")}.txt`,
+      oid: String(index).padStart(40, "0"),
+    }));
+    const first = serializeTree(entries);
+    const second = first.slice();
+    second[second.length - 1] = (second[second.length - 1] ?? 0) ^ 0xff;
+    expect(first.length).toBeGreaterThan(4_096);
+    let pass = 0;
+    const oid = hashObject("tree", first);
+
+    expect(() =>
+      store.writeStream("tree", first.length, () => [pass++ === 0 ? first : second]),
+    ).toThrow(/stream changed after hashing/);
+    expect(store.has(oid)).toBe(false);
+    expect(
+      store.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?",
+        1,
+        oid,
+      ),
+    ).toBe(0);
   });
 
   it("hashes the same way for any chunking", () => {

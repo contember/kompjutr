@@ -21,6 +21,9 @@ import {
 /** Bytes per `git_object_chunks` row. */
 const OBJECT_CHUNK = 1024 * 1024;
 
+/** Small loose objects cost more to deflate than storing their bytes directly. */
+const RAW_OBJECT_MAX = 4 * 1024;
+
 /** Deflate output chunk, and one row, for a streamed write. Smaller than
  *  OBJECT_CHUNK so a streamed object's peak is a chunk, not a megabyte. */
 const STREAM_CHUNK = 64 * 1024;
@@ -44,6 +47,9 @@ const DEFAULT_INDEX_PAGE = 512;
 
 /** Index mutations buffered before a batch is applied. */
 const DEFAULT_INDEX_FLUSH = 512;
+
+/** Bound JSON stays below the Durable Object SQLite 2 MiB value ceiling. */
+const INDEX_MUTATION_PAYLOAD = 1024 * 1024;
 
 const DEFAULT_OBJECT_CACHE_BYTES = 16 * 1024 * 1024;
 const TREE_WALK_STATE_BYTES = 8 * 1024 * 1024;
@@ -94,14 +100,14 @@ export interface IndexApplyOptions {
 }
 
 export interface ObjectBatchOptions {
-  /** Compressed bytes buffered before a flush, and the cap on one payload. */
+  /** Stored bytes buffered before a flush, and the cap on one payload. */
   payloadBytes?: number;
   /** Objects buffered before a flush. */
   flushEvery?: number;
 }
 
 /**
- * A bounded sink for loose object writes. `write` hashes and deflates, so
+ * A bounded sink for loose object writes. `write` hashes and encodes, so
  * the oid it returns is final, but no row exists until `flush`: a staged
  * object is invisible to `read`, `has` and `readChunks` until then.
  */
@@ -391,12 +397,15 @@ SELECT path, mode, oid,
     OR instr(ancestry, '/' || oid || '/') != 0
     OR (mode IN ('40000', '040000') AND descend != 1)`;
 
-/** One object staged in a batch, already hashed and deflated. */
+type LooseEncoding = "raw" | "zlib";
+
+/** One object staged in a batch, already hashed and encoded for storage. */
 interface StagedObject {
   oid: string;
   type: ObjectType;
   size: number;
-  compressed: Uint8Array;
+  stored: LooseEncoding;
+  storedData: Uint8Array;
   treeData?: Uint8Array;
 }
 
@@ -405,6 +414,85 @@ interface ChunkPayload {
   parts: Uint8Array[];
   length: number;
   rows: { o: string; q: number; a: number; n: number }[];
+}
+
+interface BufferedIndexMutation {
+  kind: "p" | "r";
+  json: string;
+  bytes: number;
+}
+
+function looseEncoding(size: number): LooseEncoding {
+  return size <= RAW_OBJECT_MAX ? "raw" : "zlib";
+}
+
+function encodeLoose(data: Uint8Array, stored: LooseEncoding): Uint8Array {
+  return stored === "raw" ? data : deflate(data);
+}
+
+function parseLooseEncoding(stored: string): LooseEncoding {
+  if (stored === "raw" || stored === "zlib") return stored;
+  throw new CorruptError(`loose object has unknown storage encoding '${stored}'`);
+}
+
+const JSON_ENCODER = new TextEncoder();
+
+function serializeIndexMutation(
+  item: IndexEntry | string,
+  sequence: number,
+): BufferedIndexMutation {
+  const kind = typeof item === "string" ? "r" : "p";
+  const json = JSON.stringify(
+    typeof item === "string"
+      ? { q: sequence, k: kind, p: item }
+      : {
+          q: sequence,
+          k: kind,
+          p: item.path,
+          g: item.stage,
+          m: item.mode,
+          o: item.oid,
+          s: item.size,
+          t: item.mtime,
+          i: item.ino,
+        },
+  );
+  return { kind, json, bytes: JSON_ENCODER.encode(json).byteLength };
+}
+
+class IndexMutationBuffer {
+  #pending: BufferedIndexMutation[] = [];
+  #bytes = 2;
+
+  constructor(
+    private readonly flushEvery: number,
+    private readonly apply: (pending: readonly BufferedIndexMutation[]) => void,
+  ) {}
+
+  add(item: IndexEntry | string): void {
+    let mutation = serializeIndexMutation(item, this.#pending.length);
+    const separator = this.#pending.length === 0 ? 0 : 1;
+    if (
+      this.#pending.length > 0 &&
+      this.#bytes + separator + mutation.bytes > INDEX_MUTATION_PAYLOAD
+    ) {
+      this.flush();
+      mutation = serializeIndexMutation(item, 0);
+    }
+    if (2 + mutation.bytes > INDEX_MUTATION_PAYLOAD) {
+      throw new GitError("E2BIG", "one index mutation exceeds the 1 MiB JSON batch limit");
+    }
+    this.#bytes += (this.#pending.length === 0 ? 0 : 1) + mutation.bytes;
+    this.#pending.push(mutation);
+    if (this.#pending.length >= this.flushEvery) this.flush();
+  }
+
+  flush(): void {
+    if (this.#pending.length === 0) return;
+    this.apply(this.#pending);
+    this.#pending = [];
+    this.#bytes = 2;
+  }
 }
 
 /** A bounded, ordered mutation sink over the index. */
@@ -616,7 +704,7 @@ export class RepoStore {
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {
     if (this.#hasLoose) {
       const row = this.#looseRow(oid);
-      if (row !== null) return row;
+      if (row !== null) return { type: row.type, size: row.size };
     }
     return this.#packs.typeAndSize(oid);
   }
@@ -656,14 +744,16 @@ export class RepoStore {
   write(type: ObjectType, data: Uint8Array): string {
     const oid = hashObject(type, data);
     if (this.has(oid)) return oid;
-    const compressed = deflate(data);
+    const stored = looseEncoding(data.length);
+    const storedData = encodeLoose(data, stored);
     this.#db.transactionSync(() => {
       this.#db.run(
-        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
         this.#repoId,
         oid,
         type,
         data.length,
+        stored,
       );
       this.#db.run(
         "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
@@ -672,16 +762,26 @@ export class RepoStore {
       );
       for (
         let seq = 0, offset = 0;
-        offset < compressed.length || seq === 0;
+        offset < storedData.length || seq === 0;
         seq++, offset += OBJECT_CHUNK
       ) {
-        this.#db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-          this.#repoId,
-          oid,
-          seq,
-          blob(compressed.subarray(offset, offset + OBJECT_CHUNK)),
-        );
+        const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
+        if (part.length === 0) {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, zeroblob(0))",
+            this.#repoId,
+            oid,
+            seq,
+          );
+        } else {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+            this.#repoId,
+            oid,
+            seq,
+            blob(part),
+          );
+        }
       }
       if (type === "tree") {
         indexTreeSource(
@@ -722,6 +822,68 @@ export class RepoStore {
     const oid = toHex(hash.digest());
     if (this.has(oid)) return oid;
 
+    const stored = looseEncoding(size);
+    if (stored === "raw") {
+      const data = new Uint8Array(size);
+      const storageHash = new Sha1().update(objectHeader(type, size));
+      let offset = 0;
+      for (const chunk of chunks()) {
+        if (offset + chunk.length > size) {
+          throw new CorruptError(`stream changed after hashing ${oid}`);
+        }
+        data.set(chunk, offset);
+        storageHash.update(chunk);
+        offset += chunk.length;
+      }
+      if (offset !== size) throw new CorruptError(`stream changed after hashing ${oid}`);
+      if (toHex(storageHash.digest()) !== oid) {
+        throw new CorruptError(`stream changed after hashing ${oid}`);
+      }
+      this.#db.transactionSync(() => {
+        this.#db.run(
+          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
+          this.#repoId,
+          oid,
+          type,
+          size,
+        );
+        this.#db.run(
+          "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+          this.#repoId,
+          oid,
+        );
+        if (data.length === 0) {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
+            this.#repoId,
+            oid,
+          );
+        } else {
+          this.#db.run(
+            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+            this.#repoId,
+            oid,
+            blob(data),
+          );
+        }
+        if (type === "tree") {
+          indexTreeSource(
+            this.#db,
+            {
+              repoId: this.#repoId,
+              treeOid: oid,
+              storage: "loose",
+              sourceId: 0,
+              objectSize: size,
+            },
+            [data],
+          );
+        }
+      });
+      this.#hasLoose = true;
+      return oid;
+    }
+
     const rows: Uint8Array[] = [];
     const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
     deflate.onData = (chunk) => {
@@ -732,7 +894,7 @@ export class RepoStore {
 
     this.#db.transactionSync(() => {
       this.#db.run(
-        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size) VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
         this.#repoId,
         oid,
         type,
@@ -756,24 +918,26 @@ export class RepoStore {
         }
         rows.length = 0;
       };
-      for (const chunk of chunks()) {
-        deflate.push(chunk, false);
+      const storageChunks = function* (): Generator<Uint8Array> {
+        const storageHash = new Sha1().update(objectHeader(type, size));
+        let streamed = 0;
+        for (const chunk of chunks()) {
+          streamed += chunk.length;
+          if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
+          storageHash.update(chunk);
+          deflate.push(chunk, false);
+          if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+          drain();
+          yield chunk;
+        }
+        deflate.push(new Uint8Array(0), true);
         if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
         drain();
-      }
-      deflate.push(new Uint8Array(0), true);
-      if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
-      drain();
-      // An empty object still deserves one row, matching `write`.
-      if (seq === 0) {
-        this.#db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-          this.#repoId,
-          oid,
-          0,
-          blob(new Uint8Array(0)),
-        );
-      }
+        if (streamed !== size || toHex(storageHash.digest()) !== oid) {
+          throw new CorruptError(`stream changed after hashing ${oid}`);
+        }
+      };
+      const storage = storageChunks();
       if (type === "tree") {
         indexTreeSource(
           this.#db,
@@ -784,7 +948,21 @@ export class RepoStore {
             sourceId: 0,
             objectSize: size,
           },
-          chunks(),
+          storage,
+        );
+      } else {
+        for (const _chunk of storage) {
+          // Storage and hashing advance together without retaining the object.
+        }
+      }
+      // An empty object still deserves one row, matching `write`.
+      if (seq === 0) {
+        this.#db.run(
+          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+          this.#repoId,
+          oid,
+          0,
+          blob(new Uint8Array(0)),
         );
       }
     });
@@ -817,11 +995,15 @@ export class RepoStore {
       write: (type: ObjectType, data: Uint8Array): string => {
         const oid = hashObject(type, data);
         if (staged.has(oid)) return oid;
-        const compressed = deflate(data);
-        const object: StagedObject = { oid, type, size: data.length, compressed };
-        if (type === "tree") object.treeData = data;
+        const stored = looseEncoding(data.length);
+        const storedData = stored === "raw" ? data.slice() : encodeLoose(data, stored);
+        const object: StagedObject = { oid, type, size: data.length, stored, storedData };
+        if (type === "tree") object.treeData = stored === "raw" ? storedData : data.slice();
         staged.set(oid, object);
-        bytes += compressed.length;
+        bytes += storedData.length;
+        if (object.treeData !== undefined && object.treeData !== storedData) {
+          bytes += object.treeData.length;
+        }
         // After staging, never before: an object's chunks and its metadata
         // row have to land in the same flush, whatever its size.
         if (bytes >= payloadBytes || staged.size >= flushEvery) flush();
@@ -842,14 +1024,14 @@ export class RepoStore {
   #flushObjects(staged: StagedObject[], payloadBytes: number): void {
     const byOid = new Map(staged.map((object) => [object.oid, object]));
     const meta = JSON.stringify(
-      staged.map((object) => ({ o: object.oid, t: object.type, s: object.size })),
+      staged.map((object) => ({ o: object.oid, t: object.type, s: object.size, e: object.stored })),
     );
     this.#db.transactionSync(() => {
       const fresh: StagedObject[] = [];
       for (const row of this.#db.iterate(
         `INSERT INTO git_objects (repo_id, oid, type, size, stored)
          SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.t'),
-                json_extract(j.value, '$.s'), 'zlib'
+                json_extract(j.value, '$.s'), json_extract(j.value, '$.e')
            FROM json_each(?) j
           WHERE true
          ON CONFLICT(repo_id, oid) DO NOTHING
@@ -870,13 +1052,13 @@ export class RepoStore {
 
       const payloads: ChunkPayload[] = [{ parts: [], length: 0, rows: [] }];
       for (const object of fresh) {
-        const compressed = object.compressed;
+        const storedData = object.storedData;
         for (
           let seq = 0, offset = 0;
-          offset < compressed.length || seq === 0;
+          offset < storedData.length || seq === 0;
           seq++, offset += OBJECT_CHUNK
         ) {
-          const part = compressed.subarray(offset, offset + OBJECT_CHUNK);
+          const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
           let current = payloads[payloads.length - 1]!;
           if (current.length > 0 && current.length + part.length > payloadBytes) {
             current = { parts: [], length: 0, rows: [] };
@@ -901,7 +1083,9 @@ export class RepoStore {
         this.#db.run(
           `INSERT INTO git_object_chunks (repo_id, oid, seq, data)
            SELECT ?, json_extract(j.value, '$.o'), json_extract(j.value, '$.q'),
-                  substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.n'))
+                  CASE WHEN json_extract(j.value, '$.n') = 0 THEN zeroblob(0)
+                       ELSE substr(?, json_extract(j.value, '$.a'), json_extract(j.value, '$.n'))
+                   END
              FROM json_each(?) j
             WHERE true
            ON CONFLICT(repo_id, oid, seq) DO UPDATE SET data = excluded.data`,
@@ -939,12 +1123,27 @@ export class RepoStore {
   readChunks(oid: string): Iterable<Uint8Array> | null {
     const cached = this.#objects.get(`loose:${oid}`);
     if (cached !== undefined) return [cached.data];
-    if (this.#hasLoose && this.#looseRow(oid) !== null) return this.#looseChunks(oid);
+    if (this.#hasLoose) {
+      const row = this.#looseRow(oid);
+      if (row !== null) return this.#looseChunks(oid, parseLooseEncoding(row.stored));
+    }
     const packed = this.#packs.read(oid);
     return packed === null ? null : [packed.data];
   }
 
-  *#looseChunks(oid: string): Generator<Uint8Array> {
+  *#looseChunks(oid: string, stored: LooseEncoding): Generator<Uint8Array> {
+    if (stored === "raw") {
+      for (let seq = 0; ; seq++) {
+        const row = this.#db.one<{ data: unknown }>(
+          "SELECT data FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq = ?",
+          this.#repoId,
+          oid,
+          seq,
+        );
+        if (row === undefined) return;
+        yield readBlob(row.data);
+      }
+    }
     const ready: Uint8Array[] = [];
     const stream = new InflateStream((chunk) => ready.push(chunk));
     for (let seq = 0; ; seq++) {
@@ -995,10 +1194,10 @@ export class RepoStore {
     return loose + this.#packs.count();
   }
 
-  #looseRow(oid: string): { type: ObjectType; size: number } | null {
+  #looseRow(oid: string): { type: ObjectType; size: number; stored: string } | null {
     return (
-      this.#db.one<{ type: ObjectType; size: number }>(
-        "SELECT type, size FROM git_objects WHERE repo_id = ? AND oid = ?",
+      this.#db.one<{ type: ObjectType; size: number; stored: string }>(
+        "SELECT type, size, stored FROM git_objects WHERE repo_id = ? AND oid = ?",
         this.#repoId,
         oid,
       ) ?? null
@@ -1016,7 +1215,10 @@ export class RepoStore {
     );
     const object: RawObject = {
       type: row.type,
-      data: inflate(concat(chunks.map((chunk) => readBlob(chunk.data)))),
+      data:
+        parseLooseEncoding(row.stored) === "raw"
+          ? concat(chunks.map((chunk) => readBlob(chunk.data)))
+          : inflate(concat(chunks.map((chunk) => readBlob(chunk.data)))),
     };
     this.#objects.set(`loose:${oid}`, object);
     return object;
@@ -1190,29 +1392,77 @@ export class RepoStore {
     this.#db.run("DELETE FROM git_index WHERE repo_id = ?", this.#repoId);
   }
 
+  #applyIndexMutations(pending: readonly BufferedIndexMutation[]): void {
+    // Delete touched paths first, then retain only puts after their last remove.
+    const hasRemoves = pending.some((item) => item.kind === "r");
+    const hasPuts = pending.some((item) => item.kind === "p");
+    const mutations = `[${pending.map((item) => item.json).join(",")}]`;
+    if (hasRemoves) {
+      this.#db.run(
+        `DELETE FROM git_index
+          WHERE repo_id = ?
+            AND path IN (
+              SELECT json_extract(value, '$.p') FROM json_each(?)
+               WHERE json_extract(value, '$.k') = 'r'
+            )`,
+        this.#repoId,
+        mutations,
+      );
+    }
+    if (!hasPuts) return;
+    this.#db.run(
+      `WITH mutation AS (
+         SELECT CAST(j.key AS INTEGER) AS q,
+                json_extract(j.value, '$.k') AS kind,
+                json_extract(j.value, '$.p') AS path,
+                json_extract(j.value, '$.g') AS stage,
+                json_extract(j.value, '$.m') AS mode,
+                json_extract(j.value, '$.o') AS oid,
+                json_extract(j.value, '$.s') AS size,
+                json_extract(j.value, '$.t') AS mtime,
+                json_extract(j.value, '$.i') AS ino
+           FROM json_each(?) j
+       ), ranked AS (
+         SELECT mutation.*,
+                max(CASE WHEN kind = 'r' THEN q ELSE -1 END)
+                  OVER (PARTITION BY path) AS last_remove,
+                max(CASE WHEN kind = 'p' THEN q ELSE -1 END)
+                  OVER (PARTITION BY path, stage) AS last_put
+           FROM mutation
+       )
+       INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino)
+       SELECT ?, current.path, current.stage, current.mode, current.oid,
+              current.size, current.mtime, current.ino
+         FROM ranked current
+        WHERE current.kind = 'p'
+          AND current.q = current.last_put
+          AND current.q > current.last_remove
+        ORDER BY current.q
+       ON CONFLICT(repo_id, path, stage) DO UPDATE SET
+         mode = excluded.mode, oid = excluded.oid, size = excluded.size,
+         mtime = excluded.mtime, ino = excluded.ino`,
+      mutations,
+      this.#repoId,
+    );
+  }
+
   /**
    * Replace the whole index from a stream. Bounded by the flush size, not by
    * the length of `entries`, so a full reset never materialises the tree.
    */
   indexReplace(entries: Iterable<IndexEntry>, options: IndexApplyOptions = {}): void {
     const flushEvery = options.flushEvery ?? DEFAULT_INDEX_FLUSH;
-    const pending: IndexEntry[] = [];
-    const flush = (clear: boolean): void => {
-      if (!clear && pending.length === 0) return;
-      this.#db.transactionSync(() => {
-        if (clear) this.indexClear();
-        for (const entry of pending) this.indexPut(entry);
-      });
-      pending.length = 0;
-    };
     let first = true;
-    for (const entry of entries) {
-      pending.push(entry);
-      if (pending.length < flushEvery) continue;
-      flush(first);
+    const pending = new IndexMutationBuffer(flushEvery, (mutations) => {
+      this.#db.transactionSync(() => {
+        if (first) this.indexClear();
+        this.#applyIndexMutations(mutations);
+      });
       first = false;
-    }
-    flush(first);
+    });
+    for (const entry of entries) pending.add(entry);
+    pending.flush();
+    if (first) this.#db.transactionSync(() => this.indexClear());
   }
 
   /**
@@ -1276,26 +1526,18 @@ export class RepoStore {
    */
   indexApply<T>(body: (sink: IndexSink) => T, options: IndexApplyOptions = {}): T {
     const flushEvery = options.flushEvery ?? DEFAULT_INDEX_FLUSH;
-    // One ordered list, not a put list and a remove list: a caller that
-    // removes a path and then re-puts it must get that order back.
-    const pending: (IndexEntry | string)[] = [];
-    const flush = (): void => {
-      if (pending.length === 0) return;
+    const pending = new IndexMutationBuffer(flushEvery, (mutations) => {
       this.#db.transactionSync(() => {
-        for (const item of pending) {
-          if (typeof item === "string") this.indexRemove(item);
-          else this.indexPut(item);
-        }
+        this.#applyIndexMutations(mutations);
       });
-      pending.length = 0;
+    });
+    const sink: IndexSink = {
+      put: (entry) => pending.add(entry),
+      remove: (path) => pending.add(path),
+      flush: () => pending.flush(),
     };
-    const record = (item: IndexEntry | string): void => {
-      pending.push(item);
-      if (pending.length >= flushEvery) flush();
-    };
-    const sink: IndexSink = { put: record, remove: record, flush };
     const result = body(sink);
-    flush();
+    pending.flush();
     return result;
   }
 

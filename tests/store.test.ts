@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { deflate } from "../src/core/zlib.js";
+import { readBlob } from "../src/sqlite/db.js";
 import { ancestors, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
@@ -83,6 +85,26 @@ describe("loose objects", () => {
     expect(store.read(oid)?.data).toEqual(data);
   });
 
+  it("stores objects through the exact 4 KiB raw boundary", () => {
+    const { store } = open();
+    for (const size of [0, 1, 4_095, 4_096, 4_097]) {
+      const data = new Uint8Array(randomBytes(size));
+      const oid = store.write("blob", data);
+      const row = store.db.one<{ stored: string; data: unknown }>(
+        `SELECT o.stored, c.data FROM git_objects o
+          JOIN git_object_chunks c ON c.repo_id = o.repo_id AND c.oid = o.oid
+         WHERE o.repo_id = ? AND o.oid = ? AND c.seq = 0`,
+        1,
+        oid,
+      );
+      if (row === undefined) throw new Error(`missing loose row for ${oid}`);
+      expect(row.stored).toBe(size <= 4_096 ? "raw" : "zlib");
+      if (size <= 4_096) expect(readBlob(row.data)).toEqual(data);
+      expect(oid).toBe(hashObject("blob", data));
+      expect(store.read(oid)?.data).toEqual(data);
+    }
+  });
+
   it("chunks objects larger than one row", () => {
     const { store } = open();
     const data = new Uint8Array(randomBytes(3_500_000));
@@ -120,6 +142,22 @@ describe("effective tree sources", () => {
 
     expect(effective(db, 1, firstOid)).toEqual({ storage: "loose", source_id: 0 });
     expect(effective(db, 1, secondOid)).toEqual({ storage: "loose", source_id: 0 });
+  });
+
+  it("indexes a raw tree written through the streaming path", () => {
+    const { db, store } = open();
+    const data = serializeTree([{ mode: MODE_FILE, name: "streamed", oid: "3".repeat(40) }]);
+    const oid = store.writeStream("tree", data.length, function* () {
+      yield data.subarray(0, 7);
+      yield data.subarray(7);
+    });
+
+    expect(
+      db.scalar<string>("SELECT stored FROM git_objects WHERE repo_id = ? AND oid = ?", 1, oid),
+    ).toBe("raw");
+    expect([...store.walkTree(oid)]).toEqual([
+      { path: "streamed", mode: MODE_FILE, oid: "3".repeat(40) },
+    ]);
   });
 
   it("removes stale parsed rows before rewriting a deleted loose tree", () => {
@@ -180,6 +218,8 @@ describe("object batches", () => {
     const shapes: Uint8Array[] = [
       new Uint8Array(0),
       utf8.encode("a tree entry or two\n"),
+      new Uint8Array(randomBytes(4_096)),
+      new Uint8Array(randomBytes(4_097)),
       // Random, so it neither compresses nor fits in one 1 MiB chunk row.
       new Uint8Array(randomBytes(3_500_000)),
       new Uint8Array(randomBytes(200_000)),
@@ -196,10 +236,61 @@ describe("object batches", () => {
       expect(oid).toBe(hashObject("blob", data));
       expect(store.has(oid)).toBe(true);
       expect(store.typeAndSize(oid)).toEqual({ type: "blob", size: data.length });
+      expect(
+        store.db.scalar<string>(
+          "SELECT stored FROM git_objects WHERE repo_id = ? AND oid = ?",
+          1,
+          oid,
+        ),
+      ).toBe(data.length <= 4_096 ? "raw" : "zlib");
       same(store.read(oid)?.data ?? new Uint8Array(1), data);
       same(concat([...(store.readChunks(oid) ?? [])]), data);
     });
-    expect(chunkCount(store, oids[2]!)).toBeGreaterThan(1);
+    expect(chunkCount(store, oids[4]!)).toBeGreaterThan(1);
+  });
+
+  it("stores empty blobs and trees as one non-null raw BLOB chunk", () => {
+    const { store } = open();
+    const empty = new Uint8Array(0);
+    const [blobOid, treeOid] = store.writeObjects((batch) => [
+      batch.write("blob", empty),
+      batch.write("tree", empty),
+    ]);
+
+    const objects: { type: "blob" | "tree"; oid: string | undefined }[] = [
+      { type: "blob", oid: blobOid },
+      { type: "tree", oid: treeOid },
+    ];
+    for (const { type, oid } of objects) {
+      if (oid === undefined) throw new Error(`missing empty ${type} oid`);
+      expect(oid).toBe(hashObject(type, empty));
+      expect(
+        store.db.scalar<string>(
+          "SELECT stored FROM git_objects WHERE repo_id = ? AND oid = ?",
+          1,
+          oid,
+        ),
+      ).toBe("raw");
+      expect(
+        store.db.one<{ seq: number; dataType: string; bytes: number }>(
+          `SELECT seq, typeof(data) AS dataType, length(data) AS bytes
+             FROM git_object_chunks WHERE repo_id = ? AND oid = ?`,
+          1,
+          oid,
+        ),
+      ).toEqual({ seq: 0, dataType: "blob", bytes: 0 });
+      expect(store.read(oid)).toEqual({ type, data: empty });
+    }
+
+    if (treeOid === undefined) throw new Error("missing empty tree oid");
+    expect(
+      store.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = ? AND tree_oid = ?",
+        1,
+        treeOid,
+      ),
+    ).toBe(1);
+    expect([...store.walkTree(treeOid)]).toEqual([]);
   });
 
   it("stages an object without writing a row until it is flushed", () => {
@@ -213,6 +304,52 @@ describe("object batches", () => {
     batch.flush();
     expect(store.has(oid)).toBe(true);
     expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it("owns raw and zlib blob bytes before the caller can mutate them", () => {
+    const { store } = open();
+    const inputs = [new Uint8Array(randomBytes(4_096)), new Uint8Array(randomBytes(4_097))];
+    const expected = inputs.map((data) => data.slice());
+    const batch = store.writeBatch();
+    const oids = inputs.map((data) => batch.write("blob", data));
+    for (const data of inputs) data.fill(0);
+    batch.flush();
+
+    expected.forEach((data, index) => {
+      const oid = oids[index];
+      if (oid === undefined) throw new Error(`missing oid ${index}`);
+      expect(oid).toBe(hashObject("blob", data));
+      expect(store.read(oid)?.data).toEqual(data);
+    });
+  });
+
+  it("owns raw and zlib tree bytes used by the parsed index", () => {
+    const { store } = open();
+    const rawEntries = [{ mode: MODE_FILE, name: "raw", oid: "1".repeat(40) }];
+    const zlibEntries = Array.from({ length: 160 }, (_, index) => ({
+      mode: MODE_FILE,
+      name: `file-${String(index).padStart(3, "0")}.txt`,
+      oid: String(index).padStart(40, "0"),
+    }));
+    const raw = serializeTree(rawEntries);
+    const zlib = serializeTree(zlibEntries);
+    const rawExpected = raw.slice();
+    const zlibExpected = zlib.slice();
+    expect(raw.length).toBeLessThanOrEqual(4_096);
+    expect(zlib.length).toBeGreaterThan(4_096);
+    const batch = store.writeBatch();
+    const rawOid = batch.write("tree", raw);
+    const zlibOid = batch.write("tree", zlib);
+    raw.fill(0);
+    zlib.fill(0);
+    batch.flush();
+
+    expect(store.read(rawOid)?.data).toEqual(rawExpected);
+    expect(store.read(zlibOid)?.data).toEqual(zlibExpected);
+    expect([...store.walkTree(rawOid)].map((row) => row.path)).toEqual(["raw"]);
+    expect([...store.walkTree(zlibOid)].map((row) => row.path)).toEqual(
+      zlibEntries.map((row) => row.name),
+    );
   });
 
   it("removes the chunks a shorter write of the same oid does not reach", () => {
@@ -246,6 +383,30 @@ describe("object batches", () => {
     const before = written();
     store.writeObjects((batch) => batch.write("blob", data));
     expect(written()).toBe(before);
+    expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it("does not rewrite an existing small legacy-zlib object as raw", () => {
+    const { store } = open();
+    const data = utf8.encode("legacy compressed bytes\n");
+    const oid = store.writeObjects((batch) => batch.write("blob", data));
+    store.db.run("UPDATE git_objects SET stored = 'zlib' WHERE repo_id = ? AND oid = ?", 1, oid);
+    store.db.run(
+      "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
+      deflate(data),
+      1,
+      oid,
+    );
+
+    store.writeObjects((batch) => batch.write("blob", data));
+
+    expect(
+      store.db.scalar<string>(
+        "SELECT stored FROM git_objects WHERE repo_id = ? AND oid = ?",
+        1,
+        oid,
+      ),
+    ).toBe("zlib");
     expect(store.read(oid)?.data).toEqual(data);
   });
 });
