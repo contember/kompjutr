@@ -73,6 +73,54 @@ describe("the content predicate", () => {
   });
 });
 
+describe("excluding binary files", () => {
+  it("drops a file holding a NUL byte", () => {
+    const { fs } = open();
+    fs.writeFiles([
+      { path: "/repo/text.ts", bytes: ENCODER.encode("NEEDLE\n") },
+      { path: "/repo/bin.ts", bytes: new Uint8Array([78, 69, 69, 68, 76, 69, 0, 9]) },
+    ]);
+    const root = fs.realpath("/repo");
+    const needle = ENCODER.encode("NEEDLE");
+
+    const all = fs.discoverFilesContaining(root, "*.ts", needle);
+    expect(paths(all.matched)).toEqual(["/repo/bin.ts", "/repo/text.ts"]);
+
+    const text = fs.discoverFilesContaining(root, "*.ts", needle, { excludeBinary: true });
+    expect(paths(text.matched)).toEqual(["/repo/text.ts"]);
+  });
+
+  it("still costs one statement", () => {
+    const { fs, storage } = open();
+    fs.writeFiles(
+      Array.from({ length: 500 }, (_, index) => ({
+        path: `/repo/f${String(index).padStart(4, "0")}.ts`,
+        bytes: ENCODER.encode(`NEEDLE ${index}\n`),
+      })),
+    );
+    const root = fs.realpath("/repo");
+    const before = storage.statementCount;
+    fs.discoverFilesContaining(root, "*.ts", ENCODER.encode("NEEDLE"), { excludeBinary: true });
+    expect(storage.statementCount - before).toBe(1);
+  });
+
+  it("leaves a multi-chunk file undecided rather than guessing", () => {
+    // The NUL could be in any chunk, and so could the needle. Reading is
+    // the caller's job either way.
+    const { fs } = open();
+    const body = new Uint8Array(CHUNK_SIZE + 16);
+    body.set(ENCODER.encode("NEEDLE"), 0);
+    fs.writeFiles([{ path: "/repo/big.ts", bytes: body }]);
+    const page = fs.discoverFilesContaining(
+      fs.realpath("/repo"),
+      "*.ts",
+      ENCODER.encode("NEEDLE"),
+      { excludeBinary: true },
+    );
+    expect(paths(page.undecided)).toEqual(["/repo/big.ts"]);
+  });
+});
+
 describe("the case SQL cannot decide", () => {
   it("reports a multi-chunk file as undecided rather than dropping it", () => {
     const { fs } = open();

@@ -38,12 +38,22 @@ export const NEEDLE_MAX_BYTES = 1024;
  * a chunk that does not contain the needle proves the file does not either.
  * Anything larger is reported undecided and the caller reads it.
  */
-const SEARCH_SQL = `SELECT fs_paths.path AS path,
+function searchSql(excludeBinary: boolean): string {
+  // `X'00'` is a one-byte blob, and `instr` over two blobs is a byte search,
+  // so this is the same NUL test the isolate would run — one row earlier.
+  const binary = excludeBinary
+    ? `,
+       max(CASE WHEN instr(fs_chunks.bytes, X'00') > 0 THEN 1 ELSE 0 END) AS nul`
+    : "";
+  const having = excludeBinary
+    ? "(hit = 1 AND nul = 0) OR single_chunk = 0"
+    : "hit = 1 OR single_chunk = 0";
+  return `SELECT fs_paths.path AS path,
        fs_paths.inode AS inode,
        fs_nodes.size AS size,
        fs_nodes.rev AS rev,
        CASE WHEN fs_nodes.size <= ? THEN 1 ELSE 0 END AS single_chunk,
-       max(CASE WHEN instr(fs_chunks.bytes, ?) > 0 THEN 1 ELSE 0 END) AS hit
+       max(CASE WHEN instr(fs_chunks.bytes, ?) > 0 THEN 1 ELSE 0 END) AS hit${binary}
   FROM fs_paths
   JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode
   LEFT JOIN fs_chunks ON fs_chunks.inode = fs_paths.inode
@@ -51,9 +61,15 @@ const SEARCH_SQL = `SELECT fs_paths.path AS path,
    AND fs_paths.path GLOB ?
    AND fs_nodes.type = 'file'
  GROUP BY fs_paths.path, fs_paths.inode, fs_nodes.size, fs_nodes.rev
-HAVING hit = 1 OR single_chunk = 0
+HAVING ${having}
  ORDER BY fs_paths.path
  LIMIT ?`;
+}
+
+// Two statements rather than one that always computes the NUL aggregate:
+// the extra `instr` per chunk is only worth paying when the caller asked.
+const SEARCH_SQL = searchSql(false);
+const SEARCH_SQL_TEXT_ONLY = searchSql(true);
 
 interface SearchRow {
   path: RealPath;
@@ -93,7 +109,8 @@ export function discoverFilesContaining(
   const after =
     options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
 
-  const rows = db.all<SearchRow>(SEARCH_SQL, CHUNK_SIZE, needle, after, upper, pattern, limit + 1);
+  const sql = options.excludeBinary === true ? SEARCH_SQL_TEXT_ONLY : SEARCH_SQL;
+  const rows = db.all<SearchRow>(sql, CHUNK_SIZE, needle, after, upper, pattern, limit + 1);
 
   const page = rows.slice(0, limit);
   const matched: RegularFileHandle[] = [];

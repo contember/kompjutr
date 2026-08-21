@@ -97,6 +97,13 @@ export interface ContentSearchOptions {
   after?: RealPath;
   /** Defaults to 1,000 and cannot exceed 1,000. */
   limit?: number;
+  /**
+   * Drop files holding a NUL byte, the way a search that walks a tree skips
+   * binaries. Decided in SQL for the same reason the needle is: a caller
+   * that had to read each file to find out would give the push-down back.
+   * Only settles single-chunk files; larger ones stay `undecided`.
+   */
+  excludeBinary?: boolean;
 }
 
 export interface ContentSearchPage {
