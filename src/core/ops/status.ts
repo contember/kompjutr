@@ -6,25 +6,70 @@
 // repeated status over an untouched tree therefore reads no file content
 // at all.
 
-import type { IndexEntry } from "../../sqlite/store.js";
+import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import { ZERO_OID } from "../bytes.js";
+import { GitError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
-import { joinPath } from "../paths.js";
+import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted3 } from "../streams.js";
+import { comparePaths, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { matchesPaths, stageZero, type TargetEntry, treeEntries } from "./checkout.js";
+import { matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
 import { treeStream } from "./tree-stream.js";
 import {
   hashWorktreePath,
+  hashWorktreePaths,
   indexMatchesStat,
+  type WorktreePath,
   walkWorktree,
+  walkWorktreeEntriesStream,
   walkWorktreeStream,
 } from "./worktree-io.js";
 
 /** A mode column in porcelain v2, and the mode of an absent side. */
 const ABSENT_MODE = "000000";
+
+/** Retained index, directory and tracked-path state for one status call. */
+export const STATUS_RETAINED_BYTES = 16 * 1024 * 1024;
+const STATUS_WINDOW_ROWS = 1000;
+const INDEX_ENTRY_FIXED_BYTES = 256;
+const DIRECTORY_FIXED_BYTES = 96;
+const SET_ENTRY_BYTES = 48;
+
+interface StatusIndexSnapshot {
+  entries: IndexEntry[];
+  trackedDirs: Set<string>;
+  trackedPaths: Set<string>;
+  budget: RetainedStatusBudget;
+}
+
+class RetainedStatusBudget {
+  #bytes = 0;
+
+  constructor(private readonly limit: number) {}
+
+  add(bytes: number): void {
+    if (bytes > this.limit - this.#bytes) {
+      throw new GitError("E2BIG", `status retained state exceeds ${this.limit} bytes`);
+    }
+    this.#bytes += bytes;
+  }
+}
+
+interface PendingTrackedRow {
+  path: string;
+  headMode: string;
+  indexMode: string;
+  worktree: WorktreePath;
+  headOid: string;
+  indexOid: string;
+  staged: StatusEntry["index"];
+}
+
+type BufferedStatusRow =
+  | { kind: "ready"; detail: StatusDetail }
+  | { kind: "hash"; tracked: PendingTrackedRow };
 
 /**
  * A `StatusEntry` plus the columns porcelain v2 prints. `status` returns
@@ -65,7 +110,7 @@ export function status(
   // Sorted over the rows, which is the output — a collapsed `dir/` entry
   // does not sort where the file that produced it did.
   return [...statusStream(repo, worktree, options)].sort((left, right) =>
-    left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+    comparePaths(left.path, right.path),
   );
 }
 
@@ -84,60 +129,71 @@ export function* statusStream(
   options: StatusOptions = {},
 ): Generator<StatusDetail> {
   const collapse = (options.untrackedFiles ?? "normal") === "normal";
-  const trackedDirs = collapse ? trackedDirectories(repo) : new Set<string>();
-  const tracked = new Set<string>();
+  const snapshot = snapshotStatusIndex(repo, collapse);
+  const ignores = options.ignores ?? loadIgnoreMatcher(worktree, repo.root);
+  const excluded = excludedRoots(repo.root, options.excludeRoots);
+  const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
+  const buffered: BufferedStatusRow[] = [];
+  let sourceRows = 0;
   let collapsed: string | null = null;
 
   for (const row of joinSorted3(
     treeStream(repo, repo.headTree()),
-    stageZero(repo.store.indexScan()),
-    worktreeFiles(repo, worktree, options),
-    { a: (entry) => entry.path, b: (entry) => entry.path, c: (path: string) => path },
+    snapshot.entries,
+    worktreeEntries(repo, worktree, options, ignores, prunable),
+    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
+    sourceRows++;
     if (row.a !== undefined || row.b !== undefined) {
-      tracked.add(row.path);
+      retainTrackedPath(snapshot, row.path);
       if (matchesPaths(row.path, options.paths)) {
-        const detail = trackedRow(repo, worktree, row.path, row.a, row.b);
-        if (detail !== null) yield detail;
+        const detail = trackedRow(row.path, row.a, row.b, row.c);
+        if (detail !== null) buffered.push(detail);
       }
       // A tracked path is never also untracked, whatever is on disk.
-      continue;
-    }
-    if (row.c === undefined) continue;
-
-    let path = row.path;
-    if (collapse) {
-      if (collapsed !== null && path.startsWith(`${collapsed}/`)) continue;
-      const directory = shallowestUntrackedDirectory(path, trackedDirs);
-      if (directory !== null && matchesPaths(directory, options.paths)) {
-        collapsed = directory;
-        path = `${directory}/`;
+    } else if (
+      row.c !== undefined &&
+      !isExcluded(row.path, excluded) &&
+      (options.includeIgnored === true || !ignores.ignores(row.path, false))
+    ) {
+      let path = row.path;
+      if (collapse) {
+        if (collapsed !== null && path.startsWith(`${collapsed}/`)) {
+          if (sourceRows >= STATUS_WINDOW_ROWS) {
+            yield* flushStatusRows(repo, worktree, buffered);
+            sourceRows = 0;
+          }
+          continue;
+        }
+        const directory = shallowestUntrackedDirectory(path, snapshot.trackedDirs);
+        if (directory !== null && matchesPaths(directory, options.paths)) {
+          collapsed = directory;
+          path = `${directory}/`;
+        }
+      }
+      if (
+        (matchesPaths(path, options.paths) || matchesPaths(row.path, options.paths)) &&
+        // A tracked file replaced by a directory is a deletion, not a new directory.
+        !snapshot.trackedPaths.has(stripSlash(path))
+      ) {
+        buffered.push({ kind: "ready", detail: untrackedRow(path) });
       }
     }
-    if (!matchesPaths(path, options.paths) && !matchesPaths(row.path, options.paths)) continue;
-    // git hides an untracked entry that names an index path — a tracked file
-    // replaced by a directory is a deletion, not a new directory.
-    if (tracked.has(stripSlash(path))) continue;
-    yield {
-      path,
-      index: " ",
-      worktree: "?",
-      headMode: ABSENT_MODE,
-      indexMode: ABSENT_MODE,
-      worktreeMode: ABSENT_MODE,
-      headOid: ZERO_OID,
-      indexOid: ZERO_OID,
-    };
+
+    if (sourceRows >= STATUS_WINDOW_ROWS) {
+      yield* flushStatusRows(repo, worktree, buffered);
+      sourceRows = 0;
+    }
   }
+  yield* flushStatusRows(repo, worktree, buffered);
 }
 
 function trackedRow(
-  repo: Repository,
-  worktree: Worktree,
   path: string,
   head: TargetEntry | undefined,
   entry: IndexEntry | undefined,
-): StatusDetail | null {
+  worktree: WorktreePath | undefined,
+): BufferedStatusRow | null {
   const headMode = head?.mode ?? ABSENT_MODE;
   const headOid = head?.oid ?? ZERO_OID;
   const indexMode = entry === undefined ? ABSENT_MODE : octalMode(entry.mode);
@@ -148,40 +204,129 @@ function trackedRow(
   else if (entry === undefined) staged = "D";
   else if (head.oid !== entry.oid || head.mode !== indexMode) staged = "M";
 
-  const { code, mode } = worktreeState(repo, worktree, path, entry);
+  const state = worktreeState(entry, worktree, {
+    path,
+    headMode,
+    indexMode,
+    headOid,
+    indexOid,
+    staged,
+  });
+  if (state.kind === "hash") return state;
+  const { code, mode } = state;
   if (staged === " " && code === " ") return null;
+  return {
+    kind: "ready",
+    detail: statusDetail(path, staged, code, headMode, indexMode, mode, headOid, indexOid),
+  };
+}
+
+/** The working-tree half of a tracked path, hashing only when it must. */
+function worktreeState(
+  entry: IndexEntry | undefined,
+  worktree: WorktreePath | undefined,
+  pending: Omit<PendingTrackedRow, "worktree">,
+):
+  | { kind: "ready"; code: StatusEntry["worktree"]; mode: string }
+  | { kind: "hash"; tracked: PendingTrackedRow } {
+  // Not in the index: the file, if any, shows up as untracked instead.
+  if (entry === undefined) return { kind: "ready", code: " ", mode: ABSENT_MODE };
+  // Submodules are out of scope; nothing on disk describes their state.
+  if (entry.mode === 0o160000) {
+    return { kind: "ready", code: " ", mode: octalMode(entry.mode) };
+  }
+
+  if (worktree === undefined) return { kind: "ready", code: "D", mode: ABSENT_MODE };
+  const mode = gitModeFor(worktree.stat);
+  if (indexMatchesStat(entry, worktree.stat)) return { kind: "ready", code: " ", mode };
+  return { kind: "hash", tracked: { ...pending, worktree } };
+}
+
+function* flushStatusRows(
+  repo: Repository,
+  worktree: Worktree,
+  buffered: BufferedStatusRow[],
+): Generator<StatusDetail> {
+  if (buffered.length === 0) return;
+  const rows = buffered.splice(0);
+  const pending = rows.flatMap((row) => (row.kind === "hash" ? [row.tracked] : []));
+  const mapped = repo.store.lookupBlobIds(
+    pending.flatMap((row) => {
+      const contentId = row.worktree.stat.contentId;
+      return contentId === null || row.worktree.stat.type === "dir" ? [] : [contentId];
+    }),
+  );
+  const mappedOids = new Map<string, string>();
+  const unresolved: WorktreePath[] = [];
+  for (const row of pending) {
+    const contentId = row.worktree.stat.contentId;
+    const oid =
+      contentId === null || row.worktree.stat.type === "dir"
+        ? undefined
+        : mapped.get(contentIdKey(contentId));
+    if (oid === undefined) unresolved.push(row.worktree);
+    else mappedOids.set(row.path, oid);
+  }
+  const hashes = hashWorktreePaths(repo, worktree, unresolved, { write: false });
+  repo.store.upsertBlobIds(
+    [...hashes.values()].flatMap((hashed) => {
+      const contentId = hashed.stat.contentId;
+      return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
+    }),
+  );
+  for (const row of rows) {
+    if (row.kind === "ready") {
+      yield row.detail;
+      continue;
+    }
+    const tracked = row.tracked;
+    const hashed = hashes.get(tracked.path);
+    const actualOid = mappedOids.get(tracked.path) ?? hashed?.oid;
+    const actualMode = hashed?.mode ?? gitModeFor(tracked.worktree.stat);
+    const code: StatusEntry["worktree"] =
+      actualOid === undefined
+        ? "D"
+        : actualOid !== tracked.indexOid || actualMode !== tracked.indexMode
+          ? "M"
+          : " ";
+    if (tracked.staged === " " && code === " ") continue;
+    yield statusDetail(
+      tracked.path,
+      tracked.staged,
+      code,
+      tracked.headMode,
+      tracked.indexMode,
+      actualOid === undefined ? ABSENT_MODE : actualMode,
+      tracked.headOid,
+      tracked.indexOid,
+    );
+  }
+}
+
+function statusDetail(
+  path: string,
+  staged: StatusEntry["index"],
+  code: StatusEntry["worktree"],
+  headMode: string,
+  indexMode: string,
+  worktreeMode: string,
+  headOid: string,
+  indexOid: string,
+): StatusDetail {
   return {
     path,
     index: staged,
     worktree: code,
     headMode,
     indexMode,
-    worktreeMode: mode,
+    worktreeMode,
     headOid,
     indexOid,
   };
 }
 
-/** The working-tree half of a tracked path, hashing only when it must. */
-function worktreeState(
-  repo: Repository,
-  worktree: Worktree,
-  path: string,
-  entry: IndexEntry | undefined,
-): { code: StatusEntry["worktree"]; mode: string } {
-  // Not in the index: the file, if any, shows up as untracked instead.
-  if (entry === undefined) return { code: " ", mode: ABSENT_MODE };
-  // Submodules are out of scope; nothing on disk describes their state.
-  if (entry.mode === 0o160000) return { code: " ", mode: octalMode(entry.mode) };
-
-  const stat = worktree.stat(joinPath(repo.root, path));
-  if (stat === null || stat.type === "dir") return { code: "D", mode: ABSENT_MODE };
-  const mode = gitModeFor(stat);
-  if (indexMatchesStat(entry, stat)) return { code: " ", mode };
-  const hashed = hashWorktreePath(repo, worktree, path, { write: false });
-  if (hashed === null) return { code: "D", mode: ABSENT_MODE };
-  if (hashed.oid !== entry.oid || mode !== octalMode(entry.mode)) return { code: "M", mode };
-  return { code: " ", mode };
+function untrackedRow(path: string): StatusDetail {
+  return statusDetail(path, " ", "?", ABSENT_MODE, ABSENT_MODE, ABSENT_MODE, ZERO_OID, ZERO_OID);
 }
 
 function worktreeFiles(
@@ -189,29 +334,122 @@ function worktreeFiles(
   worktree: Worktree,
   options: StatusOptions,
 ): Generator<string> {
-  return walkWorktreeStream(worktree, repo.root, {
+  return walkWorktreeStream(worktree, repo.root, worktreeWalkOptions(worktree, repo, options));
+}
+
+function worktreeEntries(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusOptions,
+  ignores: IgnoreMatcher,
+  excludeRoots: string[],
+): Generator<WorktreePath> {
+  return walkWorktreeEntriesStream(worktree, repo.root, {
+    excludeRoots,
+    paths: options.paths,
+    ignores,
+    // Tracked paths remain visible even when a later ignore rule matches.
+    includeIgnored: true,
+  });
+}
+
+interface ExcludedRoot {
+  absolute: string;
+  relative: string;
+}
+
+function excludedRoots(root: string, roots: string[] | undefined): ExcludedRoot[] {
+  return (roots ?? []).flatMap((candidate) => {
+    const relative = relativeTo(root, candidate);
+    return relative === null || relative === "" ? [] : [{ absolute: candidate, relative }];
+  });
+}
+
+function prunableExcludeRoots(
+  roots: readonly ExcludedRoot[],
+  trackedPaths: ReadonlySet<string>,
+): string[] {
+  return roots
+    .filter((root) => !hasTrackedPath(root.relative, trackedPaths))
+    .map((root) => root.absolute);
+}
+
+function hasTrackedPath(root: string, trackedPaths: ReadonlySet<string>): boolean {
+  for (const path of trackedPaths) {
+    if (path === root || path.startsWith(`${root}/`)) return true;
+  }
+  return false;
+}
+
+function isExcluded(path: string, roots: readonly ExcludedRoot[]): boolean {
+  return roots.some((root) => path === root.relative || path.startsWith(`${root.relative}/`));
+}
+
+function worktreeWalkOptions(
+  worktree: Worktree,
+  repo: Repository,
+  options: StatusOptions,
+): {
+  excludeRoots: string[] | undefined;
+  paths: string[] | undefined;
+  ignores: IgnoreMatcher;
+  includeIgnored: boolean | undefined;
+} {
+  return {
     excludeRoots: options.excludeRoots,
     paths: options.paths,
     ignores: options.ignores ?? loadIgnoreMatcher(worktree, repo.root),
     includeIgnored: options.includeIgnored,
-  });
+  };
 }
 
 /**
- * Every directory that has a tracked path somewhere beneath it. Collapsing
- * needs this before it reaches the first untracked file, and the answer can
- * lie later in path order, so it cannot come from the merge itself. Bounded
- * by distinct directories, not by tracked files.
+ * Snapshot stage zero once. Normal untracked collapsing needs all tracked
+ * directories before the merge reaches its first worktree path.
  */
-function trackedDirectories(repo: Repository): Set<string> {
-  const directories = new Set<string>();
+function snapshotStatusIndex(repo: Repository, includeDirectories: boolean): StatusIndexSnapshot {
+  const budget = new RetainedStatusBudget(STATUS_RETAINED_BYTES);
+  const entries: IndexEntry[] = [];
+  const trackedDirs = new Set<string>();
+  const trackedPaths = new Set<string>();
   for (const entry of repo.store.indexScan()) {
-    const parts = entry.path.split("/");
-    for (let depth = 1; depth < parts.length; depth++) {
-      directories.add(parts.slice(0, depth).join("/"));
+    if (entry.stage !== 0) continue;
+    budget.add(statusIndexRetainedBytes(entry));
+    entries.push(entry);
+    trackedPaths.add(entry.path);
+    if (!includeDirectories) continue;
+    for (
+      let slash = entry.path.indexOf("/");
+      slash !== -1;
+      slash = entry.path.indexOf("/", slash + 1)
+    ) {
+      const directory = entry.path.slice(0, slash);
+      if (trackedDirs.has(directory)) continue;
+      budget.add(DIRECTORY_FIXED_BYTES + retainedStringBytes(directory));
+      trackedDirs.add(directory);
     }
   }
-  return directories;
+  return { entries, trackedDirs, trackedPaths, budget };
+}
+
+function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
+  if (snapshot.trackedPaths.has(path)) return;
+  snapshot.budget.add(SET_ENTRY_BYTES + retainedStringBytes(path));
+  snapshot.trackedPaths.add(path);
+}
+
+/** @internal Conservative charge for one retained stage-zero index row. */
+export function statusIndexRetainedBytes(entry: IndexEntry): number {
+  return (
+    INDEX_ENTRY_FIXED_BYTES +
+    retainedStringBytes(entry.path) +
+    retainedStringBytes(entry.oid) +
+    SET_ENTRY_BYTES
+  );
+}
+
+function retainedStringBytes(value: string): number {
+  return 48 + value.length * 2;
 }
 
 function shallowestUntrackedDirectory(file: string, tracked: Set<string>): string | null {

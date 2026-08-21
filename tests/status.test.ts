@@ -1,15 +1,20 @@
 import { afterAll, describe, expect, it } from "vitest";
 
+import { fromHex, utf8 } from "../src/core/bytes.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
+import { commit } from "../src/core/ops/commit.js";
 import {
   clean,
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
+  STATUS_RETAINED_BYTES,
   status,
+  statusIndexRetainedBytes,
   statusMatrix,
 } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
+import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -121,6 +126,73 @@ async function build(scenario: Scenario): Promise<{
   return { fixture, workspace };
 }
 
+class BulkOnlyWorktree extends CountingWorktree {
+  override stat(path: string): never {
+    throw new Error(`scalar stat is forbidden during status: ${path}`);
+  }
+
+  override readFile(path: string): never {
+    throw new Error(`scalar readFile is forbidden during status: ${path}`);
+  }
+
+  override readlink(path: string): never {
+    throw new Error(`scalar readlink is forbidden during status: ${path}`);
+  }
+}
+
+function buildStatusScale(
+  fileCount = 9_329,
+  directoryCount = 3_346,
+): {
+  workspace: TestRepository;
+  entries: IndexEntry[];
+} {
+  const workspace = makeRepo("/");
+  workspace.repo.store.configSet("user.name", "Fixture");
+  workspace.repo.store.configSet("user.email", "fixture@example.com");
+  const bytes = utf8.encode("contents\n");
+  const oid = workspace.repo.store.write("blob", bytes);
+  const contentId = fromHex(oid);
+  const paths = Array.from({ length: fileCount }, (_, index) => {
+    const directory = index % directoryCount;
+    const generation = Math.floor(index / directoryCount);
+    return `d${directory.toString().padStart(4, "0")}/f${generation
+      .toString()
+      .padStart(4, "0")}.txt`;
+  });
+  workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes, contentId })));
+  const stats = new Map(
+    workspace.worktree
+      .scan("/", { filesOnly: true, limit: fileCount + 1 })
+      .map((entry) => [entry.path.slice(1), entry]),
+  );
+  const entries = paths.map((path): IndexEntry => {
+    const stat = stats.get(path);
+    if (stat === undefined) throw new Error(`scale path was not written: ${path}`);
+    return {
+      path,
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: stat.size,
+      mtime: stat.mtime,
+      ino: stat.ino,
+    };
+  });
+  workspace.repo.store.indexReplace(entries);
+  commit(workspace.context, workspace.repo, { message: "scale" });
+  return { workspace, entries };
+}
+
+function indexScanStatements(workspace: TestRepository): number {
+  for (const [query, count] of workspace.storage.histogram ?? []) {
+    if (query.startsWith("SELECT path, stage, mode, oid, size, mtime, ino FROM git_index")) {
+      return count;
+    }
+  }
+  return 0;
+}
+
 /** git's own output, untrimmed — trailing newlines are part of the check. */
 function gitStatus(fixture: GitFixture, ...flags: string[]): string {
   return fixture.gitBinary("status", ...flags).toString("utf8");
@@ -143,6 +215,11 @@ const SCENARIOS: Scenario[] = [
     name: "untracked file inside a tracked directory",
     commits: [BASE],
     mutate: [{ op: "write", path: "src/fresh.txt", content: "fresh\n" }],
+  },
+  {
+    name: "untracked sibling before a later tracked path",
+    commits: [[{ op: "write", path: "a/z.txt", content: "tracked\n" }]],
+    mutate: [{ op: "write", path: "a/0/fresh.txt", content: "fresh\n" }],
   },
   {
     name: "untracked directory",
@@ -325,6 +402,29 @@ describe("status", () => {
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "--", "src"));
   });
 
+  it("sorts non-BMP paths in Git's UTF-8 byte order", async () => {
+    const privateUse = "\uE000.txt";
+    const nonBmp = "😀.txt";
+    const { fixture, workspace } = await build({
+      name: "UTF-8 path order",
+      commits: [
+        [
+          { op: "write", path: privateUse, content: "old private\n" },
+          { op: "write", path: nonBmp, content: "old non-BMP\n" },
+        ],
+      ],
+      mutate: [
+        { op: "write", path: privateUse, content: "new private\n" },
+        { op: "write", path: nonBmp, content: "new non-BMP\n" },
+      ],
+    });
+    fixture.git("config", "core.quotePath", "false");
+
+    const entries = status(workspace.repo, workspace.worktree);
+    expect(entries.map((entry) => entry.path)).toEqual([privateUse, nonBmp]);
+    expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2"));
+  });
+
   it("lists untracked files one by one for untrackedFiles: all", async () => {
     const { fixture, workspace } = await build({
       name: "untracked all",
@@ -372,6 +472,16 @@ describe("status", () => {
     expect(entries.map((entry) => `${entry.index}${entry.worktree} ${entry.path}`)).toEqual([
       " D tracked.log",
     ]);
+  });
+
+  it("keeps tracked files visible while excluding a nested repository's untracked files", async () => {
+    const { workspace } = await build({
+      name: "nested repository exclusion",
+      commits: [[{ op: "write", path: "nested/tracked.txt", content: "tracked\n" }]],
+      mutate: [{ op: "write", path: "nested/fresh.txt", content: "fresh\n" }],
+    });
+
+    expect(status(workspace.repo, workspace.worktree, { excludeRoots: ["/nested"] })).toEqual([]);
   });
 
   it("lists every file individually in the isomorphic-git matrix", async () => {
@@ -461,6 +571,111 @@ describe("status cost", () => {
     ]);
     expect(counting.bulkReadPaths).toEqual(["/file3.txt"]);
     expect(counting.reads).toBe(0);
+  });
+
+  it("uses one bounded index pass and bulk worktree reads at repository scale", () => {
+    const { workspace, entries } = buildStatusScale();
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+    workspace.storage.histogram = new Map();
+
+    workspace.storage.resetCounters();
+    expect(status(workspace.repo, worktree)).toEqual([]);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(170);
+    expect(indexScanStatements(workspace)).toBe(19);
+    expect(worktree.bulkReadPaths).toEqual([]);
+
+    workspace.tick(60_000);
+    const changed = entries.slice(0, 1_000);
+    workspace.worktree.writeFiles(
+      changed.map((entry) => ({ path: `/${entry.path}`, bytes: utf8.encode("changed\n") })),
+    );
+    worktree.bulkReadPaths.length = 0;
+    workspace.storage.resetCounters();
+
+    const result = status(workspace.repo, worktree);
+    expect(result).toHaveLength(1_000);
+    expect(result.every((entry) => entry.worktree === "M")).toBe(true);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(170);
+    expect(indexScanStatements(workspace)).toBe(19);
+    expect(worktree.bulkReadPaths).toHaveLength(1_000);
+    expect(new Set(worktree.bulkReadPaths)).toEqual(
+      new Set(changed.map((entry) => `/${entry.path}`)),
+    );
+  });
+
+  it("does not infer an oid-shaped content identity and learns it after hashing", () => {
+    const workspace = makeRepo("/");
+    const bytes = utf8.encode("identity\n");
+    const oid = workspace.repo.store.write("blob", bytes);
+    workspace.worktree.writeFiles([{ path: "/identity.txt", bytes, contentId: fromHex(oid) }]);
+    workspace.repo.store.indexPut({
+      path: "identity.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+
+    expect(status(workspace.repo, worktree)).toEqual([
+      expect.objectContaining({ path: "identity.txt", index: "A", worktree: " " }),
+    ]);
+    expect(worktree.bulkReadPaths).toEqual(["/identity.txt"]);
+
+    worktree.bulkReadPaths.length = 0;
+    expect(status(workspace.repo, worktree)).toEqual([
+      expect.objectContaining({ path: "identity.txt", index: "A", worktree: " " }),
+    ]);
+    expect(worktree.bulkReadPaths).toEqual([]);
+  });
+
+  it("prunes an excluded root with more than one scan page of untracked descendants", () => {
+    const measure = (count: number): number => {
+      const workspace = makeRepo("/");
+      const bytes = utf8.encode("untracked\n");
+      workspace.worktree.writeFiles(
+        Array.from({ length: count }, (_, index) => ({
+          path: `/nested/file${index.toString().padStart(4, "0")}.txt`,
+          bytes,
+        })),
+      );
+      const worktree = new BulkOnlyWorktree(workspace.worktree);
+      workspace.storage.resetCounters();
+      expect(status(workspace.repo, worktree, { excludeRoots: ["/nested"] })).toEqual([]);
+      return workspace.storage.statementCount;
+    };
+
+    const small = measure(1);
+    const large = measure(1_501);
+    expect(large).toBeLessThanOrEqual(170);
+    expect(large).toBeLessThanOrEqual(small + 2);
+  });
+
+  it("fails before one retained index row crosses the status memory cap", () => {
+    const workspace = makeRepo("/");
+    const suffix = "x".repeat(2_041);
+    const entry = (index: number): IndexEntry => ({
+      path: `${index.toString().padStart(7, "0")}${suffix}`,
+      stage: 0,
+      mode: 0o100644,
+      oid: "ab".repeat(20),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    const retainedPerEntry = statusIndexRetainedBytes(entry(0));
+    const accepted = Math.floor(STATUS_RETAINED_BYTES / retainedPerEntry);
+    workspace.repo.store.indexReplace(Array.from({ length: accepted }, (_, index) => entry(index)));
+
+    expect(status(workspace.repo, workspace.worktree, { untrackedFiles: "all" })).toHaveLength(
+      accepted,
+    );
+    workspace.repo.store.indexPut(entry(accepted));
+    expect(() =>
+      status(workspace.repo, workspace.worktree, { untrackedFiles: "all" }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 });
 
