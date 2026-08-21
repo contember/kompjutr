@@ -18,10 +18,13 @@ kompjutr already has the primitives that make a command a **query** instead:
 | command | is really | statements |
 |---|---|---|
 | `find -name "*.ts"` | `fs.glob(root, pattern, { limit })` | **1** |
-| `grep -r pat --include="*.ts"` | `discoverFiles` → `readFileHandles` | `⌈files/1000⌉ + ⌈bytes/budget⌉` |
+| `grep -rl pat` (literal) | `fs.discoverFilesContaining` | **1** |
+| `grep -r pat` (expression) | `discoverFiles` → `readFileHandles` | `⌈files/1000⌉ + ⌈bytes/budget⌉` |
 | `ls dir` | `fs.readdir` | **1** |
 | `head -20 file` | `fs.readRange(path, 0, n)` | **1** |
 | `rm -rf dir` | `fs.removeFiles` (range delete) | **O(1)** |
+
+The second row is the one that took two attempts. See §12.
 
 So the shell is not a bash port that happens to run on SQLite. It is a
 **query planner with bash syntax on the front**. That is the only reason to
@@ -350,13 +353,16 @@ Measured in `tests/shell/cost.test.ts`, on a fixture of realistic file sizes
 | `cd dir` | 3 | one `statTarget`, one row written |
 | `find . -name '*.ts'` | 4 | one indexed GLOB |
 | `ls dir` | 6 | |
-| `grep -rl pat . --include='*.ts' \| head -20` | **8 at 2,000 files, 8 at 6,000** | |
-| the same without `\| head` | 11 at 2,000, **23** at 6,000 | |
+| `grep -rl pat --include='*.ts'` (literal) | **6 at 2,000 files, 6 at 6,000** | of which 1 is the search |
+| the same with `\| head -20` | 7 either way | |
+| `grep -rn pat` (literal, prints lines) | 8 at 2,000, 9 at 6,000 | +1 read batch for 3x the matching bytes |
+| `grep -rl 'pa.t'` (expression) | 12 at 2,000, **24** at 6,000 | no regex to push down |
 | `rm -r` (200 vs 2,000 files) | 10 either way | a range delete |
 
-The first two rows of the search block are the result that matters, and the
-reason the shape is asserted at two sizes rather than against a constant:
-bounded is flat, unbounded triples.
+The search block is the result that matters, and the reason the shape is
+asserted at two sizes rather than against a constant. A literal search is
+flat; the expression fallback doubles over the same step, which is what
+proves the push-down is the half doing the work.
 
 **These are not 1 apiece, and the original draft of this table said they
 should be.** Roughly half of each figure is resolving a path through every
@@ -413,6 +419,37 @@ cpu-lease run -n 2 -- npm run bench:macro
 ```
 
 ---
+
+## 12. The content predicate
+
+Everything above was written on the assumption that a search reads its
+candidate files and matches them in JS. It does not have to.
+
+`instr()` over a stored BLOB is a byte search, so "which files contain these
+bytes" is a SQL predicate, and `discoverFilesContaining` in `src/fs/` answers
+it in one indexed statement. The content of a file that cannot match never
+reaches the isolate — which on a Durable Object matters more than the
+statement it saves, because the heap is the ceiling
+[`computer-git-index-ceiling`](../benchmark-reference.md) is about.
+
+What it covers: a **literal, case-sensitive, positive** search, which is most
+of what the corpus contains. `instr` has no case folding, so `-i` falls back;
+it cannot prove the absence `-v` asks about; and `-c` prints a count for
+every file searched including zeros, which a predicate that returns only
+matches cannot supply. Each of those is a named condition in the surfaces,
+not an accident.
+
+What it cannot settle: a needle straddling a chunk boundary. Content is
+stored in `CHUNK_SIZE` pieces and `instr` sees one at a time, so a
+multi-chunk file may contain the needle without any single chunk doing so.
+Those files come back as `undecided` and are read. Note the asymmetry with
+the glob narrowing, where SQL gives a *superset* and JS trims: here a naive
+predicate gives a *subset*, and the failure mode is a search that silently
+misses a file rather than one that is merely slow.
+
+The equivalence suite runs every search twice — once where the predicate
+decides it, once forced down the read-and-match path — and demands identical
+bytes. It found the `-c` divergence on its first run.
 
 ## 11. What the measurements changed
 
