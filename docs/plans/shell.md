@@ -535,6 +535,37 @@ The equivalence suite runs every search twice — once where the predicate
 decides it, once forced down the read-and-match path — and demands identical
 bytes. It found the `-c` divergence on its first run.
 
+### What the bench shows
+
+`bench/shell.ts`, `npm run bench -- --scenarios=shell-*`. The pair to read
+is the first two rows: the same tree, the same files found, one searched
+with a substring and one with an expression.
+
+| operation | N | wall ms | statements | rows | peak RSS |
+|---|---|---|---|---|---|
+| `shell-grep-literal` | 2,000 | 19 | 5 | 203 | 0.2 MB |
+| `shell-grep-literal` | 6,000 | 48 | **5** | 603 | 2.6 MB |
+| `shell-grep-regex` | 2,000 | 136 | 12 | 4,004 | 0.4 MB |
+| `shell-grep-regex` | 6,000 | 372 | **28** | 12,008 | 8.0 MB |
+| `shell-grep-lines` | 6,000 | 84 | 7 | 1,203 | — |
+| `shell-grep-head` | 6,000 | 50 | 5 | 603 | — |
+| `shell-find` | 6,000 | 30 | 5 | 6,003 | 1.0 MB |
+| `shell-rm-rf` | 6,000 | 3 | 12 | 7 | 0.1 MB |
+
+**Rows is the number that carries the argument**, more than statements. At
+6,000 files the literal search moves 603 rows and the expression moves
+12,008 — twenty times as many — because the expression has to bring every
+candidate file's content into the isolate to test it. Peak RSS follows:
+2.6 MB against 8.0 MB, and 13.3 MB on the deep variant. On a Durable Object
+that is the ceiling that binds first.
+
+Three rows confirm claims made earlier from statement counts alone.
+`shell-grep-head` is identical to `shell-grep-literal`, which is what §11
+predicted once the search stopped reading the tree — the `head` bounds the
+output and nothing else. `shell-find` returns a row per file but never a
+byte of content. And `shell-rm-rf` is 12 statements and 7 rows at both
+sizes: the range delete does not care how much it deletes.
+
 ## 13. What parity changed
 
 C2a and C2b called for parity against the real binaries. Running them found
