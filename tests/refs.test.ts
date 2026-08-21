@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { fromHex, utf8, utf8Decoder } from "../src/core/bytes.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import {
   configGet,
@@ -333,13 +332,20 @@ describe("checkout", () => {
       await importFixture(transition, workspace.repo.store);
 
       checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
-      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "flat", force: true });
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "flat" });
       expect(workspace.worktree.stat("/node")?.type).toBe("file");
       expect(utf8Decoder.decode(workspace.worktree.readFile("/node"))).toBe("flat\n");
 
-      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main", force: true });
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
       expect(workspace.worktree.stat("/node")?.type).toBe("dir");
       expect(utf8Decoder.decode(workspace.worktree.readFile("/node/child.txt"))).toBe("nested\n");
+
+      writeWorkFile(workspace, "/node/untracked.txt", "mine\n");
+      transition.write("node/untracked.txt", "mine\n");
+      expect(() =>
+        checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "flat" }),
+      ).toThrow(/untracked working tree files/);
+      expect(() => transition.git("checkout", "flat")).toThrow();
     } finally {
       transition.dispose();
     }
@@ -382,14 +388,15 @@ describe("checkout", () => {
       };
     });
     workspace.repo.store.indexReplace(originalIndex);
-    commit(workspace.context, workspace.repo, { message: "base" });
+    const base = commit(workspace.context, workspace.repo, { message: "base" });
     workspace.repo.store.indexReplace(
       originalIndex.map((entry, index) =>
         index < 1_000 ? { ...entry, oid: changedOid, size: changed.length } : entry,
       ),
     );
-    commit(workspace.context, workspace.repo, { message: "changed" });
-    const targetTree = workspace.repo.headTree();
+    const changedCommit = commit(workspace.context, workspace.repo, { message: "changed" });
+    workspace.repo.store.setRef("refs/heads/changed", changedCommit.oid);
+    workspace.repo.store.setHead(base.oid);
     workspace.repo.store.indexReplace(originalIndex);
 
     class BulkCheckoutWorktree extends CountingWorktree {
@@ -415,7 +422,7 @@ describe("checkout", () => {
 
     const worktree = new BulkCheckoutWorktree(workspace.worktree);
     workspace.storage.resetCounters();
-    checkoutTree(workspace.repo, worktree, targetTree);
+    checkout(workspace.context, workspace.repo, worktree, { ref: "changed" });
 
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(200);
     expect(worktree.writes).toHaveLength(1_000);

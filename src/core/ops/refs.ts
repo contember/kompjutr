@@ -5,17 +5,26 @@
 import type { IndexEntry } from "../../sqlite/store.js";
 import type { GitContext } from "../context.js";
 import { GitError } from "../errors.js";
-import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted3 } from "../streams.js";
+import { comparePaths, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
 import { treeOf } from "./reads.js";
 import { treeStream } from "./tree-stream.js";
-import { hashWorktreePath, indexMatchesStat } from "./worktree-io.js";
+import {
+  hashWorktreePaths,
+  indexMatchesStat,
+  type WorktreePath,
+  walkWorktreeEntriesStream,
+} from "./worktree-io.js";
 
 const HEADS = "refs/heads/";
 const TAGS = "refs/tags/";
+const CHECKOUT_GUARD_BYTES = 16 * 1024 * 1024;
+const CHECKOUT_GUARD_BATCH = 1_000;
+const INDEX_ENTRY_BYTES = 256;
+const WORKTREE_ENTRY_BYTES = 256;
+const DIRECTORY_ENTRY_BYTES = 96;
 
 export interface BranchOptions {
   name: string;
@@ -195,7 +204,7 @@ function tagRef(name: string): string {
 function moveHead(repo: Repository, ref: string, commit: string): void {
   const expanded = repo.expandRef(ref);
   const full = expanded === "HEAD" ? repo.head().ref : expanded;
-  repo.store.setHead(full !== null && full.startsWith(HEADS) ? `ref: ${full}` : commit);
+  repo.store.setHead(full?.startsWith(HEADS) ? `ref: ${full}` : commit);
 }
 
 /**
@@ -229,14 +238,14 @@ function localChangesInTheWay(
 ): CheckoutBlockers {
   const tracked: string[] = [];
   const untracked: string[] = [];
+  const dirtyCandidates: Array<{ entry: IndexEntry; worktree: WorktreePath }> = [];
+  const snapshot = checkoutGuardSnapshot(repo, worktree);
 
-  // Target tree, HEAD tree and index are all path-ordered, so one merge
-  // answers every question this used to need three maps and a second index
-  // read to answer. What is retained is the blockers themselves.
+  // Target tree, HEAD tree and the bounded index snapshot are path-ordered.
   for (const row of joinSorted3(
     treeStream(repo, tree),
     treeStream(repo, repo.headTree()),
-    stageZero(repo.store.indexScan()),
+    snapshot.index,
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
     const target = row.a;
@@ -247,33 +256,98 @@ function localChangesInTheWay(
       // Only the checkout that prunes would remove this path.
       if (!prune || existing === undefined) continue;
     } else if (existing === undefined) {
-      // Not tracked here. If something is already on disk at that path,
-      // writing the target over it would destroy it unasked.
-      if (worktree.stat(joinPath(repo.root, row.path)) !== null) untracked.push(row.path);
+      // A clean tracked directory may be replaced by a file. Only an exact
+      // untracked leaf or an untracked descendant blocks the replacement.
+      if (snapshot.worktree.has(row.path) || snapshot.untrackedDirectories.has(row.path)) {
+        untracked.push(row.path);
+      }
       continue;
     } else if (existing.oid === target.oid && existing.mode === Number.parseInt(target.mode, 8)) {
       continue;
     }
 
     if (existing === undefined) continue;
-    if (differsFromHead(existing, row.b) || dirtyOnDisk(repo, worktree, existing)) {
+    if (differsFromHead(existing, row.b)) {
       tracked.push(row.path);
+      continue;
+    }
+    const worktreeEntry = snapshot.worktree.get(existing.path);
+    if (worktreeEntry === undefined || indexMatchesStat(existing, worktreeEntry.stat)) continue;
+    dirtyCandidates.push({ entry: existing, worktree: worktreeEntry });
+  }
+
+  for (let offset = 0; offset < dirtyCandidates.length; offset += CHECKOUT_GUARD_BATCH) {
+    const candidates = dirtyCandidates.slice(offset, offset + CHECKOUT_GUARD_BATCH);
+    const hashed = hashWorktreePaths(
+      repo,
+      worktree,
+      candidates.map((candidate) => candidate.worktree),
+      { write: false },
+    );
+    for (const candidate of candidates) {
+      const actual = hashed.get(candidate.entry.path);
+      if (
+        actual === undefined ||
+        actual.oid !== candidate.entry.oid ||
+        Number.parseInt(actual.mode, 8) !== candidate.entry.mode
+      ) {
+        tracked.push(candidate.entry.path);
+      }
     }
   }
-  // The merge already emits in path order.
+  tracked.sort(comparePaths);
   return { tracked, untracked };
 }
 
-/**
- * Does the working tree disagree with this index entry? A path missing from
- * disk does not count: git restores a locally deleted file without complaint.
- */
-function dirtyOnDisk(repo: Repository, worktree: Worktree, entry: IndexEntry): boolean {
-  const stat = worktree.stat(joinPath(repo.root, entry.path));
-  if (stat === null) return false;
-  if (indexMatchesStat(entry, stat)) return false;
-  const hashed = hashWorktreePath(repo, worktree, entry.path, { write: false });
-  return hashed === null || hashed.oid !== entry.oid;
+interface CheckoutGuardSnapshot {
+  index: IndexEntry[];
+  worktree: Map<string, WorktreePath>;
+  untrackedDirectories: Set<string>;
+}
+
+function checkoutGuardSnapshot(repo: Repository, worktree: Worktree): CheckoutGuardSnapshot {
+  let retained = 0;
+  const reserve = (bytes: number): void => {
+    if (bytes > CHECKOUT_GUARD_BYTES - retained) {
+      throw new GitError("E2BIG", `checkout guard state exceeds ${CHECKOUT_GUARD_BYTES} bytes`);
+    }
+    retained += bytes;
+  };
+
+  const index: IndexEntry[] = [];
+  const trackedPaths = new Set<string>();
+  for (const entry of stageZero(repo.store.indexScan())) {
+    reserve(INDEX_ENTRY_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid));
+    index.push(entry);
+    trackedPaths.add(entry.path);
+  }
+
+  const worktreeEntries = new Map<string, WorktreePath>();
+  const untrackedDirectories = new Set<string>();
+  for (const entry of walkWorktreeEntriesStream(worktree, repo.root)) {
+    reserve(
+      WORKTREE_ENTRY_BYTES +
+        retainedStringBytes(entry.path) +
+        retainedStringBytes(entry.stat.target ?? ""),
+    );
+    worktreeEntries.set(entry.path, entry);
+    if (trackedPaths.has(entry.path)) continue;
+    for (
+      let slash = entry.path.indexOf("/");
+      slash !== -1;
+      slash = entry.path.indexOf("/", slash + 1)
+    ) {
+      const directory = entry.path.slice(0, slash);
+      if (untrackedDirectories.has(directory)) continue;
+      reserve(DIRECTORY_ENTRY_BYTES + retainedStringBytes(directory));
+      untrackedDirectories.add(directory);
+    }
+  }
+  return { index, worktree: worktreeEntries, untrackedDirectories };
+}
+
+function retainedStringBytes(value: string): number {
+  return 48 + value.length * 2;
 }
 
 function differsFromHead(entry: IndexEntry, head: TargetEntry | undefined): boolean {
