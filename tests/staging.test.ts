@@ -98,6 +98,24 @@ describe("add", () => {
     expect(lsFiles(workspace.repo)).toEqual(["src/a.ts", "src/nested/b.ts"]);
   });
 
+  it("does not load ignore rules when updating tracked paths", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/tracked.txt", "one\n");
+    add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"], force: true });
+    writeWorkFile(workspace, "/.gitignore", "*?\n".repeat(65));
+    writeWorkFile(workspace, "/tracked.txt", "two\n");
+
+    add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"] });
+
+    expect(workspace.repo.store.indexGet("tracked.txt")?.oid).toBe(
+      hashObject("blob", utf8.encode("two\n")),
+    );
+    writeWorkFile(workspace, "/new.txt", "new\n");
+    expect(() => add(workspace.repo, workspace.worktree, { paths: ["new.txt"] })).toThrow(
+      /wildcardSegments/,
+    );
+  });
+
   it("stages new, modified and deleted tracked files with all", async () => {
     const fixture = newFixture();
     fixture.write("keep.txt", "keep\n");
@@ -393,5 +411,39 @@ describe("cost", () => {
     rm(workspace.repo, worktree, { paths: ["."] });
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
     expect(workspace.repo.store.indexEntries()).toEqual([]);
+  });
+
+  it("stages 100 explicit paths without retaining an oversized index", () => {
+    const workspace = makeRepo("/");
+    const original = utf8.encode("original\n");
+    const changed = utf8.encode("changed\n");
+    const originalOid = workspace.repo.store.write("blob", original);
+    const paths = Array.from(
+      { length: 24_252 },
+      (_, index) => `f${index.toString().padStart(5, "0")}.txt`,
+    );
+    workspace.repo.store.indexReplace(
+      paths.map((path) => ({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: originalOid,
+        size: original.length,
+        mtime: null,
+        ino: null,
+      })),
+    );
+    const selected = paths.slice(0, 100);
+    workspace.worktree.writeFiles(selected.map((path) => ({ path: `/${path}`, bytes: changed })));
+
+    workspace.storage.resetCounters();
+    add(workspace.repo, workspace.worktree, { paths: selected });
+
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(400);
+    const changedOid = hashObject("blob", changed);
+    expect(selected.every((path) => workspace.repo.store.indexGet(path)?.oid === changedOid)).toBe(
+      true,
+    );
+    expect(workspace.repo.store.indexGet(paths[100] ?? "")?.oid).toBe(originalOid);
   });
 });

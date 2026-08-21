@@ -7,7 +7,7 @@
 
 import { contentIdKey, type IndexEntry, type IndexSink } from "../../sqlite/store.js";
 import { GitError, PathspecNotFoundError } from "../errors.js";
-import { loadIgnoreMatcher } from "../ignore/index.js";
+import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { joinSorted, joinSorted3 } from "../streams.js";
@@ -75,8 +75,13 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
   const trackedOnly = all && options.trackedOnly === true;
   if (!all) assertPathspecsMatch(repo, worktree, specs);
 
-  const snapshot = snapshotAddIndex(repo);
-  const ignores = force ? undefined : loadIgnoreMatcher(worktree, repo.root);
+  const snapshot = snapshotAddIndex(repo, all ? undefined : specs);
+  let ignores: IgnoreMatcher | undefined;
+  const isIgnored = (path: string): boolean => {
+    if (force) return false;
+    ignores ??= loadIgnoreMatcher(worktree, repo.root);
+    return ignores.ignores(path, false);
+  };
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
   const walked = walkWorktreeEntriesStream(worktree, repo.root, {
     paths: all ? undefined : specs,
@@ -98,7 +103,7 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
 
       if (row.a !== undefined) {
         if (row.b === undefined && isExcluded(row.path, excluded)) continue;
-        if (row.b === undefined && ignores?.ignores(row.path, false) === true) continue;
+        if (row.b === undefined && isIgnored(row.path)) continue;
         const conflicted = snapshot.conflicted.has(row.path);
         if (!conflicted && existing !== undefined && indexMatchesStat(existing, row.a.stat)) {
           continue;
@@ -117,12 +122,13 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
   });
 }
 
-function snapshotAddIndex(repo: Repository): AddIndexSnapshot {
+function snapshotAddIndex(repo: Repository, specs: string[] | undefined): AddIndexSnapshot {
   const paths: AddIndexPath[] = [];
   const conflicted = new Set<string>();
   let retained = 0;
   let current: AddIndexPath | null = null;
   for (const entry of repo.store.indexScan()) {
+    if (specs !== undefined && !matchesPaths(entry.path, specs)) continue;
     retained +=
       INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid);
     if (retained > ADD_RETAINED_BYTES) {
