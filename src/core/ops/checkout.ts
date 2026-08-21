@@ -1,16 +1,21 @@
 // Materialising a tree into the working tree, and keeping the SQL index in
 // step with it.
 
-import type { BlobIdMapping, IndexEntry, IndexSink } from "../../sqlite/store.js";
+import {
+  type BlobIdMapping,
+  contentIdKey,
+  type IndexEntry,
+  type IndexSink,
+} from "../../sqlite/store.js";
 import { fromHex } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { isTreeMode, type TreeEntry } from "../objects.js";
-import { joinPath } from "../paths.js";
+import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted, joinSorted3 } from "../streams.js";
-import { fileModeFor, type Worktree } from "../worktree.js";
+import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
+import { fileModeFor, gitModeFor, type Worktree } from "../worktree.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
-import { indexMatchesStat, walkWorktreeEntriesStream } from "./worktree-io.js";
+import { indexMatchesStat, type WorktreePath, walkWorktreeEntriesStream } from "./worktree-io.js";
 
 export type { TargetEntry } from "./tree-stream.js";
 
@@ -42,6 +47,10 @@ export interface CheckoutOptions {
   paths?: string[];
   /** Remove tracked files that the target tree does not have. */
   prune?: boolean;
+  /** Keep local changes to entries that are identical in the index and target. */
+  preserveMatchingIndex?: boolean;
+  /** Remove worktree entries whose type prevents materialising the target. */
+  restoreStructure?: boolean;
 }
 
 const CHECKOUT_WINDOW_ROWS = 1_000;
@@ -61,6 +70,10 @@ export function checkoutTree(
   treeOid: string | null,
   options: CheckoutOptions = {},
 ): void {
+  const preservedRemovals =
+    options.restoreStructure === true
+      ? restoreStructuralConflicts(repo, worktree, treeOid, options)
+      : new Set<string>();
   const removed: string[] = [];
 
   // Remove obsolete paths before writing replacements. This also handles a
@@ -85,12 +98,19 @@ export function checkoutTree(
       removed.push(existing.path);
     }
     for (let offset = 0; offset < removed.length; offset += CHECKOUT_WINDOW_ROWS) {
-      flushRemovals(repo, worktree, removed.slice(offset, offset + CHECKOUT_WINDOW_ROWS), sink);
+      flushRemovals(
+        repo,
+        worktree,
+        removed.slice(offset, offset + CHECKOUT_WINDOW_ROWS),
+        preservedRemovals,
+        sink,
+      );
     }
   });
   if (removed.length > 0) pruneEmptyDirectories(repo, worktree, removed);
 
   const written: TargetEntry[] = [];
+  const candidates: CheckoutCandidate[] = [];
   repo.store.indexApply((sink) => {
     for (const row of joinSorted3(
       treeStream(repo, treeOid),
@@ -101,29 +121,221 @@ export function checkoutTree(
       const entry = row.a;
       if (entry === undefined || !matchesPaths(entry.path, options.paths)) continue;
       if (entry.mode === "160000") continue; // submodules are out of scope
-      const existing = row.b;
-      const unchanged =
-        existing !== undefined &&
-        existing.oid === entry.oid &&
-        existing.mode === Number.parseInt(entry.mode, 8) &&
-        row.c !== undefined &&
-        indexMatchesStat(existing, row.c.stat);
-      if (unchanged) continue;
-      written.push(entry);
-      if (written.length >= CHECKOUT_WINDOW_ROWS) flushWrites(repo, worktree, written, sink);
+      if (
+        options.preserveMatchingIndex === true &&
+        row.b !== undefined &&
+        row.b.oid === entry.oid &&
+        row.b.mode === Number.parseInt(entry.mode, 8)
+      ) {
+        continue;
+      }
+      candidates.push({ entry, index: row.b, worktree: row.c });
+      if (candidates.length >= CHECKOUT_WINDOW_ROWS) {
+        flushCheckoutCandidates(repo, worktree, candidates, written, sink);
+      }
     }
+    flushCheckoutCandidates(repo, worktree, candidates, written, sink);
     flushWrites(repo, worktree, written, sink);
   });
+}
+
+interface StructuralPath {
+  path: string;
+  type: "file" | "dir" | "symlink";
+}
+
+function restoreStructuralConflicts(
+  repo: Repository,
+  worktree: Worktree,
+  treeOid: string | null,
+  options: CheckoutOptions,
+): Set<string> {
+  const removals = new Set<string>();
+  const preservedRemovals = new Set<string>();
+  let retainedBytes = 0;
+  let activeBytes = 0;
+  const activeLeaves: Array<{ path: string; upper: string; bytes: number }> = [];
+  for (const row of joinSorted3(
+    treeStream(repo, treeOid),
+    stageZero(repo.store.indexScan()),
+    walkStructuralPaths(worktree, repo.root),
+    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
+  )) {
+    while (
+      activeLeaves.length > 0 &&
+      comparePaths(row.path, activeLeaves[activeLeaves.length - 1]!.upper) >= 0
+    ) {
+      activeBytes -= activeLeaves.pop()!.bytes;
+    }
+    const current = row.c;
+    if (current !== undefined && current.type !== "dir" && row.a === undefined) {
+      const upper = `${current.path}0`;
+      const bytes = CHECKOUT_PATH_FIXED_BYTES + current.path.length * 2 + upper.length * 2;
+      if (retainedBytes + activeBytes + bytes > CHECKOUT_REMOVAL_BYTES) {
+        throw new GitError(
+          "E2BIG",
+          `checkout structural state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
+        );
+      }
+      activeLeaves.push({ path: current.path, upper, bytes });
+      activeBytes += bytes;
+    }
+
+    const target = row.a;
+    if (
+      target === undefined &&
+      row.b !== undefined &&
+      options.prune !== false &&
+      matchesPaths(row.b.path, options.paths)
+    ) {
+      const replacedByDirectory = current?.type === "dir";
+      let replacedUnderLeaf = false;
+      for (let index = activeLeaves.length - 1; index >= 0; index--) {
+        if (row.b.path.startsWith(`${activeLeaves[index]!.path}/`)) {
+          replacedUnderLeaf = true;
+          break;
+        }
+      }
+      if ((replacedByDirectory || replacedUnderLeaf) && !preservedRemovals.has(row.b.path)) {
+        retainedBytes += CHECKOUT_PATH_FIXED_BYTES + row.b.path.length * 2;
+        if (retainedBytes + activeBytes > CHECKOUT_REMOVAL_BYTES) {
+          throw new GitError(
+            "E2BIG",
+            `checkout structural state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
+          );
+        }
+        preservedRemovals.add(row.b.path);
+      }
+    }
+    if (
+      target === undefined ||
+      target.mode === "160000" ||
+      !matchesPaths(target.path, options.paths)
+    ) {
+      continue;
+    }
+    const sameIndex =
+      row.b !== undefined &&
+      row.b.oid === target.oid &&
+      row.b.mode === Number.parseInt(target.mode, 8);
+    if (options.preserveMatchingIndex === true && sameIndex) continue;
+
+    let activeLeaf: { path: string; upper: string; bytes: number } | undefined;
+    for (let index = activeLeaves.length - 1; index >= 0; index--) {
+      const leaf = activeLeaves[index]!;
+      if (target.path.startsWith(`${leaf.path}/`)) {
+        activeLeaf = leaf;
+        break;
+      }
+    }
+    const structural = current?.type === "dir" ? target.path : activeLeaf?.path;
+    if (structural === undefined || removals.has(structural)) continue;
+    if (activeLeaf?.path === structural) {
+      activeBytes -= activeLeaf.bytes;
+      activeLeaves.splice(activeLeaves.indexOf(activeLeaf), 1);
+    }
+    retainedBytes += CHECKOUT_PATH_FIXED_BYTES + structural.length * 2;
+    if (retainedBytes + activeBytes > CHECKOUT_REMOVAL_BYTES) {
+      throw new GitError(
+        "E2BIG",
+        `checkout structural state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
+      );
+    }
+    removals.add(structural);
+  }
+
+  const paths = [...removals].sort(comparePaths);
+  for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
+    worktree.removeFiles(
+      paths.slice(offset, offset + CHECKOUT_WINDOW_ROWS).map((path) => joinPath(repo.root, path)),
+      { recursive: true },
+    );
+  }
+  return preservedRemovals;
+}
+
+function* walkStructuralPaths(worktree: Worktree, root: string): Generator<StructuralPath> {
+  const lexicalRoot = root.replace(/\/+$/, "") || "/";
+  const base = worktree.realpath(lexicalRoot);
+  let after: string | undefined;
+  while (true) {
+    const entries = worktree.scan(base, { after, limit: CHECKOUT_WINDOW_ROWS });
+    if (entries.length === 0) return;
+    for (const entry of entries) {
+      after = entry.path;
+      const path = relativeTo(base, entry.path);
+      if (path !== null && path !== "") yield { path, type: entry.type };
+    }
+    if (entries.length < CHECKOUT_WINDOW_ROWS) return;
+  }
+}
+
+interface CheckoutCandidate {
+  entry: TargetEntry;
+  index: IndexEntry | undefined;
+  worktree: WorktreePath | undefined;
+}
+
+function flushCheckoutCandidates(
+  repo: Repository,
+  worktree: Worktree,
+  candidates: CheckoutCandidate[],
+  written: TargetEntry[],
+  sink: IndexSink,
+): void {
+  if (candidates.length === 0) return;
+  const contentIds: Uint8Array[] = [];
+  for (const candidate of candidates) {
+    const existing = candidate.index;
+    const current = candidate.worktree;
+    if (
+      existing !== undefined &&
+      current !== undefined &&
+      existing.oid === candidate.entry.oid &&
+      existing.mode === Number.parseInt(candidate.entry.mode, 8) &&
+      !indexMatchesStat(existing, current.stat) &&
+      current.stat.contentId !== null
+    ) {
+      contentIds.push(current.stat.contentId);
+    }
+  }
+  const mapped = repo.store.lookupBlobIds(contentIds);
+
+  for (const candidate of candidates.splice(0, candidates.length)) {
+    const existing = candidate.index;
+    const current = candidate.worktree;
+    const sameIndex =
+      existing !== undefined &&
+      existing.oid === candidate.entry.oid &&
+      existing.mode === Number.parseInt(candidate.entry.mode, 8);
+    const mappedOid =
+      current?.stat.contentId === null || current?.stat.contentId === undefined
+        ? undefined
+        : mapped.get(contentIdKey(current.stat.contentId));
+    const unchanged =
+      sameIndex &&
+      current !== undefined &&
+      (indexMatchesStat(existing, current.stat) ||
+        (mappedOid === existing.oid &&
+          existing.mode === Number.parseInt(gitModeFor(current.stat), 8)));
+    if (unchanged) continue;
+    written.push(candidate.entry);
+    if (written.length >= CHECKOUT_WINDOW_ROWS) flushWrites(repo, worktree, written, sink);
+  }
 }
 
 function flushRemovals(
   repo: Repository,
   worktree: Worktree,
   removed: string[],
+  preserved: ReadonlySet<string>,
   sink: IndexSink,
 ): void {
   if (removed.length === 0) return;
-  worktree.removeFiles(removed.map((path) => joinPath(repo.root, path)));
+  const physical = removed.filter((path) => !preserved.has(path));
+  if (physical.length > 0) {
+    worktree.removeFiles(physical.map((path) => joinPath(repo.root, path)));
+  }
   for (const path of removed) sink.remove(path);
   sink.flush();
 }

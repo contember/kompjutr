@@ -2,12 +2,12 @@
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
 // repository row, so nothing here writes a file.
 
-import type { IndexEntry } from "../../sqlite/store.js";
+import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import type { GitContext } from "../context.js";
 import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
-import { comparePaths, joinSorted3 } from "../streams.js";
-import type { Worktree } from "../worktree.js";
+import { comparePaths, joinSorted } from "../streams.js";
+import { gitModeFor, type Worktree } from "../worktree.js";
 import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
 import { treeOf } from "./reads.js";
 import { treeStream } from "./tree-stream.js";
@@ -158,11 +158,14 @@ export function checkout(
   }
 
   if (paths !== undefined) {
-    // `git checkout <ref> -- <paths>` restores paths; it never removes any.
-    checkoutTree(repo, worktree, tree, { paths, prune: false });
+    // Path checkout restores named targets without pruning absent ones.
+    checkoutTree(repo, worktree, tree, { paths, prune: false, restoreStructure: true });
     return;
   }
-  checkoutTree(repo, worktree, tree);
+  checkoutTree(repo, worktree, tree, {
+    preserveMatchingIndex: options.force !== true,
+    restoreStructure: options.force === true,
+  });
   moveHead(repo, options.ref, commit);
 }
 
@@ -238,112 +241,243 @@ function localChangesInTheWay(
 ): CheckoutBlockers {
   const tracked: string[] = [];
   const untracked: string[] = [];
-  const dirtyCandidates: Array<{ entry: IndexEntry; worktree: WorktreePath }> = [];
-  const snapshot = checkoutGuardSnapshot(repo, worktree);
+  const dirtyCandidates: GuardCandidate[] = [];
+  const pendingTargets: PendingTarget[] = [];
+  const pendingTrackedPaths: PendingTarget[] = [];
+  const untrackedAncestors: PendingTarget[] = [];
+  const budget = new CheckoutGuardBudget();
 
-  // Target tree, HEAD tree and the bounded index snapshot are path-ordered.
-  for (const row of joinSorted3(
-    treeStream(repo, tree),
-    treeStream(repo, repo.headTree()),
-    snapshot.index,
-    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
-  )) {
-    const target = row.a;
-    const existing = row.c;
+  for (const row of checkoutGuardRows(repo, worktree, tree)) {
+    expireRanges(pendingTargets, row.path, budget);
+    expireRanges(pendingTrackedPaths, row.path, budget);
+    expireRanges(untrackedAncestors, row.path, budget);
+    if (row.worktree !== undefined && row.index === undefined) {
+      for (let index = pendingTargets.length - 1; index >= 0; index--) {
+        const pending = pendingTargets[index]!;
+        if (!row.path.startsWith(`${pending.path}/`)) continue;
+        budget.release(pending.bytes);
+        pendingTargets.splice(index, 1);
+        retainBlocker(untracked, pending.path, budget);
+        break;
+      }
+      for (let index = pendingTrackedPaths.length - 1; index >= 0; index--) {
+        const pending = pendingTrackedPaths[index]!;
+        if (!row.path.startsWith(`${pending.path}/`)) continue;
+        budget.release(pending.bytes);
+        pendingTrackedPaths.splice(index, 1);
+        retainBlocker(untracked, pending.path, budget);
+        break;
+      }
+      if (row.target === undefined) retainRange(untrackedAncestors, row.path, budget);
+    }
+
+    const target = row.target;
+    const existing = row.index;
     if (!matchesPaths(row.path, paths)) continue;
 
     if (target === undefined) {
       // Only the checkout that prunes would remove this path.
       if (!prune || existing === undefined) continue;
     } else if (existing === undefined) {
-      // A clean tracked directory may be replaced by a file. Only an exact
-      // untracked leaf or an untracked descendant blocks the replacement.
-      if (snapshot.worktree.has(row.path) || snapshot.untrackedDirectories.has(row.path)) {
-        untracked.push(row.path);
+      const ancestor = findAncestor(untrackedAncestors, row.path);
+      if (ancestor !== undefined) {
+        convertRangeToBlocker(untrackedAncestors, ancestor, untracked, budget);
+      } else if (row.worktree !== undefined) {
+        retainBlocker(untracked, row.path, budget);
+      } else {
+        retainRange(pendingTargets, row.path, budget);
       }
-      continue;
-    } else if (existing.oid === target.oid && existing.mode === Number.parseInt(target.mode, 8)) {
       continue;
     }
 
     if (existing === undefined) continue;
-    if (differsFromHead(existing, row.b)) {
-      tracked.push(row.path);
+    const changesIndex =
+      target === undefined ||
+      existing.oid !== target.oid ||
+      existing.mode !== Number.parseInt(target.mode, 8);
+    const ancestor = changesIndex ? findAncestor(untrackedAncestors, row.path) : undefined;
+    if (ancestor !== undefined) {
+      budget.release(ancestor.bytes);
+      untrackedAncestors.splice(untrackedAncestors.indexOf(ancestor), 1);
+      retainBlocker(tracked, row.path, budget);
       continue;
     }
-    const worktreeEntry = snapshot.worktree.get(existing.path);
-    if (worktreeEntry === undefined || indexMatchesStat(existing, worktreeEntry.stat)) continue;
-    dirtyCandidates.push({ entry: existing, worktree: worktreeEntry });
-  }
-
-  for (let offset = 0; offset < dirtyCandidates.length; offset += CHECKOUT_GUARD_BATCH) {
-    const candidates = dirtyCandidates.slice(offset, offset + CHECKOUT_GUARD_BATCH);
-    const hashed = hashWorktreePaths(
-      repo,
-      worktree,
-      candidates.map((candidate) => candidate.worktree),
-      { write: false },
-    );
-    for (const candidate of candidates) {
-      const actual = hashed.get(candidate.entry.path);
-      if (
-        actual === undefined ||
-        actual.oid !== candidate.entry.oid ||
-        Number.parseInt(actual.mode, 8) !== candidate.entry.mode
-      ) {
-        tracked.push(candidate.entry.path);
-      }
+    if (changesIndex && differsFromHead(existing, row.head)) {
+      retainBlocker(tracked, row.path, budget);
+      continue;
+    }
+    if (!changesIndex) continue;
+    if (row.worktree === undefined) {
+      retainRange(pendingTrackedPaths, row.path, budget);
+      continue;
+    }
+    if (indexMatchesStat(existing, row.worktree.stat)) continue;
+    const bytes =
+      INDEX_ENTRY_BYTES +
+      WORKTREE_ENTRY_BYTES +
+      retainedStringBytes(existing.path) +
+      retainedStringBytes(existing.oid) +
+      retainedStringBytes(row.worktree.path) +
+      retainedStringBytes(row.worktree.stat.target ?? "");
+    budget.add(bytes);
+    dirtyCandidates.push({ entry: existing, worktree: row.worktree, bytes });
+    if (dirtyCandidates.length >= CHECKOUT_GUARD_BATCH) {
+      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget);
     }
   }
+  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget);
   tracked.sort(comparePaths);
+  untracked.sort(comparePaths);
   return { tracked, untracked };
 }
 
-interface CheckoutGuardSnapshot {
-  index: IndexEntry[];
-  worktree: Map<string, WorktreePath>;
-  untrackedDirectories: Set<string>;
+interface CheckoutGuardRow {
+  path: string;
+  target: TargetEntry | undefined;
+  head: TargetEntry | undefined;
+  index: IndexEntry | undefined;
+  worktree: WorktreePath | undefined;
 }
 
-function checkoutGuardSnapshot(repo: Repository, worktree: Worktree): CheckoutGuardSnapshot {
-  let retained = 0;
-  const reserve = (bytes: number): void => {
-    if (bytes > CHECKOUT_GUARD_BYTES - retained) {
+function* checkoutGuardRows(
+  repo: Repository,
+  worktree: Worktree,
+  tree: string | null,
+): Generator<CheckoutGuardRow> {
+  const trees = joinSorted(treeStream(repo, tree), treeStream(repo, repo.headTree()), {
+    left: (entry) => entry.path,
+    right: (entry) => entry.path,
+  });
+  const current = joinSorted(
+    stageZero(repo.store.indexScan()),
+    walkWorktreeEntriesStream(worktree, repo.root),
+    { left: (entry) => entry.path, right: (entry) => entry.path },
+  );
+  for (const row of joinSorted(trees, current, {
+    left: (entry) => entry.path,
+    right: (entry) => entry.path,
+  })) {
+    yield {
+      path: row.path,
+      target: row.left?.left,
+      head: row.left?.right,
+      index: row.right?.left,
+      worktree: row.right?.right,
+    };
+  }
+}
+
+interface GuardCandidate {
+  entry: IndexEntry;
+  worktree: WorktreePath;
+  bytes: number;
+}
+
+interface PendingTarget {
+  path: string;
+  upper: string;
+  bytes: number;
+}
+
+class CheckoutGuardBudget {
+  #bytes = 0;
+
+  add(bytes: number): void {
+    if (bytes > CHECKOUT_GUARD_BYTES - this.#bytes) {
       throw new GitError("E2BIG", `checkout guard state exceeds ${CHECKOUT_GUARD_BYTES} bytes`);
     }
-    retained += bytes;
-  };
-
-  const index: IndexEntry[] = [];
-  const trackedPaths = new Set<string>();
-  for (const entry of stageZero(repo.store.indexScan())) {
-    reserve(INDEX_ENTRY_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid));
-    index.push(entry);
-    trackedPaths.add(entry.path);
+    this.#bytes += bytes;
   }
 
-  const worktreeEntries = new Map<string, WorktreePath>();
-  const untrackedDirectories = new Set<string>();
-  for (const entry of walkWorktreeEntriesStream(worktree, repo.root)) {
-    reserve(
-      WORKTREE_ENTRY_BYTES +
-        retainedStringBytes(entry.path) +
-        retainedStringBytes(entry.stat.target ?? ""),
-    );
-    worktreeEntries.set(entry.path, entry);
-    if (trackedPaths.has(entry.path)) continue;
-    for (
-      let slash = entry.path.indexOf("/");
-      slash !== -1;
-      slash = entry.path.indexOf("/", slash + 1)
+  release(bytes: number): void {
+    this.#bytes -= bytes;
+  }
+}
+
+function retainBlocker(paths: string[], path: string, budget: CheckoutGuardBudget): void {
+  budget.add(DIRECTORY_ENTRY_BYTES + retainedStringBytes(path));
+  paths.push(path);
+}
+
+function retainRange(ranges: PendingTarget[], path: string, budget: CheckoutGuardBudget): void {
+  const upper = `${path}0`;
+  const bytes = DIRECTORY_ENTRY_BYTES + retainedStringBytes(path) + retainedStringBytes(upper);
+  budget.add(bytes);
+  ranges.push({ path, upper, bytes });
+}
+
+function expireRanges(ranges: PendingTarget[], path: string, budget: CheckoutGuardBudget): void {
+  while (ranges.length > 0 && comparePaths(path, ranges[ranges.length - 1]!.upper) >= 0) {
+    budget.release(ranges.pop()!.bytes);
+  }
+}
+
+function findAncestor(ranges: PendingTarget[], path: string): PendingTarget | undefined {
+  for (let index = ranges.length - 1; index >= 0; index--) {
+    const range = ranges[index]!;
+    if (path.startsWith(`${range.path}/`)) return range;
+  }
+  return undefined;
+}
+
+function convertRangeToBlocker(
+  ranges: PendingTarget[],
+  range: PendingTarget,
+  blockers: string[],
+  budget: CheckoutGuardBudget,
+): void {
+  budget.release(range.bytes);
+  ranges.splice(ranges.indexOf(range), 1);
+  retainBlocker(blockers, range.path, budget);
+}
+
+function flushGuardCandidates(
+  repo: Repository,
+  worktree: Worktree,
+  candidates: GuardCandidate[],
+  tracked: string[],
+  budget: CheckoutGuardBudget,
+): void {
+  if (candidates.length === 0) return;
+  const identities = repo.store.lookupBlobIds(
+    candidates.flatMap((candidate) =>
+      candidate.worktree.stat.contentId === null ? [] : [candidate.worktree.stat.contentId],
+    ),
+  );
+  const needsHash: GuardCandidate[] = [];
+  for (const candidate of candidates) {
+    const contentId = candidate.worktree.stat.contentId;
+    const mapped = contentId === null ? undefined : identities.get(contentIdKey(contentId));
+    if (
+      mapped === candidate.entry.oid &&
+      candidate.entry.mode === Number.parseInt(gitModeFor(candidate.worktree.stat), 8)
     ) {
-      const directory = entry.path.slice(0, slash);
-      if (untrackedDirectories.has(directory)) continue;
-      reserve(DIRECTORY_ENTRY_BYTES + retainedStringBytes(directory));
-      untrackedDirectories.add(directory);
+      continue;
+    }
+    needsHash.push(candidate);
+  }
+  const hashed = hashWorktreePaths(
+    repo,
+    worktree,
+    needsHash.map((candidate) => candidate.worktree),
+    { write: false },
+  );
+  const dirty = new Set<string>();
+  for (const candidate of needsHash) {
+    const actual = hashed.get(candidate.entry.path);
+    if (
+      actual === undefined ||
+      actual.oid !== candidate.entry.oid ||
+      Number.parseInt(actual.mode, 8) !== candidate.entry.mode
+    ) {
+      dirty.add(candidate.entry.path);
     }
   }
-  return { index, worktree: worktreeEntries, untrackedDirectories };
+  for (const candidate of candidates) {
+    budget.release(candidate.bytes);
+    if (dirty.has(candidate.entry.path)) retainBlocker(tracked, candidate.entry.path, budget);
+  }
+  candidates.length = 0;
 }
 
 function retainedStringBytes(value: string): number {

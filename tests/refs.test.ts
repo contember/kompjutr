@@ -28,7 +28,7 @@ import {
 } from "../src/core/ops/refs.js";
 import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import { joinPath } from "../src/core/paths.js";
-import type { WriteEntry, WriteOptions } from "../src/fs/types.js";
+import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -88,9 +88,16 @@ function diskTree(dir: string, prefix = "", out = new Map<string, string>()): Ma
 }
 
 function ourTree(): Map<string, string> {
+  return workspaceTree(ws);
+}
+
+function workspaceTree(workspace: TestRepository): Map<string, string> {
   const out = new Map<string, string>();
-  for (const path of walkWorktree(ws.worktree, ws.repo.root)) {
-    out.set(path, utf8Decoder.decode(ws.worktree.readFile(joinPath(ws.repo.root, path))));
+  for (const path of walkWorktree(workspace.worktree, workspace.repo.root)) {
+    out.set(
+      path,
+      utf8Decoder.decode(workspace.worktree.readFile(joinPath(workspace.repo.root, path))),
+    );
   }
   return out;
 }
@@ -311,6 +318,120 @@ describe("checkout", () => {
     expect(ws.repo.head().ref).toBe("refs/heads/side");
   });
 
+  it("preserves local changes when the target keeps the index entry", () => {
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
+    writeWorkFile(ws, "/common.txt", "local common\n");
+    fixture.write("common.txt", "local common\n");
+
+    class RecordingWorktree extends CountingWorktree {
+      writes: string[] = [];
+
+      override writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {
+        this.writes.push(...entries.map((entry) => entry.path));
+        super.writeFiles(entries, options);
+      }
+    }
+
+    const worktree = new RecordingWorktree(ws.worktree);
+    checkout(ws.context, ws.repo, worktree, { ref: "side" });
+    fixture.git("checkout", "-q", "side");
+
+    expect(worktree.writes).not.toContain("/common.txt");
+    expect(utf8Decoder.decode(ws.worktree.readFile("/common.txt"))).toBe("local common\n");
+    expectSameTree();
+
+    ws.worktree.unlink("/common.txt");
+    fixture.remove("common.txt");
+    worktree.writes.length = 0;
+    checkout(ws.context, ws.repo, worktree, { ref: "main" });
+    fixture.git("checkout", "-q", "main");
+
+    expect(worktree.writes).not.toContain("/common.txt");
+    expect(ws.worktree.stat("/common.txt")).toBeNull();
+    expectSameTree();
+  });
+
+  it("preserves same-target structural changes, while path checkout and force restore them", async () => {
+    for (const targetShape of ["file", "directory"]) {
+      for (const restoreMode of ["path", "force"]) {
+        const transition = new GitFixture().init("main");
+        const workspace = makeRepo("/");
+        try {
+          if (targetShape === "file") transition.write("node", "tracked\n");
+          else transition.write("node/child.txt", "tracked\n");
+          transition.write("branch.txt", "main\n");
+          transition.commit(targetShape);
+          transition.git("checkout", "-q", "-b", "side");
+          transition.write("branch.txt", "side\n");
+          transition.commit("side");
+          transition.git("checkout", "-q", "main");
+          await importFixture(transition, workspace.repo.store);
+          checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+          transition.remove("node");
+          if (targetShape === "file") {
+            workspace.worktree.unlink("/node");
+            writeWorkFile(workspace, "/node/local.txt", "local\n");
+            transition.write("node/local.txt", "local\n");
+          } else {
+            workspace.worktree.unlink("/node/child.txt");
+            workspace.worktree.rmdir("/node");
+            if (restoreMode === "force") {
+              workspace.worktree.symlink("local-target", "/node");
+              transition.symlink("local-target", "node");
+            } else {
+              writeWorkFile(workspace, "/node", "local\n");
+              transition.write("node", "local\n");
+            }
+            writeWorkFile(workspace, "/node.extra", "prefix sibling\n");
+            transition.write("node.extra", "prefix sibling\n");
+          }
+
+          const worktree = new CountingWorktree(workspace.worktree);
+          checkout(workspace.context, workspace.repo, worktree, { ref: "side" });
+          transition.git("checkout", "-q", "side");
+
+          expect(worktree.reads).toBe(0);
+          expect(worktree.rangeReads).toBe(0);
+          expect(worktree.bulkReadPaths).toEqual([]);
+          expect(workspace.worktree.stat("/node")?.type).toBe(
+            targetShape === "file" ? "dir" : restoreMode === "force" ? "symlink" : "file",
+          );
+
+          if (restoreMode === "path") {
+            checkout(workspace.context, workspace.repo, worktree, {
+              ref: "side",
+              paths: ["node"],
+            });
+            transition.git("checkout", "side", "--", "node");
+          } else {
+            checkout(workspace.context, workspace.repo, worktree, { ref: "side", force: true });
+            transition.git("checkout", "-f", "-q", "side");
+          }
+
+          expect(worktree.reads).toBe(0);
+          expect(worktree.rangeReads).toBe(0);
+          expect(worktree.bulkReadPaths).toEqual([]);
+          if (targetShape === "file") {
+            expect(workspace.worktree.stat("/node")?.type).toBe("file");
+            expect(utf8Decoder.decode(workspace.worktree.readFile("/node"))).toBe("tracked\n");
+          } else {
+            expect(workspace.worktree.stat("/node")?.type).toBe("dir");
+            expect(utf8Decoder.decode(workspace.worktree.readFile("/node/child.txt"))).toBe(
+              "tracked\n",
+            );
+            expect(utf8Decoder.decode(workspace.worktree.readFile("/node.extra"))).toBe(
+              "prefix sibling\n",
+            );
+          }
+          expect(sorted(workspaceTree(workspace))).toEqual(sorted(diskTree(transition.dir)));
+        } finally {
+          transition.dispose();
+        }
+      }
+    }
+  });
+
   it("carries on when a file the checkout rewrites was deleted locally", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
     ws.worktree.unlink("/modified.txt");
@@ -368,6 +489,198 @@ describe("checkout", () => {
       expect(() => transition.git("checkout", "flat")).toThrow();
     } finally {
       transition.dispose();
+    }
+  });
+
+  it("refuses an untracked file or symlink above a target path", async () => {
+    for (const kind of ["file", "symlink"]) {
+      const transition = new GitFixture().init("main");
+      const workspace = makeRepo("/");
+      try {
+        transition.write("anchor.txt", "anchor\n");
+        transition.commit("base");
+        transition.git("checkout", "-q", "-b", "nested");
+        transition.write("node/child.txt", "nested\n");
+        transition.commit("nested");
+        transition.git("checkout", "-q", "main");
+        await importFixture(transition, workspace.repo.store);
+        checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+        if (kind === "file") {
+          writeWorkFile(workspace, "/node", "mine\n");
+          transition.write("node", "mine\n");
+        } else {
+          workspace.worktree.symlink("mine", "/node");
+          transition.symlink("mine", "node");
+        }
+
+        expect(() =>
+          checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "nested" }),
+        ).toThrow(/untracked working tree files/);
+        expect(() => transition.git("checkout", "nested")).toThrow();
+        expect(workspace.repo.head().ref).toBe("refs/heads/main");
+      } finally {
+        transition.dispose();
+      }
+    }
+  });
+
+  it("refuses an untracked file above a changed tracked target", async () => {
+    const transition = new GitFixture().init("main");
+    const workspace = makeRepo("/");
+    try {
+      transition.write("node/child.txt", "base\n");
+      transition.commit("base");
+      transition.git("checkout", "-q", "-b", "changed");
+      transition.write("node/child.txt", "changed\n");
+      transition.commit("changed");
+      transition.git("checkout", "-q", "main");
+      await importFixture(transition, workspace.repo.store);
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+      workspace.worktree.unlink("/node/child.txt");
+      workspace.worktree.rmdir("/node");
+      writeWorkFile(workspace, "/node", "mine\n");
+      transition.remove("node");
+      transition.write("node", "mine\n");
+
+      expect(() =>
+        checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "changed" }),
+      ).toThrow(/local changes.*node\/child\.txt/);
+      expect(() => transition.git("checkout", "changed")).toThrow();
+      expect(workspace.repo.head().ref).toBe("refs/heads/main");
+    } finally {
+      transition.dispose();
+    }
+  });
+
+  it("refuses dirty tracked paths on either side of a file-directory replacement", async () => {
+    const cases = [
+      { start: "file", target: "directory" },
+      { start: "directory", target: "file" },
+    ];
+    for (const entry of cases) {
+      const transition = new GitFixture().init("main");
+      const workspace = makeRepo("/");
+      try {
+        if (entry.start === "file") transition.write("node", "flat\n");
+        else transition.write("node/child.txt", "nested\n");
+        transition.commit(entry.start);
+        transition.git("checkout", "-q", "-b", "target");
+        transition.remove("node");
+        if (entry.target === "file") transition.write("node", "flat\n");
+        else transition.write("node/child.txt", "nested\n");
+        transition.commit(entry.target);
+        transition.git("checkout", "-q", "main");
+        await importFixture(transition, workspace.repo.store);
+        checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+        const dirtyPath = entry.start === "file" ? "/node" : "/node/child.txt";
+        writeWorkFile(workspace, dirtyPath, "local\n");
+        transition.write(dirtyPath.slice(1), "local\n");
+
+        expect(() =>
+          checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "target" }),
+        ).toThrow(/local changes/);
+        expect(() => transition.git("checkout", "target")).toThrow();
+        expect(workspace.repo.head().ref).toBe("refs/heads/main");
+      } finally {
+        transition.dispose();
+      }
+    }
+  });
+
+  it("refuses a tracked file locally replaced by a directory before target replacement", async () => {
+    for (const target of ["directory", "deleted"]) {
+      const transition = new GitFixture().init("main");
+      const workspace = makeRepo("/");
+      try {
+        transition.write("node", "tracked\n");
+        transition.write("anchor.txt", "anchor\n");
+        transition.commit("file");
+        transition.git("checkout", "-q", "-b", "target");
+        transition.remove("node");
+        if (target === "directory") transition.write("node/target.txt", "target\n");
+        transition.commit(target);
+        transition.git("checkout", "-q", "main");
+        await importFixture(transition, workspace.repo.store);
+        checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+        workspace.worktree.unlink("/node");
+        writeWorkFile(workspace, "/node/local.txt", "local\n");
+        transition.remove("node");
+        transition.write("node/local.txt", "local\n");
+
+        expect(() =>
+          checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "target" }),
+        ).toThrow(/untracked working tree files.*node/);
+        expect(() => transition.git("checkout", "target")).toThrow();
+        expect(workspace.repo.head().ref).toBe("refs/heads/main");
+      } finally {
+        transition.dispose();
+      }
+    }
+  });
+
+  it("force preserves an untracked structural replacement when the target deletes it", async () => {
+    for (const startShape of ["file", "directory"]) {
+      const transition = new GitFixture().init("main");
+      const workspace = makeRepo("/");
+      try {
+        if (startShape === "file") transition.write("node", "tracked\n");
+        else transition.write("node/child.txt", "tracked\n");
+        transition.write("anchor.txt", "anchor\n");
+        transition.commit(startShape);
+        transition.git("checkout", "-q", "-b", "target");
+        transition.remove("node");
+        transition.commit("delete node");
+        transition.git("checkout", "-q", "main");
+        await importFixture(transition, workspace.repo.store);
+        checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+
+        transition.remove("node");
+        if (startShape === "file") {
+          workspace.worktree.unlink("/node");
+          writeWorkFile(workspace, "/node/local.txt", "local\n");
+          transition.write("node/local.txt", "local\n");
+        } else {
+          workspace.worktree.unlink("/node/child.txt");
+          workspace.worktree.rmdir("/node");
+          writeWorkFile(workspace, "/node", "local\n");
+          transition.write("node", "local\n");
+        }
+
+        class RemovalWorktree extends CountingWorktree {
+          removals: Array<{ paths: string[]; recursive: boolean }> = [];
+
+          override removeFiles(paths: readonly string[], options?: RemoveOptions): void {
+            this.removals.push({ paths: [...paths], recursive: options?.recursive === true });
+            super.removeFiles(paths, options);
+          }
+        }
+
+        const worktree = new RemovalWorktree(workspace.worktree);
+        checkout(workspace.context, workspace.repo, worktree, { ref: "target", force: true });
+        transition.git("checkout", "-f", "-q", "target");
+
+        expect(worktree.removals).toEqual([]);
+        expect(workspace.repo.head().ref).toBe("refs/heads/target");
+        expect(workspace.repo.store.indexEntries().map((entry) => entry.path)).toEqual([
+          "anchor.txt",
+        ]);
+        expect(sorted(workspaceTree(workspace))).toEqual(sorted(diskTree(transition.dir)));
+        if (startShape === "file") {
+          expect(workspace.worktree.stat("/node")?.type).toBe("dir");
+          expect(utf8Decoder.decode(workspace.worktree.readFile("/node/local.txt"))).toBe(
+            "local\n",
+          );
+        } else {
+          expect(workspace.worktree.stat("/node")?.type).toBe("file");
+          expect(utf8Decoder.decode(workspace.worktree.readFile("/node"))).toBe("local\n");
+        }
+      } finally {
+        transition.dispose();
+      }
     }
   });
 
@@ -452,6 +765,111 @@ describe("checkout", () => {
     expect(
       workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
     ).toHaveLength(1_000);
+  });
+
+  it("rewrites only 100 changes from a 24,252-file clone index", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Fixture");
+    workspace.repo.store.configSet("user.email", "fixture@example.com");
+    const original = utf8.encode("original\n");
+    const changed = utf8.encode("changed\n");
+    const originalOid = workspace.repo.store.write("blob", original);
+    const changedOid = workspace.repo.store.write("blob", changed);
+    const changedFiles = 100;
+    const paths = Array.from({ length: 24_252 }, (_, index) => {
+      const directory = index % 8_084;
+      const generation = Math.floor(index / 8_084);
+      return `d${directory.toString().padStart(4, "0")}/f${generation
+        .toString()
+        .padStart(4, "0")}.txt`;
+    });
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes: original, contentId: fromHex(originalOid) })),
+    );
+    workspace.repo.store.upsertBlobIds([{ contentId: fromHex(originalOid), oid: originalOid }]);
+    const stats = new Map(
+      workspace.worktree
+        .scan("/", { filesOnly: true, limit: paths.length + 1 })
+        .map((entry) => [entry.path.slice(1), entry]),
+    );
+    const originalIndex = paths.map((path): IndexEntry => {
+      const stat = stats.get(path);
+      if (stat === undefined) throw new Error(`scale path was not written: ${path}`);
+      return {
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: originalOid,
+        size: stat.size,
+        mtime: stat.mtime,
+        ino: stat.ino,
+      };
+    });
+    workspace.repo.store.indexReplace(originalIndex);
+    const base = commit(workspace.context, workspace.repo, { message: "base" });
+    workspace.repo.store.indexReplace(
+      originalIndex.map((entry, index) =>
+        index < changedFiles ? { ...entry, oid: changedOid, size: changed.length } : entry,
+      ),
+    );
+    const changedCommit = commit(workspace.context, workspace.repo, { message: "changed" });
+    workspace.repo.store.setRef("refs/heads/changed", changedCommit.oid);
+    workspace.repo.store.setHead(base.oid);
+    workspace.repo.store.indexReplace(
+      originalIndex.map((entry) => ({ ...entry, mtime: null, ino: null, rev: null })),
+    );
+
+    class CloneCheckoutWorktree extends CountingWorktree {
+      writes: string[] = [];
+
+      override stat(path: string): never {
+        throw new Error(`scalar stat is forbidden during checkout: ${path}`);
+      }
+
+      override readFile(path: string): never {
+        throw new Error(`scalar readFile is forbidden during checkout: ${path}`);
+      }
+
+      override readlink(path: string): never {
+        throw new Error(`scalar readlink is forbidden during checkout: ${path}`);
+      }
+
+      override writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {
+        this.writes.push(...entries.map((entry) => entry.path));
+        super.writeFiles(entries, options);
+      }
+    }
+
+    const worktree = new CloneCheckoutWorktree(workspace.worktree);
+    workspace.storage.resetCounters();
+    checkout(workspace.context, workspace.repo, worktree, { ref: "changed" });
+
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(worktree.writes).toHaveLength(changedFiles);
+    expect(worktree.writes).toEqual(paths.slice(0, changedFiles).map((path) => `/${path}`));
+    expect(worktree.reads).toBe(0);
+    expect(worktree.rangeReads).toBe(0);
+    expect(worktree.bulkReadPaths).toEqual([]);
+    expect(
+      workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
+    ).toHaveLength(changedFiles);
+
+    worktree.writes.length = 0;
+    worktree.reads = 0;
+    worktree.rangeReads = 0;
+    worktree.bulkReadPaths.length = 0;
+    workspace.storage.resetCounters();
+    checkout(workspace.context, workspace.repo, worktree, { ref: base.oid, force: true });
+
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(worktree.writes).toHaveLength(changedFiles);
+    expect(worktree.writes).toEqual(paths.slice(0, changedFiles).map((path) => `/${path}`));
+    expect(worktree.reads).toBe(0);
+    expect(worktree.rangeReads).toBe(0);
+    expect(worktree.bulkReadPaths).toEqual([]);
+    expect(
+      workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
+    ).toHaveLength(0);
   });
 });
 
