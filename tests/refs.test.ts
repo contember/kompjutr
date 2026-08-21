@@ -3,7 +3,9 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { utf8, utf8Decoder } from "../src/core/bytes.js";
+import { fromHex, utf8, utf8Decoder } from "../src/core/bytes.js";
+import { checkoutTree } from "../src/core/ops/checkout.js";
+import { commit } from "../src/core/ops/commit.js";
 import {
   configGet,
   configSet,
@@ -27,6 +29,8 @@ import {
 } from "../src/core/ops/refs.js";
 import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import { joinPath } from "../src/core/paths.js";
+import type { WriteEntry, WriteOptions } from "../src/fs/types.js";
+import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import {
@@ -35,6 +39,7 @@ import {
   type TestRepository,
   writeWorkFile,
 } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 /**
  * Two branches whose trees differ by an added, a deleted and a modified
@@ -312,6 +317,114 @@ describe("checkout", () => {
     expect(ws.repo.head()).toEqual({ ref: null, oid: sideOid });
     expect(currentBranch(ws.repo)).toBeUndefined();
     expectSameTree();
+  });
+
+  it("switches between a file and a directory at the same path", async () => {
+    const transition = new GitFixture().init("main");
+    const workspace = makeRepo("/");
+    try {
+      transition.write("node/child.txt", "nested\n");
+      transition.commit("directory");
+      transition.git("checkout", "-q", "-b", "flat");
+      transition.git("rm", "-q", "-r", "node");
+      transition.write("node", "flat\n");
+      transition.commit("file");
+      transition.git("checkout", "-q", "main");
+      await importFixture(transition, workspace.repo.store);
+
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "flat", force: true });
+      expect(workspace.worktree.stat("/node")?.type).toBe("file");
+      expect(utf8Decoder.decode(workspace.worktree.readFile("/node"))).toBe("flat\n");
+
+      checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main", force: true });
+      expect(workspace.worktree.stat("/node")?.type).toBe("dir");
+      expect(utf8Decoder.decode(workspace.worktree.readFile("/node/child.txt"))).toBe("nested\n");
+    } finally {
+      transition.dispose();
+    }
+  });
+
+  it("materialises exactly 1,000 changes in bounded bulk operations", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Fixture");
+    workspace.repo.store.configSet("user.email", "fixture@example.com");
+    const original = utf8.encode("original\n");
+    const changed = utf8.encode("changed\n");
+    const originalOid = workspace.repo.store.write("blob", original);
+    const changedOid = workspace.repo.store.write("blob", changed);
+    const paths = Array.from({ length: 9_329 }, (_, index) => {
+      const directory = index % 3_346;
+      const generation = Math.floor(index / 3_346);
+      return `d${directory.toString().padStart(4, "0")}/f${generation
+        .toString()
+        .padStart(4, "0")}.txt`;
+    });
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes: original, contentId: fromHex(originalOid) })),
+    );
+    const stats = new Map(
+      workspace.worktree
+        .scan("/", { filesOnly: true, limit: paths.length + 1 })
+        .map((entry) => [entry.path.slice(1), entry]),
+    );
+    const originalIndex = paths.map((path): IndexEntry => {
+      const stat = stats.get(path);
+      if (stat === undefined) throw new Error(`scale path was not written: ${path}`);
+      return {
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: originalOid,
+        size: stat.size,
+        mtime: stat.mtime,
+        ino: stat.ino,
+      };
+    });
+    workspace.repo.store.indexReplace(originalIndex);
+    commit(workspace.context, workspace.repo, { message: "base" });
+    workspace.repo.store.indexReplace(
+      originalIndex.map((entry, index) =>
+        index < 1_000 ? { ...entry, oid: changedOid, size: changed.length } : entry,
+      ),
+    );
+    commit(workspace.context, workspace.repo, { message: "changed" });
+    const targetTree = workspace.repo.headTree();
+    workspace.repo.store.indexReplace(originalIndex);
+
+    class BulkCheckoutWorktree extends CountingWorktree {
+      writes: string[] = [];
+
+      override stat(path: string): never {
+        throw new Error(`scalar stat is forbidden during checkout: ${path}`);
+      }
+
+      override readFile(path: string): never {
+        throw new Error(`scalar readFile is forbidden during checkout: ${path}`);
+      }
+
+      override readlink(path: string): never {
+        throw new Error(`scalar readlink is forbidden during checkout: ${path}`);
+      }
+
+      override writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {
+        this.writes.push(...entries.map((entry) => entry.path));
+        super.writeFiles(entries, options);
+      }
+    }
+
+    const worktree = new BulkCheckoutWorktree(workspace.worktree);
+    workspace.storage.resetCounters();
+    checkoutTree(workspace.repo, worktree, targetTree);
+
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(200);
+    expect(worktree.writes).toHaveLength(1_000);
+    expect(new Set(worktree.writes)).toEqual(
+      new Set(paths.slice(0, 1_000).map((path) => `/${path}`)),
+    );
+    expect(
+      workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
+    ).toHaveLength(1_000);
   });
 });
 

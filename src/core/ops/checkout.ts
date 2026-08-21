@@ -1,14 +1,16 @@
 // Materialising a tree into the working tree, and keeping the SQL index in
 // step with it.
 
-import type { IndexEntry } from "../../sqlite/store.js";
+import type { BlobIdMapping, IndexEntry, IndexSink } from "../../sqlite/store.js";
 import { fromHex } from "../bytes.js";
+import { CorruptError, GitError } from "../errors.js";
 import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted } from "../streams.js";
+import { joinSorted, joinSorted3 } from "../streams.js";
 import { fileModeFor, type Worktree } from "../worktree.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
+import { indexMatchesStat, walkWorktreeEntriesStream } from "./worktree-io.js";
 
 export type { TargetEntry } from "./tree-stream.js";
 
@@ -42,6 +44,12 @@ export interface CheckoutOptions {
   prune?: boolean;
 }
 
+const CHECKOUT_WINDOW_ROWS = 1_000;
+const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
+const CHECKOUT_BLOB_BYTES = 3 * 1024 * 1024;
+const CHECKOUT_PATH_FIXED_BYTES = 96;
+const textDecoder = new TextDecoder();
+
 /**
  * Bring the working tree and the index to `treeOid`. Entries already
  * matching are left alone, so a checkout that changes one file touches one
@@ -53,42 +61,128 @@ export function checkoutTree(
   treeOid: string | null,
   options: CheckoutOptions = {},
 ): void {
-  // Target and index are both path-ordered, so one merge answers "what does
-  // this path look like on each side" without either existing as a map.
   const removed: string[] = [];
+
+  // Remove obsolete paths before writing replacements. This also handles a
+  // directory-to-file transition without retaining the whole target tree.
   repo.store.indexApply((sink) => {
+    let retainedBytes = 0;
     for (const row of joinSorted(treeStream(repo, treeOid), stageZero(repo.store.indexScan()), {
       left: (entry) => entry.path,
       right: (entry) => entry.path,
     })) {
       const entry = row.left;
       const existing = row.right;
-
-      if (entry === undefined) {
-        if (existing === undefined || options.prune === false) continue;
-        if (!matchesPaths(existing.path, options.paths)) continue;
-        worktree.unlink(joinPath(repo.root, existing.path));
-        removed.push(existing.path);
-        sink.remove(existing.path);
-        continue;
+      if (entry !== undefined || existing === undefined || options.prune === false) continue;
+      if (!matchesPaths(existing.path, options.paths)) continue;
+      retainedBytes += CHECKOUT_PATH_FIXED_BYTES + existing.path.length * 2;
+      if (retainedBytes > CHECKOUT_REMOVAL_BYTES) {
+        throw new GitError(
+          "E2BIG",
+          `checkout removal state exceeds ${CHECKOUT_REMOVAL_BYTES} bytes`,
+        );
       }
+      removed.push(existing.path);
+    }
+    for (let offset = 0; offset < removed.length; offset += CHECKOUT_WINDOW_ROWS) {
+      flushRemovals(repo, worktree, removed.slice(offset, offset + CHECKOUT_WINDOW_ROWS), sink);
+    }
+  });
+  if (removed.length > 0) pruneEmptyDirectories(repo, worktree, removed);
 
-      if (!matchesPaths(entry.path, options.paths)) continue;
+  const written: TargetEntry[] = [];
+  repo.store.indexApply((sink) => {
+    for (const row of joinSorted3(
+      treeStream(repo, treeOid),
+      stageZero(repo.store.indexScan()),
+      walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
+      { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
+    )) {
+      const entry = row.a;
+      if (entry === undefined || !matchesPaths(entry.path, options.paths)) continue;
       if (entry.mode === "160000") continue; // submodules are out of scope
-      const stat = worktree.stat(joinPath(repo.root, entry.path));
+      const existing = row.b;
       const unchanged =
         existing !== undefined &&
         existing.oid === entry.oid &&
         existing.mode === Number.parseInt(entry.mode, 8) &&
-        stat !== null &&
-        stat.size === existing.size &&
-        stat.mtime === existing.mtime;
+        row.c !== undefined &&
+        indexMatchesStat(existing, row.c.stat);
       if (unchanged) continue;
-      sink.put(writeEntry(repo, worktree, entry));
+      written.push(entry);
+      if (written.length >= CHECKOUT_WINDOW_ROWS) flushWrites(repo, worktree, written, sink);
     }
+    flushWrites(repo, worktree, written, sink);
   });
+}
 
-  if (removed.length > 0) pruneEmptyDirectories(repo, worktree, removed);
+function flushRemovals(
+  repo: Repository,
+  worktree: Worktree,
+  removed: string[],
+  sink: IndexSink,
+): void {
+  if (removed.length === 0) return;
+  worktree.removeFiles(removed.map((path) => joinPath(repo.root, path)));
+  for (const path of removed) sink.remove(path);
+  sink.flush();
+}
+
+function flushWrites(
+  repo: Repository,
+  worktree: Worktree,
+  entries: TargetEntry[],
+  sink: IndexSink,
+): void {
+  if (entries.length === 0) return;
+  let pending = entries.splice(0, entries.length);
+  while (pending.length > 0) {
+    const batch = repo.readBlobs(
+      pending.map((entry) => entry.oid),
+      {
+        budgetBytes: CHECKOUT_BLOB_BYTES,
+      },
+    );
+    const writes = [];
+    const indexEntries: IndexEntry[] = [];
+    const mappings: BlobIdMapping[] = [];
+    const deferred: TargetEntry[] = [];
+    for (const entry of pending) {
+      const data = batch.blobs.get(entry.oid);
+      if (data === undefined) {
+        deferred.push(entry);
+        continue;
+      }
+      const contentId = fromHex(entry.oid);
+      const absolute = joinPath(repo.root, entry.path);
+      writes.push(
+        entry.mode === "120000"
+          ? { path: absolute, target: textDecoder.decode(data), contentId }
+          : { path: absolute, bytes: data, mode: fileModeFor(entry.mode), contentId },
+      );
+      indexEntries.push({
+        path: entry.path,
+        stage: 0,
+        mode: Number.parseInt(entry.mode, 8),
+        oid: entry.oid,
+        size: data.length,
+        mtime: null,
+        ino: null,
+      });
+      mappings.push({ contentId, oid: entry.oid });
+    }
+    worktree.writeFiles(writes);
+    repo.store.upsertBlobIds(mappings);
+    for (const entry of indexEntries) {
+      sink.remove(entry.path);
+      sink.put(entry);
+    }
+    sink.flush();
+    if (deferred.length === pending.length) {
+      throw new CorruptError("checkout blob batch made no progress");
+    }
+    pending = deferred;
+  }
 }
 
 /** Conflict stages are not what a checkout replaces, and never were. */
@@ -142,7 +236,9 @@ function pruneEmptyDirectories(repo: Repository, worktree: Worktree, removed: st
   const deepestFirst = [...directories].sort((a, b) => b.split("/").length - a.split("/").length);
   for (const directory of deepestFirst) {
     const absolute = joinPath(repo.root, directory);
-    if (worktree.readdir(absolute).length === 0) worktree.rmdir(absolute);
+    if (worktree.stat(absolute)?.type === "dir" && worktree.readdir(absolute).length === 0) {
+      worktree.rmdir(absolute);
+    }
   }
 }
 
