@@ -61,7 +61,7 @@ function listOption(argv: string[], name: string): string[] | null {
 }
 
 function asBackend(value: string): Backend {
-  if (value === "dofs" || value === "sqlite") return value;
+  if (value === "sqlite") return value;
   throw new Error(`unknown backend: ${value}`);
 }
 
@@ -179,7 +179,7 @@ function parseRun(line: string): Run | null {
   if (typeof scenario !== "string" || typeof operation !== "string") return null;
   if (typeof variant !== "string") return null;
   if (typeof record.peakWasReset !== "boolean") return null;
-  if (backend !== "dofs" && backend !== "sqlite") return null;
+  if (backend !== "sqlite") return null;
   return {
     scenario,
     operation,
@@ -279,7 +279,7 @@ function table(outcomes: Outcome[]): string {
 }
 
 const options = parseOptions(process.argv.slice(2));
-const backends: Backend[] = options.backends ?? ["dofs", "sqlite"];
+const backends: Backend[] = options.backends ?? ["sqlite"];
 const scenarios =
   options.scenarios ??
   (options.smoke

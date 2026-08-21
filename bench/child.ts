@@ -33,7 +33,7 @@ function peakRssBytes(): number {
 }
 
 function asBackend(value: string | undefined): Backend {
-  if (value === "dofs" || value === "sqlite") return value;
+  if (value === "sqlite") return value;
   throw new Error(`unknown backend: ${String(value)}`);
 }
 

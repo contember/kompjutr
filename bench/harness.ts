@@ -1,39 +1,38 @@
-// The two clients under test, and the shape every scenario is written to.
+// The runtime under test, and the shape every scenario is written to.
 //
 // A scenario is a fixture plus an ordered list of measured phases. One
 // process runs one scenario, so a phase never pays for a previous
 // scenario's allocations; phases inside a scenario share the fixture, which
 // is what makes a six-operation macro suite affordable.
 
-import { Workspace } from "@cloudflare/computer";
-import type { GitClient, GitClientFactory } from "@cloudflare/computer/git";
-import { createGitClient } from "@cloudflare/computer/git";
-
-import { createSqliteGitClient } from "../src/compat/computer.js";
+import { createGit, type Git, Workspace } from "../src/index.js";
 import { SqliteTestStorage } from "../tests/helpers/storage.js";
 import { type FixtureName, isFixtureName } from "./fixtures.js";
 
-export type Backend = "dofs" | "sqlite";
+export type Backend = "sqlite";
 /** Flat puts every file in one directory; deep fans out, 20 per directory. */
 export type Shape = "flat" | "deep";
 /** What the cell varies: a synthetic tree shape, or a real repository. */
 export type Variant = Shape | FixtureName;
 
 export interface Harness {
-  git: GitClient;
+  git: Git;
   workspace: Workspace;
   storage: SqliteTestStorage;
 }
 
 const IDENTITY = { name: "Bench", email: "bench@example.com" };
 
-export function harness(backend: Backend): Harness {
-  const factory: GitClientFactory =
-    backend === "dofs" ? createGitClient() : createSqliteGitClient();
+export function harness(_backend: Backend): Harness {
   const storage = new SqliteTestStorage();
   const now = (): number => 1_577_836_800_000;
-  const workspace = new Workspace({ storage, now, git: factory });
-  return { git: factory({ ws: workspace, defaultIdentity: IDENTITY }), workspace, storage };
+  const workspace = new Workspace({
+    storage,
+    now,
+    git: createGit(),
+    defaultGitIdentity: IDENTITY,
+  });
+  return { git: workspace.git, workspace, storage };
 }
 
 export interface ScenarioContext {
