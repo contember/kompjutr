@@ -12,12 +12,21 @@ import { isBinary } from "../diff/lines.js";
 import { CorruptError, GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import type { SparseWorkspaceRow, SparseWorkspaceSource } from "../sparse-workspace.js";
-import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
+import type { SparseWorkspaceSource } from "../sparse-workspace.js";
+import { joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { matchesPaths, stageZero } from "./checkout.js";
+import {
+  compareIdentities,
+  type DiffOptions,
+  type EndpointIdentity,
+  type PendingChange,
+  treeIdentity,
+  type WorkingCandidate,
+} from "./diff-internal.js";
 import type { DiffSummaryEntry } from "./kinds.js";
 import { treeOf } from "./reads.js";
+import { sparseCommitPair, sparseWorkingCandidates } from "./sparse-diff.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
   hashExactWorktreePaths,
@@ -32,22 +41,8 @@ const DEFAULT_ABBREV = 7;
 const DIFF_WINDOW_ROWS = 1000;
 const DIFF_REPOSITORY_BYTES = 8 * 1024 * 1024;
 const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
-const SPARSE_DIFF_PATHS = 1000;
-const SPARSE_DIFF_RETAINED_BYTES = 16 * 1024 * 1024;
-const SPARSE_DIFF_ROW_BYTES = 1024;
 
-export interface DiffOptions {
-  /** The "from" side. Defaults to HEAD. */
-  ref?: string;
-  /** The "to" side. Set it to diff two commits instead of the working tree. */
-  to?: string;
-  /** Exact-or-directory-prefix path filter. No globs. */
-  paths?: string[];
-  /** Context lines around each hunk. */
-  context?: number;
-  /** Length of the abbreviated oids on `index` lines. */
-  abbrev?: number;
-}
+export type { DiffOptions } from "./diff-internal.js";
 
 /** One side of a file's change; null means the file is absent there. */
 interface Endpoint {
@@ -60,25 +55,6 @@ interface FileChange {
   path: string;
   before: Endpoint | null;
   after: Endpoint | null;
-}
-
-interface EndpointIdentity {
-  mode: string;
-  oid: string;
-  worktree: WorktreePath | null;
-}
-
-interface PendingChange {
-  path: string;
-  before: EndpointIdentity | null;
-  after: EndpointIdentity | null;
-}
-
-interface WorkingCandidate {
-  path: string;
-  before: TargetEntry | undefined;
-  index: IndexEntry | undefined;
-  worktree: WorktreePath | undefined;
 }
 
 export function diff(
@@ -250,133 +226,6 @@ function* collect(
   yield* resolveWorkingCandidates(repo, worktree, candidates);
 }
 
-function sparseCommitPair(
-  repo: Repository,
-  beforeTreeOid: string | null,
-  afterTreeOid: string | null,
-  options: DiffOptions,
-): PendingChange[] | null {
-  const changes: PendingChange[] = [];
-  let matchingEntries = 0;
-  let retainedBytes = 0;
-  try {
-    for (const entry of repo.walkTreeDiff(beforeTreeOid, afterTreeOid)) {
-      if (!matchesPaths(entry.path, options.paths)) continue;
-      if (matchingEntries >= SPARSE_DIFF_PATHS) return null;
-      matchingEntries++;
-      retainedBytes += SPARSE_DIFF_ROW_BYTES + utf8.encode(entry.path).length;
-      if (retainedBytes > SPARSE_DIFF_RETAINED_BYTES) return null;
-      const change = compareIdentities(
-        entry.path,
-        treePartsIdentity(entry.beforeMode, entry.beforeOid),
-        treePartsIdentity(entry.afterMode, entry.afterOid),
-      );
-      if (change !== null) changes.push(change);
-    }
-  } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) return null;
-    throw error;
-  }
-  return changes;
-}
-
-function sparseWorkingCandidates(
-  repo: Repository,
-  source: SparseWorkspaceSource,
-  currentTreeOid: string | null,
-  options: DiffOptions,
-): WorkingCandidate[] | null {
-  try {
-    const state = source.readState(repo.store.repoId);
-    if (!state.available) return null;
-    const paths = sparseWorkingPaths(
-      repo,
-      source.dirtyPaths(repo.store.repoId),
-      state.baselineTreeOid,
-      currentTreeOid,
-      options.paths,
-    );
-    if (paths === null) return null;
-    if (paths.length === 0) return [];
-
-    const hydrated = source.hydrate({
-      repoId: repo.store.repoId,
-      root: repo.root,
-      baselineTreeOid: state.baselineTreeOid,
-      currentTreeOid,
-      paths,
-    });
-    if (!hydrated.available) return null;
-    if (hydrated.rows.length !== paths.length) {
-      throw new CorruptError("sparse diff hydration returned the wrong row count");
-    }
-
-    const candidates: WorkingCandidate[] = [];
-    for (let ordinal = 0; ordinal < paths.length; ordinal++) {
-      const path = paths[ordinal];
-      const row = hydrated.rows[ordinal];
-      if (path === undefined || row === undefined || row.path !== path) {
-        throw new CorruptError("sparse diff hydration returned unordered rows");
-      }
-      const stage = row.index.find((entry) => entry.stage === 0);
-      if (row.current === null && stage === undefined) continue;
-      candidates.push({
-        path,
-        before: sparseTarget(path, row),
-        index: stage !== undefined && stage.mode !== 0o160000 ? stage : undefined,
-        worktree: sparseWorktreePath(row),
-      });
-    }
-    return candidates;
-  } catch (error) {
-    if (hasErrorCode(error, "E2BIG")) return null;
-    throw error;
-  }
-}
-
-function sparseWorkingPaths(
-  repo: Repository,
-  dirty: Iterable<{ path: string }>,
-  baselineTreeOid: string | null,
-  currentTreeOid: string | null,
-  pathspecs: string[] | undefined,
-): string[] | null {
-  const paths = new Set<string>();
-  let retainedBytes = 0;
-  const add = (path: string): boolean => {
-    if (!matchesPaths(path, pathspecs) || paths.has(path)) return true;
-    retainedBytes += SPARSE_DIFF_ROW_BYTES + utf8.encode(path).length;
-    if (paths.size >= SPARSE_DIFF_PATHS || retainedBytes > SPARSE_DIFF_RETAINED_BYTES) return false;
-    paths.add(path);
-    return true;
-  };
-  for (const entry of dirty) {
-    if (!add(entry.path)) return null;
-  }
-  for (const entry of repo.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
-    if (!add(entry.path)) return null;
-  }
-  return [...paths].sort(comparePaths);
-}
-
-function sparseTarget(path: string, row: SparseWorkspaceRow): TargetEntry | undefined {
-  return row.current === null ? undefined : { path, mode: row.current.mode, oid: row.current.oid };
-}
-
-function sparseWorktreePath(row: SparseWorkspaceRow): WorktreePath | undefined {
-  if (row.worktree === null || row.worktree.type === "dir") return undefined;
-  return { path: row.path, stat: row.worktree };
-}
-
-function treePartsIdentity(mode: string | null, oid: string | null): EndpointIdentity | null {
-  if (mode === null || oid === null || mode === "160000") return null;
-  return { mode, oid, worktree: null };
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
 function* resolveWorkingCandidates(
   repo: Repository,
   worktree: Worktree,
@@ -458,25 +307,6 @@ function cachedWorktreeOid(
 ): string | null {
   if (entry === undefined || worktree === undefined || worktree.stat.type === "dir") return null;
   return indexMatchesStat(entry, worktree.stat) ? entry.oid : null;
-}
-
-/** A change, or null when the two identities agree or neither exists. */
-function compareIdentities(
-  path: string,
-  before: EndpointIdentity | null,
-  after: EndpointIdentity | null,
-): PendingChange | null {
-  if (before === null && after === null) return null;
-  if (before !== null && after !== null && before.oid === after.oid && before.mode === after.mode) {
-    return null;
-  }
-  return { path, before, after };
-}
-
-function treeIdentity(entry: TargetEntry | undefined): EndpointIdentity | null {
-  // Submodules are out of scope.
-  if (entry === undefined || entry.mode === "160000") return null;
-  return { mode: entry.mode, oid: entry.oid, worktree: null };
 }
 
 function* hydrateChanges(
