@@ -58,6 +58,39 @@ class FakeProcessHandle extends ReadableStream<ProcessEvent> implements ProcessH
 }
 
 describe("Workspace", () => {
+  it("installs Git and cross-schema tracking only when Git is requested", () => {
+    const workspace = new Workspace({ storage: new SqliteTestStorage(), git: createGit() });
+
+    expect(
+      workspace.db.scalar<number>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'git_%'",
+      ),
+    ).toBe(0);
+    expect(
+      workspace.db.scalar<number>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'index_tracker_%'",
+      ),
+    ).toBe(0);
+
+    workspace.git;
+    expect(
+      workspace.db.scalar<number>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'index_tracker_%'",
+      ),
+    ).toBe(16);
+  });
+
+  it("keeps filesystem-only workspaces free of Git schema", async () => {
+    const workspace = new Workspace({ storage: new SqliteTestStorage() });
+    await workspace.fs.writeFile("/file.txt", "content");
+
+    expect(
+      workspace.db.scalar<number>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'trigger') AND name LIKE 'git_%'",
+      ),
+    ).toBe(0);
+  });
+
   it("shares one database across the native filesystem and Git client", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({

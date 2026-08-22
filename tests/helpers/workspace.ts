@@ -4,6 +4,7 @@ import type { Repository } from "../../src/core/repository.js";
 import { NodeFsCompat } from "../../src/fs/compat/node.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
+import { initializeIndexTracker } from "../../src/sqlite/index-tracker.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../src/sqlite/store.js";
 import { TestDatabase } from "./db.js";
 import { SqliteTestStorage } from "./storage.js";
@@ -33,6 +34,7 @@ export function makeWorkspace(options: MakeWorkspaceOptions = {}): TestWorkspace
   const worktree = createFilesystem(db, { now });
   const workspace = { fs: new NodeFsCompat(worktree) };
   const database = new SqliteGitDatabase(db, options);
+  initializeIndexTracker(db);
   const context: GitContext = {
     database,
     worktree,

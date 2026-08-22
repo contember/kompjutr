@@ -68,6 +68,8 @@ describe("repository registry", () => {
       "git_commits",
       "git_config",
       "git_index",
+      "git_index_dirty",
+      "git_index_state",
       "git_meta",
       "git_object_chunks",
       "git_objects",
@@ -82,6 +84,15 @@ describe("repository registry", () => {
       "git_tree_entries",
       "git_tree_sources",
     ]);
+  });
+
+  it("does not install cross-schema triggers in a Git-only database", () => {
+    const database = new SqliteGitDatabase(new TestDatabase());
+    expect(
+      database.db.scalar<number>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'index_tracker_%'",
+      ),
+    ).toBe(0);
   });
 
   it("shares one 8 MiB object cache across repositories", () => {

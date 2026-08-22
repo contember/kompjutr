@@ -4,7 +4,15 @@ import { utf8Decoder } from "../src/core/bytes.js";
 import { nestedRoots } from "../src/core/context.js";
 import { initRepository } from "../src/core/ops/init.js";
 import { walkWorktree } from "../src/core/ops/worktree-io.js";
+import {
+  INDEX_DIRTY,
+  iterateIndexTrackerDirty,
+  readIndexTrackerState,
+  resealIndexTracker,
+} from "../src/sqlite/index-tracker.js";
 import { makeRepo, makeWorkspace, writeWorkFile } from "./helpers/workspace.js";
+
+const TREE = "1".repeat(40);
 
 describe("workspace fixture", () => {
   it("puts the git state in SQL and the working tree in DOFS", async () => {
@@ -17,6 +25,9 @@ describe("workspace fixture", () => {
     expect(
       workspace.storage.sql.exec<{ root: string }>("SELECT root FROM git_repositories").toArray(),
     ).toEqual([{ root: "/" }]);
+    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+      available: false,
+    });
   });
 
   it("refuses to initialise the same root twice", () => {
@@ -45,5 +56,62 @@ describe("workspace fixture", () => {
     workspace.storage.resetCounters();
     workspace.repo.store.getRef("refs/heads/main");
     expect(workspace.storage.statementCount).toBe(1);
+  });
+
+  it("removes tracker state before destroying a sealed repository", () => {
+    const workspace = makeRepo("/");
+    const repoId = workspace.repo.store.repoId;
+    expect(
+      resealIndexTracker(workspace.database.db, repoId, TREE, [
+        { path: "old.txt", flags: INDEX_DIRTY },
+      ]),
+    ).toBe(true);
+
+    workspace.repo.store.destroy();
+
+    expect(
+      workspace.database.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_index_dirty WHERE repo_id = ?",
+        repoId,
+      ),
+    ).toBe(0);
+    expect(
+      workspace.database.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_index_state WHERE repo_id = ?",
+        repoId,
+      ),
+    ).toBe(0);
+  });
+
+  it("invalidates the parent tracker when a nested repository is destroyed", () => {
+    const workspace = makeRepo("/");
+    workspace.worktree.mkdir("/nested");
+    const nested = initRepository(workspace.context, { dir: "/nested" });
+    expect(resealIndexTracker(workspace.database.db, workspace.repo.store.repoId, TREE, [])).toBe(
+      true,
+    );
+    expect(resealIndexTracker(workspace.database.db, nested.store.repoId, TREE, [])).toBe(true);
+
+    nested.store.destroy();
+
+    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+      available: false,
+    });
+  });
+
+  it("starts a reused repository id with clean incomplete tracker state", () => {
+    const workspace = makeRepo("/");
+    const repoId = workspace.repo.store.repoId;
+    expect(
+      resealIndexTracker(workspace.database.db, repoId, TREE, [
+        { path: "old.txt", flags: INDEX_DIRTY },
+      ]),
+    ).toBe(true);
+    workspace.repo.store.destroy();
+
+    const replacement = initRepository(workspace.context, { dir: "/replacement" });
+    expect(replacement.store.repoId).toBe(repoId);
+    expect(readIndexTrackerState(workspace.database.db, repoId)).toEqual({ available: false });
+    expect([...iterateIndexTrackerDirty(workspace.database.db, repoId)]).toEqual([]);
   });
 });

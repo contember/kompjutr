@@ -6,6 +6,7 @@ import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory } from "../git/client.js";
 import { Database, type DurableObjectStorageLike } from "../sqlite/db.js";
+import { initializeIndexTracker } from "../sqlite/index-tracker.js";
 import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
 import type { ProcessExecOptions, ProcessHandle, ProcessHost } from "./types.js";
 
@@ -46,6 +47,7 @@ export class Workspace {
     }
     if (this.#git === undefined) {
       this.#gitDatabase = new SqliteGitDatabase(this.db, this.#options);
+      initializeIndexTracker(this.db);
       const now = this.#options.now ?? Date.now;
       const binding = {
         database: this.#gitDatabase,

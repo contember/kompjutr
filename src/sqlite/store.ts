@@ -3061,6 +3061,8 @@ export class RepoStore {
   destroy(): void {
     this.#db.transactionSync(() => {
       for (const table of [
+        "git_index_dirty",
+        "git_index_state",
         "git_refs",
         "git_blob_ids",
         "git_config",
