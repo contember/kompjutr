@@ -1,4 +1,10 @@
-import { type GitContext, type GitIdentity, nestedRoots, openRepository } from "../core/context.js";
+import {
+  type GitContext,
+  type GitIdentity,
+  type InitialWorktreeWriter,
+  nestedRoots,
+  openRepository,
+} from "../core/context.js";
 import { UnsupportedOperationError } from "../core/errors.js";
 import { type CommitOptions, commit as commitOp } from "../core/ops/commit.js";
 import {
@@ -152,6 +158,7 @@ export interface Git {
 export interface GitWorkspaceBinding {
   database: SqliteGitDatabase;
   worktree: Worktree;
+  initialWorktree?: InitialWorktreeWriter;
   now: () => number;
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;
@@ -181,6 +188,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   };
   if (binding.defaultIdentity !== undefined) context.defaultIdentity = binding.defaultIdentity;
   if (binding.http !== undefined) context.http = binding.http;
+  if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
   const yieldNow = options.yieldNow ?? binding.yieldNow;
   if (yieldNow !== undefined) context.yieldNow = yieldNow;
 

@@ -10,10 +10,39 @@ export interface GitIdentity {
   email: string;
 }
 
+export interface InitialWorktreeWriteOptions {
+  mode?: number;
+  contentId?: Uint8Array;
+}
+
+export interface InitialWorktreeSymlinkOptions {
+  mode?: number;
+  contentId?: Uint8Array;
+}
+
+export interface InitialWorktreeSession {
+  writeSymlink(path: string, target: string, options?: InitialWorktreeSymlinkOptions): void;
+  writeFile(path: string, bytes: Uint8Array, options?: InitialWorktreeWriteOptions): void;
+  writeFileStream(
+    path: string,
+    size: number,
+    chunks: Iterable<Uint8Array>,
+    options?: InitialWorktreeWriteOptions,
+  ): void;
+}
+
+export type InitialWorktreeResult<T> = { kind: "committed"; value: T } | { kind: "unavailable" };
+
+/** Optional clone-only bulk writer. Core depends only on this structural seam. */
+export interface InitialWorktreeWriter {
+  tryRun<T>(root: string, body: (session: InitialWorktreeSession) => T): InitialWorktreeResult<T>;
+}
+
 /** Everything the commands need that is not the repository itself. */
 export interface GitContext {
   database: SqliteGitDatabase;
   worktree: Worktree;
+  initialWorktree?: InitialWorktreeWriter;
   http?: GitHttpClient;
   now: () => number;
   /** Minutes west of UTC, for commit timestamps. */

@@ -6,8 +6,10 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import type { GitContext } from "../context.js";
-import { AlreadyInitializedError, GitError } from "../errors.js";
+import type { InitialStateSession } from "../../sqlite/store.js";
+import { fromHex } from "../bytes.js";
+import type { GitContext, InitialWorktreeSession } from "../context.js";
+import { AlreadyInitializedError, CorruptError, GitError } from "../errors.js";
 import { normalizePath } from "../paths.js";
 import { type MessageCallback, type ProgressCallback, progressSink } from "../protocol/progress.js";
 import {
@@ -19,10 +21,17 @@ import {
 } from "../protocol/remote.js";
 import type { AuthCallback } from "../protocol/transport.js";
 import { Repository } from "../repository.js";
+import { fileModeFor } from "../worktree.js";
 import { checkoutTree } from "./checkout.js";
+import { type TargetEntry, treeStream } from "./tree-stream.js";
 
 /** How many commits back from each local tip are offered as `have`s. */
 const HAVE_BUDGET = 256;
+const INITIAL_CLONE_WINDOW_ROWS = 1_000;
+const INITIAL_CLONE_BLOB_BYTES = 3 * 1024 * 1024;
+const INITIAL_CLONE_SMALL_FILE_BYTES = 1024 * 1024;
+const INITIAL_CLONE_READ_FALLBACK = Symbol("initial clone blob exceeds batch budget");
+const initialCloneTextDecoder = new TextDecoder();
 
 export interface RemoteAuthOptions {
   headers?: Record<string, string>;
@@ -222,6 +231,109 @@ export async function fetchInto(
   };
 }
 
+function directErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const code = Reflect.get(error, "code");
+  return typeof code === "string" ? code : undefined;
+}
+
+function readInitialCloneBlobs(repo: Repository, entries: readonly TargetEntry[]) {
+  try {
+    return repo.readBlobs(
+      entries.map((entry) => entry.oid),
+      { budgetBytes: INITIAL_CLONE_BLOB_BYTES },
+    );
+  } catch (error) {
+    if (directErrorCode(error) === "EFBIG") throw INITIAL_CLONE_READ_FALLBACK;
+    throw error;
+  }
+}
+
+function writeInitialCloneEntry(
+  worktree: InitialWorktreeSession,
+  index: InitialStateSession,
+  entry: TargetEntry,
+  data: Uint8Array,
+): void {
+  const contentId = fromHex(entry.oid);
+  if (entry.mode === "120000") {
+    worktree.writeSymlink(entry.path, initialCloneTextDecoder.decode(data), { contentId });
+  } else if (data.length <= INITIAL_CLONE_SMALL_FILE_BYTES) {
+    worktree.writeFile(entry.path, data, { mode: fileModeFor(entry.mode), contentId });
+  } else {
+    worktree.writeFileStream(entry.path, data.length, [data], {
+      mode: fileModeFor(entry.mode),
+      contentId,
+    });
+  }
+  index.put({
+    path: entry.path,
+    stage: 0,
+    mode: Number.parseInt(entry.mode, 8),
+    oid: entry.oid,
+    size: data.length,
+    mtime: null,
+    ino: null,
+  });
+  index.addBlobId({ contentId, oid: entry.oid });
+}
+
+function flushInitialCloneWindow(
+  repo: Repository,
+  worktree: InitialWorktreeSession,
+  index: InitialStateSession,
+  window: TargetEntry[],
+): void {
+  let pending = window.splice(0, window.length);
+  while (pending.length > 0) {
+    const { blobs } = readInitialCloneBlobs(repo, pending);
+    let processed = 0;
+    while (processed < pending.length) {
+      const entry = pending[processed]!;
+      const data = blobs.get(entry.oid);
+      if (data === undefined) break;
+      writeInitialCloneEntry(worktree, index, entry, data);
+      processed++;
+    }
+    if (processed === 0) throw new CorruptError("initial clone blob batch made no progress");
+    pending = pending.slice(processed);
+  }
+}
+
+function writeInitialClone(
+  repo: Repository,
+  treeOid: string,
+  worktree: InitialWorktreeSession,
+  index: InitialStateSession,
+): void {
+  const window: TargetEntry[] = [];
+  for (const entry of treeStream(repo, treeOid)) {
+    if (entry.mode === "160000") continue;
+    window.push(entry);
+    if (window.length === INITIAL_CLONE_WINDOW_ROWS) {
+      flushInitialCloneWindow(repo, worktree, index, window);
+    }
+  }
+  flushInitialCloneWindow(repo, worktree, index, window);
+}
+
+function tryInitialClone(context: GitContext, repo: Repository, treeOid: string): boolean {
+  const writer = context.initialWorktree;
+  if (writer === undefined) return false;
+  try {
+    const worktree = writer.tryRun(repo.root, (worktreeSession) => {
+      const state = repo.store.tryCreateInitialState((indexSession) => {
+        writeInitialClone(repo, treeOid, worktreeSession, indexSession);
+      });
+      return state.available;
+    });
+    return worktree.kind === "committed" && worktree.value;
+  } catch (error) {
+    if (error === INITIAL_CLONE_READ_FALLBACK) return false;
+    throw error;
+  }
+}
+
 export async function clone(context: GitContext, options: CloneOptions): Promise<void> {
   const root = normalizePath(options.dir ?? "/");
   if (context.database.at(root) !== null) throw new AlreadyInitializedError(root);
@@ -259,9 +371,13 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
       repo.store.configSet(`branch.${branch}.merge`, `refs/heads/${branch}`);
     });
 
-    checkoutTree(repo, context.worktree, repo.readCommit(repo.peel(tip)).tree, {
-      ...(options.paths === undefined ? {} : { paths: options.paths }),
-    });
+    const tree = repo.readCommit(repo.peel(tip)).tree;
+    const initial = options.paths === undefined && tryInitialClone(context, repo, tree);
+    if (!initial) {
+      checkoutTree(repo, context.worktree, tree, {
+        ...(options.paths === undefined ? {} : { paths: options.paths }),
+      });
+    }
   } catch (error) {
     // A clone that fails leaves nothing behind: the destination had no
     // repository before the call, so removing ours restores that.

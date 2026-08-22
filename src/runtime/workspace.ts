@@ -2,6 +2,7 @@ import type { GitIdentity } from "../core/context.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import { NodeFsCompat } from "../fs/compat/node.js";
 import { createFilesystem } from "../fs/filesystem.js";
+import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory } from "../git/client.js";
 import { Database, type DurableObjectStorageLike } from "../sqlite/db.js";
@@ -45,10 +46,12 @@ export class Workspace {
     }
     if (this.#git === undefined) {
       this.#gitDatabase = new SqliteGitDatabase(this.db, this.#options);
+      const now = this.#options.now ?? Date.now;
       const binding = {
         database: this.#gitDatabase,
         worktree: this.filesystem,
-        now: this.#options.now ?? Date.now,
+        initialWorktree: createInitialWorktreeWriter(this.db, now),
+        now,
         timezoneOffset: this.#options.timezoneOffset ?? (() => 0),
         defaultIdentity: this.#options.defaultGitIdentity,
         http: this.#options.http,
