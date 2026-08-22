@@ -9,7 +9,7 @@ import { createGit, type GitFactory } from "../src/git/client.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../src/sqlite/db.js";
 import { readBlob } from "../src/sqlite/db.js";
-import { WALK_TREE_SQL } from "../src/sqlite/store.js";
+import { MAX_BLOB_BATCH_BYTES, WALK_TREE_SQL } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
@@ -115,8 +115,8 @@ describe("clone initial-state fast path", () => {
 
   it("processes only the contiguous path prefix when an oid repeats after a deferred blob", async () => {
     const fixture = new GitFixture().init();
-    const first = randomBytes(2 * 1024 * 1024);
-    const second = randomBytes(2 * 1024 * 1024);
+    const first = randomBytes(2 * 1024 * 1024 + 1);
+    const second = randomBytes(2 * 1024 * 1024 + 1);
     fixture.write("a.bin", first);
     fixture.write("b.bin", second);
     fixture.write("c.bin", first);
@@ -142,12 +142,40 @@ describe("clone initial-state fast path", () => {
     }
   });
 
+  it("keeps a 4,012,235-byte blob on the initial clone path", async () => {
+    const fixture = new GitFixture().init();
+    const large = new Uint8Array(4_012_235).fill(0x61);
+    fixture.write("large.bin", large);
+    fixture.write("small.txt", "small\n");
+    fixture.commit("large initial blob");
+    const server = await startGitServer(fixture.dir);
+    const storage = new RecordingStorage();
+    const workspace = makeRuntime(storage);
+    const git = workspace.git;
+    storage.resetCounters();
+
+    try {
+      await git.clone({ url: server.url, dir: "/repo" });
+
+      const actual = await workspace.fs.readFile("/repo/large.bin");
+      if (typeof actual === "string") throw new Error("large blob read returned text");
+      expect(equalBytes(actual, large)).toBe(true);
+      expect(await workspace.fs.readFile("/repo/small.txt", "utf8")).toBe("small\n");
+      expect(count(workspace, "git_index")).toBe(2);
+      expect(storage.walkStatements).toBe(1);
+      expect(await git.status({ dir: "/repo" })).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("rolls back a late oversized batch and completes through ordinary checkout", async () => {
     const fixture = new GitFixture().init();
     for (let index = 0; index < 1_100; index++) {
       fixture.write(`file-${String(index).padStart(4, "0")}.txt`, "same\n");
     }
-    const large = randomBytes(3 * 1024 * 1024 + 1);
+    const large = randomBytes(MAX_BLOB_BATCH_BYTES + 1);
     fixture.write("zz-large.bin", large);
     fixture.commit("late oversized blob");
     const server = await startGitServer(fixture.dir);

@@ -6,7 +6,7 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import type { InitialStateSession } from "../../sqlite/store.js";
+import { type InitialStateSession, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { fromHex } from "../bytes.js";
 import type { GitContext, InitialWorktreeSession } from "../context.js";
 import { AlreadyInitializedError, CorruptError, GitError } from "../errors.js";
@@ -28,7 +28,7 @@ import { type TargetEntry, treeStream } from "./tree-stream.js";
 /** How many commits back from each local tip are offered as `have`s. */
 const HAVE_BUDGET = 256;
 const INITIAL_CLONE_WINDOW_ROWS = 1_000;
-const INITIAL_CLONE_BLOB_BYTES = 3 * 1024 * 1024;
+const INITIAL_CLONE_BLOB_BYTES = MAX_BLOB_BATCH_BYTES;
 const INITIAL_CLONE_SMALL_FILE_BYTES = 1024 * 1024;
 const INITIAL_CLONE_READ_FALLBACK = Symbol("initial clone blob exceeds batch budget");
 const initialCloneTextDecoder = new TextDecoder();
