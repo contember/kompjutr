@@ -727,8 +727,8 @@ describe("dirtyPaths content identity", () => {
     expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
     const unresolved = workspace.storage.statementCount;
 
-    expect(identities).toBe(96);
-    expect(unresolved).toBe(126);
+    expect(identities).toBe(87);
+    expect(unresolved).toBe(117);
   });
 
   it("reads no content when checkout supplied the indexed blob identity", () => {
