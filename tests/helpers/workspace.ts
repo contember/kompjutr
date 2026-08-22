@@ -5,6 +5,7 @@ import { NodeFsCompat } from "../../src/fs/compat/node.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
 import { initializeIndexTracker } from "../../src/sqlite/index-tracker.js";
+import { createSqliteSparseWorkspaceSource } from "../../src/sqlite/sparse-workspace.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../src/sqlite/store.js";
 import { TestDatabase } from "./db.js";
 import { SqliteTestStorage } from "./storage.js";
@@ -38,6 +39,7 @@ export function makeWorkspace(options: MakeWorkspaceOptions = {}): TestWorkspace
   const context: GitContext = {
     database,
     worktree,
+    sparseWorkspace: createSqliteSparseWorkspaceSource(db),
     now,
     timezoneOffset: () => options.timezoneOffset ?? 0,
   };

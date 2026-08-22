@@ -3,6 +3,7 @@ import { NotARepositoryError } from "./errors.js";
 import { normalizePath } from "./paths.js";
 import type { GitHttpClient } from "./protocol/transport.js";
 import { Repository } from "./repository.js";
+import type { SparseWorkspaceSource } from "./sparse-workspace.js";
 import type { Worktree } from "./worktree.js";
 
 export interface GitIdentity {
@@ -62,6 +63,7 @@ export interface GitContext {
   worktree: Worktree;
   initialWorktree?: InitialWorktreeWriter;
   indexTracker?: IndexTrackerWriter;
+  sparseWorkspace?: SparseWorkspaceSource;
   http?: GitHttpClient;
   now: () => number;
   /** Minutes west of UTC, for commit timestamps. */

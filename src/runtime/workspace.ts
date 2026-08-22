@@ -7,6 +7,7 @@ import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory } from "../git/client.js";
 import { Database, type DurableObjectStorageLike } from "../sqlite/db.js";
 import { initializeIndexTracker, resealIndexTracker } from "../sqlite/index-tracker.js";
+import { createSqliteSparseWorkspaceSource } from "../sqlite/sparse-workspace.js";
 import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
 import type { ProcessExecOptions, ProcessHandle, ProcessHost } from "./types.js";
 
@@ -58,6 +59,7 @@ export class Workspace {
         worktree: this.filesystem,
         initialWorktree: createInitialWorktreeWriter(this.db, now),
         indexTracker,
+        sparseWorkspace: createSqliteSparseWorkspaceSource(this.db),
         now,
         timezoneOffset: this.#options.timezoneOffset ?? (() => 0),
         defaultIdentity: this.#options.defaultGitIdentity,

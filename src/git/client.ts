@@ -79,6 +79,7 @@ import {
 import { type CleanOptions, clean as cleanOp, status as statusOp } from "../core/ops/status.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import type { Repository } from "../core/repository.js";
+import type { SparseWorkspaceSource } from "../core/sparse-workspace.js";
 import type { Worktree } from "../core/worktree.js";
 import type { SqliteGitDatabase } from "../sqlite/store.js";
 
@@ -161,6 +162,7 @@ export interface GitWorkspaceBinding {
   worktree: Worktree;
   initialWorktree?: InitialWorktreeWriter;
   indexTracker?: IndexTrackerWriter;
+  sparseWorkspace?: SparseWorkspaceSource;
   now: () => number;
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;
@@ -192,6 +194,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.http !== undefined) context.http = binding.http;
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
   if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
+  if (binding.sparseWorkspace !== undefined) context.sparseWorkspace = binding.sparseWorkspace;
   const yieldNow = options.yieldNow ?? binding.yieldNow;
   if (yieldNow !== undefined) context.yieldNow = yieldNow;
 
