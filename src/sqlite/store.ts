@@ -2305,16 +2305,6 @@ export class RepoStore {
     );
   }
 
-  /** True when the stage-zero index contains a gitlink. */
-  hasGitlinks(): boolean {
-    return (
-      (this.#db.scalar<number>(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM git_index WHERE repo_id = ? AND stage = 0 AND mode = 57344 LIMIT 1)",
-        this.#repoId,
-      ) ?? 0) > 0
-    );
-  }
-
   /** True when checkout would encounter a merge stage or stage-zero gitlink. */
   hasCheckoutBlockingIndexEntries(): boolean {
     return (

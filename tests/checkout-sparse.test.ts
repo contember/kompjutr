@@ -575,7 +575,6 @@ describe("sparse checkout", () => {
       ino: null,
     });
     seal(gitlinked.workspace);
-    expect(gitlinked.workspace.repo.store.hasGitlinks()).toBe(true);
     const gitlinkWorktree = new NoScanWorktree(gitlinked.workspace.worktree);
     expect(() =>
       checkout(trackerContext(gitlinked.workspace), gitlinked.workspace.repo, gitlinkWorktree, {
