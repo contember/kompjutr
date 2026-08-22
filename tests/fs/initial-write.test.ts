@@ -99,13 +99,12 @@ function relativeSnapshot(db: SqlDatabase, root: string): object[] {
 class RecordingDatabase implements SqlDatabase {
   widestBlob = 0;
   widestString = 0;
+  contentWrites = 0;
 
   constructor(
     private readonly inner: SqlDatabase,
     private readonly failContentAt: number | null = null,
   ) {}
-
-  #contentWrites = 0;
 
   #record(bindings: unknown[]): void {
     for (const binding of bindings) {
@@ -120,8 +119,8 @@ class RecordingDatabase implements SqlDatabase {
   run(query: string, ...bindings: unknown[]): void {
     this.#record(bindings);
     if (query.includes("INSERT INTO fs_chunks")) {
-      this.#contentWrites++;
-      if (this.#contentWrites === this.failContentAt) throw new Error("injected content failure");
+      this.contentWrites++;
+      if (this.contentWrites === this.failContentAt) throw new Error("injected content failure");
     }
     this.inner.run(query, ...bindings);
   }
@@ -288,7 +287,8 @@ describe("InitialWorktreeWriter", () => {
       { idx: 5, size: 512 * 1024 },
       { idx: 6, size: 123 },
     ]);
-    expect(db.widestBlob).toBeLessThanOrEqual(1024 * 1024);
+    expect(db.contentWrites).toBe(4);
+    expect(db.widestBlob).toBe(1024 * 1024);
     expect(db.widestString).toBeLessThanOrEqual(1_500_000);
     expect(requiredSession(captured).highWaterBytes).toBeLessThanOrEqual(
       MAX_INITIAL_WORKTREE_SESSION_BYTES,
