@@ -134,6 +134,57 @@ operations merge their streams instead of issuing scalar reads per path:
 `comparePaths` is the shared comparator. JavaScript string order is not valid
 because it compares UTF-16 code units rather than Git's byte order.
 
+## Sparse workspace tracking
+
+Schema v7 adds a source-qualified index over raw tree-entry name bytes. Sparse
+hydration can therefore resolve selected paths in loose or complete packed
+trees without scanning either full tree. The lookup still validates each parsed
+source against its authoritative object and preserves loose-source precedence.
+
+`git_index_state` and `git_index_dirty` form a conservative change journal. An
+available state has the current tracker format, a valid nullable baseline tree
+OID, and `complete = 1`. Completeness means that the dirty rows cover every
+mutation since that baseline; it does not mean that the workspace is clean.
+SQLite triggers OR index and worktree dirty flags for semantic index changes,
+cached stat changes, and filesystem mutations. Changes that cannot be
+represented safely, including ignore-file and repository-root topology changes,
+invalidate the state instead of guessing.
+
+The tracker becomes authoritative only through a bounded reseal. The bulk
+initial-clone path seeds it after writing the initial index and working tree. An
+unfiltered full `status` can repair an unavailable tracker from the exact HEAD,
+index, and worktree merge. A successful sparse `status` recomputes the retained
+dirty flags and advances the baseline to the current HEAD. If the complete seed
+does not fit its limits, the tracker remains unavailable.
+
+Sparse operations use the journal differently:
+
+- `status` combines dirty paths with the baseline-to-HEAD tree difference,
+  hydrates only those leaves, and reseals after a successful exact result.
+- working-tree `diff` uses the same candidate union without mutating the
+  tracker; tree-to-tree `diff` can use the bounded relational tree difference
+  directly.
+- clean whole-tree `checkout` requires an available baseline equal to HEAD, an
+  empty dirty journal, and no blocking index entries. It verifies the hydrated
+  leaves and the current working tree before applying the leaf difference, then
+  moves HEAD and reseals an empty journal at the target tree.
+
+Hydration admits at most 1,000 strict Git-ordered paths, 2,200 UTF-8 bytes per
+path, 1 MiB of request JSON, and 8 MiB of retained result state. Tree depth,
+edge work, parsed-source entries, source bytes, and worktree payloads have
+separate caps. Sparse checkout budgets candidate, guard, and plan state within
+the retained-state allowance. It separately rejects a conservative SQL estimate
+that would exceed the 1,000-statement operation ceiling. Its retained caller
+state fits the packed-blob reader's 8 MiB headroom; the complete packed-read
+model remains below 100 MiB.
+
+Capacity exhaustion, unavailable or incompatible tracker state, and unsupported
+sparse shapes return to the exact full operation. Malformed tracker state
+metadata also makes that state unavailable. Malformed dirty or hydration rows,
+inconsistent source markers, reordered or missing hydration results, and tree
+disagreements are corruption and fail closed; they never silently select the
+fallback path.
+
 ## Ignore matching
 
 Ignore files are discovered as regular-file handles, so a symlink named
@@ -165,10 +216,11 @@ every accepted operation. Operations that exceed an accepted structural limit
 throw a stable error instead of truncating or continuing unbounded.
 
 The separate wall target is below 0.1 seconds for operations touching at most
-1,000 changed paths. Full-repository `status` and `checkout` do not yet meet it:
-even when only 1,000 paths changed, exact semantics still traverse the full HEAD
-tree, index, and working tree, and checkout must perform physical writes. These
-are current release blockers, not hidden exceptions.
+1,000 changed paths. Tracker-backed `status`, `diff`, and clean whole-tree
+`checkout` avoid full-repository traversal when their sparse guards and budgets
+hold. Cold or invalid tracker state, path-filtered status, local checkout
+changes, and capacity fallback still use the exact full operation; checkout
+must also perform the required physical writes.
 
 Other deliberate limits include the 2,200-byte emitted Git path cap, bounded
 commit projections, bounded ignore inputs, bounded protocol negotiation, and
