@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8, utf8Decoder } from "../src/core/bytes.js";
 import { PathspecNotFoundError } from "../src/core/errors.js";
+import { IGNORE_LIMITS } from "../src/core/ignore/index.js";
 import { hashObject } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { add, lsFiles, reset, rm } from "../src/core/ops/staging.js";
@@ -102,7 +103,7 @@ describe("add", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/tracked.txt", "one\n");
     add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"], force: true });
-    writeWorkFile(workspace, "/.gitignore", "*?\n".repeat(65));
+    writeWorkFile(workspace, "/.gitignore", "*?\n".repeat(IGNORE_LIMITS.wildcardSegments + 1));
     writeWorkFile(workspace, "/tracked.txt", "two\n");
 
     add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"] });
