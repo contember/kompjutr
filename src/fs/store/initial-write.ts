@@ -31,6 +31,7 @@ export interface InitialWriteOptions {
 
 export interface InitialSymlinkOptions {
   mode?: number;
+  contentId?: Uint8Array;
 }
 
 export interface InitialWorktreeSession {
@@ -263,7 +264,7 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
         checkedMode(options.mode, DEFAULT_SYMLINK_MODE, path),
         size,
         target,
-        null,
+        checkedContentId(options.contentId, path),
       );
     } catch (error) {
       this.#failed = true;

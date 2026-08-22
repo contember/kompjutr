@@ -181,6 +181,45 @@ describe("InitialWorktreeWriter", () => {
     expect(entryAt(absent, "/repo/link")?.mode).toBe(0o777);
   });
 
+  it("owns and bounds symlink content ids", () => {
+    const accepted = setup();
+    const contentId = new Uint8Array([1, 2, 3, 4]);
+    let captured: InitialWorktreeSession | undefined;
+    expect(
+      createInitialWorktreeWriter(accepted).tryRun("/repo", (session) => {
+        captured = session;
+        session.writeSymlink("link", "target", { contentId });
+        contentId.fill(9);
+      }),
+    ).toEqual({ kind: "committed", value: undefined });
+    const stored = entryAt(accepted, "/repo/link")?.content_id;
+    expect(stored === null || stored === undefined ? stored : [...readBlob(stored)]).toEqual([
+      1, 2, 3, 4,
+    ]);
+    expect(requiredSession(captured).highWaterBytes).toBeLessThanOrEqual(
+      MAX_INITIAL_WORKTREE_SESSION_BYTES,
+    );
+
+    const rejected = setup();
+    let rejectedSession: InitialWorktreeSession | undefined;
+    let rejectedInitialHighWater = 0;
+    expect(() =>
+      createInitialWorktreeWriter(rejected).tryRun("/repo", (session) => {
+        rejectedSession = session;
+        rejectedInitialHighWater = session.highWaterBytes;
+        session.writeSymlink("link", "target", {
+          contentId: new Uint8Array(1024 * 1024 + 1),
+        });
+      }),
+    ).toThrow(/content id exceeds the payload limit/);
+    expect(rejected.scalar<number>("SELECT count(*) FROM fs_paths")).toBe(1);
+    expect(rejected.scalar<number>("SELECT count(*) FROM fs_nodes")).toBe(1);
+    expect(rejected.scalar<number>("SELECT count(*) FROM fs_chunks")).toBe(0);
+    expect(rejected.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'")).toBe(0);
+    expect(rejected.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'")).toBe(2);
+    expect(requiredSession(rejectedSession).highWaterBytes).toBe(rejectedInitialHighWater);
+  });
+
   it("bumps revision once and commits one contiguous inode range", () => {
     const db = setup();
     const result = createInitialWorktreeWriter(db, () => 700).tryRun("/repo", (session) => {
