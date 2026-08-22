@@ -16,7 +16,7 @@ import type { Repository } from "../repository.js";
 import type { SparseWorkspaceResult, SparseWorkspaceRow } from "../sparse-workspace.js";
 import { comparePaths, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { matchesPaths, stageZero, type TargetEntry, treeEntries } from "./checkout.js";
+import { matchesPaths, type TargetEntry, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
 import { treeStream } from "./tree-stream.js";
 import {
@@ -42,6 +42,11 @@ const SET_ENTRY_BYTES = 48;
 const SPARSE_STATUS_PATHS = 1_000;
 const SPARSE_INDEX_DIRTY = 1;
 const SPARSE_WORKTREE_DIRTY = 2;
+const FULL_STATUS_TRACKER_ROWS = 32_000;
+const FULL_STATUS_TRACKER_BYTES = 16 * 1024 * 1024;
+const FULL_STATUS_TRACKER_FIXED_BYTES = 256;
+const FULL_STATUS_TRACKER_ROW_BYTES = 256;
+const TRACKER_PATH_BYTES = 2_200;
 
 interface StatusIndexSnapshot {
   trackedDirs: Set<string>;
@@ -76,6 +81,87 @@ interface PendingTrackedRow {
 type BufferedStatusRow =
   | { kind: "ready"; detail: StatusDetail }
   | { kind: "hash"; tracked: PendingTrackedRow };
+
+/** Bounded dirty-leaf snapshot collected only by the eager repair pass. */
+class FullStatusTrackerSeed {
+  #entries = new Map<string, number>();
+  #retainedBytes = FULL_STATUS_TRACKER_FIXED_BYTES;
+  #available = true;
+  #finished = false;
+
+  get resealable(): boolean {
+    return this.#available && this.#finished;
+  }
+
+  observeConflict(path: string): void {
+    this.#mark(path, SPARSE_INDEX_DIRTY | SPARSE_WORKTREE_DIRTY);
+  }
+
+  observeUntracked(path: string): void {
+    this.#mark(path, SPARSE_WORKTREE_DIRTY);
+  }
+
+  observeTracked(
+    head: TargetEntry | undefined,
+    entry: IndexEntry | undefined,
+    worktree: WorktreePath | undefined,
+    buffered: BufferedStatusRow | null,
+  ): void {
+    let flags = 0;
+    if (
+      entry?.mode === 0o160000 ||
+      (head === undefined) !== (entry === undefined) ||
+      (head !== undefined &&
+        entry !== undefined &&
+        (head.oid !== entry.oid || head.mode !== octalMode(entry.mode)))
+    ) {
+      flags |= SPARSE_INDEX_DIRTY;
+    }
+
+    if (entry === undefined) {
+      if (worktree !== undefined) flags |= SPARSE_WORKTREE_DIRTY;
+    } else if (entry.mode !== 0o160000) {
+      if (worktree === undefined) flags |= SPARSE_WORKTREE_DIRTY;
+      else if (buffered?.kind === "ready" && buffered.detail.worktree !== " ") {
+        flags |= SPARSE_WORKTREE_DIRTY;
+      }
+    }
+    this.#mark(head?.path ?? entry?.path ?? worktree?.path ?? "", flags);
+  }
+
+  observeHashed(path: string, dirty: boolean): void {
+    if (dirty) this.#mark(path, SPARSE_WORKTREE_DIRTY);
+  }
+
+  finish(): void {
+    this.#finished = true;
+  }
+
+  *entries(): Generator<IndexTrackerSeedEntry> {
+    for (const [path, flags] of this.#entries) yield { path, flags };
+  }
+
+  #mark(path: string, flags: number): void {
+    if (!this.#available || flags === 0) return;
+    const previous = this.#entries.get(path);
+    if (previous !== undefined) {
+      this.#entries.set(path, previous | flags);
+      return;
+    }
+    const retained = FULL_STATUS_TRACKER_ROW_BYTES + path.length * 2;
+    if (
+      this.#entries.size === FULL_STATUS_TRACKER_ROWS ||
+      retained >= FULL_STATUS_TRACKER_BYTES - this.#retainedBytes ||
+      !trackerPathRepresentable(path)
+    ) {
+      this.#available = false;
+      this.#entries = new Map();
+      return;
+    }
+    this.#entries.set(path, flags);
+    this.#retainedBytes += retained;
+  }
+}
 
 /**
  * A `StatusEntry` plus the columns porcelain v2 prints. `status` returns
@@ -127,16 +213,6 @@ export function eagerStatus(
   options: StatusOptions,
   context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
 ): StatusDetail[] {
-  const sparse = sparseStatus(repo, worktree, options, context);
-  return sparse ?? status(repo, worktree, options);
-}
-
-function sparseStatus(
-  repo: Repository,
-  worktree: Worktree,
-  options: StatusOptions,
-  context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
-): StatusDetail[] | null {
   const source = context.sparseWorkspace;
   const tracker = context.indexTracker;
   if (
@@ -145,18 +221,43 @@ function sparseStatus(
     (options.paths?.length ?? 0) > 0 ||
     (options.excludeRoots?.length ?? 0) > 0
   ) {
-    return null;
+    return status(repo, worktree, options);
   }
 
   const state = source.readState(repo.store.repoId);
-  if (!state.available) return null;
+  if (!state.available) {
+    const baselineTreeOid = repo.headTree();
+    const seed = new FullStatusTrackerSeed();
+    const rows = [...statusStreamInternal(repo, worktree, options, baselineTreeOid, seed)].sort(
+      (left, right) => comparePaths(left.path, right.path),
+    );
+    if (seed.resealable) {
+      tracker.reseal(repo.store.repoId, baselineTreeOid, seed.entries());
+    }
+    return rows;
+  }
+
+  const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
+  return sparse ?? status(repo, worktree, options);
+}
+
+function sparseStatus(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusOptions,
+  context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
+  baselineTreeOid: string | null,
+): StatusDetail[] | null {
+  const source = context.sparseWorkspace;
+  const tracker = context.indexTracker;
+  if (source === undefined || tracker === undefined) return null;
   const currentTreeOid = repo.headTree();
   let candidates: string[] | null;
   try {
     candidates = sparseStatusCandidates(
       repo,
       source.dirtyPaths(repo.store.repoId),
-      state.baselineTreeOid,
+      baselineTreeOid,
       currentTreeOid,
     );
   } catch (error) {
@@ -171,7 +272,7 @@ function sparseStatus(
     hydrated = source.hydrate({
       repoId: repo.store.repoId,
       root: repo.root,
-      baselineTreeOid: state.baselineTreeOid,
+      baselineTreeOid,
       currentTreeOid,
       paths: candidates,
     });
@@ -229,7 +330,9 @@ function sparseStatus(
     if (flags !== 0) retained.set(path, flags);
   }
 
-  const details = [...flushStatusRows(repo, worktree, buffered, true, worktreeComparison.hashes)];
+  const details = [
+    ...flushStatusRows(repo, worktree, buffered, undefined, true, worktreeComparison.hashes),
+  ];
   const seed: IndexTrackerSeedEntry[] = [];
   for (const path of candidates) {
     const flags = retained.get(path);
@@ -347,6 +450,16 @@ export function* statusStream(
   worktree: Worktree,
   options: StatusOptions = {},
 ): Generator<StatusDetail> {
+  yield* statusStreamInternal(repo, worktree, options, repo.headTree());
+}
+
+function* statusStreamInternal(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusOptions,
+  headTreeOid: string | null,
+  seed?: FullStatusTrackerSeed,
+): Generator<StatusDetail> {
   const collapse = (options.untrackedFiles ?? "normal") === "normal";
   const excluded = excludedRoots(repo.root, options.excludeRoots);
   const snapshot = snapshotStatusIndex(repo, collapse, collapse || excluded.length > 0);
@@ -357,29 +470,38 @@ export function* statusStream(
   let collapsed: string | null = null;
 
   for (const row of joinSorted3(
-    treeStream(repo, repo.headTree()),
-    stageZero(repo.store.indexScan()),
+    treeStream(repo, headTreeOid),
+    statusIndexEntries(repo.store.indexScan(), seed),
     worktreeEntries(repo, worktree, options, ignores, prunable),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
     sourceRows++;
     if (row.a !== undefined || row.b !== undefined) {
       if (snapshot.retainsTrackedPaths) retainTrackedPath(snapshot, row.path);
-      if (matchesPaths(row.path, options.paths)) {
+      const matches = matchesPaths(row.path, options.paths);
+      if (matches || seed !== undefined) {
         const detail = trackedRow(row.path, row.a, row.b, row.c);
-        if (detail !== null) buffered.push(detail);
+        seed?.observeTracked(row.a, row.b, row.c, detail);
+        if (matches && detail !== null) buffered.push(detail);
       }
       // A tracked path is never also untracked, whatever is on disk.
-    } else if (
-      row.c !== undefined &&
-      !isExcluded(row.path, excluded) &&
-      (options.includeIgnored === true || !ignores.ignores(row.path, false))
-    ) {
+    } else if (row.c !== undefined) {
+      seed?.observeUntracked(row.path);
+      if (
+        isExcluded(row.path, excluded) ||
+        (options.includeIgnored !== true && ignores.ignores(row.path, false))
+      ) {
+        if (sourceRows >= STATUS_WINDOW_ROWS) {
+          yield* flushStatusRows(repo, worktree, buffered, seed);
+          sourceRows = 0;
+        }
+        continue;
+      }
       let path = row.path;
       if (collapse) {
         if (collapsed !== null && path.startsWith(`${collapsed}/`)) {
           if (sourceRows >= STATUS_WINDOW_ROWS) {
-            yield* flushStatusRows(repo, worktree, buffered);
+            yield* flushStatusRows(repo, worktree, buffered, seed);
             sourceRows = 0;
           }
           continue;
@@ -400,11 +522,22 @@ export function* statusStream(
     }
 
     if (sourceRows >= STATUS_WINDOW_ROWS) {
-      yield* flushStatusRows(repo, worktree, buffered);
+      yield* flushStatusRows(repo, worktree, buffered, seed);
       sourceRows = 0;
     }
   }
-  yield* flushStatusRows(repo, worktree, buffered);
+  yield* flushStatusRows(repo, worktree, buffered, seed);
+  seed?.finish();
+}
+
+function* statusIndexEntries(
+  entries: Iterable<IndexEntry>,
+  seed: FullStatusTrackerSeed | undefined,
+): Generator<IndexEntry> {
+  for (const entry of entries) {
+    if (entry.stage === 0) yield entry;
+    else seed?.observeConflict(entry.path);
+  }
 }
 
 function trackedRow(
@@ -465,6 +598,7 @@ function* flushStatusRows(
   repo: Repository,
   worktree: Worktree,
   buffered: BufferedStatusRow[],
+  seed?: FullStatusTrackerSeed,
   exact = false,
   knownHashes: ReadonlyMap<string, HashedPath> = new Map(),
 ): Generator<StatusDetail> {
@@ -515,6 +649,7 @@ function* flushStatusRows(
         : actualOid !== tracked.indexOid || actualMode !== tracked.indexMode
           ? "M"
           : " ";
+    seed?.observeHashed(tracked.path, code !== " ");
     if (tracked.staged === " " && code === " ") continue;
     yield statusDetail(
       tracked.path,
@@ -690,6 +825,45 @@ function trackedPathRetainedBytes(path: string): number {
 
 function retainedStringBytes(value: string): number {
   return 48 + value.length * 2;
+}
+
+function trackerPathRepresentable(path: string): boolean {
+  if (path === "" || path.startsWith("/") || path.endsWith("/") || path.includes("\0")) {
+    return false;
+  }
+  let bytes = 0;
+  let segmentStart = 0;
+  for (let at = 0; at < path.length; at++) {
+    const unit = path.charCodeAt(at);
+    if (unit === 0x2f) {
+      if (!validTrackerSegment(path, segmentStart, at)) return false;
+      segmentStart = at + 1;
+      bytes++;
+    } else if (unit < 0x80) {
+      bytes++;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = path.charCodeAt(++at);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    } else {
+      bytes += 3;
+    }
+    if (bytes > TRACKER_PATH_BYTES) return false;
+  }
+  return validTrackerSegment(path, segmentStart, path.length);
+}
+
+function validTrackerSegment(path: string, start: number, end: number): boolean {
+  const length = end - start;
+  return !(
+    length === 0 ||
+    (length === 1 && path.charCodeAt(start) === 0x2e) ||
+    (length === 2 && path.charCodeAt(start) === 0x2e && path.charCodeAt(start + 1) === 0x2e)
+  );
 }
 
 function shallowestUntrackedDirectory(file: string, tracked: Set<string>): string | null {
