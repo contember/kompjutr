@@ -29,7 +29,7 @@ function columnsOf(db: TestDatabase, table: string): string[] {
 }
 
 describe("git schema", () => {
-  it("creates v5 on a fresh database", () => {
+  it("creates v6 on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -49,6 +49,39 @@ describe("git schema", () => {
       "ino",
       "rev",
     ]);
+    expect(columnsOf(db, "git_index_state")).toEqual([
+      "repo_id",
+      "baseline_tree_oid",
+      "format",
+      "complete",
+    ]);
+    expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
+    expect(() =>
+      db.run(
+        "INSERT INTO git_index_state (repo_id, baseline_tree_oid, format, complete) VALUES (1, NULL, 2, 1)",
+      ),
+    ).toThrow();
+    expect(() =>
+      db.run(
+        "INSERT INTO git_index_state (repo_id, baseline_tree_oid, format, complete) VALUES (1, NULL, 1, 2)",
+      ),
+    ).toThrow();
+    for (const flags of [0, 1.5, 3.5, 4, -1]) {
+      expect(() =>
+        db.run("INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, 'a', ?)", flags),
+      ).toThrow();
+    }
+    db.run(
+      "INSERT INTO git_index_state (repo_id, baseline_tree_oid, format, complete) VALUES (1, 'abc', 1, 1)",
+    );
+    db.run("INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, 'a', 3)");
+    initializeGitSchema(db);
+    expect(db.one("SELECT baseline_tree_oid,format,complete FROM git_index_state")).toEqual({
+      baseline_tree_oid: "abc",
+      format: 1,
+      complete: 1,
+    });
+    expect(db.one("SELECT path,flags FROM git_index_dirty")).toEqual({ path: "a", flags: 3 });
     expect(columnsOf(db, "git_commits")).toEqual([
       "repo_id",
       "oid",
@@ -112,7 +145,7 @@ describe("git schema", () => {
       // Existing rows inherit the default, which is what they were.
       stored: "zlib",
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
   });
 
   it("creates empty parsed-tree tables when migrating v2", () => {
@@ -127,7 +160,7 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
   });
 
   it("replaces the incomplete v3 commit cache without touching raw objects", () => {
@@ -154,7 +187,7 @@ describe("git schema", () => {
       stored: "raw",
     });
     expect(columnsOf(db, "git_commits")).toContain("committer_timezone");
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
   });
 
   it("adds the filesystem revision to a v4 index without changing rows", () => {
@@ -182,16 +215,40 @@ describe("git schema", () => {
       ino: 3,
       rev: null,
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("5");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+  });
+
+  it("adds empty sparse-index tables to v5 without changing rows", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("DROP TABLE git_index_dirty");
+    db.run("DROP TABLE git_index_state");
+    db.run(
+      "INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev) VALUES (1, 'a.txt', 0, 33188, 'abc', 1, 2, 3, 4)",
+    );
+    db.run("UPDATE git_meta SET value = '5' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(db.one("SELECT path,size,mtime,ino,rev FROM git_index")).toEqual({
+      path: "a.txt",
+      size: 1,
+      mtime: 2,
+      ino: 3,
+      rev: 4,
+    });
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_dirty")).toBe(0);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
   });
 
   it("fails closed on a schema newer than this runtime", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("UPDATE git_meta SET value = '6' WHERE key = 'schema_version'");
+    db.run("UPDATE git_meta SET value = '7' WHERE key = 'schema_version'");
 
     expect(() => initializeGitSchema(db)).toThrow(/newer than supported/);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
   });
 
   it("accepts only canonical positive decimal schema versions", () => {
@@ -229,6 +286,13 @@ describe("git schema", () => {
     // A second run must not try to add `stored` again.
     expect(() => initializeGitSchema(db)).not.toThrow();
     expect(columnsOf(db, "git_objects").filter((c) => c === "stored")).toHaveLength(1);
+    expect(columnsOf(db, "git_index_state")).toEqual([
+      "repo_id",
+      "baseline_tree_oid",
+      "format",
+      "complete",
+    ]);
+    expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
   });
 });
 

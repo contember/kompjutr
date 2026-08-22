@@ -10,7 +10,7 @@ import { CorruptError } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -82,6 +82,20 @@ const STATEMENTS = [
      rev INTEGER,
      PRIMARY KEY (repo_id, path, stage)
    )`,
+
+  `CREATE TABLE IF NOT EXISTS git_index_state (
+     repo_id INTEGER PRIMARY KEY,
+     baseline_tree_oid TEXT,
+     format INTEGER NOT NULL CHECK (format = 1),
+     complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+   )`,
+
+  `CREATE TABLE IF NOT EXISTS git_index_dirty (
+     repo_id INTEGER NOT NULL,
+     path TEXT NOT NULL,
+     flags INTEGER NOT NULL CHECK (typeof(flags) = 'integer' AND flags IN (1, 2, 3)),
+     PRIMARY KEY (repo_id, path)
+   ) WITHOUT ROWID`,
 
   // The working tree's opaque content ids mapped to blob oids. A file whose
   // `fs_nodes.content_id` is in here is unchanged: `status` and `add` answer
@@ -284,6 +298,7 @@ const STATEMENTS = [
 // v1 -> v2 added `git_blob_ids`, `git_commits` and `git_objects.stored`.
 // v3 added parsed tree tables. v4 replaces the incomplete, unused commit
 // projection. v5 records the monotonic filesystem revision in index stat data.
+// v6 adds inert index baseline and dirty-path state for sparse status queries.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
