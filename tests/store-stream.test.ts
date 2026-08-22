@@ -121,6 +121,12 @@ describe("indexScan", () => {
     });
     db.widestRows = 0;
     let seen = 0;
+    for (const _ of store.indexScan()) seen++;
+    expect(seen).toBe(5000);
+    expect(db.widestRows).toBeLessThanOrEqual(1000);
+
+    db.widestRows = 0;
+    seen = 0;
     for (const _ of store.indexScan({ pageSize: 64 })) seen++;
     expect(seen).toBe(5000);
     expect(db.widestRows).toBeLessThanOrEqual(64);

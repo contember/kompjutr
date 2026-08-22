@@ -70,7 +70,7 @@ export const MAX_BLOB_BATCH_BYTES = MAX_PACK_BLOB_BATCH_BYTES;
 const MAX_BLOB_BATCH_OIDS = 4096;
 
 /** Index rows per round trip. This is the memory bound of a scan. */
-const DEFAULT_INDEX_PAGE = 512;
+const DEFAULT_INDEX_PAGE = 1000;
 
 /** Index mutations buffered before a batch is applied. */
 const DEFAULT_INDEX_FLUSH = 512;

@@ -583,7 +583,7 @@ describe("status cost", () => {
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    expect(indexScanStatements(workspace)).toBe(38);
+    expect(indexScanStatements(workspace)).toBe(20);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -598,7 +598,7 @@ describe("status cost", () => {
     expect(result).toHaveLength(1_000);
     expect(result.every((entry) => entry.worktree === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    expect(indexScanStatements(workspace)).toBe(38);
+    expect(indexScanStatements(workspace)).toBe(20);
     expect(worktree.bulkReadPaths).toHaveLength(1_000);
     expect(new Set(worktree.bulkReadPaths)).toEqual(
       new Set(changed.map((entry) => `/${entry.path}`)),
@@ -621,7 +621,7 @@ describe("status cost", () => {
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
-    expect(indexScanStatements(workspace)).toBe(96);
+    expect(indexScanStatements(workspace)).toBe(50);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -637,7 +637,7 @@ describe("status cost", () => {
     expect(result.map((entry) => entry.path)).toEqual(expectedPaths);
     expect(result.every((entry) => entry.index === " " && entry.worktree === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
-    expect(indexScanStatements(workspace)).toBe(96);
+    expect(indexScanStatements(workspace)).toBe(50);
     expect(worktree.bulkReadPaths).toEqual(expectedPaths.map((path) => `/${path}`));
   });
 
