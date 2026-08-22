@@ -8,16 +8,20 @@
 
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import { ZERO_OID } from "../bytes.js";
-import { GitError } from "../errors.js";
+import type { GitContext, IndexTrackerSeedEntry } from "../context.js";
+import { CorruptError, GitError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
+import type { SparseWorkspaceResult, SparseWorkspaceRow } from "../sparse-workspace.js";
 import { comparePaths, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { matchesPaths, stageZero, type TargetEntry, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
 import { treeStream } from "./tree-stream.js";
 import {
+  type HashedPath,
+  hashExactWorktreePaths,
   hashWorktreePath,
   hashWorktreePaths,
   indexMatchesStat,
@@ -35,6 +39,9 @@ export const STATUS_RETAINED_BYTES = 16 * 1024 * 1024;
 const STATUS_WINDOW_ROWS = 1000;
 const DIRECTORY_FIXED_BYTES = 96;
 const SET_ENTRY_BYTES = 48;
+const SPARSE_STATUS_PATHS = 1_000;
+const SPARSE_INDEX_DIRTY = 1;
+const SPARSE_WORKTREE_DIRTY = 2;
 
 interface StatusIndexSnapshot {
   trackedDirs: Set<string>;
@@ -111,6 +118,219 @@ export function status(
   return [...statusStream(repo, worktree, options)].sort((left, right) =>
     comparePaths(left.path, right.path),
   );
+}
+
+/** Eager status with an optional same-database sparse fast path. */
+export function eagerStatus(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusOptions,
+  context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
+): StatusDetail[] {
+  const sparse = sparseStatus(repo, worktree, options, context);
+  return sparse ?? status(repo, worktree, options);
+}
+
+function sparseStatus(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusOptions,
+  context: Pick<GitContext, "sparseWorkspace" | "indexTracker">,
+): StatusDetail[] | null {
+  const source = context.sparseWorkspace;
+  const tracker = context.indexTracker;
+  if (
+    source === undefined ||
+    tracker === undefined ||
+    (options.paths?.length ?? 0) > 0 ||
+    (options.excludeRoots?.length ?? 0) > 0
+  ) {
+    return null;
+  }
+
+  const state = source.readState(repo.store.repoId);
+  if (!state.available) return null;
+  const currentTreeOid = repo.headTree();
+  let candidates: string[] | null;
+  try {
+    candidates = sparseStatusCandidates(
+      repo,
+      source.dirtyPaths(repo.store.repoId),
+      state.baselineTreeOid,
+      currentTreeOid,
+    );
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+  if (candidates === null) return null;
+  if (candidates.length === 0) return [];
+
+  let hydrated: SparseWorkspaceResult;
+  try {
+    hydrated = source.hydrate({
+      repoId: repo.store.repoId,
+      root: repo.root,
+      baselineTreeOid: state.baselineTreeOid,
+      currentTreeOid,
+      paths: candidates,
+    });
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+  if (!hydrated.available) return null;
+  if (hydrated.rows.length !== candidates.length) {
+    throw new CorruptError("sparse status hydration returned the wrong row count");
+  }
+
+  let ignores = options.ignores;
+  const ignoredUntracked = new Set<string>();
+  for (let index = 0; index < candidates.length; index++) {
+    const path = candidates[index];
+    const row = hydrated.rows[index];
+    if (path === undefined || row === undefined || row.path !== path) {
+      throw new CorruptError("sparse status hydration returned unordered rows");
+    }
+    const stage = row.index.find((entry) => entry.stage === 0);
+    const untracked =
+      row.current === null && stage === undefined && sparseWorktreePath(row) !== undefined;
+    if (!untracked) continue;
+    if (ignores === undefined) ignores = loadIgnoreMatcher(worktree, repo.root);
+    const ignored = ignores.ignores(path, false);
+    if (ignored) ignoredUntracked.add(path);
+    const reportable = options.includeIgnored === true || !ignored;
+    if (reportable && (options.untrackedFiles ?? "normal") === "normal") return null;
+  }
+
+  const worktreeComparison = compareSparseWorktree(repo, worktree, hydrated.rows);
+  const buffered: BufferedStatusRow[] = [];
+  const retained = new Map<string, number>();
+  for (let index = 0; index < candidates.length; index++) {
+    const path = candidates[index];
+    const row = hydrated.rows[index];
+    if (path === undefined || row === undefined)
+      throw new CorruptError("sparse status row missing");
+    const stage = row.index.find((entry) => entry.stage === 0);
+    const worktreePath = sparseWorktreePath(row);
+    const untracked = row.current === null && stage === undefined && worktreePath !== undefined;
+    const ignored = ignoredUntracked.has(path);
+    if (untracked && options.includeIgnored !== true && ignored) {
+      retained.set(path, SPARSE_WORKTREE_DIRTY);
+    } else if (untracked) {
+      buffered.push({ kind: "ready", detail: untrackedRow(path) });
+    } else {
+      const detail = trackedRow(path, sparseTarget(path, row), stage, worktreePath);
+      if (detail !== null) buffered.push(detail);
+    }
+    let flags = retained.get(path) ?? 0;
+    if (sparseIndexDirty(row, stage) || stage?.mode === 0o160000) flags |= SPARSE_INDEX_DIRTY;
+    if (worktreeComparison.dirty.has(path)) flags |= SPARSE_WORKTREE_DIRTY;
+    if (flags !== 0) retained.set(path, flags);
+  }
+
+  const details = [...flushStatusRows(repo, worktree, buffered, true, worktreeComparison.hashes)];
+  const seed: IndexTrackerSeedEntry[] = [];
+  for (const path of candidates) {
+    const flags = retained.get(path);
+    if (flags !== undefined) seed.push({ path, flags });
+  }
+  tracker.reseal(repo.store.repoId, currentTreeOid, seed);
+  return details;
+}
+
+function sparseIndexDirty(row: SparseWorkspaceRow, stage: IndexEntry | undefined): boolean {
+  if (row.index.some((entry) => entry.stage !== 0)) return true;
+  if (row.current === null) return stage !== undefined;
+  return (
+    stage === undefined ||
+    stage.oid !== row.current.oid ||
+    octalMode(stage.mode) !== row.current.mode
+  );
+}
+
+function compareSparseWorktree(
+  repo: Repository,
+  worktree: Worktree,
+  rows: readonly SparseWorkspaceRow[],
+): { dirty: Set<string>; hashes: Map<string, HashedPath> } {
+  const dirty = new Set<string>();
+  const pending: Array<{ entry: IndexEntry; worktree: WorktreePath }> = [];
+  for (const row of rows) {
+    const entry = row.index.find((candidate) => candidate.stage === 0);
+    const candidate = sparseWorktreePath(row);
+    if (entry === undefined) {
+      if (candidate !== undefined) dirty.add(row.path);
+      continue;
+    }
+    if (entry.mode === 0o160000) continue;
+    if (candidate === undefined) {
+      dirty.add(row.path);
+      continue;
+    }
+    if (entry.mode !== Number.parseInt(gitModeFor(candidate.stat), 8)) {
+      dirty.add(row.path);
+      continue;
+    }
+    if (!indexMatchesStat(entry, candidate.stat)) pending.push({ entry, worktree: candidate });
+  }
+
+  const mapped = repo.store.lookupBlobIds(
+    pending.flatMap(({ worktree: candidate }) => {
+      const contentId = candidate.stat.contentId;
+      return contentId === null ? [] : [contentId];
+    }),
+  );
+  const unresolved: WorktreePath[] = [];
+  for (const candidate of pending) {
+    const contentId = candidate.worktree.stat.contentId;
+    const oid = contentId === null ? undefined : mapped.get(contentIdKey(contentId));
+    if (oid === undefined) unresolved.push(candidate.worktree);
+    else if (oid !== candidate.entry.oid) dirty.add(candidate.entry.path);
+  }
+  const hashed = hashExactWorktreePaths(repo, worktree, unresolved, { write: false });
+  repo.store.upsertBlobIds(
+    [...hashed.values()].flatMap((value) => {
+      const contentId = value.stat.contentId;
+      return contentId === null ? [] : [{ contentId, oid: value.oid }];
+    }),
+  );
+  const expected = new Map(pending.map((candidate) => [candidate.entry.path, candidate.entry.oid]));
+  for (const candidate of unresolved) {
+    if (hashed.get(candidate.path)?.oid !== expected.get(candidate.path)) dirty.add(candidate.path);
+  }
+  return { dirty, hashes: hashed };
+}
+
+function sparseStatusCandidates(
+  repo: Repository,
+  dirty: Iterable<{ path: string }>,
+  baselineTreeOid: string | null,
+  currentTreeOid: string | null,
+): string[] | null {
+  const paths = new Set<string>();
+  for (const entry of dirty) {
+    paths.add(entry.path);
+    if (paths.size > SPARSE_STATUS_PATHS) return null;
+  }
+  for (const entry of repo.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
+    paths.add(entry.path);
+    if (paths.size > SPARSE_STATUS_PATHS) return null;
+  }
+  return [...paths].sort(comparePaths);
+}
+
+function sparseTarget(path: string, row: SparseWorkspaceRow): TargetEntry | undefined {
+  return row.current === null ? undefined : { path, mode: row.current.mode, oid: row.current.oid };
+}
+
+function sparseWorktreePath(row: SparseWorkspaceRow): WorktreePath | undefined {
+  if (row.worktree === null || row.worktree.type === "dir") return undefined;
+  return { path: row.path, stat: row.worktree };
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 /**
@@ -245,6 +465,8 @@ function* flushStatusRows(
   repo: Repository,
   worktree: Worktree,
   buffered: BufferedStatusRow[],
+  exact = false,
+  knownHashes: ReadonlyMap<string, HashedPath> = new Map(),
 ): Generator<StatusDetail> {
   if (buffered.length === 0) return;
   const rows = buffered.splice(0);
@@ -263,16 +485,21 @@ function* flushStatusRows(
       contentId === null || row.worktree.stat.type === "dir"
         ? undefined
         : mapped.get(contentIdKey(contentId));
-    if (oid === undefined) unresolved.push(row.worktree);
-    else mappedOids.set(row.path, oid);
+    if (oid === undefined) {
+      if (!knownHashes.has(row.path)) unresolved.push(row.worktree);
+    } else mappedOids.set(row.path, oid);
   }
-  const hashes = hashWorktreePaths(repo, worktree, unresolved, { write: false });
+  const freshHashes = exact
+    ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
+    : hashWorktreePaths(repo, worktree, unresolved, { write: false });
   repo.store.upsertBlobIds(
-    [...hashes.values()].flatMap((hashed) => {
+    [...freshHashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;
       return contentId === null ? [] : [{ contentId, oid: hashed.oid }];
     }),
   );
+  const hashes = new Map(knownHashes);
+  for (const [path, hashed] of freshHashes) hashes.set(path, hashed);
   for (const row of rows) {
     if (row.kind === "ready") {
       yield row.detail;

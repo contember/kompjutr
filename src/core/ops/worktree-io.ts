@@ -335,6 +335,17 @@ function hashWorktreePathsAtRoot(
   return hashed;
 }
 
+/** Hash caller-hydrated paths without refreshing them through a full filesystem scan. */
+export function hashExactWorktreePaths(
+  repo: Repository,
+  worktree: Worktree,
+  paths: readonly WorktreePath[],
+  options: { write?: boolean } = {},
+): Map<string, HashedPath> {
+  if (paths.length === 0) return new Map();
+  return hashWorktreePathsAtRoot(repo, worktree, worktree.realpath(repo.root), paths, options);
+}
+
 /** Refresh scan-derived metadata immediately before hashing. */
 function refreshPaths(
   worktree: Worktree,

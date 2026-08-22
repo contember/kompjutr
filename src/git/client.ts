@@ -76,7 +76,7 @@ import {
   reset as resetOp,
   rm as rmOp,
 } from "../core/ops/staging.js";
-import { type CleanOptions, clean as cleanOp, status as statusOp } from "../core/ops/status.js";
+import { type CleanOptions, clean as cleanOp, eagerStatus } from "../core/ops/status.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import type { Repository } from "../core/repository.js";
 import type { SparseWorkspaceSource } from "../core/sparse-workspace.js";
@@ -213,11 +213,13 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async status(input = {}) {
       const repo = at(input.dir);
-      return statusOp(repo, context.worktree, { excludeRoots: excludeRoots(repo) }).map((row) => ({
-        path: row.path,
-        index: row.index,
-        worktree: row.worktree,
-      }));
+      return eagerStatus(repo, context.worktree, { excludeRoots: excludeRoots(repo) }, context).map(
+        (row) => ({
+          path: row.path,
+          index: row.index,
+          worktree: row.worktree,
+        }),
+      );
     },
     async diff(input = {}) {
       return diffOp(at(input.dir), context.worktree, input);
