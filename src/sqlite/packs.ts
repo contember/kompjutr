@@ -16,7 +16,13 @@ import {
   objectHeader,
   type RawObject,
 } from "../core/objects.js";
-import { applyDelta } from "../core/pack/delta.js";
+import {
+  type ByteSource,
+  type ChunkedBytes,
+  ChunkPool,
+  PACK_CHUNK_BYTES,
+} from "../core/pack/chunks.js";
+import { applyDelta, DeltaApplier } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
 import { InflateInto, InflateSizeError, InflateStream, inflatePrefix } from "../core/zlib.js";
 import {
@@ -28,7 +34,13 @@ import {
   prepareCommitCache,
 } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
-import { indexTreeSource, indexTreeSources, type TreeSourceInput } from "./schema.js";
+import type { MemoryCoordinator, MemoryReservation } from "./memory.js";
+import {
+  createTreeIndexSink,
+  indexTreeSource,
+  indexTreeSources,
+  type TreeSourceInput,
+} from "./schema.js";
 
 /** Bytes per `git_pack_data` row. Comfortably under the DO row limit. */
 export const PACK_CHUNK = 1024 * 1024;
@@ -70,7 +82,22 @@ const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
 const PACK_SHARED_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;
+const PACK_TREE_SOURCE_BYTES = 256;
+const PACK_TREE_CHUNK_BYTES = 64;
+const PACK_TREE_CHUNK_ARRAY_BYTES = 64;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
+const PACK_COMMIT_PARSE_BYTES = 1024;
+const PACK_COMMIT_PAYLOAD_BYTES = 256;
+const PACK_COMMIT_PHYSICAL_LINE_BYTES = 32;
+const PACK_COMMIT_LOGICAL_HEADER_BYTES = 64;
+const PACK_COMMIT_CONTINUATION_BYTES = 32;
+const PACK_COMMIT_PAGE_ROWS = 2048;
+const PACK_COMMIT_PAGE_JSON_BYTES = 1024 * 1024;
+// Three UTF-16 page copies, one encoded binding, and bounded row-array wrappers.
+const PACK_COMMIT_PAGE_TRANSIENT_BYTES =
+  7 * PACK_COMMIT_PAGE_JSON_BYTES + PACK_COMMIT_PAGE_ROWS * PACK_COMMIT_LOGICAL_HEADER_BYTES;
+const PACK_COMMIT_ACTIVE_HEADROOM_BYTES = 8 * 1024 * 1024;
+const PACK_INFLATE_OUTPUT_CHUNK_BYTES = 16 * 1024;
 const PACK_INDEX_BATCH_BYTES = 1024 * 1024;
 const PACK_INDEX_BATCH_ROWS = 2048;
 const PACK_PENDING_PAGE_ROWS = 4096;
@@ -79,6 +106,8 @@ const PACK_INDEX_MEMORY_BYTES = 3 * 1024 * 1024;
 const PACK_OFFSET_WINDOW_BYTES = 2 * 1024 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
 const PACK_EXTERNAL_BASE_BYTES = MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024;
+const PACK_INGEST_METADATA_BYTES =
+  PACK_INDEX_MEMORY_BYTES + PACK_OFFSET_WINDOW_BYTES + PACK_PENDING_PAGE_MEMORY_BYTES;
 
 // Charged JS-owned state includes both database-wide shared caches once.
 const PACK_MEMORY_MODEL_BYTES =
@@ -124,6 +153,225 @@ function pushExactInflate(stream: InflateInto, input: Uint8Array, label: string)
 
 function isObjectType(value: string): value is ObjectType {
   return value === "blob" || value === "tree" || value === "commit" || value === "tag";
+}
+
+function commitHeaderKind(data: Uint8Array, start: number, end: number): number {
+  const length = end - start;
+  if (
+    length === 4 &&
+    data[start] === 0x74 &&
+    data[start + 1] === 0x72 &&
+    data[start + 2] === 0x65 &&
+    data[start + 3] === 0x65
+  ) {
+    return 1;
+  }
+  if (
+    length === 6 &&
+    data[start] === 0x70 &&
+    data[start + 1] === 0x61 &&
+    data[start + 2] === 0x72 &&
+    data[start + 3] === 0x65 &&
+    data[start + 4] === 0x6e &&
+    data[start + 5] === 0x74
+  ) {
+    return 2;
+  }
+  if (
+    length === 6 &&
+    data[start] === 0x61 &&
+    data[start + 1] === 0x75 &&
+    data[start + 2] === 0x74 &&
+    data[start + 3] === 0x68 &&
+    data[start + 4] === 0x6f &&
+    data[start + 5] === 0x72
+  ) {
+    return 3;
+  }
+  if (
+    length === 9 &&
+    data[start] === 0x63 &&
+    data[start + 1] === 0x6f &&
+    data[start + 2] === 0x6d &&
+    data[start + 3] === 0x6d &&
+    data[start + 4] === 0x69 &&
+    data[start + 5] === 0x74 &&
+    data[start + 6] === 0x74 &&
+    data[start + 7] === 0x65 &&
+    data[start + 8] === 0x72
+  ) {
+    return 4;
+  }
+  if (
+    length === 6 &&
+    data[start] === 0x67 &&
+    data[start + 1] === 0x70 &&
+    data[start + 2] === 0x67 &&
+    data[start + 3] === 0x73 &&
+    data[start + 4] === 0x69 &&
+    data[start + 5] === 0x67
+  ) {
+    return 5;
+  }
+  return 0;
+}
+
+function jsonEscapedChars(data: Uint8Array, start: number, end: number): number {
+  let chars = 0;
+  for (let index = start; index < end; index++) {
+    const byte = data[index]!;
+    if (byte === 0x22 || byte === 0x5c) {
+      chars += 2;
+    } else if (byte < 0x20) {
+      chars +=
+        byte === 0x08 || byte === 0x09 || byte === 0x0a || byte === 0x0c || byte === 0x0d ? 2 : 6;
+    } else {
+      chars++;
+    }
+  }
+  return chars;
+}
+
+function jsonEncodedBytes(data: Uint8Array, start: number, end: number): number {
+  let bytes = 0;
+  for (let index = start; index < end; index++) {
+    const byte = data[index]!;
+    if (byte === 0x22 || byte === 0x5c) {
+      bytes += 2;
+    } else if (byte < 0x20) {
+      bytes +=
+        byte === 0x08 || byte === 0x09 || byte === 0x0a || byte === 0x0c || byte === 0x0d ? 2 : 6;
+    } else {
+      bytes += byte < 0x80 ? 1 : 3;
+    }
+  }
+  return bytes;
+}
+
+/** Preflight the parser's decoded text, header tables and retained commit without decoding. */
+function commitMemoryEstimate(
+  data: Uint8Array,
+  oid: string,
+): { prepareBytes: number; serializationBytes: number } {
+  if (data.length > MAX_INDEXED_COMMIT_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `packed commit ${oid} exceeds the ${MAX_INDEXED_COMMIT_BYTES}-byte index limit`,
+    );
+  }
+
+  let headEnd = data.length;
+  for (let index = 0; index + 1 < data.length; index++) {
+    if (data[index] === 0x0a && data[index + 1] === 0x0a) {
+      headEnd = index;
+      break;
+    }
+  }
+
+  let physicalLines = 0;
+  let logicalHeaders = 0;
+  let continuations = 0;
+  let parentCount = 0;
+  let outputBytes = headEnd === data.length ? 0 : data.length - headEnd - 2;
+  let serializedChars =
+    headEnd === data.length ? 0 : jsonEscapedChars(data, headEnd + 2, data.length);
+  let serializedBytes =
+    headEnd === data.length ? 0 : jsonEncodedBytes(data, headEnd + 2, data.length);
+  let currentKind = 0;
+  let hasHeader = false;
+  let lineStart = 0;
+  for (;;) {
+    let lineEnd = lineStart;
+    while (lineEnd < headEnd && data[lineEnd] !== 0x0a) lineEnd++;
+    physicalLines++;
+
+    if (data[lineStart] === 0x20 && hasHeader) {
+      continuations++;
+      if (currentKind !== 0) outputBytes += lineEnd - lineStart;
+      if (currentKind >= 3) {
+        serializedChars += 2 + jsonEscapedChars(data, lineStart + 1, lineEnd);
+        serializedBytes += 2 + jsonEncodedBytes(data, lineStart + 1, lineEnd);
+      }
+    } else {
+      let space = lineStart;
+      while (space < lineEnd && data[space] !== 0x20) space++;
+      if (space > lineStart && space < lineEnd) {
+        logicalHeaders++;
+        hasHeader = true;
+        currentKind = commitHeaderKind(data, lineStart, space);
+        if (currentKind !== 0) outputBytes += lineEnd - space - 1;
+        if (currentKind === 2) parentCount++;
+        if (currentKind >= 3) {
+          serializedChars += jsonEscapedChars(data, space + 1, lineEnd);
+          serializedBytes += jsonEncodedBytes(data, space + 1, lineEnd);
+        }
+      }
+    }
+
+    if (lineEnd === headEnd) break;
+    lineStart = lineEnd + 1;
+  }
+
+  const parsePeakBytes =
+    PACK_COMMIT_PARSE_BYTES +
+    2 * data.length +
+    physicalLines * PACK_COMMIT_PHYSICAL_LINE_BYTES +
+    logicalHeaders * PACK_COMMIT_LOGICAL_HEADER_BYTES +
+    continuations * PACK_COMMIT_CONTINUATION_BYTES +
+    2 * outputBytes +
+    parentCount * PACK_COMMIT_LOGICAL_HEADER_BYTES;
+  const cacheBytes =
+    PACK_COMMIT_PARSE_BYTES + 2 * outputBytes + parentCount * PACK_COMMIT_LOGICAL_HEADER_BYTES;
+  const parentJsonChars = parentCount === 0 ? 2 : 43 * parentCount + 1;
+  const escapedParentJsonChars = parentJsonChars + 2 * parentCount + 2;
+  const outerJsonChars = PACK_COMMIT_PARSE_BYTES + escapedParentJsonChars + serializedChars;
+  const outerJsonBytes = PACK_COMMIT_PARSE_BYTES + escapedParentJsonChars + serializedBytes;
+  const serializationPeakBytes = Math.max(
+    cacheBytes + 2 * parentJsonChars + 2 * outerJsonChars,
+    cacheBytes + 2 * outerJsonChars + outerJsonBytes,
+  );
+  const prepareBytes = Math.max(parsePeakBytes, serializationPeakBytes);
+  if (!Number.isSafeInteger(prepareBytes)) {
+    throw new GitError("E2BIG", `packed commit ${oid} parser state is too large`);
+  }
+  return { prepareBytes, serializationBytes: serializationPeakBytes };
+}
+
+class FlatByteSource implements ByteSource {
+  constructor(readonly bytes: Uint8Array) {}
+
+  get length(): number {
+    return this.bytes.length;
+  }
+
+  byteAt(index: number): number {
+    const value = this.bytes[index];
+    if (value === undefined) throw new RangeError("byte source index is out of range");
+    return value;
+  }
+
+  copyTo(target: ChunkedBytes, targetOffset: number, sourceOffset: number, length: number): void {
+    if (
+      !Number.isSafeInteger(sourceOffset) ||
+      !Number.isSafeInteger(length) ||
+      sourceOffset < 0 ||
+      length < 0 ||
+      sourceOffset > this.bytes.length - length
+    ) {
+      throw new RangeError("byte source range is out of bounds");
+    }
+    target.write(targetOffset, this.bytes.subarray(sourceOffset, sourceOffset + length));
+  }
+
+  *chunks(): Iterable<Uint8Array> {
+    yield this.bytes;
+  }
+}
+
+function hashByteSource(type: ObjectType, source: ByteSource): string {
+  const sha = new Sha1().update(objectHeader(type, source.length));
+  for (const chunk of source.chunks()) sha.update(chunk);
+  return toHex(sha.digest());
 }
 
 export interface PackedEntry {
@@ -213,6 +461,17 @@ interface PendingRow {
   base_oid: string | null;
   base_offset: number | null;
   resolved_oid: string | null;
+}
+
+interface PackIngestMemory {
+  reservation: MemoryReservation;
+  pool: ChunkPool;
+}
+
+interface IngestBase {
+  type: ObjectType;
+  source: ByteSource;
+  owned: ChunkedBytes | null;
 }
 
 function validatePendingRow(row: PendingRow): void {
@@ -369,31 +628,143 @@ function checkDeltaInflateBudget(base: Uint8Array, deltaSize: number): void {
 /** Parsed pack trees pending a bounded, transactional index flush. */
 class PackTreeIndex {
   readonly #sources: TreeSourceInput[] = [];
-  #bytes = 0;
+  #payloadBytes = 0;
+  #retainedBytes = 0;
 
-  constructor(private readonly db: SqlDatabase) {}
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly reservation: MemoryReservation,
+  ) {}
 
-  add(source: TreeSourceInput, bufferedBytes: number): void {
+  get retainedBytes(): number {
+    return this.#retainedBytes;
+  }
+
+  addBuffered(
+    repoId: number,
+    treeOid: string,
+    sourceId: number,
+    objectSize: number,
+    data: Uint8Array,
+  ): void {
+    const retained = this.#sourceBytes(data.length, 1);
     if (
       this.#sources.length > 0 &&
       (this.#sources.length >= PACK_TREE_BATCH_SOURCES ||
-        this.#bytes + bufferedBytes > PACK_TREE_BATCH_BYTES)
+        this.#payloadBytes + data.length > PACK_TREE_BATCH_BYTES ||
+        this.#retainedBytes + retained > PACK_TREE_BATCH_BYTES)
     ) {
       this.flush();
     }
-    if (bufferedBytes > PACK_TREE_BATCH_BYTES) {
-      this.db.transactionSync(() => indexTreeSource(this.db, source, source.chunks));
+    if (retained > PACK_TREE_BATCH_BYTES) {
+      this.#direct(() =>
+        indexTreeSource(this.db, this.#source(repoId, treeOid, sourceId, objectSize, [data]), [
+          data,
+        ]),
+      );
       return;
     }
-    this.#sources.push(source);
-    this.#bytes += bufferedBytes;
+    this.reservation.set("tree", this.#retainedBytes + retained);
+    this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, [data]));
+    this.#payloadBytes += data.length;
+    this.#retainedBytes += retained;
+  }
+
+  addStream(
+    repoId: number,
+    treeOid: string,
+    sourceId: number,
+    objectSize: number,
+    chunks: () => Iterable<Uint8Array>,
+  ): void {
+    this.flush();
+    this.#direct(() => {
+      const source = this.#source(repoId, treeOid, sourceId, objectSize, []);
+      indexTreeSource(this.db, source, chunks());
+    });
+  }
+
+  addChunked(
+    repoId: number,
+    treeOid: string,
+    sourceId: number,
+    objectSize: number,
+    target: ChunkedBytes,
+  ): void {
+    const chunkCount = Math.max(1, Math.ceil(target.length / PACK_CHUNK_BYTES));
+    const retained = this.#sourceBytes(target.length, chunkCount);
+    if (retained > PACK_TREE_BATCH_BYTES) {
+      this.flush();
+      this.#direct(() => {
+        const source = this.#source(repoId, treeOid, sourceId, objectSize, []);
+        const sink = createTreeIndexSink(this.db, source);
+        for (const chunk of target.chunks()) sink.push(chunk);
+        sink.finish();
+      });
+      return;
+    }
+    if (
+      this.#sources.length > 0 &&
+      (this.#sources.length >= PACK_TREE_BATCH_SOURCES ||
+        this.#payloadBytes + target.length > PACK_TREE_BATCH_BYTES ||
+        this.#retainedBytes + retained > PACK_TREE_BATCH_BYTES)
+    ) {
+      this.flush();
+    }
+    this.reservation.set("tree", this.#retainedBytes + retained);
+    const chunks: Uint8Array[] = [];
+    try {
+      for (const chunk of target.chunks()) chunks.push(chunk.slice());
+      this.#sources.push(this.#source(repoId, treeOid, sourceId, objectSize, chunks));
+      this.#payloadBytes += target.length;
+      this.#retainedBytes += retained;
+    } catch (error) {
+      this.reservation.set("tree", this.#retainedBytes);
+      throw error;
+    }
   }
 
   flush(): void {
     if (this.#sources.length === 0) return;
-    this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
-    this.#sources.length = 0;
-    this.#bytes = 0;
+    try {
+      this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
+    } finally {
+      this.#sources.length = 0;
+      this.#payloadBytes = 0;
+      this.#retainedBytes = 0;
+      this.reservation.clear("tree");
+    }
+  }
+
+  #sourceBytes(payloadBytes: number, chunkCount: number): number {
+    const retained =
+      payloadBytes +
+      PACK_TREE_SOURCE_BYTES +
+      PACK_TREE_CHUNK_ARRAY_BYTES +
+      chunkCount * PACK_TREE_CHUNK_BYTES;
+    if (!Number.isSafeInteger(retained)) {
+      throw new GitError("E2BIG", "packed tree batch retained state is too large");
+    }
+    return retained;
+  }
+
+  #source(
+    repoId: number,
+    treeOid: string,
+    sourceId: number,
+    objectSize: number,
+    chunks: Iterable<Uint8Array>,
+  ): TreeSourceInput {
+    return { repoId, treeOid, storage: "pack", sourceId, objectSize, chunks };
+  }
+
+  #direct(write: () => void): void {
+    this.reservation.set("tree", PACK_TREE_BATCH_BYTES);
+    try {
+      this.db.transactionSync(write);
+    } finally {
+      this.reservation.clear("tree");
+    }
   }
 }
 
@@ -401,17 +772,41 @@ class PackTreeIndex {
 class PackCommitIndex {
   readonly #entries: CommitCacheEntry[] = [];
   #bytes = 0;
+  #serializationTransientBytes = 0;
 
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
     private readonly packId: number,
     private readonly beforeWrite: () => void,
+    private readonly reservation: MemoryReservation,
   ) {}
 
+  get retainedBytes(): number {
+    return this.#bytes;
+  }
+
   add(source: CommitCacheSource): void {
-    const entry = prepareCommitCache(source);
+    const estimate = commitMemoryEstimate(source.data, source.oid);
+    if (
+      this.#entries.length > 0 &&
+      (this.#entries.length >= PACK_COMMIT_BATCH_SOURCES ||
+        this.#bytes + estimate.prepareBytes > MAX_COMMIT_CACHE_BYTES ||
+        this.#bytes + estimate.serializationBytes + PACK_COMMIT_PAGE_TRANSIENT_BYTES >
+          PACK_COMMIT_ACTIVE_HEADROOM_BYTES)
+    ) {
+      this.#stage();
+    }
+    this.reservation.set("commit", this.#bytes + estimate.prepareBytes);
+    let entry: CommitCacheEntry;
+    try {
+      entry = prepareCommitCache(source);
+    } catch (error) {
+      this.reservation.set("commit", this.#bytes);
+      throw error;
+    }
     if (entry.cacheBytes > MAX_COMMIT_CACHE_BYTES) {
+      this.reservation.set("commit", this.#bytes);
       throw new GitError("E2BIG", `packed commit ${source.oid} exceeds the cache batch limit`);
     }
     if (
@@ -421,8 +816,13 @@ class PackCommitIndex {
     ) {
       this.#stage();
     }
+    this.reservation.set("commit", this.#bytes + entry.cacheBytes);
     this.#entries.push(entry);
     this.#bytes += entry.cacheBytes;
+    this.#serializationTransientBytes = Math.max(
+      this.#serializationTransientBytes,
+      estimate.serializationBytes - entry.cacheBytes,
+    );
   }
 
   /** Flush the final batch after the caller marks the pack complete. */
@@ -430,6 +830,11 @@ class PackCommitIndex {
     this.beforeWrite();
     this.#insert();
     this.#clear();
+  }
+
+  checkpoint(): void {
+    if (this.#entries.length === 0) return;
+    this.#stage();
   }
 
   /** Persist a full batch while leaving the pack externally pending. */
@@ -454,17 +859,27 @@ class PackCommitIndex {
 
   #insert(): void {
     if (this.#entries.length === 0) return;
-    const result = insertCommitCaches(this.db, this.#entries);
-    if (result.eligible !== this.#entries.length || result.written !== this.#entries.length) {
-      throw new CorruptError(
-        `packed commit cache wrote ${result.written} of ${this.#entries.length} required rows`,
-      );
+    this.reservation.set(
+      "commit",
+      this.#bytes + this.#serializationTransientBytes + PACK_COMMIT_PAGE_TRANSIENT_BYTES,
+    );
+    try {
+      const result = insertCommitCaches(this.db, this.#entries);
+      if (result.eligible !== this.#entries.length || result.written !== this.#entries.length) {
+        throw new CorruptError(
+          `packed commit cache wrote ${result.written} of ${this.#entries.length} required rows`,
+        );
+      }
+    } finally {
+      this.reservation.set("commit", this.#bytes);
     }
   }
 
   #clear(): void {
     this.#entries.length = 0;
     this.#bytes = 0;
+    this.#serializationTransientBytes = 0;
+    this.reservation.clear("commit");
   }
 }
 
@@ -476,17 +891,20 @@ export class PackStore {
   readonly #externalMetadata: ExternalMetadataResolver;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #chunks: ByteLru<string, Uint8Array>;
+  readonly #memory: MemoryCoordinator;
   readonly #cacheNamespace: string;
   #cacheGeneration = 0;
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
   readonly #maxDeltaDepth: number;
+  #lastIngestMemoryHighWater = 0;
 
   constructor(
     db: SqlDatabase,
     repoId: number,
     objects: ByteLru<string, RawObject>,
     chunks: ByteLru<string, Uint8Array>,
+    memory: MemoryCoordinator,
     cacheNamespace: string,
     external: ExternalResolver,
     externalBatch: ExternalBatchResolver,
@@ -500,6 +918,7 @@ export class PackStore {
     this.#externalMetadata = externalMetadata;
     this.#objects = objects;
     this.#chunks = chunks;
+    this.#memory = memory;
     this.#cacheNamespace = cacheNamespace;
     this.#maxBufferedEntry = Math.min(
       options.maxBufferedEntry ?? DEFAULT_MAX_BUFFERED_ENTRY,
@@ -519,6 +938,10 @@ export class PackStore {
   /** Bytes the chunk cache currently holds. */
   get cachedChunkBytes(): number {
     return this.#chunks.bytes;
+  }
+
+  get lastIngestMemoryHighWater(): number {
+    return this.#lastIngestMemoryHighWater;
   }
 
   lookup(oid: string): PackedEntry | null {
@@ -1183,38 +1606,63 @@ export class PackStore {
     source: AsyncIterable<Uint8Array>,
     options: PackIngestOptions = {},
   ): Promise<PackIngestResult> {
-    this.reclaimPending();
-    const packId =
-      (this.#db.scalar<number | null>(
-        "SELECT MAX(pack_id) FROM git_pack_meta WHERE repo_id = ?",
-        this.#repoId,
-      ) ?? 0) + 1;
+    const reservation = this.#memory.reserve();
+    const pool = new ChunkPool(MAX_PACK_DELTA_WORKING_BYTES);
+    const memory = { reservation, pool };
     const now = options.now ?? Date.now;
     const say = options.onProgress ?? (() => {});
     const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
     const yieldNow = options.yieldNow ?? (() => Promise.resolve());
 
-    this.#db.run(
-      "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (?, ?, 0, 0, 'pending', ?)",
-      this.#repoId,
-      packId,
-      now(),
-    );
-
-    const total = await this.#writeChunks(source, packId, maxBytes, say, yieldNow);
-    const { count, commits } = await this.#indexPack(packId, total, say, yieldNow);
-
-    this.#db.transactionSync(() => {
+    try {
+      reservation.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
+      this.reclaimPending();
+      const packId =
+        (this.#db.scalar<number | null>(
+          "SELECT MAX(pack_id) FROM git_pack_meta WHERE repo_id = ?",
+          this.#repoId,
+        ) ?? 0) + 1;
       this.#db.run(
-        "UPDATE git_pack_meta SET size = ?, count = ?, state = 'complete' WHERE repo_id = ? AND pack_id = ?",
-        total,
-        count,
+        "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (?, ?, 0, 0, 'pending', ?)",
         this.#repoId,
         packId,
+        now(),
       );
-      commits.finish();
-    });
-    return { packId, count, bytes: total };
+
+      const total = await this.#writeChunks(source, packId, maxBytes, say, yieldNow, memory);
+      const { count, commits } = await this.#indexPack(packId, total, say, yieldNow, memory);
+
+      this.#db.transactionSync(() => {
+        this.#db.run(
+          "UPDATE git_pack_meta SET size = ?, count = ?, state = 'complete' WHERE repo_id = ? AND pack_id = ?",
+          total,
+          count,
+          this.#repoId,
+          packId,
+        );
+        commits.finish();
+      });
+      reservation.clear("commit");
+      return { packId, count, bytes: total };
+    } finally {
+      this.#lastIngestMemoryHighWater = reservation.highWaterBytes;
+      if (!reservation.disposed) {
+        try {
+          pool.assertIdle();
+          pool.dispose();
+          reservation.clear("flat");
+          reservation.clear("compressed");
+          reservation.clear("metadata");
+          reservation.clear("tree");
+          reservation.clear("commit");
+          reservation.clear("base");
+          reservation.clear("pool");
+          reservation.assertEmpty();
+        } finally {
+          reservation.dispose();
+        }
+      }
+    }
   }
 
   /**
@@ -1228,6 +1676,7 @@ export class PackStore {
     maxBytes: number,
     say: (message: string) => void,
     yieldNow: () => Promise<void>,
+    memory: PackIngestMemory,
   ): Promise<number> {
     const sha = new Sha1();
     let tail = new Uint8Array(0); // rolling 20-byte lookbehind: the trailer
@@ -1235,6 +1684,7 @@ export class PackStore {
     let seq = 0;
     let announced = 0;
     const buffer = new Uint8Array(PACK_CHUNK);
+    memory.reservation.set("compressed", PACK_CHUNK + 40);
     let filled = 0;
 
     const feed = (data: Uint8Array): void => {
@@ -1271,6 +1721,7 @@ export class PackStore {
       if (data.length === 0) continue;
       for (let offset = 0; offset < data.length; offset += SLICE) {
         feed(data.subarray(offset, offset + SLICE));
+        memory.pool.assertIdle();
         await yieldNow();
       }
     }
@@ -1278,6 +1729,7 @@ export class PackStore {
 
     if (total < 32) throw new CorruptError("pack is too small to be valid");
     if (toHex(tail) !== toHex(sha.digest())) throw new CorruptError("pack checksum mismatch");
+    memory.reservation.clear("compressed");
     return total;
   }
 
@@ -1297,7 +1749,9 @@ export class PackStore {
     total: number,
     say: (message: string) => void,
     yieldNow: () => Promise<void>,
+    memory: PackIngestMemory,
   ): Promise<{ count: number; commits: PackCommitIndex }> {
+    memory.reservation.set("metadata", PACK_INGEST_METADATA_BYTES);
     const reader = new PackReader(this, packId, total);
     const magic = reader.take(4);
     if (magic[0] !== 0x50 || magic[1] !== 0x41 || magic[2] !== 0x43 || magic[3] !== 0x4b) {
@@ -1311,9 +1765,13 @@ export class PackStore {
     const offsets = new OffsetWindow();
     const objectIndex = new PackObjectBatch(this.#db, this.#repoId);
     const pendingIndex = new PackPendingBatch(this.#db, this.#repoId, packId);
-    const treeIndex = new PackTreeIndex(this.#db);
-    const commitIndex = new PackCommitIndex(this.#db, this.#repoId, packId, () =>
-      objectIndex.flush(),
+    const treeIndex = new PackTreeIndex(this.#db, memory.reservation);
+    const commitIndex = new PackCommitIndex(
+      this.#db,
+      this.#repoId,
+      packId,
+      () => objectIndex.flush(),
+      memory.reservation,
     );
     const missingBases = new Set<string>();
     const offsetToOid = (offset: number): string | null => {
@@ -1324,6 +1782,7 @@ export class PackStore {
     for (let i = 0; i < count; i++) {
       const header = reader.entryHeader();
       const entryType = header.kind === null ? NUMBER_TYPE[header.type]! : null;
+      this.#reserveFlat(header.entrySize, treeIndex, commitIndex, memory.reservation);
       const entry = this.#inflateAt(reader, header.dataOff, header.entrySize, entryType);
 
       if (header.kind === null) {
@@ -1352,10 +1811,16 @@ export class PackStore {
           entry.consumed,
           header.entrySize,
           objectIndex,
+          null,
+          memory.reservation,
+          0,
         );
+        if (type === "tree") memory.reservation.clear("flat");
+        this.#syncIndexMemory(treeIndex, commitIndex, memory.reservation);
         offsets.set(header.offset, oid);
         missingBases.delete(oid);
         if (entry.data !== null) this.#cacheObject(packId, oid, { type, data: entry.data });
+        memory.reservation.clear("flat");
       } else {
         const baseOid =
           header.kind === "ref" ? header.baseOid! : offsetToOid(header.offset - header.baseDelta!);
@@ -1366,37 +1831,60 @@ export class PackStore {
             : this.#objects.get(this.#objectCacheKey(packId, baseOid));
           if (base === undefined) missingBases.add(baseOid);
           if (base !== undefined) {
-            checkDeltaWorkingSet(base.data, entry.data);
-            const data = applyDelta(base.data, entry.data);
-            const oid = hashObject(base.type, data);
-            const row: PackObjectInput = [
-              oid,
-              packId,
-              header.offset,
-              header.dataOff,
-              entry.consumed,
-              base.type,
-              data.length,
-              header.entrySize,
-              baseOid,
-            ];
-            this.#insertResolved(
-              row,
-              packId,
-              oid,
-              base.type,
-              data,
-              treeIndex,
-              commitIndex,
-              header.dataOff,
-              entry.consumed,
-              data.length,
-              objectIndex,
-            );
-            offsets.set(header.offset, oid);
-            missingBases.delete(oid);
-            this.#cacheObject(packId, oid, { type: base.type, data });
-            resolved = true;
+            const target = this.#applyDeltaBytes(base.data, entry.data, memory.pool);
+            try {
+              const oid = hashByteSource(base.type, target);
+              const row: PackObjectInput = [
+                oid,
+                packId,
+                header.offset,
+                header.dataOff,
+                entry.consumed,
+                base.type,
+                target.length,
+                header.entrySize,
+                baseOid,
+              ];
+              if (base.type === "commit") {
+                memory.reservation.set("flat", entry.data.length + target.length);
+              }
+              this.#insertResolved(
+                row,
+                packId,
+                oid,
+                base.type,
+                null,
+                treeIndex,
+                commitIndex,
+                header.dataOff,
+                entry.consumed,
+                target.length,
+                objectIndex,
+                target,
+                memory.reservation,
+                entry.data.length,
+              );
+              if (base.type === "commit") {
+                memory.reservation.set("flat", entry.data.length);
+              }
+              this.#syncIndexMemory(treeIndex, commitIndex, memory.reservation);
+              offsets.set(header.offset, oid);
+              missingBases.delete(oid);
+              if (target.length <= this.#cacheEntryLimit) {
+                this.#cacheChunked(
+                  packId,
+                  oid,
+                  base.type,
+                  target,
+                  entry.data.length,
+                  memory.reservation,
+                );
+              }
+              resolved = true;
+            } finally {
+              target.release();
+              memory.pool.dispose();
+            }
           }
         }
         if (!resolved) {
@@ -1410,11 +1898,13 @@ export class PackStore {
           ]);
           deferred++;
         }
+        memory.reservation.clear("flat");
       }
 
       if ((i & 1023) === 1023) {
         objectIndex.flush();
         pendingIndex.flush();
+        memory.pool.assertIdle();
         await yieldNow();
         if ((i & 65535) === 65535) say(`Resolving deltas: ${i + 1}/${count}\n`);
       }
@@ -1425,9 +1915,19 @@ export class PackStore {
     }
     objectIndex.flush();
     pendingIndex.flush();
-    await this.#drainPending(packId, offsets, objectIndex, treeIndex, commitIndex, yieldNow);
+    await this.#drainPending(
+      packId,
+      offsets,
+      objectIndex,
+      treeIndex,
+      commitIndex,
+      yieldNow,
+      memory,
+    );
     objectIndex.flush();
     treeIndex.flush();
+    memory.reservation.clear("tree");
+    memory.reservation.clear("metadata");
     if (deferred > 0) say(`Resolved ${deferred} deferred delta(s)\n`);
     return { count, commits: commitIndex };
   }
@@ -1439,6 +1939,7 @@ export class PackStore {
     treeIndex: PackTreeIndex,
     commitIndex: PackCommitIndex,
     yieldNow: () => Promise<void>,
+    memory: PackIngestMemory,
   ): Promise<void> {
     let remaining =
       this.#db.scalar<number>(
@@ -1496,8 +1997,16 @@ export class PackStore {
         const externalOids = baseOids.filter((oid) => !packedMetadata.has(oid));
         const externalMetadata = this.#externalMetadata(externalOids);
         this.#checkBaseAdmission(packedMetadata, externalMetadata);
-        const bases = this.#readBaseBatch([...packedMetadata.keys()], packId);
-        for (const [oid, object] of bases) {
+        let admittedBaseBytes = 0;
+        for (const metadata of [...packedMetadata.values(), ...externalMetadata.values()]) {
+          admittedBaseBytes += metadata.size;
+        }
+        memory.reservation.set(
+          "base",
+          packedMetadata.size + externalMetadata.size > 1 ? admittedBaseBytes : 0,
+        );
+        const materialized = this.#readBaseBatch([...packedMetadata.keys()], packId);
+        for (const [oid, object] of materialized) {
           const metadata = packedMetadata.get(oid);
           if (
             metadata === undefined ||
@@ -1516,10 +2025,18 @@ export class PackStore {
           ) {
             throw new CorruptError("materialized loose base disagrees with its admitted metadata");
           }
-          bases.set(oid, object);
+          materialized.set(oid, object);
+        }
+        const bases = new Map<string, IngestBase>();
+        for (const [oid, object] of materialized) {
+          bases.set(oid, {
+            type: object.type,
+            source: new FlatByteSource(object.data),
+            owned: null,
+          });
         }
         let retainedBaseBytes = 0;
-        for (const object of bases.values()) retainedBaseBytes += object.data.length;
+        for (const object of bases.values()) retainedBaseBytes += object.source.length;
         if (
           !Number.isSafeInteger(retainedBaseBytes) ||
           (bases.size > 1 && retainedBaseBytes > MAX_PACK_BLOB_BATCH_BYTES) ||
@@ -1555,73 +2072,105 @@ export class PackStore {
         }
 
         const completed: number[] = [];
-        for (let cursor = 0; cursor < ready.length; cursor++) {
-          const { row, baseOid } = ready[cursor]!;
-          const base = bases.get(baseOid);
-          if (base === undefined) continue;
-          const uses = (remainingUses.get(baseOid) ?? 1) - 1;
-          remainingUses.set(baseOid, uses);
-          if (uses === 0 && bases.delete(baseOid)) retainedBaseBytes -= base.data.length;
-          checkDeltaInflateBudget(base.data, row.entry_size);
-          const delta = this.#inflateStoredEntry(
-            packId,
-            row.data_off,
-            row.data_len,
-            row.entry_size,
-            `delta at ${row.offset}`,
-          );
-          checkDeltaWorkingSet(base.data, delta);
-          const data = applyDelta(base.data, delta);
-          const oid = hashObject(base.type, data);
-          const objectRow: PackObjectInput = [
-            oid,
-            packId,
-            row.offset,
-            row.data_off,
-            row.data_len,
-            base.type,
-            data.length,
-            row.entry_size,
-            baseOid,
-          ];
-          this.#insertResolved(
-            objectRow,
-            packId,
-            oid,
-            base.type,
-            data,
-            treeIndex,
-            commitIndex,
-            row.data_off,
-            row.data_len,
-            data.length,
-            objectIndex,
-          );
-          completed.push(row.offset);
-          offsets.set(row.offset, oid);
-          const object = { type: base.type, data };
-          const offsetChildren = byBaseOffset.get(row.offset) ?? [];
-          if (offsetChildren.length > 0) {
-            remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + offsetChildren.length);
-          }
-          const oidChildren = byBaseOid.get(oid) ?? [];
-          const hasChildren = oidChildren.length > 0 || offsetChildren.length > 0;
-          if (hasChildren && !bases.has(oid)) {
-            if (
-              data.length > MAX_PACK_DELTA_WORKING_BYTES ||
-              (retainedBaseBytes > 0 && retainedBaseBytes + data.length > MAX_PACK_BLOB_BATCH_BYTES)
-            ) {
-              throw new GitError("E2BIG", "pack ingest bases exceed the bounded live-set limit");
+        try {
+          for (let cursor = 0; cursor < ready.length; cursor++) {
+            const { row, baseOid } = ready[cursor]!;
+            const base = bases.get(baseOid);
+            if (base === undefined) continue;
+            const uses = (remainingUses.get(baseOid) ?? 1) - 1;
+            remainingUses.set(baseOid, uses);
+            const target = this.#applyStoredDelta(
+              packId,
+              row.data_off,
+              row.data_len,
+              row.entry_size,
+              `delta at ${row.offset}`,
+              base.source,
+              memory.pool,
+            );
+            if (uses === 0 && bases.delete(baseOid)) {
+              retainedBaseBytes -= base.source.length;
+              base.owned?.release();
+              memory.reservation.set("base", bases.size > 1 ? retainedBaseBytes : 0);
             }
-            bases.set(oid, object);
-            retainedBaseBytes += data.length;
+            let retainedTarget = false;
+            try {
+              const oid = hashByteSource(base.type, target);
+              const offsetChildren = byBaseOffset.get(row.offset) ?? [];
+              const oidChildren = byBaseOid.get(oid) ?? [];
+              const hasChildren = oidChildren.length > 0 || offsetChildren.length > 0;
+              const objectRow: PackObjectInput = [
+                oid,
+                packId,
+                row.offset,
+                row.data_off,
+                row.data_len,
+                base.type,
+                target.length,
+                row.entry_size,
+                baseOid,
+              ];
+              if (base.type === "commit") {
+                memory.reservation.set("flat", target.length);
+              }
+              this.#insertResolved(
+                objectRow,
+                packId,
+                oid,
+                base.type,
+                null,
+                treeIndex,
+                commitIndex,
+                row.data_off,
+                row.data_len,
+                target.length,
+                objectIndex,
+                target,
+                memory.reservation,
+                0,
+              );
+              if (base.type === "commit") memory.reservation.clear("flat");
+              this.#syncIndexMemory(treeIndex, commitIndex, memory.reservation);
+              completed.push(row.offset);
+              offsets.set(row.offset, oid);
+              if (offsetChildren.length > 0) {
+                remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + offsetChildren.length);
+              }
+              if (hasChildren && !bases.has(oid)) {
+                if (
+                  target.length > MAX_PACK_DELTA_WORKING_BYTES ||
+                  (retainedBaseBytes > 0 &&
+                    retainedBaseBytes + target.length > MAX_PACK_BLOB_BATCH_BYTES)
+                ) {
+                  throw new GitError(
+                    "E2BIG",
+                    "pack ingest bases exceed the bounded live-set limit",
+                  );
+                }
+                memory.reservation.set(
+                  "base",
+                  bases.size > 0 ? retainedBaseBytes + target.length : 0,
+                );
+                bases.set(oid, { type: base.type, source: target, owned: target });
+                retainedBaseBytes += target.length;
+                retainedTarget = true;
+              }
+              if (hasChildren) {
+                for (const child of oidChildren) enqueue(child, oid);
+                for (const child of offsetChildren) enqueue(child, oid);
+              }
+              if (target.length <= this.#cacheEntryLimit) {
+                this.#cacheChunked(packId, oid, base.type, target, 0, memory.reservation);
+              }
+              progressed++;
+            } finally {
+              if (!retainedTarget) target.release();
+            }
           }
-          if (hasChildren) {
-            for (const child of oidChildren) enqueue(child, oid);
-            for (const child of offsetChildren) enqueue(child, oid);
-          }
-          this.#cacheObject(packId, oid, object);
-          progressed++;
+        } finally {
+          for (const base of bases.values()) base.owned?.release();
+          bases.clear();
+          memory.reservation.clear("base");
         }
         if (completed.length > 0) {
           objectIndex.flush();
@@ -1632,6 +2181,8 @@ export class PackStore {
             JSON.stringify(completed),
           );
         }
+        memory.pool.assertIdle();
+        memory.pool.dispose();
         await yieldNow();
       }
       objectIndex.flush();
@@ -1801,6 +2352,129 @@ export class PackStore {
     return checkpoint?.object ?? null;
   }
 
+  #reserveFlat(
+    bytes: number,
+    trees: PackTreeIndex,
+    commits: PackCommitIndex,
+    reservation: MemoryReservation,
+  ): void {
+    const retained = bytes <= this.#maxBufferedEntry ? bytes : 0;
+    try {
+      reservation.set("flat", retained);
+    } catch (error) {
+      if (!(error instanceof GitError) || error.code !== "E2BIG") throw error;
+      trees.flush();
+      commits.checkpoint();
+      reservation.clear("tree");
+      reservation.clear("commit");
+      reservation.set("flat", retained);
+    }
+  }
+
+  #syncIndexMemory(
+    trees: PackTreeIndex,
+    commits: PackCommitIndex,
+    reservation: MemoryReservation,
+  ): void {
+    reservation.set("tree", trees.retainedBytes);
+    reservation.set("commit", commits.retainedBytes);
+  }
+
+  #cacheChunked(
+    packId: number,
+    oid: string,
+    type: ObjectType,
+    target: ChunkedBytes,
+    retainedFlatBytes: number,
+    reservation: MemoryReservation,
+  ): void {
+    try {
+      reservation.set("flat", retainedFlatBytes + target.length);
+    } catch (error) {
+      if (error instanceof GitError && error.code === "E2BIG") return;
+      throw error;
+    }
+    try {
+      this.#cacheObject(packId, oid, { type, data: target.toUint8Array() });
+    } finally {
+      reservation.set("flat", retainedFlatBytes);
+    }
+  }
+
+  #applyDeltaBytes(base: Uint8Array, delta: Uint8Array, pool: ChunkPool): ChunkedBytes {
+    const applier = new DeltaApplier(new FlatByteSource(base), pool, {
+      maxWorkingBytes: MAX_PACK_DELTA_WORKING_BYTES,
+      maxInstructionBytes: MAX_PACK_DELTA_WORKING_BYTES,
+    });
+    try {
+      applier.push(delta);
+      const target = applier.finish();
+      if (base.length + applier.instructionBytes + target.length > MAX_PACK_DELTA_WORKING_BYTES) {
+        target.release();
+        throw new CorruptError("delta working set exceeds 48 MiB");
+      }
+      return target;
+    } catch (error) {
+      applier.abort();
+      throw error;
+    }
+  }
+
+  #applyStoredDelta(
+    packId: number,
+    dataOff: number,
+    dataLen: number,
+    instructionSize: number,
+    label: string,
+    base: ByteSource,
+    pool: ChunkPool,
+  ): ChunkedBytes {
+    if (
+      !Number.isSafeInteger(dataLen) ||
+      !Number.isSafeInteger(instructionSize) ||
+      dataLen < 0 ||
+      instructionSize < 0 ||
+      base.length + instructionSize > MAX_PACK_DELTA_WORKING_BYTES
+    ) {
+      throw new CorruptError(`${label} exceeds the bounded working set`);
+    }
+    const applier = new DeltaApplier(base, pool, {
+      maxWorkingBytes: MAX_PACK_DELTA_WORKING_BYTES,
+      maxInstructionBytes: MAX_PACK_DELTA_WORKING_BYTES,
+    });
+    const stream = new InflateStream((chunk) => applier.push(chunk));
+    let consumed = 0;
+    try {
+      while (!stream.ended && consumed < dataLen) {
+        const length = Math.min(PACK_READ_BYTES, dataLen - consumed);
+        const input = this.readRaw(packId, dataOff + consumed, length);
+        let used: number;
+        try {
+          used = stream.push(input);
+        } catch (error) {
+          if (error instanceof CorruptError) throw error;
+          throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+        }
+        consumed += used;
+        if (!stream.ended && used !== input.length) {
+          throw new CorruptError(`${label} inflater stopped before the stream ended`);
+        }
+      }
+      if (!stream.ended || consumed !== dataLen || stream.inflated !== instructionSize) {
+        throw new CorruptError(`${label} size does not match its index metadata`);
+      }
+      const target = applier.finish();
+      if (base.length + applier.instructionBytes + target.length > MAX_PACK_DELTA_WORKING_BYTES) {
+        target.release();
+        throw new CorruptError("delta working set exceeds 48 MiB");
+      }
+      return target;
+    } catch (error) {
+      applier.abort();
+      throw error;
+    }
+  }
+
   #insertResolved(
     row: PackObjectInput,
     packId: number,
@@ -1813,6 +2487,9 @@ export class PackStore {
     dataLen: number,
     objectSize: number,
     objectIndex: PackObjectBatch,
+    chunked: ChunkedBytes | null,
+    reservation: MemoryReservation,
+    retainedFlatBytes: number,
   ): void {
     objectIndex.add(row);
     if (type === "commit") {
@@ -1822,23 +2499,38 @@ export class PackStore {
           `packed commit ${oid} exceeds the ${MAX_INDEXED_COMMIT_BYTES}-byte index limit`,
         );
       }
-      const commitData =
-        data ?? concat([...this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize)]);
+      let commitData: Uint8Array;
+      if (data !== null) {
+        commitData = data;
+      } else if (chunked !== null) {
+        reservation.set("flat", retainedFlatBytes + objectSize + PACK_COMMIT_PAYLOAD_BYTES);
+        commitData = chunked.toUint8Array();
+        reservation.set("flat", retainedFlatBytes + objectSize);
+      } else {
+        const chunkCount = Math.max(1, Math.ceil(objectSize / PACK_INFLATE_OUTPUT_CHUNK_BYTES));
+        const transientBytes =
+          2 * objectSize + PACK_COMMIT_PAYLOAD_BYTES + chunkCount * PACK_TREE_CHUNK_BYTES;
+        if (!Number.isSafeInteger(transientBytes)) {
+          throw new GitError("E2BIG", `packed commit ${oid} payload state is too large`);
+        }
+        reservation.set("flat", retainedFlatBytes + transientBytes);
+        const inflated = [...this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize)];
+        commitData = concat(inflated);
+        reservation.set("flat", retainedFlatBytes + objectSize);
+      }
       commitIndex.add({ repoId: this.#repoId, oid, data: commitData });
     }
     if (type !== "tree") return;
-    const chunks =
-      data === null ? this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize) : [data];
-    treeIndex.add(
-      {
-        repoId: this.#repoId,
-        treeOid: oid,
-        storage: "pack",
-        sourceId: packId,
-        objectSize,
-        chunks,
-      },
-      data?.length ?? objectSize,
+    if (chunked !== null) {
+      treeIndex.addChunked(this.#repoId, oid, packId, objectSize, chunked);
+      return;
+    }
+    if (data !== null) {
+      treeIndex.addBuffered(this.#repoId, oid, packId, objectSize, data);
+      return;
+    }
+    treeIndex.addStream(this.#repoId, oid, packId, objectSize, () =>
+      this.#inflateEntryChunks(packId, dataOff, dataLen, objectSize),
     );
   }
 

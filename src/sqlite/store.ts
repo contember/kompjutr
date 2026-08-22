@@ -22,6 +22,7 @@ import {
   readCommitGraph,
 } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
+import { MemoryCoordinator } from "./memory.js";
 import {
   MAX_PACK_BLOB_BATCH_BYTES,
   MAX_PACK_DELTA_WORKING_BYTES,
@@ -908,6 +909,7 @@ export class SqliteGitDatabase {
   readonly #stores = new Map<number, RepoStore>();
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packRows: ByteLru<string, Uint8Array>;
+  readonly #memory = new MemoryCoordinator();
   #nextStoreGeneration = 1;
 
   constructor(db: SqlDatabase, options: StoreOptions = {}) {
@@ -983,6 +985,7 @@ export class SqliteGitDatabase {
       generation,
       this.#objects,
       this.#packRows,
+      this.#memory,
       this.#options,
       () => this.#stores.delete(repository.id),
     );
@@ -1009,6 +1012,7 @@ export class RepoStore {
     storeGeneration: number,
     objects: ByteLru<string, RawObject>,
     packRows: ByteLru<string, Uint8Array>,
+    memory: MemoryCoordinator,
     options: StoreOptions = {},
     onDestroy?: () => void,
   ) {
@@ -1023,6 +1027,7 @@ export class RepoStore {
       repository.id,
       this.#objects,
       packRows,
+      memory,
       this.#cacheNamespace,
       (oid) => this.#readLoose(oid),
       (oids) => this.#readLooseObjects(oids),

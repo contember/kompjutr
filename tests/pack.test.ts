@@ -3,21 +3,24 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
 import { GitError } from "../src/core/errors.js";
+import { ByteLru } from "../src/core/lru.js";
 import {
   hashObject,
   MODE_FILE,
   type ObjectType,
   parseCommit,
   parseTree,
+  type RawObject,
   serializeCommit,
   serializeTree,
 } from "../src/core/objects.js";
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { MAX_INDEXED_COMMIT_BYTES } from "../src/sqlite/commits.js";
+import { MAX_INDEXED_COMMIT_BYTES, prepareCommitCache } from "../src/sqlite/commits.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
 import { MAX_DELTA_DEPTH, MAX_PACK_DELTA_WORKING_BYTES, PACK_CHUNK } from "../src/sqlite/packs.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 
@@ -65,6 +68,31 @@ function syntheticCommit(index: number, message = `commit ${index}\n`): Uint8Arr
     },
     message,
   });
+}
+
+function parentHeavyCommit(parentCount: number): Uint8Array {
+  const tree = utf8.encode(`tree ${"f".repeat(40)}\n`);
+  const parent = utf8.encode(`parent ${"e".repeat(40)}\n`);
+  const data = new Uint8Array(tree.length + parent.length * parentCount + 1);
+  data.set(tree);
+  for (let index = 0; index < parentCount; index++) {
+    data.set(parent, tree.length + index * parent.length);
+  }
+  data[data.length - 1] = 0x0a;
+  return data;
+}
+
+function denseIgnoredHeaderCommit(): Uint8Array {
+  const malformedTree = utf8.encode("tree malformed\n");
+  const ignored = utf8.encode("x y\n");
+  const count = Math.floor((MAX_INDEXED_COMMIT_BYTES - malformedTree.length - 1) / ignored.length);
+  const data = new Uint8Array(malformedTree.length + ignored.length * count + 1);
+  data.set(malformedTree);
+  for (let index = 0; index < count; index++) {
+    data.set(ignored, malformedTree.length + index * ignored.length);
+  }
+  data[data.length - 1] = 0x0a;
+  return data;
 }
 
 function literalDelta(baseSize: number, target: Uint8Array): Uint8Array {
@@ -383,7 +411,20 @@ describe("synthetic pack ingest", () => {
   it("re-inflates a buffered-limit commit and rejects an over-limit commit", async () => {
     const database = new SqliteGitDatabase(new TestDatabase(), { maxBufferedEntry: 64 * 1024 });
     const store = database.open(database.create("/repo", "ref: refs/heads/main"));
-    const bounded = syntheticCommit(1, `${"a".repeat(70 * 1024)}\n`);
+    let acceptedMessageBytes = 0;
+    let rejectedMessageBytes = MAX_INDEXED_COMMIT_BYTES;
+    while (acceptedMessageBytes + 1 < rejectedMessageBytes) {
+      const candidate = Math.floor((acceptedMessageBytes + rejectedMessageBytes) / 2);
+      const data = syntheticCommit(1, "a".repeat(candidate));
+      try {
+        prepareCommitCache({ repoId: 1, oid: hashObject("commit", data), data });
+        acceptedMessageBytes = candidate;
+      } catch (error) {
+        if (!(error instanceof GitError) || error.code !== "E2BIG") throw error;
+        rejectedMessageBytes = candidate;
+      }
+    }
+    const bounded = syntheticCommit(1, "a".repeat(acceptedMessageBytes));
     const boundedOid = hashObject("commit", bounded);
     const boundedChunks: Uint8Array[] = [];
     const boundedWriter = new PackWriter((chunk) => boundedChunks.push(chunk));
@@ -393,8 +434,8 @@ describe("synthetic pack ingest", () => {
     await store.packs.ingest(slices(concat(boundedChunks), 4096));
     expect(store.cachedCommit(boundedOid)?.commit).toEqual(parseCommit(bounded));
 
-    const oversized = syntheticCommit(2, "x".repeat(MAX_INDEXED_COMMIT_BYTES));
-    expect(oversized.length).toBeGreaterThan(MAX_INDEXED_COMMIT_BYTES);
+    const oversized = syntheticCommit(1, "a".repeat(acceptedMessageBytes + 1));
+    expect(oversized.length).toBe(bounded.length + 1);
     const oversizedChunks: Uint8Array[] = [];
     const oversizedWriter = new PackWriter((chunk) => oversizedChunks.push(chunk));
     oversizedWriter.header(1);
@@ -437,6 +478,120 @@ describe("synthetic pack ingest", () => {
       packed.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
     ).toBe(1);
     expect(packed.cachedCommit(oid)).toEqual(looseCache);
+  });
+
+  it("accepts a near-limit commit with 21,843 parents under shared coordinator pressure", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/repo", "ref: refs/heads/main");
+    const coordinator = new MemoryCoordinator();
+    const blocker = coordinator.reserve();
+    blocker.set("other", 1);
+    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
+    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
+    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const data = parentHeavyCommit(21_843);
+    expect(data.length).toBe(1_048_511);
+    const oid = hashObject("commit", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("commit", data);
+    writer.finish();
+
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+      expect(store.cachedCommit(oid)?.commit.parent).toHaveLength(21_843);
+      expect(coordinator.totalBytes).toBe(1);
+    } finally {
+      blocker.clear("other");
+      blocker.dispose();
+    }
+    expect(coordinator.activeCount).toBe(0);
+  });
+
+  it("rejects dense ignored headers before allocating the commit parser", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/repo", "ref: refs/heads/main");
+    const coordinator = new MemoryCoordinator();
+    const blocker = coordinator.reserve();
+    blocker.set("other", 1);
+    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
+    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
+    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const data = denseIgnoredHeaderCommit();
+    expect(data.length).toBeLessThanOrEqual(MAX_INDEXED_COMMIT_BYTES);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("commit", data);
+    writer.finish();
+
+    let error: unknown;
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    } catch (caught) {
+      error = caught;
+    } finally {
+      blocker.clear("other");
+      blocker.dispose();
+    }
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("E2BIG");
+    expect(coordinator.activeCount).toBe(0);
+  });
+
+  it("preflights commit serialization again when shared pressure arrives before flush", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/repo", "ref: refs/heads/main");
+    const coordinator = new MemoryCoordinator();
+    const blocker = coordinator.reserve();
+    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
+    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
+    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const data = parentHeavyCommit(21_843);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1_024);
+    for (let index = 0; index < 1_023; index++) {
+      writer.object("blob", new Uint8Array([index & 0xff, index >>> 8]));
+    }
+    writer.object("commit", data);
+    writer.finish();
+
+    db.storage.histogram = new Map();
+    let pressured = false;
+    let error: unknown;
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
+        yieldNow: async () => {
+          if (pressured) return;
+          const indexed =
+            db.scalar<number>("SELECT COUNT(*) FROM git_pack_objects WHERE repo_id = 1") ?? 0;
+          if (indexed !== 1_024) return;
+          blocker.set("other", 3 * 1024 * 1024);
+          pressured = true;
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    } finally {
+      blocker.clear("other");
+      blocker.dispose();
+    }
+    expect(pressured).toBe(true);
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("E2BIG");
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("INSERT INTO git_commits"))
+        .reduce((total, [, calls]) => total + calls, 0),
+    ).toBe(0);
+    expect(coordinator.activeCount).toBe(0);
   });
 
   it("rolls pack completion back when final source validation writes short", async () => {
@@ -616,6 +771,151 @@ describe("synthetic pack ingest", () => {
     ).toBeLessThanOrEqual(5);
     expect(store.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
     expect(store.read(targets[998]!.oid)?.data).toEqual(targets[998]!.data);
+  });
+
+  it("streams a deferred tree delta through one bounded operation owner", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, {
+      objectCacheBytes: 0,
+      maxBufferedEntry: 64 * 1024,
+    });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const base = syntheticTree(2_000);
+    const target = syntheticTree(3_000);
+    const baseOid = hashObject("tree", base);
+    const targetOid = hashObject("tree", target);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("tree", base);
+    writer.refDelta(baseOid, literalDelta(base.length, target));
+    writer.finish();
+
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 113));
+
+    expect(store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
+    expect(
+      db.scalar<number>(
+        "SELECT entry_count FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ? AND storage = 'pack'",
+        targetOid,
+      ),
+    ).toBe(3_000);
+    expect(store.read(targetOid)?.data).toEqual(target);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(40);
+  });
+
+  it("batches deferred chunked trees instead of flushing one sink per tree", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const base = serializeTree([{ mode: MODE_FILE, name: "base", oid: "1".repeat(40) }]);
+    const baseOid = hashObject("tree", base);
+    const targets = Array.from({ length: 80 }, (_, index) =>
+      serializeTree([
+        {
+          mode: MODE_FILE,
+          name: `file-${index.toString().padStart(3, "0")}`,
+          oid: index.toString(16).padStart(40, "0"),
+        },
+      ]),
+    );
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(targets.length + 1);
+    for (const target of targets) writer.refDelta(baseOid, literalDelta(base.length, target));
+    writer.object("tree", base);
+    writer.finish();
+
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(concat(chunks), 97));
+
+    expect(
+      db.scalar<number>(
+        "SELECT COUNT(*) FROM git_tree_sources WHERE repo_id = 1 AND storage = 'pack'",
+      ),
+    ).toBe(81);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+  });
+
+  it("preflights chunked tree retention at the exact one-MiB boundary", async () => {
+    const ingest = async (extraNameByte: boolean) => {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const base = new Uint8Array(0);
+      const suffix = serializeTree([
+        {
+          mode: MODE_FILE,
+          name: "z".repeat(extraNameByte ? 37 : 36),
+          oid: "f".repeat(40),
+        },
+      ]);
+      const target = concat([syntheticTree(29_088), suffix]);
+      expect(target.length).toBe(1_047_232 + (extraNameByte ? 1 : 0));
+      const chunks: Uint8Array[] = [];
+      const writer = new PackWriter((chunk) => chunks.push(chunk));
+      writer.header(2);
+      writer.object("tree", base);
+      writer.refDelta(hashObject("tree", base), literalDelta(0, target));
+      writer.finish();
+
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+      expect(store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
+      expect(
+        db.scalar<number>(
+          "SELECT entry_count FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
+          hashObject("tree", target),
+        ),
+      ).toBe(29_089);
+    };
+
+    await ingest(false);
+    await ingest(true);
+  });
+
+  it("does not stage an empty commit batch under repeated reservation pressure", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/repo", "ref: refs/heads/main");
+    const coordinator = new MemoryCoordinator();
+    const blocker = coordinator.reserve();
+    blocker.set("other", 1);
+    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
+    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
+    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const exactTree = concat([
+      syntheticTree(29_088),
+      serializeTree([{ mode: MODE_FILE, name: "z".repeat(36), oid: "f".repeat(40) }]),
+    ]);
+    const secondTree = exactTree.slice();
+    const lastTreeByte = secondTree.length - 1;
+    secondTree[lastTreeByte] = secondTree[lastTreeByte]! ^ 1;
+    const largeBlob = new Uint8Array(randomBytes(8 * 1024 * 1024));
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(4);
+    writer.object("tree", secondTree);
+    writer.object("blob", largeBlob);
+    writer.object("tree", exactTree);
+    writer.object("blob", largeBlob);
+    writer.finish();
+
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    } finally {
+      blocker.clear("other");
+      blocker.dispose();
+    }
+
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("UPDATE git_pack_meta SET state = ?"))
+        .reduce((total, [, calls]) => total + calls, 0),
+    ).toBe(0);
+    expect(coordinator.activeCount).toBe(0);
   });
 
   it("resolves a same-page deferred chain without one pass per delta", async () => {
@@ -916,6 +1216,57 @@ describe("synthetic pack ingest", () => {
         },
       }),
     ).rejects.toThrow(/missing base/);
+  });
+
+  it("reports a corrupt deferred zlib stream as ECORRUPT", async () => {
+    const store = open();
+    const base = utf8.encode("deferred base");
+    const baseOid = hashObject("blob", base);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1_024);
+    writer.refDelta(baseOid, literalDelta(base.length, utf8.encode("deferred target")));
+    for (let index = 0; index < 1_022; index++) {
+      writer.object("blob", new Uint8Array([index & 0xff, index >>> 8]));
+    }
+    writer.object("blob", base);
+    writer.finish();
+
+    let corrupted = false;
+    let error: unknown;
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
+        yieldNow: async () => {
+          if (corrupted) return;
+          const pending = store.db.one<{ data_off: number }>(
+            "SELECT data_off FROM git_pack_pending WHERE repo_id = 1 AND pack_id = 1 LIMIT 1",
+          );
+          if (pending === undefined) return;
+          const seq = Math.floor(pending.data_off / PACK_CHUNK);
+          const row = store.db.one<{ data: unknown }>(
+            "SELECT data FROM git_pack_data WHERE repo_id = 1 AND pack_id = 1 AND seq = ?",
+            seq,
+          );
+          if (row === undefined) throw new Error("missing deferred pack row");
+          const data = readBlob(row.data).slice();
+          data[pending.data_off - seq * PACK_CHUNK]! ^= 0xff;
+          store.db.run(
+            "UPDATE git_pack_data SET data = ? WHERE repo_id = 1 AND pack_id = 1 AND seq = ?",
+            blob(data),
+            seq,
+          );
+          store.packs.clearCaches();
+          corrupted = true;
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(corrupted).toBe(true);
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("ECORRUPT");
+    expect(error.message).toMatch(/valid zlib stream/);
   });
 
   it("preserves exact entry boundaries on buffered and streaming inflate paths", async () => {
