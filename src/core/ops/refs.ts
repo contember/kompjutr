@@ -174,7 +174,6 @@ export function checkout(
   const tree = treeOf(repo, commit);
 
   if (
-    options.force !== true &&
     paths === undefined &&
     trySparseCleanCheckout(context, repo, worktree, options.ref, commit, tree)
   ) {

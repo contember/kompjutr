@@ -94,6 +94,15 @@ class FailingHashWorktree extends NoScanWorktree {
   }
 }
 
+class LegacyScanWorktree extends CountingWorktree {
+  scans: Array<{ root: string; limit: number }> = [];
+
+  override scan(root: string, options: ScanOptions): ScanEntry[] {
+    this.scans.push({ root, limit: options.limit });
+    return super.scan(root, options);
+  }
+}
+
 class WorktreePayloadProbe implements SqlDatabase {
   rawSymlinkTargets = 0;
 
@@ -159,6 +168,13 @@ function trackerContext(
       },
     },
   };
+}
+
+function withoutSparseCheckout(context: GitContext): GitContext {
+  const result = { ...context };
+  delete result.sparseWorkspace;
+  delete result.indexTracker;
+  return result;
 }
 
 function seal(workspace: TestRepository): void {
@@ -332,17 +348,88 @@ describe("sparse checkout", () => {
     ).toBe(largeTarget.length);
   });
 
-  it("moves HEAD between commits with the same tree without touching the workspace", () => {
-    const { workspace, target } = makeChangedFiles(2, 0);
+  it("matches legacy checkout for a clean forced target change", () => {
+    const sparse = makeChangedFiles(3, 2);
+    const legacy = makeChangedFiles(3, 2);
+    const worktree = new NoScanWorktree(sparse.workspace.worktree);
+
+    checkout(trackerContext(sparse.workspace), sparse.workspace.repo, worktree, {
+      ref: sparse.target,
+      force: true,
+    });
+    checkout(
+      withoutSparseCheckout(legacy.workspace.context),
+      legacy.workspace.repo,
+      legacy.workspace.worktree,
+      { ref: legacy.target, force: true },
+    );
+
+    expect(worktree.writes).toEqual(sparse.paths.slice(0, 2).map((path) => `/${path}`));
+    expect(sparse.workspace.repo.headTree()).toBe(legacy.workspace.repo.headTree());
+    expect(
+      [...sparse.workspace.repo.store.indexScan()].map(({ path, mode, oid }) => ({
+        path,
+        mode,
+        oid,
+      })),
+    ).toEqual(
+      [...legacy.workspace.repo.store.indexScan()].map(({ path, mode, oid }) => ({
+        path,
+        mode,
+        oid,
+      })),
+    );
+    for (let index = 0; index < sparse.paths.length; index++) {
+      const sparsePath = sparse.paths[index];
+      const legacyPath = legacy.paths[index];
+      if (sparsePath === undefined || legacyPath === undefined) throw new Error("missing path");
+      expectFile(sparse.workspace, `/${sparsePath}`, index < 2 ? "after\n" : "before\n");
+      expectFile(legacy.workspace, `/${legacyPath}`, index < 2 ? "after\n" : "before\n");
+    }
+  });
+
+  it("keeps a clean forced same target free of filesystem and index writes", () => {
+    const { workspace, base } = makeChangedFiles(2, 0);
     const worktree = new NoScanWorktree(workspace.worktree);
+    const before = [...workspace.repo.store.indexScan()];
+    workspace.storage.histogram = new Map();
 
     workspace.storage.resetCounters();
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target });
+    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: base, force: true });
 
     expect(worktree.writes).toEqual([]);
     expect(worktree.removals).toEqual([]);
-    expect(workspace.repo.head().oid).toBe(target);
+    expect([...workspace.repo.store.indexScan()]).toEqual(before);
+    expect(
+      [...workspace.storage.histogram.keys()].filter(
+        (query) =>
+          query.includes("INTO git_index (") ||
+          query.includes("DELETE FROM git_index ") ||
+          query.includes("UPDATE git_index "),
+      ),
+    ).toEqual([]);
+    expect(workspace.repo.head().oid).toBe(base);
     expect(workspace.storage.statementCount).toBeLessThan(40);
+  });
+
+  it("uses legacy force to restore a dirty tracked path outside the tree diff", () => {
+    const { workspace, target, paths } = makeChangedFiles(2, 1);
+    const unchanged = paths[1];
+    if (unchanged === undefined) throw new Error("missing unchanged force fixture path");
+    writeWorkFile(workspace, `/${unchanged}`, "local\n");
+    const worktree = new LegacyScanWorktree(workspace.worktree);
+
+    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target, force: true });
+
+    expect(worktree.scans.some((scan) => scan.limit > 1)).toBe(true);
+    expectFile(workspace, `/${paths[0]}`, "after\n");
+    expectFile(workspace, `/${unchanged}`, "before\n");
+    expect(workspace.repo.head().oid).toBe(target);
+    for (const path of paths) {
+      const hashed = hashWorktreePath(workspace.repo, workspace.worktree, path, { write: false });
+      expect(workspace.repo.store.indexGet(path)?.oid).toBe(hashed?.oid);
+      expect(workspace.repo.store.indexGet(path)?.mode.toString(8)).toBe(hashed?.mode);
+    }
   });
 
   it("rewrites one hundred paths in a 24,252-file workspace without a full scan", () => {
@@ -369,7 +456,7 @@ describe("sparse checkout", () => {
     );
   });
 
-  it("handles file-directory transitions, add, delete, mode, and symlink changes", () => {
+  it("matches structural checkout semantics for clean force", () => {
     const workspace = makeRepo("/");
     configure(workspace);
     writeWorkFile(workspace, "/node", "flat\n");
@@ -396,7 +483,7 @@ describe("sparse checkout", () => {
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
     seal(workspace);
     const worktree = new NoScanWorktree(workspace.worktree);
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target });
+    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target, force: true });
 
     expect(workspace.worktree.stat("/node")?.type).toBe("dir");
     expectFile(workspace, "/node/child.txt", "nested\n");
@@ -407,7 +494,7 @@ describe("sparse checkout", () => {
 
     worktree.writes.length = 0;
     worktree.removals.length = 0;
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: base });
+    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: base, force: true });
     expect(workspace.worktree.stat("/node")?.type).toBe("file");
     expectFile(workspace, "/node", "flat\n");
     expectFile(workspace, "/deleted/old.txt", "old\n");
