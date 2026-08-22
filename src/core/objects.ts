@@ -75,6 +75,13 @@ export interface ParsedTreeEntry {
   entry: TreeEntry;
   nameBytes: Uint8Array;
   rawEntry: Uint8Array;
+  ordinal: number;
+  observedSize: number;
+}
+
+export interface TreeParseResult {
+  entryCount: number;
+  observedSize: number;
 }
 
 export const MODE_FILE = "100644";
@@ -298,6 +305,10 @@ class ByteField {
     return this.#length;
   }
 
+  get retainedBytes(): number {
+    return this.#bytes.length;
+  }
+
   push(byte: number): void {
     if (this.#length >= this.limit) throw new CorruptError(`tree ${this.label} is too long`);
     if (this.#length === this.#bytes.length) {
@@ -315,56 +326,96 @@ class ByteField {
   }
 }
 
-/** Parse raw tree chunks while retaining only the current entry. */
-export function* parseTreeStream(chunks: Iterable<Uint8Array>): Generator<ParsedTreeEntry> {
-  const mode = new ByteField(6, "mode");
-  const name = new ByteField(2_200, "entry name");
-  const oid = new Uint8Array(20);
-  let state: "mode" | "name" | "oid" = "mode";
-  let modeText = "";
-  let nameBytes: Uint8Array = new Uint8Array(0);
-  let oidAt = 0;
-  for (const chunk of chunks) {
+/** Incremental raw-tree parser retaining only the entry currently crossing a chunk boundary. */
+export class TreeParser {
+  readonly #mode = new ByteField(6, "mode");
+  readonly #name = new ByteField(2_200, "entry name");
+  readonly #oid = new Uint8Array(20);
+  #state: "mode" | "name" | "oid" = "mode";
+  #modeText = "";
+  #modeBytes: Uint8Array = new Uint8Array(0);
+  #nameBytes: Uint8Array = new Uint8Array(0);
+  #oidAt = 0;
+  #entryCount = 0;
+  #observedSize = 0;
+  #finished = false;
+
+  get retainedBytes(): number {
+    return this.#mode.retainedBytes + this.#name.retainedBytes + this.#oid.length + 64;
+  }
+
+  *push(chunk: Uint8Array): Generator<ParsedTreeEntry> {
+    if (this.#finished) throw new Error("tree parser is already finished");
     for (const byte of chunk) {
-      if (state === "mode") {
+      this.#observedSize++;
+      if (!Number.isSafeInteger(this.#observedSize)) {
+        throw new CorruptError("tree object size exceeds the safe integer range");
+      }
+      if (this.#state === "mode") {
         if (byte === 0x20) {
-          modeText = utf8Decoder.decode(mode.take());
-          state = "name";
+          this.#modeBytes = this.#mode.take();
+          this.#modeText = utf8Decoder.decode(this.#modeBytes);
+          this.#state = "name";
         } else {
-          mode.push(byte);
+          this.#mode.push(byte);
         }
-      } else if (state === "name") {
+      } else if (this.#state === "name") {
         if (byte === 0) {
-          nameBytes = name.take();
-          state = "oid";
-          oidAt = 0;
+          this.#nameBytes = this.#name.take();
+          this.#state = "oid";
+          this.#oidAt = 0;
         } else {
-          name.push(byte);
+          this.#name.push(byte);
         }
       } else {
-        oid[oidAt++] = byte;
-        if (oidAt === oid.length) {
+        this.#oid[this.#oidAt++] = byte;
+        if (this.#oidAt === this.#oid.length) {
+          const modeText = this.#modeText;
+          const modeBytes = this.#modeBytes;
+          const nameBytes = this.#nameBytes;
+          const rawEntry = concat([
+            modeBytes,
+            new Uint8Array([0x20]),
+            nameBytes,
+            new Uint8Array([0]),
+            this.#oid.slice(),
+          ]);
+          const ordinal = this.#entryCount++;
+          this.#state = "mode";
+          this.#modeText = "";
+          this.#modeBytes = new Uint8Array(0);
+          this.#nameBytes = new Uint8Array(0);
           yield {
             entry: {
               mode: modeText,
               name: utf8Decoder.decode(nameBytes),
-              oid: toHex(oid),
+              oid: toHex(this.#oid),
             },
             nameBytes,
-            rawEntry: concat([
-              utf8.encode(modeText),
-              new Uint8Array([0x20]),
-              nameBytes,
-              new Uint8Array([0]),
-              oid.slice(),
-            ]),
+            rawEntry,
+            ordinal,
+            observedSize: this.#observedSize,
           };
-          state = "mode";
         }
       }
     }
   }
-  if (state !== "mode" || mode.length !== 0) throw new CorruptError("malformed tree entry");
+
+  finish(): TreeParseResult {
+    if (this.#finished) throw new Error("tree parser is already finished");
+    this.#finished = true;
+    if (this.#state !== "mode" || this.#mode.length !== 0) {
+      throw new CorruptError("malformed tree entry");
+    }
+    return { entryCount: this.#entryCount, observedSize: this.#observedSize };
+  }
+}
+
+/** Parse raw tree chunks while retaining only the current entry. */
+export function* parseTreeStream(chunks: Iterable<Uint8Array>): Generator<ParsedTreeEntry> {
+  const parser = new TreeParser();
+  for (const chunk of chunks) yield* parser.push(chunk);
+  parser.finish();
 }
 
 /**
