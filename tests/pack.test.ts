@@ -17,12 +17,46 @@ import {
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { MAX_INDEXED_COMMIT_BYTES, prepareCommitCache } from "../src/sqlite/commits.js";
-import { blob, readBlob } from "../src/sqlite/db.js";
+import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
 import { MAX_DELTA_DEPTH, MAX_PACK_DELTA_WORKING_BYTES, PACK_CHUNK } from "../src/sqlite/packs.js";
 import { RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
+
+class ReorderedRangeDatabase implements SqlDatabase {
+  constructor(readonly inner: TestDatabase) {}
+
+  get storage() {
+    return this.inner.storage;
+  }
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    const rows = this.inner.iterate(query, ...bindings);
+    if (!query.startsWith("WITH RECURSIVE /* pack-range")) return rows;
+    return [...rows].reverse();
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
 
 function open() {
   const database = new SqliteGitDatabase(new TestDatabase(), { objectCacheBytes: 1024 * 1024 });
@@ -736,7 +770,7 @@ describe("synthetic pack ingest", () => {
   });
 
   it("batches 999 deferred deltas that share a later base", async () => {
-    const db = new TestDatabase();
+    const db = new ReorderedRangeDatabase(new TestDatabase());
     const database = new SqliteGitDatabase(db);
     const store = database.open(database.create("/repo", "ref: refs/heads/main"));
     const base = new Uint8Array(513).fill(0x61);
@@ -753,12 +787,23 @@ describe("synthetic pack ingest", () => {
     for (const target of targets) writer.refDelta(baseOid, literalDelta(base.length, target.data));
     writer.object("blob", base);
     writer.finish();
+    const packBytes = concat(chunks);
 
     db.storage.histogram = new Map();
     db.storage.resetCounters();
-    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+    await store.packs.ingest(slices(packBytes, 64 * 1024));
 
     expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBe(Math.ceil(packBytes.length / PACK_CHUNK));
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range substr <= 262144 */"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBe(1);
     expect(
       [...db.storage.histogram].filter(([query]) =>
         query.startsWith("SELECT pack_id, offset, data_off, data_len, type, size"),
@@ -771,6 +816,152 @@ describe("synthetic pack ingest", () => {
     ).toBeLessThanOrEqual(5);
     expect(store.read(targets[0]!.oid)?.data).toEqual(targets[0]!.data);
     expect(store.read(targets[998]!.oid)?.data).toEqual(targets[998]!.data);
+  });
+
+  it("reads a deferred range crossing physical rows without full-row rereads", async () => {
+    const db = new ReorderedRangeDatabase(new TestDatabase());
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const padding = new Uint8Array(randomBytes(880 * 1024));
+    const base = new Uint8Array(randomBytes(300 * 1024));
+    const target = new Uint8Array(randomBytes(300 * 1024));
+    const baseOid = hashObject("blob", base);
+    const targetOid = hashObject("blob", target);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(3);
+    writer.object("blob", padding);
+    writer.refDelta(baseOid, literalDelta(base.length, target));
+    writer.object("blob", base);
+    writer.finish();
+    const packBytes = concat(chunks);
+
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(packBytes, 64 * 1024));
+
+    const packed = store.packs.lookup(targetOid);
+    expect(packed).not.toBeNull();
+    if (packed === null) throw new Error("missing deferred target");
+    expect(Math.floor(packed.dataOff / PACK_CHUNK)).not.toBe(
+      Math.floor((packed.dataOff + packed.dataLen - 1) / PACK_CHUNK),
+    );
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBe(Math.ceil(packBytes.length / PACK_CHUNK));
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range substr <= 262144 */"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBe(1);
+    expect(store.read(targetOid)?.data).toEqual(target);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+  });
+
+  it("falls back to bounded full-row streaming above the one-MiB page range cap", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const base = new Uint8Array(randomBytes(300 * 1024));
+    const baseOid = hashObject("blob", base);
+    const targets = Array.from({ length: 4 }, () => {
+      const data = new Uint8Array(randomBytes(400 * 1024));
+      return { data, oid: hashObject("blob", data) };
+    });
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(targets.length + 1);
+    for (const target of targets) {
+      writer.refDelta(baseOid, literalDelta(base.length, target.data));
+    }
+    writer.object("blob", base);
+    writer.finish();
+    const packBytes = concat(chunks);
+
+    db.storage.histogram = new Map();
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(packBytes, 64 * 1024));
+
+    const compressedBytes = targets.reduce(
+      (bytes, target) => bytes + (store.packs.lookup(target.oid)?.dataLen ?? 0),
+      0,
+    );
+    expect(compressedBytes).toBeGreaterThan(1024 * 1024);
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range substr <= 262144 */"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBe(0);
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("SELECT data FROM git_pack_data"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBeGreaterThan(Math.ceil(packBytes.length / PACK_CHUNK));
+    expect(db.storage.statementCount).toBeLessThanOrEqual(30);
+    for (const target of targets) expect(store.read(target.oid)?.data).toEqual(target.data);
+  });
+
+  it("fails one byte before allocating a deferred range batch", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/repo", "ref: refs/heads/main");
+    const coordinator = new MemoryCoordinator();
+    const blocker = coordinator.reserve();
+    const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
+    const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
+    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const base = new Uint8Array(513).fill(0x61);
+    const baseOid = hashObject("blob", base);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1_024);
+    for (let index = 0; index < 1_023; index++) {
+      const target = base.slice();
+      target[0] = index & 0xff;
+      target[1] = index >>> 8;
+      writer.refDelta(baseOid, literalDelta(base.length, target));
+    }
+    writer.object("blob", base);
+    writer.finish();
+
+    db.storage.histogram = new Map();
+    let pressured = false;
+    let error: unknown;
+    try {
+      await store.packs.ingest(slices(concat(chunks), 64 * 1024), {
+        yieldNow: async () => {
+          if (pressured) return;
+          const pending = db.all<{ data_len: number }>(
+            "SELECT data_len FROM git_pack_pending WHERE repo_id = 1 AND pack_id = 1",
+          );
+          if (pending.length !== 1_023) return;
+          const compressedBytes = pending.reduce((bytes, row) => bytes + row.data_len, 0);
+          expect(compressedBytes).toBeLessThanOrEqual(1024 * 1024);
+          const rangeBytes = compressedBytes + 256 * 1024 + pending.length * 832;
+          const pressure = MAX_OPERATION_MEMORY_BYTES - coordinator.totalBytes - rangeBytes + 1;
+          expect(pressure).toBeGreaterThan(0);
+          blocker.set("other", pressure);
+          pressured = true;
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    } finally {
+      blocker.clear("other");
+      blocker.dispose();
+    }
+    expect(pressured).toBe(true);
+    expect(error).toBeInstanceOf(GitError);
+    if (!(error instanceof GitError)) throw new Error("expected GitError");
+    expect(error.code).toBe("E2BIG");
+    expect(
+      [...db.storage.histogram]
+        .filter(([query]) => query.startsWith("WITH RECURSIVE /* pack-range"))
+        .reduce((count, [, calls]) => count + calls, 0),
+    ).toBe(0);
+    expect(coordinator.activeCount).toBe(0);
   });
 
   it("streams a deferred tree delta through one bounded operation owner", async () => {

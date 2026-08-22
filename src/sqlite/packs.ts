@@ -78,6 +78,10 @@ const DEFAULT_MAX_BUFFERED_ENTRY = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_LIMIT = 2 * 1024 * 1024;
 export const MAX_PACK_DELTA_WORKING_BYTES = 48 * 1024 * 1024;
 const PACK_READ_BYTES = 1024 * 1024;
+const PACK_RANGE_SLICE_BYTES = 256 * 1024;
+const PACK_RANGE_BATCH_BYTES = 1024 * 1024;
+// Four conservative JSON copies plus request, map, result and view wrappers.
+const PACK_RANGE_REQUEST_MEMORY_BYTES = 832;
 const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
 const PACK_SHARED_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const PACK_TREE_BATCH_BYTES = 1024 * 1024;
@@ -153,6 +157,42 @@ function pushExactInflate(stream: InflateInto, input: Uint8Array, label: string)
 
 function isObjectType(value: string): value is ObjectType {
   return value === "blob" || value === "tree" || value === "commit" || value === "tag";
+}
+
+function packRangeBatchMemory(bytes: number, requests: number): number {
+  const retained = bytes + PACK_RANGE_SLICE_BYTES + requests * PACK_RANGE_REQUEST_MEMORY_BYTES;
+  if (!Number.isSafeInteger(retained)) {
+    throw new GitError("E2BIG", "pack range batch retained state is too large");
+  }
+  return retained;
+}
+
+function packRangeFragment(request: PackRangeRequest, position: number, length: number): number {
+  let current = request.position;
+  let fragment = 0;
+  const end = request.position + request.length;
+  while (current < end) {
+    const expected = Math.min(
+      end - current,
+      PACK_RANGE_SLICE_BYTES,
+      PACK_CHUNK - (current % PACK_CHUNK),
+    );
+    if (current === position) return expected === length ? fragment : -1;
+    current += expected;
+    fragment++;
+  }
+  return -1;
+}
+
+function packRangeFragmentMask(request: PackRangeRequest): number {
+  let current = request.position;
+  let fragments = 0;
+  const end = request.position + request.length;
+  while (current < end) {
+    current += Math.min(end - current, PACK_RANGE_SLICE_BYTES, PACK_CHUNK - (current % PACK_CHUNK));
+    fragments++;
+  }
+  return 2 ** fragments - 1;
 }
 
 function commitHeaderKind(data: Uint8Array, start: number, end: number): number {
@@ -430,6 +470,13 @@ interface BulkPackRow extends PackObjectRow {
 interface CompressedEntry {
   bytes: Uint8Array;
   filled: number;
+}
+
+interface PackRangeRequest {
+  ordinal: number;
+  offset: number;
+  position: number;
+  length: number;
 }
 
 type PackObjectInput = [
@@ -1497,6 +1544,118 @@ export class PackStore {
     }
   }
 
+  #readRangeBatch(packId: number, requests: readonly PackRangeRequest[]): Map<number, Uint8Array> {
+    if (requests.length === 0 || requests.length > PACK_PENDING_PAGE_ROWS) {
+      throw new CorruptError("pack range batch has an invalid request count");
+    }
+    let totalBytes = 0;
+    for (const request of requests) {
+      totalBytes += request.length;
+      if (
+        !Number.isSafeInteger(request.ordinal) ||
+        !Number.isSafeInteger(request.offset) ||
+        !Number.isSafeInteger(request.position) ||
+        !Number.isSafeInteger(request.length) ||
+        request.ordinal < 0 ||
+        request.offset < 0 ||
+        request.position < 0 ||
+        request.length < 1 ||
+        !Number.isSafeInteger(request.position + request.length) ||
+        totalBytes > PACK_RANGE_BATCH_BYTES
+      ) {
+        throw new CorruptError("pack range batch has invalid coordinates");
+      }
+    }
+
+    const outputs = new Map<number, Uint8Array>();
+    const seen = new Map<number, number>();
+    for (const request of requests) {
+      if (outputs.has(request.offset)) {
+        throw new CorruptError("pack range batch has a duplicate object offset");
+      }
+      outputs.set(request.offset, new Uint8Array(request.length));
+      seen.set(request.offset, 0);
+    }
+    for (const range of this.#db.iterate(
+      `WITH RECURSIVE /* pack-range substr <= ${PACK_RANGE_SLICE_BYTES} */
+         requested(ordinal, object_offset, position, remaining) AS (
+           SELECT json_extract(value, '$.ordinal'), json_extract(value, '$.offset'),
+                  json_extract(value, '$.position'), json_extract(value, '$.length')
+             FROM json_each(?)
+         ),
+         slices(ordinal, object_offset, position, remaining) AS (
+           SELECT ordinal, object_offset, position, remaining FROM requested
+           UNION ALL
+           SELECT ordinal, object_offset,
+                  position + min(remaining, ${PACK_RANGE_SLICE_BYTES},
+                                 ${PACK_CHUNK} - position % ${PACK_CHUNK}),
+                  remaining - min(remaining, ${PACK_RANGE_SLICE_BYTES},
+                                  ${PACK_CHUNK} - position % ${PACK_CHUNK})
+             FROM slices WHERE remaining > 0
+         )
+       SELECT slices.ordinal, slices.object_offset AS offset, slices.position,
+              min(slices.remaining, ${PACK_RANGE_SLICE_BYTES},
+                  ${PACK_CHUNK} - slices.position % ${PACK_CHUNK}) AS expected,
+              substr(data.data, slices.position % ${PACK_CHUNK} + 1,
+                     min(slices.remaining, ${PACK_RANGE_SLICE_BYTES},
+                         ${PACK_CHUNK} - slices.position % ${PACK_CHUNK})) AS data
+         FROM slices
+        JOIN git_pack_data data
+           ON data.repo_id = ? AND data.pack_id = ?
+          AND data.seq = CAST(slices.position / ${PACK_CHUNK} AS INTEGER)
+        WHERE slices.remaining > 0`,
+      JSON.stringify(requests),
+      this.#repoId,
+      packId,
+    )) {
+      if (
+        typeof range.ordinal !== "number" ||
+        typeof range.offset !== "number" ||
+        typeof range.position !== "number" ||
+        typeof range.expected !== "number" ||
+        !Number.isSafeInteger(range.ordinal) ||
+        !Number.isSafeInteger(range.offset) ||
+        !Number.isSafeInteger(range.position) ||
+        !Number.isSafeInteger(range.expected) ||
+        range.ordinal < 0 ||
+        range.ordinal >= requests.length ||
+        range.expected < 1 ||
+        range.expected > PACK_RANGE_SLICE_BYTES
+      ) {
+        throw new CorruptError("pack range batch returned invalid coordinates");
+      }
+      const request = requests[range.ordinal];
+      const output = outputs.get(range.offset);
+      const seenMask = seen.get(range.offset);
+      const fragment =
+        request === undefined || typeof range.position !== "number"
+          ? -1
+          : packRangeFragment(request, range.position, range.expected);
+      if (
+        request === undefined ||
+        output === undefined ||
+        seenMask === undefined ||
+        request.offset !== range.offset ||
+        fragment < 0 ||
+        (seenMask & (2 ** fragment)) !== 0
+      ) {
+        throw new CorruptError("pack range batch returned an unexpected slice");
+      }
+      const data = readBlob(range.data);
+      if (data.length !== range.expected) {
+        throw new CorruptError("pack range batch returned a truncated slice");
+      }
+      output.set(data, range.position - request.position);
+      seen.set(range.offset, seenMask | (2 ** fragment));
+    }
+    for (const request of requests) {
+      if (seen.get(request.offset) !== packRangeFragmentMask(request)) {
+        throw new CorruptError(`pack ${packId}: missing range bytes`);
+      }
+    }
+    return outputs;
+  }
+
   /** Still-compressed bytes of a pack region, assembled from chunk rows. */
   readRaw(packId: number, offset: number, length: number): Uint8Array {
     if (
@@ -1915,6 +2074,7 @@ export class PackStore {
     }
     objectIndex.flush();
     pendingIndex.flush();
+    if (deferred > 0) this.clearCaches();
     await this.#drainPending(
       packId,
       offsets,
@@ -2072,11 +2232,38 @@ export class PackStore {
         }
 
         const completed: number[] = [];
+        let compressedBatch = new Map<number, Uint8Array>();
+        let compressedBatchBytes = 0;
+        for (const row of page) {
+          compressedBatchBytes += row.data_len;
+          if (!Number.isSafeInteger(compressedBatchBytes)) {
+            throw new CorruptError("pending pack page has invalid compressed size");
+          }
+        }
+        if (compressedBatchBytes > 0 && compressedBatchBytes <= PACK_RANGE_BATCH_BYTES) {
+          memory.reservation.set(
+            "compressed",
+            packRangeBatchMemory(compressedBatchBytes, page.length),
+          );
+          const requests: PackRangeRequest[] = [];
+          for (const row of page) {
+            requests.push({
+              ordinal: requests.length,
+              offset: row.offset,
+              position: row.data_off,
+              length: row.data_len,
+            });
+          }
+          compressedBatch = this.#readRangeBatch(packId, requests);
+        } else {
+          compressedBatchBytes = 0;
+        }
         try {
           for (let cursor = 0; cursor < ready.length; cursor++) {
             const { row, baseOid } = ready[cursor]!;
             const base = bases.get(baseOid);
             if (base === undefined) continue;
+            const compressed = compressedBatch.get(row.offset) ?? null;
             const uses = (remainingUses.get(baseOid) ?? 1) - 1;
             remainingUses.set(baseOid, uses);
             const target = this.#applyStoredDelta(
@@ -2087,6 +2274,7 @@ export class PackStore {
               `delta at ${row.offset}`,
               base.source,
               memory.pool,
+              compressed,
             );
             if (uses === 0 && bases.delete(baseOid)) {
               retainedBaseBytes -= base.source.length;
@@ -2168,6 +2356,7 @@ export class PackStore {
             }
           }
         } finally {
+          memory.reservation.clear("compressed");
           for (const base of bases.values()) base.owned?.release();
           bases.clear();
           memory.reservation.clear("base");
@@ -2428,6 +2617,7 @@ export class PackStore {
     label: string,
     base: ByteSource,
     pool: ChunkPool,
+    compressed: Uint8Array | null = null,
   ): ChunkedBytes {
     if (
       !Number.isSafeInteger(dataLen) ||
@@ -2444,20 +2634,31 @@ export class PackStore {
     });
     const stream = new InflateStream((chunk) => applier.push(chunk));
     let consumed = 0;
+    const push = (input: Uint8Array): void => {
+      let used: number;
+      try {
+        used = stream.push(input);
+      } catch (error) {
+        if (error instanceof CorruptError) throw error;
+        throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+      }
+      consumed += used;
+      if (!stream.ended && used !== input.length) {
+        throw new CorruptError(`${label} inflater stopped before the stream ended`);
+      }
+    };
     try {
-      while (!stream.ended && consumed < dataLen) {
-        const length = Math.min(PACK_READ_BYTES, dataLen - consumed);
-        const input = this.readRaw(packId, dataOff + consumed, length);
-        let used: number;
-        try {
-          used = stream.push(input);
-        } catch (error) {
-          if (error instanceof CorruptError) throw error;
-          throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+      if (compressed === null) {
+        while (!stream.ended && consumed < dataLen) {
+          const length = Math.min(PACK_READ_BYTES, dataLen - consumed);
+          push(this.readRaw(packId, dataOff + consumed, length));
         }
-        consumed += used;
-        if (!stream.ended && used !== input.length) {
-          throw new CorruptError(`${label} inflater stopped before the stream ended`);
+      } else {
+        if (compressed.length !== dataLen) {
+          throw new CorruptError(`${label} compressed range has the wrong size`);
+        }
+        for (let offset = 0; offset < compressed.length; offset += PACK_RANGE_SLICE_BYTES) {
+          push(compressed.subarray(offset, offset + PACK_RANGE_SLICE_BYTES));
         }
       }
       if (!stream.ended || consumed !== dataLen || stream.inflated !== instructionSize) {
