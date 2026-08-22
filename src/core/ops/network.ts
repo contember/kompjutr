@@ -8,7 +8,7 @@
 
 import { type InitialStateSession, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { fromHex } from "../bytes.js";
-import type { GitContext, InitialWorktreeSession } from "../context.js";
+import type { GitContext, IndexTrackerSeedEntry, InitialWorktreeSession } from "../context.js";
 import { AlreadyInitializedError, CorruptError, GitError } from "../errors.js";
 import { normalizePath } from "../paths.js";
 import { type MessageCallback, type ProgressCallback, progressSink } from "../protocol/progress.js";
@@ -30,6 +30,11 @@ const HAVE_BUDGET = 256;
 const INITIAL_CLONE_WINDOW_ROWS = 1_000;
 const INITIAL_CLONE_BLOB_BYTES = MAX_BLOB_BATCH_BYTES;
 const INITIAL_CLONE_SMALL_FILE_BYTES = 1024 * 1024;
+const INITIAL_CLONE_TRACKER_ROWS = 32_000;
+const INITIAL_CLONE_TRACKER_BYTES = 4 * 1024 * 1024;
+const INITIAL_CLONE_TRACKER_FIXED_BYTES = 64 * 1024;
+const INITIAL_CLONE_TRACKER_ROW_BYTES = 128;
+const INITIAL_CLONE_INDEX_DIRTY = 1;
 const INITIAL_CLONE_READ_FALLBACK = Symbol("initial clone blob exceeds batch budget");
 const initialCloneTextDecoder = new TextDecoder();
 
@@ -305,29 +310,52 @@ function writeInitialClone(
   treeOid: string,
   worktree: InitialWorktreeSession,
   index: InitialStateSession,
-): void {
+): IndexTrackerSeedEntry[] | null {
   const window: TargetEntry[] = [];
+  let trackerSeed: IndexTrackerSeedEntry[] | null = [];
+  let trackerSeedBytes = INITIAL_CLONE_TRACKER_FIXED_BYTES;
   for (const entry of treeStream(repo, treeOid)) {
-    if (entry.mode === "160000") continue;
+    if (entry.mode === "160000") {
+      if (trackerSeed !== null) {
+        const retainedBytes = INITIAL_CLONE_TRACKER_ROW_BYTES + entry.path.length * 2;
+        if (
+          trackerSeed.length === INITIAL_CLONE_TRACKER_ROWS ||
+          trackerSeedBytes > INITIAL_CLONE_TRACKER_BYTES - retainedBytes
+        ) {
+          trackerSeed = null;
+        } else {
+          trackerSeed.push({ path: entry.path, flags: INITIAL_CLONE_INDEX_DIRTY });
+          trackerSeedBytes += retainedBytes;
+        }
+      }
+      continue;
+    }
     window.push(entry);
     if (window.length === INITIAL_CLONE_WINDOW_ROWS) {
       flushInitialCloneWindow(repo, worktree, index, window);
     }
   }
   flushInitialCloneWindow(repo, worktree, index, window);
+  return trackerSeed;
 }
 
 function tryInitialClone(context: GitContext, repo: Repository, treeOid: string): boolean {
   const writer = context.initialWorktree;
   if (writer === undefined) return false;
   try {
-    const worktree = writer.tryRun(repo.root, (worktreeSession) => {
-      const state = repo.store.tryCreateInitialState((indexSession) => {
-        writeInitialClone(repo, treeOid, worktreeSession, indexSession);
-      });
-      return state.available;
-    });
-    return worktree.kind === "committed" && worktree.value;
+    const worktree = writer.tryRun(
+      repo.root,
+      (worktreeSession) =>
+        repo.store.tryCreateInitialState((indexSession) =>
+          writeInitialClone(repo, treeOid, worktreeSession, indexSession),
+        ),
+      (state) => {
+        if (state.available && state.value !== null && context.indexTracker !== undefined) {
+          context.indexTracker.reseal(repo.store.repoId, treeOid, state.value);
+        }
+      },
+    );
+    return worktree.kind === "committed" && worktree.value.available;
   } catch (error) {
     if (error === INITIAL_CLONE_READ_FALLBACK) return false;
     throw error;

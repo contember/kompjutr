@@ -680,6 +680,7 @@ export class InitialWorktreeWriter {
   tryRun<T>(
     rootInput: string,
     body: (session: InitialWorktreeSession) => T,
+    afterClose?: (value: T) => unknown,
   ): InitialWriteResult<T> {
     const root = canonicalRoot(rootInput);
     return this.db.transactionSync(() => {
@@ -707,6 +708,13 @@ export class InitialWorktreeWriter {
           throw filesystemError("EINVAL", "initial worktree body must be synchronous");
         }
         session.close(preflight.revision, preflight.nextInode);
+        if (afterClose !== undefined) {
+          const afterResult = afterClose(value);
+          if (isThenable(afterResult)) {
+            void Promise.resolve(afterResult).catch(() => {});
+            throw filesystemError("EINVAL", "initial worktree afterClose must be synchronous");
+          }
+        }
         return { kind: "committed", value };
       } finally {
         session.invalidate();

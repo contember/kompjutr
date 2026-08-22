@@ -1,4 +1,4 @@
-import type { GitIdentity } from "../core/context.js";
+import type { GitIdentity, IndexTrackerWriter } from "../core/context.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import { NodeFsCompat } from "../fs/compat/node.js";
 import { createFilesystem } from "../fs/filesystem.js";
@@ -6,7 +6,7 @@ import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory } from "../git/client.js";
 import { Database, type DurableObjectStorageLike } from "../sqlite/db.js";
-import { initializeIndexTracker } from "../sqlite/index-tracker.js";
+import { initializeIndexTracker, resealIndexTracker } from "../sqlite/index-tracker.js";
 import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
 import type { ProcessExecOptions, ProcessHandle, ProcessHost } from "./types.js";
 
@@ -49,10 +49,15 @@ export class Workspace {
       this.#gitDatabase = new SqliteGitDatabase(this.db, this.#options);
       initializeIndexTracker(this.db);
       const now = this.#options.now ?? Date.now;
+      const indexTracker: IndexTrackerWriter = {
+        reseal: (repoId, baselineTreeOid, entries) =>
+          resealIndexTracker(this.db, repoId, baselineTreeOid, entries),
+      };
       const binding = {
         database: this.#gitDatabase,
         worktree: this.filesystem,
         initialWorktree: createInitialWorktreeWriter(this.db, now),
+        indexTracker,
         now,
         timezoneOffset: this.#options.timezoneOffset ?? (() => 0),
         defaultIdentity: this.#options.defaultGitIdentity,

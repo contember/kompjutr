@@ -35,7 +35,25 @@ export type InitialWorktreeResult<T> = { kind: "committed"; value: T } | { kind:
 
 /** Optional clone-only bulk writer. Core depends only on this structural seam. */
 export interface InitialWorktreeWriter {
-  tryRun<T>(root: string, body: (session: InitialWorktreeSession) => T): InitialWorktreeResult<T>;
+  tryRun<T>(
+    root: string,
+    body: (session: InitialWorktreeSession) => T,
+    afterClose?: (value: T) => unknown,
+  ): InitialWorktreeResult<T>;
+}
+
+export interface IndexTrackerSeedEntry {
+  path: string;
+  flags: number;
+}
+
+/** Optional sparse-state writer. Core supplies bounded, complete snapshots only. */
+export interface IndexTrackerWriter {
+  reseal(
+    repoId: number,
+    baselineTreeOid: string | null,
+    entries: Iterable<IndexTrackerSeedEntry>,
+  ): boolean;
 }
 
 /** Everything the commands need that is not the repository itself. */
@@ -43,6 +61,7 @@ export interface GitContext {
   database: SqliteGitDatabase;
   worktree: Worktree;
   initialWorktree?: InitialWorktreeWriter;
+  indexTracker?: IndexTrackerWriter;
   http?: GitHttpClient;
   now: () => number;
   /** Minutes west of UTC, for commit timestamps. */

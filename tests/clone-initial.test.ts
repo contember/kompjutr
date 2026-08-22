@@ -9,6 +9,11 @@ import { createGit, type GitFactory } from "../src/git/client.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../src/sqlite/db.js";
 import { readBlob } from "../src/sqlite/db.js";
+import {
+  INDEX_DIRTY,
+  iterateIndexTrackerDirty,
+  readIndexTrackerState,
+} from "../src/sqlite/index-tracker.js";
 import { MAX_BLOB_BATCH_BYTES, WALK_TREE_SQL } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
@@ -68,6 +73,12 @@ function count(workspace: Workspace, table: string): number | undefined {
   return workspace.db.scalar<number>(`SELECT count(*) FROM ${table}`);
 }
 
+function repoId(workspace: Workspace): number {
+  const id = workspace.db.scalar<number>("SELECT id FROM git_repositories");
+  if (id === undefined) throw new Error("test repository is missing");
+  return id;
+}
+
 describe("clone initial-state fast path", () => {
   it("matches file modes and symlink identity with one clean tree traversal", async () => {
     const fixture = new GitFixture().init();
@@ -107,6 +118,41 @@ describe("clone initial-state fast path", () => {
       ).toBe(true);
       expect(mappedOid).toBe(linkOid);
       expect(await git.status({ dir: "/repo" })).toEqual([]);
+      const id = repoId(workspace);
+      expect(readIndexTrackerState(workspace.db, id)).toEqual({
+        available: true,
+        baselineTreeOid: fixture.git("rev-parse", "HEAD^{tree}"),
+      });
+      expect([...iterateIndexTrackerDirty(workspace.db, id)]).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("seals skipped gitlinks as index-dirty paths", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "hello\n");
+    const gitlinkOid = fixture.commit("gitlink target");
+    fixture.git("update-index", "--add", "--cacheinfo", `160000,${gitlinkOid},vendor/dependency`);
+    fixture.git("commit", "-q", "-m", "add gitlink");
+    const server = await startGitServer(fixture.dir);
+    const storage = new RecordingStorage();
+    const workspace = makeRuntime(storage);
+
+    try {
+      await workspace.git.clone({ url: server.url, dir: "/repo" });
+
+      const id = repoId(workspace);
+      expect(readIndexTrackerState(workspace.db, id)).toEqual({
+        available: true,
+        baselineTreeOid: fixture.git("rev-parse", "HEAD^{tree}"),
+      });
+      expect([...iterateIndexTrackerDirty(workspace.db, id)]).toEqual([
+        { path: "vendor/dependency", flags: INDEX_DIRTY },
+      ]);
+      expect(await workspace.fs.readFile("/repo/README.md", "utf8")).toBe("hello\n");
+      expect(workspace.filesystem.stat("/repo/vendor/dependency")).toBeNull();
     } finally {
       await server.close();
       fixture.dispose();
@@ -225,6 +271,7 @@ describe("clone initial-state fast path", () => {
       expect(await paths.fs.readFile("/repo/a.txt", "utf8")).toBe("a\n");
       expect(paths.filesystem.stat("/repo/b.txt")).toBeNull();
       expect(pathStorage.walkStatements).toBe(2);
+      expect(readIndexTrackerState(paths.db, repoId(paths))).toEqual({ available: false });
 
       const absentFactory: GitFactory = (binding) =>
         createGit()({ ...binding, initialWorktree: undefined });
@@ -234,6 +281,7 @@ describe("clone initial-state fast path", () => {
       expect(await absent.fs.readFile("/repo/a.txt", "utf8")).toBe("a\n");
       expect(await absent.fs.readFile("/repo/b.txt", "utf8")).toBe("b\n");
       expect(absentStorage.walkStatements).toBe(2);
+      expect(readIndexTrackerState(absent.db, repoId(absent))).toEqual({ available: false });
 
       let unavailableAttempts = 0;
       const unavailableFactory: GitFactory = (binding) => {
@@ -256,6 +304,9 @@ describe("clone initial-state fast path", () => {
       expect(await unavailable.fs.readFile("/repo/keep.txt", "utf8")).toBe("keep\n");
       expect(await unavailable.fs.readFile("/repo/b.txt", "utf8")).toBe("b\n");
       expect(unavailableStorage.walkStatements).toBe(2);
+      expect(readIndexTrackerState(unavailable.db, repoId(unavailable))).toEqual({
+        available: false,
+      });
 
       const injected = new GitError("EFBIG", "injected writer failure");
       const failingFactory: GitFactory = (binding) => {
@@ -272,6 +323,68 @@ describe("clone initial-state fast path", () => {
       expect(count(failing, "git_repositories")).toBe(0);
       expect(failing.filesystem.stat("/repo")).toBeNull();
       expect(failingStorage.walkStatements).toBe(0);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rolls back the initial worktree and repository when tracker sealing fails", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("a.txt", "a\n");
+    fixture.commit("tracker failure");
+    const server = await startGitServer(fixture.dir);
+    const injected = new GitError("EIO", "injected tracker failure");
+    const factory: GitFactory = (binding) =>
+      createGit()({
+        ...binding,
+        indexTracker: {
+          reseal() {
+            throw injected;
+          },
+        },
+      });
+    const storage = new RecordingStorage();
+    const workspace = makeRuntime(storage, factory);
+
+    try {
+      await expect(workspace.git.clone({ url: server.url, dir: "/repo" })).rejects.toBe(injected);
+      expect(count(workspace, "git_repositories")).toBe(0);
+      expect(count(workspace, "git_index")).toBe(0);
+      expect(count(workspace, "git_index_state")).toBe(0);
+      expect(workspace.filesystem.stat("/repo")).toBeNull();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps clone successful but leaves the tracker incomplete when its seed overflows", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "hello\n");
+    const gitlinkOid = fixture.commit("gitlink target");
+    for (let start = 0; start < 1_000; start += 200) {
+      const args = ["update-index", "--add"];
+      for (let index = start; index < start + 200; index++) {
+        const prefix = `module-${String(index).padStart(4, "0")}-`;
+        const path = `${prefix}${"x".repeat(2_180)}`;
+        args.push("--cacheinfo", `160000,${gitlinkOid},${path}`);
+      }
+      fixture.git(...args);
+    }
+    fixture.git("commit", "-q", "-m", "overflow tracker seed");
+    const server = await startGitServer(fixture.dir);
+    const storage = new RecordingStorage();
+    const workspace = makeRuntime(storage);
+
+    try {
+      await workspace.git.clone({ url: server.url, dir: "/repo" });
+
+      expect(await workspace.fs.readFile("/repo/README.md", "utf8")).toBe("hello\n");
+      expect(readIndexTrackerState(workspace.db, repoId(workspace))).toEqual({
+        available: false,
+      });
+      expect(count(workspace, "git_index")).toBe(1);
     } finally {
       await server.close();
       fixture.dispose();

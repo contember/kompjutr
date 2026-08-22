@@ -415,6 +415,67 @@ describe("InitialWorktreeWriter", () => {
     }
   });
 
+  it("runs afterClose inside the transaction after closing the session", () => {
+    const db = setup();
+    let captured: InitialWorktreeSession | undefined;
+    let observedValue: number | undefined;
+    let observedRows: number | undefined;
+    const result = createInitialWorktreeWriter(db).tryRun(
+      "/repo",
+      (session) => {
+        captured = session;
+        session.writeFile("file.txt", new Uint8Array([1]));
+        return 42;
+      },
+      (value) => {
+        observedValue = value;
+        observedRows = db.scalar<number>("SELECT count(*) FROM fs_paths");
+        expect(() => requiredSession(captured).writeFile("late.txt", new Uint8Array([2]))).toThrow(
+          /closed/,
+        );
+      },
+    );
+
+    expect(result).toEqual({ kind: "committed", value: 42 });
+    expect(observedValue).toBe(42);
+    expect(observedRows).toBe(3);
+  });
+
+  it.each([
+    {
+      name: "throwing",
+      afterClose() {
+        throw new Error("afterClose failed");
+      },
+      message: /afterClose failed/,
+    },
+    {
+      name: "asynchronous",
+      async afterClose() {},
+      message: /afterClose must be synchronous/,
+    },
+  ])("rolls back and invalidates after a $name afterClose", ({ afterClose, message }) => {
+    const db = setup();
+    let captured: InitialWorktreeSession | undefined;
+    expect(() =>
+      createInitialWorktreeWriter(db).tryRun(
+        "/repo",
+        (session) => {
+          captured = session;
+          session.writeFile("file.txt", new Uint8Array([1]));
+        },
+        afterClose,
+      ),
+    ).toThrow(message);
+    expect(() => requiredSession(captured).writeFile("late.txt", new Uint8Array([2]))).toThrow(
+      /closed/,
+    );
+    expect(db.scalar<number>("SELECT count(*) FROM fs_paths")).toBe(1);
+    expect(db.scalar<number>("SELECT count(*) FROM fs_nodes")).toBe(1);
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'")).toBe(0);
+    expect(db.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'")).toBe(2);
+  });
+
   it("admits exactly 128 combined root/path segments and rejects the next one", () => {
     const root = `/${Array.from({ length: 64 }, (_, index) => `r${index}`).join("/")}`;
     const acceptedPath = Array.from({ length: 64 }, (_, index) => `a${index}`).join("/");

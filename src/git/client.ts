@@ -1,6 +1,7 @@
 import {
   type GitContext,
   type GitIdentity,
+  type IndexTrackerWriter,
   type InitialWorktreeWriter,
   nestedRoots,
   openRepository,
@@ -159,6 +160,7 @@ export interface GitWorkspaceBinding {
   database: SqliteGitDatabase;
   worktree: Worktree;
   initialWorktree?: InitialWorktreeWriter;
+  indexTracker?: IndexTrackerWriter;
   now: () => number;
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;
@@ -189,6 +191,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.defaultIdentity !== undefined) context.defaultIdentity = binding.defaultIdentity;
   if (binding.http !== undefined) context.http = binding.http;
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
+  if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
   const yieldNow = options.yieldNow ?? binding.yieldNow;
   if (yieldNow !== undefined) context.yieldNow = yieldNow;
 
