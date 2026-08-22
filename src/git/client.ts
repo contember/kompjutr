@@ -222,10 +222,10 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       );
     },
     async diff(input = {}) {
-      return diffOp(at(input.dir), context.worktree, input);
+      return diffOp(at(input.dir), context.worktree, input, context.sparseWorkspace);
     },
     async diffSummary(input = {}) {
-      return diffSummaryOp(at(input.dir), context.worktree, input);
+      return diffSummaryOp(at(input.dir), context.worktree, input, context.sparseWorkspace);
     },
     async clean(input = {}) {
       const repo = at(input.dir);

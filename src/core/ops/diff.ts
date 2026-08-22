@@ -12,13 +12,15 @@ import { isBinary } from "../diff/lines.js";
 import { CorruptError, GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted, joinSorted3 } from "../streams.js";
+import type { SparseWorkspaceRow, SparseWorkspaceSource } from "../sparse-workspace.js";
+import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { matchesPaths, stageZero } from "./checkout.js";
 import type { DiffSummaryEntry } from "./kinds.js";
 import { treeOf } from "./reads.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
+  hashExactWorktreePaths,
   hashWorktreePaths,
   indexMatchesStat,
   type WorktreePath,
@@ -30,6 +32,9 @@ const DEFAULT_ABBREV = 7;
 const DIFF_WINDOW_ROWS = 1000;
 const DIFF_REPOSITORY_BYTES = 8 * 1024 * 1024;
 const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
+const SPARSE_DIFF_PATHS = 1000;
+const SPARSE_DIFF_RETAINED_BYTES = 16 * 1024 * 1024;
+const SPARSE_DIFF_ROW_BYTES = 1024;
 
 export interface DiffOptions {
   /** The "from" side. Defaults to HEAD. */
@@ -76,12 +81,17 @@ interface WorkingCandidate {
   worktree: WorktreePath | undefined;
 }
 
-export function diff(repo: Repository, worktree: Worktree, options: DiffOptions = {}): string {
+export function diff(
+  repo: Repository,
+  worktree: Worktree,
+  options: DiffOptions = {},
+  sparseWorkspace?: SparseWorkspaceSource,
+): string {
   const abbrev = options.abbrev ?? DEFAULT_ABBREV;
   // Appended, not collected and joined: the parts array and the joined
   // result are alive at the same instant, so joining doubles the patch.
   let out = "";
-  for (const change of collect(repo, worktree, options)) {
+  for (const change of collect(repo, worktree, options, sparseWorkspace)) {
     const before = change.before;
     const after = change.after;
     const left = before === null ? "/dev/null" : `a/${change.path}`;
@@ -135,9 +145,10 @@ export function diffSummary(
   repo: Repository,
   worktree: Worktree,
   options: DiffOptions = {},
+  sparseWorkspace?: SparseWorkspaceSource,
 ): DiffSummaryEntry[] {
   const out: DiffSummaryEntry[] = [];
-  for (const change of collect(repo, worktree, options)) {
+  for (const change of collect(repo, worktree, options, sparseWorkspace)) {
     const status = change.before === null ? "A" : change.after === null ? "D" : "M";
     if (change.before?.oid === change.after?.oid) {
       out.push({ path: change.path, status, insertions: 0, deletions: 0 });
@@ -170,12 +181,20 @@ function* collect(
   repo: Repository,
   worktree: Worktree,
   options: DiffOptions,
+  sparseWorkspace: SparseWorkspaceSource | undefined,
 ): Generator<FileChange> {
-  const from = treeStream(repo, resolveFrom(repo, options));
+  const fromTreeOid = resolveFrom(repo, options);
   const byPath = { left: (entry: TargetEntry) => entry.path };
 
   if (options.to !== undefined) {
-    const to = treeStream(repo, treeOf(repo, repo.revParse(options.to)));
+    const toTreeOid = treeOf(repo, repo.revParse(options.to));
+    const sparse = sparseCommitPair(repo, fromTreeOid, toTreeOid, options);
+    if (sparse !== null) {
+      yield* hydrateChanges(repo, worktree, sparse);
+      return;
+    }
+    const from = treeStream(repo, fromTreeOid);
+    const to = treeStream(repo, toTreeOid);
     const pending: PendingChange[] = [];
     for (const row of joinSorted(from, to, { ...byPath, right: (entry) => entry.path })) {
       if (!matchesPaths(row.path, options.paths)) continue;
@@ -187,9 +206,18 @@ function* collect(
     return;
   }
 
+  if (sparseWorkspace !== undefined) {
+    const sparse = sparseWorkingCandidates(repo, sparseWorkspace, fromTreeOid, options);
+    if (sparse !== null) {
+      yield* resolveWorkingCandidates(repo, worktree, sparse, true);
+      return;
+    }
+  }
+
   // The working-tree side covers only paths git would consider — those in
   // the "from" tree or in the index — so an untracked file stays out of the
   // patch, as it does in real `git diff`.
+  const from = treeStream(repo, fromTreeOid);
   const candidates: WorkingCandidate[] = [];
   for (const row of joinSorted3(
     from,
@@ -222,10 +250,138 @@ function* collect(
   yield* resolveWorkingCandidates(repo, worktree, candidates);
 }
 
+function sparseCommitPair(
+  repo: Repository,
+  beforeTreeOid: string | null,
+  afterTreeOid: string | null,
+  options: DiffOptions,
+): PendingChange[] | null {
+  const changes: PendingChange[] = [];
+  let matchingEntries = 0;
+  let retainedBytes = 0;
+  try {
+    for (const entry of repo.walkTreeDiff(beforeTreeOid, afterTreeOid)) {
+      if (!matchesPaths(entry.path, options.paths)) continue;
+      if (matchingEntries >= SPARSE_DIFF_PATHS) return null;
+      matchingEntries++;
+      retainedBytes += SPARSE_DIFF_ROW_BYTES + utf8.encode(entry.path).length;
+      if (retainedBytes > SPARSE_DIFF_RETAINED_BYTES) return null;
+      const change = compareIdentities(
+        entry.path,
+        treePartsIdentity(entry.beforeMode, entry.beforeOid),
+        treePartsIdentity(entry.afterMode, entry.afterOid),
+      );
+      if (change !== null) changes.push(change);
+    }
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+  return changes;
+}
+
+function sparseWorkingCandidates(
+  repo: Repository,
+  source: SparseWorkspaceSource,
+  currentTreeOid: string | null,
+  options: DiffOptions,
+): WorkingCandidate[] | null {
+  try {
+    const state = source.readState(repo.store.repoId);
+    if (!state.available) return null;
+    const paths = sparseWorkingPaths(
+      repo,
+      source.dirtyPaths(repo.store.repoId),
+      state.baselineTreeOid,
+      currentTreeOid,
+      options.paths,
+    );
+    if (paths === null) return null;
+    if (paths.length === 0) return [];
+
+    const hydrated = source.hydrate({
+      repoId: repo.store.repoId,
+      root: repo.root,
+      baselineTreeOid: state.baselineTreeOid,
+      currentTreeOid,
+      paths,
+    });
+    if (!hydrated.available) return null;
+    if (hydrated.rows.length !== paths.length) {
+      throw new CorruptError("sparse diff hydration returned the wrong row count");
+    }
+
+    const candidates: WorkingCandidate[] = [];
+    for (let ordinal = 0; ordinal < paths.length; ordinal++) {
+      const path = paths[ordinal];
+      const row = hydrated.rows[ordinal];
+      if (path === undefined || row === undefined || row.path !== path) {
+        throw new CorruptError("sparse diff hydration returned unordered rows");
+      }
+      const stage = row.index.find((entry) => entry.stage === 0);
+      if (row.current === null && stage === undefined) continue;
+      candidates.push({
+        path,
+        before: sparseTarget(path, row),
+        index: stage !== undefined && stage.mode !== 0o160000 ? stage : undefined,
+        worktree: sparseWorktreePath(row),
+      });
+    }
+    return candidates;
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+}
+
+function sparseWorkingPaths(
+  repo: Repository,
+  dirty: Iterable<{ path: string }>,
+  baselineTreeOid: string | null,
+  currentTreeOid: string | null,
+  pathspecs: string[] | undefined,
+): string[] | null {
+  const paths = new Set<string>();
+  let retainedBytes = 0;
+  const add = (path: string): boolean => {
+    if (!matchesPaths(path, pathspecs) || paths.has(path)) return true;
+    retainedBytes += SPARSE_DIFF_ROW_BYTES + utf8.encode(path).length;
+    if (paths.size >= SPARSE_DIFF_PATHS || retainedBytes > SPARSE_DIFF_RETAINED_BYTES) return false;
+    paths.add(path);
+    return true;
+  };
+  for (const entry of dirty) {
+    if (!add(entry.path)) return null;
+  }
+  for (const entry of repo.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
+    if (!add(entry.path)) return null;
+  }
+  return [...paths].sort(comparePaths);
+}
+
+function sparseTarget(path: string, row: SparseWorkspaceRow): TargetEntry | undefined {
+  return row.current === null ? undefined : { path, mode: row.current.mode, oid: row.current.oid };
+}
+
+function sparseWorktreePath(row: SparseWorkspaceRow): WorktreePath | undefined {
+  if (row.worktree === null || row.worktree.type === "dir") return undefined;
+  return { path: row.path, stat: row.worktree };
+}
+
+function treePartsIdentity(mode: string | null, oid: string | null): EndpointIdentity | null {
+  if (mode === null || oid === null || mode === "160000") return null;
+  return { mode, oid, worktree: null };
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
 function* resolveWorkingCandidates(
   repo: Repository,
   worktree: Worktree,
   candidates: WorkingCandidate[],
+  exact = false,
 ): Generator<FileChange> {
   if (candidates.length === 0) return;
   const rows = candidates.splice(0);
@@ -254,7 +410,9 @@ function* resolveWorkingCandidates(
       unresolved.push(row.worktree);
     }
   }
-  const hashes = hashWorktreePaths(repo, worktree, unresolved, { write: false });
+  const hashes = exact
+    ? hashExactWorktreePaths(repo, worktree, unresolved, { write: false })
+    : hashWorktreePaths(repo, worktree, unresolved, { write: false });
   repo.store.upsertBlobIds(
     [...hashes.values()].flatMap((hashed) => {
       const contentId = hashed.stat.contentId;
