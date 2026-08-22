@@ -12,6 +12,7 @@ import { GitError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { matchesPaths, treeEntries } from "./checkout.js";
@@ -345,10 +346,6 @@ export function statusIndexRetainedBytes(entry: IndexEntry): number {
 
 function trackedPathRetainedBytes(path: string): number {
   return SET_ENTRY_BYTES + retainedStringBytes(path);
-}
-
-function retainedStringBytes(value: string): number {
-  return 48 + value.length * 2;
 }
 
 function shallowestUntrackedDirectory(file: string, tracked: Set<string>): string | null {

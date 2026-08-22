@@ -2,7 +2,7 @@
 
 import { contentIdKey, PACK_BLOB_CALLER_HEADROOM_BYTES } from "../../sqlite/store.js";
 import type { GitContext } from "../context.js";
-import { CorruptError } from "../errors.js";
+import { CorruptError, hasErrorCode } from "../errors.js";
 import { joinPath } from "../paths.js";
 import type { Repository } from "../repository.js";
 import type { SparseWorkspaceResult, SparseWorkspaceRow } from "../sparse-workspace.js";
@@ -411,8 +411,4 @@ function pruneSparseDirectories(
     }
     if (empty.length > 0) worktree.removeFiles(empty);
   }
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }

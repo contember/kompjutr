@@ -6,6 +6,7 @@ import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import type { GitContext } from "../context.js";
 import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
@@ -490,10 +491,6 @@ function flushGuardCandidates(
     if (dirty.has(candidate.entry.path)) retainBlocker(tracked, candidate.entry.path, budget);
   }
   candidates.length = 0;
-}
-
-function retainedStringBytes(value: string): number {
-  return 48 + value.length * 2;
 }
 
 function differsFromHead(entry: IndexEntry, head: TargetEntry | undefined): boolean {

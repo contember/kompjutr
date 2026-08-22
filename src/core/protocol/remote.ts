@@ -7,6 +7,7 @@
 
 import { isOid, utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
+import { retainedStringBytes } from "../retained.js";
 import { FLUSH, pkt } from "./pktline.js";
 import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt, pktText } from "./stream.js";
 import { HttpError, type RemoteRequestOptions, requestWithAuth } from "./transport.js";
@@ -35,7 +36,6 @@ export const MAX_PROTOCOL_NEGOTIATION_INPUT_BYTES = 16 * 1024 * 1024;
 export const MAX_PROTOCOL_NEGOTIATION_ENTRIES = 16_384;
 export const MAX_PROTOCOL_TEXT_BYTES = MAX_PKT_FRAME_BYTES - 4;
 
-const STRING_FIXED_BYTES = 48;
 const ADVERTISEMENT_FIXED_BYTES = 256;
 const UPLOAD_RESULT_FIXED_BYTES = 192;
 const REF_FIXED_BYTES = 96;
@@ -118,10 +118,6 @@ class UploadRequestBudget {
   #tooLarge(part: string): never {
     throw new GitError("E2BIG", `protocol ${part} exceeds its bounded limit`);
   }
-}
-
-function stringRetainedBytes(value: string): number {
-  return STRING_FIXED_BYTES + value.length * 2;
 }
 
 function resolvedProtocolLimits(
@@ -285,13 +281,13 @@ async function parseAdvertisement(
           const capability = text.slice(start, end);
           const capabilityBytes = capabilities.has(capability)
             ? 0
-            : CAPABILITY_FIXED_BYTES + stringRetainedBytes(capability);
+            : CAPABILITY_FIXED_BYTES + retainedStringBytes(capability);
           const symref = capability.startsWith("symref=HEAD:")
             ? capability.slice("symref=HEAD:".length)
             : null;
           budget.reserve(
             capabilityBytes +
-              (symref === null ? 0 : HEAD_REF_FIXED_BYTES + stringRetainedBytes(symref)),
+              (symref === null ? 0 : HEAD_REF_FIXED_BYTES + retainedStringBytes(symref)),
           );
           capabilities.add(capability);
           if (symref !== null) headRef = symref;
@@ -307,7 +303,7 @@ async function parseAdvertisement(
     const name = text.slice(space + 1);
     // An empty repository advertises only the capabilities line.
     if (oid === ZERO && name.startsWith("capabilities^{}")) continue;
-    budget.reserve(REF_FIXED_BYTES + stringRetainedBytes(name) + stringRetainedBytes(oid));
+    budget.reserve(REF_FIXED_BYTES + retainedStringBytes(name) + retainedStringBytes(oid));
     refs.push({ name, oid });
   }
   return { refs, capabilities, headRef };
@@ -424,13 +420,13 @@ export async function uploadPack(
     const text = pktText(line);
     if (text.startsWith("shallow ")) {
       const oid = text.slice(8).trim();
-      budget.reserve(BOUNDARY_FIXED_BYTES + stringRetainedBytes(oid));
+      budget.reserve(BOUNDARY_FIXED_BYTES + retainedStringBytes(oid));
       shallow.push(oid);
       continue;
     }
     if (text.startsWith("unshallow ")) {
       const oid = text.slice(10).trim();
-      budget.reserve(BOUNDARY_FIXED_BYTES + stringRetainedBytes(oid));
+      budget.reserve(BOUNDARY_FIXED_BYTES + retainedStringBytes(oid));
       unshallow.push(oid);
       continue;
     }

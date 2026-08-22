@@ -10,6 +10,7 @@ import { GitError, PathspecNotFoundError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree, matchesPaths } from "./checkout.js";
@@ -212,10 +213,6 @@ function stageCandidates(
     if (row.conflicted) sink.remove(row.path);
     sink.put(update);
   }
-}
-
-function retainedStringBytes(value: string): number {
-  return 48 + value.length * 2;
 }
 
 function relativeExcludeRoots(root: string, paths: readonly string[] | undefined): string[] {

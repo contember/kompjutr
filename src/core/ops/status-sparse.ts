@@ -1,6 +1,6 @@
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../context.js";
-import { CorruptError } from "../errors.js";
+import { CorruptError, hasErrorCode } from "../errors.js";
 import { loadIgnoreMatcher } from "../ignore/index.js";
 import type { Repository } from "../repository.js";
 import type { SparseWorkspaceResult, SparseWorkspaceRow } from "../sparse-workspace.js";
@@ -302,10 +302,6 @@ function sparseTarget(path: string, row: SparseWorkspaceRow): TargetEntry | unde
 function sparseWorktreePath(row: SparseWorkspaceRow): WorktreePath | undefined {
   if (row.worktree === null || row.worktree.type === "dir") return undefined;
   return { path: row.path, stat: row.worktree };
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 function trackerPathRepresentable(path: string): boolean {

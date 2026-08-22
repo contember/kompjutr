@@ -16,6 +16,10 @@ export class GitError extends Error {
   }
 }
 
+export function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
 export class NotARepositoryError extends GitError {
   constructor(dir: string, options?: { cause?: unknown }) {
     super("ENOTAREPO", `not a git repository: ${dir}`, options);

@@ -1,5 +1,5 @@
 import { utf8 } from "../bytes.js";
-import { CorruptError } from "../errors.js";
+import { CorruptError, hasErrorCode } from "../errors.js";
 import type { Repository } from "../repository.js";
 import type { SparseWorkspaceRow, SparseWorkspaceSource } from "../sparse-workspace.js";
 import { comparePaths } from "../streams.js";
@@ -139,8 +139,4 @@ function sparseWorktreePath(row: SparseWorkspaceRow): WorktreePath | undefined {
 function treePartsIdentity(mode: string | null, oid: string | null): EndpointIdentity | null {
   if (mode === null || oid === null || mode === "160000") return null;
   return { mode, oid, worktree: null };
-}
-
-function hasErrorCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
