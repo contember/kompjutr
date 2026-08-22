@@ -1,0 +1,77 @@
+// Shared bounded blob writes for full and sparse checkout paths.
+
+import type { BlobIdMapping, IndexEntry, IndexSink } from "../../sqlite/store.js";
+import { fromHex } from "../bytes.js";
+import { CorruptError, GitError } from "../errors.js";
+import { joinPath } from "../paths.js";
+import type { Repository } from "../repository.js";
+import { fileModeFor, type Worktree } from "../worktree.js";
+import type { TargetEntry } from "./tree-stream.js";
+
+const CHECKOUT_BLOB_BYTES = 3 * 1024 * 1024;
+const textDecoder = new TextDecoder();
+
+export function flushCheckoutWrites(
+  repo: Repository,
+  worktree: Worktree,
+  entries: TargetEntry[],
+  sink: IndexSink,
+): void {
+  if (entries.length === 0) return;
+  let pending = entries.splice(0, entries.length);
+  while (pending.length > 0) {
+    let blobs: Map<string, Uint8Array>;
+    try {
+      blobs = repo.readBlobs(
+        pending.map((entry) => entry.oid),
+        {
+          budgetBytes: CHECKOUT_BLOB_BYTES,
+        },
+      ).blobs;
+    } catch (error) {
+      if (!(error instanceof GitError) || error.code !== "EFBIG") throw error;
+      const first = pending[0];
+      if (first === undefined) throw new CorruptError("checkout blob batch is empty");
+      blobs = new Map([[first.oid, repo.readBlob(first.oid)]]);
+    }
+    const writes = [];
+    const indexEntries: IndexEntry[] = [];
+    const mappings: BlobIdMapping[] = [];
+    const deferred: TargetEntry[] = [];
+    for (const entry of pending) {
+      const data = blobs.get(entry.oid);
+      if (data === undefined) {
+        deferred.push(entry);
+        continue;
+      }
+      const contentId = fromHex(entry.oid);
+      const absolute = joinPath(repo.root, entry.path);
+      writes.push(
+        entry.mode === "120000"
+          ? { path: absolute, target: textDecoder.decode(data), contentId }
+          : { path: absolute, bytes: data, mode: fileModeFor(entry.mode), contentId },
+      );
+      indexEntries.push({
+        path: entry.path,
+        stage: 0,
+        mode: Number.parseInt(entry.mode, 8),
+        oid: entry.oid,
+        size: data.length,
+        mtime: null,
+        ino: null,
+      });
+      mappings.push({ contentId, oid: entry.oid });
+    }
+    worktree.writeFiles(writes);
+    repo.store.upsertBlobIds(mappings);
+    for (const entry of indexEntries) {
+      sink.remove(entry.path);
+      sink.put(entry);
+    }
+    sink.flush();
+    if (deferred.length === pending.length) {
+      throw new CorruptError("checkout blob batch made no progress");
+    }
+    pending = deferred;
+  }
+}
