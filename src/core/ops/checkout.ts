@@ -13,7 +13,7 @@ import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
-import { fileModeFor, gitModeFor, type Worktree } from "../worktree.js";
+import { fileModeFor, gitModeFor, type Worktree, type WorktreeEntryType } from "../worktree.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import { indexMatchesStat, type WorktreePath, walkWorktreeEntriesStream } from "./worktree-io.js";
 
@@ -57,7 +57,175 @@ const CHECKOUT_WINDOW_ROWS = 1_000;
 const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_BLOB_BYTES = 3 * 1024 * 1024;
 const CHECKOUT_PATH_FIXED_BYTES = 96;
+const SPARSE_CHECKOUT_FIXED_BYTES = 384;
+const SPARSE_CHECKOUT_SQL_LIMIT = 1_000;
+// Conservatively reserves all non-prune tree, guard, write, HEAD and reseal SQL.
+const SPARSE_CHECKOUT_FIXED_SQL = 400;
+// Guarded ancestors are real: stat costs two SQL, and resolve + LIMIT 1 scan costs two.
+const SPARSE_CHECKOUT_STAT_SQL = 2;
+// Keep one extra statement over the measured two-SQL directory probe.
+const SPARSE_CHECKOUT_DIRECTORY_PROBE_SQL = 3;
+const SPARSE_CHECKOUT_GROUP_REMOVE_SQL = 7;
 const textDecoder = new TextDecoder();
+
+export interface SparseCheckoutChange {
+  path: string;
+  before: TargetEntry | undefined;
+  after: TargetEntry | undefined;
+  worktreeType: WorktreeEntryType | null;
+}
+
+/** Apply a complete, pre-guarded leaf diff without traversing the full tree. */
+export function checkoutSparseChanges(
+  repo: Repository,
+  worktree: Worktree,
+  changes: readonly SparseCheckoutChange[],
+  maxRetainedBytes: number,
+): boolean {
+  const plan = prepareSparseCheckout(changes, maxRetainedBytes);
+  if (plan === null) return false;
+
+  repo.store.indexApply((sink) => {
+    if (plan.structuralRoots.length > 0) {
+      worktree.removeFiles(
+        plan.structuralRoots.map((path) => joinPath(repo.root, path)),
+        { recursive: true },
+      );
+    }
+    if (plan.physicalRemovals.length > 0) {
+      worktree.removeFiles(plan.physicalRemovals.map((path) => joinPath(repo.root, path)));
+    }
+    for (const path of plan.indexRemovals) sink.remove(path);
+    sink.flush();
+  });
+  pruneSparseDirectories(repo, worktree, plan.pruneGroups);
+  repo.store.indexApply((sink) => {
+    const written = [...plan.writes];
+    flushWrites(repo, worktree, written, sink);
+  });
+  return true;
+}
+
+interface SparseCheckoutPlan {
+  structuralRoots: string[];
+  physicalRemovals: string[];
+  indexRemovals: string[];
+  pruneGroups: string[][];
+  writes: TargetEntry[];
+}
+
+function prepareSparseCheckout(
+  changes: readonly SparseCheckoutChange[],
+  maxRetainedBytes: number,
+): SparseCheckoutPlan | null {
+  if (maxRetainedBytes < SPARSE_CHECKOUT_FIXED_BYTES) return null;
+  let retainedBytes = SPARSE_CHECKOUT_FIXED_BYTES;
+  const retain = (path: string): boolean => {
+    const bytes = CHECKOUT_PATH_FIXED_BYTES + path.length * 2;
+    if (bytes > maxRetainedBytes - retainedBytes) return false;
+    retainedBytes += bytes;
+    return true;
+  };
+
+  const structuralRoots: string[] = [];
+  for (const change of changes) {
+    if (change.after === undefined || change.worktreeType !== "dir") continue;
+    if (!retain(change.path)) return null;
+    structuralRoots.push(change.path);
+  }
+  structuralRoots.sort(comparePaths);
+
+  const minimalStructuralRoots: string[] = [];
+  for (const path of structuralRoots) {
+    const previous = minimalStructuralRoots[minimalStructuralRoots.length - 1];
+    if (previous !== undefined && path.startsWith(`${previous}/`)) continue;
+    minimalStructuralRoots.push(path);
+  }
+
+  const physicalRemovals: string[] = [];
+  const indexRemovals: string[] = [];
+  const writes: TargetEntry[] = [];
+  const pruneDirectories = new Set<string>();
+  for (const change of changes) {
+    if (!retain(change.path)) return null;
+    if (change.before !== undefined && change.after === undefined) {
+      indexRemovals.push(change.path);
+      if (!withinSparseRoot(change.path, minimalStructuralRoots)) {
+        physicalRemovals.push(change.path);
+      }
+    }
+    if (change.after !== undefined) writes.push(change.after);
+  }
+
+  const removalRoots = [...physicalRemovals, ...minimalStructuralRoots];
+  for (const path of removalRoots) {
+    let slash = path.lastIndexOf("/");
+    while (slash > 0) {
+      const directory = path.slice(0, slash);
+      if (!pruneDirectories.has(directory)) {
+        if (!retain(directory)) return null;
+        pruneDirectories.add(directory);
+      }
+      slash = directory.lastIndexOf("/");
+    }
+  }
+
+  const byDepth = new Map<number, string[]>();
+  for (const directory of pruneDirectories) {
+    const depth = directory.split("/").length;
+    const group = byDepth.get(depth);
+    if (group === undefined) byDepth.set(depth, [directory]);
+    else group.push(directory);
+  }
+  const depths = [...byDepth.keys()].sort((left, right) => right - left);
+  const pruneStatements =
+    pruneDirectories.size * (SPARSE_CHECKOUT_STAT_SQL + SPARSE_CHECKOUT_DIRECTORY_PROBE_SQL) +
+    depths.length * SPARSE_CHECKOUT_GROUP_REMOVE_SQL;
+  if (pruneStatements > SPARSE_CHECKOUT_SQL_LIMIT - SPARSE_CHECKOUT_FIXED_SQL) return null;
+  const pruneGroups: string[][] = [];
+  for (const depth of depths) {
+    const group = byDepth.get(depth);
+    if (group === undefined) continue;
+    group.sort(comparePaths);
+    pruneGroups.push(group);
+  }
+
+  return {
+    structuralRoots: minimalStructuralRoots,
+    physicalRemovals,
+    indexRemovals,
+    pruneGroups,
+    writes,
+  };
+}
+
+function withinSparseRoot(path: string, roots: readonly string[]): boolean {
+  for (const root of roots) {
+    if (path === root || path.startsWith(`${root}/`)) return true;
+    if (comparePaths(root, path) > 0) return false;
+  }
+  return false;
+}
+
+function pruneSparseDirectories(
+  repo: Repository,
+  worktree: Worktree,
+  groups: readonly string[][],
+): void {
+  for (const group of groups) {
+    const empty: string[] = [];
+    for (const directory of group) {
+      const absolute = joinPath(repo.root, directory);
+      if (
+        worktree.stat(absolute)?.type === "dir" &&
+        worktree.scan(absolute, { limit: 1 }).length === 0
+      ) {
+        empty.push(absolute);
+      }
+    }
+    if (empty.length > 0) worktree.removeFiles(empty);
+  }
+}
 
 /**
  * Bring the working tree and the index to `treeOid`. Entries already
@@ -456,7 +624,10 @@ function pruneEmptyDirectories(repo: Repository, worktree: Worktree, removed: st
   const deepestFirst = [...directories].sort((a, b) => b.split("/").length - a.split("/").length);
   for (const directory of deepestFirst) {
     const absolute = joinPath(repo.root, directory);
-    if (worktree.stat(absolute)?.type === "dir" && worktree.readdir(absolute).length === 0) {
+    if (
+      worktree.stat(absolute)?.type === "dir" &&
+      worktree.scan(absolute, { limit: 1 }).length === 0
+    ) {
       worktree.rmdir(absolute);
     }
   }

@@ -41,11 +41,13 @@ export interface SparseWorkspaceRequest {
   baselineTreeOid: string | null;
   currentTreeOid: string | null;
   paths: string[];
+  /** Caller-owned headroom available for retained hydration state. */
+  maxRetainedBytes?: number;
 }
 
 export type SparseWorkspaceResult =
   | { available: false }
-  | { available: true; rows: SparseWorkspaceRow[] };
+  | { available: true; rows: SparseWorkspaceRow[]; retainedBytes: number };
 
 /** Optional same-database fast path. Generic clients omit this capability. */
 export interface SparseWorkspaceSource {

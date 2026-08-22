@@ -131,7 +131,10 @@ if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
 }
 
 // The bulk-read model likewise charges both database-wide caches once.
-const PACK_BLOB_MEMORY_MODEL_BYTES =
+/** Caller-owned state allowed to coexist with one bulk packed-blob read. */
+export const PACK_BLOB_CALLER_HEADROOM_BYTES = 8 * 1024 * 1024;
+
+export const PACK_BLOB_MEMORY_MODEL_BYTES =
   MAX_PACK_DELTA_WORKING_BYTES +
   PACK_READ_BYTES +
   DEFAULT_CHUNK_BYTES +
@@ -139,8 +142,9 @@ const PACK_BLOB_MEMORY_MODEL_BYTES =
   MAX_PACK_BLOB_BATCH_BYTES * 2 +
   PACK_EXTERNAL_BASE_BYTES +
   PACK_BLOB_GRAPH_METADATA_BYTES +
-  PACK_INFLATE_HEADROOM_BYTES;
-if (PACK_BLOB_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
+  PACK_INFLATE_HEADROOM_BYTES +
+  PACK_BLOB_CALLER_HEADROOM_BYTES;
+if (PACK_BLOB_MEMORY_MODEL_BYTES >= 100 * 1024 * 1024) {
   throw new Error("packed blob batch memory model exceeds 100 MiB");
 }
 

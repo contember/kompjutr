@@ -6,7 +6,12 @@ import { commit } from "../src/core/ops/commit.js";
 import { add } from "../src/core/ops/staging.js";
 import { INDEX_DIRTY, resealIndexTracker } from "../src/sqlite/index-tracker.js";
 import {
+  PACK_BLOB_CALLER_HEADROOM_BYTES,
+  PACK_BLOB_MEMORY_MODEL_BYTES,
+} from "../src/sqlite/packs.js";
+import {
   createSqliteSparseWorkspaceSource,
+  MAX_SPARSE_WORKSPACE_RETAINED_BYTES,
   SPARSE_TREE_DEPTH_SQL,
 } from "../src/sqlite/sparse-workspace.js";
 import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
@@ -78,6 +83,59 @@ function installPackCopy(
 }
 
 describe("SQLite sparse workspace source", () => {
+  it("keeps packed blob reads and caller-held state below 100 MiB", () => {
+    expect(PACK_BLOB_CALLER_HEADROOM_BYTES).toBe(8 * 1024 * 1024);
+    expect(MAX_SPARSE_WORKSPACE_RETAINED_BYTES).toBe(PACK_BLOB_CALLER_HEADROOM_BYTES);
+    expect(PACK_BLOB_MEMORY_MODEL_BYTES).toBeLessThan(100 * 1024 * 1024);
+  });
+
+  it("validates caller retained limits before issuing SQL", () => {
+    const workspace = committedWorkspace();
+    const source = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const tree = workspace.repo.headTree();
+    workspace.storage.resetCounters();
+
+    expect(
+      source.hydrate({
+        repoId: workspace.repo.store.repoId,
+        root: "/",
+        baselineTreeOid: tree,
+        currentTreeOid: null,
+        paths: ["a.txt"],
+        maxRetainedBytes: 0,
+      }),
+    ).toEqual({ available: false });
+    expect(workspace.storage.statementCount).toBe(0);
+
+    let failure: unknown;
+    try {
+      source.hydrate({
+        repoId: workspace.repo.store.repoId,
+        root: "/",
+        baselineTreeOid: null,
+        currentTreeOid: null,
+        paths: [],
+        maxRetainedBytes: MAX_SPARSE_WORKSPACE_RETAINED_BYTES + 1,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({ code: "E2BIG" });
+    expect(workspace.storage.statementCount).toBe(0);
+
+    expect(
+      source.hydrate({
+        repoId: workspace.repo.store.repoId,
+        root: "/",
+        baselineTreeOid: null,
+        currentTreeOid: null,
+        paths: [],
+        maxRetainedBytes: MAX_SPARSE_WORKSPACE_RETAINED_BYTES,
+      }),
+    ).toEqual({ available: true, rows: [], retainedBytes: 0 });
+    expect(workspace.storage.statementCount).toBe(0);
+  });
+
   it("hydrates exact tree, index, and worktree leaves in path order", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
@@ -565,7 +623,10 @@ describe("SQLite sparse workspace source", () => {
     });
 
     expect(result.available).toBe(true);
-    if (result.available) expect(result.rows).toHaveLength(1_000);
+    if (result.available) {
+      expect(result.rows).toHaveLength(1_000);
+      expect(result.retainedBytes).toBeLessThanOrEqual(MAX_SPARSE_WORKSPACE_RETAINED_BYTES);
+    }
     expect(workspace.storage.statementCount).toBe(4);
     expect(workspace.storage.rowCount).toBe(2_001);
   });
@@ -583,7 +644,7 @@ describe("SQLite sparse workspace source", () => {
         currentTreeOid: null,
         paths: [],
       }),
-    ).toEqual({ available: true, rows: [] });
+    ).toEqual({ available: true, rows: [], retainedBytes: 0 });
     expect(workspace.storage.statementCount).toBe(0);
   });
 

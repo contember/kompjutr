@@ -2,16 +2,29 @@
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
 // repository row, so nothing here writes a file.
 
-import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
+import {
+  contentIdKey,
+  type IndexEntry,
+  PACK_BLOB_CALLER_HEADROOM_BYTES,
+} from "../../sqlite/store.js";
 import type { GitContext } from "../context.js";
-import { GitError } from "../errors.js";
+import { CorruptError, GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
+import type { SparseWorkspaceResult, SparseWorkspaceRow } from "../sparse-workspace.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
+import {
+  checkoutSparseChanges,
+  checkoutTree,
+  matchesPaths,
+  type SparseCheckoutChange,
+  stageZero,
+  type TargetEntry,
+} from "./checkout.js";
 import { treeOf } from "./reads.js";
 import { treeStream } from "./tree-stream.js";
 import {
+  hashExactWorktreePaths,
   hashWorktreePaths,
   indexMatchesStat,
   type WorktreePath,
@@ -25,6 +38,25 @@ const CHECKOUT_GUARD_BATCH = 1_000;
 const INDEX_ENTRY_BYTES = 256;
 const WORKTREE_ENTRY_BYTES = 256;
 const DIRECTORY_ENTRY_BYTES = 96;
+const SPARSE_CHECKOUT_PATHS = 1_000;
+const SPARSE_CHECKOUT_ROW_BYTES = 384;
+const SPARSE_CHECKOUT_PATH_VECTOR_BYTES = 64;
+const SPARSE_CHECKOUT_GUARD_ROW_BYTES = 512;
+const SPARSE_CHECKOUT_CHANGE_ROW_BYTES = 128;
+
+class SparseCheckoutRetainedBudget {
+  #retainedBytes = 0;
+
+  get remaining(): number {
+    return PACK_BLOB_CALLER_HEADROOM_BYTES - this.#retainedBytes;
+  }
+
+  retain(bytes: number): boolean {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.remaining) return false;
+    this.#retainedBytes += bytes;
+    return true;
+  }
+}
 
 export interface BranchOptions {
   name: string;
@@ -132,7 +164,7 @@ export interface CheckoutOptions {
 }
 
 export function checkout(
-  _context: GitContext,
+  context: GitContext,
   repo: Repository,
   worktree: Worktree,
   options: CheckoutOptions,
@@ -140,6 +172,14 @@ export function checkout(
   const paths = options.paths !== undefined && options.paths.length > 0 ? options.paths : undefined;
   const commit = repo.peel(repo.revParse(options.ref));
   const tree = treeOf(repo, commit);
+
+  if (
+    options.force !== true &&
+    paths === undefined &&
+    trySparseCleanCheckout(context, repo, worktree, options.ref, commit, tree)
+  ) {
+    return;
+  }
 
   if (options.force !== true) {
     const blocked = localChangesInTheWay(repo, worktree, tree, paths, paths === undefined);
@@ -167,6 +207,231 @@ export function checkout(
     restoreStructure: options.force === true,
   });
   moveHead(repo, options.ref, commit);
+}
+
+interface SparseCheckoutCandidate {
+  path: string;
+  before: TargetEntry | undefined;
+  after: TargetEntry | undefined;
+}
+
+function trySparseCleanCheckout(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  ref: string,
+  commit: string,
+  targetTreeOid: string,
+): boolean {
+  const source = context.sparseWorkspace;
+  const tracker = context.indexTracker;
+  if (source === undefined || tracker === undefined) return false;
+
+  const baselineTreeOid = repo.headTree();
+  const state = source.readState(repo.store.repoId);
+  if (!state.available || state.baselineTreeOid !== baselineTreeOid) return false;
+  try {
+    for (const _entry of source.dirtyPaths(repo.store.repoId)) return false;
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return false;
+    throw error;
+  }
+  if (repo.store.hasCheckoutBlockingIndexEntries()) return false;
+
+  const budget = new SparseCheckoutRetainedBudget();
+  if (!budget.retain(256)) return false;
+  const candidates = sparseCheckoutCandidates(repo, baselineTreeOid, targetTreeOid, budget);
+  if (candidates === null) return false;
+  if (candidates.length === 0) {
+    moveHead(repo, ref, commit);
+    tracker.reseal(repo.store.repoId, targetTreeOid, []);
+    return true;
+  }
+
+  const pathVectorBytes = SPARSE_CHECKOUT_PATH_VECTOR_BYTES + candidates.length * 8;
+  if (!budget.retain(pathVectorBytes)) return false;
+  const maxHydratedBytes = budget.remaining;
+  let hydrated: SparseWorkspaceResult;
+  try {
+    hydrated = source.hydrate({
+      repoId: repo.store.repoId,
+      root: repo.root,
+      baselineTreeOid,
+      currentTreeOid: targetTreeOid,
+      paths: candidates.map((candidate) => candidate.path),
+      maxRetainedBytes: maxHydratedBytes,
+    });
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return false;
+    throw error;
+  }
+  if (!hydrated.available) return false;
+  if (hydrated.rows.length !== candidates.length) {
+    throw new CorruptError("sparse checkout hydration returned the wrong row count");
+  }
+  if (
+    !Number.isSafeInteger(hydrated.retainedBytes) ||
+    hydrated.retainedBytes < 0 ||
+    hydrated.retainedBytes > maxHydratedBytes
+  ) {
+    throw new CorruptError("sparse checkout hydration returned an invalid retained size");
+  }
+  if (!budget.retain(hydrated.retainedBytes)) return false;
+  if (!validateSparseCheckoutRows(candidates, hydrated.rows)) return false;
+  if (!sparseCheckoutWorktreeMatches(repo, worktree, hydrated.rows, budget)) return false;
+
+  if (!budget.retain(candidates.length * SPARSE_CHECKOUT_CHANGE_ROW_BYTES)) return false;
+  const changes: SparseCheckoutChange[] = [];
+  for (let index = 0; index < candidates.length; index++) {
+    const candidate = candidates[index];
+    const row = hydrated.rows[index];
+    if (candidate === undefined || row === undefined) {
+      throw new CorruptError("sparse checkout hydration lost a candidate");
+    }
+    changes.push({
+      path: candidate.path,
+      before: candidate.before,
+      after: candidate.after,
+      worktreeType: row.worktree?.type ?? null,
+    });
+  }
+  if (!checkoutSparseChanges(repo, worktree, changes, budget.remaining)) return false;
+  moveHead(repo, ref, commit);
+  tracker.reseal(repo.store.repoId, targetTreeOid, []);
+  return true;
+}
+
+function sparseCheckoutCandidates(
+  repo: Repository,
+  baselineTreeOid: string | null,
+  targetTreeOid: string,
+  budget: SparseCheckoutRetainedBudget,
+): SparseCheckoutCandidate[] | null {
+  const candidates: SparseCheckoutCandidate[] = [];
+  try {
+    for (const entry of repo.walkTreeDiff(baselineTreeOid, targetTreeOid)) {
+      if (entry.beforeMode === "160000" || entry.afterMode === "160000") return null;
+      if (candidates.length === SPARSE_CHECKOUT_PATHS) return null;
+      const bytes = SPARSE_CHECKOUT_ROW_BYTES + entry.path.length * 2;
+      if (!budget.retain(bytes)) return null;
+      candidates.push({
+        path: entry.path,
+        before:
+          entry.beforeMode === null || entry.beforeOid === null
+            ? undefined
+            : { path: entry.path, mode: entry.beforeMode, oid: entry.beforeOid },
+        after:
+          entry.afterMode === null || entry.afterOid === null
+            ? undefined
+            : { path: entry.path, mode: entry.afterMode, oid: entry.afterOid },
+      });
+    }
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+  return candidates;
+}
+
+function validateSparseCheckoutRows(
+  candidates: readonly SparseCheckoutCandidate[],
+  rows: readonly SparseWorkspaceRow[],
+): boolean {
+  for (let index = 0; index < candidates.length; index++) {
+    const candidate = candidates[index];
+    const row = rows[index];
+    if (candidate === undefined || row === undefined || row.path !== candidate.path) {
+      throw new CorruptError("sparse checkout hydration returned unordered rows");
+    }
+    if (
+      !sameSparseLeaf(row.baseline, candidate.before) ||
+      !sameSparseLeaf(row.current, candidate.after)
+    ) {
+      throw new CorruptError("sparse checkout hydration disagrees with the tree difference");
+    }
+    if (candidate.before === undefined) {
+      if (row.index.length !== 0) return false;
+      if (row.worktree !== null && row.worktree.type !== "dir") return false;
+      continue;
+    }
+    const entry = row.index[0];
+    if (
+      row.index.length !== 1 ||
+      entry === undefined ||
+      entry.stage !== 0 ||
+      entry.oid !== candidate.before.oid ||
+      entry.mode !== Number.parseInt(candidate.before.mode, 8) ||
+      row.worktree === null ||
+      row.worktree.type === "dir" ||
+      gitModeFor(row.worktree) !== candidate.before.mode
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sameSparseLeaf(
+  leaf: { mode: string; oid: string } | null,
+  entry: TargetEntry | undefined,
+): boolean {
+  if (leaf === null || entry === undefined) return leaf === null && entry === undefined;
+  return leaf.mode === entry.mode && leaf.oid === entry.oid;
+}
+
+function sparseCheckoutWorktreeMatches(
+  repo: Repository,
+  worktree: Worktree,
+  rows: readonly SparseWorkspaceRow[],
+  budget: SparseCheckoutRetainedBudget,
+): boolean {
+  const pending: Array<{ expected: TargetEntry; worktree: WorktreePath }> = [];
+  for (const row of rows) {
+    if (row.baseline === null) continue;
+    const entry = row.index[0];
+    if (entry === undefined || row.worktree === null || row.worktree.type === "dir") return false;
+    const candidate: WorktreePath = { path: row.path, stat: row.worktree };
+    if (!indexMatchesStat(entry, candidate.stat)) {
+      if (!budget.retain(SPARSE_CHECKOUT_GUARD_ROW_BYTES)) return false;
+      pending.push({
+        expected: { path: row.path, mode: row.baseline.mode, oid: row.baseline.oid },
+        worktree: candidate,
+      });
+    }
+  }
+  const mapped = repo.store.lookupBlobIds(
+    pending.flatMap(({ worktree: candidate }) => {
+      const contentId = candidate.stat.contentId;
+      return contentId === null ? [] : [contentId];
+    }),
+  );
+  const unresolved: WorktreePath[] = [];
+  const unresolvedExpected = new Map<string, TargetEntry>();
+  for (const candidate of pending) {
+    const contentId = candidate.worktree.stat.contentId;
+    const oid = contentId === null ? undefined : mapped.get(contentIdKey(contentId));
+    if (oid === candidate.expected.oid) continue;
+    unresolved.push(candidate.worktree);
+    unresolvedExpected.set(candidate.expected.path, candidate.expected);
+  }
+  const hashed = hashExactWorktreePaths(repo, worktree, unresolved, { write: false });
+  for (const candidate of unresolved) {
+    const expected = unresolvedExpected.get(candidate.path);
+    const actual = hashed.get(candidate.path);
+    if (
+      expected === undefined ||
+      actual === undefined ||
+      actual.oid !== expected.oid ||
+      actual.mode !== expected.mode
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
 export interface SwitchOptions {

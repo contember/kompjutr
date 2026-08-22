@@ -23,8 +23,8 @@ const MAX_DEPTH = 64;
 const MAX_EDGE_STEPS = 32_768;
 const MAX_SOURCE_ENTRIES = 8_192;
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
-const MAX_WORKTREE_PAYLOAD_BYTES = 4 * 1024 * 1024;
-const MAX_RETAINED_BYTES = 8 * 1024 * 1024;
+const MAX_WORKTREE_RETAINED_BYTES = 4 * 1024 * 1024;
+export const MAX_SPARSE_WORKSPACE_RETAINED_BYTES = 8 * 1024 * 1024;
 const ROW_RETAINED_BYTES = 1_024;
 const INDEX_ENTRY_RETAINED_BYTES = 320;
 const SEGMENT_RETAINED_BYTES = 40;
@@ -153,7 +153,20 @@ function parseRelativePath(path: string): { bytes: number; segments: string[] } 
   return { bytes, segments };
 }
 
-function validateRequest(request: SparseWorkspaceRequest): ValidatedRequest {
+function requestRetainedLimit(value: number | undefined): number {
+  if (value === undefined) return MAX_SPARSE_WORKSPACE_RETAINED_BYTES;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw inputError("sparse workspace retained limit is invalid");
+  }
+  if (value > MAX_SPARSE_WORKSPACE_RETAINED_BYTES) {
+    throw tooLarge(
+      `sparse workspace retained limit exceeds ${MAX_SPARSE_WORKSPACE_RETAINED_BYTES} bytes`,
+    );
+  }
+  return value;
+}
+
+function validateRequest(request: SparseWorkspaceRequest, retainedLimit: number): ValidatedRequest {
   if (!Number.isSafeInteger(request.repoId) || request.repoId <= 0) {
     throw inputError("sparse workspace repository id is invalid");
   }
@@ -194,12 +207,12 @@ function validateRequest(request: SparseWorkspaceRequest): ValidatedRequest {
       path.length * 4 +
       parsed.bytes +
       parsed.segments.length * SEGMENT_RETAINED_BYTES;
-    if (retainedBytes > MAX_RETAINED_BYTES) {
+    if (retainedBytes > retainedLimit) {
       return { json: "", segments: [], retainedBytes: -1 };
     }
     previous = path;
   }
-  if (retainedBytes > MAX_RETAINED_BYTES - jsonChars * 2) {
+  if (retainedBytes > retainedLimit - jsonChars * 2) {
     return { json: "", segments: [], retainedBytes: -1 };
   }
   const json = JSON.stringify(request.paths);
@@ -509,6 +522,7 @@ function treeDepth(
   sources: Map<string, ValidatedTreeSource>,
   budget: SourceBudget,
   retainedBytes: number,
+  retainedLimit: number,
 ): { available: boolean; resolutions: Map<string, TreeResolution> } {
   const parts: string[] = [];
   let jsonBytes = 2;
@@ -527,7 +541,7 @@ function treeDepth(
     jsonChars += part.length + (parts.length === 1 ? 0 : 1);
     if (
       jsonBytes > MAX_REQUEST_JSON_BYTES ||
-      retainedBytes + jsonChars * 4 + parts.length * 8 > MAX_RETAINED_BYTES
+      retainedBytes + jsonChars * 4 + parts.length * 8 > retainedLimit
     ) {
       return { available: false, resolutions: new Map() };
     }
@@ -603,6 +617,7 @@ function resolveTrees(
   request: SparseWorkspaceRequest,
   segments: string[][],
   retainedRequestBytes: number,
+  retainedLimit: number,
 ): {
   available: boolean;
   baseline: Array<SparseTreeLeaf | null>;
@@ -659,10 +674,18 @@ function resolveTrees(
       cursors.length * RESOLUTION_RETAINED_BYTES +
       cursors.length * 64 +
       (sources.size + newSourceOids.size) * SOURCE_RETAINED_BYTES;
-    if (retainedBeforeQuery > MAX_RETAINED_BYTES) {
+    if (retainedBeforeQuery > retainedLimit) {
       return { available: false, baseline, current };
     }
-    const resolved = treeDepth(db, request.repoId, cursors, sources, budget, retainedBeforeQuery);
+    const resolved = treeDepth(
+      db,
+      request.repoId,
+      cursors,
+      sources,
+      budget,
+      retainedBeforeQuery,
+      retainedLimit,
+    );
     if (!resolved.available) return { available: false, baseline, current };
     const next: TreeCursor[] = [];
     let nextBytes = 0;
@@ -697,7 +720,7 @@ function resolveTrees(
             cursors.length * RESOLUTION_RETAINED_BYTES +
             nextBytes +
             sources.size * SOURCE_RETAINED_BYTES >
-          MAX_RETAINED_BYTES
+          retainedLimit
         ) {
           return { available: false, baseline, current };
         }
@@ -841,18 +864,31 @@ const WORKTREE_SQL = `WITH wanted(ordinal, relative) AS MATERIALIZED (
     FROM absolute
     LEFT JOIN fs_paths paths ON paths.path = absolute.path
     LEFT JOIN fs_nodes nodes ON nodes.inode = paths.inode
-), budgeted AS MATERIALIZED (
+), charged AS MATERIALIZED (
   SELECT metadata.*,
-         sum(coalesce(link_target_bytes, 0) + coalesce(content_id_bytes, 0)) OVER (
-           ORDER BY ordinal ROWS UNBOUNDED PRECEDING
-         ) AS cumulative_payload_bytes
+         CASE
+           WHEN coalesce(link_target_bytes, 0) > limits.payload_cap / 2
+                 OR coalesce(content_id_bytes, 0) > limits.payload_cap
+             THEN limits.payload_cap + 1
+           WHEN coalesce(link_target_bytes, 0) * 2
+                  > limits.payload_cap - coalesce(content_id_bytes, 0)
+             THEN limits.payload_cap + 1
+           ELSE coalesce(link_target_bytes, 0) * 2 + coalesce(content_id_bytes, 0)
+         END AS retained_payload_bytes
     FROM metadata
+    CROSS JOIN limits
+), budgeted AS MATERIALIZED (
+  SELECT charged.*,
+         sum(retained_payload_bytes) OVER (
+           ORDER BY ordinal ROWS UNBOUNDED PRECEDING
+         ) AS cumulative_retained_bytes
+    FROM charged
 )
 SELECT budgeted.*,
-       CASE WHEN budgeted.cumulative_payload_bytes <= limits.payload_cap
+       CASE WHEN budgeted.cumulative_retained_bytes <= limits.payload_cap
                  AND typeof(payload.link_target) = 'text'
             THEN payload.link_target END AS link_target,
-       CASE WHEN budgeted.cumulative_payload_bytes <= limits.payload_cap
+       CASE WHEN budgeted.cumulative_retained_bytes <= limits.payload_cap
                  AND typeof(payload.content_id) = 'blob'
             THEN payload.content_id END AS content_id
   FROM budgeted
@@ -865,12 +901,12 @@ function readWorktree(
   root: string,
   pathsJson: string,
   count: number,
-  payloadLimit: number,
-): { available: boolean; rows: Array<SparseWorktreeLeaf | null>; payloadBytes: number } {
+  retainedLimit: number,
+): { available: boolean; rows: Array<SparseWorktreeLeaf | null>; retainedBytes: number } {
   const result: Array<SparseWorktreeLeaf | null> = Array.from({ length: count }, () => null);
   let returned = 0;
-  let payloadBytes = 0;
-  for (const row of db.iterate(WORKTREE_SQL, pathsJson, payloadLimit, root, root)) {
+  let retainedBytes = 0;
+  for (const row of db.iterate(WORKTREE_SQL, pathsJson, retainedLimit, root, root)) {
     returned++;
     const ordinal = numberField(row.ordinal);
     if (ordinal === null || ordinal < 0 || ordinal >= count) {
@@ -925,20 +961,20 @@ function readWorktree(
     ) {
       throw new CorruptError("sparse worktree lookup returned malformed payload metadata");
     }
-    const cumulativePayloadBytes = numberField(row.cumulative_payload_bytes);
-    if (cumulativePayloadBytes === null || cumulativePayloadBytes > payloadLimit) {
-      return { available: false, rows: result, payloadBytes };
+    const cumulativeRetainedBytes = numberField(row.cumulative_retained_bytes);
+    if (cumulativeRetainedBytes === null || cumulativeRetainedBytes > retainedLimit) {
+      return { available: false, rows: result, retainedBytes };
     }
     if (type === "dir") continue;
     if (
       (row.link_target_type === "text" &&
         targetBytes !== null &&
-        targetBytes > MAX_WORKTREE_PAYLOAD_BYTES) ||
+        targetBytes > MAX_WORKTREE_RETAINED_BYTES) ||
       (row.content_id_type === "blob" &&
         contentBytes !== null &&
-        contentBytes > MAX_WORKTREE_PAYLOAD_BYTES)
+        contentBytes > MAX_WORKTREE_RETAINED_BYTES)
     ) {
-      return { available: false, rows: result, payloadBytes };
+      return { available: false, rows: result, retainedBytes };
     }
     if (
       (type === "file" && row.link_target !== null) ||
@@ -946,9 +982,14 @@ function readWorktree(
     ) {
       throw new CorruptError("sparse worktree lookup returned malformed payload metadata");
     }
-    payloadBytes += (targetBytes ?? 0) + (contentBytes ?? 0);
-    if (payloadBytes > MAX_WORKTREE_PAYLOAD_BYTES)
-      return { available: false, rows: result, payloadBytes };
+    const nextRetainedBytes = retainedBytes + (targetBytes ?? 0) * 2 + (contentBytes ?? 0);
+    if (
+      nextRetainedBytes !== cumulativeRetainedBytes ||
+      nextRetainedBytes > MAX_WORKTREE_RETAINED_BYTES
+    ) {
+      return { available: false, rows: result, retainedBytes };
+    }
+    retainedBytes = nextRetainedBytes;
     const contentId = row.content_id === null ? null : readBlob(row.content_id);
     result[ordinal] = {
       type,
@@ -963,15 +1004,16 @@ function readWorktree(
     };
   }
   if (returned !== count) throw new CorruptError("sparse worktree lookup lost requested paths");
-  return { available: true, rows: result, payloadBytes };
+  return { available: true, rows: result, retainedBytes };
 }
 
 function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorkspaceResult {
-  const validated = validateRequest(request);
-  if (validated.retainedBytes < 0 || validated.retainedBytes > MAX_RETAINED_BYTES) {
+  const retainedLimit = requestRetainedLimit(request.maxRetainedBytes);
+  const validated = validateRequest(request, retainedLimit);
+  if (validated.retainedBytes < 0 || validated.retainedBytes > retainedLimit) {
     return { available: false };
   }
-  if (request.paths.length === 0) return { available: true, rows: [] };
+  if (request.paths.length === 0) return { available: true, rows: [], retainedBytes: 0 };
 
   const repository = db.one<Record<string, unknown>>(
     `SELECT typeof(root) AS root_type, length(CAST(root AS BLOB)) AS root_bytes,
@@ -1003,30 +1045,36 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
     throw new CorruptError("sparse workspace repository root is malformed");
   }
 
-  const trees = resolveTrees(db, request, validated.segments, validated.retainedBytes);
+  const trees = resolveTrees(
+    db,
+    request,
+    validated.segments,
+    validated.retainedBytes,
+    retainedLimit,
+  );
   if (!trees.available) return { available: false };
   const index = readIndex(
     db,
     request.repoId,
     validated.json,
     request.paths.length,
-    MAX_RETAINED_BYTES - validated.retainedBytes,
+    retainedLimit - validated.retainedBytes,
   );
   if (!index.available) return { available: false };
-  const payloadLimit = Math.min(
-    MAX_WORKTREE_PAYLOAD_BYTES,
-    MAX_RETAINED_BYTES - validated.retainedBytes - index.retainedBytes,
+  const worktreeRetainedLimit = Math.min(
+    MAX_WORKTREE_RETAINED_BYTES,
+    retainedLimit - validated.retainedBytes - index.retainedBytes,
   );
-  if (payloadLimit < 0) return { available: false };
+  if (worktreeRetainedLimit < 0) return { available: false };
   const worktree = readWorktree(
     db,
     request.root,
     validated.json,
     request.paths.length,
-    payloadLimit,
+    worktreeRetainedLimit,
   );
   if (!worktree.available) return { available: false };
-  if (validated.retainedBytes + index.retainedBytes > MAX_RETAINED_BYTES - worktree.payloadBytes) {
+  if (validated.retainedBytes + index.retainedBytes > retainedLimit - worktree.retainedBytes) {
     return { available: false };
   }
 
@@ -1045,7 +1093,11 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
       worktree: worktree.rows[ordinal] ?? null,
     });
   }
-  return { available: true, rows };
+  return {
+    available: true,
+    rows,
+    retainedBytes: validated.retainedBytes + index.retainedBytes + worktree.retainedBytes,
+  };
 }
 
 export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorkspaceSource {
