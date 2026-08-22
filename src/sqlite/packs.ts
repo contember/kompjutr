@@ -8,7 +8,7 @@
 
 import { concat, isOid, toHex } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
-import { ByteLru } from "../core/lru.js";
+import type { ByteLru } from "../core/lru.js";
 import {
   hashObject,
   NUMBER_TYPE,
@@ -50,7 +50,7 @@ const MAX_PACK_BLOB_INPUTS = 4096;
 const OFFSET_WINDOW = 4_096;
 
 export interface PackCacheOptions {
-  /** Bytes of still-compressed pack rows held hot. */
+  /** Database-wide bytes of still-compressed pack rows held hot. */
   chunkBytes?: number;
   /** Largest entry inflated into one buffer. Anything above streams. */
   maxBufferedEntry?: number;
@@ -61,12 +61,13 @@ export interface PackCacheOptions {
 }
 
 const DEFAULT_CHUNK_BYTES = 4 * PACK_CHUNK;
+export const MAX_PACK_ROW_CACHE_BYTES = DEFAULT_CHUNK_BYTES;
 const DEFAULT_MAX_BUFFERED_ENTRY = 8 * 1024 * 1024;
 const DEFAULT_CACHE_ENTRY_LIMIT = 2 * 1024 * 1024;
 export const MAX_PACK_DELTA_WORKING_BYTES = 48 * 1024 * 1024;
 const PACK_READ_BYTES = 1024 * 1024;
 const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
-const PACK_OBJECT_CACHE_RESERVE_BYTES = 16 * 1024 * 1024;
+const PACK_SHARED_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
@@ -79,13 +80,12 @@ const PACK_OFFSET_WINDOW_BYTES = 2 * 1024 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
 const PACK_EXTERNAL_BASE_BYTES = MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024;
 
-// Delta buffers, one compressed row, both caches, both parsed-object sinks,
-// bounded commit re-inflation and inflater headroom peak below 100 MiB.
+// Charged JS-owned state includes both database-wide shared caches once.
 const PACK_MEMORY_MODEL_BYTES =
   MAX_PACK_DELTA_WORKING_BYTES +
   PACK_READ_BYTES +
   DEFAULT_CHUNK_BYTES +
-  PACK_OBJECT_CACHE_RESERVE_BYTES +
+  PACK_SHARED_OBJECT_CACHE_BYTES +
   PACK_TREE_BATCH_BYTES +
   MAX_COMMIT_CACHE_BYTES +
   PACK_INDEX_MEMORY_BYTES +
@@ -97,23 +97,18 @@ if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
   throw new Error("pack memory model exceeds 100 MiB");
 }
 
-// Delta buffers, the lazy chunk row, both shared caches, compressed graph,
-// an external base stream, returned blobs, metadata and inflater headroom stay below 100 MiB.
+// The bulk-read model likewise charges both database-wide caches once.
 const PACK_BLOB_MEMORY_MODEL_BYTES =
   MAX_PACK_DELTA_WORKING_BYTES +
   PACK_READ_BYTES +
   DEFAULT_CHUNK_BYTES +
-  PACK_OBJECT_CACHE_RESERVE_BYTES +
+  PACK_SHARED_OBJECT_CACHE_BYTES +
   MAX_PACK_BLOB_BATCH_BYTES * 2 +
   PACK_EXTERNAL_BASE_BYTES +
   PACK_BLOB_GRAPH_METADATA_BYTES +
   PACK_INFLATE_HEADROOM_BYTES;
 if (PACK_BLOB_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
   throw new Error("packed blob batch memory model exceeds 100 MiB");
-}
-
-function packObjectKey(packId: number, oid: string): string {
-  return `pack:${packId}:${oid}`;
 }
 
 function pushExactInflate(stream: InflateInto, input: Uint8Array, label: string): number {
@@ -481,6 +476,8 @@ export class PackStore {
   readonly #externalMetadata: ExternalMetadataResolver;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #chunks: ByteLru<string, Uint8Array>;
+  readonly #cacheNamespace: string;
+  #cacheGeneration = 0;
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
   readonly #maxDeltaDepth: number;
@@ -489,6 +486,8 @@ export class PackStore {
     db: SqlDatabase,
     repoId: number,
     objects: ByteLru<string, RawObject>,
+    chunks: ByteLru<string, Uint8Array>,
+    cacheNamespace: string,
     external: ExternalResolver,
     externalBatch: ExternalBatchResolver,
     externalMetadata: ExternalMetadataResolver,
@@ -500,15 +499,16 @@ export class PackStore {
     this.#externalBatch = externalBatch;
     this.#externalMetadata = externalMetadata;
     this.#objects = objects;
-    this.#chunks = new ByteLru(
-      Math.min(options.chunkBytes ?? DEFAULT_CHUNK_BYTES, DEFAULT_CHUNK_BYTES),
-      (c) => c.length,
-    );
+    this.#chunks = chunks;
+    this.#cacheNamespace = cacheNamespace;
     this.#maxBufferedEntry = Math.min(
       options.maxBufferedEntry ?? DEFAULT_MAX_BUFFERED_ENTRY,
       DEFAULT_MAX_BUFFERED_ENTRY,
     );
-    this.#cacheEntryLimit = options.cacheEntryLimit ?? DEFAULT_CACHE_ENTRY_LIMIT;
+    this.#cacheEntryLimit = Math.min(
+      options.cacheEntryLimit ?? DEFAULT_CACHE_ENTRY_LIMIT,
+      DEFAULT_CACHE_ENTRY_LIMIT,
+    );
     const maxDeltaDepth = options.maxDeltaDepth ?? MAX_DELTA_DEPTH;
     if (!Number.isFinite(maxDeltaDepth) || !Number.isInteger(maxDeltaDepth) || maxDeltaDepth < 0) {
       throw new RangeError("maxDeltaDepth must be a finite non-negative integer");
@@ -618,7 +618,7 @@ export class PackStore {
   read(oid: string): RawObject | null {
     const first = this.lookup(oid);
     if (first === null) return null;
-    const cached = this.#objects.get(packObjectKey(first.packId, oid));
+    const cached = this.#objects.get(this.#objectCacheKey(first.packId, oid));
     if (cached !== undefined) return cached;
 
     const chain: PackedEntry[] = [];
@@ -646,7 +646,7 @@ export class PackStore {
         base = external;
         break;
       }
-      const cachedBase = this.#objects.get(packObjectKey(next.packId, next.oid));
+      const cachedBase = this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
       if (cachedBase !== undefined) {
         base = cachedBase;
         break;
@@ -801,7 +801,7 @@ export class PackStore {
     const externalOids = new Set<string>();
     for (const oid of available) {
       let current = entries.get(oid)!;
-      if (this.#objects.get(packObjectKey(current.packId, oid)) !== undefined) continue;
+      if (this.#objects.get(this.#objectCacheKey(current.packId, oid)) !== undefined) continue;
       const seen = new Set<string>();
       let depth = 0;
       for (;;) {
@@ -819,7 +819,7 @@ export class PackStore {
           externalOids.add(current.baseOid);
           break;
         }
-        if (this.#objects.get(packObjectKey(next.packId, next.oid)) !== undefined) break;
+        if (this.#objects.get(this.#objectCacheKey(next.packId, next.oid)) !== undefined) break;
         current = next;
       }
     }
@@ -863,7 +863,7 @@ export class PackStore {
       const separator = key.indexOf(":");
       const packId = Number(key.slice(0, separator));
       const seq = Number(key.slice(separator + 1));
-      const hit = this.#chunks.get(key);
+      const hit = this.#chunks.get(this.#chunkCacheKey(packId, seq));
       if (hit === undefined) missingChunks.push({ p: packId, q: seq });
       else copyChunk(packId, seq, hit);
     }
@@ -891,7 +891,7 @@ export class PackStore {
         const data = readBlob(row.data);
         const key = `${packId}:${seq}`;
         returned.add(key);
-        this.#chunks.set(key, data);
+        this.#chunks.set(this.#chunkCacheKey(packId, seq), data);
         copyChunk(packId, seq, data);
       }
     }
@@ -910,7 +910,7 @@ export class PackStore {
     const result = new Map<string, RawObject>();
     for (const oid of available) {
       const first = entries.get(oid)!;
-      const cached = this.#objects.get(packObjectKey(first.packId, oid));
+      const cached = this.#objects.get(this.#objectCacheKey(first.packId, oid));
       if (cached !== undefined) {
         result.set(oid, cached);
         continue;
@@ -947,7 +947,7 @@ export class PackStore {
           }
           break;
         }
-        const cachedBase = this.#objects.get(packObjectKey(next.packId, next.oid));
+        const cachedBase = this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
         if (cachedBase !== undefined) {
           object = cachedBase;
           break;
@@ -1014,8 +1014,16 @@ export class PackStore {
 
   #cacheObject(packId: number, oid: string, object: RawObject): void {
     if (object.data.length <= this.#cacheEntryLimit) {
-      this.#objects.set(packObjectKey(packId, oid), object);
+      this.#objects.set(this.#objectCacheKey(packId, oid), object);
     }
+  }
+
+  #objectCacheKey(packId: number, oid: string): string {
+    return `${this.#cacheNamespace}:${this.#cacheGeneration}:pack:${packId}:${oid}`;
+  }
+
+  #chunkCacheKey(packId: number, seq: number): string {
+    return `${this.#cacheNamespace}:${this.#cacheGeneration}:row:${packId}:${seq}`;
   }
 
   /** Inflate one indexed entry, whose compressed length is already known. */
@@ -1098,13 +1106,12 @@ export class PackStore {
   }
 
   /**
-   * One decoded `git_pack_data` row through the LRU. Rows are immutable
-   * once written — a chunk is inserted exactly once and only ever removed
-   * wholesale, at which point the cache is cleared — so a hit is never
-   * stale.
+   * One decoded `git_pack_data` row through the database-wide LRU. The key
+   * includes both store and invalidation generations, so deleted rows can
+   * stay stale only until this bounded cache evicts them.
    */
   #chunk(packId: number, seq: number): Uint8Array {
-    const key = `${packId}:${seq}`;
+    const key = this.#chunkCacheKey(packId, seq);
     const hit = this.#chunks.get(key);
     if (hit !== undefined) return hit;
     const row = this.#db.one<{ data: unknown }>(
@@ -1120,7 +1127,7 @@ export class PackStore {
   }
 
   clearCaches(): void {
-    this.#chunks.clear();
+    this.#cacheGeneration++;
   }
 
   /** Drop every pack left half-written by an interrupted ingest. */
@@ -1140,7 +1147,7 @@ export class PackStore {
     this.#db.transactionSync(() => {
       for (const packId of ids) this.#deletePack(packId);
     });
-    this.#chunks.clear();
+    this.clearCaches();
     return ids.size;
   }
 
@@ -1356,7 +1363,7 @@ export class PackStore {
         if (entry.data !== null && baseOid !== null) {
           const base = missingBases.has(baseOid)
             ? undefined
-            : this.#objects.get(packObjectKey(packId, baseOid));
+            : this.#objects.get(this.#objectCacheKey(packId, baseOid));
           if (base === undefined) missingBases.add(baseOid);
           if (base !== undefined) {
             checkDeltaWorkingSet(base.data, entry.data);
@@ -1689,7 +1696,7 @@ export class PackStore {
     const result = new Map<string, RawObject>();
     const uncached: string[] = [];
     for (const oid of wanted) {
-      const cached = this.#objects.get(packObjectKey(packId, oid));
+      const cached = this.#objects.get(this.#objectCacheKey(packId, oid));
       if (cached === undefined) uncached.push(oid);
       else result.set(oid, cached);
     }

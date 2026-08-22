@@ -25,6 +25,7 @@ import { blob, readBlob, type SqlDatabase } from "./db.js";
 import {
   MAX_PACK_BLOB_BATCH_BYTES,
   MAX_PACK_DELTA_WORKING_BYTES,
+  MAX_PACK_ROW_CACHE_BYTES,
   type PackCacheOptions,
   PackStore,
 } from "./packs.js";
@@ -83,13 +84,13 @@ const INITIAL_BLOB_ROW_JSON_BYTES = 96;
 /** Parsed commits staged beside encoded object bytes before a batch flush. */
 const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 
-const DEFAULT_OBJECT_CACHE_BYTES = 16 * 1024 * 1024;
+const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const TREE_WALK_STATE_BYTES = 8 * 1024 * 1024;
 const TREE_WALK_PATH_BYTES = 2_200;
 const TREE_WALK_QUEUE_BYTES = 16 * 1024 * 1024;
 
 export interface StoreOptions extends PackCacheOptions {
-  /** Bytes of inflated objects held hot across reads. */
+  /** Database-wide bytes of inflated objects held hot across reads. */
   objectCacheBytes?: number;
   now?: () => number;
 }
@@ -898,17 +899,28 @@ export function ancestors(path: string): string[] {
 
 /**
  * Owns the schema and the repository registry. One instance per
- * workspace database; `open()` hands out per-repository stores, cached so
- * their object and chunk caches survive across calls.
+ * workspace database; `open()` hands out per-repository stores over the
+ * database-wide object and pack-row caches.
  */
 export class SqliteGitDatabase {
   readonly #db: SqlDatabase;
   readonly #options: StoreOptions;
   readonly #stores = new Map<number, RepoStore>();
+  readonly #objects: ByteLru<string, RawObject>;
+  readonly #packRows: ByteLru<string, Uint8Array>;
+  #nextStoreGeneration = 1;
 
   constructor(db: SqlDatabase, options: StoreOptions = {}) {
     this.#db = db;
     this.#options = options;
+    this.#objects = new ByteLru(
+      Math.min(options.objectCacheBytes ?? DEFAULT_OBJECT_CACHE_BYTES, DEFAULT_OBJECT_CACHE_BYTES),
+      (object) => object.data.length,
+    );
+    this.#packRows = new ByteLru(
+      Math.min(options.chunkBytes ?? MAX_PACK_ROW_CACHE_BYTES, MAX_PACK_ROW_CACHE_BYTES),
+      (row) => row.length,
+    );
     initializeGitSchema(db);
   }
 
@@ -959,10 +971,20 @@ export class SqliteGitDatabase {
   open(repository: RepositoryRow): RepoStore {
     const existing = this.#stores.get(repository.id);
     if (existing !== undefined) return existing;
+    if (!Number.isSafeInteger(this.#nextStoreGeneration)) {
+      throw new GitError("E2BIG", "repository store generation is exhausted");
+    }
+    const generation = this.#nextStoreGeneration++;
     // Destroying a repository evicts its store, so a reused id can never
     // hand back the previous repository's caches.
-    const store = new RepoStore(this.#db, repository, this.#options, () =>
-      this.#stores.delete(repository.id),
+    const store = new RepoStore(
+      this.#db,
+      repository,
+      generation,
+      this.#objects,
+      this.#packRows,
+      this.#options,
+      () => this.#stores.delete(repository.id),
     );
     this.#stores.set(repository.id, store);
     return store;
@@ -976,12 +998,17 @@ export class RepoStore {
   readonly #root: string;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packs: PackStore;
+  readonly #cacheNamespace: string;
+  #cacheGeneration = 0;
   #hasLoose: boolean;
   readonly #onDestroy: (() => void) | undefined;
 
   constructor(
     db: SqlDatabase,
     repository: RepositoryRow,
+    storeGeneration: number,
+    objects: ByteLru<string, RawObject>,
+    packRows: ByteLru<string, Uint8Array>,
     options: StoreOptions = {},
     onDestroy?: () => void,
   ) {
@@ -989,14 +1016,14 @@ export class RepoStore {
     this.#db = db;
     this.#repoId = repository.id;
     this.#root = repository.root;
-    this.#objects = new ByteLru(
-      Math.min(options.objectCacheBytes ?? DEFAULT_OBJECT_CACHE_BYTES, DEFAULT_OBJECT_CACHE_BYTES),
-      (object) => object.data.length,
-    );
+    this.#objects = objects;
+    this.#cacheNamespace = `${repository.id}:${storeGeneration}`;
     this.#packs = new PackStore(
       db,
       repository.id,
       this.#objects,
+      packRows,
+      this.#cacheNamespace,
       (oid) => this.#readLoose(oid),
       (oids) => this.#readLooseObjects(oids),
       (oids) => this.#looseObjectMetadata(oids),
@@ -1025,7 +1052,7 @@ export class RepoStore {
     return this.#packs;
   }
 
-  /** Bytes currently held by the two bounded caches. */
+  /** Bytes currently held by this database's two shared bounded caches. */
   cacheBytes(): { objects: number; chunks: number } {
     return { objects: this.#objects.bytes, chunks: this.#packs.cachedChunkBytes };
   }
@@ -1229,7 +1256,7 @@ export class RepoStore {
   }
 
   read(oid: string): RawObject | null {
-    const cached = this.#objects.get(`loose:${oid}`);
+    const cached = this.#objects.get(this.#objectCacheKey(oid));
     if (cached !== undefined) return cached;
     return this.#readLoose(oid) ?? this.#packs.read(oid);
   }
@@ -1423,7 +1450,7 @@ export class RepoStore {
       }
     });
     this.#hasLoose = true;
-    this.#objects.set(`loose:${oid}`, { type, data });
+    this.#objects.set(this.#objectCacheKey(oid), { type, data });
     return oid;
   }
 
@@ -1800,7 +1827,7 @@ export class RepoStore {
    * be reconstructed without its full base in memory. Null when unknown.
    */
   readChunks(oid: string): Iterable<Uint8Array> | null {
-    const cached = this.#objects.get(`loose:${oid}`);
+    const cached = this.#objects.get(this.#objectCacheKey(oid));
     if (cached !== undefined) return [cached.data];
     if (this.#hasLoose) {
       const row = this.#looseRow(oid);
@@ -1899,7 +1926,7 @@ export class RepoStore {
           ? concat(chunks.map((chunk) => readBlob(chunk.data)))
           : inflate(concat(chunks.map((chunk) => readBlob(chunk.data)))),
     };
-    this.#objects.set(`loose:${oid}`, object);
+    this.#objects.set(this.#objectCacheKey(oid), object);
     return object;
   }
 
@@ -2087,7 +2114,7 @@ export class RepoStore {
         throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
       }
       const object: RawObject = { type: row.type, data };
-      this.#objects.set(`loose:${row.oid}`, object);
+      this.#objects.set(this.#objectCacheKey(row.oid), object);
       result.set(row.oid, object);
     }
     return result;
@@ -2648,10 +2675,14 @@ export class RepoStore {
       }
       this.#db.run("DELETE FROM git_repositories WHERE id = ?", this.#repoId);
     });
-    this.#objects.clear();
+    this.#cacheGeneration++;
     this.#packs.clearCaches();
     this.#hasLoose = false;
     this.#onDestroy?.();
+  }
+
+  #objectCacheKey(oid: string): string {
+    return `${this.#cacheNamespace}:${this.#cacheGeneration}:loose:${oid}`;
   }
 }
 

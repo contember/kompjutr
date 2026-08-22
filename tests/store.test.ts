@@ -6,7 +6,7 @@ import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
-import { readBlob } from "../src/sqlite/db.js";
+import { blob, readBlob } from "../src/sqlite/db.js";
 import {
   ancestors,
   blobIdMismatchRetainedBytes,
@@ -22,6 +22,23 @@ function open() {
   const database = new SqliteGitDatabase(db);
   const repository = database.create("/repo", "ref: refs/heads/main");
   return { db, database, store: database.open(repository) };
+}
+
+function insertRawBlob(db: TestDatabase, repoId: number, data: Uint8Array): string {
+  const oid = hashObject("blob", data);
+  db.run(
+    "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'blob', ?, 'raw')",
+    repoId,
+    oid,
+    data.length,
+  );
+  db.run(
+    "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+    repoId,
+    oid,
+    blob(data),
+  );
+  return oid;
 }
 
 describe("path helpers", () => {
@@ -65,6 +82,47 @@ describe("repository registry", () => {
       "git_tree_entries",
       "git_tree_sources",
     ]);
+  });
+
+  it("shares one 8 MiB object cache across repositories", () => {
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const first = database.open(database.create("/one", "ref: refs/heads/main"));
+    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    for (let index = 0; index < 10; index++) {
+      const data = new Uint8Array(1024 * 1024).fill(index);
+      (index < 5 ? first : second).write("blob", data);
+    }
+    expect(first.cacheBytes().objects).toBe(8 * 1024 * 1024);
+    expect(second.cacheBytes()).toEqual(first.cacheBytes());
+  });
+
+  it("isolates equal oids by repository and store generation", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const firstRow = database.create("/one", "ref: refs/heads/main");
+    const secondRow = database.create("/two", "ref: refs/heads/main");
+    const first = database.open(firstRow);
+    const data = utf8.encode("same object, isolated cache\n");
+    const oid = first.write("blob", data);
+    expect(insertRawBlob(db, secondRow.id, data)).toBe(oid);
+    const second = database.open(secondRow);
+
+    db.storage.resetCounters();
+    expect(second.read(oid)?.data).toEqual(data);
+    expect(db.storage.statementCount).toBeGreaterThan(0);
+    db.storage.resetCounters();
+    expect(second.read(oid)?.data).toEqual(data);
+    expect(db.storage.statementCount).toBe(0);
+
+    first.destroy();
+    second.destroy();
+    const recreated = database.create("/recreated", "ref: refs/heads/main");
+    expect(recreated.id).toBe(firstRow.id);
+    expect(insertRawBlob(db, recreated.id, data)).toBe(oid);
+    const replacement = database.open(recreated);
+    db.storage.resetCounters();
+    expect(replacement.read(oid)?.data).toEqual(data);
+    expect(db.storage.statementCount).toBeGreaterThan(0);
   });
 });
 

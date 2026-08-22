@@ -15,6 +15,7 @@ import {
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { MAX_INDEXED_COMMIT_BYTES } from "../src/sqlite/commits.js";
+import { blob, readBlob } from "../src/sqlite/db.js";
 import { MAX_DELTA_DEPTH, MAX_PACK_DELTA_WORKING_BYTES, PACK_CHUNK } from "../src/sqlite/packs.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -98,6 +99,15 @@ function deltaPack(depth: number): { bytes: Uint8Array; target: Uint8Array; targ
   return { bytes: concat(chunks), target, targetOid };
 }
 
+function singleBlobPack(data: Uint8Array): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(1);
+  writer.object("blob", data);
+  writer.finish();
+  return concat(chunks);
+}
+
 describe("delta", () => {
   it("round-trips a literal-only delta", () => {
     const base = utf8.encode("the quick brown fox");
@@ -133,6 +143,67 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
+  it("shares and isolates one 4 MiB pack-row cache across repositories", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { chunkBytes: 16 * 1024 * 1024 });
+    const first = database.open(database.create("/one", "ref: refs/heads/main"));
+    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    for (const { store, prefix } of [
+      { store: first, prefix: 0x10 },
+      { store: second, prefix: 0x20 },
+    ]) {
+      for (let seq = 0; seq < 3; seq++) {
+        db.run(
+          "INSERT INTO git_pack_data (repo_id, pack_id, seq, data) VALUES (?, 1, ?, ?)",
+          store.repoId,
+          seq,
+          blob(new Uint8Array(PACK_CHUNK).fill(prefix + seq)),
+        );
+        expect(store.packs.readRaw(1, seq * PACK_CHUNK, 1)[0]).toBe(prefix + seq);
+      }
+    }
+    expect(first.cacheBytes().chunks).toBe(4 * 1024 * 1024);
+    expect(second.cacheBytes()).toEqual(first.cacheBytes());
+
+    expect(first.packs.readRaw(1, 0, 1)[0]).toBe(0x10);
+    expect(second.packs.readRaw(1, 0, 1)[0]).toBe(0x20);
+    const row = db.one<{ data: unknown }>(
+      "SELECT data FROM git_pack_data WHERE repo_id = ? AND pack_id = 1 AND seq = 0",
+      first.repoId,
+    );
+    if (row === undefined) throw new Error("missing first repository pack row");
+    const replacement = readBlob(row.data).slice();
+    replacement[0]! ^= 0xff;
+    db.run(
+      "UPDATE git_pack_data SET data = ? WHERE repo_id = ? AND pack_id = 1 AND seq = 0",
+      blob(replacement),
+      first.repoId,
+    );
+    first.packs.clearCaches();
+
+    db.storage.resetCounters();
+    expect(second.packs.readRaw(1, 0, 1)[0]).toBe(0x20);
+    expect(db.storage.statementCount).toBe(0);
+    db.storage.resetCounters();
+    expect(first.packs.readRaw(1, 0, 1)[0]).toBe(0xef);
+    expect(db.storage.statementCount).toBe(1);
+  });
+
+  it("does not reuse a reclaimed pack row cache generation", async () => {
+    const store = open();
+    const bad = singleBlobPack(utf8.encode("pending stale row\n"));
+    bad[bad.length - 1]! ^= 0xff;
+    await expect(store.packs.ingest(slices(bad, 64))).rejects.toThrow(/checksum/);
+    expect(store.packs.readRaw(1, 0, bad.length)).toEqual(bad);
+    expect(store.packs.reclaimPending()).toBe(1);
+
+    const current = utf8.encode("replacement pack row\n");
+    const oid = hashObject("blob", current);
+    const result = await store.packs.ingest(slices(singleBlobPack(current), 64));
+    expect(result.packId).toBe(1);
+    expect(store.read(oid)?.data).toEqual(current);
+  });
+
   it("bulk-reads 1,000 shuffled packed and delta blobs without scalar fallback", async () => {
     const store = open();
     const objects = Array.from({ length: 1_000 }, (_, index) => {
