@@ -6,7 +6,7 @@ import { CorruptError } from "../src/core/errors.js";
 import { checkoutSparseChanges, type SparseCheckoutChange } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import { checkout } from "../src/core/ops/refs.js";
-import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
+import { hashWorktreePath } from "../src/core/ops/worktree-io.js";
 import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type {
@@ -17,9 +17,15 @@ import type {
   WriteOptions,
 } from "../src/fs/types.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
-import { resealIndexTracker } from "../src/sqlite/index-tracker.js";
 import { createSqliteSparseWorkspaceSource } from "../src/sqlite/sparse-workspace.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
+import {
+  configureFixtureIdentity,
+  requireSparseWorkspace,
+  sealIndexTracker,
+  sparseTrackerContext,
+  stageWorktreePaths,
+} from "./helpers/sparse.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 
@@ -138,54 +144,11 @@ class WorktreePayloadProbe implements SqlDatabase {
   }
 }
 
-function configure(workspace: TestRepository): void {
-  workspace.repo.store.configSet("user.name", "Fixture");
-  workspace.repo.store.configSet("user.email", "fixture@example.com");
-}
-
-function stagePaths(workspace: TestRepository, paths: readonly string[]): void {
-  for (const path of paths) {
-    const hashed = hashWorktreePath(workspace.repo, workspace.worktree, path);
-    if (hashed === null) throw new Error(`missing fixture path: ${path}`);
-    workspace.repo.store.indexPut(indexEntryFor(path, hashed));
-  }
-}
-
-function trackerContext(
-  workspace: TestRepository,
-  source: SparseWorkspaceSource | undefined = workspace.context.sparseWorkspace,
-): GitContext {
-  return {
-    ...workspace.context,
-    sparseWorkspace: source,
-    indexTracker: {
-      reseal(
-        repoId: number,
-        baselineTreeOid: string | null,
-        entries: Iterable<IndexTrackerSeedEntry>,
-      ) {
-        return resealIndexTracker(workspace.database.db, repoId, baselineTreeOid, entries);
-      },
-    },
-  };
-}
-
 function withoutSparseCheckout(context: GitContext): GitContext {
   const result = { ...context };
   delete result.sparseWorkspace;
   delete result.indexTracker;
   return result;
-}
-
-function seal(workspace: TestRepository): void {
-  expect(
-    resealIndexTracker(
-      workspace.database.db,
-      workspace.repo.store.repoId,
-      workspace.repo.headTree(),
-      [],
-    ),
-  ).toBe(true);
 }
 
 function expectFile(workspace: TestRepository, path: string, content: string): void {
@@ -197,7 +160,7 @@ function makeChangedFiles(
   changedFiles: number,
 ): { workspace: TestRepository; base: string; target: string; paths: string[] } {
   const workspace = makeRepo("/");
-  configure(workspace);
+  configureFixtureIdentity(workspace);
   const before = utf8.encode("before\n");
   const after = utf8.encode("after\n");
   const beforeOid = workspace.repo.store.write("blob", before);
@@ -251,7 +214,7 @@ function makeChangedFiles(
   );
   workspace.repo.store.indexReplace(original);
   workspace.repo.store.setHead(base);
-  seal(workspace);
+  sealIndexTracker(workspace);
   return { workspace, base, target, paths };
 }
 
@@ -259,7 +222,7 @@ describe("sparse checkout", () => {
   it("rejects one byte below the exact plan budget before mutation", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a", "a\n");
-    stagePaths(workspace, ["a"]);
+    stageWorktreePaths(workspace, ["a"]);
     const entry = workspace.repo.store.indexGet("a");
     if (entry === null) throw new Error("missing plan boundary index entry");
     const change: SparseCheckoutChange = {
@@ -287,24 +250,24 @@ describe("sparse checkout", () => {
 
   it("charges a large symlink target before raw egress and checkout mutation", () => {
     const workspace = makeRepo("/");
-    configure(workspace);
+    configureFixtureIdentity(workspace);
     const largeTarget = "t".repeat(512 * 1024);
     workspace.worktree.symlink(largeTarget, "/link");
-    stagePaths(workspace, ["link"]);
+    stageWorktreePaths(workspace, ["link"]);
     const baseEntry = workspace.repo.store.indexGet("link");
     if (baseEntry === null) throw new Error("missing large symlink index entry");
     const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
 
     workspace.worktree.unlink("/link");
     workspace.worktree.symlink("after", "/link");
-    stagePaths(workspace, ["link"]);
+    stageWorktreePaths(workspace, ["link"]);
     const target = commit(workspace.context, workspace.repo, { message: "target" }).oid;
     workspace.worktree.writeFiles([
       { path: "/link", target: largeTarget, contentId: fromHex(baseEntry.oid) },
     ]);
     workspace.repo.store.indexReplace([baseEntry]);
     workspace.repo.store.setHead(base);
-    seal(workspace);
+    sealIndexTracker(workspace);
 
     const probe = new WorktreePayloadProbe(workspace.database.db);
     const source = createSqliteSparseWorkspaceSource(probe);
@@ -333,7 +296,7 @@ describe("sparse checkout", () => {
     };
     const worktree = new NoScanWorktree(workspace.worktree);
     expect(() =>
-      checkout(trackerContext(workspace, constrainedSource), workspace.repo, worktree, {
+      checkout(sparseTrackerContext(workspace, constrainedSource), workspace.repo, worktree, {
         ref: target,
       }),
     ).toThrow(/must not scan/);
@@ -353,7 +316,7 @@ describe("sparse checkout", () => {
     const legacy = makeChangedFiles(3, 2);
     const worktree = new NoScanWorktree(sparse.workspace.worktree);
 
-    checkout(trackerContext(sparse.workspace), sparse.workspace.repo, worktree, {
+    checkout(sparseTrackerContext(sparse.workspace), sparse.workspace.repo, worktree, {
       ref: sparse.target,
       force: true,
     });
@@ -395,7 +358,10 @@ describe("sparse checkout", () => {
     workspace.storage.histogram = new Map();
 
     workspace.storage.resetCounters();
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: base, force: true });
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+      ref: base,
+      force: true,
+    });
 
     expect(worktree.writes).toEqual([]);
     expect(worktree.removals).toEqual([]);
@@ -419,7 +385,10 @@ describe("sparse checkout", () => {
     writeWorkFile(workspace, `/${unchanged}`, "local\n");
     const worktree = new LegacyScanWorktree(workspace.worktree);
 
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target, force: true });
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+      ref: target,
+      force: true,
+    });
 
     expect(worktree.scans.some((scan) => scan.limit > 1)).toBe(true);
     expectFile(workspace, `/${paths[0]}`, "after\n");
@@ -437,7 +406,7 @@ describe("sparse checkout", () => {
     const worktree = new NoScanWorktree(workspace.worktree);
 
     workspace.storage.resetCounters();
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target });
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, { ref: target });
 
     expect(worktree.writes).toEqual(paths.slice(0, 100).map((path) => `/${path}`));
     expect(worktree.removals).toEqual([]);
@@ -458,12 +427,12 @@ describe("sparse checkout", () => {
 
   it("matches structural checkout semantics for clean force", () => {
     const workspace = makeRepo("/");
-    configure(workspace);
+    configureFixtureIdentity(workspace);
     writeWorkFile(workspace, "/node", "flat\n");
     writeWorkFile(workspace, "/deleted/old.txt", "old\n");
     writeWorkFile(workspace, "/mode.txt", "mode\n");
     workspace.worktree.symlink("before", "/link");
-    stagePaths(workspace, ["deleted/old.txt", "link", "mode.txt", "node"]);
+    stageWorktreePaths(workspace, ["deleted/old.txt", "link", "mode.txt", "node"]);
     const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
     workspace.repo.store.setRef("refs/heads/base", base);
 
@@ -477,13 +446,16 @@ describe("sparse checkout", () => {
     workspace.worktree.chmod("/mode.txt", 0o755);
     workspace.worktree.unlink("/link");
     workspace.worktree.symlink("after", "/link");
-    stagePaths(workspace, ["added/new.txt", "link", "mode.txt", "node/child.txt"]);
+    stageWorktreePaths(workspace, ["added/new.txt", "link", "mode.txt", "node/child.txt"]);
     const target = commit(workspace.context, workspace.repo, { message: "target" }).oid;
 
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
-    seal(workspace);
+    sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree);
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target, force: true });
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+      ref: target,
+      force: true,
+    });
 
     expect(workspace.worktree.stat("/node")?.type).toBe("dir");
     expectFile(workspace, "/node/child.txt", "nested\n");
@@ -494,7 +466,10 @@ describe("sparse checkout", () => {
 
     worktree.writes.length = 0;
     worktree.removals.length = 0;
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: base, force: true });
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+      ref: base,
+      force: true,
+    });
     expect(workspace.worktree.stat("/node")?.type).toBe("file");
     expectFile(workspace, "/node", "flat\n");
     expectFile(workspace, "/deleted/old.txt", "old\n");
@@ -508,7 +483,7 @@ describe("sparse checkout", () => {
     writeWorkFile(dirty.workspace, `/${dirty.paths[0]}`, "local\n");
     const dirtyWorktree = new NoScanWorktree(dirty.workspace.worktree);
     expect(() =>
-      checkout(trackerContext(dirty.workspace), dirty.workspace.repo, dirtyWorktree, {
+      checkout(sparseTrackerContext(dirty.workspace), dirty.workspace.repo, dirtyWorktree, {
         ref: dirty.target,
       }),
     ).toThrow(/must not scan/);
@@ -517,8 +492,7 @@ describe("sparse checkout", () => {
     expect(dirty.workspace.repo.head().oid).toBe(dirty.base);
 
     const unavailable = makeChangedFiles(2, 1);
-    const source = unavailable.workspace.context.sparseWorkspace;
-    if (source === undefined) throw new Error("missing sparse workspace source");
+    const source = requireSparseWorkspace(unavailable.workspace);
     const unavailableSource: SparseWorkspaceSource = {
       readState: (repoId) => source.readState(repoId),
       dirtyPaths: (repoId) => source.dirtyPaths(repoId),
@@ -527,7 +501,7 @@ describe("sparse checkout", () => {
     const unavailableWorktree = new NoScanWorktree(unavailable.workspace.worktree);
     expect(() =>
       checkout(
-        trackerContext(unavailable.workspace, unavailableSource),
+        sparseTrackerContext(unavailable.workspace, unavailableSource),
         unavailable.workspace.repo,
         unavailableWorktree,
         { ref: unavailable.target },
@@ -538,9 +512,12 @@ describe("sparse checkout", () => {
     const oversized = makeChangedFiles(1_001, 1_001);
     const oversizedWorktree = new NoScanWorktree(oversized.workspace.worktree);
     expect(() =>
-      checkout(trackerContext(oversized.workspace), oversized.workspace.repo, oversizedWorktree, {
-        ref: oversized.target,
-      }),
+      checkout(
+        sparseTrackerContext(oversized.workspace),
+        oversized.workspace.repo,
+        oversizedWorktree,
+        { ref: oversized.target },
+      ),
     ).toThrow(/must not scan/);
     expect(oversizedWorktree.writes).toEqual([]);
 
@@ -555,12 +532,15 @@ describe("sparse checkout", () => {
       mtime: null,
       ino: null,
     });
-    seal(conflicted.workspace);
+    sealIndexTracker(conflicted.workspace);
     const conflictWorktree = new NoScanWorktree(conflicted.workspace.worktree);
     expect(() =>
-      checkout(trackerContext(conflicted.workspace), conflicted.workspace.repo, conflictWorktree, {
-        ref: conflicted.target,
-      }),
+      checkout(
+        sparseTrackerContext(conflicted.workspace),
+        conflicted.workspace.repo,
+        conflictWorktree,
+        { ref: conflicted.target },
+      ),
     ).toThrow(/must not scan/);
     expect(conflictWorktree.writes).toEqual([]);
 
@@ -574,20 +554,22 @@ describe("sparse checkout", () => {
       mtime: null,
       ino: null,
     });
-    seal(gitlinked.workspace);
+    sealIndexTracker(gitlinked.workspace);
     const gitlinkWorktree = new NoScanWorktree(gitlinked.workspace.worktree);
     expect(() =>
-      checkout(trackerContext(gitlinked.workspace), gitlinked.workspace.repo, gitlinkWorktree, {
-        ref: gitlinked.target,
-      }),
+      checkout(
+        sparseTrackerContext(gitlinked.workspace),
+        gitlinked.workspace.repo,
+        gitlinkWorktree,
+        { ref: gitlinked.target },
+      ),
     ).toThrow(/must not scan/);
     expect(gitlinkWorktree.writes).toEqual([]);
   });
 
   it("propagates corrupt hydration and hash failures before mutation", () => {
     const corrupt = makeChangedFiles(2, 1);
-    const source = corrupt.workspace.context.sparseWorkspace;
-    if (source === undefined) throw new Error("missing sparse workspace source");
+    const source = requireSparseWorkspace(corrupt.workspace);
     const corruptSource: SparseWorkspaceSource = {
       readState: (repoId) => source.readState(repoId),
       dirtyPaths: (repoId) => source.dirtyPaths(repoId),
@@ -606,7 +588,7 @@ describe("sparse checkout", () => {
     const corruptWorktree = new NoScanWorktree(corrupt.workspace.worktree);
     expect(() =>
       checkout(
-        trackerContext(corrupt.workspace, corruptSource),
+        sparseTrackerContext(corrupt.workspace, corruptSource),
         corrupt.workspace.repo,
         corruptWorktree,
         { ref: corrupt.target },
@@ -617,10 +599,10 @@ describe("sparse checkout", () => {
 
     const hashing = makeChangedFiles(2, 1);
     writeWorkFile(hashing.workspace, `/${hashing.paths[0]}`, "before\n");
-    seal(hashing.workspace);
+    sealIndexTracker(hashing.workspace);
     const hashingWorktree = new FailingHashWorktree(hashing.workspace.worktree);
     expect(() =>
-      checkout(trackerContext(hashing.workspace), hashing.workspace.repo, hashingWorktree, {
+      checkout(sparseTrackerContext(hashing.workspace), hashing.workspace.repo, hashingWorktree, {
         ref: hashing.target,
       }),
     ).toThrow(/hash failure/);
@@ -630,7 +612,7 @@ describe("sparse checkout", () => {
 
   it("bounds an emptiness probe in a wide directory and preserves its siblings", () => {
     const workspace = makeRepo("/");
-    configure(workspace);
+    configureFixtureIdentity(workspace);
     const bytes = utf8.encode("tracked\n");
     const oid = workspace.repo.store.write("blob", bytes);
     const siblingPaths = Array.from(
@@ -667,11 +649,11 @@ describe("sparse checkout", () => {
     const target = commit(workspace.context, workspace.repo, { message: "delete one" }).oid;
     workspace.repo.store.indexReplace(original);
     workspace.repo.store.setHead(base);
-    seal(workspace);
+    sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree, () => workspace.storage.statementCount);
 
     workspace.storage.resetCounters();
-    checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target });
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, { ref: target });
 
     expect(worktree.scanProbes).toEqual([{ root: "/wide", limit: 1, rows: 1, statements: 2 }]);
     expect(worktree.statProbes).toEqual([{ path: "/wide", statements: 2 }]);
@@ -687,25 +669,25 @@ describe("sparse checkout", () => {
 
   it("falls back before mutating 296 distinct directories that exceed the prune SQL budget", () => {
     const workspace = makeRepo("/");
-    configure(workspace);
+    configureFixtureIdentity(workspace);
     // The old two-SQL charge admitted this 1,531-statement prune.
     const paths = Array.from(
       { length: 296 },
       (_, index) => `d${index.toString().padStart(3, "0")}/file.txt`,
     );
     for (const path of paths) writeWorkFile(workspace, `/${path}`, "tracked\n");
-    stagePaths(workspace, paths);
+    stageWorktreePaths(workspace, paths);
     const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
     workspace.repo.store.setRef("refs/heads/base", base);
     workspace.worktree.removeFiles(paths.map((path) => `/${path}`));
     workspace.repo.store.indexClear();
     const target = commit(workspace.context, workspace.repo, { message: "delete" }).oid;
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
-    seal(workspace);
+    sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree);
 
     expect(() =>
-      checkout(trackerContext(workspace), workspace.repo, worktree, { ref: target }),
+      checkout(sparseTrackerContext(workspace), workspace.repo, worktree, { ref: target }),
     ).toThrow(/must not scan/);
     expect(worktree.writes).toEqual([]);
     expect(worktree.removals).toEqual([]);
@@ -714,8 +696,7 @@ describe("sparse checkout", () => {
 
   it("does not fall back or reseal when sparse apply fails", () => {
     const { workspace, target } = makeChangedFiles(2, 1);
-    const source = workspace.context.sparseWorkspace;
-    if (source === undefined) throw new Error("missing sparse workspace source");
+    const source = requireSparseWorkspace(workspace);
     const reseals: Array<{ baseline: string | null; entries: IndexTrackerSeedEntry[] }> = [];
     const context: GitContext = {
       ...workspace.context,

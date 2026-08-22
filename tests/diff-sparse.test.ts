@@ -5,10 +5,14 @@ import { CorruptError } from "../src/core/errors.js";
 import { MODE_COMMIT, serializeTree } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import { diff, diffSummary } from "../src/core/ops/diff.js";
-import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
-import { resealIndexTracker } from "../src/sqlite/index-tracker.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
+import {
+  configureFixtureIdentity,
+  requireSparseWorkspace,
+  sealIndexTracker,
+  stageWorktreePaths,
+} from "./helpers/sparse.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 
@@ -18,31 +22,10 @@ class NoScanWorktree extends CountingWorktree {
   }
 }
 
-function stagePaths(workspace: TestRepository, paths: readonly string[]): void {
-  for (const path of paths) {
-    const hashed = hashWorktreePath(workspace.repo, workspace.worktree, path);
-    if (hashed === null) throw new Error(`missing fixture path: ${path}`);
-    workspace.repo.store.indexPut(indexEntryFor(path, hashed));
-  }
-}
-
 function commitPaths(workspace: TestRepository, paths: readonly string[], message: string): string {
-  workspace.repo.store.configSet("user.name", "Fixture");
-  workspace.repo.store.configSet("user.email", "fixture@example.com");
-  stagePaths(workspace, paths);
+  configureFixtureIdentity(workspace);
+  stageWorktreePaths(workspace, paths);
   return commit(workspace.context, workspace.repo, { message }).oid;
-}
-
-function seal(workspace: TestRepository, baselineTreeOid = workspace.repo.headTree()): void {
-  expect(
-    resealIndexTracker(workspace.database.db, workspace.repo.store.repoId, baselineTreeOid, []),
-  ).toBe(true);
-}
-
-function source(workspace: TestRepository): SparseWorkspaceSource {
-  const value = workspace.context.sparseWorkspace;
-  if (value === undefined) throw new Error("missing sparse workspace source");
-  return value;
 }
 
 describe("sparse diff", () => {
@@ -50,11 +33,13 @@ describe("sparse diff", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "a\n");
     commitPaths(workspace, ["a.txt"], "initial");
-    seal(workspace);
+    sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree);
 
     workspace.storage.resetCounters();
-    expect(diffSummary(workspace.repo, worktree, {}, source(workspace))).toEqual([]);
+    expect(diffSummary(workspace.repo, worktree, {}, requireSparseWorkspace(workspace))).toEqual(
+      [],
+    );
     expect(workspace.storage.statementCount).toBeLessThan(10);
     expect(workspace.storage.rowCount).toBeLessThan(10);
   });
@@ -67,13 +52,13 @@ describe("sparse diff", () => {
     );
     for (const path of paths) writeWorkFile(workspace, `/${path}`, "before\n");
     commitPaths(workspace, paths, "initial");
-    seal(workspace);
+    sealIndexTracker(workspace);
     workspace.tick(60_000);
     for (const path of paths) writeWorkFile(workspace, `/${path}`, "after\n");
     const worktree = new NoScanWorktree(workspace.worktree);
 
     workspace.storage.resetCounters();
-    const summary = diffSummary(workspace.repo, worktree, {}, source(workspace));
+    const summary = diffSummary(workspace.repo, worktree, {}, requireSparseWorkspace(workspace));
 
     expect(summary.map((entry) => entry.path)).toEqual(paths);
     expect(summary.every((entry) => entry.status === "M")).toBe(true);
@@ -91,7 +76,7 @@ describe("sparse diff", () => {
     writeWorkFile(workspace, "/mode.txt", "mode\n");
     writeWorkFile(workspace, "/staged.txt", "before\n");
     commitPaths(workspace, paths, "initial");
-    seal(workspace);
+    sealIndexTracker(workspace);
     workspace.tick(60_000);
 
     workspace.worktree.unlink("/deleted.txt");
@@ -99,7 +84,7 @@ describe("sparse diff", () => {
     workspace.worktree.unlink("/link");
     workspace.worktree.symlink("after", "/link");
     writeWorkFile(workspace, "/staged.txt", "after\n");
-    stagePaths(workspace, ["staged.txt"]);
+    stageWorktreePaths(workspace, ["staged.txt"]);
     workspace.repo.store.indexRemove("conflict.txt");
     const conflictOid = workspace.repo.store.write("blob", utf8.encode("conflict\n"));
     for (const stage of [1, 2, 3]) {
@@ -118,8 +103,12 @@ describe("sparse diff", () => {
     const expectedPatch = diff(workspace.repo, workspace.worktree);
     const expectedSummary = diffSummary(workspace.repo, workspace.worktree);
     const worktree = new NoScanWorktree(workspace.worktree);
-    expect(diff(workspace.repo, worktree, {}, source(workspace))).toBe(expectedPatch);
-    expect(diffSummary(workspace.repo, worktree, {}, source(workspace))).toEqual(expectedSummary);
+    expect(diff(workspace.repo, worktree, {}, requireSparseWorkspace(workspace))).toBe(
+      expectedPatch,
+    );
+    expect(diffSummary(workspace.repo, worktree, {}, requireSparseWorkspace(workspace))).toEqual(
+      expectedSummary,
+    );
   });
 
   it("uses the tracker baseline for a custom ref and respects pathspecs", () => {
@@ -130,12 +119,17 @@ describe("sparse diff", () => {
     writeWorkFile(workspace, "/a.txt", "two\n");
     writeWorkFile(workspace, "/nested/b.txt", "two\n");
     commitPaths(workspace, ["a.txt", "nested/b.txt"], "second");
-    seal(workspace);
+    sealIndexTracker(workspace);
     const options = { ref: first, paths: ["nested"] };
 
     const expected = diff(workspace.repo, workspace.worktree, options);
     expect(
-      diff(workspace.repo, new NoScanWorktree(workspace.worktree), options, source(workspace)),
+      diff(
+        workspace.repo,
+        new NoScanWorktree(workspace.worktree),
+        options,
+        requireSparseWorkspace(workspace),
+      ),
     ).toBe(expected);
     expect(expected).toContain("nested/b.txt");
     expect(expected).not.toContain("a.txt");
@@ -145,10 +139,10 @@ describe("sparse diff", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "before\n");
     commitPaths(workspace, ["a.txt"], "initial");
-    seal(workspace);
+    sealIndexTracker(workspace);
     workspace.tick(60_000);
     writeWorkFile(workspace, "/a.txt", "after\n");
-    const available = source(workspace);
+    const available = requireSparseWorkspace(workspace);
     const unavailableState: SparseWorkspaceSource = {
       readState: () => ({ available: false }),
       dirtyPaths: (repoId) => available.dirtyPaths(repoId),
@@ -192,9 +186,9 @@ describe("sparse diff", () => {
 
   it("propagates sparse hydration corruption", () => {
     const workspace = makeRepo("/");
-    seal(workspace);
+    sealIndexTracker(workspace);
     writeWorkFile(workspace, "/broken.txt", "broken\n");
-    const available = source(workspace);
+    const available = requireSparseWorkspace(workspace);
     const broken: SparseWorkspaceSource = {
       readState: (repoId) => available.readState(repoId),
       dirtyPaths: (repoId) => available.dirtyPaths(repoId),
@@ -210,13 +204,18 @@ describe("sparse diff", () => {
 
   it("handles an unborn tree with a staged addition", () => {
     const workspace = makeRepo("/");
-    seal(workspace, null);
+    sealIndexTracker(workspace, { baselineTreeOid: null });
     writeWorkFile(workspace, "/added.txt", "added\n");
-    stagePaths(workspace, ["added.txt"]);
+    stageWorktreePaths(workspace, ["added.txt"]);
 
     const expected = diff(workspace.repo, workspace.worktree);
     expect(
-      diff(workspace.repo, new NoScanWorktree(workspace.worktree), {}, source(workspace)),
+      diff(
+        workspace.repo,
+        new NoScanWorktree(workspace.worktree),
+        {},
+        requireSparseWorkspace(workspace),
+      ),
     ).toBe(expected);
     expect(expected).toContain("new file mode 100644");
   });
@@ -230,7 +229,7 @@ describe("sparse diff", () => {
     for (const path of paths) writeWorkFile(workspace, `/${path}`, "before\n");
     commitPaths(workspace, paths, "first");
     writeWorkFile(workspace, `/${paths[137]}`, "after\n");
-    stagePaths(workspace, [paths[137]!]);
+    stageWorktreePaths(workspace, [paths[137]!]);
     commit(workspace.context, workspace.repo, { message: "second" });
 
     workspace.storage.histogram = new Map();
@@ -255,7 +254,7 @@ describe("sparse diff", () => {
     commitPaths(workspace, paths, "first");
     workspace.tick(60_000);
     for (const path of paths) writeWorkFile(workspace, `/${path}`, "after\n");
-    stagePaths(workspace, paths);
+    stageWorktreePaths(workspace, paths);
     commit(workspace.context, workspace.repo, { message: "second" });
     workspace.storage.histogram = new Map();
     workspace.storage.resetCounters();
