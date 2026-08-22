@@ -10,7 +10,7 @@ import { CorruptError } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -226,6 +226,10 @@ const STATEMENTS = [
        ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
    ) WITHOUT ROWID`,
 
+  `CREATE INDEX IF NOT EXISTS git_tree_entries_by_name_bytes
+     ON git_tree_entries (repo_id, tree_oid, storage, source_id, name_bytes)
+     WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200`,
+
   // The source selected for traversal. A loose object always shadows its
   // packed copy, including while its parsed marker is missing or corrupt.
   `CREATE TABLE IF NOT EXISTS git_tree_effective (
@@ -299,6 +303,7 @@ const STATEMENTS = [
 // v3 added parsed tree tables. v4 replaces the incomplete, unused commit
 // projection. v5 records the monotonic filesystem revision in index stat data.
 // v6 adds inert index baseline and dirty-path state for sparse status queries.
+// v7 adds source-qualified tree entry lookup by raw name bytes.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");

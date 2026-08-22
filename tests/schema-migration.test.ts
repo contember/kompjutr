@@ -28,8 +28,34 @@ function columnsOf(db: TestDatabase, table: string): string[] {
   return db.all<{ name: string }>(`PRAGMA table_info(${table})`).map((row) => row.name);
 }
 
+interface IndexColumn {
+  name: string | null;
+  desc: number;
+  coll: string;
+  key: number;
+}
+
+interface IndexListEntry {
+  name: string;
+  unique: number;
+  partial: number;
+}
+
+function treeNameBytesIndexColumns(db: TestDatabase): IndexColumn[] {
+  return db.all<IndexColumn>("PRAGMA index_xinfo(git_tree_entries_by_name_bytes)");
+}
+
+function treeNameBytesIndex(db: TestDatabase): IndexListEntry | undefined {
+  const index = db
+    .all<IndexListEntry>("PRAGMA index_list(git_tree_entries)")
+    .find((index) => index.name === "git_tree_entries_by_name_bytes");
+  return index === undefined
+    ? undefined
+    : { name: index.name, unique: index.unique, partial: index.partial };
+}
+
 describe("git schema", () => {
-  it("creates v6 on a fresh database", () => {
+  it("creates v7 on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -128,6 +154,29 @@ describe("git schema", () => {
       "storage",
       "source_id",
     ]);
+    expect(
+      treeNameBytesIndexColumns(db)
+        .filter((column) => column.key === 1)
+        .map((column) => ({ name: column.name, coll: column.coll, desc: column.desc })),
+    ).toEqual([
+      { name: "repo_id", coll: "BINARY", desc: 0 },
+      { name: "tree_oid", coll: "BINARY", desc: 0 },
+      { name: "storage", coll: "BINARY", desc: 0 },
+      { name: "source_id", coll: "BINARY", desc: 0 },
+      { name: "name_bytes", coll: "BINARY", desc: 0 },
+    ]);
+    expect(treeNameBytesIndex(db)).toEqual({
+      name: "git_tree_entries_by_name_bytes",
+      unique: 0,
+      partial: 1,
+    });
+    expect(
+      db
+        .scalar<string>(
+          "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'git_tree_entries_by_name_bytes'",
+        )
+        ?.replace(/\s+/g, " "),
+    ).toContain("WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200");
   });
 
   it("migrates a v1 database without touching its rows", () => {
@@ -145,7 +194,7 @@ describe("git schema", () => {
       // Existing rows inherit the default, which is what they were.
       stored: "zlib",
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
   });
 
   it("creates empty parsed-tree tables when migrating v2", () => {
@@ -160,7 +209,7 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
   });
 
   it("replaces the incomplete v3 commit cache without touching raw objects", () => {
@@ -187,7 +236,7 @@ describe("git schema", () => {
       stored: "raw",
     });
     expect(columnsOf(db, "git_commits")).toContain("committer_timezone");
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
   });
 
   it("adds the filesystem revision to a v4 index without changing rows", () => {
@@ -215,7 +264,7 @@ describe("git schema", () => {
       ino: 3,
       rev: null,
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
   });
 
   it("adds empty sparse-index tables to v5 without changing rows", () => {
@@ -239,16 +288,99 @@ describe("git schema", () => {
     });
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_state")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_dirty")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("6");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+  });
+
+  it("adds the tree name-bytes index to v6 without changing rows", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("DROP INDEX git_tree_entries_by_name_bytes");
+    db.run("INSERT INTO git_tree_sources VALUES (1, 'tree', 'loose', 0, 3, 3, 3)");
+    db.run(
+      `INSERT INTO git_tree_entries VALUES
+         (1, 'tree', 'loose', 0, 0, '100644', 'file', X'66696C65', 'blob-0', X'00', 1),
+         (1, 'tree', 'loose', 0, 1, '100644', 'file', X'66696C65', 'blob-1', X'01', 2)`,
+    );
+    // Migration leaves corrupt v6 rows for read-time source validation.
+    db.run(
+      `INSERT INTO git_tree_entries VALUES
+         (1, 'tree', 'loose', 0, 2, '100644', 'oversized', ?, 'blob-2', X'02', 3)`,
+      new Uint8Array(2201),
+    );
+    db.run("UPDATE git_meta SET value = '6' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(
+      db.one(`SELECT repo_id, tree_oid, storage, source_id, ordinal, mode, name,
+                     hex(name_bytes) AS name_bytes, oid, hex(raw_entry) AS raw_entry,
+                     cumulative_base
+                FROM git_tree_entries
+               WHERE ordinal = 0`),
+    ).toEqual({
+      repo_id: 1,
+      tree_oid: "tree",
+      storage: "loose",
+      source_id: 0,
+      ordinal: 0,
+      mode: "100644",
+      name: "file",
+      name_bytes: "66696C65",
+      oid: "blob-0",
+      raw_entry: "00",
+      cumulative_base: 1,
+    });
+    expect(
+      db.all<{ ordinal: number; nameBytes: number }>(
+        `SELECT ordinal, length(name_bytes) AS nameBytes
+           FROM git_tree_entries
+          ORDER BY ordinal`,
+      ),
+    ).toEqual([
+      { ordinal: 0, nameBytes: 4 },
+      { ordinal: 1, nameBytes: 4 },
+      { ordinal: 2, nameBytes: 2201 },
+    ]);
+    expect(
+      db.scalar<number>(`SELECT COUNT(*)
+          FROM git_tree_entries INDEXED BY git_tree_entries_by_name_bytes
+         WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200`),
+    ).toBe(2);
+    expect(treeNameBytesIndex(db)).toEqual({
+      name: "git_tree_entries_by_name_bytes",
+      unique: 0,
+      partial: 1,
+    });
+    expect(
+      treeNameBytesIndexColumns(db)
+        .filter((column) => column.key === 1)
+        .map((column) => column.name),
+    ).toEqual(["repo_id", "tree_oid", "storage", "source_id", "name_bytes"]);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+  });
+
+  it("uses the tree name-bytes index for source-qualified point lookups", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+
+    const plan = db.all<{ detail: string }>(`EXPLAIN QUERY PLAN
+      SELECT ordinal
+        FROM git_tree_entries
+       WHERE repo_id = 1 AND tree_oid = 'tree' AND storage = 'loose'
+         AND source_id = 0 AND typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200
+         AND name_bytes = X'66696C65'
+       ORDER BY name_bytes`);
+
+    expect(plan.some((row) => row.detail.includes("git_tree_entries_by_name_bytes"))).toBe(true);
   });
 
   it("fails closed on a schema newer than this runtime", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("UPDATE git_meta SET value = '7' WHERE key = 'schema_version'");
+    db.run("UPDATE git_meta SET value = '8' WHERE key = 'schema_version'");
 
     expect(() => initializeGitSchema(db)).toThrow(/newer than supported/);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("8");
   });
 
   it("accepts only canonical positive decimal schema versions", () => {
@@ -293,6 +425,7 @@ describe("git schema", () => {
       "complete",
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
+    expect(treeNameBytesIndexColumns(db)).not.toHaveLength(0);
   });
 });
 
