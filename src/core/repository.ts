@@ -8,7 +8,7 @@ import {
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
 } from "../sqlite/commits.js";
-import type { BlobReadBatch, RepoStore } from "../sqlite/store.js";
+import type { BlobReadBatch, RepoStore, WalkTreeDiffEntry } from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
@@ -491,6 +491,14 @@ export class Repository {
         },
       };
     }
+  }
+
+  /** Changed leaves between two tree objects, ordered by repo-relative path. */
+  walkTreeDiff(
+    beforeTreeOid: string | null,
+    afterTreeOid: string | null,
+  ): Generator<WalkTreeDiffEntry> {
+    return this.store.walkTreeDiff(beforeTreeOid, afterTreeOid);
   }
 
   /** The tree of the commit HEAD points at, or null on an unborn branch. */
