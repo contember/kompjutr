@@ -8,6 +8,7 @@ import { CorruptError, GitError, ObjectNotFoundError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
 import { Sha1 } from "../core/sha1.js";
+import { comparePaths } from "../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
 import {
   type CommitCacheEntry,
@@ -74,6 +75,10 @@ const DEFAULT_INDEX_FLUSH = 512;
 
 /** Bound JSON stays below the Durable Object SQLite 2 MiB value ceiling. */
 const INDEX_MUTATION_PAYLOAD = 1024 * 1024;
+const INDEX_MUTATION_ROW_BYTES = 192;
+const INITIAL_STATE_MEMORY_BYTES = 4 * 1024 * 1024;
+const INITIAL_STATE_FIXED_BYTES = 64 * 1024;
+const INITIAL_BLOB_ROW_JSON_BYTES = 96;
 
 /** Parsed commits staged beside encoded object bytes before a batch flush. */
 const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
@@ -139,6 +144,14 @@ export interface BlobIdMapping {
   contentId: Uint8Array;
   oid: string;
 }
+
+export interface InitialStateSession {
+  readonly retainedBytes: number;
+  put(entry: IndexEntry): void;
+  addBlobId(mapping: BlobIdMapping): void;
+}
+
+export type InitialStateResult<T> = { available: false } | { available: true; value: T };
 
 export interface BlobReadBatch {
   /** Complete blob contents, keyed by oid in first-occurrence input order. */
@@ -633,6 +646,14 @@ class IndexMutationBuffer {
     private readonly apply: (pending: readonly BufferedIndexMutation[]) => void,
   ) {}
 
+  get retainedBytes(): number {
+    return this.#bytes * 2 + this.#pending.length * INDEX_MUTATION_ROW_BYTES;
+  }
+
+  get reservedBytes(): number {
+    return this.retainedBytes + this.#bytes * 2 + this.#pending.length * 8;
+  }
+
   add(item: IndexEntry | string): void {
     let mutation = serializeIndexMutation(item, this.#pending.length);
     const separator = this.#pending.length === 0 ? 0 : 1;
@@ -657,6 +678,193 @@ class IndexMutationBuffer {
     this.#pending = [];
     this.#bytes = 2;
   }
+
+  dispose(): void {
+    this.#pending = [];
+    this.#bytes = 2;
+  }
+}
+
+function validNullableIndexInteger(value: number | null | undefined): boolean {
+  return value === null || value === undefined || (Number.isSafeInteger(value) && value >= 0);
+}
+
+function initialPathJsonBytes(path: string): number {
+  if (path.length === 0 || path.charCodeAt(0) === 0x2f) {
+    throw new CorruptError("initial index entry has an invalid path");
+  }
+  let utf8Bytes = 0;
+  let jsonBytes = 0;
+  let segmentStart = 0;
+  for (let at = 0; at < path.length; at++) {
+    const unit = path.charCodeAt(at);
+    if (unit === 0) throw new CorruptError("initial index entry has an invalid path");
+    if (unit === 0x2f) {
+      const segmentLength = at - segmentStart;
+      if (
+        segmentLength === 0 ||
+        (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
+        (segmentLength === 2 &&
+          path.charCodeAt(segmentStart) === 0x2e &&
+          path.charCodeAt(segmentStart + 1) === 0x2e)
+      ) {
+        throw new CorruptError("initial index entry has an invalid path");
+      }
+      segmentStart = at + 1;
+      utf8Bytes++;
+      jsonBytes++;
+    } else if ((unit & 0xfc00) === 0xd800) {
+      const low = path.charCodeAt(at + 1);
+      if ((low & 0xfc00) !== 0xdc00) {
+        throw new CorruptError("initial index entry path is not canonical UTF-16");
+      }
+      at++;
+      utf8Bytes += 4;
+      jsonBytes += 4;
+    } else if ((unit & 0xfc00) === 0xdc00) {
+      throw new CorruptError("initial index entry path is not canonical UTF-16");
+    } else {
+      utf8Bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+      if (
+        unit === 0x22 ||
+        unit === 0x5c ||
+        unit === 0x08 ||
+        unit === 0x09 ||
+        unit === 0x0a ||
+        unit === 0x0c ||
+        unit === 0x0d
+      ) {
+        jsonBytes += 2;
+      } else if (unit < 0x20) {
+        jsonBytes += 6;
+      } else {
+        jsonBytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+      }
+    }
+    if (utf8Bytes > TREE_WALK_PATH_BYTES) {
+      throw new GitError("E2BIG", `initial index path exceeds ${TREE_WALK_PATH_BYTES} UTF-8 bytes`);
+    }
+  }
+  const segmentLength = path.length - segmentStart;
+  if (
+    segmentLength === 0 ||
+    (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
+    (segmentLength === 2 &&
+      path.charCodeAt(segmentStart) === 0x2e &&
+      path.charCodeAt(segmentStart + 1) === 0x2e)
+  ) {
+    throw new CorruptError("initial index entry has an invalid path");
+  }
+  return jsonBytes;
+}
+
+function validateInitialIndexEntry(entry: IndexEntry): number {
+  const pathJsonBytes = initialPathJsonBytes(entry.path);
+  if (entry.stage !== 0) throw new CorruptError("initial index entry must be stage 0");
+  if (
+    entry.mode !== 0o100644 &&
+    entry.mode !== 0o100755 &&
+    entry.mode !== 0o120000 &&
+    entry.mode !== 0o160000
+  ) {
+    throw new CorruptError("initial index entry has an invalid mode");
+  }
+  if (!isOid(entry.oid)) throw new CorruptError("initial index entry has an invalid oid");
+  if (
+    !validNullableIndexInteger(entry.size) ||
+    !validNullableIndexInteger(entry.mtime) ||
+    !validNullableIndexInteger(entry.ino) ||
+    !validNullableIndexInteger(entry.rev)
+  ) {
+    throw new CorruptError("initial index entry has invalid filesystem metadata");
+  }
+  return pathJsonBytes;
+}
+
+class InitialBlobIdBuffer {
+  #payload: Uint8Array | null = new Uint8Array(CONTENT_ID_PAYLOAD);
+  #rows: { a: number; n: number; o: string }[] = [];
+  #length = 0;
+
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly repoId: number,
+  ) {}
+
+  get retainedBytes(): number {
+    return (this.#payload?.length ?? 0) + this.#rows.length * BLOB_ID_MISMATCH_ROW_BYTES;
+  }
+
+  get reservedBytes(): number {
+    return this.retainedBytes + this.#rows.length * INITIAL_BLOB_ROW_JSON_BYTES * 2 + 4;
+  }
+
+  additionalReservedBytes(): number {
+    return BLOB_ID_MISMATCH_ROW_BYTES + INITIAL_BLOB_ROW_JSON_BYTES * 2;
+  }
+
+  needsFlush(mapping: BlobIdMapping): boolean {
+    return (
+      this.#rows.length >= CONTENT_ID_PAGE ||
+      this.#length + mapping.contentId.length > CONTENT_ID_PAYLOAD
+    );
+  }
+
+  validate(mapping: BlobIdMapping): void {
+    if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+    if (mapping.contentId.length > CONTENT_ID_PAYLOAD) {
+      throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
+    }
+  }
+
+  add(mapping: BlobIdMapping): void {
+    this.validate(mapping);
+    if (
+      this.#rows.length > 0 &&
+      (this.#rows.length >= CONTENT_ID_PAGE ||
+        this.#length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+    ) {
+      this.flush();
+    }
+    const payload = this.#payload;
+    if (payload === null) throw new Error("initial blob id buffer is disposed");
+    payload.set(mapping.contentId, this.#length);
+    this.#rows.push({ a: this.#length + 1, n: mapping.contentId.length, o: mapping.oid });
+    this.#length += mapping.contentId.length;
+  }
+
+  flush(): void {
+    if (this.#rows.length === 0) return;
+    const payload = this.#payload;
+    if (payload === null) throw new Error("initial blob id buffer is disposed");
+    this.db.run(
+      `INSERT INTO git_blob_ids (repo_id, content_id, oid)
+       SELECT ?,
+              CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
+                   ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
+               END,
+              json_extract(value, '$.o')
+         FROM json_each(?)
+        WHERE true
+       ON CONFLICT(repo_id, content_id) DO UPDATE SET oid = excluded.oid`,
+      this.repoId,
+      blob(payload),
+      JSON.stringify(this.#rows),
+    );
+    this.#rows = [];
+    this.#length = 0;
+  }
+
+  dispose(): void {
+    this.#payload = null;
+    this.#rows = [];
+    this.#length = 0;
+  }
+}
+
+function isThenableResult(value: unknown): boolean {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") return false;
+  return typeof Reflect.get(value, "then") === "function";
 }
 
 /** A bounded, ordered mutation sink over the index. */
@@ -2038,6 +2246,114 @@ export class RepoStore {
   }
 
   // -- index ----------------------------------------------------------
+
+  /** Create clone state only while every index stage is still empty. */
+  tryCreateInitialState<T>(body: (session: InitialStateSession) => T): InitialStateResult<T> {
+    return this.#db.transactionSync(() => {
+      const exists = this.#db.scalar<number>(
+        "SELECT EXISTS(SELECT 1 FROM git_index WHERE repo_id = ? LIMIT 1)",
+        this.#repoId,
+      );
+      if (exists !== 0 && exists !== 1) {
+        throw new CorruptError("initial index availability probe returned an invalid value");
+      }
+      if (exists === 1) return { available: false };
+
+      let active = true;
+      let failed = false;
+      let failure: unknown;
+      let previousPath: string | null = null;
+      const pending = new IndexMutationBuffer(DEFAULT_INDEX_FLUSH, (mutations) => {
+        this.#applyIndexMutations(mutations);
+      });
+      const blobIds = new InitialBlobIdBuffer(this.#db, this.#repoId);
+      const requireActive = (): void => {
+        if (!active) throw new Error("initial state session is no longer active");
+        if (failed) throw failure;
+      };
+      const attempt = (operation: () => void): void => {
+        requireActive();
+        try {
+          operation();
+        } catch (error) {
+          failed = true;
+          failure = error;
+          throw error;
+        }
+      };
+      const reservedBytes = (): number =>
+        INITIAL_STATE_FIXED_BYTES +
+        pending.reservedBytes +
+        blobIds.reservedBytes +
+        (previousPath?.length ?? 0) * 2;
+      const requireRoom = (additional: number, first: "index" | "blob"): void => {
+        if (reservedBytes() + additional <= INITIAL_STATE_MEMORY_BYTES) return;
+        if (first === "index") pending.flush();
+        else blobIds.flush();
+        if (reservedBytes() + additional <= INITIAL_STATE_MEMORY_BYTES) return;
+        if (first === "index") blobIds.flush();
+        else pending.flush();
+        if (reservedBytes() + additional > INITIAL_STATE_MEMORY_BYTES) {
+          throw new GitError("E2BIG", "initial state session exceeds its 4 MiB memory limit");
+        }
+      };
+      const session: InitialStateSession = {
+        get retainedBytes() {
+          return active ? reservedBytes() : 0;
+        },
+        put: (entry) => {
+          attempt(() => {
+            const pathJsonBytes = validateInitialIndexEntry(entry);
+            if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+              throw new CorruptError("initial index entries are not in strict Git path order");
+            }
+            const mutationJsonBytes = pathJsonBytes + 512;
+            requireRoom(
+              mutationJsonBytes * 4 + INDEX_MUTATION_ROW_BYTES + entry.path.length * 2,
+              "index",
+            );
+            pending.add(entry);
+            previousPath = entry.path;
+            if (reservedBytes() > INITIAL_STATE_MEMORY_BYTES) {
+              throw new CorruptError("initial index reservation exceeded its preflight");
+            }
+          });
+        },
+        addBlobId: (mapping) => {
+          attempt(() => {
+            blobIds.validate(mapping);
+            if (blobIds.needsFlush(mapping)) blobIds.flush();
+            requireRoom(blobIds.additionalReservedBytes(), "blob");
+            blobIds.add(mapping);
+            if (reservedBytes() > INITIAL_STATE_MEMORY_BYTES) {
+              throw new CorruptError("initial blob reservation exceeded its preflight");
+            }
+          });
+        },
+      };
+      const finish = (): void => {
+        attempt(() => pending.flush());
+        attempt(() => blobIds.flush());
+      };
+
+      try {
+        const value = body(session);
+        requireActive();
+        if (isThenableResult(value)) {
+          void Promise.resolve(value).catch(() => {});
+          throw new Error("initial state body returned an asynchronous result");
+        }
+        finish();
+        return { available: true, value };
+      } finally {
+        active = false;
+        pending.dispose();
+        blobIds.dispose();
+        previousPath = null;
+        failure = undefined;
+      }
+    });
+  }
 
   indexEntries(): IndexEntry[] {
     return this.#db.all<IndexEntry>(

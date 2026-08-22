@@ -9,7 +9,11 @@ import { concat, toHex, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
-import { type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
+import {
+  type IndexEntry,
+  type InitialStateSession,
+  SqliteGitDatabase,
+} from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
 /** Records the widest result any single query returned — the memory probe. */
@@ -19,6 +23,9 @@ class WidestDatabase implements SqlDatabase {
   widestStringBytes = 0;
   /** Most bound parameters any one statement carried. The platform cap is 100. */
   widestBindings = 0;
+  deleteStatements = 0;
+  initialStateWrites = 0;
+  failInitialStateWrite = 0;
 
   constructor(private readonly inner: SqlDatabase = new TestDatabase()) {}
 
@@ -37,6 +44,13 @@ class WidestDatabase implements SqlDatabase {
 
   run(query: string, ...bindings: unknown[]): void {
     this.#measure(bindings);
+    if (/^\s*DELETE\b/.test(query)) this.deleteStatements++;
+    if (/^\s*(?:WITH[\s\S]*?)?INSERT INTO git_(?:index|blob_ids)\b/.test(query)) {
+      this.initialStateWrites++;
+      if (this.initialStateWrites === this.failInitialStateWrite) {
+        throw new Error("injected initial state write");
+      }
+    }
     this.inner.run(query, ...bindings);
   }
 
@@ -310,6 +324,276 @@ describe("indexReplace", () => {
 
     expect(inner.storage.statementCount).toBe(20);
     expect(store.indexEntries()).toHaveLength(9_329);
+  });
+});
+
+describe("tryCreateInitialState", () => {
+  const contentId = (value: number): Uint8Array =>
+    new Uint8Array([
+      value & 0xff,
+      (value >>> 8) & 0xff,
+      (value >>> 16) & 0xff,
+      (value >>> 24) & 0xff,
+    ]);
+  const oid = (value: number): string => value.toString(16).padStart(40, "0");
+
+  it("atomically writes an ordered empty index and binary blob mappings without DELETE", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    inner.storage.resetCounters();
+
+    const result = store.tryCreateInitialState((session) => {
+      session.put({ ...entry("a.txt", 0, oid(1)), size: 3, mtime: 4, ino: 5, rev: 6 });
+      session.addBlobId({ contentId: new Uint8Array([0, 255, 0]), oid: oid(1) });
+      session.put({ ...entry("z.txt", 0, oid(2)), size: 7 });
+      session.addBlobId({ contentId: new Uint8Array([255, 0, 255]), oid: oid(2) });
+      return "created";
+    });
+
+    expect(result).toEqual({ available: true, value: "created" });
+    expect(inner.storage.statementCount).toBe(3);
+    expect(db.initialStateWrites).toBe(2);
+    expect(db.deleteStatements).toBe(0);
+    expect(store.indexEntries()).toEqual([
+      { ...entry("a.txt", 0, oid(1)), size: 3, mtime: 4, ino: 5, rev: 6 },
+      { ...entry("z.txt", 0, oid(2)), size: 7 },
+    ]);
+    expect(
+      store.lookupBlobIds([new Uint8Array([0, 255, 0]), new Uint8Array([255, 0, 255])]),
+    ).toEqual(
+      new Map([
+        ["00ff00", oid(1)],
+        ["ff00ff", oid(2)],
+      ]),
+    );
+  });
+
+  it("allows an empty body", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    inner.storage.resetCounters();
+    expect(store.tryCreateInitialState(() => 42)).toEqual({ available: true, value: 42 });
+    expect(inner.storage.statementCount).toBe(1);
+    expect(store.indexEntries()).toEqual([]);
+  });
+
+  it("orders paths by Git UTF-8 bytes rather than JavaScript UTF-16 units", () => {
+    const store = open();
+    expect(
+      store.tryCreateInitialState((session) => {
+        session.put(entry(".txt", 0, oid(1)));
+        session.put(entry("😀.txt", 0, oid(2)));
+      }),
+    ).toEqual({ available: true, value: undefined });
+    expect(store.indexEntries().map((row) => row.path)).toEqual([".txt", "😀.txt"]);
+
+    const reversed = open();
+    expect(() =>
+      reversed.tryCreateInitialState((session) => {
+        session.put(entry("😀.txt", 0, oid(1)));
+        session.put(entry(".txt", 0, oid(2)));
+      }),
+    ).toThrow("strict Git path order");
+    expect(reversed.indexEntries()).toEqual([]);
+  });
+
+  it("reserves one shared budget at the exact 2,200-byte path boundary", () => {
+    const acceptedInner = new TestDatabase();
+    const acceptedDb = new WidestDatabase(acceptedInner);
+    const accepted = open(acceptedDb);
+    acceptedInner.storage.resetCounters();
+    let acceptedHighWater = 0;
+    const emptyContentId = new Uint8Array(0);
+
+    expect(
+      accepted.tryCreateInitialState((session) => {
+        for (let index = 0; index < 4_095; index++) {
+          session.addBlobId({ contentId: emptyContentId, oid: oid(1) });
+          acceptedHighWater = Math.max(acceptedHighWater, session.retainedBytes);
+        }
+        session.put(entry("a".repeat(2_200), 0, oid(1)));
+        acceptedHighWater = Math.max(acceptedHighWater, session.retainedBytes);
+      }),
+    ).toEqual({ available: true, value: undefined });
+    expect(acceptedHighWater).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(acceptedInner.storage.statementCount).toBe(3);
+
+    const rejectedInner = new TestDatabase();
+    const rejectedDb = new WidestDatabase(rejectedInner);
+    const rejected = open(rejectedDb);
+    rejectedInner.storage.resetCounters();
+    let rejectedHighWater = 0;
+    expect(() =>
+      rejected.tryCreateInitialState((session) => {
+        for (let index = 0; index < 4_095; index++) {
+          session.addBlobId({ contentId: emptyContentId, oid: oid(1) });
+          rejectedHighWater = Math.max(rejectedHighWater, session.retainedBytes);
+        }
+        session.put(entry("a".repeat(2_201), 0, oid(1)));
+      }),
+    ).toThrow("exceeds 2200 UTF-8 bytes");
+    expect(rejectedHighWater).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(rejectedDb.initialStateWrites).toBe(0);
+    expect(rejected.indexEntries()).toEqual([]);
+    expect(
+      rejected.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = ?",
+        rejected.repoId,
+      ),
+    ).toBe(0);
+  });
+
+  it("returns unavailable before calling the body for every existing stage", () => {
+    for (const stage of [0, 2]) {
+      const inner = new TestDatabase();
+      const db = new WidestDatabase(inner);
+      const store = open(db);
+      store.indexPut(entry("existing.txt", stage, oid(stage + 1)));
+      inner.storage.resetCounters();
+      db.initialStateWrites = 0;
+      let called = false;
+
+      const result = store.tryCreateInitialState(() => {
+        called = true;
+        return "unexpected";
+      });
+
+      expect(result).toEqual({ available: false });
+      expect(called).toBe(false);
+      expect(inner.storage.statementCount).toBe(1);
+      expect(db.initialStateWrites).toBe(0);
+      expect(store.indexEntries()).toEqual([entry("existing.txt", stage, oid(stage + 1))]);
+    }
+  });
+
+  it("streams 24,252 index rows and blob mappings through bounded state", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    inner.storage.resetCounters();
+    let maxRetainedBytes = 0;
+
+    const result = store.tryCreateInitialState((session) => {
+      for (let index = 0; index < 24_252; index++) {
+        const path = `dir/file-${String(index).padStart(5, "0")}.txt`;
+        const objectId = oid(index + 1);
+        session.put({ ...entry(path, 0, objectId), size: index });
+        session.addBlobId({ contentId: contentId(index), oid: objectId });
+        maxRetainedBytes = Math.max(maxRetainedBytes, session.retainedBytes);
+      }
+      return 24_252;
+    });
+
+    expect(result).toEqual({ available: true, value: 24_252 });
+    expect(inner.storage.statementCount).toBe(55);
+    expect(db.deleteStatements).toBe(0);
+    expect(db.widestBindings).toBeLessThanOrEqual(3);
+    expect(db.widestBlob).toBeLessThanOrEqual(1024 * 1024);
+    expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(maxRetainedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_index WHERE repo_id = ?", store.repoId),
+    ).toBe(24_252);
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = ?", store.repoId),
+    ).toBe(24_252);
+    expect(store.indexGet("dir/file-00000.txt")?.oid).toBe(oid(1));
+    expect(store.indexGet("dir/file-24251.txt")?.oid).toBe(oid(24_252));
+  });
+
+  it("rejects duplicate, backward, and invalid entries with full rollback", () => {
+    const invalid: IndexEntry[] = [
+      entry("f0511.txt", 0, oid(9000)),
+      entry("f0000.txt", 0, oid(9001)),
+      { ...entry("f0512.txt", 1, oid(9002)) },
+      { ...entry("f0512.txt", 0, oid(9003)), mode: 0o100600 },
+      { ...entry("f0512.txt", 0, "not-an-oid") },
+      { ...entry("f0512.txt", 0, oid(9004)), size: -1 },
+      entry("../invalid.txt", 0, oid(9005)),
+      entry("f0512-\ud800.txt", 0, oid(9006)),
+    ];
+
+    for (const rejected of invalid) {
+      const store = open();
+      expect(() =>
+        store.tryCreateInitialState((session) => {
+          for (let index = 0; index < 512; index++) {
+            session.put(entry(`f${String(index).padStart(4, "0")}.txt`, 0, oid(index + 1)));
+          }
+          session.addBlobId({ contentId: contentId(1), oid: oid(1) });
+          session.put(rejected);
+        }),
+      ).toThrow();
+      expect(store.indexEntries()).toEqual([]);
+      expect(store.lookupBlobIds([contentId(1)])).toEqual(new Map());
+    }
+  });
+
+  it("invalidates captured sessions after body errors and thenables", () => {
+    const thrownStore = open();
+    let thrownSession: InitialStateSession | undefined;
+    expect(() =>
+      thrownStore.tryCreateInitialState((session) => {
+        thrownSession = session;
+        throw new Error("body failed");
+      }),
+    ).toThrow("body failed");
+    const endedThrownSession = thrownSession;
+    if (endedThrownSession === undefined) throw new Error("body did not capture its session");
+    expect(endedThrownSession.retainedBytes).toBe(0);
+    expect(() => endedThrownSession.put(entry("late.txt"))).toThrow("no longer active");
+
+    const asyncStore = open();
+    let asyncSession: InitialStateSession | undefined;
+    expect(() =>
+      asyncStore.tryCreateInitialState((session) => {
+        asyncSession = session;
+        session.put(entry("pending.txt"));
+        session.addBlobId({ contentId: contentId(1), oid: oid(1) });
+        return new Promise<void>(() => undefined).then(() => {
+          session.put(entry("never.txt"));
+          return "later";
+        });
+      }),
+    ).toThrow("asynchronous result");
+    const endedAsyncSession = asyncSession;
+    if (endedAsyncSession === undefined) throw new Error("body did not capture its session");
+    expect(endedAsyncSession.retainedBytes).toBe(0);
+    expect(() => endedAsyncSession.addBlobId({ contentId: contentId(1), oid: oid(1) })).toThrow(
+      "no longer active",
+    );
+    expect(asyncStore.indexEntries()).toEqual([]);
+  });
+
+  it("rolls back both sinks when a later flush fails", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    db.failInitialStateWrite = 10;
+    let bodyCaught = false;
+
+    expect(() =>
+      store.tryCreateInitialState((session) => {
+        try {
+          for (let index = 0; index < 5_000; index++) {
+            const objectId = oid(index + 1);
+            session.put(entry(`f${String(index).padStart(4, "0")}.txt`, 0, objectId));
+            session.addBlobId({ contentId: contentId(index), oid: objectId });
+          }
+        } catch (error) {
+          bodyCaught = true;
+          expect(error).toEqual(new Error("injected initial state write"));
+        }
+      }),
+    ).toThrow("injected initial state write");
+
+    expect(db.initialStateWrites).toBe(10);
+    expect(bodyCaught).toBe(true);
+    expect(store.indexEntries()).toEqual([]);
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = ?", store.repoId),
+    ).toBe(0);
   });
 });
 
