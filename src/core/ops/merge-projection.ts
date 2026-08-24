@@ -29,8 +29,13 @@ export interface MergeProjectionOptions {
   untrackedCollisions?: ReadonlySet<string>;
 }
 
-function selectedWorktree(stages: IntegrationStages): IntegrationIdentity | null {
-  return stages.current ?? stages.incoming;
+function selectedWorktree(
+  stages: IntegrationStages,
+  resultMode: string | undefined,
+): IntegrationIdentity | null {
+  const selected = stages.current ?? stages.incoming;
+  if (selected === null || resultMode === undefined) return selected;
+  return { mode: resultMode, oid: selected.oid };
 }
 
 function ordinary(entry: IntegrationEntry): ProjectedMergeEntry {
@@ -51,7 +56,7 @@ function ordinary(entry: IntegrationEntry): ProjectedMergeEntry {
     purpose: "primary",
     stageZero: null,
     stages: entry.stages,
-    worktree: selectedWorktree(entry.stages),
+    worktree: selectedWorktree(entry.stages, entry.resultMode),
     content: entry.content,
   };
 }

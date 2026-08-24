@@ -9,6 +9,40 @@ function identity(digit: string, mode = "100644"): IntegrationIdentity {
 }
 
 describe("merge file/directory projection", () => {
+  it("projects conflict content with its independently resolved mode", () => {
+    const base = identity("1");
+    const current = identity("2");
+    const incoming = identity("3", "100755");
+    const content = new TextEncoder().encode("conflict markers\n");
+    const plan: IntegrationPlan = {
+      entries: [
+        {
+          kind: "conflict",
+          path: "x",
+          conflict: "content",
+          stages: { base, current, incoming },
+          resultMode: "100755",
+          content,
+        },
+      ],
+      sourceRows: 1,
+      blobReadCalls: 1,
+      memoryHighWaterBytes: 0,
+    };
+
+    expect(projectMergePlan(plan, { currentLabel: "HEAD", incomingLabel: "topic" })).toEqual([
+      {
+        path: "x",
+        logicalPath: "x",
+        purpose: "primary",
+        stageZero: null,
+        stages: { base, current, incoming },
+        worktree: { mode: "100755", oid: current.oid },
+        content,
+      },
+    ]);
+  });
+
   it("relocates the current file and makes an added incoming descendant stage zero", () => {
     const current = identity("1");
     const incoming = identity("2");

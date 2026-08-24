@@ -9,9 +9,11 @@ import {
   type TextMergeOptions,
 } from "../diff/xmerge.js";
 import { CorruptError, GitError } from "../errors.js";
-import { hashObject } from "../objects.js";
+import { hashObject, MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
 import type { Repository } from "../repository.js";
+import { comparePaths } from "../streams.js";
 import {
+  type ConflictStructuralEntry,
   type ContentStructuralEntry,
   classifyIntegrationStructure,
   type IntegrationIdentity,
@@ -19,6 +21,7 @@ import {
   type StructuralConflictKind,
   type StructuralIntegrationEntry,
 } from "./integration-structure.js";
+import { treeStream } from "./tree-stream.js";
 
 export const MAX_INTEGRATION_SOURCE_ROWS = 200_000;
 export const MAX_INTEGRATION_PLAN_ENTRIES = 1_000;
@@ -33,12 +36,21 @@ export const MAX_INTEGRATION_SQL_STATEMENTS =
 if (MAX_INTEGRATION_SQL_STATEMENTS >= 1_000) {
   throw new Error("integration SQL model exceeds the operation statement limit");
 }
+export const MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS = 10;
+export const MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS =
+  MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS +
+  MAX_INTEGRATION_BLOB_READ_CALLS * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
+if (MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS >= 1_000) {
+  throw new Error("virtual-ancestor integration SQL model exceeds the operation statement limit");
+}
 
 const FIXED_CALLER_BYTES = 16 * 1024;
 const STRUCTURAL_ENTRY_BYTES = 768;
 const INTEGRATION_ENTRY_BYTES = 512;
 const ID_VECTOR_ENTRY_BYTES = 192;
 const BLOB_MAP_ENTRY_BYTES = 128;
+const EMPTY_BLOB = new Uint8Array();
+const BASE_CONFLICT_MARKER_SIZE = 7;
 
 export type IntegrationConflictKind = StructuralConflictKind | "content" | "binary";
 
@@ -56,6 +68,8 @@ export interface ConflictIntegrationEntry {
   path: string;
   conflict: IntegrationConflictKind;
   stages: IntegrationStages;
+  /** Worktree mode after independently resolving the mode dimension, when defined. */
+  resultMode?: string;
   /** Conflict-marker bytes, or the current bytes for a binary conflict. */
   content: Uint8Array | null;
   conflicts?: number;
@@ -85,6 +99,284 @@ export interface IntegrationInput {
   incomingTreeOid: string | null;
   text?: TextMergeOptions;
   limits?: IntegrationLimits;
+}
+
+export interface VirtualAncestorIntegrationInput extends IntegrationInput {
+  labels: { current: string; incoming: string };
+  /** Recursive merge depth. Git adds two marker bytes at every depth; defaults to one. */
+  depth?: number;
+}
+
+interface ContentCandidate {
+  path: string;
+  base: IntegrationIdentity | null;
+  current: IntegrationIdentity;
+  incoming: IntegrationIdentity;
+  resultMode: string;
+  stages: IntegrationStages;
+  forceAddAddConflict: boolean;
+}
+
+interface RelocationRequest {
+  key: string;
+  path: string;
+  desired: string;
+  side: "current" | "incoming";
+  identity: IntegrationIdentity;
+}
+
+interface CollisionNamespace {
+  occupied: Set<number>;
+  blockedByAncestor: boolean;
+}
+
+class CollisionTrieNode {
+  readonly children = new Map<string, CollisionTrieNode>();
+  namespace: CollisionNamespace | null = null;
+}
+
+class RelocationAllocator {
+  readonly #root = new CollisionTrieNode();
+  readonly #namespaces = new Map<string, CollisionNamespace>();
+  #retainedBytes = 256;
+
+  constructor(
+    requests: readonly RelocationRequest[],
+    private readonly maxRetainedBytes: number,
+  ) {
+    for (const request of requests) this.#add(request.desired);
+  }
+
+  get retainedBytes(): number {
+    return this.#retainedBytes;
+  }
+
+  observe(path: string): void {
+    let node = this.#root;
+    for (let index = 0; index <= path.length; index++) {
+      const namespace = node.namespace;
+      if (namespace !== null) {
+        const suffix = path.slice(index);
+        const ordinal = collisionOrdinal(suffix);
+        if (ordinal !== null && !namespace.occupied.has(ordinal)) {
+          this.#retain(64);
+          namespace.occupied.add(ordinal);
+        }
+      }
+      if (index === path.length) {
+        const descendants = node.children.get("/");
+        if (descendants !== undefined) this.#blockDescendantNamespaces(descendants);
+        return;
+      }
+      const next = node.children.get(path[index]!);
+      if (next === undefined) return;
+      node = next;
+    }
+  }
+
+  allocate(desired: string): string {
+    const namespace = this.#namespaces.get(desired);
+    if (namespace === undefined) throw new CorruptError("virtual relocation namespace is missing");
+    if (namespace.blockedByAncestor) {
+      throw new GitError("E2BIG", "virtual relocation path is below an occupied file");
+    }
+    if (!namespace.occupied.has(-1)) {
+      validateRelocationPath(desired);
+      this.observe(desired);
+      return desired;
+    }
+    for (let ordinal = 0; ordinal < MAX_INTEGRATION_PLAN_ENTRIES - 1; ordinal++) {
+      if (namespace.occupied.has(ordinal)) continue;
+      const allocated = `${desired}_${ordinal}`;
+      validateRelocationPath(allocated);
+      this.observe(allocated);
+      return allocated;
+    }
+    throw new GitError("E2BIG", "virtual relocation suffix space is exhausted");
+  }
+
+  #add(desired: string): void {
+    if (this.#namespaces.has(desired)) return;
+    const namespace: CollisionNamespace = { occupied: new Set(), blockedByAncestor: false };
+    this.#retain(256 + desired.length * 2);
+    this.#namespaces.set(desired, namespace);
+    let node = this.#root;
+    for (let index = 0; index < desired.length; index++) {
+      const unit = desired[index]!;
+      let next = node.children.get(unit);
+      if (next === undefined) {
+        this.#retain(128);
+        next = new CollisionTrieNode();
+        node.children.set(unit, next);
+      }
+      node = next;
+    }
+    node.namespace = namespace;
+  }
+
+  #blockDescendantNamespaces(root: CollisionTrieNode): void {
+    const pending = [root];
+    while (pending.length > 0) {
+      const node = pending.pop();
+      if (node === undefined) throw new CorruptError("virtual relocation trie is inconsistent");
+      if (node.namespace !== null) node.namespace.blockedByAncestor = true;
+      for (const child of node.children.values()) pending.push(child);
+    }
+  }
+
+  #retain(bytes: number): void {
+    if (bytes > this.maxRetainedBytes - this.#retainedBytes) {
+      throw new GitError(
+        "E2BIG",
+        `virtual relocation state exceeds ${this.maxRetainedBytes} retained bytes`,
+      );
+    }
+    this.#retainedBytes += bytes;
+  }
+}
+
+function collisionOrdinal(suffix: string): number | null {
+  if (suffix === "" || suffix.startsWith("/")) return -1;
+  if (!suffix.startsWith("_") || suffix.length === 1) return null;
+  const separator = suffix.indexOf("/", 1);
+  const digits = suffix.slice(1, separator < 0 ? undefined : separator);
+  if (digits.length === 0) return null;
+  if (digits.length > 1 && digits.startsWith("0")) return null;
+  for (const digit of digits) {
+    if (digit < "0" || digit > "9") return null;
+  }
+  const ordinal = Number(digits);
+  return Number.isSafeInteger(ordinal) && ordinal >= 0 ? ordinal : null;
+}
+
+function validateVirtualLabel(label: string, role: string): void {
+  if (label.length > 256) throw new GitError("E2BIG", `virtual ${role} label exceeds 256 bytes`);
+  const bytes = new TextEncoder().encode(label).length;
+  if (label.length === 0 || label.includes("/") || label.includes("\0")) {
+    throw new GitError("EINVAL", `virtual ${role} label is not a safe path segment`);
+  }
+  if (bytes > 256) throw new GitError("E2BIG", `virtual ${role} label exceeds 256 bytes`);
+}
+
+function virtualMarkerSize(depth: number | undefined): number {
+  const resolved = depth ?? 1;
+  if (!Number.isSafeInteger(resolved) || resolved < 0) {
+    throw new GitError("EINVAL", "virtual integration depth must be a non-negative safe integer");
+  }
+  const markerSize = BASE_CONFLICT_MARKER_SIZE + resolved * 2;
+  if (markerSize > DEFAULT_TEXT_MERGE_LIMITS.maxMarkerSize) {
+    throw new GitError("E2BIG", "virtual integration depth exceeds the marker-size limit");
+  }
+  return markerSize;
+}
+
+function validateRelocationPath(path: string): void {
+  if (new TextEncoder().encode(path).length > 2_200) {
+    throw new GitError("E2BIG", "virtual relocation path exceeds 2200 bytes");
+  }
+}
+
+function relocationKey(path: string, side: "current" | "incoming"): string {
+  return `${path}\0${side}`;
+}
+
+function modeRank(mode: string): number {
+  if (mode === MODE_FILE) return 1;
+  if (mode === MODE_EXECUTABLE) return 2;
+  if (mode === MODE_SYMLINK) return 3;
+  if (mode === MODE_COMMIT) return 4;
+  throw new CorruptError(`virtual integration has invalid mode ${mode}`);
+}
+
+function isDescendant(path: string, parent: string): boolean {
+  return path.length > parent.length && path.startsWith(parent) && path[parent.length] === "/";
+}
+
+function relocationRequests(
+  entries: readonly StructuralIntegrationEntry[],
+  labels: { current: string; incoming: string },
+): RelocationRequest[] {
+  const requests: RelocationRequest[] = [];
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (entry?.kind !== "conflict") continue;
+    const current = entry.stages.current;
+    const incoming = entry.stages.incoming;
+    if (entry.conflict === "file/directory") {
+      const next = entries[index + 1];
+      if (next === undefined || !isDescendant(next.path, entry.path)) continue;
+      if (current !== null && incoming === null) {
+        validateRelocationPath(`${entry.path}~${labels.current}`);
+        requests.push({
+          key: relocationKey(entry.path, "current"),
+          path: entry.path,
+          desired: `${entry.path}~${labels.current}`,
+          side: "current",
+          identity: current,
+        });
+      } else if (incoming !== null && current === null) {
+        validateRelocationPath(`${entry.path}~${labels.incoming}`);
+        requests.push({
+          key: relocationKey(entry.path, "incoming"),
+          path: entry.path,
+          desired: `${entry.path}~${labels.incoming}`,
+          side: "incoming",
+          identity: incoming,
+        });
+      }
+      continue;
+    }
+    if (
+      current === null ||
+      incoming === null ||
+      current.mode === incoming.mode ||
+      (isRegularMode(current.mode) && isRegularMode(incoming.mode))
+    ) {
+      continue;
+    }
+    if (
+      entry.conflict !== "add/add" &&
+      entry.conflict !== "symlink" &&
+      entry.conflict !== "gitlink"
+    ) {
+      continue;
+    }
+    const side = modeRank(current.mode) < modeRank(incoming.mode) ? "current" : "incoming";
+    const identity = side === "current" ? current : incoming;
+    const label = side === "current" ? labels.current : labels.incoming;
+    validateRelocationPath(`${entry.path}~${label}`);
+    requests.push({
+      key: relocationKey(entry.path, side),
+      path: entry.path,
+      desired: `${entry.path}~${label}`,
+      side,
+      identity,
+    });
+  }
+  return requests;
+}
+
+function allocateRelocations(
+  repo: Repository,
+  input: VirtualAncestorIntegrationInput,
+  requests: readonly RelocationRequest[],
+  limits: ResolvedIntegrationLimits,
+): { names: Map<string, string>; retainedBytes: number } {
+  if (requests.length === 0) return { names: new Map(), retainedBytes: 0 };
+  const allocator = new RelocationAllocator(requests, limits.maxStructureBytes);
+  let rows = 0;
+  for (const treeOid of [input.currentTreeOid, input.incomingTreeOid]) {
+    for (const entry of treeStream(repo, treeOid)) {
+      if (rows >= limits.maxSourceRows * 2) {
+        throw new GitError("E2BIG", "virtual relocation scan exceeds its source row limit");
+      }
+      rows++;
+      allocator.observe(entry.path);
+    }
+  }
+  const names = new Map<string, string>();
+  for (const request of requests) names.set(request.key, allocator.allocate(request.desired));
+  return { names, retainedBytes: allocator.retainedBytes };
 }
 
 interface ResolvedIntegrationLimits {
@@ -192,11 +484,16 @@ function boundTextOutput(text: TextMergeOptions, maxOutputBytes: number): TextMe
   };
 }
 
-function stableIdentityVector(entries: readonly ContentStructuralEntry[]): string[] {
+function stableIdentityVector(entries: readonly ContentCandidate[]): string[] {
   const seen = new Set<string>();
   const oids: string[] = [];
   for (const entry of entries) {
-    for (const oid of [entry.base.oid, entry.current.oid, entry.incoming.oid]) {
+    const identities =
+      entry.base === null
+        ? [entry.current, entry.incoming]
+        : [entry.base, entry.current, entry.incoming];
+    for (const identity of identities) {
+      const oid = identity.oid;
       if (seen.has(oid)) continue;
       seen.add(oid);
       oids.push(oid);
@@ -205,7 +502,7 @@ function stableIdentityVector(entries: readonly ContentStructuralEntry[]): strin
   return oids;
 }
 
-function identityUseCounts(entries: readonly ContentStructuralEntry[]): Map<string, number> {
+function identityUseCounts(entries: readonly ContentCandidate[]): Map<string, number> {
   const counts = new Map<string, number>();
   for (const entry of entries) {
     for (const oid of new Set(candidateOids(entry))) {
@@ -215,8 +512,10 @@ function identityUseCounts(entries: readonly ContentStructuralEntry[]): Map<stri
   return counts;
 }
 
-function candidateOids(entry: ContentStructuralEntry): readonly string[] {
-  return [entry.base.oid, entry.current.oid, entry.incoming.oid];
+function candidateOids(entry: ContentCandidate): readonly string[] {
+  return entry.base === null
+    ? [entry.current.oid, entry.incoming.oid]
+    : [entry.base.oid, entry.current.oid, entry.incoming.oid];
 }
 
 function callerRetainedBytes(
@@ -278,15 +577,118 @@ function passThroughEntry(entry: StructuralIntegrationEntry): IntegrationEntry {
   return { ...entry, content: null };
 }
 
+function isRegularMode(mode: string): boolean {
+  return mode === MODE_FILE || mode === MODE_EXECUTABLE;
+}
+
+function ordinaryContentCandidate(entry: ContentStructuralEntry): ContentCandidate {
+  return {
+    path: entry.path,
+    base: entry.base,
+    current: entry.current,
+    incoming: entry.incoming,
+    resultMode: entry.resultMode,
+    stages: { base: entry.base, current: entry.current, incoming: entry.incoming },
+    forceAddAddConflict: false,
+  };
+}
+
+function virtualAddAddCandidate(entry: ConflictStructuralEntry): ContentCandidate | null {
+  const current = entry.stages.current;
+  const incoming = entry.stages.incoming;
+  if (
+    entry.conflict !== "add/add" ||
+    current === null ||
+    incoming === null ||
+    !isRegularMode(current.mode) ||
+    !isRegularMode(incoming.mode)
+  ) {
+    return null;
+  }
+  return {
+    path: entry.path,
+    base: null,
+    current,
+    incoming,
+    resultMode: current.mode,
+    stages: entry.stages,
+    forceAddAddConflict: current.mode !== incoming.mode,
+  };
+}
+
+function cleanIdentity(
+  path: string,
+  before: IntegrationIdentity | null,
+  result: IntegrationIdentity | null,
+): CleanIntegrationEntry | null {
+  if (
+    before?.mode === result?.mode &&
+    before?.oid === result?.oid &&
+    (before !== null || result !== null)
+  ) {
+    return null;
+  }
+  return { kind: "clean", path, before, result, content: null };
+}
+
+function relocatedEntry(
+  request: RelocationRequest,
+  names: ReadonlyMap<string, string>,
+): CleanIntegrationEntry {
+  const path = names.get(request.key);
+  if (path === undefined) throw new CorruptError("virtual relocation path is missing");
+  return { kind: "clean", path, before: null, result: request.identity, content: null };
+}
+
+function collapseVirtualConflict(
+  entry: ConflictStructuralEntry,
+  requests: ReadonlyMap<string, RelocationRequest>,
+  names: ReadonlyMap<string, string>,
+): CleanIntegrationEntry[] {
+  const current = entry.stages.current;
+  const incoming = entry.stages.incoming;
+  const currentRequest = requests.get(relocationKey(entry.path, "current"));
+  const incomingRequest = requests.get(relocationKey(entry.path, "incoming"));
+  const request = currentRequest ?? incomingRequest;
+  if (request !== undefined) {
+    const result: CleanIntegrationEntry[] = [];
+    if (request.side === "current") {
+      const original = cleanIdentity(entry.path, current, incoming);
+      if (original !== null) result.push(original);
+    }
+    if (request.side === "incoming" && current !== null && incoming !== null) {
+      const original = cleanIdentity(entry.path, current, current);
+      if (original !== null) result.push(original);
+    } else if (request.side === "incoming" && current === null && incoming !== null) {
+      // The original path is occupied by the current directory and remains implicit.
+    }
+    result.push(relocatedEntry(request, names));
+    return result;
+  }
+  if (entry.conflict === "file/directory") {
+    const clean = cleanIdentity(entry.path, current, current ?? incoming);
+    return clean === null ? [] : [clean];
+  }
+  if (entry.conflict === "modify/delete") {
+    const modified = current ?? incoming;
+    const clean = cleanIdentity(entry.path, current, modified);
+    return clean === null ? [] : [clean];
+  }
+  // Git keeps the current side for unresolved modes, symlinks and gitlinks.
+  const clean = cleanIdentity(entry.path, current, current ?? incoming);
+  return clean === null ? [] : [clean];
+}
+
 function resolveContentCandidate(
-  entry: ContentStructuralEntry,
+  entry: ContentCandidate,
   loaded: ReadonlyMap<string, Uint8Array>,
   text: TextMergeOptions,
   reservation: MemoryReservation,
   retainedBytes: number,
   maxContentBytes: number,
+  virtualAncestor: boolean,
 ): IntegrationEntry {
-  const base = loaded.get(entry.base.oid);
+  const base = entry.base === null ? EMPTY_BLOB : loaded.get(entry.base.oid);
   const current = loaded.get(entry.current.oid);
   const incoming = loaded.get(entry.incoming.oid);
   if (base === undefined || current === undefined || incoming === undefined) {
@@ -296,21 +698,57 @@ function resolveContentCandidate(
   const memory = estimateTextMergeMemory(base, current, incoming, boundedText);
   reservation.set("other", checkedAdd(retainedBytes, memory.peakBytes, "memory"));
   const merged = mergeText(base, current, incoming, boundedText);
-  const stages = { base: entry.base, current: entry.current, incoming: entry.incoming };
+  const stages = entry.stages;
   if (merged.kind === "binary") {
     if (current.length > maxContentBytes) {
       throw new GitError("E2BIG", `integration plan exceeds its retained content capacity`);
     }
-    return { kind: "conflict", path: entry.path, conflict: "binary", stages, content: current };
+    if (!virtualAncestor) {
+      return {
+        kind: "conflict",
+        path: entry.path,
+        conflict: "binary",
+        stages,
+        resultMode: entry.resultMode,
+        content: current,
+      };
+    }
+    return {
+      kind: "clean",
+      path: entry.path,
+      before: entry.current,
+      result: { mode: entry.resultMode, oid: entry.current.oid },
+      content: current,
+    };
   }
   if (merged.kind === "conflict") {
+    if (virtualAncestor) {
+      return {
+        kind: "clean",
+        path: entry.path,
+        before: entry.current,
+        result: { mode: entry.resultMode, oid: hashObject("blob", merged.content) },
+        content: merged.content,
+      };
+    }
     return {
       kind: "conflict",
       path: entry.path,
       conflict: "content",
       stages,
+      resultMode: entry.resultMode,
       content: merged.content,
       conflicts: merged.conflicts,
+    };
+  }
+  if (!virtualAncestor && entry.forceAddAddConflict) {
+    return {
+      kind: "conflict",
+      path: entry.path,
+      conflict: "add/add",
+      stages,
+      resultMode: entry.resultMode,
+      content: merged.content,
     };
   }
   return {
@@ -324,6 +762,43 @@ function resolveContentCandidate(
 
 /** Build a deterministic integration delta without mutating repository state. */
 export function planIntegration(repo: Repository, input: IntegrationInput): IntegrationPlan {
+  return planIntegrationInternal(repo, input, null);
+}
+
+/** Collapse conflicts the way Git builds a temporary recursive merge-base tree. */
+export function planVirtualAncestorIntegration(
+  repo: Repository,
+  input: VirtualAncestorIntegrationInput,
+): IntegrationPlan {
+  validateVirtualLabel(input.labels.current, "current");
+  validateVirtualLabel(input.labels.incoming, "incoming");
+  const markerSize = virtualMarkerSize(input.depth);
+  if (input.text?.markerSize !== undefined && input.text.markerSize !== markerSize) {
+    throw new GitError("EINVAL", "virtual integration marker size does not match its depth");
+  }
+  return planIntegrationInternal(
+    repo,
+    {
+      ...input,
+      text: {
+        ...input.text,
+        labels: {
+          ...input.text?.labels,
+          current: input.labels.current,
+          incoming: input.labels.incoming,
+        },
+        markerSize,
+      },
+    },
+    input.labels,
+  );
+}
+
+function planIntegrationInternal(
+  repo: Repository,
+  input: IntegrationInput,
+  virtualLabels: { current: string; incoming: string } | null,
+): IntegrationPlan {
   const reservation = repo.store.reserveMemory();
   try {
     // Exclude yielded pack ingest before opening any tree cursor or retaining plan state.
@@ -339,9 +814,25 @@ export function planIntegration(repo: Repository, input: IntegrationInput): Inte
         maxRetainedBytes: limits.maxStructureBytes,
       },
     });
-    const candidates = structure.entries.filter(
-      (entry): entry is ContentStructuralEntry => entry.kind === "content",
-    );
+    const candidates: ContentCandidate[] = [];
+    for (const entry of structure.entries) {
+      if (entry.kind === "content") {
+        candidates.push(ordinaryContentCandidate(entry));
+        continue;
+      }
+      if (entry.kind === "conflict") {
+        const candidate = virtualAddAddCandidate(entry);
+        if (candidate !== null) candidates.push(candidate);
+      }
+    }
+    const candidatePaths = new Set(candidates.map((candidate) => candidate.path));
+    const relocationList =
+      virtualLabels === null ? [] : relocationRequests(structure.entries, virtualLabels);
+    const relocations =
+      virtualLabels === null
+        ? { names: new Map<string, string>(), retainedBytes: 0 }
+        : allocateRelocations(repo, { ...input, labels: virtualLabels }, relocationList, limits);
+    const relocationByKey = new Map(relocationList.map((request) => [request.key, request]));
     const requestedOids = stableIdentityVector(candidates);
     const remainingUses = identityUseCounts(candidates);
     let staticBytes = FIXED_CALLER_BYTES;
@@ -354,23 +845,54 @@ export function planIntegration(repo: Repository, input: IntegrationInput): Inte
         ID_VECTOR_ENTRY_BYTES,
       "identity vectors",
     );
-    requireCallerHeadroom(staticBytes);
+    staticBytes = checkedAdd(staticBytes, relocations.retainedBytes, "virtual relocations");
+    for (const request of relocationList) {
+      const allocated = relocations.names.get(request.key);
+      if (allocated === undefined) throw new CorruptError("virtual relocation path is missing");
+      staticBytes = checkedAdd(
+        staticBytes,
+        checkedAdd(
+          INTEGRATION_ENTRY_BYTES,
+          checkedAdd(pathBytes(request.key), pathBytes(request.desired), "virtual relocation"),
+          "virtual relocation",
+        ),
+        "virtual relocations",
+      );
+      staticBytes = checkedAdd(
+        staticBytes,
+        checkedAdd(ID_VECTOR_ENTRY_BYTES, pathBytes(allocated), "virtual relocation map"),
+        "virtual relocation map",
+      );
+    }
 
     const resolved = new Map<string, IntegrationEntry>();
     const loaded = new Map<string, Uint8Array>();
+    const staticEntries: IntegrationEntry[] = [];
     let passthroughBytes = 0;
     for (const entry of structure.entries) {
-      if (entry.kind !== "content") {
-        passthroughBytes = checkedAdd(
-          passthroughBytes,
-          integrationEntryBytes(passThroughEntry(entry)),
-          "plan",
-        );
+      if (candidatePaths.has(entry.path)) continue;
+      const entries =
+        virtualLabels !== null && entry.kind === "conflict"
+          ? collapseVirtualConflict(entry, relocationByKey, relocations.names)
+          : [passThroughEntry(entry)];
+      for (const planned of entries) {
+        staticEntries.push(planned);
+        passthroughBytes = checkedAdd(passthroughBytes, integrationEntryBytes(planned), "plan");
       }
+    }
+    if (staticEntries.length + candidates.length > limits.maxEntries) {
+      throw new GitError("E2BIG", `integration plan exceeds ${limits.maxEntries} entries`);
     }
     if (passthroughBytes > limits.maxPlanBytes) {
       throw new GitError("E2BIG", `integration plan exceeds ${limits.maxPlanBytes} retained bytes`);
     }
+    staticBytes = checkedAdd(staticBytes, passthroughBytes, "static plan");
+    staticBytes = checkedAdd(
+      staticBytes,
+      staticEntries.length * ID_VECTOR_ENTRY_BYTES,
+      "static plan vector",
+    );
+    requireCallerHeadroom(staticBytes);
 
     let resolvedBytes = 0;
     let remaining = requestedOids;
@@ -424,6 +946,7 @@ export function planIntegration(repo: Repository, input: IntegrationInput): Inte
         reservation,
         retained,
         maxContentBytes,
+        virtualLabels !== null,
       );
       const entryBytes = integrationEntryBytes(result);
       const nextPlanBytes = checkedAdd(
@@ -458,23 +981,16 @@ export function planIntegration(repo: Repository, input: IntegrationInput): Inte
     if (remaining.length !== 0 || loaded.size !== 0 || remainingUses.size !== 0) {
       throw new CorruptError("integration content phase retained unconsumed blob objects");
     }
-    const finalArrayBytes = structure.entries.length * ID_VECTOR_ENTRY_BYTES;
+    const finalArrayBytes = (staticEntries.length + resolved.size) * ID_VECTOR_ENTRY_BYTES;
     const finalPeak = checkedAdd(
       callerRetainedBytes(staticBytes, resolvedBytes, loaded),
-      checkedAdd(finalArrayBytes, passthroughBytes, "final plan"),
+      finalArrayBytes,
       "final plan",
     );
     reservation.set("other", finalPeak);
-    const entries: IntegrationEntry[] = [];
-    for (const entry of structure.entries) {
-      if (entry.kind !== "content") {
-        entries.push(passThroughEntry(entry));
-        continue;
-      }
-      const content = resolved.get(entry.path);
-      if (content === undefined) throw new CorruptError("integration content result is missing");
-      entries.push(content);
-    }
+    const entries = [...staticEntries, ...resolved.values()].sort((left, right) =>
+      comparePaths(left.path, right.path),
+    );
     return {
       entries,
       sourceRows: structure.sourceRows,
