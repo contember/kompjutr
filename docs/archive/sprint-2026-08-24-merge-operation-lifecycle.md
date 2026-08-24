@@ -239,10 +239,10 @@ Consumed backlog item 19 and builds directly on the archived
   signing, hooks, rerere, and strategy selection remain follow-on behavior. The
   shipped integration engine continues to model renames as delete/add and
   gitlinks as identities or conflicts.
-- Stash, rebase, cherry-pick, and revert remain separate consumers in
-  [backlog item 06](../backlog/06-stash-operations.md),
-  [backlog item 07](../backlog/07-rebase.md), and
-  [backlog item 14](../backlog/14-cherry-pick-and-revert.md).
+- Stash and rebase remain separate consumers in
+  [backlog item 06](../backlog/06-stash-operations.md) and
+  [backlog item 07](../backlog/07-rebase.md). Cherry-pick and revert shipped in
+  the later [replay lifecycle sprint](./sprint-2026-08-24-cherry-pick-and-revert.md).
 - The generic `git.cli()` dispatcher remains unsupported. This sprint ships the
   typed native and compatibility method surfaces, not a shell parser.
 - No benchmark or production deployment claim belongs to this sprint.

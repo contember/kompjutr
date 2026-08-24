@@ -20,6 +20,3 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 <!-- one line per active sprint; empty between sprints -->
-
-- [Cherry-pick and revert lifecycle](sprint-2026-08-24-cherry-pick-and-revert.md)
-  — bounded one-commit replay and inversion with restart-safe recovery.

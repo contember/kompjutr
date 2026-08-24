@@ -24,7 +24,6 @@ unwieldy; numbers stay folder-local.
 - [11 — Add a production Durable Object regression probe](11-production-do-regression-probe.md)
 - [12 — Add reflogs and ref recovery](12-reflogs-and-ref-recovery.md)
 - [13 — Add force-with-lease push](13-force-with-lease.md)
-- [14 — Implement cherry-pick and revert](14-cherry-pick-and-revert.md)
 - [15 — Make network operations abortable](15-abortable-network-operations.md)
 - [16 — Verify concurrent and interrupted operations](16-concurrent-and-restart-conformance.md)
 - [17 — Add repository integrity audit and snapshots](17-integrity-audit-and-snapshots.md)

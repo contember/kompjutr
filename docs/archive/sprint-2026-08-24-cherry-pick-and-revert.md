@@ -1,3 +1,16 @@
+> **OUTCOME — shipped 2026-08-24.** The native client now supports bounded
+> one-commit cherry-pick and revert with clean, conflicted, empty, restart-safe
+> continue, skip, and abort outcomes. Both commands share one authenticated
+> schema-v10 operation journal and one three-tree replay lifecycle; Computer
+> compatibility remains unchanged because its installed interface has no replay
+> methods. Commit map: plan → `ba58f56`; WU1 → `a55ed53`; WU2 → `0c40e45`;
+> WU3 → `36989c5`; shared conflict-label seam → `3dc9b69`; WU4 → `1a8df50`;
+> WU5 → `8bf6c6d`. Verification: `npm run check`; `npm run typecheck`; leased
+> full suite — 90 files and 1,590 tests passed, 5 skipped; leased production
+> build; docs lint. Backlog closed: 14. Deferred: multi-commit rebase and
+> sequencing, reflogs, rename detection, custom merge drivers, signing, hooks,
+> rerere, and the other explicit non-goals below.
+
 # Sprint — Cherry-pick and revert lifecycle (2026-08-24)
 
 **Goal.** Deliver bounded native cherry-pick and revert for one selected commit,
@@ -11,9 +24,9 @@ three-tree integration and path-scoped recovery machinery. Success means either
 operation commits atomically, leaves one explicit recoverable state, or changes
 nothing.
 
-Consumes [backlog item 14](../backlog/14-cherry-pick-and-revert.md) on ship and
-establishes the one-commit replay seam needed by the later
-[rebase](../backlog/07-rebase.md) sprint without implementing a sequencer here.
+Consumed backlog item 14, which was deleted on ship, and established the
+one-commit replay seam needed by the later [rebase](../backlog/07-rebase.md)
+sprint without implementing a sequencer here.
 
 ## Refs re-verified at HEAD (2026-08-24, `ba85a8b`)
 
@@ -323,3 +336,6 @@ their complete restart-safe lifecycle exists.
   `tests/schema-migration.test.ts`; atomic apply witnesses live in
   `tests/merge-apply.test.ts` and `tests/merge-lifecycle.test.ts`. The proposed
   `tests/migrations.test.ts` and `tests/transactions.test.ts` do not exist.
+- 2026-08-24 — Revert conflict markers required a command-specific incoming
+  label. The shared replay policy now selects either the cherry-pick source
+  subject or Git's `parent of` revert form and revalidates it after restart.
