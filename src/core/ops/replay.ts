@@ -11,6 +11,8 @@ import { type IntegrationLimits, type IntegrationPlan, planIntegration } from ".
 export const MAX_REPLAY_REVISION_CODE_UNITS = 1_024;
 export const MAX_REPLAY_REVISION_HOPS = 32;
 export const MAX_REPLAY_TAG_HOPS = 16;
+// Covers bounded revision/tag peeling and authoritative commit-object reads.
+export const MAX_REPLAY_METADATA_SQL_STATEMENTS = 256;
 
 export type ReplayKind = "cherry-pick" | "revert";
 
@@ -21,6 +23,8 @@ export interface ReplayInput {
   mainline?: number;
   text?: TextMergeOptions;
   limits?: IntegrationLimits;
+  /** Use Git's sequencer label without changing the planner's default fixture labels. */
+  sourceSubjectLabel?: boolean;
 }
 
 export interface ReplayLabels {
@@ -44,6 +48,8 @@ export interface ReplayPlan {
   incomingTreeOid: string | null;
   labels: ReplayLabels;
   integration: IntegrationPlan;
+  /** Conservative metadata work, excluding the integration plan's own reads. */
+  sqlStatements: number;
 }
 
 function requireRevision(value: unknown): string {
@@ -237,6 +243,11 @@ function shortOid(oid: string | null): string {
   return oid === null ? "empty tree" : oid.slice(0, 12);
 }
 
+function sourceSubject(message: string): string {
+  const newline = message.indexOf("\n");
+  return (newline < 0 ? message : message.slice(0, newline)).replace(/\r$/, "");
+}
+
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
 export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
   const sourceRevision = requireRevision(input.source);
@@ -265,7 +276,9 @@ export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
       shortOid(input.kind === "cherry-pick" ? selectedParentOid : sourceOid),
     incoming:
       input.text?.labels?.incoming ??
-      shortOid(input.kind === "cherry-pick" ? sourceOid : selectedParentOid),
+      (input.sourceSubjectLabel === true
+        ? `${sourceOid.slice(0, 7)} (${sourceSubject(sourceCommit.message)})`
+        : shortOid(input.kind === "cherry-pick" ? sourceOid : selectedParentOid)),
   };
   const integration = planIntegration(repo, {
     baseTreeOid,
@@ -293,5 +306,6 @@ export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
     incomingTreeOid,
     labels,
     integration,
+    sqlStatements: MAX_REPLAY_METADATA_SQL_STATEMENTS,
   };
 }

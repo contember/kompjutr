@@ -5,57 +5,50 @@ import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
 import { hashObject, type ObjectType, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
-import { comparePaths, joinSorted } from "../streams.js";
+import { joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { type CommitIdentities, commitIndex, resolveIdentity } from "./commit.js";
 import {
   type IntegrationPlan,
-  MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ,
   MAX_INTEGRATION_TREE_STATEMENTS,
   MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS,
   planIntegration,
   planVirtualAncestorIntegration,
 } from "./integration.js";
+import {
+  INTEGRATION_COLLISION_SQL_STATEMENTS,
+  INTEGRATION_GUARD_SQL_STATEMENTS,
+  INTEGRATION_INDEX_SQL_STATEMENTS,
+  integrationCommitSqlStatements,
+  integrationSqlStatements,
+  MAX_INTEGRATION_COMMIT_SQL_STATEMENTS,
+  projectedTouchedShape,
+  projectIntegrationWithCollisions,
+  prospectiveIntegrationIndexEntries,
+  requireBoundedIntegrationIndex,
+  requireBoundedIntegrationTree,
+  requireCleanIntegrationIndex,
+  requireSafeIntegrationWorktree,
+  reserveIntegrationExecution,
+  reserveIntegrationPlan,
+} from "./integration-worktree.js";
 import type { MergeResult } from "./kinds.js";
 import { abortProjectedMerge, applyProjectedMerge } from "./merge-apply.js";
 import { selectMergeBases } from "./merge-base.js";
-import { type ProjectedMergeEntry, projectMergePlan } from "./merge-projection.js";
+import type { ProjectedMergeEntry } from "./merge-projection.js";
 import {
-  MAX_MERGE_IDENTITY_BYTES,
-  MAX_MERGE_MESSAGE_BYTES,
   type MergeJournal,
   type MergeStateMetadata,
   type MergeTouchedPath,
   validateMergeStateMetadata,
 } from "./merge-state.js";
-import { checkoutBlockers } from "./refs.js";
-import {
-  buildTreeInBatch,
-  preflightTreeBuild,
-  type TreeBuildPreflightStats,
-} from "./tree-build.js";
+import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
-import { walkWorktreeEntriesStream } from "./worktree-io.js";
 
 const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
-const MAX_RELOCATION_COLLISIONS = 1_000;
 const MAX_VIRTUAL_COMMITS = 1;
-const MAX_MERGE_REPOSITORY_ROWS = 50_000;
-const MAX_MERGE_INDEX_ENTRIES = 10_000;
-const MAX_MERGE_INDEX_PATH_BYTES = 4 * 1024 * 1024;
-const MAX_MERGE_TREE_OBJECTS = 4_096;
-const MAX_MERGE_SERIALIZED_TREE_BYTES = 16 * 1024 * 1024;
-const MAX_MERGE_GUARD_HASH_BYTES = 32 * 1024 * 1024;
-// One 16 MiB tree plus one 8 MiB blob/filesystem batch beside the retained plan.
-const MERGE_EXECUTION_HEADROOM_BYTES = 24 * 1024 * 1024;
 const MERGE_FIXED_SQL_STATEMENTS = 30;
-const MERGE_INDEX_SQL_STATEMENTS = 48;
-const MERGE_GUARD_SQL_STATEMENTS = 300;
-const MERGE_COLLISION_SQL_STATEMENTS = 160;
-const MERGE_OBJECT_BATCH_BYTES = 1024 * 1024;
-const MERGE_OBJECT_BATCH_COUNT = 4_096;
-const MERGE_TREE_INDEX_ROWS = 2_048;
 const VIRTUAL_OBJECT_PAYLOAD_BYTES = 1024 * 1024;
 const VIRTUAL_OBJECT_OVERHEAD_BYTES = 64 * 1024;
 const VIRTUAL_IDENTITY = {
@@ -214,7 +207,7 @@ function virtualMaterializationStatements(
   plan: IntegrationPlan,
 ): number {
   const currentTree = commitTree(repo, currentOid);
-  requireBoundedTreeEntries(virtualTreeEntries(repo, batchForIdentity(), currentTree, plan));
+  requireBoundedIntegrationTree(virtualTreeEntries(repo, batchForIdentity(), currentTree, plan));
   let statements = 1;
   const batch: ObjectBatch = {
     write(type: ObjectType, data: Uint8Array): string {
@@ -250,39 +243,6 @@ function batchForIdentity(): ObjectBatch {
   };
 }
 
-function integrationSqlStatements(plan: IntegrationPlan, treeStatements: number): number {
-  return treeStatements + plan.blobReadCalls * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
-}
-
-function commitSqlStatements(stats: TreeBuildPreflightStats): number {
-  const objects = stats.treeObjects + 1;
-  const payloadBytes =
-    stats.serializedTreeBytes +
-    stats.treeObjects * 1_024 +
-    MAX_MERGE_MESSAGE_BYTES +
-    4 * MAX_MERGE_IDENTITY_BYTES +
-    1_024;
-  const payloadPages = Math.max(1, Math.ceil(payloadBytes / MERGE_OBJECT_BATCH_BYTES));
-  const flushes = Math.ceil(objects / MERGE_OBJECT_BATCH_COUNT) + payloadPages;
-  const indexedRows = stats.leafEntries + stats.treeObjects - 1;
-  return (
-    20 +
-    flushes * 6 +
-    payloadPages * 2 +
-    Math.ceil(indexedRows / MERGE_TREE_INDEX_ROWS) * 2 +
-    Math.ceil(stats.treeObjects / MERGE_TREE_INDEX_ROWS) * 2 +
-    Math.ceil(stats.leafEntries / 2_048)
-  );
-}
-
-const MERGE_COMMIT_SQL_STATEMENTS = commitSqlStatements({
-  leafEntries: MAX_MERGE_INDEX_ENTRIES,
-  totalPathBytes: MAX_MERGE_INDEX_PATH_BYTES,
-  treeObjects: MAX_MERGE_TREE_OBJECTS,
-  serializedTreeBytes: MAX_MERGE_SERIALIZED_TREE_BYTES,
-  maxSingleTreeBytes: MAX_MERGE_SERIALIZED_TREE_BYTES,
-});
-
 function synthesizeVirtualPair(
   repo: Repository,
   currentOid: string,
@@ -316,7 +276,7 @@ function synthesizeVirtualPair(
     depth,
   });
   budget.sqlStatements += integrationSqlStatements(plan, MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS);
-  const reservation = reservePlan(repo, plan);
+  const reservation = reserveIntegrationPlan(repo, plan);
   try {
     budget.sqlStatements += virtualMaterializationStatements(repo, currentOid, incomingOid, plan);
     if (budget.sqlStatements >= 1_000) {
@@ -354,254 +314,6 @@ function selectedBaseTree(
   budget: VirtualBudget,
 ): string {
   return commitTree(repo, synthesizeVirtualBases(repo, bases, budget, 1));
-}
-
-function requireBoundedTreeEntries(entries: Iterable<IndexEntry>): TreeBuildPreflightStats {
-  return preflightTreeBuild(entries, {
-    maxLeafEntries: MAX_MERGE_INDEX_ENTRIES,
-    maxTotalPathBytes: MAX_MERGE_INDEX_PATH_BYTES,
-    maxTreeObjects: MAX_MERGE_TREE_OBJECTS,
-    maxSerializedTreeBytes: MAX_MERGE_SERIALIZED_TREE_BYTES,
-  });
-}
-
-function projectedIdentity(entry: ProjectedMergeEntry): { mode: string; oid: string } | null {
-  if (entry.stageZero !== null) return entry.stageZero;
-  if (entry.stages === null) return null;
-  return entry.stages.current ?? entry.stages.incoming ?? entry.stages.base;
-}
-
-function* prospectiveIndexEntries(
-  repo: Repository,
-  projected: readonly ProjectedMergeEntry[],
-): Generator<IndexEntry> {
-  const owned = new Set(projectedTouchedShape(projected).map((entry) => entry.path));
-  for (const row of joinSorted(repo.store.indexScan(), projected, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    if (row.right !== undefined) {
-      const identity = projectedIdentity(row.right);
-      if (identity !== null) yield indexEntry(row.right.path, identity.mode, identity.oid);
-      continue;
-    }
-    if (row.left !== undefined && !owned.has(row.left.path)) yield row.left;
-  }
-}
-
-function* continuationIndexEntries(repo: Repository): Generator<IndexEntry> {
-  let previous: string | null = null;
-  for (const entry of repo.store.indexScan()) {
-    if (entry.path === previous) continue;
-    previous = entry.path;
-    yield entry.stage === 0 ? entry : { ...entry, stage: 0 };
-  }
-}
-
-function requireBoundedIndex(repo: Repository): void {
-  requireBoundedTreeEntries(continuationIndexEntries(repo));
-}
-
-function reservePlan(
-  repo: Repository,
-  plan: IntegrationPlan,
-): ReturnType<Repository["store"]["reserveMemory"]> {
-  const reservation = repo.store.reserveMemory();
-  reservation.set("other", plan.retainedBytes + MERGE_EXECUTION_HEADROOM_BYTES);
-  return reservation;
-}
-
-function reserveExecutionHeadroom(
-  repo: Repository,
-): ReturnType<Repository["store"]["reserveMemory"]> {
-  const reservation = repo.store.reserveMemory();
-  reservation.set("other", MERGE_EXECUTION_HEADROOM_BYTES);
-  return reservation;
-}
-
-function requireCleanIndex(repo: Repository, headTree: string): void {
-  if (repo.store.hasConflicts()) {
-    throw new GitError("EUNMERGED", "cannot merge with unmerged index entries");
-  }
-  for (const row of joinSorted(treeStream(repo, headTree), repo.store.indexScan(), {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    const tree = row.left;
-    const index = row.right;
-    if (
-      tree === undefined ||
-      index === undefined ||
-      index.stage !== 0 ||
-      index.oid !== tree.oid ||
-      index.mode !== Number.parseInt(tree.mode, 8)
-    ) {
-      throw new GitError("ECHECKOUTFAIL", "cannot merge: the index contains staged changes");
-    }
-  }
-}
-
-function requireSafeWorktree(
-  repo: Repository,
-  worktree: Worktree,
-  incomingTree: string,
-  paths: readonly string[],
-): void {
-  if (paths.length === 0) return;
-  const blockers = checkoutBlockers(repo, worktree, incomingTree, [...paths], true, {
-    maxRows: MAX_MERGE_REPOSITORY_ROWS,
-    maxHashBytes: MAX_MERGE_GUARD_HASH_BYTES,
-    rows: 0,
-    hashBytes: 0,
-    maxHashRangeReads: 30,
-    hashRangeReads: 0,
-    maxHashCandidates: 1_000,
-    hashCandidates: 0,
-    maxHashBatches: 1,
-    hashBatches: 0,
-  });
-  if (blockers.tracked.length > 0) {
-    throw new GitError(
-      "ECHECKOUTFAIL",
-      `local changes to ${blockers.tracked.join(", ")} would be overwritten by merge`,
-    );
-  }
-  if (blockers.untracked.length > 0) {
-    throw new GitError(
-      "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by merge: ${blockers.untracked.join(", ")}`,
-    );
-  }
-}
-
-function relocationBases(entries: readonly ProjectedMergeEntry[]): string[] {
-  return entries.flatMap((entry) => (entry.purpose === "primary" ? [] : [entry.path]));
-}
-
-function collisionCandidate(base: string, path: string): string | null {
-  if (path === base || path.startsWith(`${base}/`)) return base;
-  if (!path.startsWith(`${base}_`)) return null;
-  let end = base.length + 1;
-  while (end < path.length && path.charCodeAt(end) >= 0x30 && path.charCodeAt(end) <= 0x39) end++;
-  if (end === base.length + 1 || (end < path.length && path.charCodeAt(end) !== 0x2f)) return null;
-  return path.slice(0, end);
-}
-
-function retainCollision(path: string, bases: readonly string[], collisions: Set<string>): void {
-  for (const base of bases) {
-    const candidate = collisionCandidate(base, path);
-    if (candidate === null || collisions.has(candidate)) continue;
-    if (collisions.size >= MAX_RELOCATION_COLLISIONS) {
-      throw new GitError(
-        "E2BIG",
-        `merge relocation collisions exceed ${MAX_RELOCATION_COLLISIONS} paths`,
-      );
-    }
-    collisions.add(candidate);
-  }
-}
-
-function relocationCollisions(
-  repo: Repository,
-  worktree: Worktree,
-  baseTree: string,
-  incomingTree: string,
-  initial: readonly ProjectedMergeEntry[],
-  omitted: ReadonlySet<string>,
-): { tracked: ReadonlySet<string>; untracked: ReadonlySet<string> } {
-  const bases = relocationBases(initial);
-  if (bases.length === 0) return { tracked: new Set(), untracked: new Set() };
-  const tracked = new Set<string>();
-  let indexRows = 0;
-  for (const entry of repo.store.indexScan()) {
-    if (indexRows >= MAX_MERGE_REPOSITORY_ROWS) {
-      throw new GitError("E2BIG", `merge collision scan exceeds ${MAX_MERGE_REPOSITORY_ROWS} rows`);
-    }
-    indexRows++;
-    if (!omitted.has(entry.path)) retainCollision(entry.path, bases, tracked);
-  }
-  for (const entry of treeStream(repo, baseTree)) retainCollision(entry.path, bases, tracked);
-  for (const entry of treeStream(repo, incomingTree)) retainCollision(entry.path, bases, tracked);
-
-  const untracked = new Set<string>();
-  let worktreeRows = 0;
-  for (const row of joinSorted(
-    repo.store.indexScan(),
-    walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
-    { left: (entry) => entry.path, right: (entry) => entry.path },
-  )) {
-    if (worktreeRows >= MAX_MERGE_REPOSITORY_ROWS) {
-      throw new GitError("E2BIG", `merge collision scan exceeds ${MAX_MERGE_REPOSITORY_ROWS} rows`);
-    }
-    worktreeRows++;
-    if (omitted.has(row.path)) continue;
-    if (row.right !== undefined && row.left === undefined) {
-      retainCollision(row.path, bases, untracked);
-    }
-  }
-  return { tracked, untracked };
-}
-
-function projectWithCollisions(
-  repo: Repository,
-  worktree: Worktree,
-  baseTree: string,
-  incomingTree: string,
-  plan: ReturnType<typeof planIntegration>,
-  currentLabel: string,
-  nextLabel: string,
-  omitted: ReadonlySet<string> = new Set(),
-): readonly ProjectedMergeEntry[] {
-  const initial = projectMergePlan(plan, { currentLabel, incomingLabel: nextLabel });
-  const collisions = relocationCollisions(repo, worktree, baseTree, incomingTree, initial, omitted);
-  return projectMergePlan(plan, {
-    currentLabel,
-    incomingLabel: nextLabel,
-    trackedCollisions: collisions.tracked,
-    untrackedCollisions: collisions.untracked,
-  });
-}
-
-interface TouchedShape {
-  path: string;
-  logicalPath: string;
-  purpose: MergeTouchedPath["purpose"];
-}
-
-function projectedTouchedShape(entries: readonly ProjectedMergeEntry[]): TouchedShape[] {
-  const byPath = new Map<string, TouchedShape>();
-  const retain = (shape: TouchedShape): void => {
-    if (byPath.has(shape.path)) return;
-    if (byPath.size >= 1_000) {
-      throw new GitError("E2BIG", "merge ownership exceeds 1000 touched paths");
-    }
-    byPath.set(shape.path, shape);
-  };
-  const retainAncestor = (path: string): void => {
-    let slash = path.lastIndexOf("/");
-    while (slash > 0) {
-      const ancestor = path.slice(0, slash);
-      retain({ path: ancestor, logicalPath: ancestor, purpose: "primary" });
-      slash = ancestor.lastIndexOf("/");
-    }
-  };
-  for (const entry of entries) {
-    retain({
-      path: entry.path,
-      logicalPath: entry.logicalPath,
-      purpose: entry.purpose,
-    });
-    if (entry.purpose !== "primary" && !byPath.has(entry.logicalPath)) {
-      retain({
-        path: entry.logicalPath,
-        logicalPath: entry.logicalPath,
-        purpose: "primary",
-      });
-    }
-    retainAncestor(entry.path);
-    retainAncestor(entry.logicalPath);
-  }
-  return [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
 }
 
 function snapshotMode(entry: MergeTouchedPath): string | null {
@@ -670,7 +382,7 @@ function requireJournalOwnership(
   const budget: VirtualBudget = {
     commits: 0,
     sqlStatements:
-      selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + MERGE_COLLISION_SQL_STATEMENTS,
+      selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + INTEGRATION_COLLISION_SQL_STATEMENTS,
   };
   const baseTree = selectedBaseTree(repo, selection.bases, budget);
   const plan = planIntegration(repo, {
@@ -689,10 +401,10 @@ function requireJournalOwnership(
   if (budget.sqlStatements + tailSqlStatements >= 1_000) {
     throw new GitError("E2BIG", "merge recovery SQL model exceeds 999 statements");
   }
-  const reservation = reservePlan(repo, plan);
+  const reservation = reserveIntegrationPlan(repo, plan);
   try {
     const omitted = new Set(journal.touched.map((entry) => entry.path));
-    const projected = projectWithCollisions(
+    const projected = projectIntegrationWithCollisions(
       repo,
       worktree,
       baseTree,
@@ -836,12 +548,12 @@ function mergeInTransaction(
   const budget: VirtualBudget = {
     commits: 0,
     sqlStatements:
-      selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + MERGE_GUARD_SQL_STATEMENTS,
+      selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + INTEGRATION_GUARD_SQL_STATEMENTS,
   };
   if (!isFastForward) {
-    requireBoundedIndex(repo);
-    requireCleanIndex(repo, currentTree);
-    budget.sqlStatements += MERGE_INDEX_SQL_STATEMENTS;
+    requireBoundedIntegrationIndex(repo);
+    requireCleanIntegrationIndex(repo, currentTree, "merge");
+    budget.sqlStatements += INTEGRATION_INDEX_SQL_STATEMENTS;
   }
   const baseTree = isFastForward ? currentTree : selectedBaseTree(repo, selection.bases, budget);
   const plan = planIntegration(repo, {
@@ -851,9 +563,9 @@ function mergeInTransaction(
     text: { labels: { current: currentLabel, base: "base", incoming: nextLabel } },
   });
   budget.sqlStatements += integrationSqlStatements(plan, MAX_INTEGRATION_TREE_STATEMENTS);
-  const reservation = reservePlan(repo, plan);
+  const reservation = reserveIntegrationPlan(repo, plan);
   try {
-    const projected = projectWithCollisions(
+    const projected = projectIntegrationWithCollisions(
       repo,
       worktree,
       baseTree,
@@ -863,13 +575,14 @@ function mergeInTransaction(
       nextLabel,
     );
     if (projected.some((entry) => entry.purpose !== "primary")) {
-      budget.sqlStatements += MERGE_COLLISION_SQL_STATEMENTS;
+      budget.sqlStatements += INTEGRATION_COLLISION_SQL_STATEMENTS;
     }
-    requireSafeWorktree(
+    requireSafeIntegrationWorktree(
       repo,
       worktree,
       nextTree,
       plan.entries.map((entry) => entry.path),
+      "merge",
     );
     const conflicts = conflictedPaths(projected);
     if (conflicts.length > 0 && behavior.persistConflicts === false) {
@@ -877,9 +590,11 @@ function mergeInTransaction(
     }
     let projectedTree: TreeBuildPreflightStats | null = null;
     if (!isFastForward) {
-      projectedTree = requireBoundedTreeEntries(prospectiveIndexEntries(repo, projected));
+      projectedTree = requireBoundedIntegrationTree(
+        prospectiveIntegrationIndexEntries(repo, projected),
+      );
       if (conflicts.length === 0 && options.commit !== false) {
-        budget.sqlStatements += commitSqlStatements(projectedTree);
+        budget.sqlStatements += integrationCommitSqlStatements(projectedTree);
       }
     }
 
@@ -902,7 +617,7 @@ function mergeInTransaction(
       repo.store.setRef(head.ref, incomingOid);
       return { oid: incomingOid, fastForward: true };
     }
-    requireBoundedIndex(repo);
+    requireBoundedIntegrationIndex(repo);
     if (applied.outcome === "conflicted") {
       return { conflicted: true, pendingCommit: true };
     }
@@ -946,13 +661,13 @@ export function mergeContinue(
       repo,
       context.worktree,
       journal,
-      MERGE_COMMIT_SQL_STATEMENTS + MERGE_INDEX_SQL_STATEMENTS,
+      MAX_INTEGRATION_COMMIT_SQL_STATEMENTS + INTEGRATION_INDEX_SQL_STATEMENTS,
     );
     if (repo.store.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue: the index has unmerged paths");
     }
-    requireBoundedIndex(repo);
-    const reservation = reserveExecutionHeadroom(repo);
+    requireBoundedIntegrationIndex(repo);
+    const reservation = reserveIntegrationExecution(repo);
     try {
       const identities = resolveIdentity(context, repo, {
         author: options.author ?? journal.state.author ?? undefined,
@@ -981,7 +696,7 @@ export function mergeAbort(repo: Repository, worktree: Worktree): void {
     const journal = repo.store.requireMergeState();
     requireOriginalHead(repo, journal.state);
     requireJournalOwnership(repo, worktree, journal, 350);
-    const reservation = reserveExecutionHeadroom(repo);
+    const reservation = reserveIntegrationExecution(repo);
     try {
       abortProjectedMerge(repo, worktree, journal);
     } finally {

@@ -21,6 +21,13 @@ import {
   validateMergePath,
   validateMergeStateMetadata,
 } from "./merge-state.js";
+import {
+  mergeOperationState,
+  type OperationJournal,
+  type OperationStateMetadata,
+  operationJournalIntegrityOid,
+  operationJournalRetainedBytes,
+} from "./operation-state.js";
 
 const APPLY_SCAN_PAGE = 1_000;
 export const MAX_MERGE_APPLY_SCAN_PAGES = 50;
@@ -55,6 +62,33 @@ export interface MergeApplyResult {
 export interface MergeApplyOptions {
   /** Statements already reserved by merge-base selection and integration planning. */
   priorSqlStatements?: number;
+}
+
+export interface OperationApplyOptions {
+  priorSqlStatements?: number;
+  suspendedState: OperationStateMetadata | null;
+}
+
+export interface OperationApplyResult {
+  touched: readonly MergeTouchedPath[] | null;
+  sqlStatements: number;
+}
+
+export interface OperationRestoreOptions {
+  /** Statements already reserved by journal verification and ownership reconstruction. */
+  priorSqlStatements?: number;
+  /** Include the caller's operation-state clear in the pre-write estimate. */
+  clearState?: boolean;
+}
+
+export interface OperationRestoreSqlInput {
+  worktreeScanPages: number;
+  blobReadCalls: number;
+  worktreeWriteCalls: number;
+  worktreeWriteBytes: number;
+  indexMutations: number;
+  hasRemovals: boolean;
+  clearState: boolean;
 }
 
 export interface MergeApplySqlInput {
@@ -198,6 +232,42 @@ export function calculateMergeApplySqlStatements(
   return {
     applySqlStatements: apply,
     totalSqlStatements: addStatements(priorSqlStatements, apply),
+  };
+}
+
+/** Compose a replay restore estimate before its first mutation. */
+export function calculateOperationRestoreSqlStatements(
+  priorSqlStatements: number,
+  input: OperationRestoreSqlInput,
+): MergeApplySqlEstimate {
+  requireCount(priorSqlStatements, "prior SQL statements");
+  for (const count of [
+    input.worktreeScanPages,
+    input.blobReadCalls,
+    input.worktreeWriteCalls,
+    input.worktreeWriteBytes,
+    input.indexMutations,
+  ]) {
+    requireCount(count, "restore SQL estimate input");
+  }
+  let restore = 6; // authenticated journal, roots, and bounded fixed probes
+  restore = addStatements(restore, input.worktreeScanPages);
+  restore = addStatements(restore, input.blobReadCalls * MAX_OBJECT_STATEMENTS_PER_READ);
+  restore = addStatements(restore, 1); // one bounded object-info probe for snapshot blobs
+  if (input.hasRemovals) restore = addStatements(restore, 6);
+  if (input.worktreeWriteCalls > 0) {
+    restore = addStatements(
+      restore,
+      input.worktreeWriteCalls * 10 + payloadPages(input.worktreeWriteBytes),
+    );
+  }
+  if (input.indexMutations > 0) {
+    restore = addStatements(restore, Math.ceil(input.indexMutations / 512) * 2);
+  }
+  if (input.clearState) restore = addStatements(restore, 9);
+  return {
+    applySqlStatements: restore,
+    totalSqlStatements: addStatements(priorSqlStatements, restore),
   };
 }
 
@@ -818,21 +888,15 @@ function structuralRemovals(
 }
 
 /** Apply inside the caller's transaction so journal and mutations commit together. */
-export function applyProjectedMerge(
+export function applyProjectedOperation(
   repo: Repository,
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
-  metadata: MergeApplyMetadata,
-  options: MergeApplyOptions = {},
-): MergeApplyResult {
+  options: OperationApplyOptions,
+): OperationApplyResult {
   validateEntries(entries);
-  repo.store.requireNoMergeState();
-  const outcome = outcomeOf(entries, metadata.mode);
-  if (outcome === "clean") {
-    validateMergeStateMetadata({ ...metadata, phase: "conflicted" });
-  } else {
-    validateMergeStateMetadata(metadataForOutcome(metadata, outcome));
-  }
+  repo.store.requireNoOperationState();
+  const suspendedState = options.suspendedState;
 
   const specs = touchedSpecs(entries);
   const owned = specs.map((spec) => spec.path);
@@ -840,10 +904,9 @@ export function applyProjectedMerge(
   const worktreeRows = worktreeSnapshotScan(repo, worktree, specs, destructive, owned);
   const calls: ReadCallBudget = { snapshot: 0, blobs: 0 };
   let drafts: SnapshotDraft[] = [];
-  let state: MergeStateMetadata | null = null;
   let previewTouched: MergeTouchedPath[] = [];
   let indexRows = 0;
-  if (outcome !== "clean") {
+  if (suspendedState !== null) {
     const index = indexSnapshots(repo, specs);
     indexRows = index.rows;
     drafts = specs.map((spec) => ({
@@ -851,7 +914,6 @@ export function applyProjectedMerge(
       index: index.entries.get(spec.path) ?? null,
       stat: worktreeRows.entries.get(spec.path) ?? null,
     }));
-    state = metadataForOutcome(metadata, outcome);
     previewTouched = touchedFromDrafts(drafts, null);
   }
 
@@ -868,7 +930,7 @@ export function applyProjectedMerge(
   const contentBytes = contentObjectSizes.reduce((total, size) => total + size, 0);
   const removals = structuralRemovals(entries, worktreeRows.entries);
   const journalRetainedBytes =
-    state === null ? 0 : mergeJournalRetainedBytes(state, previewTouched);
+    suspendedState === null ? 0 : operationJournalRetainedBytes(suspendedState, previewTouched);
   const estimate = calculateMergeApplySqlStatements(options.priorSqlStatements ?? 0, {
     worktreeScanPages: worktreeRows.pages,
     indexScanRows: indexRows,
@@ -880,9 +942,9 @@ export function applyProjectedMerge(
     worktreeWriteBytes: source.bytes + contentBytes,
     indexMutations: indexMutationCount(entries, specs),
     journalRetainedBytes,
-    hasJournal: state !== null,
+    hasJournal: suspendedState !== null,
     hasRemovals: removals.length > 0,
-    objectInfoCalls: (source.calls > 0 ? 1 : 0) + (state === null ? 0 : 1),
+    objectInfoCalls: (source.calls > 0 ? 1 : 0) + (suspendedState === null ? 0 : 1),
   });
   if (
     estimate.applySqlStatements > MAX_MERGE_APPLY_SQL_STATEMENTS ||
@@ -894,13 +956,12 @@ export function applyProjectedMerge(
     );
   }
 
-  let journal: MergeJournal | null = null;
-  if (state !== null) {
+  let touched: readonly MergeTouchedPath[] | null = null;
+  if (suspendedState !== null) {
     const root = worktree.realpath(repo.root);
     const snapshotOids = snapshotWorktreeObjects(repo, worktree, root, drafts, calls);
-    const touched = touchedFromDrafts(drafts, snapshotOids);
-    journal = { state, touched, retainedBytes: mergeJournalRetainedBytes(state, touched) };
-    validateJournalObjects(repo, journal);
+    touched = touchedFromDrafts(drafts, snapshotOids);
+    operationJournalRetainedBytes(suspendedState, touched);
   }
 
   const contentOids = contentObjects(repo, entries);
@@ -914,8 +975,38 @@ export function applyProjectedMerge(
   }
   materialiseWrites(repo, worktree, entries, contentOids, calls);
   applyIndex(repo, entries, specs);
-  if (journal !== null) repo.store.writeMergeState(journal.state, journal.touched);
-  return { outcome, journal, sqlStatements: estimate.applySqlStatements };
+  if (touched !== null) {
+    if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
+    repo.store.writeOperationState(suspendedState, touched);
+  }
+  return { touched, sqlStatements: estimate.applySqlStatements };
+}
+
+export function applyProjectedMerge(
+  repo: Repository,
+  worktree: Worktree,
+  entries: readonly ProjectedMergeEntry[],
+  metadata: MergeApplyMetadata,
+  options: MergeApplyOptions = {},
+): MergeApplyResult {
+  const outcome = outcomeOf(entries, metadata.mode);
+  if (outcome === "clean") {
+    validateMergeStateMetadata({ ...metadata, phase: "conflicted" });
+  }
+  const state = outcome === "clean" ? null : metadataForOutcome(metadata, outcome);
+  const applied = applyProjectedOperation(repo, worktree, entries, {
+    priorSqlStatements: options.priorSqlStatements,
+    suspendedState: state === null ? null : mergeOperationState(state),
+  });
+  const journal =
+    state === null || applied.touched === null
+      ? null
+      : {
+          state,
+          touched: applied.touched,
+          retainedBytes: mergeJournalRetainedBytes(state, applied.touched),
+        };
+  return { outcome, journal, sqlStatements: applied.sqlStatements };
 }
 
 function validateJournal(journal: MergeJournal): void {
@@ -1065,6 +1156,64 @@ function restoreWorktree(
   }
 }
 
+function restoreSqlInput(
+  repo: Repository,
+  touched: readonly MergeTouchedPath[],
+  current: ReadonlyMap<string, WorktreeStat>,
+  worktreeScanPages: number,
+  clearState: boolean,
+): OperationRestoreSqlInput {
+  const oids: string[] = [];
+  const seen = new Set<string>();
+  let directories = 0;
+  let hasRemovals = false;
+  for (const entry of touched) {
+    const snapshot = entry.worktree;
+    if (snapshot.kind === "absent") {
+      hasRemovals = true;
+      continue;
+    }
+    if (snapshot.kind === "directory") {
+      directories++;
+      if (current.get(entry.path)?.type !== "dir") hasRemovals = true;
+      continue;
+    }
+    if (current.get(entry.path)?.type === "dir") hasRemovals = true;
+    if (!seen.has(snapshot.oid)) {
+      seen.add(snapshot.oid);
+      oids.push(snapshot.oid);
+    }
+  }
+  const sizes: number[] = [];
+  const sizeByOid = new Map<string, number>();
+  for (const object of repo.store.objectInfo(oids)) {
+    if (object.type !== "blob") {
+      throw new CorruptError(`merge abort object ${object.oid} is not a blob`);
+    }
+    sizes.push(object.size);
+    sizeByOid.set(object.oid, object.size);
+  }
+  let bytes = 0;
+  for (const entry of touched) {
+    const snapshot = entry.worktree;
+    if (snapshot.kind !== "file" && snapshot.kind !== "symlink") continue;
+    const size = sizeByOid.get(snapshot.oid);
+    if (size === undefined) throw new CorruptError(`merge abort lost object ${snapshot.oid}`);
+    bytes += size;
+    if (!Number.isSafeInteger(bytes)) throw new GitError("E2BIG", "merge abort size overflow");
+  }
+  const blobReadCalls = boundedReadCalls(sizes, MAX_MERGE_APPLY_BLOB_READ_CALLS, "blob");
+  return {
+    worktreeScanPages,
+    blobReadCalls,
+    worktreeWriteCalls: blobReadCalls + (directories > 0 ? 1 : 0),
+    worktreeWriteBytes: bytes,
+    indexMutations: touched.length * 2,
+    hasRemovals,
+    clearState,
+  };
+}
+
 /** Restore only journal-owned paths; the caller supplies the atomic transaction. */
 export function abortProjectedMerge(
   repo: Repository,
@@ -1092,4 +1241,61 @@ export function abortProjectedMerge(
   restoreWorktree(repo, worktree, journal.touched, current.entries, calls);
   restoreIndex(repo, journal.touched);
   repo.store.clearMergeState();
+}
+
+/** Restore one authenticated operation snapshot; the caller owns state clearing. */
+export function restoreProjectedOperation(
+  repo: Repository,
+  worktree: Worktree,
+  journal: OperationJournal,
+  options: OperationRestoreOptions = {},
+): void {
+  const retainedBytes = operationJournalRetainedBytes(journal.state, journal.touched);
+  if (retainedBytes !== journal.retainedBytes) {
+    throw new CorruptError("operation journal retained-byte count is stale");
+  }
+  if (operationJournalIntegrityOid(journal.state, journal.touched) !== journal.integrityOid) {
+    throw new CorruptError("operation journal integrity identity is stale");
+  }
+  let previous: string | null = null;
+  for (const entry of journal.touched) {
+    if (previous !== null && comparePaths(previous, entry.path) >= 0) {
+      throw new CorruptError("operation journal paths are not in strict Git path order");
+    }
+    previous = entry.path;
+  }
+  const calls: ReadCallBudget = { snapshot: 0, blobs: 0 };
+  const specs = journal.touched.map((entry) => ({
+    path: entry.path,
+    logicalPath: entry.logicalPath,
+    purpose: entry.purpose,
+  }));
+  const owned = journal.touched
+    .filter((entry) => entry.worktree.kind === "absent")
+    .map((entry) => entry.path);
+  const current = worktreeSnapshotScan(
+    repo,
+    worktree,
+    specs,
+    abortDestructiveRoots(journal.touched),
+    owned,
+  );
+  const estimate = calculateOperationRestoreSqlStatements(
+    options.priorSqlStatements ?? 0,
+    restoreSqlInput(
+      repo,
+      journal.touched,
+      current.entries,
+      current.pages,
+      options.clearState ?? false,
+    ),
+  );
+  if (estimate.totalSqlStatements >= 1_000) {
+    throw new GitError(
+      "E2BIG",
+      `merge restore SQL model requires ${estimate.totalSqlStatements} statements`,
+    );
+  }
+  restoreWorktree(repo, worktree, journal.touched, current.entries, calls);
+  restoreIndex(repo, journal.touched);
 }

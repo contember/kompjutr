@@ -5,6 +5,7 @@ import { hashObject } from "../src/core/objects.js";
 import {
   abortProjectedMerge,
   applyProjectedMerge,
+  calculateOperationRestoreSqlStatements,
   MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS,
   MAX_MERGE_APPLY_SQL_STATEMENTS,
   type MergeApplyMetadata,
@@ -69,6 +70,25 @@ function textAt(workspace: TestRepository, path: string): string | null {
 }
 
 describe("projected merge apply", () => {
+  it("accepts recovery statement 999 and rejects statement 1000 exactly", () => {
+    const emptyTail = {
+      worktreeScanPages: 0,
+      blobReadCalls: 0,
+      worktreeWriteCalls: 0,
+      worktreeWriteBytes: 0,
+      indexMutations: 0,
+      hasRemovals: false,
+      clearState: false,
+    };
+    const tail = calculateOperationRestoreSqlStatements(0, emptyTail).applySqlStatements;
+    expect(calculateOperationRestoreSqlStatements(999 - tail, emptyTail).totalSqlStatements).toBe(
+      999,
+    );
+    expect(calculateOperationRestoreSqlStatements(1_000 - tail, emptyTail).totalSqlStatements).toBe(
+      1_000,
+    );
+  });
+
   it("reserves a bounded apply share of the whole-operation SQL limit", () => {
     expect(MAX_MERGE_APPLY_SQL_STATEMENTS).toBe(831);
     expect(MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS).toBe(168);
