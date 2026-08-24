@@ -170,9 +170,8 @@ Consumed backlog item 02, deleted on ship, and implements
   merge commits, and continue/abort state shipped in the later
   [merge lifecycle sprint](./sprint-2026-08-24-merge-operation-lifecycle.md).
   This sprint accepts tree OIDs and returns a plan only.
-- Fast-forward pull and divergent pull remain in
-  [backlog item 01](../backlog/01-fast-forward-pull.md) and
-  [backlog item 03](../backlog/03-divergent-pull.md).
+- Fast-forward and divergent pull shipped in the later
+  [complete pull sprint](./sprint-2026-08-24-complete-pull.md).
 - Stash, rebase, cherry-pick, and revert remain consumers in
   [backlog item 06](../backlog/06-stash-operations.md),
   [backlog item 07](../backlog/07-rebase.md), and

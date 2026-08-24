@@ -20,6 +20,3 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 <!-- one line per active sprint; empty between sprints -->
-- [Complete pull (2026-08-24)](sprint-2026-08-24-complete-pull.md) — compose
-  configured-upstream fetch with native merge for fast-forward and divergent
-  histories.

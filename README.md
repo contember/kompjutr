@@ -46,13 +46,15 @@ fs.writeFileSync("/src/index.ts", "export const value = 1;\n");
 
 ## Git
 
-The native client supports repository initialization, clone, fetch, single-branch
-Smart HTTP push, status, staging, commit, log, diff, checkout, branches, tags,
-refs, config, remotes, local two-head merge, and the plumbing operations exposed
-by `Git`. Merge supports fast-forward, forced merge commits, clean and conflicted
-integration, `commit: false`, restart-safe continue, and path-scoped abort for the
-checked-out branch. Unsupported commands fail with `EUNSUPPORTED` instead of
-falling back to another implementation.
+The native client supports repository initialization, clone, fetch, pull,
+single-branch Smart HTTP push, status, staging, commit, log, diff, checkout,
+branches, tags, refs, config, remotes, local two-head merge, and the plumbing
+operations exposed by `Git`. Pull fetches the configured upstream and delegates
+fast-forward or divergent integration to the native merge lifecycle. Merge
+supports fast-forward, forced merge commits, clean and conflicted integration,
+`commit: false`, restart-safe continue, and path-scoped abort for the checked-out
+branch. Unsupported commands fail with `EUNSUPPORTED` instead of falling back to
+another implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });
@@ -102,6 +104,11 @@ const workspace = new Workspace({
 
 `@cloudflare/computer` is an optional peer dependency. It is not loaded by
 `kompjutr`, `kompjutr/fs`, `kompjutr/git`, or `kompjutr/testing`.
+
+Native pull returns the same structured outcomes as merge and preserves
+restart-safe conflict or no-commit state. The compatibility interface returns
+`void` as declared by Computer; if integration conflicts, it rolls back the local
+index and worktree while retaining the successful fetch and tracking ref.
 
 ## Resource model
 

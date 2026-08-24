@@ -14,8 +14,6 @@ unwieldy; numbers stay folder-local.
 
 ## Items
 
-- [01 — Implement fast-forward pull](01-fast-forward-pull.md)
-- [03 — Complete divergent pull](03-divergent-pull.md)
 - [04 — Add incremental repack and garbage collection](04-repack-and-garbage-collection.md)
 - [05 — Establish CI and release gates](05-ci-and-release-gates.md)
 - [06 — Implement stash operations](06-stash-operations.md)

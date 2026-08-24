@@ -200,6 +200,31 @@ worktree content is preserved, and a structural blocker makes abort fail closed.
 Compatibility clients expose only single-shot merge, so a conflict is rolled
 back and reported as `EMERGEFAIL` instead of leaving unreachable pending state.
 
+## Pull composition
+
+Pull is a two-phase composition rather than a second integration engine. Before
+network work, it validates the checked-out symbolic branch and reads bounded
+`branch.<name>.remote`, `branch.<name>.merge`, remote URL, `pull.ff`, and
+`pull.rebase` values. Explicit remote and branch selectors take precedence over
+lower-priority configuration. Rebase requests fail explicitly; supported pull
+integration delegates every graph, index, worktree, and commit decision to merge.
+
+Fetch publishes a complete validated pack and the selected remote-tracking ref in
+its existing transaction. Pull then revalidates the captured symbolic HEAD, local
+OID, and upstream configuration before invoking merge. A concurrent HEAD change
+fails with `ESTALEHEAD`; an upstream change fails with `ESTALEUPSTREAM`. These
+checks happen after the fetch because no SQLite transaction spans an HTTP await.
+Consequently, a successful fetch remains visible after a later fast-forward-only
+refusal, dirty-worktree refusal, stale-state error, or integration conflict, while
+the local branch, index, worktree, and merge state retain merge's atomicity.
+
+Native pull returns `MergeResult`. Conflicts and `commit: false` use the same
+schema-v9 journal as local merge and can be continued or aborted after a restart.
+The Computer compatibility contract returns `void` and exposes no recovery
+methods, so compatibility pull uses single-shot merge: conflicts roll back local
+integration and report `EMERGEFAIL`, but do not discard fetched objects or the
+tracking ref.
+
 ## Sparse workspace tracking
 
 Schema v7 adds a source-qualified index over raw tree-entry name bytes. Sparse

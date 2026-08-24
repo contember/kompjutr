@@ -1,10 +1,16 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-08-24.** Native and Computer-compatible pull now
+> resolve one bounded configured upstream, fetch it over Smart HTTP, revalidate
+> HEAD and upstream state across the await boundary, and delegate local
+> integration to the complete merge lifecycle. Native conflicts and no-commit
+> results remain restart-safe; compatibility conflicts roll local integration
+> back while retaining fetched objects and tracking refs. Commit map: WU1–WU3 →
+> `2e5f36b`; WU4 → `2e5f36b` plus this archive commit. Verification: `npm run
+> check`; `npm run typecheck`; 150 targeted integration tests; leased production
+> build; leased full suite — 82 files and 1,530 tests passed, 5 skipped, with one
+> unchanged `reads.test.ts` 100 ms wall-clock witness failing at 106.63 ms and
+> reproducing on parent `aa3785e` at 112.64 ms. Backlog closed: 01 and 03.
+> Deferred: rebase, abortable network operations, general interleaving coverage,
+> and the other explicit non-goals below.
 
 # Sprint — Complete pull (2026-08-24)
 
@@ -20,8 +26,7 @@ local integration atomically, leaves native callers an explicit recoverable merg
 state, or leaves the local branch, index, and worktree unchanged while retaining a
 successful fetch.
 
-Consumes backlog items [01](../backlog/01-fast-forward-pull.md) and
-[03](../backlog/03-divergent-pull.md).
+Consumed backlog items 01 and 03, which were deleted on ship.
 
 ## Refs re-verified at HEAD (2026-08-24, `9058b51`)
 
@@ -281,3 +286,25 @@ unit.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- 2026-08-24 — Real Git 2.54 refuses an unconfigured divergent pull and asks for
+  `pull.rebase` or `pull.ff`. This sprint keeps the approved merge-default native
+  contract from Decision 4; configured rebase modes fail explicitly rather than
+  silently selecting merge.
+- 2026-08-24 — Independent WU1 review found that lower-priority invalid upstream
+  config could defeat explicit selectors, config values were materialized before
+  pull bounds, and HEAD OIDs were trusted. Explicit selectors now avoid unused
+  config reads, `configGetBounded()` probes type and byte size before reading the
+  value, and pull validates the checked-out commit before HTTP.
+- 2026-08-24 — WU1 and WU2 share the public client and acceptance witness, so
+  they are integrated as one checkpoint rather than committing a typed public
+  method whose runtime body still throws `EUNSUPPORTED`.
+- 2026-08-24 — Independent feature review found incorrect `remote`/`url`
+  precedence, unsafe URL presentation, a non-Git conflict label, and missing race
+  witnesses. Pull now keeps the configured tracking namespace under an explicit
+  transport URL, strips userinfo/query/fragment from persisted messages, uses the
+  fetched OID in conflict markers, and covers every captured HEAD/upstream field.
+- 2026-08-24 — The leased full suite had one unrelated timing failure in
+  `reads.test.ts`. An isolated no-SMT run reproduced it on the sprint parent
+  `aa3785e`, so it is recorded as a baseline gate exception rather than attributed
+  to pull.

@@ -16,15 +16,13 @@ decisions → reference → archive.
 ## Active sprints
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
-- [`sprints/sprint-2026-08-24-complete-pull.md`](sprints/sprint-2026-08-24-complete-pull.md)
-  — configured-upstream fetch plus safe fast-forward and divergent integration.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Complete pull is active. It composes the shipped fetch and merge engines while
-  preserving native conflict recovery and compatibility-client atomicity.
+- CI and release gates are the next delivery priority now that clone, fetch,
+  push, merge, and pull have complete public paths.
 
 ## Key reference
 
@@ -40,6 +38,8 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-24-complete-pull.md`](archive/sprint-2026-08-24-complete-pull.md)
+  — configured-upstream fetch plus safe native and compatibility integration.
 - [`archive/sprint-2026-08-24-merge-operation-lifecycle.md`](archive/sprint-2026-08-24-merge-operation-lifecycle.md)
   — complete bounded two-head merge lifecycle for the checked-out branch.
 - [`archive/sprint-2026-08-24-three-way-integration-engine.md`](archive/sprint-2026-08-24-three-way-integration-engine.md)

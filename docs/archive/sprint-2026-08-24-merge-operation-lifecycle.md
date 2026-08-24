@@ -228,10 +228,9 @@ Consumed backlog item 19 and builds directly on the archived
 
 ## Out of scope (explicit)
 
-- `pull` composition remains in
-  [backlog item 01](../backlog/01-fast-forward-pull.md) and
-  [backlog item 03](../backlog/03-divergent-pull.md). This sprint accepts only
-  commits and refs already present in the local object database.
+- `pull` composition shipped in the later
+  [complete pull sprint](./sprint-2026-08-24-complete-pull.md). This sprint
+  accepts only commits and refs already present in the local object database.
 - Octopus merges, unrelated-history opt-in, detached-HEAD merges, and merging
   into a branch other than the checked-out branch are separate command shapes.
   This sprint fully implements the normal two-head checked-out-branch lifecycle
