@@ -22,7 +22,8 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- No active sprint. Create one before starting the next feature batch.
+- No active sprint. The next recommended item is
+  [the shared three-way integration engine](backlog/02-three-way-integration-engine.md).
 
 ## Key reference
 
@@ -34,6 +35,7 @@ decisions → reference → archive.
 
 - [`decisions/0001-own-the-standalone-sqlite-runtime.md`](decisions/0001-own-the-standalone-sqlite-runtime.md)
 - [`decisions/0002-compile-shell-commands-to-bounded-queries.md`](decisions/0002-compile-shell-commands-to-bounded-queries.md)
+- [`decisions/0003-port-xdiff-text-merge.md`](decisions/0003-port-xdiff-text-merge.md)
 
 ## Historical records
 

@@ -16,3 +16,4 @@ a commit message suffices.
 
 - [0001 — Own the standalone SQLite runtime](0001-own-the-standalone-sqlite-runtime.md) — accepted (2026-08-20)
 - [0002 — Compile shell commands to bounded queries](0002-compile-shell-commands-to-bounded-queries.md) — accepted (2026-08-21)
+- [0003 — Port xdiff for text merge](0003-port-xdiff-text-merge.md) — accepted (2026-08-24)
