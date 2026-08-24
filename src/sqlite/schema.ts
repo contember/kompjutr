@@ -10,7 +10,7 @@ import { CorruptError } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -97,16 +97,21 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, path)
    ) WITHOUT ROWID`,
 
-  // One durable, incomplete merge per repository. Applying is never a
-  // persisted phase: the enclosing database transaction makes it atomic.
-  `CREATE TABLE IF NOT EXISTS git_merge_state (
+  // One durable, incomplete integration operation per repository. Applying is
+  // never persisted: the enclosing database transaction makes it atomic.
+  `CREATE TABLE IF NOT EXISTS git_operation_state (
      repo_id INTEGER PRIMARY KEY,
+     kind TEXT NOT NULL CHECK (kind IN ('merge', 'cherry-pick', 'revert')),
      original_head_ref TEXT NOT NULL,
      original_head_oid TEXT NOT NULL,
-     current_parent_oid TEXT NOT NULL,
-     incoming_parent_oid TEXT NOT NULL,
-     phase TEXT NOT NULL CHECK (phase IN ('conflicted', 'ready')),
-     mode TEXT NOT NULL CHECK (mode IN ('commit', 'no-commit')),
+     phase TEXT NOT NULL CHECK (phase IN ('conflicted', 'ready', 'empty')),
+     empty_reason TEXT CHECK (empty_reason IN ('source', 'result')),
+     current_parent_oid TEXT,
+     incoming_parent_oid TEXT,
+     mode TEXT CHECK (mode IN ('commit', 'no-commit')),
+     source_oid TEXT,
+     selected_parent_oid TEXT,
+     mainline INTEGER,
      current_label TEXT NOT NULL,
      incoming_label TEXT NOT NULL,
      message TEXT NOT NULL,
@@ -117,14 +122,25 @@ const STATEMENTS = [
      touched_count INTEGER NOT NULL,
      retained_bytes INTEGER NOT NULL,
      integrity_oid TEXT NOT NULL,
-     CHECK (phase != 'ready' OR mode = 'no-commit'),
+     CHECK (
+       (kind = 'merge' AND phase IN ('conflicted', 'ready') AND empty_reason IS NULL
+          AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NOT NULL
+          AND mode IS NOT NULL AND source_oid IS NULL AND selected_parent_oid IS NULL
+          AND mainline IS NULL AND (phase != 'ready' OR mode = 'no-commit'))
+       OR
+       (kind IN ('cherry-pick', 'revert') AND phase IN ('conflicted', 'empty')
+          AND current_parent_oid IS NULL AND incoming_parent_oid IS NULL AND mode IS NULL
+          AND source_oid IS NOT NULL
+          AND ((phase = 'conflicted' AND empty_reason IS NULL)
+            OR (phase = 'empty' AND empty_reason IS NOT NULL)))
+     ),
      CHECK ((author_name IS NULL) = (author_email IS NULL)),
      CHECK ((committer_name IS NULL) = (committer_email IS NULL))
    )`,
 
-  // Original identities for only paths owned by the merge. Physical paths
+  // Original identities for only paths owned by the operation. Physical paths
   // include conflict relocations; logical_path ties them back to the index path.
-  `CREATE TABLE IF NOT EXISTS git_merge_touched (
+  `CREATE TABLE IF NOT EXISTS git_operation_touched (
      repo_id INTEGER NOT NULL,
      ordinal INTEGER NOT NULL,
      path TEXT NOT NULL,
@@ -370,7 +386,8 @@ const STATEMENTS = [
 // projection. v5 records the monotonic filesystem revision in index stat data.
 // v6 adds inert index baseline and dirty-path state for sparse status queries.
 // v7 adds source-qualified tree entry lookup by raw name bytes. v8 adds the
-// durable merge journal; v9 binds its rows to one deterministic identity.
+// durable merge journal; v9 binds its rows to one deterministic identity. v10
+// generalizes that authenticated journal to merge and one-commit replay.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
@@ -386,14 +403,46 @@ function migrate(db: SqlDatabase, from: number): void {
     if (!hasRevision) db.run("ALTER TABLE git_index ADD COLUMN rev INTEGER");
   }
   if (from < 9) {
-    const hasIntegrity = db
-      .all<{ name: string }>("PRAGMA table_info(git_merge_state)")
-      .some((column) => column.name === "integrity_oid");
-    if (!hasIntegrity) {
+    const legacyColumns = db.all<{ name: string }>("PRAGMA table_info(git_merge_state)");
+    const hasLegacyJournal = legacyColumns.some((column) => column.name === "repo_id");
+    const hasIntegrity = legacyColumns.some((column) => column.name === "integrity_oid");
+    if (hasLegacyJournal && !hasIntegrity) {
       db.run("ALTER TABLE git_merge_state ADD COLUMN integrity_oid TEXT NOT NULL DEFAULT ''");
       // A v8 journal cannot be authenticated after the upgrade.
       db.run("DELETE FROM git_merge_touched");
       db.run("DELETE FROM git_merge_state");
+    }
+  }
+  if (from < 10) {
+    const legacy = db
+      .all<{ name: string }>("PRAGMA table_info(git_merge_state)")
+      .some((column) => column.name === "repo_id");
+    if (legacy) {
+      db.run(
+        `INSERT INTO git_operation_state
+           (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+            current_parent_oid, incoming_parent_oid, mode, source_oid,
+            selected_parent_oid, mainline, current_label, incoming_label, message,
+            author_name, author_email, committer_name, committer_email,
+            touched_count, retained_bytes, integrity_oid)
+         SELECT repo_id, 'merge', original_head_ref, original_head_oid, phase, NULL,
+                current_parent_oid, incoming_parent_oid, mode, NULL, NULL, NULL,
+                current_label, incoming_label, message, author_name, author_email,
+                committer_name, committer_email, touched_count, retained_bytes, integrity_oid
+           FROM git_merge_state`,
+      );
+      db.run(
+        `INSERT INTO git_operation_touched
+           (repo_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
+            index_oid, index_size, index_mtime, index_ino, index_rev, worktree_kind,
+            worktree_mode, worktree_oid, worktree_revision)
+         SELECT repo_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
+                index_oid, index_size, index_mtime, index_ino, index_rev, worktree_kind,
+                worktree_mode, worktree_oid, worktree_revision
+           FROM git_merge_touched`,
+      );
+      db.run("DROP TABLE git_merge_touched");
+      db.run("DROP TABLE git_merge_state");
     }
   }
 }

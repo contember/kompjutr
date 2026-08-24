@@ -558,7 +558,7 @@ describe("merge lifecycle", () => {
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
     ).toEqual({ conflicted: true, pendingCommit: true });
     workspace.database.db.run(
-      `UPDATE git_merge_touched
+      `UPDATE git_operation_touched
           SET path = 'sentinel.txt', logical_path = 'sentinel.txt'
         WHERE repo_id = ? AND path = 'conflict.txt'`,
       workspace.repo.store.repoId,
@@ -570,7 +570,7 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "sentinel.txt")).toBe("unrelated\n");
     expect(
       workspace.database.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_merge_state WHERE repo_id = ?",
+        "SELECT COUNT(*) FROM git_operation_state WHERE repo_id = ?",
         workspace.repo.store.repoId,
       ),
     ).toBe(1);
@@ -586,7 +586,7 @@ describe("merge lifecycle", () => {
     const incoming = workspace.repo.store.indexGet("conflict.txt", 3);
     if (incoming === null) throw new Error("expected incoming conflict stage");
     workspace.database.db.run(
-      `UPDATE git_merge_touched
+      `UPDATE git_operation_touched
           SET worktree_oid = ?
         WHERE repo_id = ? AND path = 'conflict.txt'`,
       incoming.oid,
@@ -598,7 +598,7 @@ describe("merge lifecycle", () => {
     );
     expect(
       workspace.database.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_merge_state WHERE repo_id = ?",
+        "SELECT COUNT(*) FROM git_operation_state WHERE repo_id = ?",
         workspace.repo.store.repoId,
       ),
     ).toBe(1);
@@ -625,7 +625,7 @@ describe("merge lifecycle", () => {
     writeWorkFile(workspace, "/conflict.txt", "resolved\n");
     add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
     workspace.database.db.run(
-      "UPDATE git_merge_state SET incoming_parent_oid = ? WHERE repo_id = ?",
+      "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE repo_id = ?",
       alternate,
       workspace.repo.store.repoId,
     );
@@ -635,7 +635,7 @@ describe("merge lifecycle", () => {
     );
     expect(workspace.repo.head().oid).toBe(current);
     const persisted = workspace.database.db.scalar<string>(
-      "SELECT incoming_parent_oid FROM git_merge_state WHERE repo_id = ?",
+      "SELECT incoming_parent_oid FROM git_operation_state WHERE repo_id = ?",
       workspace.repo.store.repoId,
     );
     expect(persisted).toBe(alternate);

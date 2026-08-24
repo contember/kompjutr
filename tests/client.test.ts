@@ -246,6 +246,50 @@ describe("createSqliteGitClient", () => {
     });
   });
 
+  it("blocks ordinary native commit during replay and lets hard reset clear it", async () => {
+    const { workspace, storage } = makeWorkspace();
+    await workspace.git.init({});
+    await workspace.fs.writeFile("/file.txt", "base\n");
+    await workspace.git.add({ paths: ["file.txt"] });
+    const original = await workspace.git.commit({ message: "base" });
+    const database = new SqliteGitDatabase(new TestDatabase(storage));
+    const repository = database.find("/");
+    if (repository === null) throw new Error("repository is missing");
+    const store = database.open(repository);
+    store.writeOperationState(
+      {
+        kind: "cherry-pick",
+        originalHeadRef: "refs/heads/main",
+        originalHeadOid: original.oid,
+        phase: "empty",
+        emptyReason: "result",
+        sourceOid: original.oid,
+        selectedParentOid: null,
+        mainline: null,
+        currentLabel: "HEAD",
+        incomingLabel: original.oid.slice(0, 7),
+        message: "base\n",
+        author: null,
+        committer: null,
+      },
+      [],
+    );
+    const native = createGit()({
+      database,
+      worktree: new ComputerWorktree(workspace.provider()),
+      now: () => 1_600_000_000_000,
+      timezoneOffset: () => 0,
+      defaultIdentity: IDENTITY,
+    });
+
+    await expect(native.commit({ message: "must not continue replay" })).rejects.toMatchObject({
+      code: "EOPACTIVE",
+    });
+    await native.reset({ hard: true });
+    expect(store.readOperationState()).toBeNull();
+    expect(store.getRef("refs/heads/main")).toBe(original.oid);
+  });
+
   it("fails explicitly for methods that remain unsupported", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});

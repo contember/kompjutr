@@ -178,7 +178,7 @@ describe("durable merge journal", () => {
     expect(store.clearMergeState()).toBe(false);
 
     store.writeMergeState(metadata(), touched());
-    db.run("DELETE FROM git_merge_state WHERE repo_id = 1");
+    db.run("DELETE FROM git_operation_state WHERE repo_id = 1");
     expect(() => store.readMergeState()).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
@@ -192,8 +192,8 @@ describe("durable merge journal", () => {
 
     store.destroy();
 
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_touched")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
   });
 
   it("rejects invalid order and hard bounds before writing a state row", () => {
@@ -223,8 +223,8 @@ describe("durable merge journal", () => {
         touched(),
       ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_touched")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
   });
 
   it("fails closed on corrupt metadata, order, revisions, counts, and retained bytes", () => {
@@ -237,27 +237,27 @@ describe("durable merge journal", () => {
         name: "phase",
         corrupt: (db) => {
           db.run("PRAGMA ignore_check_constraints = ON");
-          db.run("UPDATE git_merge_state SET phase = 'applying' WHERE repo_id = 1");
+          db.run("UPDATE git_operation_state SET phase = 'applying' WHERE repo_id = 1");
           db.run("PRAGMA ignore_check_constraints = OFF");
         },
         code: "ECORRUPT",
       },
       {
         name: "path order",
-        corrupt: (db) => db.run("UPDATE git_merge_touched SET path = 'z' WHERE ordinal = 0"),
+        corrupt: (db) => db.run("UPDATE git_operation_touched SET path = 'z' WHERE ordinal = 0"),
         code: "ECORRUPT",
       },
       {
         name: "revision",
         corrupt: (db) =>
-          db.run("UPDATE git_merge_touched SET worktree_revision = -1 WHERE ordinal = 0"),
+          db.run("UPDATE git_operation_touched SET worktree_revision = -1 WHERE ordinal = 0"),
         code: "ECORRUPT",
       },
       {
         name: "count",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_merge_state SET touched_count = ? WHERE repo_id = 1",
+            "UPDATE git_operation_state SET touched_count = ? WHERE repo_id = 1",
             MAX_MERGE_TOUCHED_PATHS + 1,
           ),
         code: "E2BIG",
@@ -266,7 +266,7 @@ describe("durable merge journal", () => {
         name: "retained bytes",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_merge_state SET retained_bytes = retained_bytes + 1 WHERE repo_id = 1",
+            "UPDATE git_operation_state SET retained_bytes = retained_bytes + 1 WHERE repo_id = 1",
           ),
         code: "ECORRUPT",
       },
@@ -305,7 +305,7 @@ describe("durable merge journal", () => {
       store.writeMergeState(metadata(), touched());
       db.run("PRAGMA ignore_check_constraints = ON");
       db.run(
-        `UPDATE git_merge_state SET ${column} = zeroblob(?) WHERE repo_id = 1`,
+        `UPDATE git_operation_state SET ${column} = zeroblob(?) WHERE repo_id = 1`,
         MAX_MERGE_MESSAGE_BYTES + 1,
       );
       db.run("PRAGMA ignore_check_constraints = OFF");
@@ -316,7 +316,7 @@ describe("durable merge journal", () => {
 
     const { db, store } = open();
     store.writeMergeState(metadata(), touched());
-    db.run("UPDATE git_merge_touched SET path = zeroblob(4096) WHERE ordinal = 0");
+    db.run("UPDATE git_operation_touched SET path = zeroblob(4096) WHERE ordinal = 0");
     expect(() => store.readMergeState()).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
@@ -340,25 +340,25 @@ describe("durable merge journal", () => {
         name: "missing parent",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_merge_state SET incoming_parent_oid = ? WHERE repo_id = 1",
+            "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE repo_id = 1",
             "f".repeat(40),
           ),
       },
       {
         name: "parent is a blob",
         corrupt: (db) =>
-          db.run("UPDATE git_merge_state SET incoming_parent_oid = ? WHERE repo_id = 1", FILE),
+          db.run("UPDATE git_operation_state SET incoming_parent_oid = ? WHERE repo_id = 1", FILE),
       },
       {
         name: "index file is a commit",
         corrupt: (db) =>
-          db.run("UPDATE git_merge_touched SET index_oid = ? WHERE path = 'a.txt'", INCOMING),
+          db.run("UPDATE git_operation_touched SET index_oid = ? WHERE path = 'a.txt'", INCOMING),
       },
       {
         name: "worktree symlink is a commit",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_merge_touched SET worktree_oid = ? WHERE path = 'node~HEAD'",
+            "UPDATE git_operation_touched SET worktree_oid = ? WHERE path = 'node~HEAD'",
             INCOMING,
           ),
       },

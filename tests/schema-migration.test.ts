@@ -5,7 +5,7 @@
 // the working tree is imported.
 
 import { describe, expect, it } from "vitest";
-import { MODE_FILE, serializeTree } from "../src/core/objects.js";
+import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import { initializeFsSchema, ROOT_INODE } from "../src/fs/schema.js";
 import { initializeGitSchema, SCHEMA_VERSION } from "../src/sqlite/schema.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -82,14 +82,19 @@ describe("git schema", () => {
       "complete",
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
-    expect(columnsOf(db, "git_merge_state")).toEqual([
+    expect(columnsOf(db, "git_operation_state")).toEqual([
       "repo_id",
+      "kind",
       "original_head_ref",
       "original_head_oid",
+      "phase",
+      "empty_reason",
       "current_parent_oid",
       "incoming_parent_oid",
-      "phase",
       "mode",
+      "source_oid",
+      "selected_parent_oid",
+      "mainline",
       "current_label",
       "incoming_label",
       "message",
@@ -101,7 +106,7 @@ describe("git schema", () => {
       "retained_bytes",
       "integrity_oid",
     ]);
-    expect(columnsOf(db, "git_merge_touched")).toEqual([
+    expect(columnsOf(db, "git_operation_touched")).toEqual([
       "repo_id",
       "ordinal",
       "path",
@@ -408,17 +413,17 @@ describe("git schema", () => {
     );
   });
 
-  it("adds empty merge journal tables to v7", () => {
+  it("adds empty operation journal tables to v7", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("DROP TABLE git_merge_touched");
-    db.run("DROP TABLE git_merge_state");
+    db.run("DROP TABLE git_operation_touched");
+    db.run("DROP TABLE git_operation_state");
     db.run("UPDATE git_meta SET value = '7' WHERE key = 'schema_version'");
 
     initializeGitSchema(db);
 
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_touched")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
     expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
       String(SCHEMA_VERSION),
     );
@@ -427,7 +432,23 @@ describe("git schema", () => {
   it("invalidates unauthenticated merge state when migrating v8", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("ALTER TABLE git_merge_state DROP COLUMN integrity_oid");
+    db.run(
+      `CREATE TABLE git_merge_state AS
+       SELECT repo_id, original_head_ref, original_head_oid, current_parent_oid,
+              incoming_parent_oid, phase, mode, current_label, incoming_label,
+              message, author_name, author_email, committer_name, committer_email,
+              touched_count, retained_bytes
+         FROM git_operation_state WHERE 0`,
+    );
+    db.run(
+      `CREATE TABLE git_merge_touched AS
+       SELECT repo_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
+              index_oid, index_size, index_mtime, index_ino, index_rev, worktree_kind,
+              worktree_mode, worktree_oid, worktree_revision
+         FROM git_operation_touched WHERE 0`,
+    );
+    db.run("DROP TABLE git_operation_touched");
+    db.run("DROP TABLE git_operation_state");
     db.run(
       `INSERT INTO git_merge_state
          (repo_id, original_head_ref, original_head_oid, current_parent_oid,
@@ -444,11 +465,100 @@ describe("git schema", () => {
 
     initializeGitSchema(db);
 
-    expect(columnsOf(db, "git_merge_state")).toContain("integrity_oid");
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
+    expect(columnsOf(db, "git_operation_state")).toContain("integrity_oid");
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
     expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
       String(SCHEMA_VERSION),
     );
+  });
+
+  it("preserves an authenticated active merge exactly when migrating v9", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/repo", "ref: refs/heads/main");
+    const store = database.open(repository);
+    const tree = store.write("tree", serializeTree([]));
+    const person = {
+      name: "Fixture",
+      email: "fixture@example.com",
+      timestamp: 1_700_000_000,
+      timezoneOffset: 0,
+    };
+    const current = store.write(
+      "commit",
+      serializeCommit({ tree, parent: [], author: person, committer: person, message: "base\n" }),
+    );
+    const incoming = store.write(
+      "commit",
+      serializeCommit({
+        tree,
+        parent: [current],
+        author: person,
+        committer: person,
+        message: "topic\n",
+      }),
+    );
+    store.setRef("refs/heads/main", current);
+    const state = {
+      originalHeadRef: "refs/heads/main",
+      originalHeadOid: current,
+      currentParentOid: current,
+      incomingParentOid: incoming,
+      phase: "conflicted",
+      mode: "commit",
+      currentLabel: "HEAD",
+      incomingLabel: "topic",
+      message: "Merge topic\n",
+      author: null,
+      committer: null,
+    } satisfies import("../src/core/ops/merge-state.js").MergeStateMetadata;
+    const touched = [
+      {
+        path: "file.txt",
+        logicalPath: "file.txt",
+        purpose: "primary",
+        index: null,
+        worktree: { kind: "absent" },
+      },
+    ] satisfies readonly import("../src/core/ops/merge-state.js").MergeTouchedPath[];
+    store.writeMergeState(state, touched);
+    const before = db.one<{ retained_bytes: number; integrity_oid: string }>(
+      "SELECT retained_bytes, integrity_oid FROM git_operation_state WHERE repo_id = 1",
+    );
+    const beforeTouched = db.all(
+      "SELECT * FROM git_operation_touched WHERE repo_id = 1 ORDER BY ordinal",
+    );
+
+    db.run(
+      `CREATE TABLE git_merge_state AS
+       SELECT repo_id, original_head_ref, original_head_oid, current_parent_oid,
+              incoming_parent_oid, phase, mode, current_label, incoming_label,
+              message, author_name, author_email, committer_name, committer_email,
+              touched_count, retained_bytes, integrity_oid
+         FROM git_operation_state`,
+    );
+    db.run(
+      `CREATE TABLE git_merge_touched AS
+       SELECT repo_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
+              index_oid, index_size, index_mtime, index_ino, index_rev, worktree_kind,
+              worktree_mode, worktree_oid, worktree_revision
+         FROM git_operation_touched`,
+    );
+    db.run("DROP TABLE git_operation_touched");
+    db.run("DROP TABLE git_operation_state");
+    db.run("UPDATE git_meta SET value = '9' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(
+      db.one("SELECT retained_bytes, integrity_oid FROM git_operation_state WHERE repo_id = 1"),
+    ).toEqual(before);
+    expect(
+      db.all("SELECT * FROM git_operation_touched WHERE repo_id = 1 ORDER BY ordinal"),
+    ).toEqual(beforeTouched);
+    const cold = new SqliteGitDatabase(db).open(repository);
+    expect(cold.requireMergeState().state).toEqual(state);
+    expect(cold.requireMergeState().touched).toEqual(touched);
   });
 
   it("uses the tree name-bytes index for source-qualified point lookups", () => {
@@ -520,8 +630,8 @@ describe("git schema", () => {
       "complete",
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
-    expect(columnsOf(db, "git_merge_state")).not.toHaveLength(0);
-    expect(columnsOf(db, "git_merge_touched")).not.toHaveLength(0);
+    expect(columnsOf(db, "git_operation_state")).not.toHaveLength(0);
+    expect(columnsOf(db, "git_operation_touched")).not.toHaveLength(0);
     expect(treeNameBytesIndexColumns(db)).not.toHaveLength(0);
   });
 });

@@ -133,7 +133,7 @@ export function createSqliteGitClient(
       },
       async clean(input = {}) {
         const repo = at(input.dir);
-        repo.store.requireNoMergeState();
+        repo.store.requireNoOperationState();
         return cleanOp(repo, ctx().worktree, { ...input, excludeRoots: excludeRoots(repo) });
       },
 
@@ -149,16 +149,16 @@ export function createSqliteGitClient(
         if (input.hard === true) {
           repo.store.db.transactionSync(() => {
             resetOp(repo, ctx().worktree, input);
-            repo.store.clearMergeState();
+            repo.store.clearOperationState();
           });
           return;
         }
-        repo.store.requireNoMergeState();
+        repo.store.requireNoOperationState();
         resetOp(repo, ctx().worktree, input);
       },
       async commit(input) {
         const repo = at(input.dir);
-        repo.store.requireNoMergeState();
+        repo.store.requireNoOperationState();
         return commitOp(ctx(), repo, input);
       },
 
@@ -187,7 +187,7 @@ export function createSqliteGitClient(
 
       async branch(input) {
         const repo = at(input.dir);
-        repo.store.requireNoMergeState();
+        repo.store.requireNoOperationState();
         branchOp(repo, input);
       },
       async branchDelete(input) {
@@ -207,7 +207,7 @@ export function createSqliteGitClient(
       },
       async checkout(input) {
         const repo = at(input.dir);
-        repo.store.requireNoMergeState();
+        repo.store.requireNoOperationState();
         checkoutOp(ctx(), repo, ctx().worktree, input);
       },
 
@@ -240,7 +240,7 @@ export function createSqliteGitClient(
       },
       async updateRef(input) {
         const repo = at(input.dir);
-        repo.store.requireNoMergeState();
+        repo.store.requireNoOperationState();
         updateRefOp(repo, input);
       },
 

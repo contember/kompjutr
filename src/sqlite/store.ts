@@ -21,10 +21,6 @@ import {
   type MergeStateMetadata,
   type MergeTouchedPath,
   type MergeWorktreeSnapshot,
-  mergeAlreadyActive,
-  mergeJournalIntegrityOid,
-  mergeJournalRetainedBytes,
-  mergeNotActive,
   requireMergeInteger,
   requireMergeMode,
   requireMergeNullableInteger,
@@ -33,6 +29,22 @@ import {
   requireMergePurpose,
   requireMergeText,
 } from "../core/ops/merge-state.js";
+import {
+  type CherryPickJournal,
+  type MergeOperationJournal,
+  mergeJournalFromOperation,
+  mergeOperationState,
+  type OperationJournal,
+  type OperationKind,
+  type OperationStateMetadata,
+  operationAlreadyActive,
+  operationJournalIntegrityOid,
+  operationJournalRetainedBytes,
+  operationKindMismatch,
+  operationNotActive,
+  type ReplayStateMetadata,
+  type RevertJournal,
+} from "../core/ops/operation-state.js";
 import { Sha1 } from "../core/sha1.js";
 import { comparePaths } from "../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
@@ -186,13 +198,18 @@ export interface InitialStateSession {
   addBlobId(mapping: BlobIdMapping): void;
 }
 
-interface MergeStateRow {
+interface OperationStateRow {
+  kind: unknown;
   original_head_ref: unknown;
   original_head_oid: unknown;
+  phase: unknown;
+  empty_reason: unknown;
   current_parent_oid: unknown;
   incoming_parent_oid: unknown;
-  phase: unknown;
   mode: unknown;
+  source_oid: unknown;
+  selected_parent_oid: unknown;
+  mainline: unknown;
   current_label: unknown;
   incoming_label: unknown;
   message: unknown;
@@ -205,7 +222,7 @@ interface MergeStateRow {
   integrity_oid: unknown;
 }
 
-interface MergeTouchedRow {
+interface OperationTouchedRow {
   ordinal: unknown;
   path: unknown;
   logical_path: unknown;
@@ -223,7 +240,7 @@ interface MergeTouchedRow {
   worktree_revision: unknown;
 }
 
-interface PersistedMergeTouched {
+interface PersistedOperationTouched {
   ordinal: number;
   path: string;
   logicalPath: string;
@@ -270,7 +287,7 @@ export interface ObjectReadInfo {
   chunkRows: number;
 }
 
-interface ExpectedMergeObject {
+interface ExpectedOperationObject {
   oid: string;
   type: "blob" | "commit";
   label: string;
@@ -615,14 +632,14 @@ function validateInitialIndexEntry(entry: IndexEntry): number {
   return pathJsonBytes;
 }
 
-function mergeIdentityFromRow(
+function operationIdentityFromRow(
   name: unknown,
   email: unknown,
   label: string,
 ): MergeSavedIdentity | null {
   if (name === null && email === null) return null;
   if (name === null || email === null) {
-    throw new CorruptError(`merge ${label} identity row is incomplete`);
+    throw new CorruptError(`operation ${label} identity row is incomplete`);
   }
   return {
     name: requireMergeText(name, `${label} name`),
@@ -630,23 +647,86 @@ function mergeIdentityFromRow(
   };
 }
 
-function mergeMetadataFromRow(row: MergeStateRow): MergeStateMetadata {
-  return {
+function requireOperationKind(value: unknown): OperationKind {
+  if (value === "merge" || value === "cherry-pick" || value === "revert") return value;
+  throw new CorruptError("operation journal has an invalid kind");
+}
+
+function requireNullableOperationOid(value: unknown, label: string): string | null {
+  return value === null ? null : requireMergeOid(value, label);
+}
+
+function requireNullableMainline(value: unknown): number | null {
+  if (value === null) return null;
+  const mainline = requireMergeInteger(value, "mainline");
+  if (mainline === 0) throw new CorruptError("replay mainline is not positive");
+  return mainline;
+}
+
+function operationMetadataFromRow(row: OperationStateRow): OperationStateMetadata {
+  const kind = requireOperationKind(row.kind);
+  const common = {
     originalHeadRef: requireMergeText(row.original_head_ref, "original HEAD ref"),
     originalHeadOid: requireMergeOid(row.original_head_oid, "original HEAD"),
-    currentParentOid: requireMergeOid(row.current_parent_oid, "current parent"),
-    incomingParentOid: requireMergeOid(row.incoming_parent_oid, "incoming parent"),
-    phase: requireMergePhase(row.phase),
-    mode: requireMergeMode(row.mode),
     currentLabel: requireMergeText(row.current_label, "current label"),
     incomingLabel: requireMergeText(row.incoming_label, "incoming label"),
     message: requireMergeText(row.message, "message"),
-    author: mergeIdentityFromRow(row.author_name, row.author_email, "author"),
-    committer: mergeIdentityFromRow(row.committer_name, row.committer_email, "committer"),
+    author: operationIdentityFromRow(row.author_name, row.author_email, "author"),
+    committer: operationIdentityFromRow(row.committer_name, row.committer_email, "committer"),
+  };
+  if (kind === "merge") {
+    if (
+      row.empty_reason !== null ||
+      row.source_oid !== null ||
+      row.selected_parent_oid !== null ||
+      row.mainline !== null
+    ) {
+      throw new CorruptError("merge journal retained replay metadata");
+    }
+    return {
+      kind,
+      ...common,
+      currentParentOid: requireMergeOid(row.current_parent_oid, "current parent"),
+      incomingParentOid: requireMergeOid(row.incoming_parent_oid, "incoming parent"),
+      phase: requireMergePhase(row.phase),
+      mode: requireMergeMode(row.mode),
+    };
+  }
+  if (row.current_parent_oid !== null || row.incoming_parent_oid !== null || row.mode !== null) {
+    throw new CorruptError("replay journal retained merge metadata");
+  }
+  const phase = row.phase;
+  if (phase !== "conflicted" && phase !== "empty") {
+    throw new CorruptError("replay journal has an invalid phase");
+  }
+  const emptyReason = row.empty_reason;
+  if (emptyReason !== null && emptyReason !== "source" && emptyReason !== "result") {
+    throw new CorruptError("replay journal has an invalid empty reason");
+  }
+  return {
+    kind,
+    ...common,
+    phase,
+    emptyReason,
+    sourceOid: requireMergeOid(row.source_oid, "source"),
+    selectedParentOid: requireNullableOperationOid(row.selected_parent_oid, "selected parent"),
+    mainline: requireNullableMainline(row.mainline),
   };
 }
 
-function mergeIndexFromRow(row: MergeTouchedRow): MergeIndexSnapshot | null {
+function operationJournal(
+  state: OperationStateMetadata,
+  touched: readonly MergeTouchedPath[],
+  retainedBytes: number,
+  integrityOid: string,
+): OperationJournal {
+  const fields = { touched, retainedBytes, integrityOid };
+  if (state.kind === "merge") return { kind: state.kind, state, ...fields };
+  if (state.kind === "cherry-pick") return { kind: state.kind, state, ...fields };
+  return { kind: state.kind, state, ...fields };
+}
+
+function operationIndexFromRow(row: OperationTouchedRow): MergeIndexSnapshot | null {
   const values = [
     row.index_stage,
     row.index_mode,
@@ -669,7 +749,7 @@ function mergeIndexFromRow(row: MergeTouchedRow): MergeIndexSnapshot | null {
   };
 }
 
-function mergeWorktreeFromRow(row: MergeTouchedRow): MergeWorktreeSnapshot {
+function operationWorktreeFromRow(row: OperationTouchedRow): MergeWorktreeSnapshot {
   const kind = requireMergeText(row.worktree_kind, "worktree kind");
   if (kind === "absent") {
     if (row.worktree_mode !== null || row.worktree_oid !== null || row.worktree_revision !== null) {
@@ -691,17 +771,20 @@ function mergeWorktreeFromRow(row: MergeTouchedRow): MergeWorktreeSnapshot {
   throw new CorruptError("merge journal has an invalid worktree kind");
 }
 
-function mergeTouchedFromRow(row: MergeTouchedRow): MergeTouchedPath {
+function operationTouchedFromRow(row: OperationTouchedRow): MergeTouchedPath {
   return {
     path: requireMergeText(row.path, "touched path"),
     logicalPath: requireMergeText(row.logical_path, "logical path"),
     purpose: requireMergePurpose(row.purpose),
-    index: mergeIndexFromRow(row),
-    worktree: mergeWorktreeFromRow(row),
+    index: operationIndexFromRow(row),
+    worktree: operationWorktreeFromRow(row),
   };
 }
 
-function persistedMergeTouched(entry: MergeTouchedPath, ordinal: number): PersistedMergeTouched {
+function persistedOperationTouched(
+  entry: MergeTouchedPath,
+  ordinal: number,
+): PersistedOperationTouched {
   const index = entry.index;
   const worktree = entry.worktree;
   return {
@@ -2396,28 +2479,45 @@ export class RepoStore {
       .map((row) => row.path);
   }
 
-  // -- merge journal -------------------------------------------------
+  // -- integration operation journal --------------------------------
 
-  /** Read and validate the one durable incomplete merge for this repository. */
-  readMergeState(): MergeJournal | null {
-    const row = this.#db.one<MergeStateRow>(
+  /** Read and validate the one durable incomplete integration operation. */
+  readOperationState(): OperationJournal | null {
+    const row = this.#db.one<OperationStateRow>(
       `SELECT
+              CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= 11
+                   THEN kind END AS kind,
               CASE WHEN typeof(original_head_ref) = 'text'
                          AND length(CAST(original_head_ref AS BLOB)) <= ${MAX_MERGE_REF_BYTES}
                    THEN original_head_ref END AS original_head_ref,
               CASE WHEN typeof(original_head_oid) = 'text'
                          AND length(CAST(original_head_oid AS BLOB)) = 40
                    THEN original_head_oid END AS original_head_oid,
-              CASE WHEN typeof(current_parent_oid) = 'text'
+              CASE WHEN current_parent_oid IS NULL THEN NULL
+                   WHEN typeof(current_parent_oid) = 'text'
                          AND length(CAST(current_parent_oid AS BLOB)) = 40
-                   THEN current_parent_oid END AS current_parent_oid,
-              CASE WHEN typeof(incoming_parent_oid) = 'text'
+                   THEN current_parent_oid ELSE 0 END AS current_parent_oid,
+              CASE WHEN incoming_parent_oid IS NULL THEN NULL
+                   WHEN typeof(incoming_parent_oid) = 'text'
                          AND length(CAST(incoming_parent_oid AS BLOB)) = 40
-                   THEN incoming_parent_oid END AS incoming_parent_oid,
+                   THEN incoming_parent_oid ELSE 0 END AS incoming_parent_oid,
               CASE WHEN typeof(phase) = 'text' AND length(CAST(phase AS BLOB)) <= 10
                    THEN phase END AS phase,
-              CASE WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
-                   THEN mode END AS mode,
+              CASE WHEN empty_reason IS NULL THEN NULL
+                   WHEN typeof(empty_reason) = 'text'
+                         AND length(CAST(empty_reason AS BLOB)) <= 6
+                   THEN empty_reason ELSE 0 END AS empty_reason,
+              CASE WHEN mode IS NULL THEN NULL
+                   WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
+                   THEN mode ELSE 0 END AS mode,
+              CASE WHEN source_oid IS NULL THEN NULL
+                   WHEN typeof(source_oid) = 'text' AND length(CAST(source_oid AS BLOB)) = 40
+                   THEN source_oid ELSE 0 END AS source_oid,
+              CASE WHEN selected_parent_oid IS NULL THEN NULL
+                   WHEN typeof(selected_parent_oid) = 'text'
+                         AND length(CAST(selected_parent_oid AS BLOB)) = 40
+                   THEN selected_parent_oid ELSE 0 END AS selected_parent_oid,
+              mainline,
               CASE WHEN typeof(current_label) = 'text'
                          AND length(CAST(current_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
                    THEN current_label END AS current_label,
@@ -2447,18 +2547,18 @@ export class RepoStore {
               CASE WHEN typeof(integrity_oid) = 'text'
                          AND length(CAST(integrity_oid AS BLOB)) = 40
                    THEN integrity_oid END AS integrity_oid
-         FROM git_merge_state WHERE repo_id = ?`,
+         FROM git_operation_state WHERE repo_id = ?`,
       this.#repoId,
     );
     if (row === undefined) {
       const orphaned = requireBooleanProbe(
         this.#db.scalar<unknown>(
-          "SELECT EXISTS(SELECT 1 FROM git_merge_touched WHERE repo_id = ? LIMIT 1)",
+          "SELECT EXISTS(SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1)",
           this.#repoId,
         ),
-        "merge touched-path orphan probe",
+        "operation touched-path orphan probe",
       );
-      if (orphaned) throw new CorruptError("merge touched paths exist without operation state");
+      if (orphaned) throw new CorruptError("touched paths exist without operation state");
       return null;
     }
 
@@ -2470,7 +2570,7 @@ export class RepoStore {
     if (storedBytes > MAX_MERGE_STATE_BYTES) {
       throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`);
     }
-    const state = mergeMetadataFromRow(row);
+    const state = operationMetadataFromRow(row);
 
     const touched: MergeTouchedPath[] = [];
     let previousPath: string | null = null;
@@ -2498,10 +2598,10 @@ export class RepoStore {
                          AND length(CAST(worktree_oid AS BLOB)) = 40
                    THEN worktree_oid ELSE 0 END AS worktree_oid,
               worktree_revision
-         FROM git_merge_touched WHERE repo_id = ? ORDER BY ordinal`,
+         FROM git_operation_touched WHERE repo_id = ? ORDER BY ordinal`,
       this.#repoId,
     )) {
-      const touchedRow: MergeTouchedRow = {
+      const touchedRow: OperationTouchedRow = {
         ordinal: raw.ordinal,
         path: raw.path,
         logical_path: raw.logical_path,
@@ -2525,7 +2625,7 @@ export class RepoStore {
       if (touched.length >= touchedCount || touched.length >= MAX_MERGE_TOUCHED_PATHS) {
         throw new CorruptError("merge journal yielded too many touched paths");
       }
-      const entry = mergeTouchedFromRow(touchedRow);
+      const entry = operationTouchedFromRow(touchedRow);
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
         throw new CorruptError("merge touched paths are not in strict Git path order");
       }
@@ -2535,48 +2635,54 @@ export class RepoStore {
     if (touched.length !== touchedCount) {
       throw new CorruptError("merge journal touched-path count does not match its rows");
     }
-    const retainedBytes = mergeJournalRetainedBytes(state, touched);
+    const retainedBytes = operationJournalRetainedBytes(state, touched);
     if (retainedBytes !== storedBytes) {
       throw new CorruptError("merge journal retained-byte count does not match its rows");
     }
     const integrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
-    if (mergeJournalIntegrityOid(state, touched) !== integrityOid) {
-      throw new CorruptError("merge journal integrity identity does not match its rows");
+    if (operationJournalIntegrityOid(state, touched) !== integrityOid) {
+      throw new CorruptError("operation journal integrity identity does not match its rows");
     }
-    const journal = { state, touched, retainedBytes };
-    this.#validateMergeObjects(journal);
+    const journal = operationJournal(state, touched, retainedBytes, integrityOid);
+    this.#validateOperationObjects(journal);
     return journal;
   }
 
-  /** Atomically create one bounded merge journal; an existing merge wins. */
-  writeMergeState(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
-    const retainedBytes = mergeJournalRetainedBytes(state, touched);
-    const integrityOid = mergeJournalIntegrityOid(state, touched);
+  /** Atomically create one bounded operation journal; an existing operation wins. */
+  writeOperationState(state: OperationStateMetadata, touched: readonly MergeTouchedPath[]): void {
+    const retainedBytes = operationJournalRetainedBytes(state, touched);
+    const integrityOid = operationJournalIntegrityOid(state, touched);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-        throw new CorruptError("merge touched paths are not in strict Git path order");
+        throw new CorruptError("operation touched paths are not in strict Git path order");
       }
       previousPath = entry.path;
     }
 
     this.#db.transactionSync(() => {
-      this.requireNoMergeState();
-      this.#validateMergeObjects({ state, touched, retainedBytes });
+      this.requireNoOperationState();
+      this.#validateOperationObjects(operationJournal(state, touched, retainedBytes, integrityOid));
       this.#db.run(
-        `INSERT INTO git_merge_state
-           (repo_id, original_head_ref, original_head_oid, current_parent_oid,
-            incoming_parent_oid, phase, mode, current_label, incoming_label,
+        `INSERT INTO git_operation_state
+           (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+            current_parent_oid, incoming_parent_oid, mode, source_oid,
+            selected_parent_oid, mainline, current_label, incoming_label,
             message, author_name, author_email, committer_name, committer_email,
             touched_count, retained_bytes, integrity_oid)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         this.#repoId,
+        state.kind,
         state.originalHeadRef,
         state.originalHeadOid,
-        state.currentParentOid,
-        state.incomingParentOid,
         state.phase,
-        state.mode,
+        state.kind === "merge" ? null : state.emptyReason,
+        state.kind === "merge" ? state.currentParentOid : null,
+        state.kind === "merge" ? state.incomingParentOid : null,
+        state.kind === "merge" ? state.mode : null,
+        state.kind === "merge" ? null : state.sourceOid,
+        state.kind === "merge" ? null : state.selectedParentOid,
+        state.kind === "merge" ? null : state.mainline,
         state.currentLabel,
         state.incomingLabel,
         state.message,
@@ -2589,14 +2695,14 @@ export class RepoStore {
         integrityOid,
       );
 
-      function* rows(): Generator<PersistedMergeTouched> {
+      function* rows(): Generator<PersistedOperationTouched> {
         for (let ordinal = 0; ordinal < touched.length; ordinal++) {
-          yield persistedMergeTouched(touched[ordinal]!, ordinal);
+          yield persistedOperationTouched(touched[ordinal]!, ordinal);
         }
       }
-      for (const page of jsonPages(rows(), "merge touched path")) {
+      for (const page of jsonPages(rows(), "operation touched path")) {
         this.#db.run(
-          `INSERT INTO git_merge_touched
+          `INSERT INTO git_operation_touched
              (repo_id, ordinal, path, logical_path, purpose,
               index_stage, index_mode, index_oid, index_size, index_mtime,
               index_ino, index_rev, worktree_kind, worktree_mode,
@@ -2625,18 +2731,31 @@ export class RepoStore {
     });
   }
 
-  #validateMergeObjects(journal: MergeJournal): void {
-    const expected = new Map<string, ExpectedMergeObject>();
-    const add = (object: ExpectedMergeObject): void => {
+  #validateOperationObjects(journal: OperationJournal): void {
+    const expected = new Map<string, ExpectedOperationObject>();
+    const add = (object: ExpectedOperationObject): void => {
       const previous = expected.get(object.oid);
       if (previous !== undefined && previous.type !== object.type) {
-        throw new CorruptError(`merge journal object ${object.oid} has conflicting expected types`);
+        throw new CorruptError(
+          `operation journal object ${object.oid} has conflicting expected types`,
+        );
       }
       if (previous === undefined) expected.set(object.oid, object);
     };
     add({ oid: journal.state.originalHeadOid, type: "commit", label: "original HEAD" });
-    add({ oid: journal.state.currentParentOid, type: "commit", label: "current parent" });
-    add({ oid: journal.state.incomingParentOid, type: "commit", label: "incoming parent" });
+    if (journal.state.kind === "merge") {
+      add({ oid: journal.state.currentParentOid, type: "commit", label: "current parent" });
+      add({ oid: journal.state.incomingParentOid, type: "commit", label: "incoming parent" });
+    } else {
+      add({ oid: journal.state.sourceOid, type: "commit", label: "source" });
+      if (journal.state.selectedParentOid !== null) {
+        add({
+          oid: journal.state.selectedParentOid,
+          type: "commit",
+          label: "selected parent",
+        });
+      }
+    }
     for (const entry of journal.touched) {
       if (entry.index !== null) {
         add({
@@ -2659,7 +2778,7 @@ export class RepoStore {
       info = this.objectInfo([...expected.keys()]);
     } catch (error) {
       if (hasErrorCode(error, "ENOTFOUND")) {
-        throw new CorruptError("merge journal references a missing object", { cause: error });
+        throw new CorruptError("operation journal references a missing object", { cause: error });
       }
       throw error;
     }
@@ -2667,43 +2786,165 @@ export class RepoStore {
       const wanted = expected.get(object.oid);
       if (wanted === undefined || object.type !== wanted.type) {
         throw new CorruptError(
-          `merge ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
+          `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
         );
       }
     }
+    if (journal.kind !== "merge") this.#validateReplayParentSelection(journal.state);
   }
 
-  /** Clear merge metadata and touched snapshots, including corrupt orphan rows. */
-  clearMergeState(): boolean {
+  #validateReplayParentSelection(state: ReplayStateMetadata): void {
+    const batch = this.readObjects([state.sourceOid], { budgetBytes: MAX_INDEXED_COMMIT_BYTES });
+    const object = batch.objects.get(state.sourceOid);
+    if (object === undefined || batch.remaining.length !== 0 || object.type !== "commit") {
+      throw new CorruptError("replay source did not produce one complete commit object");
+    }
+    const source = prepareCommitCache({
+      repoId: this.#repoId,
+      oid: state.sourceOid,
+      data: object.data,
+    });
+    const parents = source.commit.parent;
+    if (parents.length === 0) {
+      if (state.selectedParentOid !== null || state.mainline !== null) {
+        throw new CorruptError("root replay source retained a selected parent or mainline");
+      }
+      return;
+    }
+    if (parents.length === 1) {
+      if (
+        state.selectedParentOid !== parents[0] ||
+        (state.mainline !== null && state.mainline !== 1)
+      ) {
+        throw new CorruptError("single-parent replay selection differs from its source commit");
+      }
+      return;
+    }
+    if (
+      state.mainline === null ||
+      state.mainline > parents.length ||
+      state.selectedParentOid !== parents[state.mainline - 1]
+    ) {
+      throw new CorruptError("merge replay selection differs from its source commit");
+    }
+  }
+
+  /** Replace authenticated metadata while retaining the exact touched snapshot. */
+  replaceOperationState(expectedIntegrityOid: string, state: OperationStateMetadata): void {
+    if (!isOid(expectedIntegrityOid)) {
+      throw new GitError("EINVAL", "expected operation integrity identity is invalid");
+    }
+    this.#db.transactionSync(() => {
+      const current = this.readOperationState();
+      if (current === null) throw operationNotActive(state.kind);
+      if (current.state.kind !== state.kind) {
+        throw operationKindMismatch(state.kind, current.state.kind);
+      }
+      if (current.integrityOid !== expectedIntegrityOid) {
+        throw new GitError("EOPMISMATCH", "operation state changed before replacement");
+      }
+      const retainedBytes = operationJournalRetainedBytes(state, current.touched);
+      const integrityOid = operationJournalIntegrityOid(state, current.touched);
+      this.#validateOperationObjects(
+        operationJournal(state, current.touched, retainedBytes, integrityOid),
+      );
+      this.#db.run(
+        `UPDATE git_operation_state
+            SET original_head_ref = ?, original_head_oid = ?, phase = ?, empty_reason = ?,
+                current_parent_oid = ?, incoming_parent_oid = ?, mode = ?, source_oid = ?,
+                selected_parent_oid = ?, mainline = ?, current_label = ?, incoming_label = ?,
+                message = ?, author_name = ?, author_email = ?, committer_name = ?,
+                committer_email = ?, retained_bytes = ?, integrity_oid = ?
+          WHERE repo_id = ? AND integrity_oid = ?`,
+        state.originalHeadRef,
+        state.originalHeadOid,
+        state.phase,
+        state.kind === "merge" ? null : state.emptyReason,
+        state.kind === "merge" ? state.currentParentOid : null,
+        state.kind === "merge" ? state.incomingParentOid : null,
+        state.kind === "merge" ? state.mode : null,
+        state.kind === "merge" ? null : state.sourceOid,
+        state.kind === "merge" ? null : state.selectedParentOid,
+        state.kind === "merge" ? null : state.mainline,
+        state.currentLabel,
+        state.incomingLabel,
+        state.message,
+        state.author?.name ?? null,
+        state.author?.email ?? null,
+        state.committer?.name ?? null,
+        state.committer?.email ?? null,
+        retainedBytes,
+        integrityOid,
+        this.#repoId,
+        expectedIntegrityOid,
+      );
+    });
+  }
+
+  /** Clear operation metadata and touched snapshots, including corrupt orphans. */
+  clearOperationState(): boolean {
     return this.#db.transactionSync(() => {
       const existed = requireBooleanProbe(
         this.#db.scalar<unknown>(
           `SELECT EXISTS(
-             SELECT 1 FROM git_merge_state WHERE repo_id = ?
+             SELECT 1 FROM git_operation_state WHERE repo_id = ?
              UNION ALL
-             SELECT 1 FROM git_merge_touched WHERE repo_id = ? LIMIT 1
+             SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1
            )`,
           this.#repoId,
           this.#repoId,
         ),
-        "merge state clear probe",
+        "operation state clear probe",
       );
-      this.#db.run("DELETE FROM git_merge_touched WHERE repo_id = ?", this.#repoId);
-      this.#db.run("DELETE FROM git_merge_state WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_operation_touched WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_operation_state WHERE repo_id = ?", this.#repoId);
       return existed;
     });
   }
 
-  /** Refuse an operation that cannot coexist with an incomplete merge. */
-  requireNoMergeState(): void {
-    if (this.readMergeState() !== null) throw mergeAlreadyActive();
+  /** Refuse an operation that cannot coexist with an incomplete operation. */
+  requireNoOperationState(): void {
+    const active = this.readOperationState();
+    if (active !== null) throw operationAlreadyActive(active.state.kind);
   }
 
-  /** Require and return the durable state used by continue and abort. */
+  requireOperationState(kind: "merge"): MergeOperationJournal;
+  requireOperationState(kind: "cherry-pick"): CherryPickJournal;
+  requireOperationState(kind: "revert"): RevertJournal;
+  requireOperationState(kind: OperationKind): OperationJournal;
+  requireOperationState(kind: OperationKind): OperationJournal {
+    const journal = this.readOperationState();
+    if (journal === null) throw operationNotActive(kind);
+    if (journal.kind !== kind) throw operationKindMismatch(kind, journal.kind);
+    if (journal.kind === "merge") return journal;
+    if (journal.kind === "cherry-pick") return journal;
+    return journal;
+  }
+
+  /** Merge-specific compatibility wrappers preserve the existing surface. */
+  readMergeState(): MergeJournal | null {
+    const journal = this.readOperationState();
+    if (journal === null) return null;
+    if (journal.kind !== "merge") {
+      throw operationKindMismatch("merge", journal.kind);
+    }
+    return mergeJournalFromOperation(journal);
+  }
+
+  writeMergeState(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
+    this.writeOperationState(mergeOperationState(state), touched);
+  }
+
+  clearMergeState(): boolean {
+    return this.clearOperationState();
+  }
+
+  requireNoMergeState(): void {
+    this.requireNoOperationState();
+  }
+
   requireMergeState(): MergeJournal {
-    const state = this.readMergeState();
-    if (state === null) throw mergeNotActive();
-    return state;
+    return mergeJournalFromOperation(this.requireOperationState("merge"));
   }
 
   // -- index ----------------------------------------------------------
@@ -3104,8 +3345,8 @@ export class RepoStore {
       for (const table of [
         "git_index_dirty",
         "git_index_state",
-        "git_merge_touched",
-        "git_merge_state",
+        "git_operation_touched",
+        "git_operation_state",
         "git_refs",
         "git_blob_ids",
         "git_config",
