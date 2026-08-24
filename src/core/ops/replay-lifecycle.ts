@@ -33,7 +33,7 @@ import type {
   ReplayStateMetadata,
   RevertJournal,
 } from "./operation-state.js";
-import { planReplay, type ReplayPlan } from "./replay.js";
+import { planReplay, type ReplayIncomingLabelStyle, type ReplayPlan } from "./replay.js";
 import { treeStream } from "./tree-stream.js";
 
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
@@ -63,6 +63,7 @@ export interface ReplayContinueOptions {
 
 export interface ReplayPolicy {
   kind: ReplayKind;
+  incomingLabelStyle: ReplayIncomingLabelStyle;
   suspendEmpty: boolean;
   defaultMessage(plan: ReplayPlan): string;
   resolveIdentities(
@@ -197,13 +198,17 @@ function requireSql(total: number): void {
   }
 }
 
-function planForState(repo: Repository, state: ReplayStateMetadata): ReplayPlan {
+function planForState(
+  repo: Repository,
+  state: ReplayStateMetadata,
+  incomingLabelStyle: ReplayIncomingLabelStyle,
+): ReplayPlan {
   const plan = planReplay(repo, {
     kind: state.kind,
     source: state.sourceOid,
     currentOid: state.originalHeadOid,
     mainline: state.mainline ?? undefined,
-    sourceSubjectLabel: true,
+    incomingLabelStyle,
   });
   if (
     plan.sourceOid !== state.sourceOid ||
@@ -256,6 +261,7 @@ function requireOwnership(
   repo: Repository,
   worktree: Worktree,
   journal: OperationJournal,
+  incomingLabelStyle: ReplayIncomingLabelStyle,
 ): {
   plan: ReplayPlan;
   sqlStatements: number;
@@ -263,7 +269,7 @@ function requireOwnership(
 } {
   if (journal.kind === "merge") throw new GitError("EOPMISMATCH", "expected replay operation");
   requireOriginalSnapshots(repo, journal);
-  const plan = planForState(repo, journal.state);
+  const plan = planForState(repo, journal.state, incomingLabelStyle);
   const reservation = reserveIntegrationPlan(repo, plan.integration);
   try {
     const omitted = new Set(journal.touched.map((entry) => entry.path));
@@ -322,7 +328,7 @@ export function startReplay(
       source: input.source,
       currentOid: head.oid,
       mainline: input.mainline,
-      sourceSubjectLabel: true,
+      incomingLabelStyle: policy.incomingLabelStyle,
     });
     const message = input.message ?? policy.defaultMessage(plan);
     const prior = replayStartSqlStatements(plan);
@@ -402,7 +408,7 @@ export function continueReplay(
   return repo.store.db.transactionSync(() => {
     const journal = requireReplayJournal(repo, policy.kind);
     const head = requireOriginalHead(repo, journal.state);
-    const verified = requireOwnership(repo, context.worktree, journal);
+    const verified = requireOwnership(repo, context.worktree, journal, policy.incomingLabelStyle);
     const plan = verified.plan;
     try {
       if (journal.state.phase === "empty") {
@@ -469,7 +475,9 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
   repo.store.db.transactionSync(() => {
     const journal = requireReplayJournal(repo, kind);
     requireOriginalHead(repo, journal.state);
-    const verified = requireOwnership(repo, worktree, journal);
+    const incomingLabelStyle: ReplayIncomingLabelStyle =
+      kind === "cherry-pick" ? "source-subject" : "parent-of-source-subject";
+    const verified = requireOwnership(repo, worktree, journal, incomingLabelStyle);
     try {
       if (journal.touched.length > 0) {
         restoreProjectedOperation(repo, worktree, journal, {

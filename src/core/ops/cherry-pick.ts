@@ -30,6 +30,7 @@ export interface CherryPickContinueOptions {
 
 const POLICY: ReplayPolicy = {
   kind: "cherry-pick",
+  incomingLabelStyle: "source-subject",
   suspendEmpty: true,
   defaultMessage: (plan) => plan.sourceCommit.message,
   resolveIdentities: (context, repo, plan, input) =>

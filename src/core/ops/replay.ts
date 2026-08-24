@@ -15,6 +15,7 @@ export const MAX_REPLAY_TAG_HOPS = 16;
 export const MAX_REPLAY_METADATA_SQL_STATEMENTS = 256;
 
 export type ReplayKind = "cherry-pick" | "revert";
+export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";
 
 export interface ReplayInput {
   kind: ReplayKind;
@@ -23,8 +24,8 @@ export interface ReplayInput {
   mainline?: number;
   text?: TextMergeOptions;
   limits?: IntegrationLimits;
-  /** Use Git's sequencer label without changing the planner's default fixture labels. */
-  sourceSubjectLabel?: boolean;
+  /** Select Git's command-specific sequencer label or the planner's tree label. */
+  incomingLabelStyle?: ReplayIncomingLabelStyle;
 }
 
 export interface ReplayLabels {
@@ -248,6 +249,22 @@ function sourceSubject(message: string): string {
   return (newline < 0 ? message : message.slice(0, newline)).replace(/\r$/, "");
 }
 
+function incomingLabel(
+  style: ReplayIncomingLabelStyle,
+  kind: ReplayKind,
+  sourceOid: string,
+  selectedParentOid: string | null,
+  sourceMessage: string,
+): string {
+  if (style === "source-subject") {
+    return `${sourceOid.slice(0, 7)} (${sourceSubject(sourceMessage)})`;
+  }
+  if (style === "parent-of-source-subject") {
+    return `parent of ${sourceOid.slice(0, 7)} (${sourceSubject(sourceMessage)})`;
+  }
+  return shortOid(kind === "cherry-pick" ? sourceOid : selectedParentOid);
+}
+
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
 export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
   const sourceRevision = requireRevision(input.source);
@@ -276,9 +293,13 @@ export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
       shortOid(input.kind === "cherry-pick" ? selectedParentOid : sourceOid),
     incoming:
       input.text?.labels?.incoming ??
-      (input.sourceSubjectLabel === true
-        ? `${sourceOid.slice(0, 7)} (${sourceSubject(sourceCommit.message)})`
-        : shortOid(input.kind === "cherry-pick" ? sourceOid : selectedParentOid)),
+      incomingLabel(
+        input.incomingLabelStyle ?? "tree",
+        input.kind,
+        sourceOid,
+        selectedParentOid,
+        sourceCommit.message,
+      ),
   };
   const integration = planIntegration(repo, {
     baseTreeOid,
