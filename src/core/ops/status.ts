@@ -498,16 +498,20 @@ export function clean(repo: Repository, worktree: Worktree, options: CleanOption
     return removeAll(repo, worktree, files, options);
   }
 
-  const visible = new Set<string>(worktreeFiles(repo, worktree, statusOptions));
-  const everything = walkWorktree(worktree, repo.root, {
-    excludeRoots: options.excludeRoots,
-    paths: options.paths,
-    includeIgnored: true,
-  });
-  const ignored = everything.filter((path) => !visible.has(path));
+  const snapshot = snapshotCleanWorktree(repo, worktree, options, ignores);
+  const visible = new Set<string>(snapshot.visible);
+  const ignored = snapshot.ignored;
   const untracked = [...visible].filter((path) => !index.has(path));
-  const entries = collapsed.flatMap((entry) => expandAroundIgnored(entry, untracked, ignored));
-  return removeAll(repo, worktree, entries.sort(), options);
+  const directories = cleanableDirectories(snapshot.directories, [
+    ...index.keys(),
+    ...ignored,
+    ...snapshot.protectedDirectories,
+  ]);
+  const entries = minimalCleanEntries([
+    ...collapsed.flatMap((entry) => expandAroundIgnored(entry, untracked, ignored)),
+    ...directories.map((path) => `${path}/`),
+  ]);
+  return removeAll(repo, worktree, entries, options);
 }
 
 /** The untracked half of `status`, which is what `clean` acts on. */
@@ -516,7 +520,7 @@ function untrackedEntries(repo: Repository, worktree: Worktree, options: StatusO
   for (const row of statusStream(repo, worktree, options)) {
     if (row.worktree === "?") out.push(row.path);
   }
-  return out.sort();
+  return out.sort(comparePaths);
 }
 
 /**
@@ -535,6 +539,111 @@ function expandAroundIgnored(entry: string, untracked: string[], ignored: string
     children.add(slash === -1 ? path : `${prefix}${rest.slice(0, slash)}/`);
   }
   return [...children].flatMap((child) => expandAroundIgnored(child, untracked, ignored));
+}
+
+interface CleanWorktreeSnapshot {
+  visible: string[];
+  ignored: string[];
+  directories: string[];
+  protectedDirectories: string[];
+}
+
+/** Classify files and otherwise invisible empty directories in one paged traversal. */
+function snapshotCleanWorktree(
+  repo: Repository,
+  worktree: Worktree,
+  options: CleanOptions,
+  ignores: IgnoreMatcher,
+): CleanWorktreeSnapshot {
+  const excluded = excludedRoots(repo.root, options.excludeRoots);
+  const visible: string[] = [];
+  const ignored: string[] = [];
+  const directories: string[] = [];
+  const protectedDirectories = excluded.map((root) => root.relative);
+  let retainedBytes = 0;
+  const retain = (path: string): void => {
+    retainedBytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(path);
+    if (retainedBytes > STATUS_RETAINED_BYTES) {
+      throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
+    }
+  };
+  for (const path of protectedDirectories) retain(path);
+
+  const root = worktree.realpath(repo.root);
+  let ignoredRoot: string | null = null;
+  let after: string | undefined;
+  while (true) {
+    const page = worktree.scan(root, { after, limit: STATUS_WINDOW_ROWS });
+    if (page.length === 0) break;
+    for (const entry of page) {
+      const path = relativeTo(root, entry.path);
+      if (path === null || path === "") continue;
+      if (ignoredRoot !== null && !path.startsWith(`${ignoredRoot}/`)) ignoredRoot = null;
+      if (isExcluded(path, excluded)) continue;
+      if (entry.type === "dir") {
+        if (ignoredRoot !== null) continue;
+        if (ignores.ignores(path, true)) {
+          retain(path);
+          ignored.push(path);
+          protectedDirectories.push(path);
+          ignoredRoot = path;
+          continue;
+        }
+        if (!matchesPaths(path, options.paths)) continue;
+        retain(path);
+        directories.push(path);
+        continue;
+      }
+      if (ignoredRoot !== null || !matchesPaths(path, options.paths)) continue;
+      retain(path);
+      if (ignores.ignores(path, false)) ignored.push(path);
+      else visible.push(path);
+    }
+    const tail = page[page.length - 1];
+    if (tail === undefined || page.length < STATUS_WINDOW_ROWS) break;
+    after = tail.path;
+  }
+  return { visible, ignored, directories, protectedDirectories };
+}
+
+/** Include empty directories that status cannot report because Git tracks no directories. */
+function cleanableDirectories(directories: string[], protectedPaths: string[]): string[] {
+  const protectedDirectories = new Set<string>();
+  let retainedBytes = 0;
+  const protect = (path: string): void => {
+    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+      const directory = path.slice(0, slash);
+      if (protectedDirectories.has(directory)) continue;
+      retainedBytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(directory);
+      if (retainedBytes > STATUS_RETAINED_BYTES) {
+        throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
+      }
+      protectedDirectories.add(directory);
+    }
+    if (!protectedDirectories.has(path)) {
+      retainedBytes += DIRECTORY_FIXED_BYTES + retainedStringBytes(path);
+      if (retainedBytes > STATUS_RETAINED_BYTES) {
+        throw new GitError("E2BIG", `clean retained state exceeds ${STATUS_RETAINED_BYTES} bytes`);
+      }
+      protectedDirectories.add(path);
+    }
+  };
+  for (const path of protectedPaths) protect(path);
+  return directories.filter((path) => !protectedDirectories.has(path));
+}
+
+function minimalCleanEntries(entries: string[]): string[] {
+  const sorted = entries.sort(comparePaths);
+  const out: string[] = [];
+  let directory: string | null = null;
+  for (const entry of sorted) {
+    if (directory !== null && entry.startsWith(directory)) continue;
+    const previous = out[out.length - 1];
+    if (entry === previous) continue;
+    out.push(entry);
+    directory = entry.endsWith("/") ? entry : null;
+  }
+  return out;
 }
 
 function removeAll(
@@ -557,12 +666,16 @@ function removeDirectory(repo: Repository, worktree: Worktree, directory: string
     includeIgnored: true,
   });
   const directories = new Set<string>([directory]);
+  const rootDepth = directory.split("/").length;
   for (const path of contents) {
     worktree.unlink(joinPath(repo.root, path));
     const parts = path.split("/");
-    for (let depth = 1; depth < parts.length; depth++)
+    for (let depth = rootDepth; depth < parts.length; depth++)
       directories.add(parts.slice(0, depth).join("/"));
   }
-  const deepestFirst = [...directories].sort((a, b) => b.split("/").length - a.split("/").length);
+  const deepestFirst = [...directories].sort((a, b) => {
+    const depth = b.split("/").length - a.split("/").length;
+    return depth === 0 ? comparePaths(a, b) : depth;
+  });
   for (const path of deepestFirst) worktree.rmdir(joinPath(repo.root, path));
 }

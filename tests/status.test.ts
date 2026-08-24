@@ -775,4 +775,23 @@ describe("clean", () => {
     expect(workspace.worktree.stat("/src/nested.txt")).not.toBeNull();
     expect(status(workspace.repo, workspace.worktree)).toEqual([]);
   });
+
+  it("keeps parents of empty ignored and excluded directories", async () => {
+    const { workspace } = await build({
+      name: "protected empty directories",
+      commits: [[...BASE, { op: "write", path: ".gitignore", content: "ignored/\n" }]],
+      mutate: [],
+    });
+    workspace.worktree.makeDirectories(["/outer/ignored", "/vendor/nested"]);
+    writeWorkFile(workspace, "/vendor/nested/file.txt", "nested\n");
+
+    expect(
+      clean(workspace.repo, workspace.worktree, {
+        directories: true,
+        excludeRoots: ["/vendor/nested"],
+      }),
+    ).toEqual([]);
+    expect(workspace.worktree.stat("/outer/ignored")?.type).toBe("dir");
+    expect(workspace.worktree.stat("/vendor/nested/file.txt")?.type).toBe("file");
+  });
 });
