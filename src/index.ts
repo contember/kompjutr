@@ -62,6 +62,8 @@ export {
   createGit,
   type Git,
   type GitFactory,
+  type GitMergeContinueOptions,
+  type GitMergeOptions,
 } from "./git/client.js";
 export {
   type Async,

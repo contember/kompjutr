@@ -29,6 +29,7 @@ import {
 } from "../../core/ops/config.js";
 import { diff as diffOp, diffSummary as diffSummaryOp } from "../../core/ops/diff.js";
 import { initRepository } from "../../core/ops/init.js";
+import { merge as mergeOp } from "../../core/ops/merge.js";
 import { clone as cloneOp, fetchInto } from "../../core/ops/network.js";
 import {
   catFile as catFileOp,
@@ -131,6 +132,7 @@ export function createSqliteGitClient(
       },
       async clean(input = {}) {
         const repo = at(input.dir);
+        repo.store.requireNoMergeState();
         return cleanOp(repo, ctx().worktree, { ...input, excludeRoots: excludeRoots(repo) });
       },
 
@@ -142,10 +144,21 @@ export function createSqliteGitClient(
         rmOp(at(input.dir), ctx().worktree, input);
       },
       async reset(input = {}) {
-        resetOp(at(input.dir), ctx().worktree, input);
+        const repo = at(input.dir);
+        if (input.hard === true) {
+          repo.store.db.transactionSync(() => {
+            resetOp(repo, ctx().worktree, input);
+            repo.store.clearMergeState();
+          });
+          return;
+        }
+        repo.store.requireNoMergeState();
+        resetOp(repo, ctx().worktree, input);
       },
       async commit(input) {
-        return commitOp(ctx(), at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoMergeState();
+        return commitOp(ctx(), repo, input);
       },
 
       async log(input = {}) {
@@ -172,7 +185,9 @@ export function createSqliteGitClient(
       },
 
       async branch(input) {
-        branchOp(at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoMergeState();
+        branchOp(repo, input);
       },
       async branchDelete(input) {
         branchDeleteOp(at(input.dir), input);
@@ -190,7 +205,9 @@ export function createSqliteGitClient(
         return tagListOp(at(input.dir));
       },
       async checkout(input) {
-        checkoutOp(ctx(), at(input.dir), ctx().worktree, input);
+        const repo = at(input.dir);
+        repo.store.requireNoMergeState();
+        checkoutOp(ctx(), repo, ctx().worktree, input);
       },
 
       async remoteAdd(input) {
@@ -221,7 +238,9 @@ export function createSqliteGitClient(
           : catFileRead(repo, input.oid, input.filepath);
       },
       async updateRef(input) {
-        updateRefOp(at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoMergeState();
+        updateRefOp(repo, input);
       },
 
       // Phase 5 and beyond. The object satisfies the interface so a caller
@@ -232,8 +251,9 @@ export function createSqliteGitClient(
       async pull() {
         throw new UnsupportedOperationError("pull");
       },
-      async merge() {
-        throw new UnsupportedOperationError("merge");
+      async merge(input) {
+        const repo = at(input.dir);
+        return mergeOp(ctx(), repo, ctx().worktree, input, { persistConflicts: false });
       },
       async stashPush() {
         throw new UnsupportedOperationError("stash push");

@@ -5,7 +5,10 @@
 import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { createSqliteGitClient } from "../src/compat/computer.js";
+import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
+import { createGit } from "../src/git/client.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
@@ -148,12 +151,74 @@ describe("createSqliteGitClient", () => {
     }
   });
 
-  it("satisfies the interface for what it does not implement yet", async () => {
+  it("rolls a compatibility merge conflict back without pending state", async () => {
+    const { workspace } = makeWorkspace();
+    const git = workspace.git;
+    await git.init({});
+    await workspace.fs.writeFile("/conflict.txt", "base\n");
+    await git.add({ paths: ["conflict.txt"] });
+    await git.commit({ message: "base" });
+    await git.branch({ name: "topic" });
+    await git.checkout({ ref: "topic" });
+    await workspace.fs.writeFile("/conflict.txt", "incoming\n");
+    await git.add({ paths: ["conflict.txt"] });
+    await git.commit({ message: "topic" });
+    await git.checkout({ ref: "main" });
+    await workspace.fs.writeFile("/conflict.txt", "current\n");
+    await git.add({ paths: ["conflict.txt"] });
+    const current = await git.commit({ message: "main" });
+
+    await expect(git.merge({ theirs: "topic" })).rejects.toMatchObject({ code: "EMERGEFAIL" });
+    expect(await git.revParse({ ref: "HEAD" })).toBe(current.oid);
+    expect(await workspace.fs.readFile("/conflict.txt", "utf8")).toBe("current\n");
+    expect(await git.status()).toEqual([]);
+    await expect(git.merge({ theirs: "topic" })).rejects.toMatchObject({ code: "EMERGEFAIL" });
+  });
+
+  it("blocks compatibility commit while a native merge is pending", async () => {
+    const { workspace, storage } = makeWorkspace();
+    const compat = workspace.git;
+    await compat.init({});
+    await workspace.fs.writeFile("/base.txt", "base\n");
+    await compat.add({ paths: ["base.txt"] });
+    await compat.commit({ message: "base" });
+    await compat.branch({ name: "topic" });
+    await compat.checkout({ ref: "topic" });
+    await workspace.fs.writeFile("/topic.txt", "topic\n");
+    await compat.add({ paths: ["topic.txt"] });
+    await compat.commit({ message: "topic" });
+    await compat.checkout({ ref: "main" });
+    await workspace.fs.writeFile("/main.txt", "main\n");
+    await compat.add({ paths: ["main.txt"] });
+    const current = await compat.commit({ message: "main" });
+
+    const native = createGit()({
+      database: new SqliteGitDatabase(new TestDatabase(storage)),
+      worktree: new ComputerWorktree(workspace.provider()),
+      now: () => 1_600_000_000_000,
+      timezoneOffset: () => 0,
+      defaultIdentity: IDENTITY,
+    });
+    await expect(native.merge({ theirs: "topic", commit: false })).resolves.toEqual({
+      pendingCommit: true,
+    });
+
+    await expect(
+      compat.commit({ message: "must not bypass merge continuation" }),
+    ).rejects.toMatchObject({
+      code: "EMERGEACTIVE",
+    });
+    expect(await compat.revParse({ ref: "HEAD" })).toBe(current.oid);
+    await expect(native.merge({ theirs: "topic" })).rejects.toMatchObject({
+      code: "EMERGEACTIVE",
+    });
+  });
+
+  it("fails explicitly for methods that remain unsupported", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});
     for (const call of [
       () => workspace.git.pull({}),
-      () => workspace.git.merge({ theirs: "main" }),
       () => workspace.git.stashPush({}),
       () => workspace.git.cli({ argv: ["status"] }),
     ]) {

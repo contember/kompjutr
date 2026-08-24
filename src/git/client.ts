@@ -6,7 +6,7 @@ import {
   nestedRoots,
   openRepository,
 } from "../core/context.js";
-import { UnsupportedOperationError } from "../core/errors.js";
+import { GitError, UnsupportedOperationError } from "../core/errors.js";
 import { type CommitOptions, commit as commitOp } from "../core/ops/commit.js";
 import {
   type ConfigGetOptions,
@@ -28,10 +28,18 @@ import { type InitOptions, initRepository } from "../core/ops/init.js";
 import type {
   CommitResult,
   DiffSummaryEntry,
+  MergeResult,
   PushResult,
   RemoteView,
   StatusEntry,
 } from "../core/ops/kinds.js";
+import {
+  type MergeContinueOptions,
+  type MergeOptions,
+  mergeAbort as mergeAbortOp,
+  mergeContinue as mergeContinueOp,
+  merge as mergeOp,
+} from "../core/ops/merge.js";
 import {
   type CloneOptions,
   clone as cloneOp,
@@ -103,6 +111,8 @@ export type GitAddOptions = Omit<AddOptions, "excludeRoots"> & GitDirOptions;
 export type GitRmOptions = RmOptions & GitDirOptions;
 export type GitResetOptions = ResetOptions & GitDirOptions;
 export type GitCommitOptions = CommitOptions & GitDirOptions;
+export type GitMergeOptions = MergeOptions & GitDirOptions;
+export type GitMergeContinueOptions = MergeContinueOptions & GitDirOptions;
 export type GitBranchOptions = BranchOptions & GitDirOptions;
 export type GitBranchDeleteOptions = BranchDeleteOptions & GitDirOptions;
 export type GitTagOptions = TagOptions & GitDirOptions;
@@ -158,7 +168,9 @@ export interface Git {
   updateRef(input: GitUpdateRefOptions): Promise<void>;
   push(input?: GitPushOptions): Promise<PushResult>;
   pull(input?: GitDirOptions): Promise<never>;
-  merge(input: GitDirOptions & { theirs: string }): Promise<never>;
+  merge(input: GitMergeOptions): Promise<MergeResult>;
+  mergeContinue(input?: GitMergeContinueOptions): Promise<MergeResult>;
+  mergeAbort(input?: GitDirOptions): Promise<void>;
   stashPush(input?: GitDirOptions): Promise<never>;
   stashList(input?: GitDirOptions): Promise<never>;
   stashPop(input?: GitDirOptions): Promise<never>;
@@ -237,6 +249,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async clean(input = {}) {
       const repo = at(input.dir);
+      repo.store.requireNoMergeState();
       return cleanOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
     },
     async add(input) {
@@ -247,10 +260,30 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       rmOp(at(input.dir), context.worktree, input);
     },
     async reset(input = {}) {
-      resetOp(at(input.dir), context.worktree, input);
+      const repo = at(input.dir);
+      if (input.hard === true) {
+        repo.store.db.transactionSync(() => {
+          resetOp(repo, context.worktree, input);
+          repo.store.clearMergeState();
+        });
+        return;
+      }
+      repo.store.requireNoMergeState();
+      resetOp(repo, context.worktree, input);
     },
     async commit(input) {
-      return commitOp(context, at(input.dir), input);
+      const repo = at(input.dir);
+      if (repo.store.readMergeState() !== null) {
+        if (input.amend === true) {
+          throw new GitError("EINVAL", "cannot amend while continuing a merge");
+        }
+        const result = mergeContinueOp(context, repo, input);
+        if (result.oid === undefined) {
+          throw new GitError("ECORRUPT", "merge continuation did not create a commit");
+        }
+        return { oid: result.oid };
+      }
+      return commitOp(context, repo, input);
     },
     async log(input = {}) {
       return logOp(at(input.dir), input);
@@ -275,7 +308,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return lsTreeOp(at(input.dir), input.ref, input.path);
     },
     async branch(input) {
-      branchOp(at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoMergeState();
+      branchOp(repo, input);
     },
     async branchDelete(input) {
       branchDeleteOp(at(input.dir), input);
@@ -293,7 +328,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return tagListOp(at(input.dir));
     },
     async checkout(input) {
-      checkoutOp(context, at(input.dir), context.worktree, input);
+      const repo = at(input.dir);
+      repo.store.requireNoMergeState();
+      checkoutOp(context, repo, context.worktree, input);
     },
     async remoteAdd(input) {
       remoteAdd(at(input.dir), input);
@@ -322,7 +359,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return { oid: result.oid, bytes: result.bytes };
     },
     async updateRef(input) {
-      updateRefOp(at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoMergeState();
+      updateRefOp(repo, input);
     },
     async push(input = {}) {
       return pushOp(context, at(input.dir), input);
@@ -330,8 +369,15 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async pull() {
       throw new UnsupportedOperationError("pull");
     },
-    async merge() {
-      throw new UnsupportedOperationError("merge");
+    async merge(input) {
+      const repo = at(input.dir);
+      return mergeOp(context, repo, context.worktree, input);
+    },
+    async mergeContinue(input = {}) {
+      return mergeContinueOp(context, at(input.dir), input);
+    },
+    async mergeAbort(input = {}) {
+      mergeAbortOp(at(input.dir), context.worktree);
     },
     async stashPush() {
       throw new UnsupportedOperationError("stash push");

@@ -60,4 +60,8 @@ export interface MergeResult {
   oid?: string;
   alreadyMerged?: boolean;
   fastForward?: boolean;
+  /** The index contains unresolved stages and the merge can be continued or aborted. */
+  conflicted?: boolean;
+  /** The merge has durable state but has not created its merge commit yet. */
+  pendingCommit?: boolean;
 }

@@ -63,6 +63,8 @@ export {
   type GitFetchOptions,
   type GitHashObjectOptions,
   type GitInitOptions,
+  type GitMergeContinueOptions,
+  type GitMergeOptions,
   type GitPushOptions,
   type GitRemoteAddOptions,
   type GitRemoteRemoveOptions,
