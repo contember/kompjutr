@@ -7,6 +7,14 @@ import {
   openRepository,
 } from "../core/context.js";
 import { GitError, UnsupportedOperationError } from "../core/errors.js";
+import {
+  type CherryPickContinueOptions,
+  type CherryPickOptions,
+  cherryPickAbort as cherryPickAbortOp,
+  cherryPickContinue as cherryPickContinueOp,
+  cherryPick as cherryPickOp,
+  cherryPickSkip as cherryPickSkipOp,
+} from "../core/ops/cherry-pick.js";
 import { type CommitOptions, commit as commitOp } from "../core/ops/commit.js";
 import {
   type ConfigGetOptions,
@@ -31,6 +39,7 @@ import type {
   MergeResult,
   PushResult,
   RemoteView,
+  ReplayResult,
   StatusEntry,
 } from "../core/ops/kinds.js";
 import {
@@ -84,6 +93,14 @@ import {
   tag as tagOp,
 } from "../core/ops/refs.js";
 import {
+  type RevertContinueOptions,
+  type RevertOptions,
+  revertAbort as revertAbortOp,
+  revertContinue as revertContinueOp,
+  revert as revertOp,
+  revertSkip as revertSkipOp,
+} from "../core/ops/revert.js";
+import {
   type AddOptions,
   add as addOp,
   lsFiles as lsFilesOp,
@@ -114,6 +131,10 @@ export type GitResetOptions = ResetOptions & GitDirOptions;
 export type GitCommitOptions = CommitOptions & GitDirOptions;
 export type GitMergeOptions = MergeOptions & GitDirOptions;
 export type GitMergeContinueOptions = MergeContinueOptions & GitDirOptions;
+export type GitCherryPickOptions = CherryPickOptions & GitDirOptions;
+export type GitCherryPickContinueOptions = CherryPickContinueOptions & GitDirOptions;
+export type GitRevertOptions = RevertOptions & GitDirOptions;
+export type GitRevertContinueOptions = RevertContinueOptions & GitDirOptions;
 export type GitBranchOptions = BranchOptions & GitDirOptions;
 export type GitBranchDeleteOptions = BranchDeleteOptions & GitDirOptions;
 export type GitTagOptions = TagOptions & GitDirOptions;
@@ -173,6 +194,14 @@ export interface Git {
   merge(input: GitMergeOptions): Promise<MergeResult>;
   mergeContinue(input?: GitMergeContinueOptions): Promise<MergeResult>;
   mergeAbort(input?: GitDirOptions): Promise<void>;
+  cherryPick(input: GitCherryPickOptions): Promise<ReplayResult>;
+  cherryPickContinue(input?: GitCherryPickContinueOptions): Promise<ReplayResult>;
+  cherryPickSkip(input?: GitDirOptions): Promise<void>;
+  cherryPickAbort(input?: GitDirOptions): Promise<void>;
+  revert(input: GitRevertOptions): Promise<ReplayResult>;
+  revertContinue(input?: GitRevertContinueOptions): Promise<ReplayResult>;
+  revertSkip(input?: GitDirOptions): Promise<void>;
+  revertAbort(input?: GitDirOptions): Promise<void>;
   stashPush(input?: GitDirOptions): Promise<never>;
   stashList(input?: GitDirOptions): Promise<never>;
   stashPop(input?: GitDirOptions): Promise<never>;
@@ -383,6 +412,30 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async mergeAbort(input = {}) {
       mergeAbortOp(at(input.dir), context.worktree);
+    },
+    async cherryPick(input) {
+      return cherryPickOp(context, at(input.dir), context.worktree, input);
+    },
+    async cherryPickContinue(input = {}) {
+      return cherryPickContinueOp(context, at(input.dir), input);
+    },
+    async cherryPickSkip(input = {}) {
+      cherryPickSkipOp(at(input.dir), context.worktree);
+    },
+    async cherryPickAbort(input = {}) {
+      cherryPickAbortOp(at(input.dir), context.worktree);
+    },
+    async revert(input) {
+      return revertOp(context, at(input.dir), context.worktree, input);
+    },
+    async revertContinue(input = {}) {
+      return revertContinueOp(context, at(input.dir), input);
+    },
+    async revertSkip(input = {}) {
+      revertSkipOp(at(input.dir), context.worktree);
+    },
+    async revertAbort(input = {}) {
+      revertAbortOp(at(input.dir), context.worktree);
     },
     async stashPush() {
       throw new UnsupportedOperationError("stash push");

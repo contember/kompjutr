@@ -48,13 +48,13 @@ fs.writeFileSync("/src/index.ts", "export const value = 1;\n");
 
 The native client supports repository initialization, clone, fetch, pull,
 single-branch Smart HTTP push, status, staging, commit, log, diff, checkout,
-branches, tags, refs, config, remotes, local two-head merge, and the plumbing
-operations exposed by `Git`. Pull fetches the configured upstream and delegates
-fast-forward or divergent integration to the native merge lifecycle. Merge
-supports fast-forward, forced merge commits, clean and conflicted integration,
-`commit: false`, restart-safe continue, and path-scoped abort for the checked-out
-branch. Unsupported commands fail with `EUNSUPPORTED` instead of falling back to
-another implementation.
+branches, tags, refs, config, remotes, local two-head merge, one-commit
+cherry-pick and revert, and the plumbing operations exposed by `Git`. Pull
+fetches the configured upstream and delegates fast-forward or divergent
+integration to the native merge lifecycle. Merge supports fast-forward, forced
+merge commits, clean and conflicted integration, `commit: false`, restart-safe
+continue, and path-scoped abort for the checked-out branch. Unsupported commands
+fail with `EUNSUPPORTED` instead of falling back to another implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });
@@ -62,6 +62,16 @@ workspace.fs.writeFileSync("/README.md", "# project\n");
 await workspace.git.add({ paths: ["README.md"] });
 const commit = await workspace.git.commit({ message: "Initial commit" });
 ```
+
+`cherryPick()` and `revert()` return a `ReplayResult`: `committed` includes the
+new OID, `conflicted` leaves restart-safe state for continue, skip, or abort,
+and `empty` describes a no-change operation. Empty reason `source` means the
+selected source commit introduces no tree change relative to its selected
+parent. Empty reason `result` means applying the change would leave the current
+tree unchanged. Cherry-pick keeps either empty result active until
+`cherryPickSkip()` or `cherryPickAbort()`; revert treats an empty result as a
+completed no-op. Recovery methods are operation-specific and reject the wrong
+or missing operation state.
 
 Push creates, fast-forwards, force-updates, or deletes one `refs/heads/*` ref.
 It streams a replayable full-object pack and updates the local remote-tracking

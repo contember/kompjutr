@@ -22,6 +22,8 @@ export type {
   PushResult,
   RefUpdateStatus,
   RemoteView,
+  ReplayEmptyReason,
+  ReplayResult,
   StatusEntry,
   StatusRow,
 } from "./core/ops/kinds.js";
@@ -61,10 +63,14 @@ export {
   type CreateGitOptions,
   createGit,
   type Git,
+  type GitCherryPickContinueOptions,
+  type GitCherryPickOptions,
   type GitFactory,
   type GitMergeContinueOptions,
   type GitMergeOptions,
   type GitPullOptions,
+  type GitRevertContinueOptions,
+  type GitRevertOptions,
 } from "./git/client.js";
 export {
   type Async,

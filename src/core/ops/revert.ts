@@ -5,13 +5,13 @@ import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import type { Worktree } from "../worktree.js";
 import { resolveIdentity } from "./commit.js";
+import type { ReplayResult } from "./kinds.js";
 import type { ReplayPlan } from "./replay.js";
 import {
   cancelReplay,
   continueReplay,
   type ReplayContinueOptions,
   type ReplayPolicy,
-  type ReplayResult,
   type ReplayStartOptions,
   startReplay,
 } from "./replay-lifecycle.js";

@@ -200,6 +200,37 @@ worktree content is preserved, and a structural blocker makes abort fail closed.
 Compatibility clients expose only single-shot merge, so a conflict is rolled
 back and reported as `EMERGEFAIL` instead of leaving unreachable pending state.
 
+## Cherry-pick and revert lifecycle
+
+Cherry-pick and revert share one bounded replay planner and one durable recovery
+lifecycle. The planner resolves a full or abbreviated object ID, ref, annotated
+tag, or bounded `^` and `~` suffix. It selects the commit parent, reverses the
+tree mapping for revert, and delegates the resulting base/current/incoming trees
+to the same integration engine as merge. Root commits use the empty tree. Merge
+commits require an explicit valid mainline.
+
+Clean replay creates one commit whose sole parent is the original checked-out
+HEAD. Cherry-pick preserves the source author and message by default and creates
+a new committer identity. Revert creates new author and committer identities and
+uses Git-compatible default messages. A caller can override the supported
+message and identity fields through the native `Git` methods.
+
+Conflicts and cherry-pick empty results persist schema-v10 operation metadata
+plus bounded snapshots for only replay-owned paths. Continue validates the
+authoritative source, selected parent, original HEAD, labels, and saved path
+ownership before committing. Skip and abort restore the original index and
+worktree state for those paths and preserve unrelated content. Each recovery
+method requires its matching operation kind; ordinary commit cannot bypass a
+pending replay.
+
+`ReplayResult` reports `committed`, `conflicted`, or `empty`. Empty reason
+`source` means the source tree equals its selected parent tree. Empty reason
+`result` means the projected integration tree equals the current tree.
+Cherry-pick suspends both empty outcomes for explicit cancellation, matching
+Git's active empty-pick state. Revert completes an empty operation immediately.
+All planning, apply, recovery, and journal-transition statements are composed
+into the fail-closed operation limit before writes become visible.
+
 ## Pull composition
 
 Pull is a two-phase composition rather than a second integration engine. Before

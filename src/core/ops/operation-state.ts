@@ -3,6 +3,7 @@
 import { isOid, utf8 } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { hashObject } from "../objects.js";
+import type { ReplayEmptyReason } from "./kinds.js";
 import {
   MAX_MERGE_IDENTITY_BYTES,
   MAX_MERGE_LABEL_BYTES,
@@ -24,7 +25,6 @@ import {
 export type OperationKind = "merge" | "cherry-pick" | "revert";
 export type ReplayKind = Exclude<OperationKind, "merge">;
 export type ReplayStatePhase = "conflicted" | "empty";
-export type ReplayEmptyReason = "source" | "result";
 
 export type MergeOperationStateMetadata = MergeStateMetadata & { kind: "merge" };
 

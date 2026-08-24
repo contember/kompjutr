@@ -24,11 +24,11 @@ import {
   requireSafeIntegrationWorktree,
   reserveIntegrationPlan,
 } from "./integration-worktree.js";
+import type { ReplayEmptyReason, ReplayResult } from "./kinds.js";
 import { applyProjectedOperation, restoreProjectedOperation } from "./merge-apply.js";
 import type {
   CherryPickJournal,
   OperationJournal,
-  ReplayEmptyReason,
   ReplayKind,
   ReplayStateMetadata,
   RevertJournal,
@@ -39,11 +39,6 @@ import { treeStream } from "./tree-stream.js";
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
 const REPLAY_FIXED_SQL_STATEMENTS = 30;
 const OPERATION_STATE_TRANSITION_SQL_STATEMENTS = 9;
-
-export type ReplayResult =
-  | { outcome: "committed"; oid: string }
-  | { outcome: "conflicted" }
-  | { outcome: "empty"; reason: ReplayEmptyReason };
 
 export interface ReplayStartOptions {
   source: string;

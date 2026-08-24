@@ -65,3 +65,10 @@ export interface MergeResult {
   /** The merge has durable state but has not created its merge commit yet. */
   pendingCommit?: boolean;
 }
+
+export type ReplayEmptyReason = "source" | "result";
+
+export type ReplayResult =
+  | { outcome: "committed"; oid: string }
+  | { outcome: "conflicted" }
+  | { outcome: "empty"; reason: ReplayEmptyReason };

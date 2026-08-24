@@ -6,12 +6,17 @@ import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
-import { createGit } from "../src/git/client.js";
+import { createGit, type Git } from "../src/git/client.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
+import {
+  makeWorkspace as makeTestWorkspace,
+  type TestWorkspace,
+  writeWorkFile,
+} from "./helpers/workspace.js";
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
 
@@ -23,6 +28,31 @@ function makeWorkspace(): { workspace: Workspace; storage: SqliteTestStorage } {
     defaultGitIdentity: IDENTITY,
   });
   return { workspace, storage };
+}
+
+function makeNativeGit(): { git: Git; workspace: TestWorkspace } {
+  const workspace = makeTestWorkspace();
+  const git = createGit()({
+    database: workspace.database,
+    worktree: workspace.worktree,
+    now: workspace.context.now,
+    timezoneOffset: workspace.context.timezoneOffset,
+    defaultIdentity: IDENTITY,
+  });
+  return { git, workspace };
+}
+
+async function commitFile(
+  git: Git,
+  workspace: TestWorkspace,
+  dir: string,
+  path: string,
+  contents: string,
+  message: string,
+): Promise<string> {
+  writeWorkFile(workspace, `${dir === "/" ? "" : dir}/${path}`, contents);
+  await git.add({ dir, paths: [path] });
+  return (await git.commit({ dir, message })).oid;
 }
 
 const fixtures: GitFixture[] = [];
@@ -288,6 +318,81 @@ describe("createSqliteGitClient", () => {
     await native.reset({ hard: true });
     expect(store.readOperationState()).toBeNull();
     expect(store.getRef("refs/heads/main")).toBe(original.oid);
+  });
+
+  it("routes clean cherry-pick and revert through a selected repository", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/nested/repo";
+    await git.init({ dir });
+    await commitFile(git, workspace, dir, "base.txt", "base\n", "base");
+    await git.branch({ dir, name: "topic" });
+    await git.checkout({ dir, ref: "topic" });
+    const source = await commitFile(git, workspace, dir, "topic.txt", "topic\n", "topic");
+    await git.checkout({ dir, ref: "main" });
+
+    const picked = await git.cherryPick({ dir, source });
+
+    expect(picked.outcome).toBe("committed");
+    expect(workspace.workspace.fs.readFileSync(`${dir}/topic.txt`, "utf8")).toBe("topic\n");
+
+    const reverted = await git.revert({ dir, source });
+
+    expect(reverted.outcome).toBe("committed");
+    expect(workspace.workspace.fs.existsSync(`${dir}/topic.txt`)).toBe(false);
+  });
+
+  it("routes conflicted cherry-pick and revert continuations", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/nested/repo";
+    await git.init({ dir });
+    await commitFile(git, workspace, dir, "conflict.txt", "base\n", "base");
+    await git.branch({ dir, name: "topic" });
+    await git.checkout({ dir, ref: "topic" });
+    const source = await commitFile(git, workspace, dir, "conflict.txt", "incoming\n", "topic");
+    await git.checkout({ dir, ref: "main" });
+    await commitFile(git, workspace, dir, "conflict.txt", "current\n", "main");
+
+    await expect(git.cherryPick({ dir, source })).resolves.toEqual({ outcome: "conflicted" });
+    writeWorkFile(workspace, `${dir}/conflict.txt`, "resolved\n");
+    await git.add({ dir, paths: ["conflict.txt"] });
+    await expect(git.cherryPickContinue({ dir })).resolves.toMatchObject({ outcome: "committed" });
+
+    await expect(git.revert({ dir, source })).resolves.toEqual({ outcome: "conflicted" });
+    await expect(git.cherryPickContinue({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    await expect(git.cherryPickSkip({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    await expect(git.cherryPickAbort({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    writeWorkFile(workspace, `${dir}/conflict.txt`, "base\n");
+    await git.add({ dir, paths: ["conflict.txt"] });
+    await expect(git.revertContinue({ dir })).resolves.toMatchObject({ outcome: "committed" });
+  });
+
+  it("routes replay cancellation, wrong-kind, and no-active calls", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/nested/repo";
+    await git.init({ dir });
+    await commitFile(git, workspace, dir, "same.txt", "base\n", "base");
+    await git.branch({ dir, name: "topic" });
+    await git.checkout({ dir, ref: "topic" });
+    const source = await commitFile(git, workspace, dir, "same.txt", "same\n", "topic");
+    await git.checkout({ dir, ref: "main" });
+    await commitFile(git, workspace, dir, "same.txt", "same\n", "main");
+
+    await expect(git.cherryPick({ dir, source })).resolves.toEqual({
+      outcome: "empty",
+      reason: "result",
+    });
+    await expect(git.revertContinue({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    await expect(git.revertSkip({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    await expect(git.revertAbort({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    await expect(git.cherryPickSkip({ dir })).resolves.toBeUndefined();
+
+    await expect(git.cherryPick({ dir, source })).resolves.toMatchObject({ outcome: "empty" });
+    await expect(git.cherryPickAbort({ dir })).resolves.toBeUndefined();
+    await expect(git.cherryPickContinue({ dir })).rejects.toMatchObject({
+      code: "ENOCHERRYPICK",
+    });
+    await expect(git.revertSkip({ dir })).rejects.toMatchObject({ code: "ENOREVERT" });
+    await expect(git.revertAbort({ dir })).rejects.toMatchObject({ code: "ENOREVERT" });
   });
 
   it("fails explicitly for methods that remain unsupported", async () => {
