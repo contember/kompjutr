@@ -59,6 +59,7 @@ export function comparePaths(left: string, right: string): number {
 export interface Peekable<T> {
   peek(): T | undefined;
   next(): T | undefined;
+  close(): void;
 }
 
 /**
@@ -72,6 +73,7 @@ export function peekable<T>(source: Iterable<T>): Peekable<T> {
   let ahead: T | undefined;
   let buffered = false;
   let drained = false;
+  let closed = false;
 
   function fill(): void {
     if (buffered || drained) return;
@@ -96,6 +98,14 @@ export function peekable<T>(source: Iterable<T>): Peekable<T> {
       ahead = undefined;
       buffered = false;
       return value;
+    },
+    close(): void {
+      if (closed) return;
+      closed = true;
+      drained = true;
+      buffered = false;
+      ahead = undefined;
+      iterator.return?.();
     },
   };
 }
@@ -128,32 +138,37 @@ export function* joinSorted<L, R>(
   const leftSide = peekable(left);
   const rightSide = peekable(right);
 
-  for (;;) {
-    const leftHead = leftSide.peek();
-    const rightHead = rightSide.peek();
+  try {
+    for (;;) {
+      const leftHead = leftSide.peek();
+      const rightHead = rightSide.peek();
 
-    if (leftHead === undefined) {
-      if (rightHead === undefined) return;
-      rightSide.next();
-      yield { path: keyOf.right(rightHead), left: undefined, right: rightHead };
-      continue;
-    }
-    const leftKey = keyOf.left(leftHead);
-    if (rightHead === undefined) {
-      leftSide.next();
-      yield { path: leftKey, left: leftHead, right: undefined };
-      continue;
-    }
+      if (leftHead === undefined) {
+        if (rightHead === undefined) return;
+        rightSide.next();
+        yield { path: keyOf.right(rightHead), left: undefined, right: rightHead };
+        continue;
+      }
+      const leftKey = keyOf.left(leftHead);
+      if (rightHead === undefined) {
+        leftSide.next();
+        yield { path: leftKey, left: leftHead, right: undefined };
+        continue;
+      }
 
-    const rightKey = keyOf.right(rightHead);
-    const order = comparePaths(leftKey, rightKey);
-    if (order <= 0) leftSide.next();
-    if (order >= 0) rightSide.next();
-    yield {
-      path: order <= 0 ? leftKey : rightKey,
-      left: order <= 0 ? leftHead : undefined,
-      right: order >= 0 ? rightHead : undefined,
-    };
+      const rightKey = keyOf.right(rightHead);
+      const order = comparePaths(leftKey, rightKey);
+      if (order <= 0) leftSide.next();
+      if (order >= 0) rightSide.next();
+      yield {
+        path: order <= 0 ? leftKey : rightKey,
+        left: order <= 0 ? leftHead : undefined,
+        right: order >= 0 ? rightHead : undefined,
+      };
+    }
+  } finally {
+    leftSide.close();
+    rightSide.close();
   }
 }
 
@@ -190,32 +205,38 @@ export function* joinSorted3<A, B, C>(
   const sideB = peekable(b);
   const sideC = peekable(c);
 
-  for (;;) {
-    const headA = sideA.peek();
-    const headB = sideB.peek();
-    const headC = sideC.peek();
-    if (headA === undefined && headB === undefined && headC === undefined) return;
+  try {
+    for (;;) {
+      const headA = sideA.peek();
+      const headB = sideB.peek();
+      const headC = sideC.peek();
+      if (headA === undefined && headB === undefined && headC === undefined) return;
 
-    const keyA = headA === undefined ? undefined : keyOf.a(headA);
-    const keyB = headB === undefined ? undefined : keyOf.b(headB);
-    const keyC = headC === undefined ? undefined : keyOf.c(headC);
+      const keyA = headA === undefined ? undefined : keyOf.a(headA);
+      const keyB = headB === undefined ? undefined : keyOf.b(headB);
+      const keyC = headC === undefined ? undefined : keyOf.c(headC);
 
-    let path = keyA ?? keyB ?? keyC ?? "";
-    if (keyB !== undefined && comparePaths(keyB, path) < 0) path = keyB;
-    if (keyC !== undefined && comparePaths(keyC, path) < 0) path = keyC;
+      let path = keyA ?? keyB ?? keyC ?? "";
+      if (keyB !== undefined && comparePaths(keyB, path) < 0) path = keyB;
+      if (keyC !== undefined && comparePaths(keyC, path) < 0) path = keyC;
 
-    const takeA = keyA === path;
-    const takeB = keyB === path;
-    const takeC = keyC === path;
-    if (takeA) sideA.next();
-    if (takeB) sideB.next();
-    if (takeC) sideC.next();
+      const takeA = keyA === path;
+      const takeB = keyB === path;
+      const takeC = keyC === path;
+      if (takeA) sideA.next();
+      if (takeB) sideB.next();
+      if (takeC) sideC.next();
 
-    yield {
-      path,
-      a: takeA ? headA : undefined,
-      b: takeB ? headB : undefined,
-      c: takeC ? headC : undefined,
-    };
+      yield {
+        path,
+        a: takeA ? headA : undefined,
+        b: takeB ? headB : undefined,
+        c: takeC ? headC : undefined,
+      };
+    }
+  } finally {
+    sideA.close();
+    sideB.close();
+    sideC.close();
   }
 }

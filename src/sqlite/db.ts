@@ -68,17 +68,28 @@ export function* iterateSqlCursor(cursor: unknown): Generator<Record<string, unk
   }
   const next = Reflect.get(iterator, "next");
   if (typeof next !== "function") throw new Error("SQL cursor iterator has no next method");
-  for (;;) {
-    const step = Reflect.apply(next, iterator, []);
-    if (typeof step !== "object" || step === null) {
-      throw new Error("SQL cursor iterator returned an invalid step");
+  let finished = false;
+  try {
+    for (;;) {
+      const step = Reflect.apply(next, iterator, []);
+      if (typeof step !== "object" || step === null) {
+        throw new Error("SQL cursor iterator returned an invalid step");
+      }
+      const done = Reflect.get(step, "done");
+      if (done === true) {
+        finished = true;
+        return;
+      }
+      if (done !== false && done !== undefined) {
+        throw new Error("SQL cursor iterator returned an invalid done flag");
+      }
+      yield normalizeRow(Reflect.get(step, "value"));
     }
-    const done = Reflect.get(step, "done");
-    if (done === true) return;
-    if (done !== false && done !== undefined) {
-      throw new Error("SQL cursor iterator returned an invalid done flag");
+  } finally {
+    if (!finished) {
+      const close = Reflect.get(iterator, "return");
+      if (typeof close === "function") Reflect.apply(close, iterator, []);
     }
-    yield normalizeRow(Reflect.get(step, "value"));
   }
 }
 

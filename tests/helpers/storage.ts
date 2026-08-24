@@ -40,6 +40,16 @@ class Cursor<Row extends object> implements SQLCursorLike<Row>, IterableIterator
     return { done: false, value: step.value };
   }
 
+  return(): IteratorResult<Row> {
+    if (!this.#finished) {
+      this.iterator.return?.();
+      this.#finished = true;
+      this.#prefetched = null;
+      this.onDone();
+    }
+    return { done: true, value: undefined };
+  }
+
   [Symbol.iterator](): IterableIterator<Row> {
     return this;
   }

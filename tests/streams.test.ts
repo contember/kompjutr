@@ -307,6 +307,25 @@ describe("joinSorted", () => {
       "000000000005",
     ]);
   });
+
+  it("closes both sources when the consumer stops early", () => {
+    const closed: string[] = [];
+    function* tracked(name: string, values: string[]): Generator<string> {
+      try {
+        yield* values;
+      } finally {
+        closed.push(name);
+      }
+    }
+    const joined = joinSorted(
+      tracked("left", ["a", "c"]),
+      tracked("right", ["b", "d"]),
+      byIdentity,
+    );
+    expect(joined.next().value?.path).toBe("a");
+    joined.return(undefined);
+    expect(closed).toEqual(["left", "right"]);
+  });
 });
 
 describe("joinSorted3", () => {
@@ -350,5 +369,26 @@ describe("joinSorted3", () => {
     }
     const joined = joinSorted3(guarded(["a", "z"], 2), ["a"], ["a"], keyOf);
     expect(joined.next().value?.path).toBe("a");
+  });
+
+  it("closes every source after an early failure", () => {
+    const closed: string[] = [];
+    function* tracked(name: string): Generator<string> {
+      try {
+        yield "a";
+        yield "b";
+      } finally {
+        closed.push(name);
+      }
+    }
+    const joined = joinSorted3(tracked("a"), tracked("b"), tracked("c"), {
+      a: () => {
+        throw new Error("stop");
+      },
+      b: (item) => item,
+      c: (item) => item,
+    });
+    expect(() => joined.next()).toThrow("stop");
+    expect(closed).toEqual(["a", "b", "c"]);
   });
 });

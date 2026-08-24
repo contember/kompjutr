@@ -4,6 +4,7 @@ import { initializeFsSchema } from "../src/fs/schema.js";
 import {
   Database,
   type DurableObjectStorageLike,
+  iterateSqlCursor,
   type SQLCursorLike,
   type SQLStorageLike,
 } from "../src/sqlite/db.js";
@@ -242,6 +243,30 @@ describe("Database", () => {
     expect(storage.cursorNextCount).toBe(0);
     expect([...rows]).toEqual([{ value: 1 }, { value: 2 }]);
     expect(storage.cursorNextCount).toBe(3);
+  });
+
+  it("closes a platform cursor when iteration stops early", () => {
+    let closed = 0;
+    const cursor = {
+      [Symbol.iterator]() {
+        let emitted = false;
+        return {
+          next(): IteratorResult<{ value: number }> {
+            if (emitted) return { done: true, value: undefined };
+            emitted = true;
+            return { done: false, value: { value: 1 } };
+          },
+          return(): IteratorResult<{ value: number }> {
+            closed++;
+            return { done: true, value: undefined };
+          },
+        };
+      },
+    };
+    const rows = iterateSqlCursor(cursor);
+    expect(rows.next().value).toEqual({ value: 1 });
+    rows.return(undefined);
+    expect(closed).toBe(1);
   });
 
   it("initializes the filesystem and git schemas over Durable Object storage", () => {
