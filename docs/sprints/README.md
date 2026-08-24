@@ -20,3 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 <!-- one line per active sprint; empty between sprints -->
+- [Three-way integration engine](sprint-2026-08-24-three-way-integration-engine.md)

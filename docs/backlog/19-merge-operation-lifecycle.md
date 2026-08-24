@@ -27,6 +27,9 @@ conflict state, and creates a two-parent commit.
 - Persist unresolved stages and enough operation state to continue or abort after
   a Durable Object restart. Abort must restore the original ref, index, and
   worktree without discarding unrelated changes.
+- Project logical file/directory conflicts into Git-compatible label-derived
+  unique paths such as `~HEAD` and `~<branch>`, including collision handling,
+  before writing the index and worktree.
 - Add typed merge, continue, and abort APIs with stable errors for detached HEAD,
   unmerged state, unsafe worktrees, missing history, and exceeded limits.
 - Cover fast-forward, already-merged, clean, conflicted, no-commit, continue,
