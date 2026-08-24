@@ -1,0 +1,408 @@
+import { afterEach, describe, expect, it } from "vitest";
+
+import { utf8Decoder } from "../src/core/bytes.js";
+import type { GitContext } from "../src/core/context.js";
+import { checkoutTree } from "../src/core/ops/checkout.js";
+import { cherryPick } from "../src/core/ops/cherry-pick.js";
+import { revert, revertAbort, revertContinue, revertSkip } from "../src/core/ops/revert.js";
+import { add, rm } from "../src/core/ops/staging.js";
+import { Repository } from "../src/core/repository.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { TestDatabase } from "./helpers/db.js";
+import { GitFixture } from "./helpers/git.js";
+import { importFixture } from "./helpers/import.js";
+import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+
+const REVERTER = { name: "Reverter", email: "reverter@example.com" };
+const fixtures: GitFixture[] = [];
+
+afterEach(() => {
+  while (fixtures.length > 0) fixtures.pop()?.dispose();
+});
+
+function fixture(): GitFixture {
+  const created = new GitFixture().init();
+  fixtures.push(created);
+  return created;
+}
+
+async function imported(source: GitFixture): Promise<TestRepository> {
+  const workspace = makeRepo("/");
+  await importFixture(source, workspace.repo.store);
+  checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+  workspace.repo.store.configSet("user.name", REVERTER.name);
+  workspace.repo.store.configSet("user.email", REVERTER.email);
+  return workspace;
+}
+
+function reopen(workspace: TestRepository): { context: GitContext; repo: Repository } {
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+  const row = database.find("/");
+  if (row === null) throw new Error("reopened repository is missing");
+  return {
+    context: { ...workspace.context, database },
+    repo: new Repository(database.open(row), "/"),
+  };
+}
+
+function textAt(workspace: TestRepository, path: string): string | null {
+  if (workspace.worktree.stat(`/${path}`) === null) return null;
+  return utf8Decoder.decode(workspace.worktree.readFile(`/${path}`));
+}
+
+function fixtureCommitMessage(source: GitFixture, oid: string): string {
+  const commit = utf8Decoder.decode(source.catFile(oid));
+  const separator = commit.indexOf("\n\n");
+  if (separator < 0) throw new Error("fixture commit has no message separator");
+  return commit.slice(separator + 2);
+}
+
+describe("revert lifecycle", () => {
+  it("creates a one-parent commit with Git's exact default message and two new identities", async () => {
+    const source = fixture();
+    source.write("tracked.txt", "base\n");
+    source.commit("base");
+    source.write("tracked.txt", "changed\n");
+    source.write(".git/message", "\n  subject   with\ttab  \n\nbody\n");
+    source.git("add", "tracked.txt");
+    source.git("commit", "-q", "--cleanup=verbatim", "-F", ".git/message");
+    const reverted = source.git("rev-parse", "HEAD");
+    source.write("later.txt", "later\n");
+    const current = source.commit("later");
+    const workspace = await imported(source);
+    workspace.tick(120_000);
+
+    const result = revert(workspace.context, workspace.repo, workspace.worktree, {
+      source: reverted,
+    });
+
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("revert did not commit");
+    const commit = workspace.repo.readCommit(result.oid);
+    expect(commit.parent).toEqual([current]);
+    expect(commit.message).toBe(
+      `Revert "  subject   with\ttab  "\n\nThis reverts commit ${reverted}.\n`,
+    );
+    source.git("revert", "--no-edit", reverted);
+    expect(commit.message).toBe(fixtureCommitMessage(source, source.git("rev-parse", "HEAD")));
+    expect(commit.author).toEqual({
+      ...REVERTER,
+      timestamp: 1_577_836_920,
+      timezoneOffset: 0,
+    });
+    expect(commit.committer).toEqual(commit.author);
+    expect(textAt(workspace, "tracked.txt")).toBe("base\n");
+    expect(textAt(workspace, "later.txt")).toBe("later\n");
+    expect(workspace.repo.store.readOperationState()).toBeNull();
+  });
+
+  it("reverts a root commit relative to the empty tree", async () => {
+    const source = fixture();
+    source.write("root.txt", "root\n");
+    const root = source.commit("root");
+    source.write("later.txt", "later\n");
+    const current = source.commit("later");
+    const workspace = await imported(source);
+
+    const result = revert(workspace.context, workspace.repo, workspace.worktree, { source: root });
+
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("root revert did not commit");
+    expect(workspace.repo.readCommit(result.oid).parent).toEqual([current]);
+    expect(textAt(workspace, "root.txt")).toBeNull();
+    expect(textAt(workspace, "later.txt")).toBe("later\n");
+  });
+
+  it("requires a valid mainline and emits Git's merge-revert message", async () => {
+    const source = fixture();
+    source.write("base.txt", "base\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("topic.txt", "topic\n");
+    source.commit("topic");
+    source.git("checkout", "-q", "main");
+    source.write("main.txt", "main\n");
+    source.commit("main");
+    source.git("merge", "-q", "--no-ff", "topic", "-m", "merge subject");
+    const merge = source.git("rev-parse", "HEAD");
+    const selectedParent = source.git("rev-parse", `${merge}^1`);
+
+    const rejectedMainlines: readonly (number | undefined)[] = [undefined, 3];
+    for (const mainline of rejectedMainlines) {
+      const rejected = await imported(source);
+      const before = rejected.repo.head();
+      expect(() =>
+        revert(rejected.context, rejected.repo, rejected.worktree, {
+          source: merge,
+          mainline,
+        }),
+      ).toThrow(expect.objectContaining({ code: "EINVAL" }));
+      expect(rejected.repo.head()).toEqual(before);
+      expect(rejected.repo.store.readOperationState()).toBeNull();
+    }
+
+    const workspace = await imported(source);
+    const result = revert(workspace.context, workspace.repo, workspace.worktree, {
+      source: merge,
+      mainline: 1,
+    });
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("merge revert did not commit");
+    expect(workspace.repo.readCommit(result.oid).message).toBe(
+      `Revert "merge subject"\n\nThis reverts commit ${merge}, reversing\nchanges made to ${selectedParent}.\n`,
+    );
+    source.git("revert", "--no-edit", "-m", "1", merge);
+    expect(workspace.repo.readCommit(result.oid).message).toBe(
+      fixtureCommitMessage(source, source.git("rev-parse", "HEAD")),
+    );
+    expect(textAt(workspace, "topic.txt")).toBeNull();
+    expect(textAt(workspace, "main.txt")).toBe("main\n");
+  });
+
+  it("treats source-empty and result-empty reverts as terminal", async () => {
+    const kinds: readonly ("source" | "result")[] = ["source", "result"];
+    for (const kind of kinds) {
+      const source = fixture();
+      source.write("tracked.txt", "base\n");
+      source.commit("base");
+      let reverted: string;
+      if (kind === "source") {
+        source.git("commit", "--allow-empty", "-q", "-m", "empty");
+        reverted = source.git("rev-parse", "HEAD");
+      } else {
+        source.write("tracked.txt", "changed\n");
+        reverted = source.commit("change");
+        source.write("tracked.txt", "base\n");
+        source.commit("already reversed");
+      }
+      const workspace = await imported(source);
+      const before = workspace.repo.head();
+
+      expect(
+        revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
+      ).toEqual({ outcome: "empty", reason: kind });
+      expect(workspace.repo.head()).toEqual(before);
+      expect(workspace.repo.store.readOperationState()).toBeNull();
+      expect(() => revertContinue(workspace.context, workspace.repo)).toThrow(
+        expect.objectContaining({ code: "ENOREVERT" }),
+      );
+    }
+  });
+
+  it("writes inverse conflict stages and continues after a cold reopen", async () => {
+    const source = fixture();
+    source.write("conflict.txt", "base\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("conflict.txt", "source\n");
+    const reverted = source.commit("source subject");
+    source.git("checkout", "-q", "main");
+    source.write("conflict.txt", "current\n");
+    const current = source.commit("current");
+    const expectedStage1 = source.git("rev-parse", `${reverted}:conflict.txt`);
+    const expectedStage2 = source.git("rev-parse", `${current}:conflict.txt`);
+    const expectedStage3 = source.git("rev-parse", `${reverted}^:conflict.txt`);
+    const workspace = await imported(source);
+
+    expect(
+      revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
+    ).toEqual({ outcome: "conflicted" });
+    expect(workspace.repo.head().oid).toBe(current);
+    expect(workspace.repo.store.indexGet("conflict.txt", 1)?.oid).toBe(expectedStage1);
+    expect(workspace.repo.store.indexGet("conflict.txt", 2)?.oid).toBe(expectedStage2);
+    expect(workspace.repo.store.indexGet("conflict.txt", 3)?.oid).toBe(expectedStage3);
+    expect(textAt(workspace, "conflict.txt")).toContain(
+      `>>>>>>> parent of ${reverted.slice(0, 7)} (source subject)`,
+    );
+
+    workspace.tick(60_000);
+    const cold = reopen(workspace);
+    writeWorkFile(workspace, "/conflict.txt", "resolved\n");
+    add(cold.repo, workspace.worktree, { paths: ["conflict.txt"], excludeRoots: [] });
+    const result = revertContinue(cold.context, cold.repo);
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("revert continuation did not commit");
+    const commit = cold.repo.readCommit(result.oid);
+    expect(commit.parent).toEqual([current]);
+    expect(commit.author).toMatchObject({ ...REVERTER, timestamp: 1_577_836_860 });
+    expect(commit.committer).toEqual(commit.author);
+    expect(cold.repo.store.readOperationState()).toBeNull();
+  });
+
+  it("continues a revert modify/delete conflict after native rm resolution", async () => {
+    const source = fixture();
+    source.write("base.txt", "base\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("added.txt", "source\n");
+    const reverted = source.commit("add file");
+    source.git("checkout", "-q", "main");
+    source.write("added.txt", "current\n");
+    const current = source.commit("independent add");
+    const workspace = await imported(source);
+
+    expect(
+      revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
+    ).toEqual({ outcome: "conflicted" });
+    expect(workspace.repo.store.indexGet("added.txt", 1)?.oid).toBeDefined();
+    expect(workspace.repo.store.indexGet("added.txt", 2)?.oid).toBeDefined();
+    expect(workspace.repo.store.indexGet("added.txt", 3)).toBeNull();
+    rm(workspace.repo, workspace.worktree, { paths: ["added.txt"] });
+    const result = revertContinue(workspace.context, workspace.repo);
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("delete resolution did not commit");
+    const commit = workspace.repo.readCommit(result.oid);
+    expect(commit.parent).toEqual([current]);
+    expect(workspace.repo.readTree(commit.tree).map((entry) => entry.name)).not.toContain(
+      "added.txt",
+    );
+  });
+
+  it("ends a conflict resolved back to HEAD as a terminal empty revert", async () => {
+    const source = fixture();
+    source.write("conflict.txt", "base\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("conflict.txt", "source\n");
+    const reverted = source.commit("source");
+    source.git("checkout", "-q", "main");
+    source.write("conflict.txt", "current\n");
+    const current = source.commit("current");
+    const workspace = await imported(source);
+    revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted });
+
+    writeWorkFile(workspace, "/conflict.txt", "current\n");
+    add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"], excludeRoots: [] });
+
+    expect(revertContinue(workspace.context, workspace.repo)).toEqual({
+      outcome: "empty",
+      reason: "result",
+    });
+    expect(workspace.repo.head().oid).toBe(current);
+    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(() => revertContinue(workspace.context, workspace.repo)).toThrow(
+      expect.objectContaining({ code: "ENOREVERT" }),
+    );
+  });
+
+  it("restores owned paths on skip and abort after partial resolution", async () => {
+    const actions: readonly ("skip" | "abort")[] = ["skip", "abort"];
+    for (const action of actions) {
+      const source = fixture();
+      source.write("conflict.txt", "base\n");
+      source.write("sentinel.txt", "sentinel\n");
+      source.commit("base");
+      source.git("checkout", "-q", "-b", "topic");
+      source.write("conflict.txt", "source\n");
+      const reverted = source.commit("source");
+      source.git("checkout", "-q", "main");
+      source.write("conflict.txt", "current\n");
+      const current = source.commit("current");
+      const workspace = await imported(source);
+      revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted });
+      writeWorkFile(workspace, "/conflict.txt", "partial\n");
+      add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"], excludeRoots: [] });
+      writeWorkFile(workspace, "/sentinel.txt", "local sentinel\n");
+      writeWorkFile(workspace, "/untracked.txt", "untracked\n");
+
+      if (action === "skip") {
+        const cold = reopen(workspace);
+        revertSkip(cold.repo, workspace.worktree);
+        expect(cold.repo.store.readOperationState()).toBeNull();
+      } else {
+        revertAbort(workspace.repo, workspace.worktree);
+        expect(workspace.repo.store.readOperationState()).toBeNull();
+      }
+      expect(workspace.repo.head().oid).toBe(current);
+      expect(textAt(workspace, "conflict.txt")).toBe("current\n");
+      expect(textAt(workspace, "sentinel.txt")).toBe("local sentinel\n");
+      expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
+    }
+  });
+
+  it("keeps wrong-kind state and reports stable no-active errors", async () => {
+    const source = fixture();
+    source.write("conflict.txt", "base\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("conflict.txt", "topic\n");
+    const picked = source.commit("topic");
+    source.git("checkout", "-q", "main");
+    source.write("conflict.txt", "main\n");
+    source.commit("main");
+    const workspace = await imported(source);
+
+    for (const invoke of [
+      () => revertContinue(workspace.context, workspace.repo),
+      () => revertSkip(workspace.repo, workspace.worktree),
+      () => revertAbort(workspace.repo, workspace.worktree),
+    ]) {
+      expect(invoke).toThrow(expect.objectContaining({ code: "ENOREVERT" }));
+    }
+
+    cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked });
+    for (const invoke of [
+      () => revertContinue(workspace.context, workspace.repo),
+      () => revertSkip(workspace.repo, workspace.worktree),
+      () => revertAbort(workspace.repo, workspace.worktree),
+    ]) {
+      expect(invoke).toThrow(expect.objectContaining({ code: "EOPMISMATCH" }));
+      expect(workspace.repo.store.readOperationState()?.kind).toBe("cherry-pick");
+    }
+  });
+
+  it("rejects staged and touched work while preserving unrelated local changes", async () => {
+    const source = fixture();
+    source.write("tracked.txt", "base\n");
+    source.write("sentinel.txt", "sentinel\n");
+    source.commit("base");
+    source.write("tracked.txt", "source\n");
+    const reverted = source.commit("change");
+
+    const staged = await imported(source);
+    writeWorkFile(staged, "/staged.txt", "staged\n");
+    add(staged.repo, staged.worktree, { paths: ["staged.txt"], excludeRoots: [] });
+    expect(() =>
+      revert(staged.context, staged.repo, staged.worktree, { source: reverted }),
+    ).toThrow(expect.objectContaining({ code: "ECHECKOUTFAIL" }));
+
+    const dirty = await imported(source);
+    writeWorkFile(dirty, "/tracked.txt", "dirty\n");
+    expect(() => revert(dirty.context, dirty.repo, dirty.worktree, { source: reverted })).toThrow(
+      expect.objectContaining({ code: "ECHECKOUTFAIL" }),
+    );
+
+    const unrelated = await imported(source);
+    writeWorkFile(unrelated, "/sentinel.txt", "local sentinel\n");
+    writeWorkFile(unrelated, "/untracked.txt", "untracked\n");
+    expect(
+      revert(unrelated.context, unrelated.repo, unrelated.worktree, { source: reverted }).outcome,
+    ).toBe("committed");
+    expect(textAt(unrelated, "sentinel.txt")).toBe("local sentinel\n");
+    expect(textAt(unrelated, "untracked.txt")).toBe("untracked\n");
+  });
+
+  it("restores the original tree after a forward cherry-pick and revert", async () => {
+    const source = fixture();
+    source.write("base.txt", "base\n");
+    const original = source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.write("picked.txt", "picked\n");
+    const picked = source.commit("pick");
+    source.git("checkout", "-q", "main");
+    const workspace = await imported(source);
+    const originalTree = workspace.repo.readCommit(original).tree;
+
+    expect(
+      cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }).outcome,
+    ).toBe("committed");
+    const result = revert(workspace.context, workspace.repo, workspace.worktree, {
+      source: picked,
+    });
+
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("round-trip revert did not commit");
+    expect(workspace.repo.readCommit(result.oid).tree).toBe(originalTree);
+    expect(textAt(workspace, "picked.txt")).toBeNull();
+  });
+});

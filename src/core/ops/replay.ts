@@ -245,8 +245,10 @@ function shortOid(oid: string | null): string {
 }
 
 function sourceSubject(message: string): string {
-  const newline = message.indexOf("\n");
-  return (newline < 0 ? message : message.slice(0, newline)).replace(/\r$/, "");
+  let start = 0;
+  while (message.charCodeAt(start) === 0x0a) start++;
+  const newline = message.indexOf("\n", start);
+  return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
 }
 
 function incomingLabel(

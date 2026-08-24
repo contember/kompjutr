@@ -201,6 +201,33 @@ describe("one-commit replay planner", () => {
     ).toBe(`parent of ${source.slice(0, 7)} (source subject)`);
   });
 
+  it("skips leading LF blank lines in command-specific source subject labels", () => {
+    const { store, repo } = harness();
+    const baseTree = tree(store, "base\n");
+    const sourceTree = tree(store, "source\n");
+    const currentTree = tree(store, "current\n");
+    const parent = commit(store, baseTree.tree, [], "parent");
+    const source = commit(store, sourceTree.tree, [parent], "\n\n  source subject\r\nbody");
+    const current = commit(store, currentTree.tree, [], "current");
+
+    expect(
+      planReplay(repo, {
+        kind: "cherry-pick",
+        source,
+        currentOid: current,
+        incomingLabelStyle: "source-subject",
+      }).labels.incoming,
+    ).toBe(`${source.slice(0, 7)} (  source subject)`);
+    expect(
+      planReplay(repo, {
+        kind: "revert",
+        source,
+        currentOid: current,
+        incomingLabelStyle: "parent-of-source-subject",
+      }).labels.incoming,
+    ).toBe(`parent of ${source.slice(0, 7)} (  source subject)`);
+  });
+
   it("uses a null parent tree for root cherry-pick and root revert", () => {
     const { store, repo } = harness();
     const empty = tree(store);
