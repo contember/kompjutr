@@ -1,7 +1,7 @@
 ---
 id: 14
 title: Implement cherry-pick and revert
-blocked-by: [./02-three-way-integration-engine.md]
+blocked-by: []
 ---
 
 # 14 — Implement cherry-pick and revert

@@ -9,5 +9,7 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Three-way integration engine](sprint-2026-08-24-three-way-integration-engine.md)
+  — bounded pure integration plan with Git-compatible content conflicts.
 - [`plans/`](plans/README.md) — completed and superseded design and delivery plans.
 - [`benchmarks/`](benchmarks/README.md) — pre-standalone benchmark evidence.

@@ -1,7 +1,7 @@
 ---
 id: 07
 title: Implement rebase
-blocked-by: [./02-three-way-integration-engine.md]
+blocked-by: []
 ---
 
 # 07 — Implement rebase

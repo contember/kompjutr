@@ -134,6 +134,36 @@ operations merge their streams instead of issuing scalar reads per path:
 `comparePaths` is the shared comparator. JavaScript string order is not valid
 because it compares UTF-16 code units rather than Git's byte order.
 
+## Three-way integration planning
+
+The internal integration engine accepts base, current, and incoming tree OIDs
+and returns a mutation-free delta relative to the current tree. It does not
+write objects, refs, index rows, or worktree files. Clean entries either reuse
+an existing identity or retain the bounded bytes and computed OID of a new
+merged blob. Conflicts carry exact base/current/incoming identities; text
+conflicts also carry marker bytes, while binary conflicts retain current bytes.
+
+The structural phase merge-joins three authoritative tree cursors. It resolves
+identity and mode dimensions independently, recognizes file/directory prefixes
+without materializing directory trees, and leaves symlink and gitlink conflicts
+structural. Equal-root pruning still validates object metadata and the effective
+tree source. File/directory conflicts use logical paths; label-derived relocation
+belongs to the later merge lifecycle that owns index and worktree writes.
+
+Only divergent regular files reach the content phase. Their OIDs are read in
+bounded prefixes rather than through scalar path lookups. Each returned prefix
+must preserve request order and object hashes are recomputed before use. The
+byte-oriented xdiff port handles merge, diff3, and zdiff3 markers without UTF-8
+decoding; NUL-bearing inputs become binary conflicts.
+
+An integration plan admits at most 1,000 entries, 200,000 source rows, 4 MiB of
+structural state, 32 MiB of retained plan state, and 16 bulk blob-read calls.
+The SQL model is at most 134 statements: six tree statements plus eight for each
+bulk read. Caller-owned state stays within the packed reader's 8 MiB headroom.
+A shared 64 MiB exclusion reservation is acquired before any tree cursor opens,
+then reduced to conservative live-state and xdiff peaks. Capacity and corruption
+fail closed before exposing a partial plan.
+
 ## Sparse workspace tracking
 
 Schema v7 adds a source-qualified index over raw tree-entry name bytes. Sparse

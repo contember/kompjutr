@@ -27,6 +27,7 @@ A hot op merges **sorted streams**; it never issues a read per path.
 - `status` merges the HEAD tree stream, one bounded index snapshot, and
   filesystem metadata through `joinSorted3`.
 - `diff` batches unresolved working-tree hashes and blob reads.
+- three-way integration joins three tree streams, then batch-reads only divergent regular files.
 - `checkout` batches removals, object reads, writes, and index mutations.
 - `add`, `reset`, `commit` write through bounded index and object sinks.
 

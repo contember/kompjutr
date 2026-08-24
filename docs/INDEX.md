@@ -16,15 +16,14 @@ decisions → reference → archive.
 ## Active sprints
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
-- [Three-way integration engine](sprints/sprint-2026-08-24-three-way-integration-engine.md)
+- _none active_
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The [three-way integration engine](sprints/sprint-2026-08-24-three-way-integration-engine.md)
-  is active. It builds the bounded pure layer shared by merge, rebase, stash,
-  cherry-pick, and revert.
+- No active sprint. The next recommended item is the
+  [merge operation lifecycle](backlog/19-merge-operation-lifecycle.md).
 
 ## Key reference
 
@@ -40,5 +39,7 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-24-three-way-integration-engine.md`](archive/sprint-2026-08-24-three-way-integration-engine.md)
+  — bounded pure three-tree integration engine.
 - [`archive/plans/`](archive/plans/README.md) — completed and superseded implementation plans.
 - [`archive/benchmarks/`](archive/benchmarks/README.md) — pre-standalone benchmark evidence.

@@ -1,7 +1,7 @@
 ---
 id: 06
 title: Implement stash operations
-blocked-by: [./02-three-way-integration-engine.md]
+blocked-by: []
 ---
 
 # 06 — Implement stash operations

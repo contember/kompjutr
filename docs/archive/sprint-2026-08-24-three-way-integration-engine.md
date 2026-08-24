@@ -1,10 +1,13 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-08-24.** Delivered a mutation-free, bounded
+> three-tree integration engine with byte-exact xdiff text merge, structural and
+> binary conflict stages, batched loose/packed blob reads, and fail-closed SQL,
+> memory, trust, and output gates. Commit map: WU1 → `c4746f0`; WU2 → `cb5e596`
+> with trust fix `9951095`; WU3 → `705431c`; WU4 → `aa33001` and `a16a0cd`.
+> Verification: `npm run check`; `npm run typecheck`; leased full suite — 75
+> files, 1,422 passed, 5 skipped; leased production build. Backlog closed: 02.
+> Deferred: public merge lifecycle and physical file/directory conflict
+> relocation remain in backlog 19. The 134-statement static ceiling has cold
+> loose/packed coverage, but no synthetic 16-batch external-delta-base witness.
 
 # Sprint — Three-way integration engine (2026-08-24)
 
@@ -18,8 +21,8 @@ layer once. Success means callers can inspect clean results, conflicts, and inde
 stages under explicit SQL and memory bounds; command orchestration remains a
 separate concern.
 
-Consumes [backlog item 02](../backlog/02-three-way-integration-engine.md) and
-implements [ADR 0003](../decisions/0003-port-xdiff-text-merge.md).
+Consumed backlog item 02, deleted on ship, and implements
+[ADR 0003](../decisions/0003-port-xdiff-text-merge.md).
 
 ## Refs re-verified at HEAD (2026-08-24, `5546a94`)
 
@@ -240,3 +243,6 @@ claim.
   conflict identities; lifecycle projection is now explicit in backlog item 19.
   Also corrected the expected three-tree read cost from three statements to up
   to six because each `treeStream` validates the root before opening its cursor.
+- 2026-08-24 — Independent review found and closed three fail-closed gaps:
+  reservation coverage before classification, authoritative equal-root source
+  validation, and plan-output capacity checks before allocation.

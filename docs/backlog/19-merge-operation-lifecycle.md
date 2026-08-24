@@ -1,7 +1,7 @@
 ---
 id: 19
 title: Implement merge operation lifecycle
-blocked-by: [./02-three-way-integration-engine.md]
+blocked-by: []
 ---
 
 # 19 — Implement merge operation lifecycle
