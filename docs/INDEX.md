@@ -16,13 +16,15 @@ decisions → reference → archive.
 ## Active sprints
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
+- [`sprints/sprint-2026-08-24-complete-pull.md`](sprints/sprint-2026-08-24-complete-pull.md)
+  — configured-upstream fetch plus safe fast-forward and divergent integration.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- No sprint is active. The merge lifecycle is shipped, so fast-forward and
-  divergent pull composition are no longer blocked on a native merge engine.
+- Complete pull is active. It composes the shipped fetch and merge engines while
+  preserving native conflict recovery and compatibility-client atomicity.
 
 ## Key reference
 
