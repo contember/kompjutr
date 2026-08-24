@@ -55,7 +55,7 @@ function treeNameBytesIndex(db: TestDatabase): IndexListEntry | undefined {
 }
 
 describe("git schema", () => {
-  it("creates v7 on a fresh database", () => {
+  it("creates v8 on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -82,6 +82,42 @@ describe("git schema", () => {
       "complete",
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
+    expect(columnsOf(db, "git_merge_state")).toEqual([
+      "repo_id",
+      "original_head_ref",
+      "original_head_oid",
+      "current_parent_oid",
+      "incoming_parent_oid",
+      "phase",
+      "mode",
+      "current_label",
+      "incoming_label",
+      "message",
+      "author_name",
+      "author_email",
+      "committer_name",
+      "committer_email",
+      "touched_count",
+      "retained_bytes",
+    ]);
+    expect(columnsOf(db, "git_merge_touched")).toEqual([
+      "repo_id",
+      "ordinal",
+      "path",
+      "logical_path",
+      "purpose",
+      "index_stage",
+      "index_mode",
+      "index_oid",
+      "index_size",
+      "index_mtime",
+      "index_ino",
+      "index_rev",
+      "worktree_kind",
+      "worktree_mode",
+      "worktree_oid",
+      "worktree_revision",
+    ]);
     expect(() =>
       db.run(
         "INSERT INTO git_index_state (repo_id, baseline_tree_oid, format, complete) VALUES (1, NULL, 2, 1)",
@@ -194,7 +230,9 @@ describe("git schema", () => {
       // Existing rows inherit the default, which is what they were.
       stored: "zlib",
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
   });
 
   it("creates empty parsed-tree tables when migrating v2", () => {
@@ -209,7 +247,9 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
   });
 
   it("replaces the incomplete v3 commit cache without touching raw objects", () => {
@@ -236,7 +276,9 @@ describe("git schema", () => {
       stored: "raw",
     });
     expect(columnsOf(db, "git_commits")).toContain("committer_timezone");
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
   });
 
   it("adds the filesystem revision to a v4 index without changing rows", () => {
@@ -264,7 +306,9 @@ describe("git schema", () => {
       ino: 3,
       rev: null,
     });
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
   });
 
   it("adds empty sparse-index tables to v5 without changing rows", () => {
@@ -288,7 +332,9 @@ describe("git schema", () => {
     });
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_state")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_dirty")).toBe(0);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
   });
 
   it("adds the tree name-bytes index to v6 without changing rows", () => {
@@ -356,7 +402,25 @@ describe("git schema", () => {
         .filter((column) => column.key === 1)
         .map((column) => column.name),
     ).toEqual(["repo_id", "tree_oid", "storage", "source_id", "name_bytes"]);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("7");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
+  });
+
+  it("adds empty merge journal tables to v7", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("DROP TABLE git_merge_touched");
+    db.run("DROP TABLE git_merge_state");
+    db.run("UPDATE git_meta SET value = '7' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_touched")).toBe(0);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
   });
 
   it("uses the tree name-bytes index for source-qualified point lookups", () => {
@@ -377,10 +441,10 @@ describe("git schema", () => {
   it("fails closed on a schema newer than this runtime", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("UPDATE git_meta SET value = '8' WHERE key = 'schema_version'");
+    db.run("UPDATE git_meta SET value = '9' WHERE key = 'schema_version'");
 
     expect(() => initializeGitSchema(db)).toThrow(/newer than supported/);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("8");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("9");
   });
 
   it("accepts only canonical positive decimal schema versions", () => {
@@ -425,6 +489,8 @@ describe("git schema", () => {
       "complete",
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
+    expect(columnsOf(db, "git_merge_state")).not.toHaveLength(0);
+    expect(columnsOf(db, "git_merge_touched")).not.toHaveLength(0);
     expect(treeNameBytesIndexColumns(db)).not.toHaveLength(0);
   });
 });

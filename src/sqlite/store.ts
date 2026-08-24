@@ -7,6 +7,26 @@ import { concat, isOid, toHex } from "../core/bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
+import {
+  MAX_MERGE_STATE_BYTES,
+  MAX_MERGE_TOUCHED_PATHS,
+  type MergeIndexSnapshot,
+  type MergeJournal,
+  type MergeSavedIdentity,
+  type MergeStateMetadata,
+  type MergeTouchedPath,
+  type MergeWorktreeSnapshot,
+  mergeAlreadyActive,
+  mergeJournalRetainedBytes,
+  mergeNotActive,
+  requireMergeInteger,
+  requireMergeMode,
+  requireMergeNullableInteger,
+  requireMergeOid,
+  requireMergePhase,
+  requireMergePurpose,
+  requireMergeText,
+} from "../core/ops/merge-state.js";
 import { Sha1 } from "../core/sha1.js";
 import { comparePaths } from "../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
@@ -158,6 +178,60 @@ export interface InitialStateSession {
   readonly retainedBytes: number;
   put(entry: IndexEntry): void;
   addBlobId(mapping: BlobIdMapping): void;
+}
+
+interface MergeStateRow {
+  original_head_ref: unknown;
+  original_head_oid: unknown;
+  current_parent_oid: unknown;
+  incoming_parent_oid: unknown;
+  phase: unknown;
+  mode: unknown;
+  current_label: unknown;
+  incoming_label: unknown;
+  message: unknown;
+  author_name: unknown;
+  author_email: unknown;
+  committer_name: unknown;
+  committer_email: unknown;
+  touched_count: unknown;
+  retained_bytes: unknown;
+}
+
+interface MergeTouchedRow {
+  ordinal: unknown;
+  path: unknown;
+  logical_path: unknown;
+  purpose: unknown;
+  index_stage: unknown;
+  index_mode: unknown;
+  index_oid: unknown;
+  index_size: unknown;
+  index_mtime: unknown;
+  index_ino: unknown;
+  index_rev: unknown;
+  worktree_kind: unknown;
+  worktree_mode: unknown;
+  worktree_oid: unknown;
+  worktree_revision: unknown;
+}
+
+interface PersistedMergeTouched {
+  ordinal: number;
+  path: string;
+  logicalPath: string;
+  purpose: string;
+  indexStage: number | null;
+  indexMode: number | null;
+  indexOid: string | null;
+  indexSize: number | null;
+  indexMtime: number | null;
+  indexIno: number | null;
+  indexRev: number | null;
+  worktreeKind: string;
+  worktreeMode: number | null;
+  worktreeOid: string | null;
+  worktreeRevision: number | null;
 }
 
 export type InitialStateResult<T> = { available: false } | { available: true; value: T };
@@ -526,6 +600,119 @@ function validateInitialIndexEntry(entry: IndexEntry): number {
     throw new CorruptError("initial index entry has invalid filesystem metadata");
   }
   return pathJsonBytes;
+}
+
+function mergeIdentityFromRow(
+  name: unknown,
+  email: unknown,
+  label: string,
+): MergeSavedIdentity | null {
+  if (name === null && email === null) return null;
+  if (name === null || email === null) {
+    throw new CorruptError(`merge ${label} identity row is incomplete`);
+  }
+  return {
+    name: requireMergeText(name, `${label} name`),
+    email: requireMergeText(email, `${label} email`),
+  };
+}
+
+function mergeMetadataFromRow(row: MergeStateRow): MergeStateMetadata {
+  return {
+    originalHeadRef: requireMergeText(row.original_head_ref, "original HEAD ref"),
+    originalHeadOid: requireMergeOid(row.original_head_oid, "original HEAD"),
+    currentParentOid: requireMergeOid(row.current_parent_oid, "current parent"),
+    incomingParentOid: requireMergeOid(row.incoming_parent_oid, "incoming parent"),
+    phase: requireMergePhase(row.phase),
+    mode: requireMergeMode(row.mode),
+    currentLabel: requireMergeText(row.current_label, "current label"),
+    incomingLabel: requireMergeText(row.incoming_label, "incoming label"),
+    message: requireMergeText(row.message, "message"),
+    author: mergeIdentityFromRow(row.author_name, row.author_email, "author"),
+    committer: mergeIdentityFromRow(row.committer_name, row.committer_email, "committer"),
+  };
+}
+
+function mergeIndexFromRow(row: MergeTouchedRow): MergeIndexSnapshot | null {
+  const values = [
+    row.index_stage,
+    row.index_mode,
+    row.index_oid,
+    row.index_size,
+    row.index_mtime,
+    row.index_ino,
+    row.index_rev,
+  ];
+  if (values.every((value) => value === null)) return null;
+  if (row.index_stage !== 0) throw new CorruptError("merge index snapshot has an invalid stage");
+  return {
+    stage: 0,
+    mode: requireMergeInteger(row.index_mode, "index mode"),
+    oid: requireMergeOid(row.index_oid, "index oid"),
+    size: requireMergeNullableInteger(row.index_size, "index size"),
+    mtime: requireMergeNullableInteger(row.index_mtime, "index mtime"),
+    ino: requireMergeNullableInteger(row.index_ino, "index inode"),
+    rev: requireMergeNullableInteger(row.index_rev, "index revision"),
+  };
+}
+
+function mergeWorktreeFromRow(row: MergeTouchedRow): MergeWorktreeSnapshot {
+  const kind = requireMergeText(row.worktree_kind, "worktree kind");
+  if (kind === "absent") {
+    if (row.worktree_mode !== null || row.worktree_oid !== null || row.worktree_revision !== null) {
+      throw new CorruptError("absent merge worktree snapshot retained metadata");
+    }
+    return { kind };
+  }
+  const mode = requireMergeInteger(row.worktree_mode, "worktree mode");
+  const revision = requireMergeInteger(row.worktree_revision, "worktree revision");
+  if (kind === "directory") {
+    if (row.worktree_oid !== null) {
+      throw new CorruptError("merge directory snapshot retained an object id");
+    }
+    return { kind, mode, revision };
+  }
+  if (kind === "file" || kind === "symlink") {
+    return { kind, mode, oid: requireMergeOid(row.worktree_oid, "worktree oid"), revision };
+  }
+  throw new CorruptError("merge journal has an invalid worktree kind");
+}
+
+function mergeTouchedFromRow(row: MergeTouchedRow): MergeTouchedPath {
+  return {
+    path: requireMergeText(row.path, "touched path"),
+    logicalPath: requireMergeText(row.logical_path, "logical path"),
+    purpose: requireMergePurpose(row.purpose),
+    index: mergeIndexFromRow(row),
+    worktree: mergeWorktreeFromRow(row),
+  };
+}
+
+function persistedMergeTouched(entry: MergeTouchedPath, ordinal: number): PersistedMergeTouched {
+  const index = entry.index;
+  const worktree = entry.worktree;
+  return {
+    ordinal,
+    path: entry.path,
+    logicalPath: entry.logicalPath,
+    purpose: entry.purpose,
+    indexStage: index?.stage ?? null,
+    indexMode: index?.mode ?? null,
+    indexOid: index?.oid ?? null,
+    indexSize: index?.size ?? null,
+    indexMtime: index?.mtime ?? null,
+    indexIno: index?.ino ?? null,
+    indexRev: index?.rev ?? null,
+    worktreeKind: worktree.kind,
+    worktreeMode: worktree.kind === "absent" ? null : worktree.mode,
+    worktreeOid: worktree.kind === "file" || worktree.kind === "symlink" ? worktree.oid : null,
+    worktreeRevision: worktree.kind === "absent" ? null : worktree.revision,
+  };
+}
+
+function requireBooleanProbe(value: unknown, label: string): boolean {
+  if (value !== 0 && value !== 1) throw new CorruptError(`${label} returned an invalid value`);
+  return value === 1;
 }
 
 class InitialBlobIdBuffer {
@@ -2112,6 +2299,199 @@ export class RepoStore {
       .map((row) => row.path);
   }
 
+  // -- merge journal -------------------------------------------------
+
+  /** Read and validate the one durable incomplete merge for this repository. */
+  readMergeState(): MergeJournal | null {
+    const row = this.#db.one<MergeStateRow>(
+      `SELECT original_head_ref, original_head_oid, current_parent_oid,
+              incoming_parent_oid, phase, mode, current_label, incoming_label,
+              message, author_name, author_email, committer_name, committer_email,
+              touched_count, retained_bytes
+         FROM git_merge_state WHERE repo_id = ?`,
+      this.#repoId,
+    );
+    if (row === undefined) {
+      const orphaned = requireBooleanProbe(
+        this.#db.scalar<unknown>(
+          "SELECT EXISTS(SELECT 1 FROM git_merge_touched WHERE repo_id = ? LIMIT 1)",
+          this.#repoId,
+        ),
+        "merge touched-path orphan probe",
+      );
+      if (orphaned) throw new CorruptError("merge touched paths exist without operation state");
+      return null;
+    }
+
+    const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
+    const storedBytes = requireMergeInteger(row.retained_bytes, "retained-byte count");
+    if (touchedCount > MAX_MERGE_TOUCHED_PATHS) {
+      throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
+    }
+    if (storedBytes > MAX_MERGE_STATE_BYTES) {
+      throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`);
+    }
+    const state = mergeMetadataFromRow(row);
+    mergeJournalRetainedBytes(state, []);
+
+    const touched: MergeTouchedPath[] = [];
+    let previousPath: string | null = null;
+    for (const raw of this.#db.iterate(
+      `SELECT ordinal, path, logical_path, purpose,
+              index_stage, index_mode, index_oid, index_size, index_mtime,
+              index_ino, index_rev, worktree_kind, worktree_mode,
+              worktree_oid, worktree_revision
+         FROM git_merge_touched WHERE repo_id = ? ORDER BY ordinal`,
+      this.#repoId,
+    )) {
+      const touchedRow: MergeTouchedRow = {
+        ordinal: raw.ordinal,
+        path: raw.path,
+        logical_path: raw.logical_path,
+        purpose: raw.purpose,
+        index_stage: raw.index_stage,
+        index_mode: raw.index_mode,
+        index_oid: raw.index_oid,
+        index_size: raw.index_size,
+        index_mtime: raw.index_mtime,
+        index_ino: raw.index_ino,
+        index_rev: raw.index_rev,
+        worktree_kind: raw.worktree_kind,
+        worktree_mode: raw.worktree_mode,
+        worktree_oid: raw.worktree_oid,
+        worktree_revision: raw.worktree_revision,
+      };
+      const ordinal = requireMergeInteger(touchedRow.ordinal, "touched-path ordinal");
+      if (ordinal !== touched.length) {
+        throw new CorruptError("merge touched-path ordinals are not contiguous");
+      }
+      if (touched.length >= touchedCount || touched.length >= MAX_MERGE_TOUCHED_PATHS) {
+        throw new CorruptError("merge journal yielded too many touched paths");
+      }
+      const entry = mergeTouchedFromRow(touchedRow);
+      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+        throw new CorruptError("merge touched paths are not in strict Git path order");
+      }
+      touched.push(entry);
+      previousPath = entry.path;
+    }
+    if (touched.length !== touchedCount) {
+      throw new CorruptError("merge journal touched-path count does not match its rows");
+    }
+    const retainedBytes = mergeJournalRetainedBytes(state, touched);
+    if (retainedBytes !== storedBytes) {
+      throw new CorruptError("merge journal retained-byte count does not match its rows");
+    }
+    return { state, touched, retainedBytes };
+  }
+
+  /** Atomically create one bounded merge journal; an existing merge wins. */
+  writeMergeState(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
+    const retainedBytes = mergeJournalRetainedBytes(state, touched);
+    let previousPath: string | null = null;
+    for (const entry of touched) {
+      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+        throw new CorruptError("merge touched paths are not in strict Git path order");
+      }
+      previousPath = entry.path;
+    }
+
+    this.#db.transactionSync(() => {
+      this.requireNoMergeState();
+      this.#db.run(
+        `INSERT INTO git_merge_state
+           (repo_id, original_head_ref, original_head_oid, current_parent_oid,
+            incoming_parent_oid, phase, mode, current_label, incoming_label,
+            message, author_name, author_email, committer_name, committer_email,
+            touched_count, retained_bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        this.#repoId,
+        state.originalHeadRef,
+        state.originalHeadOid,
+        state.currentParentOid,
+        state.incomingParentOid,
+        state.phase,
+        state.mode,
+        state.currentLabel,
+        state.incomingLabel,
+        state.message,
+        state.author?.name ?? null,
+        state.author?.email ?? null,
+        state.committer?.name ?? null,
+        state.committer?.email ?? null,
+        touched.length,
+        retainedBytes,
+      );
+
+      function* rows(): Generator<PersistedMergeTouched> {
+        for (let ordinal = 0; ordinal < touched.length; ordinal++) {
+          yield persistedMergeTouched(touched[ordinal]!, ordinal);
+        }
+      }
+      for (const page of jsonPages(rows(), "merge touched path")) {
+        this.#db.run(
+          `INSERT INTO git_merge_touched
+             (repo_id, ordinal, path, logical_path, purpose,
+              index_stage, index_mode, index_oid, index_size, index_mtime,
+              index_ino, index_rev, worktree_kind, worktree_mode,
+              worktree_oid, worktree_revision)
+           SELECT ?,
+                  json_extract(value, '$.ordinal'),
+                  json_extract(value, '$.path'),
+                  json_extract(value, '$.logicalPath'),
+                  json_extract(value, '$.purpose'),
+                  json_extract(value, '$.indexStage'),
+                  json_extract(value, '$.indexMode'),
+                  json_extract(value, '$.indexOid'),
+                  json_extract(value, '$.indexSize'),
+                  json_extract(value, '$.indexMtime'),
+                  json_extract(value, '$.indexIno'),
+                  json_extract(value, '$.indexRev'),
+                  json_extract(value, '$.worktreeKind'),
+                  json_extract(value, '$.worktreeMode'),
+                  json_extract(value, '$.worktreeOid'),
+                  json_extract(value, '$.worktreeRevision')
+             FROM json_each(?) ORDER BY CAST(json_extract(value, '$.ordinal') AS INTEGER)`,
+          this.#repoId,
+          page,
+        );
+      }
+    });
+  }
+
+  /** Clear merge metadata and touched snapshots, including corrupt orphan rows. */
+  clearMergeState(): boolean {
+    return this.#db.transactionSync(() => {
+      const existed = requireBooleanProbe(
+        this.#db.scalar<unknown>(
+          `SELECT EXISTS(
+             SELECT 1 FROM git_merge_state WHERE repo_id = ?
+             UNION ALL
+             SELECT 1 FROM git_merge_touched WHERE repo_id = ? LIMIT 1
+           )`,
+          this.#repoId,
+          this.#repoId,
+        ),
+        "merge state clear probe",
+      );
+      this.#db.run("DELETE FROM git_merge_touched WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_merge_state WHERE repo_id = ?", this.#repoId);
+      return existed;
+    });
+  }
+
+  /** Refuse an operation that cannot coexist with an incomplete merge. */
+  requireNoMergeState(): void {
+    if (this.readMergeState() !== null) throw mergeAlreadyActive();
+  }
+
+  /** Require and return the durable state used by continue and abort. */
+  requireMergeState(): MergeJournal {
+    const state = this.readMergeState();
+    if (state === null) throw mergeNotActive();
+    return state;
+  }
+
   // -- index ----------------------------------------------------------
 
   /** Create clone state only while every index stage is still empty. */
@@ -2510,6 +2890,8 @@ export class RepoStore {
       for (const table of [
         "git_index_dirty",
         "git_index_state",
+        "git_merge_touched",
+        "git_merge_state",
         "git_refs",
         "git_blob_ids",
         "git_config",

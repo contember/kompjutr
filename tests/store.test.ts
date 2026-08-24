@@ -70,6 +70,8 @@ describe("repository registry", () => {
       "git_index",
       "git_index_dirty",
       "git_index_state",
+      "git_merge_state",
+      "git_merge_touched",
       "git_meta",
       "git_object_chunks",
       "git_objects",

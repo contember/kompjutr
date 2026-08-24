@@ -10,7 +10,7 @@ import { CorruptError } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -95,6 +95,71 @@ const STATEMENTS = [
      path TEXT NOT NULL,
      flags INTEGER NOT NULL CHECK (typeof(flags) = 'integer' AND flags IN (1, 2, 3)),
      PRIMARY KEY (repo_id, path)
+   ) WITHOUT ROWID`,
+
+  // One durable, incomplete merge per repository. Applying is never a
+  // persisted phase: the enclosing database transaction makes it atomic.
+  `CREATE TABLE IF NOT EXISTS git_merge_state (
+     repo_id INTEGER PRIMARY KEY,
+     original_head_ref TEXT NOT NULL,
+     original_head_oid TEXT NOT NULL,
+     current_parent_oid TEXT NOT NULL,
+     incoming_parent_oid TEXT NOT NULL,
+     phase TEXT NOT NULL CHECK (phase IN ('conflicted', 'ready')),
+     mode TEXT NOT NULL CHECK (mode IN ('commit', 'no-commit')),
+     current_label TEXT NOT NULL,
+     incoming_label TEXT NOT NULL,
+     message TEXT NOT NULL,
+     author_name TEXT,
+     author_email TEXT,
+     committer_name TEXT,
+     committer_email TEXT,
+     touched_count INTEGER NOT NULL,
+     retained_bytes INTEGER NOT NULL,
+     CHECK (phase != 'ready' OR mode = 'no-commit'),
+     CHECK ((author_name IS NULL) = (author_email IS NULL)),
+     CHECK ((committer_name IS NULL) = (committer_email IS NULL))
+   )`,
+
+  // Original identities for only paths owned by the merge. Physical paths
+  // include conflict relocations; logical_path ties them back to the index path.
+  `CREATE TABLE IF NOT EXISTS git_merge_touched (
+     repo_id INTEGER NOT NULL,
+     ordinal INTEGER NOT NULL,
+     path TEXT NOT NULL,
+     logical_path TEXT NOT NULL,
+     purpose TEXT NOT NULL CHECK (
+       purpose IN ('primary', 'current-relocation', 'incoming-relocation')
+     ),
+     index_stage INTEGER,
+     index_mode INTEGER,
+     index_oid TEXT,
+     index_size INTEGER,
+     index_mtime INTEGER,
+     index_ino INTEGER,
+     index_rev INTEGER,
+     worktree_kind TEXT NOT NULL CHECK (
+       worktree_kind IN ('absent', 'file', 'symlink', 'directory')
+     ),
+     worktree_mode INTEGER,
+     worktree_oid TEXT,
+     worktree_revision INTEGER,
+     PRIMARY KEY (repo_id, ordinal),
+     UNIQUE (repo_id, path),
+     CHECK (
+       (index_stage IS NULL AND index_mode IS NULL AND index_oid IS NULL
+          AND index_size IS NULL AND index_mtime IS NULL AND index_ino IS NULL
+          AND index_rev IS NULL)
+       OR (index_stage = 0 AND index_mode IS NOT NULL AND index_oid IS NOT NULL)
+     ),
+     CHECK (
+       (worktree_kind = 'absent' AND worktree_mode IS NULL
+          AND worktree_oid IS NULL AND worktree_revision IS NULL)
+       OR (worktree_kind IN ('file', 'symlink') AND worktree_mode IS NOT NULL
+          AND worktree_oid IS NOT NULL AND worktree_revision IS NOT NULL)
+       OR (worktree_kind = 'directory' AND worktree_mode IS NOT NULL
+          AND worktree_oid IS NULL AND worktree_revision IS NOT NULL)
+     )
    ) WITHOUT ROWID`,
 
   // The working tree's opaque content ids mapped to blob oids. A file whose
@@ -303,7 +368,8 @@ const STATEMENTS = [
 // v3 added parsed tree tables. v4 replaces the incomplete, unused commit
 // projection. v5 records the monotonic filesystem revision in index stat data.
 // v6 adds inert index baseline and dirty-path state for sparse status queries.
-// v7 adds source-qualified tree entry lookup by raw name bytes.
+// v7 adds source-qualified tree entry lookup by raw name bytes. v8 adds the
+// durable merge journal and its bounded touched-path snapshot.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
