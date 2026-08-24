@@ -397,6 +397,35 @@ describe("ordering, bounds, and trust", () => {
       }),
     ).toThrowError(expect.objectContaining({ code: "ENOTFOUND" }));
   });
+
+  it("rejects corrupt authoritative metadata on the equal-root fast path", () => {
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const blob = store.write("blob", new TextEncoder().encode("content\n"));
+    const tree = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]));
+    const repo = new Repository(store, "/repo");
+    const classifyEqual = (oid: string): ReturnType<typeof classifyIntegrationStructure> =>
+      classifyIntegrationStructure(repo, {
+        baseTreeOid: oid,
+        currentTreeOid: oid,
+        incomingTreeOid: oid,
+      });
+
+    store.db.run("UPDATE git_objects SET type = 'tree' WHERE repo_id = ? AND oid = ?", 1, blob);
+    expect(() => classifyEqual(blob)).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    store.db.run("UPDATE git_objects SET size = -1 WHERE repo_id = ? AND oid = ?", 1, tree);
+    expect(() => classifyEqual(tree)).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    store.db.run(
+      "UPDATE git_objects SET size = ? WHERE repo_id = ? AND oid = ?",
+      serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]).length,
+      1,
+      tree,
+    );
+    store.db.run("DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?", 1, tree);
+    expect(() => classifyEqual(tree)).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
 });
 
 function gitTree(fixture: GitFixture, revision: string): TargetEntry[] {

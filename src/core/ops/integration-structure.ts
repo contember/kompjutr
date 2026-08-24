@@ -453,12 +453,21 @@ export function classifyIntegrationStructure(
     input.currentTreeOid === input.incomingTreeOid ||
     input.baseTreeOid === input.incomingTreeOid
   ) {
-    const validatedRoots = new Set<string>();
+    const roots: string[] = [];
+    const seen = new Set<string>();
     for (const treeOid of [input.baseTreeOid, input.currentTreeOid, input.incomingTreeOid]) {
-      if (treeOid === null || validatedRoots.has(treeOid)) continue;
-      validatedRoots.add(treeOid);
-      const type = repo.typeOf(treeOid);
-      if (type !== "tree") throw new CorruptError(`${treeOid} is a ${type}, not a tree`);
+      if (treeOid === null || seen.has(treeOid)) continue;
+      seen.add(treeOid);
+      roots.push(treeOid);
+    }
+    for (const info of repo.store.objectInfo(roots)) {
+      if (info.type !== "tree") throw new CorruptError(`${info.oid} is a ${info.type}, not a tree`);
+      const stream = treeStream(repo, info.oid);
+      try {
+        stream.next();
+      } finally {
+        stream.return(undefined);
+      }
     }
     return { entries: [], sourceRows: 0 };
   }
