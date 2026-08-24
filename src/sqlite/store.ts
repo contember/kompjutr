@@ -4,10 +4,15 @@
 import pako from "pako";
 
 import { concat, isOid, toHex } from "../core/bytes.js";
-import { CorruptError, GitError, ObjectNotFoundError } from "../core/errors.js";
+import { CorruptError, GitError, hasErrorCode, ObjectNotFoundError } from "../core/errors.js";
 import { ByteLru } from "../core/lru.js";
 import { hashObject, type ObjectType, objectHeader, type RawObject } from "../core/objects.js";
 import {
+  MAX_MERGE_IDENTITY_BYTES,
+  MAX_MERGE_LABEL_BYTES,
+  MAX_MERGE_MESSAGE_BYTES,
+  MAX_MERGE_PATH_BYTES,
+  MAX_MERGE_REF_BYTES,
   MAX_MERGE_STATE_BYTES,
   MAX_MERGE_TOUCHED_PATHS,
   type MergeIndexSnapshot,
@@ -261,6 +266,12 @@ export interface ObjectReadInfo {
   source: "loose" | "pack";
   /** Stored loose rows; zero for packed objects. */
   chunkRows: number;
+}
+
+interface ExpectedMergeObject {
+  oid: string;
+  type: "blob" | "commit";
+  label: string;
 }
 
 /** Stable, collision-free key for an opaque binary content id. */
@@ -1220,28 +1231,54 @@ export class RepoStore {
       source: string | null;
       type: string | null;
       size: number | null;
+      stored: string | null;
       chunk_rows: number;
+      first_chunk: number | null;
+      last_chunk: number | null;
+      largest_chunk: number;
+      stored_bytes: number;
     }>(
-      `WITH wanted(ordinal, oid) AS (
+      `WITH wanted(ordinal, oid) AS MATERIALIZED (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
+       ), chunks AS MATERIALIZED (
+         SELECT chunk.oid, COUNT(*) AS chunk_rows, MIN(chunk.seq) AS first_chunk,
+                MAX(chunk.seq) AS last_chunk, MAX(length(chunk.data)) AS largest_chunk,
+                SUM(length(chunk.data)) AS stored_bytes
+           FROM git_object_chunks chunk
+           JOIN wanted ON wanted.oid = chunk.oid
+          WHERE chunk.repo_id = ?
+          GROUP BY chunk.oid
        )
        SELECT w.ordinal, w.oid,
               CASE WHEN loose.oid IS NOT NULL THEN 'loose'
                    WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-              CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
-              CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size,
-              CASE WHEN loose.oid IS NULL THEN 0 ELSE
-                (SELECT COUNT(*) FROM git_object_chunks chunk
-                  WHERE chunk.repo_id = loose.repo_id AND chunk.oid = loose.oid)
-              END AS chunk_rows
+              CASE WHEN loose.oid IS NOT NULL
+                         AND typeof(loose.type) = 'text'
+                         AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type
+                   WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
+                         AND typeof(packed.type) = 'text'
+                         AND length(CAST(packed.type AS BLOB)) <= 6 THEN packed.type END AS type,
+              CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer' THEN loose.size
+                   WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
+                         AND typeof(packed.size) = 'integer' THEN packed.size END AS size,
+              CASE WHEN loose.oid IS NOT NULL
+                         AND typeof(loose.stored) = 'text'
+                         AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS stored,
+              CASE WHEN loose.oid IS NULL THEN 0 ELSE COALESCE(chunks.chunk_rows, 0) END AS chunk_rows,
+              CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.first_chunk END AS first_chunk,
+              CASE WHEN loose.oid IS NULL THEN NULL ELSE chunks.last_chunk END AS last_chunk,
+              CASE WHEN loose.oid IS NULL THEN 0 ELSE COALESCE(chunks.largest_chunk, 0) END AS largest_chunk,
+              CASE WHEN loose.oid IS NULL THEN 0 ELSE COALESCE(chunks.stored_bytes, 0) END AS stored_bytes
          FROM wanted w
          LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
+         LEFT JOIN chunks ON chunks.oid = w.oid
          LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
          LEFT JOIN git_pack_meta pack
            ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
           AND pack.state = 'complete'
         ORDER BY w.ordinal`,
       JSON.stringify(wanted),
+      this.#repoId,
       this.#repoId,
       this.#repoId,
     );
@@ -1262,8 +1299,24 @@ export class RepoStore {
         row.size < 0 ||
         !Number.isSafeInteger(row.chunk_rows) ||
         row.chunk_rows < 0 ||
-        (row.source === "loose" && row.chunk_rows === 0) ||
-        (row.source === "pack" && row.chunk_rows !== 0)
+        !Number.isSafeInteger(row.largest_chunk) ||
+        row.largest_chunk < 0 ||
+        !Number.isSafeInteger(row.stored_bytes) ||
+        row.stored_bytes < 0 ||
+        (row.source === "loose" && row.stored !== "raw" && row.stored !== "zlib") ||
+        (row.source === "loose" && row.chunk_rows <= 0) ||
+        (row.source === "loose" && row.first_chunk !== 0) ||
+        (row.source === "loose" && row.last_chunk !== row.chunk_rows - 1) ||
+        (row.source === "loose" && row.largest_chunk > OBJECT_CHUNK) ||
+        (row.source === "loose" && row.stored === "raw" && row.stored_bytes !== row.size) ||
+        (row.source === "loose" && row.stored === "zlib" && row.stored_bytes === 0) ||
+        (row.source === "pack" &&
+          (row.stored !== null ||
+            row.chunk_rows !== 0 ||
+            row.first_chunk !== null ||
+            row.last_chunk !== null ||
+            row.largest_chunk !== 0 ||
+            row.stored_bytes !== 0))
       ) {
         if (row.source === null) throw new ObjectNotFoundError(wanted[ordinal]!);
         throw new CorruptError("object metadata lookup returned an invalid row");
@@ -2304,9 +2357,48 @@ export class RepoStore {
   /** Read and validate the one durable incomplete merge for this repository. */
   readMergeState(): MergeJournal | null {
     const row = this.#db.one<MergeStateRow>(
-      `SELECT original_head_ref, original_head_oid, current_parent_oid,
-              incoming_parent_oid, phase, mode, current_label, incoming_label,
-              message, author_name, author_email, committer_name, committer_email,
+      `SELECT
+              CASE WHEN typeof(original_head_ref) = 'text'
+                         AND length(CAST(original_head_ref AS BLOB)) <= ${MAX_MERGE_REF_BYTES}
+                   THEN original_head_ref END AS original_head_ref,
+              CASE WHEN typeof(original_head_oid) = 'text'
+                         AND length(CAST(original_head_oid AS BLOB)) = 40
+                   THEN original_head_oid END AS original_head_oid,
+              CASE WHEN typeof(current_parent_oid) = 'text'
+                         AND length(CAST(current_parent_oid AS BLOB)) = 40
+                   THEN current_parent_oid END AS current_parent_oid,
+              CASE WHEN typeof(incoming_parent_oid) = 'text'
+                         AND length(CAST(incoming_parent_oid AS BLOB)) = 40
+                   THEN incoming_parent_oid END AS incoming_parent_oid,
+              CASE WHEN typeof(phase) = 'text' AND length(CAST(phase AS BLOB)) <= 10
+                   THEN phase END AS phase,
+              CASE WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
+                   THEN mode END AS mode,
+              CASE WHEN typeof(current_label) = 'text'
+                         AND length(CAST(current_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
+                   THEN current_label END AS current_label,
+              CASE WHEN typeof(incoming_label) = 'text'
+                         AND length(CAST(incoming_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
+                   THEN incoming_label END AS incoming_label,
+              CASE WHEN typeof(message) = 'text'
+                         AND length(CAST(message AS BLOB)) <= ${MAX_MERGE_MESSAGE_BYTES}
+                   THEN message END AS message,
+              CASE WHEN author_name IS NULL THEN NULL
+                   WHEN typeof(author_name) = 'text'
+                         AND length(CAST(author_name AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                   THEN author_name ELSE 0 END AS author_name,
+              CASE WHEN author_email IS NULL THEN NULL
+                   WHEN typeof(author_email) = 'text'
+                         AND length(CAST(author_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                   THEN author_email ELSE 0 END AS author_email,
+              CASE WHEN committer_name IS NULL THEN NULL
+                   WHEN typeof(committer_name) = 'text'
+                         AND length(CAST(committer_name AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                   THEN committer_name ELSE 0 END AS committer_name,
+              CASE WHEN committer_email IS NULL THEN NULL
+                   WHEN typeof(committer_email) = 'text'
+                         AND length(CAST(committer_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                   THEN committer_email ELSE 0 END AS committer_email,
               touched_count, retained_bytes
          FROM git_merge_state WHERE repo_id = ?`,
       this.#repoId,
@@ -2332,15 +2424,33 @@ export class RepoStore {
       throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`);
     }
     const state = mergeMetadataFromRow(row);
-    mergeJournalRetainedBytes(state, []);
 
     const touched: MergeTouchedPath[] = [];
     let previousPath: string | null = null;
     for (const raw of this.#db.iterate(
-      `SELECT ordinal, path, logical_path, purpose,
-              index_stage, index_mode, index_oid, index_size, index_mtime,
-              index_ino, index_rev, worktree_kind, worktree_mode,
-              worktree_oid, worktree_revision
+      `SELECT ordinal,
+              CASE WHEN typeof(path) = 'text'
+                         AND length(CAST(path AS BLOB)) <= ${MAX_MERGE_PATH_BYTES}
+                   THEN path END AS path,
+              CASE WHEN typeof(logical_path) = 'text'
+                         AND length(CAST(logical_path AS BLOB)) <= ${MAX_MERGE_PATH_BYTES}
+                   THEN logical_path END AS logical_path,
+              CASE WHEN typeof(purpose) = 'text' AND length(CAST(purpose AS BLOB)) <= 19
+                   THEN purpose END AS purpose,
+              index_stage, index_mode,
+              CASE WHEN index_oid IS NULL THEN NULL
+                   WHEN typeof(index_oid) = 'text' AND length(CAST(index_oid AS BLOB)) = 40
+                   THEN index_oid ELSE 0 END AS index_oid,
+              index_size, index_mtime, index_ino, index_rev,
+              CASE WHEN typeof(worktree_kind) = 'text'
+                         AND length(CAST(worktree_kind AS BLOB)) <= 9
+                   THEN worktree_kind END AS worktree_kind,
+              worktree_mode,
+              CASE WHEN worktree_oid IS NULL THEN NULL
+                   WHEN typeof(worktree_oid) = 'text'
+                         AND length(CAST(worktree_oid AS BLOB)) = 40
+                   THEN worktree_oid ELSE 0 END AS worktree_oid,
+              worktree_revision
          FROM git_merge_touched WHERE repo_id = ? ORDER BY ordinal`,
       this.#repoId,
     )) {
@@ -2382,7 +2492,9 @@ export class RepoStore {
     if (retainedBytes !== storedBytes) {
       throw new CorruptError("merge journal retained-byte count does not match its rows");
     }
-    return { state, touched, retainedBytes };
+    const journal = { state, touched, retainedBytes };
+    this.#validateMergeObjects(journal);
+    return journal;
   }
 
   /** Atomically create one bounded merge journal; an existing merge wins. */
@@ -2398,6 +2510,7 @@ export class RepoStore {
 
     this.#db.transactionSync(() => {
       this.requireNoMergeState();
+      this.#validateMergeObjects({ state, touched, retainedBytes });
       this.#db.run(
         `INSERT INTO git_merge_state
            (repo_id, original_head_ref, original_head_oid, current_parent_oid,
@@ -2457,6 +2570,54 @@ export class RepoStore {
         );
       }
     });
+  }
+
+  #validateMergeObjects(journal: MergeJournal): void {
+    const expected = new Map<string, ExpectedMergeObject>();
+    const add = (object: ExpectedMergeObject): void => {
+      const previous = expected.get(object.oid);
+      if (previous !== undefined && previous.type !== object.type) {
+        throw new CorruptError(`merge journal object ${object.oid} has conflicting expected types`);
+      }
+      if (previous === undefined) expected.set(object.oid, object);
+    };
+    add({ oid: journal.state.originalHeadOid, type: "commit", label: "original HEAD" });
+    add({ oid: journal.state.currentParentOid, type: "commit", label: "current parent" });
+    add({ oid: journal.state.incomingParentOid, type: "commit", label: "incoming parent" });
+    for (const entry of journal.touched) {
+      if (entry.index !== null) {
+        add({
+          oid: entry.index.oid,
+          type: entry.index.mode === 0o160000 ? "commit" : "blob",
+          label: `saved index path ${entry.path}`,
+        });
+      }
+      if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink") {
+        add({
+          oid: entry.worktree.oid,
+          type: "blob",
+          label: `saved worktree path ${entry.path}`,
+        });
+      }
+    }
+
+    let info: ObjectReadInfo[];
+    try {
+      info = this.objectInfo([...expected.keys()]);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOTFOUND")) {
+        throw new CorruptError("merge journal references a missing object", { cause: error });
+      }
+      throw error;
+    }
+    for (const object of info) {
+      const wanted = expected.get(object.oid);
+      if (wanted === undefined || object.type !== wanted.type) {
+        throw new CorruptError(
+          `merge ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
+        );
+      }
+    }
   }
 
   /** Clear merge metadata and touched snapshots, including corrupt orphan rows. */

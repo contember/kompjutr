@@ -271,6 +271,9 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
     if (!isOid(oid)) throw new CorruptError(`merge ${label} has an invalid object id`);
     bytes = checkedAdd(bytes, 40);
   }
+  if (state.currentParentOid !== state.originalHeadOid) {
+    throw new CorruptError("merge current parent differs from the original HEAD");
+  }
   if (state.phase !== "conflicted" && state.phase !== "ready") {
     throw new CorruptError("merge journal has an invalid phase");
   }
@@ -280,14 +283,23 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
   if (state.phase === "ready" && state.mode !== "no-commit") {
     throw new CorruptError("a ready merge journal must be a no-commit merge");
   }
-  bytes = checkedAdd(
-    bytes,
-    boundedTextBytes(state.currentLabel, "current label", MAX_MERGE_LABEL_BYTES, control),
+  const currentLabelBytes = boundedTextBytes(
+    state.currentLabel,
+    "current label",
+    MAX_MERGE_LABEL_BYTES,
+    control,
   );
-  bytes = checkedAdd(
-    bytes,
-    boundedTextBytes(state.incomingLabel, "incoming label", MAX_MERGE_LABEL_BYTES, control),
+  const incomingLabelBytes = boundedTextBytes(
+    state.incomingLabel,
+    "incoming label",
+    MAX_MERGE_LABEL_BYTES,
+    control,
   );
+  if (currentLabelBytes === 0 || incomingLabelBytes === 0) {
+    throw new CorruptError("merge labels must not be empty");
+  }
+  bytes = checkedAdd(bytes, currentLabelBytes);
+  bytes = checkedAdd(bytes, incomingLabelBytes);
   bytes = checkedAdd(
     bytes,
     boundedTextBytes(state.message, "message", MAX_MERGE_MESSAGE_BYTES, nul),
@@ -373,6 +385,9 @@ export function mergeJournalRetainedBytes(
 ): number {
   if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
     throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
+  }
+  if (state.phase === "conflicted" && touched.length === 0) {
+    throw new CorruptError("a conflicted merge journal must retain a touched path");
   }
   let bytes = validateMergeStateMetadata(state);
   for (const entry of touched) {

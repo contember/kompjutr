@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import { utf8 } from "../src/core/bytes.js";
 import { hasErrorCode } from "../src/core/errors.js";
+import { hashObject, serializeCommit, serializeTree } from "../src/core/objects.js";
 import {
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_TOUCHED_PATHS,
@@ -11,10 +13,34 @@ import {
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
-const ORIGINAL = "1".repeat(40);
-const INCOMING = "2".repeat(40);
-const FILE = "3".repeat(40);
-const LINK = "4".repeat(40);
+const TREE_BYTES = serializeTree([]);
+const TREE = hashObject("tree", TREE_BYTES);
+const PERSON = {
+  name: "Fixture",
+  email: "fixture@example.com",
+  timestamp: 1_700_000_000,
+  timezoneOffset: 0,
+};
+const ORIGINAL_BYTES = serializeCommit({
+  tree: TREE,
+  parent: [],
+  author: PERSON,
+  committer: PERSON,
+  message: "original\n",
+});
+const ORIGINAL = hashObject("commit", ORIGINAL_BYTES);
+const INCOMING_BYTES = serializeCommit({
+  tree: TREE,
+  parent: [ORIGINAL],
+  author: PERSON,
+  committer: PERSON,
+  message: "incoming\n",
+});
+const INCOMING = hashObject("commit", INCOMING_BYTES);
+const FILE_BYTES = utf8.encode("content\n");
+const FILE = hashObject("blob", FILE_BYTES);
+const LINK_BYTES = utf8.encode("target");
+const LINK = hashObject("blob", LINK_BYTES);
 
 function metadata(overrides: Partial<MergeStateMetadata> = {}): MergeStateMetadata {
   return {
@@ -78,7 +104,13 @@ function open() {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
   const repository = database.create("/repo", "ref: refs/heads/main");
-  return { db, database, repository, store: database.open(repository) };
+  const store = database.open(repository);
+  store.write("tree", TREE_BYTES);
+  store.write("commit", ORIGINAL_BYTES);
+  store.write("commit", INCOMING_BYTES);
+  store.write("blob", FILE_BYTES);
+  store.write("blob", LINK_BYTES);
+  return { db, database, repository, store };
 }
 
 describe("durable merge journal", () => {
@@ -99,7 +131,7 @@ describe("durable merge journal", () => {
       touched: paths,
       retainedBytes: mergeJournalRetainedBytes(state, paths),
     });
-    expect(db.storage.statementCount).toBe(2);
+    expect(db.storage.statementCount).toBe(3);
   });
 
   it("persists ready no-commit state and optional explicit identities", () => {
@@ -129,7 +161,7 @@ describe("durable merge journal", () => {
     store.writeMergeState(metadata(), touched());
     const before = store.requireMergeState();
 
-    expect(() => store.writeMergeState(metadata({ message: "second\n" }), [])).toThrowError(
+    expect(() => store.writeMergeState(metadata({ message: "second\n" }), touched())).toThrowError(
       expect.objectContaining({ code: "EMERGEACTIVE" }),
     );
     expect(() => store.requireNoMergeState()).toThrowError(
@@ -186,7 +218,10 @@ describe("durable merge journal", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
     expect(() =>
-      store.writeMergeState(metadata({ message: "x".repeat(MAX_MERGE_MESSAGE_BYTES + 1) }), []),
+      store.writeMergeState(
+        metadata({ message: "x".repeat(MAX_MERGE_MESSAGE_BYTES + 1) }),
+        touched(),
+      ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_touched")).toBe(0);
@@ -247,6 +282,100 @@ describe("durable merge journal", () => {
       } catch (error) {
         expect(hasErrorCode(error, corruption.code), corruption.name).toBe(true);
       }
+    }
+  });
+
+  it("rejects impossible metadata and empty conflicted journals", () => {
+    const cases: readonly (() => void)[] = [
+      () => open().store.writeMergeState(metadata({ currentLabel: "" }), touched()),
+      () => open().store.writeMergeState(metadata({ incomingLabel: "" }), touched()),
+      () => open().store.writeMergeState(metadata({ currentParentOid: INCOMING }), touched()),
+      () => open().store.writeMergeState(metadata(), []),
+    ];
+
+    for (const operation of cases) {
+      expect(operation).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    }
+  });
+
+  it("guards oversized SQL text and blob values before they cross the read boundary", () => {
+    const metadataCases: readonly string[] = ["message", "author_name"];
+    for (const column of metadataCases) {
+      const { db, store } = open();
+      store.writeMergeState(metadata(), touched());
+      db.run("PRAGMA ignore_check_constraints = ON");
+      db.run(
+        `UPDATE git_merge_state SET ${column} = zeroblob(?) WHERE repo_id = 1`,
+        MAX_MERGE_MESSAGE_BYTES + 1,
+      );
+      db.run("PRAGMA ignore_check_constraints = OFF");
+      expect(() => store.readMergeState(), column).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+    }
+
+    const { db, store } = open();
+    store.writeMergeState(metadata(), touched());
+    db.run("UPDATE git_merge_touched SET path = zeroblob(4096) WHERE ordinal = 0");
+    expect(() => store.readMergeState()).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
+  it("requires authoritative complete objects with types matching every saved mode", () => {
+    const missingOnWrite = open();
+    expect(() =>
+      missingOnWrite.store.writeMergeState(
+        metadata({ incomingParentOid: "f".repeat(40) }),
+        touched(),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(missingOnWrite.store.readMergeState()).toBeNull();
+
+    const corruptions: readonly {
+      name: string;
+      corrupt: (db: TestDatabase) => void;
+    }[] = [
+      {
+        name: "missing parent",
+        corrupt: (db) =>
+          db.run(
+            "UPDATE git_merge_state SET incoming_parent_oid = ? WHERE repo_id = 1",
+            "f".repeat(40),
+          ),
+      },
+      {
+        name: "parent is a blob",
+        corrupt: (db) =>
+          db.run("UPDATE git_merge_state SET incoming_parent_oid = ? WHERE repo_id = 1", FILE),
+      },
+      {
+        name: "index file is a commit",
+        corrupt: (db) =>
+          db.run("UPDATE git_merge_touched SET index_oid = ? WHERE path = 'a.txt'", INCOMING),
+      },
+      {
+        name: "worktree symlink is a commit",
+        corrupt: (db) =>
+          db.run(
+            "UPDATE git_merge_touched SET worktree_oid = ? WHERE path = 'node~HEAD'",
+            INCOMING,
+          ),
+      },
+      {
+        name: "loose blob lost its only chunk",
+        corrupt: (db) =>
+          db.run("DELETE FROM git_object_chunks WHERE repo_id = 1 AND oid = ?", FILE),
+      },
+    ];
+
+    for (const corruption of corruptions) {
+      const { db, store } = open();
+      store.writeMergeState(metadata(), touched());
+      corruption.corrupt(db);
+      expect(() => store.readMergeState(), corruption.name).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
     }
   });
 });
