@@ -155,7 +155,7 @@ export function checkout(
   }
 
   if (options.force !== true) {
-    const blocked = localChangesInTheWay(repo, worktree, tree, paths, paths === undefined);
+    const blocked = checkoutBlockers(repo, worktree, tree, paths, paths === undefined);
     if (blocked.tracked.length > 0) {
       throw new GitError(
         "ECHECKOUTFAIL",
@@ -229,7 +229,7 @@ function moveHead(repo: Repository, ref: string, commit: string): void {
  * clobber. A path missing from disk is not one of them: git restores a
  * locally deleted file without complaint.
  */
-interface CheckoutBlockers {
+export interface CheckoutBlockers {
   /** Tracked paths carrying uncommitted work the checkout would discard. */
   tracked: string[];
   /** Untracked files the target tree would write over. */
@@ -245,7 +245,7 @@ interface CheckoutBlockers {
  * index entry differing from HEAD. Either would be lost, and only the first
  * is what `dirtyPaths` can see on its own.
  */
-function localChangesInTheWay(
+export function checkoutBlockers(
   repo: Repository,
   worktree: Worktree,
   tree: string | null,
