@@ -167,9 +167,9 @@ Consumed backlog item 02, deleted on ship, and implements
 ## Out of scope (explicit)
 
 - Public merge orchestration, merge-base traversal, fast-forward selection,
-  merge commits, and continue/abort state remain in
-  [backlog item 19](../backlog/19-merge-operation-lifecycle.md). This sprint
-  accepts tree OIDs and returns a plan only.
+  merge commits, and continue/abort state shipped in the later
+  [merge lifecycle sprint](./sprint-2026-08-24-merge-operation-lifecycle.md).
+  This sprint accepts tree OIDs and returns a plan only.
 - Fast-forward pull and divergent pull remain in
   [backlog item 01](../backlog/01-fast-forward-pull.md) and
   [backlog item 03](../backlog/03-divergent-pull.md).

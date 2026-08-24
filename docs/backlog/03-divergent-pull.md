@@ -1,7 +1,7 @@
 ---
 id: 03
 title: Complete divergent pull
-blocked-by: [./19-merge-operation-lifecycle.md]
+blocked-by: []
 ---
 
 # 03 — Complete divergent pull

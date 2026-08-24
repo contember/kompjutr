@@ -31,4 +31,3 @@ unwieldy; numbers stay folder-local.
 - [16 — Verify concurrent and interrupted operations](16-concurrent-and-restart-conformance.md)
 - [17 — Add repository integrity audit and snapshots](17-integrity-audit-and-snapshots.md)
 - [18 — Complete branch and remote management](18-branch-and-remote-management.md)
-- [19 — Implement merge operation lifecycle](19-merge-operation-lifecycle.md)

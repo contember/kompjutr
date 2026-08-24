@@ -48,9 +48,11 @@ fs.writeFileSync("/src/index.ts", "export const value = 1;\n");
 
 The native client supports repository initialization, clone, fetch, single-branch
 Smart HTTP push, status, staging, commit, log, diff, checkout, branches, tags,
-refs, config, remotes, and the plumbing operations exposed by `Git`. Unsupported
-commands fail with `EUNSUPPORTED` instead of falling back to another
-implementation.
+refs, config, remotes, local two-head merge, and the plumbing operations exposed
+by `Git`. Merge supports fast-forward, forced merge commits, clean and conflicted
+integration, `commit: false`, restart-safe continue, and path-scoped abort for the
+checked-out branch. Unsupported commands fail with `EUNSUPPORTED` instead of
+falling back to another implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });

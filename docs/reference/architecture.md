@@ -148,7 +148,7 @@ identity and mode dimensions independently, recognizes file/directory prefixes
 without materializing directory trees, and leaves symlink and gitlink conflicts
 structural. Equal-root pruning still validates object metadata and the effective
 tree source. File/directory conflicts use logical paths; label-derived relocation
-belongs to the later merge lifecycle that owns index and worktree writes.
+is handled by the merge lifecycle that owns index and worktree writes.
 
 Only divergent regular files reach the content phase. Their OIDs are read in
 bounded prefixes rather than through scalar path lookups. Each returned prefix
@@ -163,6 +163,42 @@ bulk read. Caller-owned state stays within the packed reader's 8 MiB headroom.
 A shared 64 MiB exclusion reservation is acquired before any tree cursor opens,
 then reduced to conservative live-state and xdiff peaks. Capacity and corruption
 fail closed before exposing a partial plan.
+
+## Merge lifecycle
+
+Local merge targets the checked-out symbolic branch and accepts two commit heads.
+A bounded graph pass distinguishes already-merged, fast-forward, divergent,
+unrelated, and shallow histories. Multiple best bases are recursively combined
+through clean synthetic commits inside the enclosing transaction. Their temporary
+trees use Git-compatible conflict markers and never update a ref.
+
+The final integration plan is projected to physical index and worktree paths.
+Text and binary conflicts write stages 1–3 and marker/current bytes. Structural
+file/directory conflicts relocate the file side to a collision-checked
+`~<label>` path. One outer `transactionSync()` covers temporary objects, output
+objects, worktree changes, index stages, merge state, and the final ref update.
+The composed SQL estimate includes graph selection, virtual-base work, final
+planning, and apply; an operation that cannot remain below 1,000 statements
+fails before its transaction becomes visible.
+
+Merge preflights the current, projected, and final index shape before tree
+construction. The operation accepts at most 10,000 leaf paths, 4 MiB of full
+path bytes, 4,096 tree objects, and 16 MiB of serialized tree data. Worktree
+overwrite checks scan at most 50,000 rows and hash at most one 1,000-path batch
+or 30 large-file range reads. The retained integration plan stays reserved with
+24 MiB of execution headroom through projection, application, and commit.
+
+Clean divergent merges create a commit with ordered current/incoming parents.
+`commit: false` and conflicts persist schema-v9 merge metadata plus bounded
+snapshots for only merge-owned paths. A deterministic integrity identity binds
+every saved parent, option, and snapshot row; unauthenticated v8 pending state is
+cleared during migration. Native `mergeContinue()` and ordinary `commit()`
+finalize the saved parents after all stages are resolved.
+`mergeAbort()` first reconstructs ownership from the authoritative parents, then
+restores those index/worktree paths and their structural ancestors. Unrelated
+worktree content is preserved, and a structural blocker makes abort fail closed.
+Compatibility clients expose only single-shot merge, so a conflict is rolled
+back and reported as `EMERGEFAIL` instead of leaving unreachable pending state.
 
 ## Sparse workspace tracking
 

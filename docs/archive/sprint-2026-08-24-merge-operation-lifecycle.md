@@ -1,10 +1,14 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-08-24.** The native client now supports bounded
+> already-merged, fast-forward, divergent, conflicted, no-commit, continue, and
+> abort outcomes for the checked-out branch; the compatibility client exposes
+> atomic single-shot merge. Recovery state is authenticated in schema v9, and
+> graph, guard, tree, SQL, and memory limits fail closed. Commit map: WU1 →
+> `6215367`, `497fb7a`; WU2 → `99dfad0`, `12f4f13`, `e84695f`; WU3 →
+> `ad7bd90`, `e8e030e`, `c52491e`; WU4 → `c1c783f`, `49c2d19`; WU5 →
+> `49c2d19`. Verification: `npm run check`; `npm run typecheck`; leased full
+> suite — 82 files, 1,494 passed, 5 skipped; leased production build. Backlog
+> closed: 19. Deferred: pull composition, octopus/unrelated/detached merges,
+> rename detection, custom drivers, signing, hooks, and other listed non-goals.
 
 # Sprint — Complete merge operation lifecycle (2026-08-24)
 
@@ -17,9 +21,8 @@ does not choose commits or mutate repository state. This sprint turns that engin
 into one recoverable public operation. Success means a merge either completes
 atomically, leaves an explicit resumable state, or changes nothing.
 
-Consumes [backlog item 19](../backlog/19-merge-operation-lifecycle.md) when shipped
-and builds directly on the archived
-[three-way integration sprint](../archive/sprint-2026-08-24-three-way-integration-engine.md).
+Consumed backlog item 19 and builds directly on the archived
+[three-way integration sprint](./sprint-2026-08-24-three-way-integration-engine.md).
 
 ## Refs re-verified at HEAD (2026-08-24, `fb12702`)
 
@@ -304,3 +307,13 @@ Do not run or publish a benchmark from this sprint.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- Independent lifecycle review found five recovery/interlock gaps. Regression
+  witnesses now cover missing tracked files, unmerged fast-forward indexes,
+  compatibility commit, continuation capacity, and parent substitution.
+- Type-valid journal substitution required a deterministic integrity identity;
+  this advanced the merge journal from schema v8 to v9. Migrating v8 clears an
+  unauthenticated pending operation instead of trusting it.
+- Resource audit disproved the initial fixed guard and commit estimates. Final
+  limits include hash batch/range caps and streaming preflight of current,
+  projected, final, and virtual tree shapes.

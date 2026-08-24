@@ -16,16 +16,13 @@ decisions → reference → archive.
 ## Active sprints
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
-- [`sprints/sprint-2026-08-24-merge-operation-lifecycle.md`](sprints/sprint-2026-08-24-merge-operation-lifecycle.md)
-  — complete bounded two-head merge for the checked-out branch.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The active sprint turns the pure integration engine into the public merge
-  lifecycle: merge-base selection, atomic application, restart-safe conflict
-  recovery, abort, and two-parent commits.
+- No sprint is active. The merge lifecycle is shipped, so fast-forward and
+  divergent pull composition are no longer blocked on a native merge engine.
 
 ## Key reference
 
@@ -41,6 +38,8 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-24-merge-operation-lifecycle.md`](archive/sprint-2026-08-24-merge-operation-lifecycle.md)
+  — complete bounded two-head merge lifecycle for the checked-out branch.
 - [`archive/sprint-2026-08-24-three-way-integration-engine.md`](archive/sprint-2026-08-24-three-way-integration-engine.md)
   — bounded pure three-tree integration engine.
 - [`archive/plans/`](archive/plans/README.md) — completed and superseded implementation plans.
