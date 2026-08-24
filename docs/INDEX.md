@@ -17,12 +17,16 @@ decisions → reference → archive.
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
 
+- [`sprints/sprint-2026-08-24-cherry-pick-and-revert.md`](sprints/sprint-2026-08-24-cherry-pick-and-revert.md)
+  — bounded native cherry-pick and revert with durable continue, skip, and abort.
+
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- CI and release gates are the next delivery priority now that clone, fetch,
-  push, merge, and pull have complete public paths.
+- Cherry-pick and revert are the active functional priority, extending the
+  shipped merge engine into a reusable one-commit replay lifecycle.
+- CI and release gates remain the next release-readiness priority.
 
 ## Key reference
 
