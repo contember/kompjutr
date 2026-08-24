@@ -22,7 +22,7 @@ import {
   readCommitGraph,
 } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
-import { MemoryCoordinator } from "./memory.js";
+import { MemoryCoordinator, type MemoryReservation } from "./memory.js";
 import {
   MAX_PACK_BLOB_BATCH_BYTES,
   MAX_PACK_DELTA_WORKING_BYTES,
@@ -746,6 +746,7 @@ export class RepoStore {
   readonly #root: string;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packs: PackStore;
+  readonly #memory: MemoryCoordinator;
   readonly #cacheNamespace: string;
   #cacheGeneration = 0;
   #hasLoose: boolean;
@@ -766,6 +767,7 @@ export class RepoStore {
     this.#repoId = repository.id;
     this.#root = repository.root;
     this.#objects = objects;
+    this.#memory = memory;
     this.#cacheNamespace = `${repository.id}:${storeGeneration}`;
     this.#packs = new PackStore(
       db,
@@ -805,6 +807,11 @@ export class RepoStore {
   /** Bytes currently held by this database's two shared bounded caches. */
   cacheBytes(): { objects: number; chunks: number } {
     return { objects: this.#objects.bytes, chunks: this.#packs.cachedChunkBytes };
+  }
+
+  /** Reserve operation state against this database's shared memory budget. */
+  reserveMemory(): MemoryReservation {
+    return this.#memory.reserve();
   }
 
   // -- objects --------------------------------------------------------
