@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
-import { commit } from "../src/core/ops/commit.js";
+import { commit, commitIndex, resolveIdentity } from "../src/core/ops/commit.js";
 import { log } from "../src/core/ops/reads.js";
 import { buildTree } from "../src/core/ops/tree-build.js";
 import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/core/ops/worktree-io.js";
@@ -203,6 +203,49 @@ describe("history", () => {
     );
     expect(repo.workspace.repo.head().ref).toBe("refs/heads/main");
     expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(second);
+  });
+});
+
+describe("explicit-parent commit seam", () => {
+  it("writes ordered merge parents", () => {
+    const repo = mirror();
+    repo.write("a.txt", "one\n");
+    const first = repo.expectSameCommit("first");
+    repo.write("a.txt", "two\n");
+    const second = repo.expectSameCommit("second");
+    const head = repo.workspace.repo.head();
+
+    const result = commitIndex(repo.workspace.repo, {
+      message: "merge",
+      parent: [first, second],
+      identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
+      expectedHead: head,
+    });
+
+    expect(repo.workspace.repo.readCommit(result.oid).parent).toEqual([first, second]);
+  });
+
+  it("does not write an object when HEAD changed", () => {
+    const repo = mirror();
+    repo.write("a.txt", "one\n");
+    const first = repo.expectSameCommit("first");
+    repo.write("a.txt", "two\n");
+    repo.expectSameCommit("second");
+    const expectedHead = repo.workspace.repo.head();
+    if (expectedHead.ref === null) throw new Error("fixture HEAD is detached");
+    repo.workspace.repo.store.setRef(expectedHead.ref, first);
+    const before = repo.workspace.repo.store.objectCount();
+
+    expect(() =>
+      commitIndex(repo.workspace.repo, {
+        message: "stale",
+        parent: [first],
+        identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
+        expectedHead,
+      }),
+    ).toThrow(expect.objectContaining({ code: "ESTALEHEAD" }));
+    expect(repo.workspace.repo.store.objectCount()).toBe(before);
+    expect(repo.workspace.repo.resolveRef(expectedHead.ref)).toBe(first);
   });
 });
 

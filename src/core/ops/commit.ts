@@ -23,35 +23,70 @@ export interface CommitIdentities {
   committer: Person;
 }
 
+export interface IndexedCommitOptions {
+  message: string;
+  parent: readonly string[];
+  identities: CommitIdentities;
+  expectedHead: ResolvedHead;
+}
+
 export function commit(
   context: GitContext,
   repo: Repository,
   options: CommitOptions,
 ): CommitResult {
   if (options.message.trim() === "") throw new GitError("EMSG", "commit message is required");
-  if (repo.store.hasConflicts()) {
-    throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
-  }
+  return repo.store.db.transactionSync(() => {
+    if (repo.store.hasConflicts()) {
+      throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
+    }
 
-  const head = repo.head();
-  const amended = options.amend === true ? readAmended(repo, head) : undefined;
-  const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
-  const { author, committer } = resolveIdentity(context, repo, options, amended);
+    const head = repo.head();
+    const amended = options.amend === true ? readAmended(repo, head) : undefined;
+    const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
+    const identities = resolveIdentity(context, repo, options, amended);
+    return writeCommitIndex(repo, {
+      message: options.message,
+      parent,
+      identities,
+      expectedHead: head,
+    });
+  });
+}
 
+/** Build the stage-zero index and move only the HEAD observed by the caller. */
+export function commitIndex(repo: Repository, options: IndexedCommitOptions): CommitResult {
+  if (options.message.trim() === "") throw new GitError("EMSG", "commit message is required");
+
+  return repo.store.db.transactionSync(() => {
+    const head = repo.head();
+    if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
+      throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
+    }
+    return writeCommitIndex(repo, options);
+  });
+}
+
+/** Caller owns the transaction and has already validated `expectedHead`. */
+function writeCommitIndex(repo: Repository, options: IndexedCommitOptions): CommitResult {
   // A paged scan, so the index never exists as one array alongside the build.
   const oid = repo.store.writeObjects((batch) => {
     const tree = buildTreeInBatch(batch, repo.store.indexScan({ pageSize: 2048 }));
     return batch.write(
       "commit",
-      serializeCommit({ tree, parent, author, committer, message: cleanMessage(options.message) }),
+      serializeCommit({
+        tree,
+        parent: [...options.parent],
+        author: options.identities.author,
+        committer: options.identities.committer,
+        message: cleanMessage(options.message),
+      }),
     );
   });
 
-  repo.store.db.transactionSync(() => {
-    // A symbolic HEAD on an unborn branch creates the branch here.
-    if (head.ref === null) repo.store.setHead(oid);
-    else repo.store.setRef(head.ref, oid);
-  });
+  // A symbolic HEAD on an unborn branch creates the branch here.
+  if (options.expectedHead.ref === null) repo.store.setHead(oid);
+  else repo.store.setRef(options.expectedHead.ref, oid);
   return { oid };
 }
 
