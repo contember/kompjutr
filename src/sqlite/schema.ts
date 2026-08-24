@@ -10,7 +10,7 @@ import { CorruptError } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -116,6 +116,7 @@ const STATEMENTS = [
      committer_email TEXT,
      touched_count INTEGER NOT NULL,
      retained_bytes INTEGER NOT NULL,
+     integrity_oid TEXT NOT NULL,
      CHECK (phase != 'ready' OR mode = 'no-commit'),
      CHECK ((author_name IS NULL) = (author_email IS NULL)),
      CHECK ((committer_name IS NULL) = (committer_email IS NULL))
@@ -369,7 +370,7 @@ const STATEMENTS = [
 // projection. v5 records the monotonic filesystem revision in index stat data.
 // v6 adds inert index baseline and dirty-path state for sparse status queries.
 // v7 adds source-qualified tree entry lookup by raw name bytes. v8 adds the
-// durable merge journal and its bounded touched-path snapshot.
+// durable merge journal; v9 binds its rows to one deterministic identity.
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
@@ -383,6 +384,17 @@ function migrate(db: SqlDatabase, from: number): void {
       .all<{ name: string }>("PRAGMA table_info(git_index)")
       .some((column) => column.name === "rev");
     if (!hasRevision) db.run("ALTER TABLE git_index ADD COLUMN rev INTEGER");
+  }
+  if (from < 9) {
+    const hasIntegrity = db
+      .all<{ name: string }>("PRAGMA table_info(git_merge_state)")
+      .some((column) => column.name === "integrity_oid");
+    if (!hasIntegrity) {
+      db.run("ALTER TABLE git_merge_state ADD COLUMN integrity_oid TEXT NOT NULL DEFAULT ''");
+      // A v8 journal cannot be authenticated after the upgrade.
+      db.run("DELETE FROM git_merge_touched");
+      db.run("DELETE FROM git_merge_state");
+    }
   }
 }
 

@@ -22,6 +22,7 @@ import {
   type MergeTouchedPath,
   type MergeWorktreeSnapshot,
   mergeAlreadyActive,
+  mergeJournalIntegrityOid,
   mergeJournalRetainedBytes,
   mergeNotActive,
   requireMergeInteger,
@@ -201,6 +202,7 @@ interface MergeStateRow {
   committer_email: unknown;
   touched_count: unknown;
   retained_bytes: unknown;
+  integrity_oid: unknown;
 }
 
 interface MergeTouchedRow {
@@ -2399,7 +2401,10 @@ export class RepoStore {
                    WHEN typeof(committer_email) = 'text'
                          AND length(CAST(committer_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
                    THEN committer_email ELSE 0 END AS committer_email,
-              touched_count, retained_bytes
+              touched_count, retained_bytes,
+              CASE WHEN typeof(integrity_oid) = 'text'
+                         AND length(CAST(integrity_oid AS BLOB)) = 40
+                   THEN integrity_oid END AS integrity_oid
          FROM git_merge_state WHERE repo_id = ?`,
       this.#repoId,
     );
@@ -2492,6 +2497,10 @@ export class RepoStore {
     if (retainedBytes !== storedBytes) {
       throw new CorruptError("merge journal retained-byte count does not match its rows");
     }
+    const integrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
+    if (mergeJournalIntegrityOid(state, touched) !== integrityOid) {
+      throw new CorruptError("merge journal integrity identity does not match its rows");
+    }
     const journal = { state, touched, retainedBytes };
     this.#validateMergeObjects(journal);
     return journal;
@@ -2500,6 +2509,7 @@ export class RepoStore {
   /** Atomically create one bounded merge journal; an existing merge wins. */
   writeMergeState(state: MergeStateMetadata, touched: readonly MergeTouchedPath[]): void {
     const retainedBytes = mergeJournalRetainedBytes(state, touched);
+    const integrityOid = mergeJournalIntegrityOid(state, touched);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
@@ -2516,8 +2526,8 @@ export class RepoStore {
            (repo_id, original_head_ref, original_head_oid, current_parent_oid,
             incoming_parent_oid, phase, mode, current_label, incoming_label,
             message, author_name, author_email, committer_name, committer_email,
-            touched_count, retained_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            touched_count, retained_bytes, integrity_oid)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         this.#repoId,
         state.originalHeadRef,
         state.originalHeadOid,
@@ -2534,6 +2544,7 @@ export class RepoStore {
         state.committer?.email ?? null,
         touched.length,
         retainedBytes,
+        integrityOid,
       );
 
       function* rows(): Generator<PersistedMergeTouched> {

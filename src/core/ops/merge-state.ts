@@ -1,7 +1,8 @@
 // Durable, bounded state for one incomplete two-head merge.
 
-import { isOid } from "../bytes.js";
+import { isOid, utf8 } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
+import { hashObject } from "../objects.js";
 
 export const MAX_MERGE_TOUCHED_PATHS = 1_000;
 export const MAX_MERGE_STATE_BYTES = 4 * 1024 * 1024;
@@ -397,6 +398,62 @@ export function mergeJournalRetainedBytes(
     }
   }
   return bytes;
+}
+
+function savedIdentityVector(identity: MergeSavedIdentity | null): readonly unknown[] | null {
+  return identity === null ? null : [identity.name, identity.email];
+}
+
+function indexSnapshotVector(snapshot: MergeIndexSnapshot | null): readonly unknown[] | null {
+  return snapshot === null
+    ? null
+    : [
+        snapshot.stage,
+        snapshot.mode,
+        snapshot.oid,
+        snapshot.size,
+        snapshot.mtime,
+        snapshot.ino,
+        snapshot.rev,
+      ];
+}
+
+function worktreeSnapshotVector(snapshot: MergeWorktreeSnapshot): readonly unknown[] {
+  if (snapshot.kind === "absent") return [snapshot.kind];
+  if (snapshot.kind === "directory") return [snapshot.kind, snapshot.mode, snapshot.revision];
+  return [snapshot.kind, snapshot.mode, snapshot.oid, snapshot.revision];
+}
+
+/** Bind every persisted operation field to one deterministic content identity. */
+export function mergeJournalIntegrityOid(
+  state: MergeStateMetadata,
+  touched: readonly MergeTouchedPath[],
+): string {
+  mergeJournalRetainedBytes(state, touched);
+  const payload: readonly unknown[] = [
+    1,
+    [
+      state.originalHeadRef,
+      state.originalHeadOid,
+      state.currentParentOid,
+      state.incomingParentOid,
+      state.phase,
+      state.mode,
+      state.currentLabel,
+      state.incomingLabel,
+      state.message,
+      savedIdentityVector(state.author),
+      savedIdentityVector(state.committer),
+    ],
+    touched.map((entry) => [
+      entry.path,
+      entry.logicalPath,
+      entry.purpose,
+      indexSnapshotVector(entry.index),
+      worktreeSnapshotVector(entry.worktree),
+    ]),
+  ];
+  return hashObject("blob", utf8.encode(JSON.stringify(payload)));
 }
 
 export function mergeAlreadyActive(): GitError {

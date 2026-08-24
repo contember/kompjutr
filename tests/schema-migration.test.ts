@@ -55,7 +55,7 @@ function treeNameBytesIndex(db: TestDatabase): IndexListEntry | undefined {
 }
 
 describe("git schema", () => {
-  it("creates v8 on a fresh database", () => {
+  it("creates the current schema on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
 
@@ -99,6 +99,7 @@ describe("git schema", () => {
       "committer_email",
       "touched_count",
       "retained_bytes",
+      "integrity_oid",
     ]);
     expect(columnsOf(db, "git_merge_touched")).toEqual([
       "repo_id",
@@ -423,6 +424,33 @@ describe("git schema", () => {
     );
   });
 
+  it("invalidates unauthenticated merge state when migrating v8", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run("ALTER TABLE git_merge_state DROP COLUMN integrity_oid");
+    db.run(
+      `INSERT INTO git_merge_state
+         (repo_id, original_head_ref, original_head_oid, current_parent_oid,
+          incoming_parent_oid, phase, mode, current_label, incoming_label,
+          message, author_name, author_email, committer_name, committer_email,
+          touched_count, retained_bytes)
+       VALUES (1, 'refs/heads/main', ?, ?, ?, 'ready', 'no-commit', 'HEAD',
+               'topic', 'merge', NULL, NULL, NULL, NULL, 0, 0)`,
+      "1".repeat(40),
+      "1".repeat(40),
+      "2".repeat(40),
+    );
+    db.run("UPDATE git_meta SET value = '8' WHERE key = 'schema_version'");
+
+    initializeGitSchema(db);
+
+    expect(columnsOf(db, "git_merge_state")).toContain("integrity_oid");
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_merge_state")).toBe(0);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
+  });
+
   it("uses the tree name-bytes index for source-qualified point lookups", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
@@ -441,10 +469,13 @@ describe("git schema", () => {
   it("fails closed on a schema newer than this runtime", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("UPDATE git_meta SET value = '9' WHERE key = 'schema_version'");
+    const newer = String(SCHEMA_VERSION + 1);
+    db.run("UPDATE git_meta SET value = ? WHERE key = 'schema_version'", newer);
 
     expect(() => initializeGitSchema(db)).toThrow(/newer than supported/);
-    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("9");
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      newer,
+    );
   });
 
   it("accepts only canonical positive decimal schema versions", () => {
