@@ -16,14 +16,16 @@ decisions → reference → archive.
 ## Active sprints
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
-- _none active_
+- [`sprints/sprint-2026-08-24-merge-operation-lifecycle.md`](sprints/sprint-2026-08-24-merge-operation-lifecycle.md)
+  — complete bounded two-head merge for the checked-out branch.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- No active sprint. The next recommended item is the
-  [merge operation lifecycle](backlog/19-merge-operation-lifecycle.md).
+- The active sprint turns the pure integration engine into the public merge
+  lifecycle: merge-base selection, atomic application, restart-safe conflict
+  recovery, abort, and two-parent commits.
 
 ## Key reference
 
