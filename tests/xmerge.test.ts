@@ -28,7 +28,7 @@ function gitMergeFile(
   incoming: Uint8Array,
   style: TextMergeStyle = "merge",
   markerSize = 7,
-): { content: Uint8Array; conflicts: boolean } {
+): { content: Uint8Array; conflicts: number } {
   const prefix = join(scratch, `${Date.now()}-${Math.random()}`);
   const currentPath = `${prefix}-current`;
   const basePath = `${prefix}-base`;
@@ -57,7 +57,7 @@ function gitMergeFile(
           env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
         }),
       ),
-      conflicts: false,
+      conflicts: 0,
     };
   } catch (error) {
     if (
@@ -70,7 +70,7 @@ function gitMergeFile(
       "stdout" in error &&
       error.stdout instanceof Uint8Array
     ) {
-      return { content: new Uint8Array(error.stdout), conflicts: true };
+      return { content: new Uint8Array(error.stdout), conflicts: error.status };
     }
     throw error;
   }
@@ -91,8 +91,9 @@ function expectGitParity(
     labels: { current: "current", base: "base", incoming: "incoming" },
   });
   if (actual.kind === "binary") throw new Error(`${name}: unexpected binary result`);
-  expect(actual.kind, name).toBe(expected.conflicts ? "conflict" : "clean");
+  expect(actual.kind, name).toBe(expected.conflicts > 0 ? "conflict" : "clean");
   expect(actual.content, name).toEqual(expected.content);
+  if (actual.kind === "conflict") expect(actual.conflicts, name).toBe(expected.conflicts);
 }
 
 function withLimits(limits: TextMergeOptions["limits"]): TextMergeOptions {
@@ -228,6 +229,31 @@ describe("bounded byte-oriented xmerge", () => {
     expect(result.memory.outputBytes).toBe(0);
   });
 
+  it("uses Git's exact 8,000-byte binary inspection window", () => {
+    const binary = new Uint8Array(8_001).fill(0x61);
+    binary[7_999] = 0;
+    expect(mergeText(binary, binary, binary).kind).toBe("binary");
+
+    const text = new Uint8Array(8_001).fill(0x61);
+    text[8_000] = 0;
+    expect(mergeText(text, text, text).kind).toBe("clean");
+  });
+
+  it("reports Git's exact conflict count", () => {
+    const base = bytes("a\nbase one\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nbase two\nz\n");
+    const current = bytes("a\ncurrent one\nkeep 1\nkeep 2\nkeep 3\nkeep 4\ncurrent two\nz\n");
+    const incoming = bytes("a\nincoming one\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nincoming two\nz\n");
+    const expected = gitMergeFile(base, current, incoming);
+    const actual = mergeText(base, current, incoming, {
+      labels: { current: "current", base: "base", incoming: "incoming" },
+    });
+    expect(expected.conflicts).toBe(2);
+    expect(actual.kind).toBe("conflict");
+    if (actual.kind !== "conflict") throw new Error("expected a conflict");
+    expect(actual.conflicts).toBe(expected.conflicts);
+    expect(actual.content).toEqual(expected.content);
+  });
+
   it("supports labels and custom marker sizes", () => {
     expectGitParity(
       "custom marker size",
@@ -294,6 +320,19 @@ describe("bounded byte-oriented xmerge", () => {
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(() => run({ labels: { current: "unsafe\nlabel" } })).toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() => run({ labels: { current: "unsafe\rlabel" } })).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() => run({ labels: { current: "unsafe\0label" } })).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() => run({ labels: { current: "unsafe\ud800label" } })).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() => run({ labels: { current: "éé" }, limits: { maxLabelBytes: 4 } })).not.toThrow();
+    expect(() => run({ labels: { current: "éé" }, limits: { maxLabelBytes: 3 } })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
     );
     expect(() => run({ markerSize: 8, limits: { maxMarkerSize: 8 } })).not.toThrow();
     expect(() => run({ markerSize: 9, limits: { maxMarkerSize: 8 } })).toThrowError(
