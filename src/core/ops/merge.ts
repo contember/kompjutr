@@ -88,6 +88,8 @@ export interface MergeContinueOptions {
 export interface MergeBehavior {
   /** Compatibility clients cannot reach native continue/abort after a conflict. */
   persistConflicts?: boolean;
+  /** Pull supplies the remote branch label without changing revision lookup. */
+  incomingLabel?: string;
 }
 
 function requireMergeRevision(value: unknown, label: string): string {
@@ -825,7 +827,10 @@ function mergeInTransaction(
 
   const currentTree = commitTree(repo, head.oid);
   const nextTree = commitTree(repo, incomingOid);
-  const nextLabel = incomingLabel(repo, theirs, incomingOid);
+  const nextLabel =
+    behavior.incomingLabel === undefined
+      ? incomingLabel(repo, theirs, incomingOid)
+      : requireMergeRevision(behavior.incomingLabel, "incoming label");
   const currentLabel = "HEAD";
   const isFastForward = selection.kind === "fast-forward" && options.fastForward !== false;
   const budget: VirtualBudget = {

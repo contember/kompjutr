@@ -37,6 +37,7 @@ import {
   repoRoot as repoRootOp,
   updateRef as updateRefOp,
 } from "../../core/ops/plumbing.js";
+import { pull as pullOp } from "../../core/ops/pull.js";
 import { push as pushOp } from "../../core/ops/push.js";
 import {
   catFile as catFileRead,
@@ -248,8 +249,9 @@ export function createSqliteGitClient(
       async push(input = {}) {
         return pushOp(ctx(), at(input.dir), input);
       },
-      async pull() {
-        throw new UnsupportedOperationError("pull");
+      async pull(input = {}) {
+        const repo = at(input.dir);
+        await pullOp(ctx(), repo, ctx().worktree, input, { persistConflicts: false });
       },
       async merge(input) {
         const repo = at(input.dir);

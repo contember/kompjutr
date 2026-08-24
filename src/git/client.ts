@@ -56,6 +56,7 @@ import {
   type UpdateRefOptions,
   updateRef as updateRefOp,
 } from "../core/ops/plumbing.js";
+import { type PullOptions, pull as pullOp } from "../core/ops/pull.js";
 import { type PushOptions, push as pushOp } from "../core/ops/push.js";
 import {
   type CommitView,
@@ -126,6 +127,7 @@ export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
 export type GitCatFileOptions = CatFileOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
 export type GitPushOptions = PushOptions & GitDirOptions;
+export type GitPullOptions = PullOptions & GitDirOptions;
 
 export interface GitCatFileResult {
   oid: string;
@@ -167,7 +169,7 @@ export interface Git {
   catFile(input: GitCatFileOptions): Promise<GitCatFileResult>;
   updateRef(input: GitUpdateRefOptions): Promise<void>;
   push(input?: GitPushOptions): Promise<PushResult>;
-  pull(input?: GitDirOptions): Promise<never>;
+  pull(input?: GitPullOptions): Promise<MergeResult>;
   merge(input: GitMergeOptions): Promise<MergeResult>;
   mergeContinue(input?: GitMergeContinueOptions): Promise<MergeResult>;
   mergeAbort(input?: GitDirOptions): Promise<void>;
@@ -366,8 +368,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async push(input = {}) {
       return pushOp(context, at(input.dir), input);
     },
-    async pull() {
-      throw new UnsupportedOperationError("pull");
+    async pull(input = {}) {
+      const repo = at(input.dir);
+      return pullOp(context, repo, context.worktree, input);
     },
     async merge(input) {
       const repo = at(input.dir);

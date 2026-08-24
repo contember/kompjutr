@@ -151,6 +151,38 @@ describe("createSqliteGitClient", () => {
     }
   });
 
+  it("pulls through the compatibility surface and rolls conflicts back locally", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("conflict.txt", "base\n");
+    fixture.commit("base");
+    const server = await startGitServer(fixture.dir);
+    try {
+      const { workspace } = makeWorkspace();
+      const git = workspace.git;
+      await git.clone({ url: server.url, dir: "/", depth: 0 });
+
+      fixture.write("remote.txt", "remote\n");
+      const fastForward = fixture.commit("remote fast-forward");
+      await expect(git.pull({})).resolves.toBeUndefined();
+      expect(await git.revParse({ ref: "HEAD" })).toBe(fastForward);
+
+      await workspace.fs.writeFile("/conflict.txt", "local\n");
+      await git.add({ paths: ["conflict.txt"] });
+      const local = await git.commit({ message: "local" });
+      fixture.write("conflict.txt", "incoming\n");
+      const incoming = fixture.commit("incoming");
+
+      await expect(git.pull({})).rejects.toMatchObject({ code: "EMERGEFAIL" });
+      expect(await git.revParse({ ref: "HEAD" })).toBe(local.oid);
+      expect(await git.revParse({ ref: "refs/remotes/origin/main" })).toBe(incoming);
+      expect(await workspace.fs.readFile("/conflict.txt", "utf8")).toBe("local\n");
+      expect(await git.status()).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("rolls a compatibility merge conflict back without pending state", async () => {
     const { workspace } = makeWorkspace();
     const git = workspace.git;
@@ -218,7 +250,6 @@ describe("createSqliteGitClient", () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});
     for (const call of [
-      () => workspace.git.pull({}),
       () => workspace.git.stashPush({}),
       () => workspace.git.cli({ argv: ["status"] }),
     ]) {

@@ -2308,6 +2308,48 @@ export class RepoStore {
     return values.length === 0 ? undefined : values[values.length - 1];
   }
 
+  /** Read one config value only after SQLite proves its type and byte bound. */
+  configGetBounded(path: string, maxBytes: number): string | undefined {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
+    }
+    const info = this.#db.one<{ value_type: unknown; value_bytes: unknown }>(
+      `SELECT typeof(value) AS value_type,
+              length(CAST(value AS BLOB)) AS value_bytes
+         FROM git_config
+        WHERE repo_id = ? AND path = ?
+        ORDER BY seq DESC
+        LIMIT 1`,
+      this.#repoId,
+      path,
+    );
+    if (info === undefined) return undefined;
+    if (
+      info.value_type !== "text" ||
+      typeof info.value_bytes !== "number" ||
+      !Number.isSafeInteger(info.value_bytes) ||
+      info.value_bytes < 0
+    ) {
+      throw new CorruptError(`config ${path} has invalid text metadata`);
+    }
+    if (info.value_bytes > maxBytes) {
+      throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
+    }
+    const value = this.#db.scalar<unknown>(
+      `SELECT value
+         FROM git_config
+        WHERE repo_id = ? AND path = ?
+        ORDER BY seq DESC
+        LIMIT 1`,
+      this.#repoId,
+      path,
+    );
+    if (typeof value !== "string") {
+      throw new CorruptError(`config ${path} has a non-text value`);
+    }
+    return value;
+  }
+
   configSet(path: string, value: string): void {
     this.#db.transactionSync(() => {
       this.#db.run("DELETE FROM git_config WHERE repo_id = ? AND path = ?", this.#repoId, path);

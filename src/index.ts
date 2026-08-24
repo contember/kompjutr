@@ -64,6 +64,7 @@ export {
   type GitFactory,
   type GitMergeContinueOptions,
   type GitMergeOptions,
+  type GitPullOptions,
 } from "./git/client.js";
 export {
   type Async,

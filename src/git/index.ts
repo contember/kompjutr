@@ -65,6 +65,7 @@ export {
   type GitInitOptions,
   type GitMergeContinueOptions,
   type GitMergeOptions,
+  type GitPullOptions,
   type GitPushOptions,
   type GitRemoteAddOptions,
   type GitRemoteRemoveOptions,
