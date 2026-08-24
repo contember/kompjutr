@@ -27,6 +27,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 1,
       blobReadCalls: 1,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -65,6 +66,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 2,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -113,6 +115,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 2,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -150,6 +153,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 2,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -189,6 +193,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 1,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -215,6 +220,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 1,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -249,6 +255,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 2,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 
@@ -273,6 +280,7 @@ describe("merge file/directory projection", () => {
       ],
       sourceRows: 1,
       blobReadCalls: 0,
+      retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
 

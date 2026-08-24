@@ -305,28 +305,29 @@ function boundedUtf8Length(value: string, limit: number, label: string): number 
 
 function touchedSpecs(entries: readonly ProjectedMergeEntry[]): TouchedSpec[] {
   const byPath = new Map<string, TouchedSpec>();
+  const retain = (spec: TouchedSpec): void => {
+    if (byPath.has(spec.path)) return;
+    if (byPath.size >= MAX_MERGE_TOUCHED_PATHS) {
+      throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
+    }
+    byPath.set(spec.path, spec);
+  };
   const retainAncestor = (path: string): void => {
     let slash = path.lastIndexOf("/");
     while (slash > 0) {
       const ancestor = path.slice(0, slash);
-      if (!byPath.has(ancestor)) {
-        byPath.set(ancestor, {
-          path: ancestor,
-          logicalPath: ancestor,
-          purpose: "primary",
-        });
-      }
+      retain({ path: ancestor, logicalPath: ancestor, purpose: "primary" });
       slash = ancestor.lastIndexOf("/");
     }
   };
   for (const entry of entries) {
-    byPath.set(entry.path, {
+    retain({
       path: entry.path,
       logicalPath: entry.logicalPath,
       purpose: entry.purpose,
     });
     if (entry.purpose !== "primary" && !byPath.has(entry.logicalPath)) {
-      byPath.set(entry.logicalPath, {
+      retain({
         path: entry.logicalPath,
         logicalPath: entry.logicalPath,
         purpose: "primary",
@@ -336,9 +337,6 @@ function touchedSpecs(entries: readonly ProjectedMergeEntry[]): TouchedSpec[] {
     retainAncestor(entry.logicalPath);
   }
   const specs = [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
-  if (specs.length > MAX_MERGE_TOUCHED_PATHS) {
-    throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
-  }
   return specs;
 }
 

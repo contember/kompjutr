@@ -69,10 +69,10 @@ function textAt(workspace: TestRepository, path: string): string | null {
 }
 
 describe("projected merge apply", () => {
-  it("keeps the static whole-operation SQL ceiling below the platform limit", () => {
+  it("reserves a bounded apply share of the whole-operation SQL limit", () => {
     expect(MAX_MERGE_APPLY_SQL_STATEMENTS).toBe(831);
     expect(MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS).toBe(168);
-    expect(7 + 134 + MAX_MERGE_APPLY_SQL_STATEMENTS).toBeLessThan(1_000);
+    expect(MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS + MAX_MERGE_APPLY_SQL_STATEMENTS).toBe(999);
     expect(MAX_MERGE_APPLY_SQL_STATEMENTS).toBeLessThan(1_000);
   });
 
@@ -154,6 +154,32 @@ describe("projected merge apply", () => {
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     expect(textAt(workspace, "guarded.txt")).toBe("old\n");
     expect(workspace.repo.store.indexGet("guarded.txt")).toBeNull();
+    expect(workspace.repo.store.readMergeState()).toBeNull();
+  });
+
+  it("bounds structural ancestors while they are retained", () => {
+    const workspace = makeRepo();
+    const path = `${"a/".repeat(1_000)}z`;
+    const entries: readonly ProjectedMergeEntry[] = [
+      {
+        path,
+        logicalPath: path,
+        purpose: "primary",
+        stageZero: null,
+        stages: null,
+        worktree: null,
+        content: null,
+      },
+    ];
+
+    expect(() =>
+      applyProjectedMerge(
+        workspace.repo,
+        workspace.worktree,
+        entries,
+        metadata(workspace.repo, "no-commit"),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(workspace.repo.store.readMergeState()).toBeNull();
   });
 

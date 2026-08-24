@@ -82,6 +82,8 @@ export interface IntegrationPlan {
   entries: readonly IntegrationEntry[];
   sourceRows: number;
   blobReadCalls: number;
+  /** Conservative bytes the caller must reserve while retaining this plan. */
+  retainedBytes: number;
   memoryHighWaterBytes: number;
 }
 
@@ -995,6 +997,7 @@ function planIntegrationInternal(
       entries,
       sourceRows: structure.sourceRows,
       blobReadCalls,
+      retainedBytes: finalPeak,
       memoryHighWaterBytes: reservation.highWaterBytes,
     };
   } finally {

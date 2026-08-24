@@ -55,6 +55,17 @@ export interface WorktreePath {
   stat: WorktreeStat;
 }
 
+/** Number of bounded filesystem range reads used to hash large regular files. */
+export function worktreeHashRangeReads(paths: readonly WorktreePath[]): number {
+  let reads = 0;
+  for (const path of paths) {
+    if (path.stat.type !== "file" || path.stat.size <= STREAM_ABOVE) continue;
+    reads += Math.ceil(path.stat.size / READ_CHUNK);
+    if (!Number.isSafeInteger(reads)) return Number.MAX_SAFE_INTEGER;
+  }
+  return reads;
+}
+
 /**
  * Every file and symlink under the working tree, as sorted repo-relative
  * paths. Directories are not returned — git tracks files.

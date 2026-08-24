@@ -18,6 +18,7 @@ import {
   indexMatchesStat,
   type WorktreePath,
   walkWorktreeEntriesStream,
+  worktreeHashRangeReads,
 } from "./worktree-io.js";
 
 const HEADS = "refs/heads/";
@@ -236,6 +237,19 @@ export interface CheckoutBlockers {
   untracked: string[];
 }
 
+export interface CheckoutBlockerLimits {
+  maxRows: number;
+  maxHashBytes: number;
+  rows: number;
+  hashBytes: number;
+  maxHashRangeReads: number;
+  hashRangeReads: number;
+  maxHashCandidates: number;
+  hashCandidates: number;
+  maxHashBatches: number;
+  hashBatches: number;
+}
+
 /**
  * What stands between the working tree and `tree`. git refuses a checkout
  * for two separate reasons and says so in two separate messages, so they
@@ -251,6 +265,7 @@ export function checkoutBlockers(
   tree: string | null,
   paths: string[] | undefined,
   prune: boolean,
+  limits?: CheckoutBlockerLimits,
 ): CheckoutBlockers {
   const tracked: string[] = [];
   const untracked: string[] = [];
@@ -261,6 +276,12 @@ export function checkoutBlockers(
   const budget = new CheckoutGuardBudget();
 
   for (const row of checkoutGuardRows(repo, worktree, tree)) {
+    if (limits !== undefined) {
+      if (limits.rows >= limits.maxRows) {
+        throw new GitError("E2BIG", `checkout guard exceeds ${limits.maxRows} source rows`);
+      }
+      limits.rows++;
+    }
     expireRanges(pendingTargets, row.path, budget);
     expireRanges(pendingTrackedPaths, row.path, budget);
     expireRanges(untrackedAncestors, row.path, budget);
@@ -335,10 +356,10 @@ export function checkoutBlockers(
     budget.add(bytes);
     dirtyCandidates.push({ entry: existing, worktree: row.worktree, bytes });
     if (dirtyCandidates.length >= CHECKOUT_GUARD_BATCH) {
-      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget);
+      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget, limits);
     }
   }
-  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget);
+  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget, limits);
   tracked.sort(comparePaths);
   untracked.sort(comparePaths);
   return { tracked, untracked };
@@ -450,6 +471,7 @@ function flushGuardCandidates(
   candidates: GuardCandidate[],
   tracked: string[],
   budget: CheckoutGuardBudget,
+  limits: CheckoutBlockerLimits | undefined,
 ): void {
   if (candidates.length === 0) return;
   const identities = repo.store.lookupBlobIds(
@@ -468,6 +490,39 @@ function flushGuardCandidates(
       continue;
     }
     needsHash.push(candidate);
+  }
+  if (limits !== undefined) {
+    if (needsHash.length > 0) {
+      if (limits.hashBatches >= limits.maxHashBatches) {
+        throw new GitError(
+          "E2BIG",
+          `checkout guard hashing exceeds ${limits.maxHashBatches} batches`,
+        );
+      }
+      if (needsHash.length > limits.maxHashCandidates - limits.hashCandidates) {
+        throw new GitError(
+          "E2BIG",
+          `checkout guard hashing exceeds ${limits.maxHashCandidates} paths`,
+        );
+      }
+      limits.hashBatches++;
+      limits.hashCandidates += needsHash.length;
+    }
+    const rangeReads = worktreeHashRangeReads(needsHash.map((candidate) => candidate.worktree));
+    if (rangeReads > limits.maxHashRangeReads - limits.hashRangeReads) {
+      throw new GitError(
+        "E2BIG",
+        `checkout guard hashing exceeds ${limits.maxHashRangeReads} range reads`,
+      );
+    }
+    limits.hashRangeReads += rangeReads;
+    for (const candidate of needsHash) {
+      const size = candidate.worktree.stat.size;
+      if (size > limits.maxHashBytes - limits.hashBytes) {
+        throw new GitError("E2BIG", `checkout guard hashing exceeds ${limits.maxHashBytes} bytes`);
+      }
+      limits.hashBytes += size;
+    }
   }
   const hashed = hashWorktreePaths(
     repo,
