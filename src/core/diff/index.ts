@@ -16,6 +16,18 @@ import { type UnifiedOptions, unifiedHunks } from "./unified.js";
 export { isBinary, splitLines } from "./lines.js";
 export { type ChangeGroup, diffLines } from "./myers.js";
 export { type UnifiedOptions, unifiedHunks } from "./unified.js";
+export {
+  DEFAULT_TEXT_MERGE_LIMITS,
+  estimateTextMergeMemory,
+  mergeText,
+  type TextMergeLabels,
+  type TextMergeLimits,
+  type TextMergeMemoryEstimate,
+  type TextMergeOptions,
+  type TextMergeRefinement,
+  type TextMergeResult,
+  type TextMergeStyle,
+} from "./xmerge.js";
 
 export interface TextDiff {
   changes: ChangeGroup[];

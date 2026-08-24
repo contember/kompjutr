@@ -19,6 +19,8 @@
 // whitespace-insensitive comparison flags. git's defaults are Myers plus
 // the indent heuristic, which is what we implement.
 
+import { GitError } from "../errors.js";
+
 /** One contiguous run of changed lines, as `xdl_build_script` emits it. */
 export interface ChangeGroup {
   oldStart: number;
@@ -85,8 +87,16 @@ class Marks {
 }
 
 /** One side of the comparison, mirroring xdiff's `xdfile_t`. */
+export interface ByteRecord {
+  bytes: Uint8Array;
+  start: number;
+  end: number;
+}
+
+type LineRecord = string | ByteRecord;
+
 interface Side {
-  lines: string[];
+  lines: LineRecord[];
   /** Equality class of each line: two lines match iff their classes do. */
   classes: number[];
   changed: Marks;
@@ -131,6 +141,8 @@ interface Split {
 export interface DiffLinesOptions {
   /** Turn off git's indent heuristic. On by default, as in git. */
   indentHeuristic?: boolean;
+  /** Reject the next change group before retaining it. */
+  maxChanges?: number;
 }
 
 export function diffLines(
@@ -139,6 +151,28 @@ export function diffLines(
   options: DiffLinesOptions = {},
 ): ChangeGroup[] {
   const { oldClasses, newClasses, inOld, inNew } = classify(oldLines, newLines);
+  return diffClassified(oldLines, newLines, oldClasses, newClasses, inOld, inNew, options);
+}
+
+/** Byte-record variant used by xmerge without decoding arbitrary blob bytes. */
+export function diffByteRecords(
+  oldLines: ByteRecord[],
+  newLines: ByteRecord[],
+  options: DiffLinesOptions = {},
+): ChangeGroup[] {
+  const { oldClasses, newClasses, inOld, inNew } = classifyBytes(oldLines, newLines);
+  return diffClassified(oldLines, newLines, oldClasses, newClasses, inOld, inNew, options);
+}
+
+function diffClassified(
+  oldLines: LineRecord[],
+  newLines: LineRecord[],
+  oldClasses: number[],
+  newClasses: number[],
+  inOld: number[],
+  inNew: number[],
+  options: DiffLinesOptions,
+): ChangeGroup[] {
   const left: Side = {
     lines: oldLines,
     classes: oldClasses,
@@ -183,7 +217,64 @@ export function diffLines(
   const indentHeuristic = options.indentHeuristic !== false;
   compact(left, right, indentHeuristic);
   compact(right, left, indentHeuristic);
-  return buildScript(left, right);
+  return buildScript(left, right, options.maxChanges);
+}
+
+function classifyBytes(
+  oldLines: ByteRecord[],
+  newLines: ByteRecord[],
+): { oldClasses: number[]; newClasses: number[]; inOld: number[]; inNew: number[] } {
+  const buckets = new Map<string, number[]>();
+  const representatives: ByteRecord[] = [];
+  const inOld: number[] = [];
+  const inNew: number[] = [];
+  const idFor = (line: ByteRecord): number => {
+    const key = byteRecordHash(line);
+    const bucket = buckets.get(key);
+    if (bucket !== undefined) {
+      for (const id of bucket) {
+        if (byteRecordsEqual(representatives[id]!, line)) return id;
+      }
+    }
+    const id = representatives.length;
+    representatives.push(line);
+    inOld.push(0);
+    inNew.push(0);
+    if (bucket === undefined) buckets.set(key, [id]);
+    else bucket.push(id);
+    return id;
+  };
+  const oldClasses = oldLines.map((line) => {
+    const id = idFor(line);
+    inOld[id] = (inOld[id] ?? 0) + 1;
+    return id;
+  });
+  const newClasses = newLines.map((line) => {
+    const id = idFor(line);
+    inNew[id] = (inNew[id] ?? 0) + 1;
+    return id;
+  });
+  return { oldClasses, newClasses, inOld, inNew };
+}
+
+function byteRecordHash(record: ByteRecord): string {
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  for (let index = record.start; index < record.end; index++) {
+    const byte = record.bytes[index]!;
+    left = Math.imul(left ^ byte, 0x01000193) >>> 0;
+    right = Math.imul(right ^ byte, 0x85ebca6b) >>> 0;
+  }
+  return `${record.end - record.start}:${left}:${right}`;
+}
+
+export function byteRecordsEqual(left: ByteRecord, right: ByteRecord): boolean {
+  const length = left.end - left.start;
+  if (right.end - right.start !== length) return false;
+  for (let index = 0; index < length; index++) {
+    if (left.bytes[left.start + index] !== right.bytes[right.start + index]) return false;
+  }
+  return true;
 }
 
 /** Give every distinct line an id, and count its occurrences on each side. */
@@ -683,26 +774,27 @@ interface Measurement {
 }
 
 /** Indentation in columns, tabs counting to the next multiple of 8. */
-function indentOf(line: string): number {
+function indentOf(line: LineRecord): number {
   let indent = 0;
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i]!;
-    if (char === " ") indent += 1;
-    else if (char === "\t") indent += 8 - (indent % 8);
+  const length = typeof line === "string" ? line.length : line.end - line.start;
+  for (let i = 0; i < length; i++) {
+    const char = typeof line === "string" ? line.charCodeAt(i) : line.bytes[line.start + i]!;
+    if (char === 0x20) indent += 1;
+    else if (char === 0x09) indent += 8 - (indent % 8);
     else if (!isSpace(char)) return indent;
     if (indent >= MAX_INDENT) return MAX_INDENT;
   }
   return -1;
 }
 
-function isSpace(char: string): boolean {
+function isSpace(char: number): boolean {
   return (
-    char === " " ||
-    char === "\t" ||
-    char === "\n" ||
-    char === "\v" ||
-    char === "\f" ||
-    char === "\r"
+    char === 0x20 ||
+    char === 0x09 ||
+    char === 0x0a ||
+    char === 0x0b ||
+    char === 0x0c ||
+    char === 0x0d
   );
 }
 
@@ -771,12 +863,15 @@ function compareScores(left: Score, right: Score): number {
 }
 
 /** `xdl_build_script`: walk backwards collecting the marked runs. */
-function buildScript(left: Side, right: Side): ChangeGroup[] {
+function buildScript(left: Side, right: Side, maxChanges: number | undefined): ChangeGroup[] {
   const groups: ChangeGroup[] = [];
   let i1 = left.lines.length;
   let i2 = right.lines.length;
   while (i1 >= 0 || i2 >= 0) {
     if (left.changed.get(i1 - 1) || right.changed.get(i2 - 1)) {
+      if (maxChanges !== undefined && groups.length >= maxChanges) {
+        throw new GitError("E2BIG", `xdiff change list exceeds ${maxChanges}`);
+      }
       const end1 = i1;
       const end2 = i2;
       while (left.changed.get(i1 - 1)) i1--;

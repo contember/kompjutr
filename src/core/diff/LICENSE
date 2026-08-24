@@ -1,12 +1,14 @@
 This directory is NOT covered by the MIT license in the repository root.
 
-The line-differ here is a port of the xdiff library as it appears in git
-(xdiff/xprepare.c, xdiff/xdiffi.c, xdiff/xemit.c), including its record
-cleanup heuristic and the indent-heuristic weights. xdiff derives from
+The line-differ and three-way text merge here are ports of the xdiff library
+as it appears in git (xdiff/xprepare.c, xdiff/xdiffi.c, xdiff/xemit.c, and
+xdiff/xmerge.c), including its record cleanup heuristic, indent-heuristic
+weights, and conflict refinement. The xmerge port is pinned to Git commit
+94f057755b7941b321fd11fec1b2e3ca5313a4e0 (v2.54.0). xdiff derives from
 LibXDiff:
 
     LibXDiff by Davide Libenzi ( File Differential Library )
-    Copyright (C) 2003  Davide Libenzi <davidel@xmailserver.org>
+    Copyright (C) 2003-2006 Davide Libenzi and Johannes E. Schindelin
 
 and carries, in git as in LibXDiff:
 
