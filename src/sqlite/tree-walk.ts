@@ -20,6 +20,11 @@ export interface WalkTreeDiffEntry {
   afterOid: string | null;
 }
 
+export interface WalkTreeDiffObject {
+  oid: string;
+  type: "tree" | "blob";
+}
+
 export const WALK_TREE_SQL = `WITH RECURSIVE
   params(repo_id, root_oid, path_cap, state_cap, queue_cap, queue_fixed)
     AS (VALUES (?, ?, ?, ?, ?, ?)),
@@ -295,8 +300,9 @@ SELECT path, mode, oid,
     OR (mode IN ('40000', '040000') AND descend != 1)`;
 
 const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
-  params(repo_id, before_root, after_root, path_cap, state_cap, queue_cap, queue_fixed)
-    AS (VALUES (?, ?, ?, ?, ?, ?, ?)),
+  params(repo_id, before_root, after_root, path_cap, state_cap, queue_cap, queue_fixed,
+         emit_objects)
+    AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
   source_valid(repo_id, tree_oid, storage, source_id, object_size,
                entry_count, base_cost) AS NOT MATERIALIZED (
     SELECT x.repo_id, x.tree_oid, x.storage, x.source_id, s.object_size,
@@ -640,11 +646,16 @@ SELECT path,
        CASE WHEN before_mode IN ('40000', '040000') THEN NULL ELSE before_oid END AS before_oid,
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_mode END AS after_mode,
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_oid END AS after_oid,
+       after_mode AS object_mode, after_oid AS object_oid,
        error, error_code
   FROM walk
+  CROSS JOIN params p
  WHERE error IS NOT NULL
     OR ((before_mode NOT IN ('40000', '040000') OR after_mode NOT IN ('40000', '040000'))
-        AND NOT (before_mode IS after_mode AND before_oid IS after_oid))`;
+        AND NOT (before_mode IS after_mode AND before_oid IS after_oid))
+    OR (p.emit_objects != 0 AND after_mode IN ('40000', '040000')
+        AND NOT (COALESCE(before_mode IN ('40000', '040000'), 0)
+                 AND before_oid = after_oid))`;
 
 /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
 export function* iterateTree(
@@ -676,6 +687,41 @@ export function* iterateTree(
   }
 }
 
+/** Stream the tree and blob objects introduced by one tree transition. */
+export function* iterateTreeDiffObjects(
+  db: SqlDatabase,
+  repoId: number,
+  beforeTreeOid: string | null,
+  afterTreeOid: string,
+): Generator<WalkTreeDiffObject> {
+  if (beforeTreeOid === afterTreeOid) return;
+  for (const row of db.iterate(
+    WALK_TREE_DIFF_SQL,
+    repoId,
+    beforeTreeOid,
+    afterTreeOid,
+    TREE_WALK_PATH_BYTES,
+    TREE_WALK_STATE_BYTES,
+    TREE_WALK_QUEUE_BYTES,
+    TREE_QUEUE_ROW_FIXED_BYTES,
+    1,
+  )) {
+    const error = row.error;
+    if (typeof error === "string") {
+      if (row.error_code === "E2BIG") throw new GitError("E2BIG", error);
+      throw new CorruptError(error);
+    }
+    const mode = row.object_mode;
+    const oid = row.object_oid;
+    if (mode === null && oid === null) continue;
+    if (typeof mode !== "string" || typeof oid !== "string") {
+      throw new CorruptError("tree diff object traversal yielded an invalid row");
+    }
+    if (mode === "160000") continue;
+    yield { oid, type: mode === "40000" || mode === "040000" ? "tree" : "blob" };
+  }
+}
+
 /** Stream changed leaves between two trees while pruning equal subtrees. */
 export function* iterateTreeDiff(
   db: SqlDatabase,
@@ -693,6 +739,7 @@ export function* iterateTreeDiff(
     TREE_WALK_STATE_BYTES,
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
+    0,
   )) {
     const error = row.error;
     if (typeof error === "string") {

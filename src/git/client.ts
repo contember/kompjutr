@@ -25,7 +25,13 @@ import {
   diffSummary as diffSummaryOp,
 } from "../core/ops/diff.js";
 import { type InitOptions, initRepository } from "../core/ops/init.js";
-import type { CommitResult, DiffSummaryEntry, RemoteView, StatusEntry } from "../core/ops/kinds.js";
+import type {
+  CommitResult,
+  DiffSummaryEntry,
+  PushResult,
+  RemoteView,
+  StatusEntry,
+} from "../core/ops/kinds.js";
 import {
   type CloneOptions,
   clone as cloneOp,
@@ -42,6 +48,7 @@ import {
   type UpdateRefOptions,
   updateRef as updateRefOp,
 } from "../core/ops/plumbing.js";
+import { type PushOptions, push as pushOp } from "../core/ops/push.js";
 import {
   type CommitView,
   catFile as catFileRead,
@@ -108,6 +115,7 @@ export type GitRemoteRemoveOptions = RemoteRemoveOptions & GitDirOptions;
 export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
 export type GitCatFileOptions = CatFileOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
+export type GitPushOptions = PushOptions & GitDirOptions;
 
 export interface GitCatFileResult {
   oid: string;
@@ -148,7 +156,7 @@ export interface Git {
   hashObject(input: GitHashObjectOptions): Promise<string>;
   catFile(input: GitCatFileOptions): Promise<GitCatFileResult>;
   updateRef(input: GitUpdateRefOptions): Promise<void>;
-  push(input?: GitDirOptions): Promise<never>;
+  push(input?: GitPushOptions): Promise<PushResult>;
   pull(input?: GitDirOptions): Promise<never>;
   merge(input: GitDirOptions & { theirs: string }): Promise<never>;
   stashPush(input?: GitDirOptions): Promise<never>;
@@ -316,8 +324,8 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async updateRef(input) {
       updateRefOp(at(input.dir), input);
     },
-    async push() {
-      throw new UnsupportedOperationError("push");
+    async push(input = {}) {
+      return pushOp(context, at(input.dir), input);
     },
     async pull() {
       throw new UnsupportedOperationError("pull");

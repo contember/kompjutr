@@ -1032,18 +1032,17 @@ amortise.
 
 ### 5.1 What replaces `GitClient`
 
-`GitClient` (`tmp/computer-src/packages/computer/src/git/index.ts:232-317`) is
-40 methods. Kompjutr implements 30 of them and throws
-`UnsupportedOperationError` on 7 (`src/computer/client.ts:216-236`).
+The native `Git` interface owns its method and option types. The compatibility
+adapter implements the same supported methods without loading the legacy Git
+engine.
 
 **Decision: keep the shape, own the type.** `export interface Git` in
 `kompjutr/git`, structurally the subset we implement, with:
 
 - Every method that exists today, same names, same option bags
   (`src/computer/client.ts:93-237`).
-- `push` / `pull` / `merge` / `stashPush` / `stashList` / `stashPop` **removed
-  from the type**, not stubbed. A method that always throws is a worse contract
-  than a method that is not there — the caller finds out at compile time.
+- `push` supports one branch over Smart HTTP. `pull`, `merge`, and stash methods
+  remain explicit `EUNSUPPORTED` compatibility stubs.
 - `cli(input)` kept: it is the only method the shell reach-back needs
   (`stub.ts:577-579`), and dropping it would close §6 before it opens.
 - `symbolicRef(name, target?)` accepting any ref name. Computer's only accepts
@@ -1797,7 +1796,7 @@ ours already (`src/core/ops/network.ts:219`).
 | **`@platformatic/vfs` / FUSE contract** | `provider.ts:1-8`, `workspace.ts:500-513` | the `VirtualProvider` shape as a *promise*. We keep the method shapes; we do not promise FUSE-mountability. `internalModuleStat`, `copyFile`, `appendFile` are already `ENOSYS` in DOFS (`provider.ts:496-533`). |
 | **Assets, artifacts, AI tools, the JavaScript module backend** | Computer's `src/assets/`, `src/artifacts/`, `src/tools/`, `src/backends/worker-javascript/` (1,771 lines) | those features. Never ours. |
 | **Exec / shell** | §6 | running commands. Deferred, with the seam designed so it is additive. |
-| **`push` / `pull` / `merge` / `stash`** | `src/computer/client.ts:216-236` — already unimplemented | nothing that works today. Removed from the type rather than left throwing. |
+| **`pull` / `merge` / `stash`** | not implemented by the SQLite runtime | callers must compose fetch with local integration once those operations land. |
 | **Hardlinks**, if D2 goes that way | §3.8 | `ln` without `-s`. Computer's own shell adapter already refuses them (`backends/worker-shell/adapter.ts:242`). |
 
 ---

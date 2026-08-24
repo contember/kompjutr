@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
 import { FLUSH, pkt, pktLines } from "../src/core/protocol/pktline.js";
+import { receivePack } from "../src/core/protocol/receive-pack.js";
 import {
   discover,
   MAX_PROTOCOL_RETAINED_BYTES,
@@ -44,6 +45,19 @@ async function collect(pack: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of pack) chunks.push(chunk);
   return concat(chunks);
+}
+
+async function collectBody(
+  body: Uint8Array | AsyncIterable<Uint8Array> | undefined,
+): Promise<Uint8Array> {
+  if (body === undefined) return new Uint8Array(0);
+  return body instanceof Uint8Array ? body : collect(body);
+}
+
+function bufferedBody(body: Uint8Array | AsyncIterable<Uint8Array> | undefined): Uint8Array {
+  if (body === undefined) return new Uint8Array(0);
+  if (!(body instanceof Uint8Array)) throw new Error("expected a buffered request body");
+  return body;
 }
 
 const OID = "1".repeat(40);
@@ -114,6 +128,80 @@ describe("pkt-lines", () => {
   });
 });
 
+describe("receive-pack", () => {
+  const ref = "refs/heads/main";
+  const oldOid = "2".repeat(40);
+  const newOid = "3".repeat(40);
+  const ok = concat([pkt("unpack ok\n"), pkt(`ok ${ref}\n`), FLUSH]);
+
+  it("replays an identical streamed command and pack after a 401", async () => {
+    const requests: Uint8Array[] = [];
+    const http: GitHttpClient = async (request) => {
+      requests.push(await collectBody(request.body));
+      if (requests.length === 1) {
+        return {
+          status: 401,
+          statusText: "Unauthorized",
+          headers: { "content-type": "text/plain" },
+          body: once(utf8.encode("auth required")),
+        };
+      }
+      return respond(ok, "application/x-git-receive-pack-result");
+    };
+    let opens = 0;
+    const result = await receivePack(
+      {
+        url: "http://host/repo",
+        oldOid,
+        newOid,
+        ref,
+        advertised: new Set(["report-status"]),
+        pack: () => {
+          opens++;
+          return once(utf8.encode("PACKbody"));
+        },
+      },
+      { http, onAuth: () => ({ username: "token" }) },
+    );
+
+    expect(result).toEqual({ unpack: "ok", refs: new Map([[ref, { ok: true }]]) });
+    expect(opens).toBe(2);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toEqual(requests[0]);
+    expect(new TextDecoder().decode(requests[0])).toContain(` ${ref}\0report-status\n`);
+  });
+
+  it("returns a bounded per-ref rejection report", async () => {
+    const rejected = concat([pkt("unpack ok\n"), pkt(`ng ${ref} non-fast-forward\n`), FLUSH]);
+    await expect(
+      receivePack(
+        { url: "http://host/repo", oldOid, newOid, ref, advertised: new Set(["report-status"]) },
+        { http: canned(() => respond(rejected, "application/x-git-receive-pack-result")) },
+      ),
+    ).resolves.toEqual({
+      unpack: "ok",
+      refs: new Map([[ref, { ok: false, error: "non-fast-forward" }]]),
+    });
+  });
+
+  it("rejects missing report-status support and malformed status", async () => {
+    await expect(
+      receivePack(
+        { url: "http://host/repo", oldOid, newOid, ref, advertised: new Set() },
+        { http: canned(() => respond(ok, "application/x-git-receive-pack-result")) },
+      ),
+    ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+
+    const duplicate = concat([pkt("unpack ok\n"), pkt(`ok ${ref}\n`), pkt(`ok ${ref}\n`), FLUSH]);
+    await expect(
+      receivePack(
+        { url: "http://host/repo", oldOid, newOid, ref, advertised: new Set(["report-status"]) },
+        { http: canned(() => respond(duplicate, "application/x-git-receive-pack-result")) },
+      ),
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
+  });
+});
+
 describe("remote urls", () => {
   it("keeps http(s) and drops trailing slashes", () => {
     expect(normalizeRemoteUrl("https://example.com/x.git/")).toBe("https://example.com/x.git");
@@ -155,6 +243,20 @@ describe("discovery", () => {
     expect(advertisement.headRef).toBe("refs/heads/main");
     expect(advertisement.capabilities.has("side-band-64k")).toBe(true);
     expect(advertisement.capabilities.has("ofs-delta")).toBe(true);
+  });
+
+  it("retries one failed idempotent discovery request", async () => {
+    const body = advertisementBody([`${OID} refs/heads/main`]);
+    let calls = 0;
+    const advertisement = await discover("http://host/repo", "git-upload-pack", {
+      http: () => {
+        calls++;
+        if (calls === 1) return Promise.reject(new Error("stale keep-alive connection"));
+        return Promise.resolve(respond(body, "application/x-git-upload-pack-advertisement"));
+      },
+    });
+    expect(calls).toBe(2);
+    expect(advertisement.refs).toEqual([{ name: "refs/heads/main", oid: OID }]);
   });
 
   it("treats an empty repository as zero refs", async () => {
@@ -565,7 +667,7 @@ describe("upload-pack", () => {
       },
       {
         http: (request) => {
-          sent = new TextDecoder().decode(request.body ?? new Uint8Array(0));
+          sent = new TextDecoder().decode(bufferedBody(request.body));
           return Promise.resolve(respond(body, "application/x-git-upload-pack-result"));
         },
       },
@@ -588,7 +690,7 @@ describe("upload-pack", () => {
     let sentBytes = 0;
     const http: GitHttpClient = (request) => {
       calls++;
-      sentBytes = request.body?.length ?? 0;
+      sentBytes = bufferedBody(request.body).length;
       return Promise.resolve(respond(body, "application/x-git-upload-pack-result"));
     };
     const request = {

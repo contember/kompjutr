@@ -46,10 +46,11 @@ fs.writeFileSync("/src/index.ts", "export const value = 1;\n");
 
 ## Git
 
-The native client supports repository initialization, clone and fetch, status,
-staging, commit, log, diff, checkout, branches, tags, refs, config, remotes, and
-the plumbing operations exposed by `Git`. Unsupported commands fail with
-`EUNSUPPORTED` instead of falling back to another implementation.
+The native client supports repository initialization, clone, fetch, single-branch
+Smart HTTP push, status, staging, commit, log, diff, checkout, branches, tags,
+refs, config, remotes, and the plumbing operations exposed by `Git`. Unsupported
+commands fail with `EUNSUPPORTED` instead of falling back to another
+implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });
@@ -57,6 +58,11 @@ workspace.fs.writeFileSync("/README.md", "# project\n");
 await workspace.git.add({ paths: ["README.md"] });
 const commit = await workspace.git.commit({ message: "Initial commit" });
 ```
+
+Push creates, fast-forwards, force-updates, or deletes one `refs/heads/*` ref.
+It streams a replayable full-object pack and updates the local remote-tracking
+ref only after `receive-pack` confirms success. Multi-ref pushes, tags, push
+options, SSH, and outbound Git deltas are not implemented yet.
 
 ## Shell
 

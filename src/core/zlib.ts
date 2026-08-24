@@ -55,6 +55,33 @@ export function deflate(data: Uint8Array): Uint8Array {
   return asBytes(zlib.deflateSync(data));
 }
 
+/** Incremental zlib deflate with bounded output chunks. */
+export class DeflateStream {
+  readonly #deflate: pako.Deflate;
+  #ended = false;
+
+  constructor(onData: (chunk: Uint8Array) => void) {
+    this.#deflate = new pako.Deflate({ chunkSize: INFLATE_CHUNK });
+    this.#deflate.onData = (chunk) => {
+      if (!(chunk instanceof Uint8Array)) throw new Error("deflate produced a non-binary chunk");
+      onData(chunk);
+    };
+  }
+
+  push(chunk: Uint8Array): void {
+    if (this.#ended) throw new Error("deflate stream is already finished");
+    this.#deflate.push(chunk, false);
+    if (this.#deflate.err) throw new Error(`deflate failed: ${this.#deflate.msg}`);
+  }
+
+  finish(): void {
+    if (this.#ended) throw new Error("deflate stream is already finished");
+    this.#ended = true;
+    this.#deflate.push(new Uint8Array(0), true);
+    if (this.#deflate.err) throw new Error(`deflate failed: ${this.#deflate.msg}`);
+  }
+}
+
 /** Inflate a buffer that holds exactly one zlib stream. */
 export function inflate(data: Uint8Array): Uint8Array {
   return asBytes(zlib.inflateSync(data));

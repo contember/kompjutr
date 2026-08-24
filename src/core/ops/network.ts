@@ -19,7 +19,7 @@ import {
   type RemoteRef,
   uploadPack,
 } from "../protocol/remote.js";
-import type { AuthCallback } from "../protocol/transport.js";
+import { type AuthCallback, RemoteAuthSession } from "../protocol/transport.js";
 import { Repository } from "../repository.js";
 import { fileModeFor } from "../worktree.js";
 import { checkoutTree } from "./checkout.js";
@@ -159,6 +159,7 @@ export async function fetchInto(
     ...(context.http === undefined ? {} : { http: context.http }),
     ...(options.headers === undefined ? {} : { headers: options.headers }),
     ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
+    authSession: new RemoteAuthSession(),
   };
   const advertisement = await discover(url, "git-upload-pack", auth);
   const requestedRef = options.remoteRef ?? options.ref;

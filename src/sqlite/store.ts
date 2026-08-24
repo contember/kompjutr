@@ -37,12 +37,14 @@ import { indexTreeSource, indexTreeSources, initializeGitSchema } from "./schema
 import {
   iterateTree,
   iterateTreeDiff,
+  iterateTreeDiffObjects,
   TREE_WALK_PATH_BYTES,
   type WalkTreeDiffEntry,
+  type WalkTreeDiffObject,
   type WalkTreeEntry,
 } from "./tree-walk.js";
 
-export type { WalkTreeDiffEntry, WalkTreeEntry } from "./tree-walk.js";
+export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./tree-walk.js";
 export { WALK_TREE_SQL } from "./tree-walk.js";
 
 /** Bytes per `git_object_chunks` row. */
@@ -167,6 +169,24 @@ export interface BlobReadBatch {
   remaining: string[];
   /** Sum of the returned blob sizes. */
   bytes: number;
+}
+
+export interface ObjectReadBatch {
+  /** Complete objects, keyed by oid in first-occurrence input order. */
+  objects: Map<string, RawObject>;
+  /** Deduplicated oids deferred to the next call. */
+  remaining: string[];
+  /** Sum of the returned inflated object sizes. */
+  bytes: number;
+}
+
+export interface ObjectReadInfo {
+  oid: string;
+  type: ObjectType;
+  size: number;
+  source: "loose" | "pack";
+  /** Stored loose rows; zero for packed objects. */
+  chunkRows: number;
 }
 
 /** Stable, collision-free key for an opaque binary content id. */
@@ -991,20 +1011,95 @@ export class RepoStore {
     return this.#readLoose(oid) ?? this.#packs.read(oid);
   }
 
-  /** Read a deduplicated prefix of blobs under an explicit byte budget. */
-  readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
-    const budget = options.budgetBytes ?? MAX_BLOB_BATCH_BYTES;
-    if (!Number.isSafeInteger(budget) || budget <= 0 || budget > MAX_BLOB_BATCH_BYTES) {
-      throw new RangeError(`blob read budget must be an integer from 1 to ${MAX_BLOB_BATCH_BYTES}`);
-    }
+  /** Validate bounded object metadata without reading payload bytes. */
+  objectInfo(oids: readonly string[]): ObjectReadInfo[] {
     const wanted = [...new Set(oids)];
     if (wanted.length > MAX_BLOB_BATCH_OIDS) {
-      throw new GitError("E2BIG", `blob batch exceeds ${MAX_BLOB_BATCH_OIDS} inputs`);
+      throw new GitError("E2BIG", `object metadata batch exceeds ${MAX_BLOB_BATCH_OIDS} inputs`);
     }
     for (const oid of wanted) {
       if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
     }
-    if (wanted.length === 0) return { blobs: new Map(), remaining: [], bytes: 0 };
+    const rows = this.#db.all<{
+      ordinal: number;
+      oid: string;
+      source: string | null;
+      type: string | null;
+      size: number | null;
+      chunk_rows: number;
+    }>(
+      `WITH wanted(ordinal, oid) AS (
+         SELECT CAST(key AS INTEGER), value FROM json_each(?)
+       )
+       SELECT w.ordinal, w.oid,
+              CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+                   WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.type ELSE packed.type END AS type,
+              CASE WHEN loose.oid IS NOT NULL THEN loose.size ELSE packed.size END AS size,
+              CASE WHEN loose.oid IS NULL THEN 0 ELSE
+                (SELECT COUNT(*) FROM git_object_chunks chunk
+                  WHERE chunk.repo_id = loose.repo_id AND chunk.oid = loose.oid)
+              END AS chunk_rows
+         FROM wanted w
+         LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
+         LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
+         LEFT JOIN git_pack_meta pack
+           ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
+          AND pack.state = 'complete'
+        ORDER BY w.ordinal`,
+      JSON.stringify(wanted),
+      this.#repoId,
+      this.#repoId,
+    );
+    if (rows.length !== wanted.length) {
+      throw new CorruptError("object metadata lookup returned the wrong row count");
+    }
+    return rows.map((row, ordinal) => {
+      if (
+        row.ordinal !== ordinal ||
+        row.oid !== wanted[ordinal] ||
+        (row.source !== "loose" && row.source !== "pack") ||
+        (row.type !== "blob" &&
+          row.type !== "tree" &&
+          row.type !== "commit" &&
+          row.type !== "tag") ||
+        !Number.isSafeInteger(row.size) ||
+        row.size === null ||
+        row.size < 0 ||
+        !Number.isSafeInteger(row.chunk_rows) ||
+        row.chunk_rows < 0 ||
+        (row.source === "loose" && row.chunk_rows === 0) ||
+        (row.source === "pack" && row.chunk_rows !== 0)
+      ) {
+        if (row.source === null) throw new ObjectNotFoundError(wanted[ordinal]!);
+        throw new CorruptError("object metadata lookup returned an invalid row");
+      }
+      return {
+        oid: row.oid,
+        type: row.type,
+        size: row.size,
+        source: row.source,
+        chunkRows: row.chunk_rows,
+      };
+    });
+  }
+
+  /** Read a deduplicated prefix of mixed objects under an explicit byte budget. */
+  readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
+    const budget = options.budgetBytes ?? MAX_BLOB_BATCH_BYTES;
+    if (!Number.isSafeInteger(budget) || budget <= 0 || budget > MAX_BLOB_BATCH_BYTES) {
+      throw new RangeError(
+        `object read budget must be an integer from 1 to ${MAX_BLOB_BATCH_BYTES}`,
+      );
+    }
+    const wanted = [...new Set(oids)];
+    if (wanted.length > MAX_BLOB_BATCH_OIDS) {
+      throw new GitError("E2BIG", `object batch exceeds ${MAX_BLOB_BATCH_OIDS} inputs`);
+    }
+    for (const oid of wanted) {
+      if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
+    }
+    if (wanted.length === 0) return { objects: new Map(), remaining: [], bytes: 0 };
 
     const metadata = this.#db.all<{
       ordinal: number;
@@ -1037,7 +1132,7 @@ export class RepoStore {
       this.#repoId,
     );
     if (metadata.length !== wanted.length) {
-      throw new CorruptError("blob metadata lookup returned the wrong row count");
+      throw new CorruptError("object metadata lookup returned the wrong row count");
     }
 
     const selected: typeof metadata = [];
@@ -1050,16 +1145,23 @@ export class RepoStore {
         (row.source !== "loose" && row.source !== "pack")
       ) {
         if (row.source === null) throw new ObjectNotFoundError(wanted[index]!);
-        throw new CorruptError("blob metadata lookup returned an invalid source");
+        throw new CorruptError("object metadata lookup returned an invalid source");
       }
-      if (row.type !== "blob") throw new CorruptError(`${row.oid} is a ${row.type}, not a blob`);
+      if (
+        row.type !== "blob" &&
+        row.type !== "tree" &&
+        row.type !== "commit" &&
+        row.type !== "tag"
+      ) {
+        throw new CorruptError(`object ${row.oid} has an invalid indexed type`);
+      }
       const size = row.size;
       if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
-        throw new CorruptError(`blob ${row.oid} has an invalid indexed size`);
+        throw new CorruptError(`object ${row.oid} has an invalid indexed size`);
       }
       if (bytes + size > budget) {
         if (selected.length === 0) {
-          throw new GitError("EFBIG", `blob ${row.oid} exceeds the ${budget}-byte read budget`);
+          throw new GitError("EFBIG", `object ${row.oid} exceeds the ${budget}-byte read budget`);
         }
         break;
       }
@@ -1070,21 +1172,27 @@ export class RepoStore {
     const looseRows = selected.filter((row) => row.source === "loose");
     const packedOids = selected.filter((row) => row.source === "pack").map((row) => row.oid);
     const looseObjects = this.#readLooseObjectRows(looseRows);
-    const loose = new Map<string, Uint8Array>();
-    for (const [oid, object] of looseObjects) {
-      if (object.type !== "blob") throw new CorruptError(`${oid} is not a blob`);
-      loose.set(oid, object.data);
-    }
-    const packed = this.#packs.readBlobs(packedOids);
-    const blobs = new Map<string, Uint8Array>();
+    const packed = this.#packs.readObjects(packedOids);
+    const objects = new Map<string, RawObject>();
     for (const row of selected) {
-      const data = (row.source === "loose" ? loose : packed).get(row.oid);
-      if (data === undefined || data.length !== row.size) {
-        throw new CorruptError(`blob ${row.oid} did not produce its indexed bytes`);
+      const object = (row.source === "loose" ? looseObjects : packed).get(row.oid);
+      if (object === undefined || object.type !== row.type || object.data.length !== row.size) {
+        throw new CorruptError(`object ${row.oid} did not produce its indexed bytes`);
       }
-      blobs.set(row.oid, data);
+      objects.set(row.oid, object);
     }
-    return { blobs, remaining: wanted.slice(selected.length), bytes };
+    return { objects, remaining: wanted.slice(selected.length), bytes };
+  }
+
+  /** Read a deduplicated prefix of blobs under an explicit byte budget. */
+  readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
+    const batch = this.readObjects(oids, options);
+    const blobs = new Map<string, Uint8Array>();
+    for (const [oid, object] of batch.objects) {
+      if (object.type !== "blob") throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
+      blobs.set(oid, object.data);
+    }
+    return { blobs, remaining: batch.remaining, bytes: batch.bytes };
   }
 
   /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
@@ -1098,6 +1206,14 @@ export class RepoStore {
     afterTreeOid: string | null,
   ): Generator<WalkTreeDiffEntry> {
     yield* iterateTreeDiff(this.#db, this.#repoId, beforeTreeOid, afterTreeOid);
+  }
+
+  /** Stream objects introduced by one tree transition. */
+  *walkTreeDiffObjects(
+    beforeTreeOid: string | null,
+    afterTreeOid: string,
+  ): Generator<WalkTreeDiffObject> {
+    yield* iterateTreeDiffObjects(this.#db, this.#repoId, beforeTreeOid, afterTreeOid);
   }
 
   write(type: ObjectType, data: Uint8Array): string {

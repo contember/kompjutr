@@ -543,6 +543,14 @@ export class PackStore {
     return blobs;
   }
 
+  /** Resolve a bounded mixed-object batch in physical pack order. */
+  readObjects(
+    oids: readonly string[],
+    expectedType: ObjectType | null = null,
+  ): Map<string, RawObject> {
+    return this.#readObjects(oids, null, expectedType, false);
+  }
+
   /** Resolve ingest bases in bounded graph and physical pack order. */
   #readObjects(
     oids: readonly string[],

@@ -43,7 +43,16 @@ function peakRssBytes(): number {
 }
 
 function message(error: unknown): string {
-  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth++) {
+    parts.push(current instanceof Error ? `${current.name}: ${current.message}` : String(current));
+    if (typeof current !== "object" || current === null) break;
+    const cause = Reflect.get(current, "cause");
+    if (cause === undefined) break;
+    current = cause;
+  }
+  return parts.join(" <- ");
 }
 
 function mayContinue(operation: string, error: unknown): boolean {

@@ -38,6 +38,8 @@ export interface GitServer {
   url: string;
   /** Every request the server saw, in order. */
   requests: RequestRecord[];
+  /** Handler failures retained for protocol diagnostics. */
+  errors: unknown[];
   close(): Promise<void>;
 }
 
@@ -53,11 +55,13 @@ export async function startGitServer(
   const projectRoot = dirname(root);
   const name = basename(root);
   const requests: RequestRecord[] = [];
+  const errors: unknown[] = [];
   const sockets = new Set<Socket>();
 
   const server = createServer((request, response) => {
-    handle(request, response, backend, projectRoot, requests, options).catch(() => {
+    handle(request, response, backend, projectRoot, requests, options).catch((error) => {
       // A client that walked away mid-response is a case under test.
+      errors.push(error);
       response.destroy();
     });
   });
@@ -72,6 +76,7 @@ export async function startGitServer(
   return {
     url: `http://127.0.0.1:${port}/${name}`,
     requests,
+    errors,
     close: () =>
       new Promise<void>((resolve) => {
         for (const socket of sockets) socket.destroy();
@@ -148,10 +153,16 @@ async function handle(
     },
   });
   child.stderr.resume();
-  child.stdin.end(body);
+  const input = new Promise<void>((resolve, reject) => {
+    child.stdin.on("error", (error) => {
+      if ("code" in error && error.code === "EPIPE") resolve();
+      else reject(error);
+    });
+    child.stdin.end(body, resolve);
+  });
 
   const limit = method === "POST" ? options.truncatePostAfter : undefined;
-  await pipeCgi(child.stdout, response, limit, () => child.kill("SIGKILL"));
+  await Promise.all([input, pipeCgi(child.stdout, response, limit, () => child.kill("SIGKILL"))]);
 }
 
 async function drain(request: IncomingMessage): Promise<void> {

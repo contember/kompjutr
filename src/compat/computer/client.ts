@@ -36,6 +36,7 @@ import {
   repoRoot as repoRootOp,
   updateRef as updateRefOp,
 } from "../../core/ops/plumbing.js";
+import { push as pushOp } from "../../core/ops/push.js";
 import {
   catFile as catFileRead,
   log as logOp,
@@ -225,8 +226,8 @@ export function createSqliteGitClient(
 
       // Phase 5 and beyond. The object satisfies the interface so a caller
       // can bind it today and find out precisely what is missing.
-      async push() {
-        throw new UnsupportedOperationError("push");
+      async push(input = {}) {
+        return pushOp(ctx(), at(input.dir), input);
       },
       async pull() {
         throw new UnsupportedOperationError("pull");

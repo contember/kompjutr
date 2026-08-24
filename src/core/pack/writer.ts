@@ -1,10 +1,10 @@
 // Derived from dgit (MIT, Copyright (c) 2026 Divy Srivastava),
 // https://github.com/littledivy/dgit — the entry header encoding and the streaming writer are adapted from dgit's src/git/pack.ts.
 //
-import { fromHex, utf8 } from "../bytes.js";
-import { type ObjectType, TYPE_NUMBER } from "../objects.js";
+import { fromHex, toHex, utf8 } from "../bytes.js";
+import { type ObjectType, objectHeader, TYPE_NUMBER } from "../objects.js";
 import { Sha1 } from "../sha1.js";
-import { deflate } from "../zlib.js";
+import { DeflateStream, deflate } from "../zlib.js";
 
 const REF_DELTA = 7;
 
@@ -48,8 +48,16 @@ export class PackWriter {
   }
 
   object(type: ObjectType, data: Uint8Array): void {
-    this.#out(encodeTypeAndSize(TYPE_NUMBER[type], data.length));
-    this.#out(deflate(data));
+    const object = this.startObject(type, data.length);
+    object.push(data);
+    object.finish();
+  }
+
+  /** Begin one full object whose input can arrive in bounded chunks. */
+  startObject(type: ObjectType, size: number, expectedOid?: string): PackObjectWriter {
+    if (!Number.isSafeInteger(size) || size < 0) throw new RangeError("invalid pack object size");
+    this.#out(encodeTypeAndSize(TYPE_NUMBER[type], size));
+    return new PackObjectWriter(type, size, expectedOid, (chunk) => this.#out(chunk));
   }
 
   /** A ref-delta entry against `baseOid`. `delta` is the raw delta body. */
@@ -62,5 +70,44 @@ export class PackWriter {
   /** Emits the trailer; the trailer itself is not hashed. */
   finish(): void {
     this.#emit(this.#sha.digest());
+  }
+}
+
+/** One streamed full-object entry owned by a PackWriter. */
+export class PackObjectWriter {
+  readonly #sha = new Sha1();
+  readonly #deflate: DeflateStream;
+  #written = 0;
+  #finished = false;
+
+  constructor(
+    type: ObjectType,
+    private readonly size: number,
+    private readonly expectedOid: string | undefined,
+    emit: (chunk: Uint8Array) => void,
+  ) {
+    this.#sha.update(objectHeader(type, size));
+    this.#deflate = new DeflateStream(emit);
+  }
+
+  push(chunk: Uint8Array): void {
+    if (this.#finished) throw new Error("pack object is already finished");
+    if (chunk.length > this.size - this.#written) {
+      throw new Error("pack object exceeds its declared size");
+    }
+    this.#written += chunk.length;
+    this.#sha.update(chunk);
+    this.#deflate.push(chunk);
+  }
+
+  finish(): void {
+    if (this.#finished) throw new Error("pack object is already finished");
+    if (this.#written !== this.size) throw new Error("pack object size does not match its input");
+    this.#finished = true;
+    this.#deflate.finish();
+    const oid = toHex(this.#sha.digest());
+    if (this.expectedOid !== undefined && oid !== this.expectedOid) {
+      throw new Error(`pack object ${this.expectedOid} hashes to ${oid}`);
+    }
   }
 }

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -25,8 +26,13 @@ interface Sample {
   mode: number;
 }
 
-let origin: { url: string; close(): Promise<void> } | null = null;
+let origin: {
+  url: string;
+  errors: unknown[];
+  close(): Promise<void>;
+} | null = null;
 let sample: Sample[] = [];
+let fixtureDir: string | null = null;
 
 function changed(content: Uint8Array, index: number): Uint8Array {
   const marker = new TextEncoder().encode(`\n${MARKER_PREFIX}${index} */\n`);
@@ -92,6 +98,8 @@ export const NEXTJS_WORKFLOW: Scenario = {
   async setup() {
     const fixture = FIXTURES.nextjs;
     const dir = prepareFixture(fixture);
+    fixtureDir = dir;
+    execFileSync("git", ["update-ref", "-d", "refs/heads/bench-work"], { cwd: dir });
     sample = collectSample(dir, trackedEntries(dir));
     origin = await startGitServer(join(dir, ".git"));
   },
@@ -178,6 +186,20 @@ export const NEXTJS_WORKFLOW: Scenario = {
       },
     },
     {
+      name: "git.push (100)",
+      async run({ harness }) {
+        try {
+          await harness.git.push({ dir: REPO, remoteRef: "bench-work" });
+        } catch (error) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          const serverError = origin?.errors.at(-1);
+          if (serverError === undefined) throw error;
+          const detail = serverError instanceof Error ? serverError.message : String(serverError);
+          throw new Error(`git HTTP test server failed: ${detail}`, { cause: error });
+        }
+      },
+    },
+    {
       name: "git.status (clean commit)",
       async run({ harness }) {
         expectClean(await harness.git.status({ dir: REPO }), "post-commit status");
@@ -222,7 +244,11 @@ export const NEXTJS_WORKFLOW: Scenario = {
   ],
   async teardown() {
     await origin?.close();
+    if (fixtureDir !== null) {
+      execFileSync("git", ["update-ref", "-d", "refs/heads/bench-work"], { cwd: fixtureDir });
+    }
     origin = null;
+    fixtureDir = null;
     sample = [];
   },
 };

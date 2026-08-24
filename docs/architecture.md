@@ -197,6 +197,21 @@ cases, UTF-8 byte semantics, malformed classes, escapes, and globstars are
 checked against real Git. Rule lookup uses a bounded exact source index and
 charges collision comparisons by bytes examined.
 
+## Smart HTTP
+
+Clone and fetch stream incoming `upload-pack` responses directly into a
+provisional pack. Push discovers `receive-pack`, plans one branch update against
+the freshly advertised refs, and streams a replayable full-object pack. A 401
+opens a new body stream from the immutable OID plan; network failures never
+automatically replay a POST.
+
+The outbound planner walks validated commit projections and changed tree edges.
+It subtracts locally known advertised remote closures, excludes gitlinks, and
+reserves the worst-case two-pass SQL cost before starting the POST. The server's
+advertised old OID is included in the ref command, so a concurrent remote update
+is rejected by the server. Local remote-tracking refs move only after a complete
+`report-status` success.
+
 ## Transactions and trust boundaries
 
 `Database.transactionSync()` delegates every nesting level to Durable Object

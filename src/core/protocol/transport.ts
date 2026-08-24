@@ -8,7 +8,7 @@ export interface GitHttpRequest {
   url: string;
   method: "GET" | "POST";
   headers: Record<string, string>;
-  body?: Uint8Array;
+  body?: Uint8Array | AsyncIterable<Uint8Array>;
 }
 
 export interface GitHttpResponse {
@@ -56,14 +56,45 @@ async function* streamOf(response: Response): AsyncGenerator<Uint8Array> {
   }
 }
 
+function requestStream(body: AsyncIterable<Uint8Array>): ReadableStream<Uint8Array> {
+  const iterator = body[Symbol.asyncIterator]();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) controller.close();
+        else controller.enqueue(next.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await iterator.return?.();
+    },
+  });
+}
+
+interface StreamingRequestInit extends RequestInit {
+  /** Required by Node's fetch; ignored by Workers. */
+  duplex?: "half";
+}
+
 /** The default transport: the platform's global `fetch`. */
 export const fetchHttpClient: GitHttpClient = async (request) => {
-  const response = await fetch(request.url, {
+  const streaming = request.body !== undefined && !(request.body instanceof Uint8Array);
+  const init: StreamingRequestInit = {
     method: request.method,
     headers: request.headers,
-    body: request.body === undefined ? undefined : request.body,
+    body:
+      request.body === undefined
+        ? undefined
+        : request.body instanceof Uint8Array
+          ? request.body
+          : requestStream(request.body),
     redirect: "follow",
-  });
+    ...(streaming ? { duplex: "half" } : {}),
+  };
+  const response = await fetch(request.url, init);
   const headers: Record<string, string> = {};
   response.headers.forEach((value, key) => {
     headers[key.toLowerCase()] = value;
@@ -88,27 +119,74 @@ export interface RemoteRequestOptions {
   onAuth?: AuthCallback;
 }
 
+export type GitHttpRequestFactory = () => GitHttpRequest;
+
+function openRequest(request: GitHttpRequest | GitHttpRequestFactory): GitHttpRequest {
+  return typeof request === "function" ? request() : request;
+}
+
+/** Credentials retained across one remote operation's discovery and POSTs. */
+export class RemoteAuthSession {
+  #auth: GitAuth | undefined;
+
+  async request(
+    request: GitHttpRequest | GitHttpRequestFactory,
+    options: RemoteRequestOptions,
+  ): Promise<GitHttpResponse> {
+    const http = options.http ?? fetchHttpClient;
+    const firstRequest = openRequest(request);
+    const headers = {
+      ...firstRequest.headers,
+      ...options.headers,
+      ...(this.#auth === undefined ? {} : basicAuth(this.#auth)),
+      ...this.#auth?.headers,
+    };
+    let first: GitHttpResponse;
+    try {
+      first = await http({ ...firstRequest, headers });
+    } catch (error) {
+      if (firstRequest.method !== "GET") throw error;
+      const retryRequest = openRequest(request);
+      first = await http({ ...retryRequest, headers: { ...retryRequest.headers, ...headers } });
+    }
+    if (first.status !== 401 || options.onAuth === undefined) return first;
+
+    await drain(first.body);
+    const auth = await options.onAuth(firstRequest.url, this.#auth ?? {});
+    if (auth === undefined) return first;
+    this.#auth = auth;
+
+    const retryRequest = openRequest(request);
+    const retryHeaders = {
+      ...retryRequest.headers,
+      ...options.headers,
+      ...basicAuth(auth),
+      ...auth.headers,
+    };
+    return http({ ...retryRequest, headers: retryHeaders });
+  }
+}
+
+async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
+  try {
+    for await (const _chunk of body) {
+      // discard
+    }
+  } catch {
+    // A rejected response may itself be truncated.
+  }
+}
+
 /**
- * One request with git's auth contract: static headers always, and one
- * retry through `onAuth` when the remote answers 401.
+ * Git's auth contract: static headers always and one retry through `onAuth`.
+ * An idempotent GET also retries one transport failure; a POST never does.
  */
 export async function requestWithAuth(
-  request: GitHttpRequest,
+  request: GitHttpRequest | GitHttpRequestFactory,
   options: RemoteRequestOptions,
+  session = new RemoteAuthSession(),
 ): Promise<GitHttpResponse> {
-  const http = options.http ?? fetchHttpClient;
-  const headers = { ...request.headers, ...options.headers };
-  const first = await http({ ...request, headers });
-  if (first.status !== 401 || options.onAuth === undefined) return first;
-
-  // Drain the rejected response so the connection is not left hanging.
-  for await (const _chunk of first.body) {
-    // discard
-  }
-  const auth = await options.onAuth(request.url, {});
-  if (auth === undefined) return first;
-  const retryHeaders = { ...headers, ...basicAuth(auth), ...auth.headers };
-  return http({ ...request, headers: retryHeaders });
+  return session.request(request, options);
 }
 
 export async function readAll(body: AsyncIterable<Uint8Array>): Promise<string> {

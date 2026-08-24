@@ -120,11 +120,38 @@ describe("createSqliteGitClient", () => {
     }
   });
 
+  it("pushes a committed change through Smart HTTP", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("README.md", "before\n");
+    fixture.commit("initial");
+    fixture.git("config", "receive.denyCurrentBranch", "updateInstead");
+
+    const server = await startGitServer(fixture.dir);
+    try {
+      const { workspace } = makeWorkspace();
+      await workspace.git.clone({ url: server.url, dir: "/" });
+      await workspace.fs.writeFile("/README.md", "after\n");
+      await workspace.git.add({ paths: ["README.md"] });
+      const local = await workspace.git.commit({ message: "local change" });
+
+      const result = await workspace.git.push({});
+      expect(result).toEqual({
+        ok: true,
+        error: null,
+        refs: { "refs/heads/main": { ok: true } },
+      });
+      expect(fixture.git("rev-parse", "refs/heads/main")).toBe(local.oid);
+      expect(fixture.git("show", "HEAD:README.md")).toBe("after");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("satisfies the interface for what it does not implement yet", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});
     for (const call of [
-      () => workspace.git.push({}),
       () => workspace.git.pull({}),
       () => workspace.git.merge({ theirs: "main" }),
       () => workspace.git.stashPush({}),

@@ -10,7 +10,12 @@ import { CorruptError, GitError } from "../errors.js";
 import { retainedStringBytes } from "../retained.js";
 import { FLUSH, pkt } from "./pktline.js";
 import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt, pktText } from "./stream.js";
-import { HttpError, type RemoteRequestOptions, requestWithAuth } from "./transport.js";
+import {
+  HttpError,
+  type RemoteAuthSession,
+  type RemoteRequestOptions,
+  requestWithAuth,
+} from "./transport.js";
 
 export const AGENT = "kompjutr/0.0.0";
 
@@ -60,8 +65,9 @@ interface ResolvedProtocolMemoryLimits {
   lineBytes: number;
 }
 
-interface ProtocolRequestOptions extends RemoteRequestOptions {
+export interface ProtocolRequestOptions extends RemoteRequestOptions {
   protocolLimits?: ProtocolMemoryLimits;
+  authSession?: RemoteAuthSession;
 }
 
 class NegotiationBudget {
@@ -147,7 +153,7 @@ function boundedLimit(value: number | undefined, ceiling: number, name: string):
   return Math.min(value, ceiling);
 }
 
-async function readErrorPrefix(body: AsyncIterable<Uint8Array>): Promise<string> {
+export async function readErrorPrefix(body: AsyncIterable<Uint8Array>): Promise<string> {
   const prefix = new Uint8Array(ERROR_PREFIX_BYTES);
   let length = 0;
   try {
@@ -171,7 +177,7 @@ export function normalizeRemoteUrl(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
-function baseHeaders(): Record<string, string> {
+export function baseHeaders(): Record<string, string> {
   return {
     "User-Agent": `git/${AGENT}`,
     Accept: "*/*",
@@ -197,6 +203,7 @@ export async function discover(
       headers: baseHeaders(),
     },
     options,
+    options.authSession,
   );
   if (response.status !== 200) {
     const body = await readErrorPrefix(response.body);
@@ -241,7 +248,7 @@ export async function discover(
   }
 }
 
-async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
+export async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
   try {
     for await (const _chunk of body) {
       // discard
@@ -387,6 +394,7 @@ export async function uploadPack(
       body: concatBody(body),
     },
     options,
+    options.authSession,
   );
   if (response.status !== 200) {
     const text = await readErrorPrefix(response.body);

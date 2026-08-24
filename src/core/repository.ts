@@ -8,7 +8,13 @@ import {
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
 } from "../sqlite/commits.js";
-import type { BlobReadBatch, RepoStore, WalkTreeDiffEntry } from "../sqlite/store.js";
+import type {
+  BlobReadBatch,
+  ObjectReadBatch,
+  RepoStore,
+  WalkTreeDiffEntry,
+  WalkTreeDiffObject,
+} from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
@@ -185,6 +191,19 @@ export class Repository {
   /** Read a bounded prefix of blobs without scalar object lookups. */
   readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
     return this.store.readBlobs(oids, options);
+  }
+
+  /** Read a bounded prefix of mixed objects without scalar lookups. */
+  readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
+    return this.store.readObjects(oids, options);
+  }
+
+  /** Objects introduced by one tree transition, with equal subtrees pruned. */
+  *walkTreeDiffObjects(
+    beforeTreeOid: string | null,
+    afterTreeOid: string,
+  ): Generator<WalkTreeDiffObject> {
+    yield* this.store.walkTreeDiffObjects(beforeTreeOid, afterTreeOid);
   }
 
   readTag(oid: string): Tag {
