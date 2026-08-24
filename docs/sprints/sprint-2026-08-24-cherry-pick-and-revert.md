@@ -313,3 +313,13 @@ their complete restart-safe lifecycle exists.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- 2026-08-24 — Git 2.54 parity probe corrected two edge cases without changing
+  scope: an empty cherry-pick retains recoverable state, while an empty revert
+  terminates without `REVERT_HEAD`; `mainline: 1` is also valid for a normal
+  one-parent source. Command-specific behavior wins over the planned symmetric
+  fallback.
+- 2026-08-24 — Planning touch-point drift: migration witnesses live in
+  `tests/schema-migration.test.ts`; atomic apply witnesses live in
+  `tests/merge-apply.test.ts` and `tests/merge-lifecycle.test.ts`. The proposed
+  `tests/migrations.test.ts` and `tests/transactions.test.ts` do not exist.
