@@ -35,11 +35,21 @@ export class GitFixture {
   }
 
   git(...args: string[]): string {
-    return execFileSync("git", args, { cwd: this.dir, env: ENV, encoding: "utf8" }).trimEnd();
+    return execFileSync("git", args, {
+      cwd: this.dir,
+      env: ENV,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trimEnd();
   }
 
   gitBinary(...args: string[]): Buffer {
-    return execFileSync("git", args, { cwd: this.dir, env: ENV, maxBuffer: 1 << 30 });
+    return execFileSync("git", args, {
+      cwd: this.dir,
+      env: ENV,
+      maxBuffer: 1 << 30,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
   }
 
   init(defaultBranch = "main"): this {

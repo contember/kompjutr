@@ -8,6 +8,7 @@ a Worker — Workers' DO SQL surface is a subset of it.
 helpers/db.ts        TestDatabase — use for store tests, no Workspace needed
 helpers/storage.ts   node:sqlite DurableObjectStorageLike
 helpers/git.ts       fixtures built by the real git binary
+helpers/git-parity.ts upstream behavioural scenarios through Git and kompjutr
 helpers/http-backend.ts real Smart HTTP through `git http-backend`
 helpers/parity.ts    differential harness for grep and rg
 helpers/workspace.ts full runtime under test
@@ -24,6 +25,9 @@ implementation can be asked instead.
   against the `git` binary through `helpers/git.ts`. Its fixtures pin
   `GIT_*_DATE` and identity so hashes are reproducible; do not introduce a
   fixture with a floating timestamp.
+- **Upstream Git scenarios** name the pinned `git.git` test they adapt and run
+  through `helpers/git-parity.ts`. Compare only public repository state; never
+  copy GPL test code or assert `.git` storage layout.
 - **`grep` and `rg`** run the same corpus through the installed binaries and
   demand the same bytes back (`helpers/parity.ts`). Two dimensions are
   controlled rather than compared: `LC_ALL=C`, and `--no-ignore` with an empty
