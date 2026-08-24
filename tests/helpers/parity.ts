@@ -11,7 +11,7 @@
 //
 //   * `LC_ALL=C`, so the real binaries match bytes the way the shell does.
 //   * `--no-ignore` and an empty `RIPGREP_CONFIG_PATH` for rg. Ignore-file
-//     handling is the deliberate divergence in docs/plans/shell.md §5.1;
+//     handling is the deliberate divergence in docs/archive/plans/shell.md §5.1;
 //     switching it off on rg's side makes everything else comparable.
 //
 // Walk order is the third. `rg --sort path` fixes it, so rg compares

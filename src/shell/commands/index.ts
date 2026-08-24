@@ -3,7 +3,7 @@
 // `git` is deliberately absent. It is injected by the consumer as a
 // registered command, exactly as `@cloudflare/computer` does it, because
 // putting it here would make `src/shell/` depend on `src/git/` and break the
-// one-way rule in docs/architecture.md.
+// one-way rule in docs/reference/architecture.md.
 
 import type { Command } from "../exec/context.js";
 import { fileCommands } from "./files.js";

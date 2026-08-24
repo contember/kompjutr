@@ -1,5 +1,5 @@
 // Planning is pure, so these run with no database. Every case is a pipeline
-// shape counted in the corpus behind docs/plans/shell.md §1.3.
+// shape counted in the corpus behind docs/archive/plans/shell.md §1.3.
 
 import { describe, expect, it } from "vitest";
 

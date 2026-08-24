@@ -1,4 +1,4 @@
-// Wave A probe from docs/plans/shell.md: the plan's thesis is that a search
+// Wave A probe from docs/archive/plans/shell.md: the plan's thesis is that a search
 // costs `⌈files/page⌉ + ⌈bytes/budget⌉` statements and that a trailing
 // `| head -N` stops early instead of walking the tree. Both are asserted
 // here before anything is built on them.

@@ -4,7 +4,7 @@
 // payload budget of content.
 //
 // Every statement here is one of two shapes, both from §7.0 of
-// docs/plans/standalone-runtime.md:
+// docs/archive/plans/standalone-runtime.md:
 //
 //   * metadata rows carry no BLOBs, so they are fed straight from
 //     `json_each(?)` — one statement for thousands of rows;

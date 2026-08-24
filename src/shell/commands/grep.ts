@@ -1,5 +1,5 @@
 // The `grep` surface. Defaults are GNU grep's: not recursive, dotfiles
-// searched, BRE unless `-E`. See docs/plans/shell.md §5.1 for the six ways
+// searched, BRE unless `-E`. See docs/archive/plans/shell.md §5.1 for the six ways
 // this differs from `rg`, which shares the engine below it.
 
 import { type Command, fail } from "../exec/context.js";

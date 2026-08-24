@@ -1,7 +1,7 @@
 // The public surface: `kompjutr/shell`.
 //
 // A bash-shaped command surface over `Filesystem`, in which a command is a
-// query rather than a tree walk. See docs/plans/shell.md for what it does
+// query rather than a tree walk. See docs/archive/plans/shell.md for what it does
 // and, more usefully, for what it deliberately does not.
 
 import type { Filesystem } from "../fs/types.js";

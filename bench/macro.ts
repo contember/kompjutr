@@ -1,5 +1,5 @@
 // The macro suite: the same repositories, the same operations and the same
-// order as the DOFS experiment recorded in `docs/benchmark-reference.md`,
+// order as the DOFS experiment recorded in `docs/archive/benchmarks/benchmark-reference.md`,
 // so a row here can be read against a row there.
 //
 // It is split in two scenarios rather than one. The reference deleted

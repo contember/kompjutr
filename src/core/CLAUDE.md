@@ -1,7 +1,7 @@
 # src/core — the Git engine
 
-Pure Git over a `Repository` and a `Worktree`. Nothing here knows about
-Durable Objects, HTTP transport wiring, or `@cloudflare/computer`.
+Git operations and Smart HTTP over a `Repository` and a `Worktree`. Nothing here
+knows about Durable Objects or `@cloudflare/computer`; HTTP stays behind `GitHttpClient`.
 
 ## Layout
 
@@ -17,9 +17,8 @@ ignore/        gitignore discovery and byte-oriented matchers
 streams.ts     comparePaths, joinSorted, joinSorted3 — the merge-join primitives
 ```
 
-`src/git/client.ts` is the only place that assembles ops into a public API. An op
-throws `UnsupportedOperationError` rather than falling back to another
-implementation.
+`src/git/client.ts` alone assembles ops into the public API. Ops throw
+`UnsupportedOperationError` instead of falling back.
 
 ## Cost model — this is the point of the module
 
@@ -44,12 +43,14 @@ module exists to prevent.
   corrupt loose duplicate must not borrow a valid packed projection, and a packed
   delta base must not resolve through an unrelated loose cache entry.
 - **Pack ingest is provisional.** Only a complete, trailer-validated pack is
-  readable, and an interrupted or rejected ingest can never move a ref.
+  readable; interrupted or rejected ingest never moves a ref.
+- **Push preflights both pack passes before POST.** Reopen a pack only for a 401
+  auth retry; never replay a network-failed POST. Move tracking refs only after
+  complete `report-status`; uncertain results leave them untouched.
 - **A new commit must produce a valid cache projection atomically with object
   visibility.** Reject malformed, oversized, or unsafe-numeric commits instead of
   storing an object the cache cannot represent.
-- Emitted git paths cap at 2,200 UTF-8 bytes; the tree traversal budget is
-  16 MiB. Both fail closed.
+- Git paths cap at 2,200 UTF-8 bytes; tree traversal retains at most 16 MiB. Both fail closed.
 
 ## diff/ is not MIT
 

@@ -80,7 +80,7 @@ const { stdout, operations } = shell.run("grep -rl createShell /src");
 
 Output bytes and filesystem operations are bounded by the executor, so a command
 without `| head` still returns a bounded result. `git` is not a built-in; a
-consumer injects it through `commands`. See [the plan](docs/plans/shell.md) for
+consumer injects it through `commands`. See [the shell reference](docs/reference/shell.md) for
 the command set and the deliberate divergences from bash.
 
 ## Compatibility
@@ -114,9 +114,9 @@ wall target is below 0.1 seconds for operations touching at most 1,000 changed
 paths. This wall target is not yet met by full-repository `status` and
 `checkout`; they remain bounded by full tree, index, and filesystem scans.
 
-See [the architecture](docs/architecture.md) for the storage model and current
-limits. The benchmark documents are historical design evidence from before the
-standalone runtime cut.
+See [the architecture](docs/reference/architecture.md) for the storage model and current
+limits, and [the current benchmark](docs/reference/benchmark-current.md) for the native
+Next.js workflow. Older comparisons are historical pre-standalone evidence.
 
 ## Status
 

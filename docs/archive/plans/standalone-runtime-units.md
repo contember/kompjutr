@@ -387,7 +387,7 @@ checkout stayed double-scanned. **[R6]**
 | Migrate the last Computer consumers | `tests/client.test.ts`, `tests/factory.test.ts`, `bench/harness.ts` — all three still import `@cloudflare/computer` and all three are inside `tsconfig.json`'s `include`. **[R9]** |
 | `package.json` | `@cloudflare/computer` **stays as an optional peer** through the compatibility milestone, per §1.1 and §5.3. Removing it is a later, separate decision. **[R9]** |
 | Declare the exec seam | `src/runtime/` — `Workspace`, `AsyncFilesystem`, `ProcessHost`, `RpcHost`: typed, unimplemented (§6) |
-| Re-measure and rewrite | `docs/benchmark-macro.md`, `docs/benchmark-reference.md`, `README.md` |
+| Re-measure and rewrite | archived benchmark reports and `README.md` |
 
 ---
 

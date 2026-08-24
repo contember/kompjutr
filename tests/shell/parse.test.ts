@@ -1,4 +1,4 @@
-// The shapes come from the 614-line agent corpus behind docs/plans/shell.md;
+// The shapes come from the 614-line agent corpus behind docs/archive/plans/shell.md;
 // the payloads do not. The corpus itself carries client data and this package
 // is public, so each case here reproduces an observed *shape* with neutral
 // content. Coverage against the real corpus is checked out of tree: 608 of

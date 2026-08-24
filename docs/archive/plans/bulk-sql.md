@@ -301,7 +301,7 @@ green unit is committed as it lands.
   4 KiB. Setting it to 0 restores today's always-deflate behaviour for anyone who
   would rather pay CPU than Durable Object storage.
 - **The write-buffer difference is accepted and documented** in
-  `docs/architecture.md`, not worked around.
+  `docs/reference/architecture.md`, not worked around.
 - **All four waves run**, not a trial slice.
 
 ## Out of scope unless separately approved

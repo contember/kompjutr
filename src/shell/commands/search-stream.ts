@@ -1,5 +1,5 @@
 // Searching a pipe stage's input rather than the filesystem — R5 in
-// docs/plans/shell.md. `ls | grep foo` and `grep a | grep b` are 12 corpus
+// docs/archive/plans/shell.md. `ls | grep foo` and `grep a | grep b` are 12 corpus
 // lines between them, and neither should issue a second query.
 //
 // Pull-based like everything else: the generator only consumes as much of

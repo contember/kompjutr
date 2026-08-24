@@ -12,16 +12,16 @@ npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
 reference experiment against real repositories; `shell` measures the command
-surface. Fixtures are `express`, `tailwind`, `vue`, `eslint`, `prettier`,
-`nextjs` (218 → 24,252 files). `bench/results/` and `bench/.fixtures/` are
-gitignored.
+surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push.
+Fixtures are `express`, `tailwind`, `vue`, `eslint`, `prettier`, `nextjs`
+(218 → 24,252 files). `bench/results/` and `bench/.fixtures/` are gitignored.
 
 ## The number that matters
 
 `commit` must not exhaust isolate memory at 985 tracked files. That ceiling —
 not raw speed — is why the index is rows instead of one binary blob. The
-targets and how they came out are in `docs/benchmark-reference.md` and
-`docs/benchmark-macro.md`.
+current native snapshot is in `docs/reference/benchmark-current.md`; original targets and
+legacy comparisons are under `docs/archive/benchmarks/`.
 
 ## Measurement rules — violating these produces a confident wrong number
 
@@ -42,6 +42,8 @@ targets and how they came out are in `docs/benchmark-reference.md` and
    `workerd` supports. A date set to "today" makes the benchmark unrunnable.
 7. Local workerd has no isolate memory limiter. Its process RSS is a regression
    signal, not proof that the production 128 MB isolate limit is satisfied.
+8. The Next.js push phase must create a fresh remote branch. Setup and teardown
+   delete `bench-work`, so a no-op push cannot masquerade as a measurement.
 
 Benchmark numbers taken on a loaded machine are noise. Reserve CPU before a run
 and say in the write-up how it was reserved.

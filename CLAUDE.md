@@ -30,7 +30,7 @@ src/git/       Git client facade over core/ops
 src/compat/    Migration adapter; the only entry allowed to import @cloudflare/computer
 tests/         Vitest suite, parity and conformance harnesses
 bench/         Standalone benchmark harness
-docs/plans/    Design documents; standalone-runtime.md is the current one
+docs/          Architecture, current benchmarks, plans, and historical records
 ```
 
 Layering is one-way: `shell` and `git` may depend on `fs`, never the reverse,
@@ -78,3 +78,21 @@ Read the file for a directory before changing code in it:
 - `src/shell/CLAUDE.md` — a command is a query; parse → plan → execute
 - `tests/CLAUDE.md` — parity against real binaries, conformance against `node:fs`
 - `bench/CLAUDE.md` — measurement rules; a number measured wrong is worse than none
+
+<!-- AGENT-DOCS:POINTER (managed by the agent-docs skill — edit the body freely,
+     keep the markers) -->
+## Docs
+
+Project docs live in [`docs/`](./docs/) and follow a fixed structure — start at
+[`docs/CLAUDE.md`](./docs/CLAUDE.md) (the operating manual) and
+[`docs/INDEX.md`](./docs/INDEX.md) (the map). In short:
+
+- `docs/reference/` — how the system works now.
+- `docs/decisions/` — ADRs (the *why*), immutable.
+- `docs/backlog/` — decided work not yet scheduled · `docs/sprints/` — active
+  work-plans · `docs/archive/` — shipped.
+- `docs/ideas/` — proposals, no commitment.
+
+Path is the status (no `status:` fields); when you finish or supersede something,
+move/delete it per `docs/CLAUDE.md`.
+<!-- /AGENT-DOCS:POINTER -->

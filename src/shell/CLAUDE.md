@@ -6,8 +6,9 @@ hit, filter in JS — which is one statement per file. Here a command compiles t
 a bounded query: `find -name` is one `glob`, `grep -rl` on a literal is one
 `discoverFilesContaining`, `ls` is one `readdir`, `head -20` is one `readRange`.
 
-`docs/plans/shell.md` is the specification, including the deliberate
-divergences from real bash. Read §5.1 before "fixing" ignore-file handling.
+`docs/reference/shell.md` is the current specification. Historical measurements
+and rationale are in `docs/archive/plans/shell.md`; read §5.1 there before
+"fixing" ignore-file handling.
 
 ## Pipeline
 

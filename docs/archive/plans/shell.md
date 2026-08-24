@@ -128,7 +128,7 @@ Deliberately not implemented. Each is a decision, not an omission:
 `git` is **not** a shell command in this package. It is injected by the
 consumer as a registered command, exactly like Computer does it — otherwise
 `src/shell/` would depend on `src/git/` and break the one-way rule in
-[`architecture.md`](../architecture.md).
+[`architecture.md`](../../reference/architecture.md).
 
 ---
 
@@ -320,7 +320,7 @@ shell_sessions(session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, rev INTEGER)
 `initializeShellSchema(db, now)`, mirroring `initializeFsSchema`. The shell
 reaches the database through `Filesystem.db`, which the interface already
 exposes — no new dependency, and the one-way rule in
-[`architecture.md`](../architecture.md) holds.
+[`architecture.md`](../../reference/architecture.md) holds.
 
 Cost: **one write statement per `cd`**, and one read per isolate — the value
 is cached in memory for the isolate's lifetime, which is exactly the lifetime
@@ -515,7 +515,7 @@ bytes" is a SQL predicate, and `discoverFilesContaining` in `src/fs/` answers
 it in one indexed statement. The content of a file that cannot match never
 reaches the isolate — which on a Durable Object matters more than the
 statement it saves, because the heap is the ceiling
-[`computer-git-index-ceiling`](../benchmark-reference.md) is about.
+[`computer-git-index-ceiling`](../benchmarks/benchmark-reference.md) is about.
 
 What it covers: a **literal, case-sensitive, positive** search, which is most
 of what the corpus contains. `instr` has no case folding, so `-i` falls back;

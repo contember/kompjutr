@@ -2,7 +2,7 @@
 // agents are not scripting, they are making single calls with two ergonomic
 // decorations — truncate the output and swallow the errors — and both of
 // those are query parameters, not language features. See §4 of
-// docs/plans/shell.md.
+// docs/archive/plans/shell.md.
 //
 // Two rewrites are active here:
 //

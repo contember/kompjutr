@@ -1,4 +1,4 @@
-// The §7 targets from docs/plans/shell.md. These are the reason the shell
+// The §7 targets from docs/archive/plans/shell.md. These are the reason the shell
 // exists: if a command costs what a tree walk costs, the whole design was
 // pointless and tool calls would have been the better answer.
 //

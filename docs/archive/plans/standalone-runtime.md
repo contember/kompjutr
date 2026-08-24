@@ -1,5 +1,11 @@
 # Plan — the standalone runtime
 
+> **Status: implemented.** This is the historical design and delivery record.
+> Use [`../../reference/architecture.md`](../../reference/architecture.md) for
+> the current system and
+> [`../../reference/benchmark-current.md`](../../reference/benchmark-current.md)
+> for current measurements.
+
 Target architecture for cutting `@cloudflare/computer` and shipping our own
 workspace runtime: a filesystem over Durable Object SQLite, with git inside it,
 and a seam for a shell layer later.
@@ -37,7 +43,7 @@ Two consumers are referred to throughout as **the static site generator** and
 - **Our own schema.** `fs_paths` is keyed by the full canonical path under
   BINARY collation, which is byte-for-byte git's tree order — the order the
   entire git core already merges on (`src/core/streams.ts:29`,
-  `docs/architecture.md:110-113`). The working-tree walk stops being a
+  `docs/reference/architecture.md:110-113`). The working-tree walk stops being a
   recursive CTE and becomes an indexed range scan.
 - **The filesystem does not hash anything.** No content addressing, no
   sha256, no manifests, no blob GC. Writers may supply an opaque `content_id`;
@@ -46,7 +52,7 @@ Two consumers are referred to throughout as **the static site generator** and
   `writeFiles`, `removeFiles`, `makeDirectories` are first-class; the
   node:fs-shaped surface both consumers use today is a shim over them.
 - **No write-back buffer.** The correctness hazard that blocks direct reads
-  under Computer (`docs/plans/bulk-sql.md:88-106`) is removed by construction,
+  under Computer (`docs/archive/plans/bulk-sql.md:88-106`) is removed by construction,
   not worked around.
 - Every operation lands under 1,000 statements at 9,329 files, including
   `checkout` and `clone`, which are structurally impossible under Computer.
@@ -54,7 +60,7 @@ Two consumers are referred to throughout as **the static site generator** and
 ### The numbers this buys
 
 Prettier 3.9.6, 9,329 tracked files. Today's column is
-`docs/benchmark-macro.md`; the target column is derived in §7.
+`docs/archive/benchmarks/benchmark-macro.md`; the target column is derived in §7.
 
 | Operation | today | target | of which is the filesystem |
 |---|---:|---:|---:|
@@ -94,7 +100,7 @@ Worth stating before planning anything, because the working tree is mid-flight:
   multi-row `VALUES` and no `json_each` anywhere in `store.ts`, `packs.ts` or
   `schema.ts`.
 
-So `docs/plans/bulk-sql.md` landed its wave-0 seams and stopped. This plan
+So `docs/archive/plans/bulk-sql.md` landed its wave-0 seams and stopped. This plan
 supersedes it: the seams stay, the `vfs_*` reader becomes the importer (§8.2),
 and the bulk write path targets our own tables instead of Computer's.
 
@@ -146,7 +152,7 @@ same handle to both.
 
 This is already how the code is arranged: `src/core/` talks to the working tree
 through `Worktree` (`src/core/worktree.ts:72`) and knows nothing else, and
-`docs/architecture.md:38-41` states the rule. The change is that `Worktree`
+`docs/reference/architecture.md:38-41` states the rule. The change is that `Worktree`
 becomes a *slice* of the filesystem's own interface rather than an adapter over
 somebody else's.
 
@@ -212,7 +218,7 @@ manifest that nothing consumes, because the sync protocol they exist for is out
 of scope (§9). What it costs in maintenance: the schema is at v5 with four
 migrations already shipped (`schema/migrations.ts:145-150`), and we would be
 maintaining a bug-compatible reimplementation of the write path underneath it.
-`docs/plans/bulk-sql.md:296-301` already gated direct `vfs_*` writes as "a real
+`docs/archive/plans/bulk-sql.md:296-301` already gated direct `vfs_*` writes as "a real
 risk of corrupting a user's filesystem"; Option F makes that the foundation.
 
 **Option R — rewrite over a new schema.**
@@ -375,7 +381,7 @@ turns out to append byte-at-a-time, add a bounded write-back buffer *inside*
 the filesystem module where the bulk read paths can also consult it — which is
 possible for us and was not possible from outside DOFS, because its cache is a
 module-level `WeakMap` with no exported accessor
-(`docs/plans/bulk-sql.md:92-95`).
+(`docs/archive/plans/bulk-sql.md:92-95`).
 
 ---
 
@@ -417,9 +423,9 @@ asserted and relied on across the codebase:
 
 - `comparePaths` (`src/core/streams.ts:29`) is the one comparator all merge
   joins use, and it compares code points, not UTF-16 units, for this reason
-  (`docs/architecture.md:121-125`).
+  (`docs/reference/architecture.md:121-125`).
 - `git_index` has `(path, stage)` as its primary key and the index scan pages on
-  it (`src/sqlite/store.ts:669`, `docs/architecture.md:107-113`).
+  it (`src/sqlite/store.ts:669`, `docs/reference/architecture.md:107-113`).
 - The tree builder relies on SQLite's `ORDER BY path, stage` already matching
   git's tree order and deliberately does not re-sort
   (`src/core/ops/tree-build.ts:20-29`).
@@ -552,7 +558,7 @@ And one change of meaning, not of shape: `git_blob_ids.content_id`
 now holds `fs_nodes.content_id`.
 
 `git_blob_ids` and `git_objects.stored` were drafted as wave-0 seams for
-`docs/plans/bulk-sql.md` and reverted when that plan was superseded. They are
+`docs/archive/plans/bulk-sql.md` and reverted when that plan was superseded. They are
 re-introduced here as part of the seam wave, this time with the code that reads
 them landing in the same run.
 
@@ -574,7 +580,7 @@ free. On `add`, a file whose `content_id` is non-NULL and present in
 
 This is strictly stronger than git's stat cache, which guesses from
 `(size, mtime, ino)` (`src/sqlite/schema.ts:53-56`,
-`docs/architecture.md:202-204`): a file touched but unchanged, or restored to a
+`docs/reference/architecture.md:202-204`): a file touched but unchanged, or restored to a
 previous content, never gets re-hashed. The stat columns stay for the NULL case.
 
 ### 3.6 The invariant that will bite
@@ -1249,12 +1255,13 @@ shell lands it declares the equivalent of `sync: "none"` and Computer's entire
 ## 7. Per-operation SQL design
 
 All counts at 9,329 files / 3,346 directories / 12,675 nodes / 24 MB, the
-Prettier 3.9.6 fixture (`docs/benchmark-reference.md`). Page sizes: worktree
-scan 1,000 rows, index scan 2,048 rows, payload budget 1 MiB.
+Prettier 3.9.6 fixture
+(`docs/archive/benchmarks/benchmark-reference.md`). Page sizes: worktree scan
+1,000 rows, index scan 2,048 rows, payload budget 1 MiB.
 
 Statement counts are the Durable Object metric; wall time is reported from
 local runs only and is not a duration inside a Worker
-(`docs/benchmark-reference.md`, measurement rule 1).
+(`docs/archive/benchmarks/benchmark-reference.md`, measurement rule 1).
 
 ### 7.0 The three primitives everything is built from
 
@@ -1430,7 +1437,7 @@ SELECT o.oid, o.type, o.size, o.stored, c.seq, c.data
 
 that becomes one statement per tree depth level (~12 for Prettier), plus the
 pack chunks those objects span. The 16 MiB object LRU
-(`docs/architecture.md:88-92`) holds Prettier's whole tree set, so the pack
+(`docs/reference/architecture.md:88-92`) holds Prettier's whole tree set, so the pack
 chunk reads are paid once. Worst case, with a cold 4 MiB chunk LRU thrashing
 against a 10 MB pack, is ~150.
 
@@ -1527,7 +1534,7 @@ met.** Without it, ~300 ms.
 
 This is the operation Computer makes structurally impossible: ~45 statements
 per file written, ~420,000 for this fixture
-(`docs/plans/bulk-sql.md:81-86`).
+(`docs/archive/plans/bulk-sql.md:81-86`).
 
 **Read side** (~171): target tree stream (25–150) + index scan (5) + working
 tree scan (15). One fix: the unforced path currently walks the target tree
@@ -1591,7 +1598,7 @@ object store. A 100k-object pack is 100k statements today.
 Wall time: SHA-1 per object during ingest, plus inflate. **Not met**, and the
 known lever is `crypto.subtle.digest("SHA-1", …)` — byte-identical, ~24× faster
 per dgit's measurement, and async, which is why it has not been done
-(`docs/architecture.md:250-255`). Out of scope here.
+(`docs/reference/architecture.md:250-255`). Out of scope here.
 
 ### 7.7 `log` — ≤ 100 statements, with a caveat
 
@@ -1873,7 +1880,7 @@ writing a single bulk primitive** and record the pass rate. Below ~95% after
 the mechanical fixes, stop and reconsider Option F.
 
 *If it fires:* the fallback is Option F with the CTE reader and no bulk writes
-— which is `docs/plans/bulk-sql.md` as already gated, i.e. `status` fixed and
+— which is `docs/archive/plans/bulk-sql.md` as already gated, i.e. `status` fixed and
 `checkout` not.
 
 **R3 — neither consumer switches, and we maintain two things.**
@@ -1898,7 +1905,7 @@ first-class surface stays clean. The failure mode to avoid is widening the
 
 - **Memory.** Every bulk primitive is budgeted in bytes, never in rows, and the
   caller pages. The existing code already holds this discipline
-  (`docs/architecture.md:83-99`). The failure mode is a new bulk call site that
+  (`docs/reference/architecture.md:83-99`). The failure mode is a new bulk call site that
   forgets to page — catchable by asserting peak payload in the same test that
   asserts statement count.
 - **`withReadScope` semantics.** Ambiguous (§4.4). Cheap to get wrong, cheap to
@@ -1993,7 +2000,7 @@ rather than a pass or a fail.
 
 The async-`crypto.subtle` work is **not** taken now. It is byte-identical and
 roughly 24× faster, but it is async against a deliberately synchronous ops
-layer (`docs/architecture.md:250-255`), and threading a promise through the
+layer (`docs/reference/architecture.md:250-255`), and threading a promise through the
 buffered-entry path is a separate piece of work with its own estimate.
 
 ### D4 — `withReadScope` → **resolved; ours is a no-op shim**

@@ -1,5 +1,5 @@
 // Real repositories, pinned to the tags the earlier DOFS experiment sized,
-// so a row here lines up with a row in `docs/benchmark-reference.md`.
+// so a row here lines up with `docs/archive/benchmarks/benchmark-reference.md`.
 //
 // A fixture is fetched once into `bench/.fixtures` and then rebuilt as a
 // single-commit repository. That rebuild is what makes it usable as a local

@@ -110,5 +110,6 @@ for a 2,000-file commit — which is the price of the bound.
 - Repositories with large individual files, where the streaming object paths
   matter and where 4 KB fixtures say nothing.
 
-Real repositories and `clone` are in `docs/benchmark-macro.md`, which replays
-the reference experiment's fixtures and operations against both clients.
+Real repositories and `clone` are in
+`docs/archive/benchmarks/benchmark-macro.md`, which replays the reference
+experiment's fixtures and operations against both clients.

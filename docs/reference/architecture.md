@@ -241,6 +241,9 @@ Other deliberate limits include the 2,200-byte emitted Git path cap, bounded
 commit projections, bounded ignore inputs, bounded protocol negotiation, and
 fail-closed oversized materialization. `RpcHost` is a declared future seam only.
 
+The current native Next.js workflow and its measurement caveats are recorded in
+[`benchmark-current.md`](benchmark-current.md).
+
 ## Shell
 
 `kompjutr/shell` applies the same cost model to a command surface: a command is
@@ -249,4 +252,4 @@ are pure — `src/shell/plan/` imports nothing from `src/fs/` — and every
 filesystem call the executor makes is counted against an operation ceiling, so a
 command written without a limiter still returns a bounded result. The command
 set, the ceilings, and the deliberate divergences from bash are specified in
-[`plans/shell.md`](plans/shell.md).
+[`shell.md`](shell.md).

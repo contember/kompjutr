@@ -1,7 +1,7 @@
 // `rg` against real ripgrep, one case per shipped flag.
 //
 // rg is not an alias for `grep` and this suite is where that stops being an
-// assertion in a comment. The divergences in docs/plans/shell.md §5.1 are
+// assertion in a comment. The divergences in docs/archive/plans/shell.md §5.1 are
 // each pinned here as a *difference from grep's answer on the same corpus*,
 // so aliasing the two would fail loudly rather than quietly returning the
 // wrong set of files.

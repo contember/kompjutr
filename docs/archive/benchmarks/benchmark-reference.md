@@ -38,8 +38,8 @@ chunk at a time.
 
 ### How it came out
 
-Measured in `docs/benchmark-macro.md`, same fixtures, both clients in one
-harness.
+Measured in `docs/archive/benchmarks/benchmark-macro.md`, same fixtures, both
+clients in one harness.
 
 | Target | Result |
 | --- | --- |

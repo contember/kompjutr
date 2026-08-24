@@ -6,7 +6,7 @@
 // process substitution, brace expansion, functions, `[[ ]]` — is rejected by
 // name in `lexer.ts` rather than half-implemented, because a construct that
 // parses and then means something slightly different is worse than one that
-// does not parse at all. See docs/plans/shell.md §1.2.
+// does not parse at all. See docs/archive/plans/shell.md §1.2.
 
 /**
  * A word is a sequence of parts, not a string: `"a b"*.ts` is one word made

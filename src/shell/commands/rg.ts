@@ -2,7 +2,7 @@
 // occurrences) and the defaults differ in six ways that change what comes
 // back. Aliasing would be a lie that surfaces as wrong output.
 //
-// Differences from `grep`, per docs/plans/shell.md §5.1:
+// Differences from `grep`, per docs/archive/plans/shell.md §5.1:
 //   recursive by default · `-g` instead of `--include` · `-t <type>` ·
 //   `-S` smart-case · dotfiles skipped unless `--hidden` · always ERE
 //

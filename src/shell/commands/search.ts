@@ -1,5 +1,5 @@
 // The search engine. `grep` and `rg` are two flag surfaces over this one
-// implementation — see docs/plans/shell.md §5.1.
+// implementation — see docs/archive/plans/shell.md §5.1.
 //
 // The cost model is the whole point, and there are two of them.
 //

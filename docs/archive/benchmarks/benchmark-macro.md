@@ -7,8 +7,8 @@
 Measured 2026-08-20 on Linux 6.17, node 24.4, every run under `cpu-lease -n 2` —
 the lease width the reference experiment used.
 
-The target is `docs/benchmark-reference.md`: an earlier experiment that
-optimised DOFS *underneath* Computer's isomorphic-git client. This suite
+The target is `docs/archive/benchmarks/benchmark-reference.md`: an earlier
+experiment that optimised DOFS *underneath* Computer's isomorphic-git client. This suite
 replays that experiment's fixtures and operations, and runs **both** clients
 through them in one harness, so the comparison does not have to cross two
 runtimes.
@@ -183,8 +183,8 @@ working tree least improve most, which is the same statement above told in time.
 
 The metric that avoids both is the smallest V8 old-space the workload completes
 in, found by bisection with `--max-semi-space-size=1`. It is the metric
-`docs/benchmark-results.md` settled on, and it is available for real
-repositories too — for the whole loose suite, `add` through `status`:
+`docs/archive/benchmarks/benchmark-results.md` settled on, and it is available
+for real repositories too — for the whole loose suite, `add` through `status`:
 
 | Fixture | Files | `createGitClient()` | kompjutr |
 | --- | ---: | ---: | ---: |

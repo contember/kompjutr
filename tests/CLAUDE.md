@@ -8,6 +8,7 @@ a Worker — Workers' DO SQL surface is a subset of it.
 helpers/db.ts        TestDatabase — use for store tests, no Workspace needed
 helpers/storage.ts   node:sqlite DurableObjectStorageLike
 helpers/git.ts       fixtures built by the real git binary
+helpers/http-backend.ts real Smart HTTP through `git http-backend`
 helpers/parity.ts    differential harness for grep and rg
 helpers/workspace.ts full runtime under test
 fs/conformance/      the dofs suite, ported; MIT, keep the file headers
@@ -40,6 +41,8 @@ an assertion to make it pass, and never weaken the controlled dimensions.
 
 - Prefer `TestDatabase` over a full `Workspace` when the subject is a store or
   a stream — it is faster and the failure points at the right layer.
+- Test Smart HTTP success paths against `helpers/http-backend.ts`. Reserve mocks
+  for malformed frames and transport failures that real Git cannot produce.
 - Cost is behaviour: assert statement and operation counts where the suite
   already does (`tests/shell/cost.test.ts`, `tests/shell/bounds.test.ts`). A change that
   keeps outputs identical and raises the counts must fail a test.

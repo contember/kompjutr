@@ -1,0 +1,41 @@
+# kompjutr docs — index
+
+The map of everything under `docs/`. Read [`CLAUDE.md`](CLAUDE.md) for the rules.
+When sources disagree, precedence is: invariants/hard-rules → active sprint →
+decisions → reference → archive.
+
+## Folders
+
+- [`reference/`](reference/README.md) — how the system works now.
+- [`ideas/`](ideas/README.md) — proposals, no commitment.
+- [`decisions/`](decisions/README.md) — ADRs (the *why*), immutable.
+- [`backlog/`](backlog/README.md) — decided work, not yet scheduled.
+- [`sprints/`](sprints/README.md) — active thematic work-plans.
+- [`archive/`](archive/README.md) — shipped sprints + reference-worthy records.
+
+## Active sprints
+
+<!-- list the sprint files currently in sprints/ ; empty between sprints -->
+- _none active_
+
+## What's hot
+
+<!-- hand-maintained, keep short: the few things actually in motion + what's next.
+     If everything is "hot", nothing is. -->
+- No active sprint. Create one before starting the next feature batch.
+
+## Key reference
+
+- [`reference/architecture.md`](reference/architecture.md) — current runtime architecture and limits.
+- [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
+- [`reference/shell.md`](reference/shell.md) — current shell surface and deliberate limits.
+
+## Decisions
+
+- [`decisions/0001-own-the-standalone-sqlite-runtime.md`](decisions/0001-own-the-standalone-sqlite-runtime.md)
+- [`decisions/0002-compile-shell-commands-to-bounded-queries.md`](decisions/0002-compile-shell-commands-to-bounded-queries.md)
+
+## Historical records
+
+- [`archive/plans/`](archive/plans/README.md) — completed and superseded implementation plans.
+- [`archive/benchmarks/`](archive/benchmarks/README.md) — pre-standalone benchmark evidence.
