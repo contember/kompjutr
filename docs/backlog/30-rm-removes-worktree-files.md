@@ -25,14 +25,17 @@ safety behaviour is missing in both directions.
 
 - Delete the matched working-tree entries in the same `transactionSync()` as the
   index removal, using the bounded bulk filesystem API rather than per-path calls.
-- Add explicit `cached` (index only, today's behaviour) and `force` options.
+- Add explicit `cached` (index only, today's behaviour), `force`, and `recursive`
+  options. A native directory pathspec without `recursive` must fail as Git does;
+  the compatibility facade preserves its current implicit recursion explicitly.
   Without `force`, refuse a path that differs from HEAD or from the index with a
   stable error, as Git does.
 - Prune directories that become empty, matching Git's behaviour for a recursive
   removal, and keep the retained-state cap already enforced by `ADD_RETAINED_BYTES`.
 - Real Git parity tests: clean removal, `--cached`, staged-but-different,
-  worktree-modified, directory pathspec, nested repository boundary, and a
-  pathspec that matches nothing.
+  worktree-modified, directory pathspec with and without recursion, a directory
+  retaining an untracked file, nested repository boundary, and a pathspec that
+  matches nothing.
 
 ## Touch points
 

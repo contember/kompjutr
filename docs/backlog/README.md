@@ -49,6 +49,56 @@ not effort: a wrong answer outranks a missing one.
   `.gitattributes` filters, config scopes, `clean -x`, SSH transport. Reopen a
   case for one only with a concrete workload behind it.
 
+## Recommended implementation order
+
+This is the default priority at the current HEAD, not scheduling state. Items in
+the same phase may run in parallel, but a blocked item must not move ahead of its
+blocker. Re-evaluate the order after each phase as production evidence arrives.
+
+1. **Release correctness baseline:** [05](05-ci-and-release-gates.md),
+   [19](19-foreign-key-enforcement-parity.md),
+   [32](32-refuse-empty-commits.md), the measurement plus decision part of
+   [22](22-oid-column-encoding.md), and [30](30-rm-removes-worktree-files.md).
+   This phase is scheduled in the active
+   [release correctness sprint](../sprints/sprint-2026-08-25-release-correctness-baseline.md).
+2. **Remove remaining silent Git divergences:**
+   [31](31-status-unmerged-and-options.md) and
+   [34](34-rename-detection.md). Correct plausible-but-wrong results before
+   adding more surface area.
+3. **Settle storage contracts before data volume grows:**
+   [20](20-blob-id-mapping-role-and-growth.md),
+   [21](21-narrow-parsed-tree-keys.md), and
+   [23](23-write-time-checks-on-derived-tables.md). If [22](22-oid-column-encoding.md)
+   selects BLOB OIDs, combine its migration with 21 so keyed tables are rebuilt
+   once.
+4. **Build recovery before destructive maintenance:**
+   [12](12-reflogs-and-ref-recovery.md), then
+   [33](33-branch-delete-merged-check.md) and
+   [04](04-repack-and-garbage-collection.md). Reflogs are the retention and
+   recovery prerequisite for both follow-ups.
+5. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
+   [11](11-production-do-regression-probe.md), and
+   [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
+   work unit; 11 starts only after 05 supplies the CI/release seam.
+6. **Add the highest-return daily workflows:**
+   [38](38-clone-depth-and-deepening.md), [28](28-pull-rebase.md),
+   [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
+   [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
+   [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
+7. **Broaden management and diagnostic surfaces:**
+   [18](18-branch-and-remote-management.md),
+   [08](08-extend-push-refspecs.md), [25](25-rebase-targets-and-roots.md),
+   [39](39-plumbing-read-surface.md), and
+   [17](17-integrity-audit-and-snapshots.md).
+8. **Defer until a concrete workload justifies them:**
+   [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
+   [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md). Item 29 also
+   remains blocked by 12.
+
+Before scheduling them, split 04, 16, 17, and 39 into smaller work units with
+independent witnesses. Their current acceptance scopes are larger than one
+focused sprint.
+
 ## Items
 
 - [04 — Add incremental repack and garbage collection](04-repack-and-garbage-collection.md)

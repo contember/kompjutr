@@ -34,7 +34,7 @@ is a multi-hour maintenance operation under the per-operation budgets.
   from authoritative sources in bounded steps.
 
 Acceptance: the decision file exists and links the measurements; if migrating,
-`tests/schema-migration.test.ts` covers a v10 database with loose objects, a
+`tests/schema-migration.test.ts` covers a v11 database with loose objects, a
 complete pack, a pending pack, and an active operation journal.
 
 ## Touch points

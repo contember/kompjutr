@@ -25,8 +25,9 @@ that commits on every pass silently grows the history instead of stopping.
 - Compare the projected tree with the parent's tree inside the existing
   transaction and throw a stable error when they are equal.
 - Add `allowEmpty` for the callers that want Git's `--allow-empty`.
-- Preserve the exceptions Git itself makes: a root commit, `--amend` that only
-  rewrites metadata, and finalising a pending merge, which commits by definition.
+- Refuse an empty root commit too; allow a non-empty root normally. Preserve the
+  actual exceptions: `--amend` that only rewrites metadata and finalising a
+  pending merge, which commits by definition.
 - Real Git parity tests for no-op commit, staged no-op (content restaged
   identical), amend-message-only, empty merge continuation, and `allowEmpty`.
 

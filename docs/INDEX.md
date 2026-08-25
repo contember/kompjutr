@@ -17,11 +17,16 @@ decisions → reference → archive.
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
 
+- [`sprints/sprint-2026-08-25-release-correctness-baseline.md`](sprints/sprint-2026-08-25-release-correctness-baseline.md)
+  — release gates, SQLite contract evidence, OID decision, and safe Git mutation
+  defaults.
+
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- CI and release gates remain the next release-readiness priority.
+- The release correctness baseline sprint is active: CI/artifact gates,
+  foreign-key evidence, OID encoding, empty commits, and native `rm` semantics.
 - Stash can now build on the authenticated operation-step journal and shared
   integration engine.
 
