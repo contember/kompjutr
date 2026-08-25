@@ -30,6 +30,7 @@ function committedRepo(): TestRepository {
     message: "base",
     author: IDENTITY,
     committer: IDENTITY,
+    allowEmpty: true,
   });
   return workspace;
 }

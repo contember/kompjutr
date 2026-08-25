@@ -203,7 +203,10 @@ function makeChangedFiles(
       index < changedFiles ? { ...entry, oid: afterOid, size: after.length } : entry,
     ),
   );
-  const target = commit(workspace.context, workspace.repo, { message: "target" }).oid;
+  const target = commit(workspace.context, workspace.repo, {
+    message: "target",
+    ...(changedFiles === 0 ? { allowEmpty: true } : {}),
+  }).oid;
 
   workspace.worktree.writeFiles(
     paths.slice(0, changedFiles).map((path) => ({
