@@ -373,6 +373,105 @@ const SCENARIOS: Scenario[] = [
 ];
 
 describe("status", () => {
+  it("matches every unmerged XY shape in porcelain v1, v2, and short output", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    const shapes: Array<{ path: string; stages: readonly number[]; code: string }> = [
+      { path: "aa.txt", stages: [2, 3], code: "AA" },
+      { path: "au.txt", stages: [2], code: "AU" },
+      { path: "dd.txt", stages: [1], code: "DD" },
+      { path: "du.txt", stages: [1, 3], code: "DU" },
+      { path: "ua.txt", stages: [3], code: "UA" },
+      { path: "ud.txt", stages: [1, 2], code: "UD" },
+      { path: "uu.txt", stages: [1, 2, 3], code: "UU" },
+    ];
+    for (const shape of shapes) {
+      if (shape.stages.includes(1)) fixture.write(shape.path, `base ${shape.path}\n`);
+    }
+    fixture.commit("base");
+
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.store);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    const index: IndexEntry[] = [];
+    let indexInfo = "";
+    for (const shape of shapes) {
+      const baseOid = shape.stages.includes(1)
+        ? fixture.git("rev-parse", `HEAD:${shape.path}`)
+        : undefined;
+      const currentBytes = utf8.encode(`current ${shape.path}\n`);
+      const incomingBytes = utf8.encode(`incoming ${shape.path}\n`);
+      const currentOid = fixture.writeObject("blob", currentBytes);
+      const incomingOid = fixture.writeObject("blob", incomingBytes);
+      expect(workspace.repo.store.write("blob", currentBytes)).toBe(currentOid);
+      expect(workspace.repo.store.write("blob", incomingBytes)).toBe(incomingOid);
+
+      indexInfo += `0 ${"0".repeat(40)}\t${shape.path}\n`;
+      for (const stage of shape.stages) {
+        const oid = stage === 1 ? baseOid : stage === 2 ? currentOid : incomingOid;
+        if (oid === undefined) throw new Error(`missing stage ${stage} oid for ${shape.path}`);
+        indexInfo += `100644 ${oid} ${stage}\t${shape.path}\n`;
+        index.push({
+          path: shape.path,
+          stage,
+          mode: 0o100644,
+          oid,
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+      }
+
+      if (workspace.worktree.stat(`/${shape.path}`) !== null) {
+        workspace.worktree.unlink(`/${shape.path}`);
+      }
+      if (shape.stages.includes(2) || shape.stages.includes(3)) {
+        writeWorkFile(
+          workspace,
+          `/${shape.path}`,
+          shape.stages.length > 1 ? `conflict ${shape.path}\n` : `side ${shape.path}\n`,
+        );
+        fixture.write(
+          shape.path,
+          shape.stages.length > 1 ? `conflict ${shape.path}\n` : `side ${shape.path}\n`,
+        );
+      } else {
+        fixture.remove(shape.path);
+      }
+    }
+    fixture.gitInput(indexInfo, "update-index", "--index-info");
+    workspace.repo.store.indexReplace(index);
+
+    const entries = status(workspace.repo, workspace.worktree);
+    expect(entries.map((entry) => `${entry.index}${entry.worktree}`)).toEqual(
+      shapes.map((shape) => shape.code),
+    );
+    expect(formatPorcelainV1(entries)).toBe(gitStatus(fixture, "--porcelain=v1"));
+    expect(formatShort(entries)).toBe(gitStatus(fixture, "--short"));
+    expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2"));
+    expect(() => statusMatrix(workspace.repo, workspace.worktree)).toThrow(
+      expect.objectContaining({ code: "EUNMERGED" }),
+    );
+  });
+
+  it("rejects mixed stage-zero and unmerged index rows", () => {
+    const workspace = makeRepo("/");
+    const entry = (stage: number): IndexEntry => ({
+      path: "conflict.txt",
+      stage,
+      mode: 0o100644,
+      oid: "ab".repeat(20),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+
+    workspace.repo.store.indexReplace([entry(0), entry(1)]);
+    expect(() => status(workspace.repo, workspace.worktree)).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
   for (const scenario of SCENARIOS) {
     it(`matches git --porcelain=v2 byte for byte: ${scenario.name}`, async () => {
       const { fixture, workspace } = await build(scenario);

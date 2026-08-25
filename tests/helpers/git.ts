@@ -52,6 +52,16 @@ export class GitFixture {
     });
   }
 
+  gitInput(input: string, ...args: string[]): string {
+    return execFileSync("git", args, {
+      cwd: this.dir,
+      env: ENV,
+      input,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trimEnd();
+  }
+
   init(defaultBranch = "main"): this {
     this.git("init", "-q", "-b", defaultBranch);
     this.git("config", "core.autocrlf", "false");

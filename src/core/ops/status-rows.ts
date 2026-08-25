@@ -1,10 +1,13 @@
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
-import { ZERO_OID } from "../bytes.js";
+import { isOid, ZERO_OID } from "../bytes.js";
+import { CorruptError } from "../errors.js";
 import type { IgnoreMatcher } from "../ignore/index.js";
 import type { Repository } from "../repository.js";
+import { comparePaths } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import type { TargetEntry } from "./checkout.js";
-import type { StatusEntry } from "./kinds.js";
+import type { OrdinaryStatusEntry, StatusEntry, UnmergedStatusCode } from "./kinds.js";
+import { validateMergePath } from "./merge-state.js";
 import {
   type HashedPath,
   hashExactWorktreePaths,
@@ -23,7 +26,7 @@ interface PendingTrackedRow {
   worktree: WorktreePath;
   headOid: string;
   indexOid: string;
-  staged: StatusEntry["index"];
+  staged: OrdinaryStatusEntry["index"];
 }
 
 export type BufferedStatusRow =
@@ -39,7 +42,8 @@ export interface StatusHashObserver {
  * these so the v2 formatter needs no second pass over the repository;
  * anything wanting Computer's narrower shape can use it as-is.
  */
-export interface StatusDetail extends StatusEntry {
+export interface OrdinaryStatusDetail extends OrdinaryStatusEntry {
+  readonly unmerged?: false;
   /** Mode in HEAD, in the index and on disk; "000000" where absent. */
   headMode: string;
   indexMode: string;
@@ -47,6 +51,40 @@ export interface StatusDetail extends StatusEntry {
   /** Oid in HEAD and in the index; all-zero where absent. */
   headOid: string;
   indexOid: string;
+}
+
+export interface UnmergedStatusDetail extends StatusEntry {
+  readonly unmerged: true;
+  index: UnmergedStatusCode;
+  worktree: UnmergedStatusCode;
+  baseMode: string;
+  currentMode: string;
+  incomingMode: string;
+  worktreeMode: string;
+  baseOid: string;
+  currentOid: string;
+  incomingOid: string;
+}
+
+export type StatusDetail = OrdinaryStatusDetail | UnmergedStatusDetail;
+
+export type StatusIndexGroup =
+  | { kind: "tracked"; path: string; entry: IndexEntry }
+  | {
+      kind: "unmerged";
+      path: string;
+      base: IndexEntry | undefined;
+      current: IndexEntry | undefined;
+      incoming: IndexEntry | undefined;
+    };
+
+interface PendingStatusIndexGroup {
+  path: string;
+  lastStage: number;
+  stageZero: IndexEntry | undefined;
+  base: IndexEntry | undefined;
+  current: IndexEntry | undefined;
+  incoming: IndexEntry | undefined;
 }
 
 export interface StatusOptions {
@@ -65,6 +103,97 @@ export interface StatusOptions {
   untrackedFiles?: "normal" | "all";
 }
 
+/** Group a validated `(path, stage)` index stream without retaining the index. */
+export function* statusIndexGroups(entries: Iterable<IndexEntry>): Generator<StatusIndexGroup> {
+  let pending: PendingStatusIndexGroup | undefined;
+  for (const entry of entries) {
+    validateStatusIndexEntry(entry);
+    if (pending === undefined || pending.path !== entry.path) {
+      if (pending !== undefined) {
+        if (comparePaths(pending.path, entry.path) >= 0) {
+          throw new CorruptError("status index paths are not strictly ordered");
+        }
+        yield finishStatusIndexGroup(pending);
+      }
+      pending = {
+        path: entry.path,
+        lastStage: -1,
+        stageZero: undefined,
+        base: undefined,
+        current: undefined,
+        incoming: undefined,
+      };
+    }
+    if (entry.stage <= pending.lastStage) {
+      throw new CorruptError(`status index stages are not strictly ordered for ${entry.path}`);
+    }
+    pending.lastStage = entry.stage;
+    if (entry.stage === 0) pending.stageZero = entry;
+    else if (entry.stage === 1) pending.base = entry;
+    else if (entry.stage === 2) pending.current = entry;
+    else pending.incoming = entry;
+  }
+  if (pending !== undefined) yield finishStatusIndexGroup(pending);
+}
+
+export function oneStatusIndexGroup(
+  entries: Iterable<IndexEntry>,
+  expectedPath: string,
+): StatusIndexGroup | undefined {
+  let found: StatusIndexGroup | undefined;
+  for (const group of statusIndexGroups(entries)) {
+    if (found !== undefined || group.path !== expectedPath) {
+      throw new CorruptError("sparse status returned index rows for the wrong path");
+    }
+    found = group;
+  }
+  return found;
+}
+
+function finishStatusIndexGroup(group: PendingStatusIndexGroup): StatusIndexGroup {
+  const conflicted =
+    group.base !== undefined || group.current !== undefined || group.incoming !== undefined;
+  if (group.stageZero !== undefined) {
+    if (conflicted) {
+      throw new CorruptError(`status index mixes stage zero and conflict stages for ${group.path}`);
+    }
+    return { kind: "tracked", path: group.path, entry: group.stageZero };
+  }
+  if (!conflicted) throw new CorruptError(`status index path ${group.path} has no stages`);
+  return {
+    kind: "unmerged",
+    path: group.path,
+    base: group.base,
+    current: group.current,
+    incoming: group.incoming,
+  };
+}
+
+function validateStatusIndexEntry(entry: IndexEntry): void {
+  if (typeof entry.path !== "string") throw new CorruptError("status index path is not text");
+  validateMergePath(entry.path, "status index path");
+  if (!Number.isSafeInteger(entry.stage) || entry.stage < 0 || entry.stage > 3) {
+    throw new CorruptError("status index stage is invalid");
+  }
+  if (
+    !Number.isSafeInteger(entry.mode) ||
+    (entry.mode !== 0o100644 &&
+      entry.mode !== 0o100755 &&
+      entry.mode !== 0o120000 &&
+      entry.mode !== 0o160000)
+  ) {
+    throw new CorruptError("status index mode is invalid");
+  }
+  if (typeof entry.oid !== "string" || !isOid(entry.oid)) {
+    throw new CorruptError("status index object id is invalid");
+  }
+  for (const value of [entry.size, entry.mtime, entry.ino, entry.rev]) {
+    if (value !== null && value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new CorruptError("status index metadata is invalid");
+    }
+  }
+}
+
 export function trackedRow(
   path: string,
   head: TargetEntry | undefined,
@@ -76,7 +205,7 @@ export function trackedRow(
   const indexMode = entry === undefined ? ABSENT_MODE : octalMode(entry.mode);
   const indexOid = entry?.oid ?? ZERO_OID;
 
-  let staged: StatusEntry["index"] = " ";
+  let staged: OrdinaryStatusEntry["index"] = " ";
   if (head === undefined) staged = entry === undefined ? " " : "A";
   else if (entry === undefined) staged = "D";
   else if (head.oid !== entry.oid || head.mode !== indexMode) staged = "M";
@@ -104,7 +233,7 @@ function worktreeState(
   worktree: WorktreePath | undefined,
   pending: Omit<PendingTrackedRow, "worktree">,
 ):
-  | { kind: "ready"; code: StatusEntry["worktree"]; mode: string }
+  | { kind: "ready"; code: OrdinaryStatusEntry["worktree"]; mode: string }
   | { kind: "hash"; tracked: PendingTrackedRow } {
   // Not in the index: the file, if any, shows up as untracked instead.
   if (entry === undefined) return { kind: "ready", code: " ", mode: ABSENT_MODE };
@@ -168,7 +297,7 @@ export function* flushStatusRows(
     const hashed = hashes.get(tracked.path);
     const actualOid = mappedOids.get(tracked.path) ?? hashed?.oid;
     const actualMode = hashed?.mode ?? gitModeFor(tracked.worktree.stat);
-    const code: StatusEntry["worktree"] =
+    const code: OrdinaryStatusEntry["worktree"] =
       actualOid === undefined
         ? "D"
         : actualOid !== tracked.indexOid || actualMode !== tracked.indexMode
@@ -191,14 +320,14 @@ export function* flushStatusRows(
 
 function statusDetail(
   path: string,
-  staged: StatusEntry["index"],
-  code: StatusEntry["worktree"],
+  staged: OrdinaryStatusEntry["index"],
+  code: OrdinaryStatusEntry["worktree"],
   headMode: string,
   indexMode: string,
   worktreeMode: string,
   headOid: string,
   indexOid: string,
-): StatusDetail {
+): OrdinaryStatusDetail {
   return {
     path,
     index: staged,
@@ -213,6 +342,49 @@ function statusDetail(
 
 export function untrackedRow(path: string): StatusDetail {
   return statusDetail(path, " ", "?", ABSENT_MODE, ABSENT_MODE, ABSENT_MODE, ZERO_OID, ZERO_OID);
+}
+
+export function unmergedRow(
+  group: Extract<StatusIndexGroup, { kind: "unmerged" }>,
+  worktree: WorktreePath | undefined,
+): UnmergedStatusDetail {
+  const [index, worktreeCode] = unmergedCodes(group);
+  return {
+    unmerged: true,
+    path: group.path,
+    index,
+    worktree: worktreeCode,
+    baseMode: indexMode(group.base),
+    currentMode: indexMode(group.current),
+    incomingMode: indexMode(group.incoming),
+    worktreeMode:
+      worktree === undefined || worktree.stat.type === "dir"
+        ? ABSENT_MODE
+        : gitModeFor(worktree.stat),
+    baseOid: group.base?.oid ?? ZERO_OID,
+    currentOid: group.current?.oid ?? ZERO_OID,
+    incomingOid: group.incoming?.oid ?? ZERO_OID,
+  };
+}
+
+function unmergedCodes(
+  group: Extract<StatusIndexGroup, { kind: "unmerged" }>,
+): readonly [UnmergedStatusCode, UnmergedStatusCode] {
+  const base = group.base !== undefined;
+  const current = group.current !== undefined;
+  const incoming = group.incoming !== undefined;
+  if (base && !current && !incoming) return ["D", "D"];
+  if (!base && current && !incoming) return ["A", "U"];
+  if (base && current && !incoming) return ["U", "D"];
+  if (!base && !current && incoming) return ["U", "A"];
+  if (base && !current && incoming) return ["D", "U"];
+  if (!base && current && incoming) return ["A", "A"];
+  if (base && current && incoming) return ["U", "U"];
+  throw new CorruptError(`status index path ${group.path} has no conflict stages`);
+}
+
+function indexMode(entry: IndexEntry | undefined): string {
+  return entry === undefined ? ABSENT_MODE : octalMode(entry.mode);
 }
 
 export function octalMode(mode: number): string {

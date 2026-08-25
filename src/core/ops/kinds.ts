@@ -15,10 +15,20 @@ export type { CatFileResult, CommitView, TreeEntryView } from "./reads.js";
  * formatting a commit date has to negate.
  */
 
+export type OrdinaryStatusIndexCode = " " | "A" | "M" | "D";
+export type OrdinaryStatusWorktreeCode = " " | "A" | "M" | "D" | "?";
+export type UnmergedStatusCode = "A" | "D" | "U";
+
+export interface OrdinaryStatusEntry {
+  path: string;
+  index: OrdinaryStatusIndexCode;
+  worktree: OrdinaryStatusWorktreeCode;
+}
+
 export interface StatusEntry {
   path: string;
-  index: " " | "A" | "M" | "D";
-  worktree: " " | "A" | "M" | "D" | "?";
+  index: OrdinaryStatusIndexCode | UnmergedStatusCode;
+  worktree: OrdinaryStatusWorktreeCode | UnmergedStatusCode;
 }
 
 /**

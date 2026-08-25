@@ -18,7 +18,7 @@ import {
   nestedRoots,
   openRepository,
 } from "../../core/context.js";
-import { UnsupportedOperationError } from "../../core/errors.js";
+import { GitError, UnsupportedOperationError } from "../../core/errors.js";
 import { commit as commitOp } from "../../core/ops/commit.js";
 import {
   configGet,
@@ -125,7 +125,15 @@ export function createSqliteGitClient(
         // a superset, and handing it back would be a silent shape change
         // for anyone comparing or serialising the result. Callers wanting
         // the modes and oids use the `status` op directly.
-        return rows.map((row) => ({ path: row.path, index: row.index, worktree: row.worktree }));
+        return rows.map((row) => {
+          if (row.unmerged === true) {
+            throw new GitError(
+              "EUNMERGED",
+              `Computer status cannot represent conflict at ${row.path}`,
+            );
+          }
+          return { path: row.path, index: row.index, worktree: row.worktree };
+        });
       },
       async diff(input = {}) {
         return diffOp(at(input.dir), ctx().worktree, input);

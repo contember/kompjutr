@@ -259,6 +259,9 @@ describe("sparse eager status", () => {
       sparseTrackerContext(workspace),
     );
     expect(actual).toEqual(expected);
+    expect(actual).toContainEqual(
+      expect.objectContaining({ path: "conflict.txt", index: "U", worktree: "U" }),
+    );
     expect([
       ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId),
     ]).toContainEqual({ path: "conflict.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY });

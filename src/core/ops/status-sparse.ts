@@ -11,9 +11,12 @@ import {
   type BufferedStatusRow,
   flushStatusRows,
   octalMode,
+  oneStatusIndexGroup,
   type StatusDetail,
+  type StatusIndexGroup,
   type StatusOptions,
   trackedRow,
+  unmergedRow,
   untrackedRow,
 } from "./status-rows.js";
 import {
@@ -165,9 +168,9 @@ export function sparseStatus(
     if (path === undefined || row === undefined || row.path !== path) {
       throw new CorruptError("sparse status hydration returned unordered rows");
     }
-    const stage = row.index.find((entry) => entry.stage === 0);
+    const group = oneStatusIndexGroup(row.index, row.path);
     const untracked =
-      row.current === null && stage === undefined && sparseWorktreePath(row) !== undefined;
+      row.current === null && group === undefined && sparseWorktreePath(row) !== undefined;
     if (!untracked) continue;
     if (ignores === undefined) ignores = loadIgnoreMatcher(worktree, repo.root);
     const ignored = ignores.ignores(path, false);
@@ -184,20 +187,23 @@ export function sparseStatus(
     const row = hydrated.rows[index];
     if (path === undefined || row === undefined)
       throw new CorruptError("sparse status row missing");
-    const stage = row.index.find((entry) => entry.stage === 0);
+    const group = oneStatusIndexGroup(row.index, row.path);
+    const stage = group?.kind === "tracked" ? group.entry : undefined;
     const worktreePath = sparseWorktreePath(row);
-    const untracked = row.current === null && stage === undefined && worktreePath !== undefined;
+    const untracked = row.current === null && group === undefined && worktreePath !== undefined;
     const ignored = ignoredUntracked.has(path);
     if (untracked && options.includeIgnored !== true && ignored) {
       retained.set(path, SPARSE_WORKTREE_DIRTY);
     } else if (untracked) {
       buffered.push({ kind: "ready", detail: untrackedRow(path) });
+    } else if (group?.kind === "unmerged") {
+      buffered.push({ kind: "ready", detail: unmergedRow(group, worktreePath) });
     } else {
       const detail = trackedRow(path, sparseTarget(path, row), stage, worktreePath);
       if (detail !== null) buffered.push(detail);
     }
     let flags = retained.get(path) ?? 0;
-    if (sparseIndexDirty(row, stage) || stage?.mode === 0o160000) flags |= SPARSE_INDEX_DIRTY;
+    if (sparseIndexDirty(row, group) || stage?.mode === 0o160000) flags |= SPARSE_INDEX_DIRTY;
     if (worktreeComparison.dirty.has(path)) flags |= SPARSE_WORKTREE_DIRTY;
     if (flags !== 0) retained.set(path, flags);
   }
@@ -214,8 +220,9 @@ export function sparseStatus(
   return details;
 }
 
-function sparseIndexDirty(row: SparseWorkspaceRow, stage: IndexEntry | undefined): boolean {
-  if (row.index.some((entry) => entry.stage !== 0)) return true;
+function sparseIndexDirty(row: SparseWorkspaceRow, group: StatusIndexGroup | undefined): boolean {
+  if (group?.kind === "unmerged") return true;
+  const stage = group?.entry;
   if (row.current === null) return stage !== undefined;
   return (
     stage === undefined ||
@@ -232,7 +239,12 @@ function compareSparseWorktree(
   const dirty = new Set<string>();
   const pending: Array<{ entry: IndexEntry; worktree: WorktreePath }> = [];
   for (const row of rows) {
-    const entry = row.index.find((candidate) => candidate.stage === 0);
+    const group = oneStatusIndexGroup(row.index, row.path);
+    if (group?.kind === "unmerged") {
+      dirty.add(row.path);
+      continue;
+    }
+    const entry = group?.entry;
     const candidate = sparseWorktreePath(row);
     if (entry === undefined) {
       if (candidate !== undefined) dirty.add(row.path);

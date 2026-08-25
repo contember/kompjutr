@@ -345,6 +345,43 @@ describe("createSqliteGitClient", () => {
     });
   });
 
+  it("reports native conflicts after reopen and rejects them on the Computer facade", async () => {
+    const { workspace, storage } = makeWorkspace();
+    const compat = workspace.git;
+    await compat.init({});
+    await workspace.fs.writeFile("/conflict.txt", "base\n");
+    await compat.add({ paths: ["conflict.txt"] });
+    await compat.commit({ message: "base" });
+    await compat.branch({ name: "topic" });
+    await compat.checkout({ ref: "topic" });
+    await workspace.fs.writeFile("/conflict.txt", "incoming\n");
+    await compat.add({ paths: ["conflict.txt"] });
+    await compat.commit({ message: "topic" });
+    await compat.checkout({ ref: "main" });
+    await workspace.fs.writeFile("/conflict.txt", "current\n");
+    await compat.add({ paths: ["conflict.txt"] });
+    await compat.commit({ message: "main" });
+
+    const binding = {
+      database: new SqliteGitDatabase(new TestDatabase(storage)),
+      worktree: new ComputerWorktree(workspace.provider()),
+      now: () => 1_600_000_000_000,
+      timezoneOffset: () => 0,
+      defaultIdentity: IDENTITY,
+    };
+    const native = createGit()(binding);
+    await expect(native.merge({ theirs: "topic" })).resolves.toEqual({
+      conflicted: true,
+      pendingCommit: true,
+    });
+    const reopened = createGit()(binding);
+
+    await expect(reopened.status()).resolves.toEqual([
+      { path: "conflict.txt", index: "U", worktree: "U" },
+    ]);
+    await expect(compat.status()).rejects.toMatchObject({ code: "EUNMERGED" });
+  });
+
   it("blocks ordinary native commit during replay and lets hard reset clear it", async () => {
     const { workspace, storage } = makeWorkspace();
     await workspace.git.init({});
@@ -422,11 +459,17 @@ describe("createSqliteGitClient", () => {
     await commitFile(git, workspace, dir, "conflict.txt", "current\n", "main");
 
     await expect(git.cherryPick({ dir, source })).resolves.toEqual({ outcome: "conflicted" });
+    await expect(git.status({ dir })).resolves.toEqual([
+      { path: "conflict.txt", index: "U", worktree: "U" },
+    ]);
     writeWorkFile(workspace, `${dir}/conflict.txt`, "resolved\n");
     await git.add({ dir, paths: ["conflict.txt"] });
     await expect(git.cherryPickContinue({ dir })).resolves.toMatchObject({ outcome: "committed" });
 
     await expect(git.revert({ dir, source })).resolves.toEqual({ outcome: "conflicted" });
+    await expect(git.status({ dir })).resolves.toEqual([
+      { path: "conflict.txt", index: "U", worktree: "U" },
+    ]);
     await expect(git.cherryPickContinue({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
     await expect(git.cherryPickSkip({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
     await expect(git.cherryPickAbort({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
@@ -467,6 +510,9 @@ describe("createSqliteGitClient", () => {
   it("routes rebase continue, skip, and abort through a reopened native client", async () => {
     const continued = await conflictingRebase();
     const continuedGit = bindNativeGit(continued.workspace);
+    await expect(continuedGit.status({ dir: continued.dir })).resolves.toEqual([
+      { path: "shared.txt", index: "U", worktree: "U" },
+    ]);
     writeWorkFile(continued.workspace, `${continued.dir}/shared.txt`, "resolved\n");
     await continuedGit.add({ dir: continued.dir, paths: ["shared.txt"] });
     await expect(continuedGit.rebaseContinue({ dir: continued.dir })).resolves.toMatchObject({
@@ -516,7 +562,9 @@ describe("createSqliteGitClient", () => {
     const { git, workspace, dir, original } = await conflictingRebase();
     const source = await git.revParse({ dir, ref: "upstream" });
 
-    await expect(git.status({ dir })).resolves.toBeDefined();
+    await expect(git.status({ dir })).resolves.toEqual([
+      { path: "shared.txt", index: "U", worktree: "U" },
+    ]);
     await expect(git.diff({ dir })).resolves.toBeDefined();
     writeWorkFile(workspace, `${dir}/added.txt`, "resolution work\n");
     await expect(git.add({ dir, paths: ["added.txt"] })).resolves.toBeUndefined();

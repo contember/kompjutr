@@ -22,7 +22,9 @@ import {
   flushStatusRows,
   type StatusDetail,
   type StatusOptions,
+  statusIndexGroups,
   trackedRow,
+  unmergedRow,
   untrackedRow,
 } from "./status-rows.js";
 import { FullStatusTrackerSeed, sparseStatus } from "./status-sparse.js";
@@ -146,7 +148,7 @@ function* statusStreamInternal(
 
   for (const row of joinSorted3(
     treeStream(repo, headTreeOid),
-    statusIndexEntries(repo.store.indexScan(), seed),
+    statusIndexGroups(repo.store.indexScan()),
     worktreeEntries(repo, worktree, options, ignores, prunable),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
@@ -155,8 +157,12 @@ function* statusStreamInternal(
       if (snapshot.retainsTrackedPaths) retainTrackedPath(snapshot, row.path);
       const matches = matchesPaths(row.path, options.paths);
       if (matches || seed !== undefined) {
-        const detail = trackedRow(row.path, row.a, row.b, row.c);
-        seed?.observeTracked(row.a, row.b, row.c, detail);
+        const detail: BufferedStatusRow | null =
+          row.b?.kind === "unmerged"
+            ? { kind: "ready", detail: unmergedRow(row.b, row.c) }
+            : trackedRow(row.path, row.a, row.b?.entry, row.c);
+        if (row.b?.kind === "unmerged") seed?.observeConflict(row.path);
+        else seed?.observeTracked(row.a, row.b?.entry, row.c, detail);
         if (matches && detail !== null) buffered.push(detail);
       }
       // A tracked path is never also untracked, whatever is on disk.
@@ -203,16 +209,6 @@ function* statusStreamInternal(
   }
   yield* flushStatusRows(repo, worktree, buffered, seed);
   seed?.finish();
-}
-
-function* statusIndexEntries(
-  entries: Iterable<IndexEntry>,
-  seed: FullStatusTrackerSeed | undefined,
-): Generator<IndexEntry> {
-  for (const entry of entries) {
-    if (entry.stage === 0) yield entry;
-    else seed?.observeConflict(entry.path);
-  }
 }
 
 function worktreeFiles(
@@ -304,19 +300,15 @@ function snapshotStatusIndex(
   if (!includeDirectories && !includeTrackedPaths) {
     return { trackedDirs, trackedPaths, budget, retainsTrackedPaths: false };
   }
-  for (const entry of repo.store.indexScan()) {
-    if (entry.stage !== 0) continue;
+  for (const group of statusIndexGroups(repo.store.indexScan())) {
+    const path = group.path;
     if (includeTrackedPaths) {
-      budget.add(trackedPathRetainedBytes(entry.path));
-      trackedPaths.add(entry.path);
+      budget.add(trackedPathRetainedBytes(path));
+      trackedPaths.add(path);
     }
     if (!includeDirectories) continue;
-    for (
-      let slash = entry.path.indexOf("/");
-      slash !== -1;
-      slash = entry.path.indexOf("/", slash + 1)
-    ) {
-      const directory = entry.path.slice(0, slash);
+    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+      const directory = path.slice(0, slash);
       if (trackedDirs.has(directory)) continue;
       budget.add(DIRECTORY_FIXED_BYTES + retainedStringBytes(directory));
       trackedDirs.add(directory);
@@ -364,8 +356,11 @@ function stripSlash(path: string): string {
 /** O(tracked). Only `statusMatrix`, which is not on the client surface, still needs it. */
 function stagedIndex(repo: Repository): Map<string, IndexEntry> {
   const index = new Map<string, IndexEntry>();
-  for (const entry of repo.store.indexScan()) {
-    if (entry.stage === 0) index.set(entry.path, entry);
+  for (const group of statusIndexGroups(repo.store.indexScan())) {
+    if (group.kind === "unmerged") {
+      throw new GitError("EUNMERGED", `status matrix cannot represent conflict at ${group.path}`);
+    }
+    index.set(group.path, group.entry);
   }
   return index;
 }
@@ -388,7 +383,7 @@ export function statusMatrix(
 
   const paths = new Set<string>([...head.keys(), ...index.keys(), ...present]);
   const rows: StatusRow[] = [];
-  for (const path of [...paths].sort()) {
+  for (const path of [...paths].sort(comparePaths)) {
     if (!matchesPaths(path, options.paths)) continue;
     const headOid = head.get(path)?.oid ?? null;
     const stageOid = index.get(path)?.oid ?? null;
@@ -424,6 +419,14 @@ function worktreeOid(
 export function formatPorcelainV2(entries: StatusDetail[]): string {
   const lines: string[] = [];
   for (const entry of entries) {
+    if (entry.unmerged === true) {
+      lines.push(
+        `u ${entry.index}${entry.worktree} N... ` +
+          `${entry.baseMode} ${entry.currentMode} ${entry.incomingMode} ${entry.worktreeMode} ` +
+          `${entry.baseOid} ${entry.currentOid} ${entry.incomingOid} ${entry.path}`,
+      );
+      continue;
+    }
     if (entry.worktree === "?") continue;
     lines.push(
       `1 ${v2Code(entry.index)}${v2Code(entry.worktree)} N... ` +

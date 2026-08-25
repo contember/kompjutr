@@ -315,3 +315,10 @@ updating `docs/reference/git-support.md`, running `npm run check`,
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- 2026-08-25 — WU1 complete. Status now groups and validates `(path, stage)`
+  rows, emits all seven unmerged XY shapes and porcelain v2 `u` records, and
+  preserves conflict truth through sparse hydration and cold reopen. Native
+  merge, cherry-pick, revert, and rebase witnesses report `UU`; the Computer
+  facade rejects unrepresentable conflict rows with `EUNMERGED`. Verification:
+  status 66/66, sparse status 18/18, client 17/17, and typecheck pass.
