@@ -280,6 +280,26 @@ function treeNameBytesIndex(db: TestDatabase): IndexListEntry | undefined {
 }
 
 describe("git schema", () => {
+  it("enables foreign keys before migrating an existing database", () => {
+    const db = new TestDatabase();
+    db.run("PRAGMA foreign_keys = OFF");
+    createV1(db);
+    db.run("INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, 'abc', 'blob', 7)");
+
+    new SqliteGitDatabase(db);
+
+    expect(db.scalar<unknown>("PRAGMA foreign_keys")).toBe(1);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+      String(SCHEMA_VERSION),
+    );
+    expect(db.one("SELECT oid, type, size, stored FROM git_objects")).toEqual({
+      oid: "abc",
+      type: "blob",
+      size: 7,
+      stored: "zlib",
+    });
+  });
+
   it("creates the current schema on a fresh database", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);

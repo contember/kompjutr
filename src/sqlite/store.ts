@@ -1111,6 +1111,13 @@ export function ancestors(path: string): string[] {
   return out;
 }
 
+function enforceForeignKeys(db: SqlDatabase): void {
+  db.run("PRAGMA foreign_keys = ON");
+  if (db.scalar<unknown>("PRAGMA foreign_keys") !== 1) {
+    throw new Error("SQLite adapter did not enable foreign-key enforcement");
+  }
+}
+
 /**
  * Owns the schema and the repository registry. One instance per
  * workspace database; `open()` hands out per-repository stores over the
@@ -1136,6 +1143,7 @@ export class SqliteGitDatabase {
       Math.min(options.chunkBytes ?? MAX_PACK_ROW_CACHE_BYTES, MAX_PACK_ROW_CACHE_BYTES),
       (row) => row.length,
     );
+    enforceForeignKeys(db);
     initializeGitSchema(db);
   }
 
