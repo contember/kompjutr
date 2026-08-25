@@ -5,7 +5,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { utf8 } from "../src/core/bytes.js";
+import { utf8, utf8Decoder } from "../src/core/bytes.js";
 import { type Person, serializeCommit } from "../src/core/objects.js";
 import {
   commit,
@@ -59,7 +59,7 @@ interface Mirror {
   symlink(target: string, path: string): Mirror;
   remove(path: string): Mirror;
   /** Commit the same content on both sides and assert the tree and the commit agree. */
-  expectSameCommit(message: string, extra?: string[]): string;
+  expectSameCommit(message: string, extra?: string[], allowEmpty?: boolean): string;
 }
 
 /** A working tree kept byte-for-byte identical in a git checkout and in DOFS. */
@@ -94,12 +94,12 @@ function mirror(): Mirror {
       workspace.worktree.unlink(`/${path}`);
       return self;
     },
-    expectSameCommit(message, extra = []) {
+    expectSameCommit(message, extra = [], allowEmpty = false) {
       fixture.git("add", "-A");
       fixture.git("commit", "-q", "-m", message, ...extra);
       const theirs = fixture.git("rev-parse", "HEAD");
       stageAll(workspace);
-      const ours = commit(workspace.context, workspace.repo, { message }).oid;
+      const ours = commit(workspace.context, workspace.repo, { message, allowEmpty }).oid;
       // Compare the tree first: a mismatch there localises the failure.
       expect(workspace.repo.readCommit(ours).tree).toBe(fixture.git("rev-parse", "HEAD^{tree}"));
       expect(ours).toBe(theirs);
@@ -182,11 +182,11 @@ describe("commit oids match git", () => {
     repo.expectSameCommit("non-ascii");
   });
 
-  it("hashes an empty commit with the parent's tree", () => {
+  it("allows an empty commit explicitly and hashes the parent's tree", () => {
     const repo = mirror();
     repo.write("only.txt", "only\n");
     const first = repo.expectSameCommit("first");
-    const second = repo.expectSameCommit("empty", ["--allow-empty"]);
+    const second = repo.expectSameCommit("empty", ["--allow-empty"], true);
     const parent = repo.workspace.repo.readCommit(first);
     const empty = repo.workspace.repo.readCommit(second);
     expect(empty.tree).toBe(parent.tree);
@@ -425,21 +425,32 @@ describe("identity", () => {
       message: "explicit",
       author: { name: "Explicit", email: "explicit@example.com" },
       env,
+      allowEmpty: true,
     }).oid;
     expect(workspace.repo.readCommit(explicit).author).toMatchObject({
       name: "Explicit",
       email: "explicit@example.com",
     });
 
-    const fromEnv = commit(workspace.context, workspace.repo, { message: "env", env }).oid;
+    const fromEnv = commit(workspace.context, workspace.repo, {
+      message: "env",
+      env,
+      allowEmpty: true,
+    }).oid;
     expect(workspace.repo.readCommit(fromEnv).author.name).toBe("Env");
 
-    const fromConfig = commit(workspace.context, workspace.repo, { message: "config" }).oid;
+    const fromConfig = commit(workspace.context, workspace.repo, {
+      message: "config",
+      allowEmpty: true,
+    }).oid;
     expect(workspace.repo.readCommit(fromConfig).author.name).toBe("Config");
 
     workspace.repo.store.configUnset("user.name");
     workspace.repo.store.configUnset("user.email");
-    const fromDefault = commit(workspace.context, workspace.repo, { message: "default" }).oid;
+    const fromDefault = commit(workspace.context, workspace.repo, {
+      message: "default",
+      allowEmpty: true,
+    }).oid;
     expect(workspace.repo.readCommit(fromDefault).author.name).toBe("Default");
   });
 
@@ -447,13 +458,18 @@ describe("identity", () => {
     const workspace = makeRepo("/");
     const author = { name: "Author", email: "author@example.com" };
 
-    const shared = commit(workspace.context, workspace.repo, { message: "shared", author }).oid;
+    const shared = commit(workspace.context, workspace.repo, {
+      message: "shared",
+      author,
+      allowEmpty: true,
+    }).oid;
     expect(workspace.repo.readCommit(shared).committer).toMatchObject(author);
 
     const split = commit(workspace.context, workspace.repo, {
       message: "split",
       author,
       env: { GIT_COMMITTER_NAME: "Committer", GIT_COMMITTER_EMAIL: "committer@example.com" },
+      allowEmpty: true,
     }).oid;
     expect(workspace.repo.readCommit(split).committer).toMatchObject({
       name: "Committer",
@@ -504,6 +520,66 @@ describe("refusals", () => {
     expect(() => commit(workspace.context, workspace.repo, { message: "  \n" })).toThrow(
       /message is required/,
     );
+  });
+
+  it("refuses an empty root commit like git", () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    const workspace = makeRepo("/");
+    useIdentity(workspace);
+
+    expect(() => fixture.git("commit", "-q", "-m", "empty root")).toThrow();
+    expect(() => commit(workspace.context, workspace.repo, { message: "empty root" })).toThrow(
+      expect.objectContaining({ code: "EEMPTYCOMMIT" }),
+    );
+
+    expect(workspace.repo.head()).toEqual({ ref: "refs/heads/main", oid: null });
+    expect(workspace.repo.store.objectCount()).toBe(0);
+  });
+
+  it("refuses an unchanged index like git without changing repository state", () => {
+    const repo = mirror();
+    repo.write("a.txt", "one\n");
+    const first = repo.expectSameCommit("first");
+    const before = {
+      head: repo.workspace.repo.head(),
+      refs: repo.workspace.repo.store.listRefs(),
+      index: repo.workspace.repo.store.indexEntries(),
+      objects: repo.workspace.repo.store.objectCount(),
+      operation: repo.workspace.repo.store.readOperationState(),
+      paths: walkWorktree(repo.workspace.worktree, repo.workspace.repo.root),
+      content: utf8Decoder.decode(repo.workspace.worktree.readFile("/a.txt")),
+    };
+
+    expect(() => repo.fixture.git("commit", "-q", "-m", "unchanged")).toThrow();
+    expect(() =>
+      commit(repo.workspace.context, repo.workspace.repo, { message: "unchanged" }),
+    ).toThrow(expect.objectContaining({ code: "EEMPTYCOMMIT" }));
+
+    expect(repo.workspace.repo.head()).toEqual(before.head);
+    expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(first);
+    expect(repo.workspace.repo.store.listRefs()).toEqual(before.refs);
+    expect(repo.workspace.repo.store.indexEntries()).toEqual(before.index);
+    expect(repo.workspace.repo.store.objectCount()).toBe(before.objects);
+    expect(repo.workspace.repo.store.readOperationState()).toEqual(before.operation);
+    expect(walkWorktree(repo.workspace.worktree, repo.workspace.repo.root)).toEqual(before.paths);
+    expect(utf8Decoder.decode(repo.workspace.worktree.readFile("/a.txt"))).toBe(before.content);
+  });
+
+  it("refuses restaged content identical to HEAD like git", () => {
+    const repo = mirror();
+    repo.write("a.txt", "same\n");
+    repo.expectSameCommit("first");
+
+    repo.fixture.write("a.txt", "same\n");
+    repo.fixture.git("add", "-A");
+    writeWorkFile(repo.workspace, "/a.txt", "same\n");
+    stageAll(repo.workspace);
+
+    expect(() => repo.fixture.git("commit", "-q", "-m", "restaged")).toThrow();
+    expect(() =>
+      commit(repo.workspace.context, repo.workspace.repo, { message: "restaged" }),
+    ).toThrow(expect.objectContaining({ code: "EEMPTYCOMMIT" }));
   });
 });
 

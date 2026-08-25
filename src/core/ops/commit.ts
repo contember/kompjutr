@@ -3,7 +3,7 @@
 
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, MissingIdentityError } from "../errors.js";
-import { type Commit, type Person, serializeCommit } from "../objects.js";
+import { type Commit, hashObject, type Person, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import type { CommitResult } from "./kinds.js";
 import { MAX_MERGE_IDENTITY_BYTES, MAX_MERGE_MESSAGE_BYTES } from "./merge-state.js";
@@ -12,13 +12,16 @@ import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js"
 const OBJECT_BATCH_BYTES = 1024 * 1024;
 const OBJECT_BATCH_COUNT = 4_096;
 const TREE_INDEX_ROWS = 2_048;
+const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
 
-/** Mirrors Computer's `GitCommitOptions`, minus `dir` — the repository is already resolved. */
+/** Native commit options; Computer-compatible fields plus explicit empty-commit policy. */
 export interface CommitOptions {
   message: string;
   author?: GitIdentity;
   committer?: GitIdentity;
   amend?: boolean;
+  /** Permit an ordinary commit whose tree is identical to its first parent. */
+  allowEmpty?: boolean;
   /** Read for GIT_AUTHOR_* / GIT_COMMITTER_*; never pulled from `process.env`. */
   env?: Record<string, string>;
 }
@@ -84,13 +87,25 @@ export function commit(
     const head = repo.head();
     const amended = options.amend === true ? readAmended(repo, head) : undefined;
     const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
+    const baselineTree =
+      amended !== undefined
+        ? undefined
+        : head.oid === null
+          ? EMPTY_TREE_OID
+          : repo.readCommit(head.oid).tree;
     const identities = resolveIdentity(context, repo, options, amended);
-    return publishCommit(repo, {
-      message: options.message,
-      parent,
-      identities,
-      expectedHead: head,
-    });
+    const result = writeCommitObjects(
+      repo,
+      {
+        parent,
+        identities,
+      },
+      { mode: "clean", value: options.message },
+    );
+    if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
+      throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
+    }
+    return publishCommitResult(repo, head, result);
   });
 }
 
@@ -141,9 +156,17 @@ function writeCommitObjects(
 /** Caller owns the transaction and has already validated `expectedHead`. */
 function publishCommit(repo: Repository, options: IndexedCommitOptions): CommitResult {
   const result = writeCommitObjects(repo, options, { mode: "clean", value: options.message });
+  return publishCommitResult(repo, options.expectedHead, result);
+}
+
+function publishCommitResult(
+  repo: Repository,
+  expectedHead: ResolvedHead,
+  result: UnpublishedCommitResult,
+): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
-  if (options.expectedHead.ref === null) repo.store.setHead(result.oid);
-  else repo.store.setRef(options.expectedHead.ref, result.oid);
+  if (expectedHead.ref === null) repo.store.setHead(result.oid);
+  else repo.store.setRef(expectedHead.ref, result.oid);
   return { oid: result.oid };
 }
 
