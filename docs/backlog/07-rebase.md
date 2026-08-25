@@ -1,7 +1,7 @@
 ---
 id: 07
 title: Implement rebase
-blocked-by: []
+blocked-by: [./24-operation-step-journal.md]
 ---
 
 # 07 — Implement rebase

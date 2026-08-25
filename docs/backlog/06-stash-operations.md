@@ -1,7 +1,7 @@
 ---
 id: 06
 title: Implement stash operations
-blocked-by: []
+blocked-by: [./24-operation-step-journal.md]
 ---
 
 # 06 — Implement stash operations
