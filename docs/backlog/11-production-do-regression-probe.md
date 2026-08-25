@@ -13,15 +13,18 @@ memory, restart, and wall-time behaviour instead of extrapolating from Node.
 
 The local benchmark transfers SQL statement counts but explicitly does not prove
 production isolate memory or latency. Clone has production evidence from a pinned
-revision, while the current release head and Smart HTTP push do not have a
-repeatable release regression lane.
+revision, while the current release head, Smart HTTP push, and restart-safe
+integration operations do not have a repeatable release regression lane.
 
 ## Approach / acceptance
 
 - Package a deterministic probe for clone, fetch, local mutation, commit, push,
-  reopen, and physical repository audit on a release candidate.
+  clean and conflicting rebase, continue, abort, reopen, and physical repository
+  audit on a release candidate.
 - Record operation SQL counts, external wall time, platform analytics, response
   correctness, and state correctness after a fresh Durable Object instance.
+- Restart the Durable Object at rebase journal boundaries and verify that refs,
+  index, worktree, and unpublished replay commits recover together.
 - Separate application failures, storage resets, and isolate resets. Never infer
   platform memory from Node process RSS.
 - Keep deployment and credentials in an explicitly authorized CI or operator
