@@ -302,3 +302,7 @@ gates run serially through `cpu-lease`.
   messages, including empty and non-canonical messages, while public commit
   paths retain their existing cleanup. Commit materialization now exposes one
   shared preflight cost model and leaves ref publication to its caller.
+- 2026-08-25, WU2 review: replay and rebase share one bounded authoritative
+  revision resolver without changing replay validation precedence. Planner
+  limits are lower-only, so exact step, retained-byte, and graph boundaries are
+  testable without weakening the production ceilings.

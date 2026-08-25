@@ -381,6 +381,21 @@ describe("one-commit replay planner", () => {
     );
   });
 
+  it("validates the source revision before a competing invalid current oid", () => {
+    const { repo } = harness();
+
+    expect(() =>
+      planReplay(repo, { kind: "cherry-pick", source: "", currentOid: "invalid" }),
+    ).toThrowError("replay source revision is required");
+    expect(() =>
+      planReplay(repo, {
+        kind: "revert",
+        source: "x".repeat(MAX_REPLAY_REVISION_CODE_UNITS + 1),
+        currentOid: "invalid",
+      }),
+    ).toThrowError(`replay source revision exceeds ${MAX_REPLAY_REVISION_CODE_UNITS} code units`);
+  });
+
   it("does not populate the derived commit cache on success or a later planning failure", () => {
     const { db, store, repo } = harness();
     const baseTree = tree(store, "base\n");
@@ -442,6 +457,13 @@ describe("one-commit replay planner", () => {
         }),
       "E2BIG",
     );
+    expect(() =>
+      planReplay(repo, {
+        kind: "revert",
+        source: `${tip}~999999999999999999999999999999999999999999999999999999999999`,
+        currentOid: tip,
+      }),
+    ).toThrowError("replay revision ordinal exceeds the safe integer range");
   });
 
   it("resolves abbreviated commits, annotated tags, and bounded parent suffixes", () => {

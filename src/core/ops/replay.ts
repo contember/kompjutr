@@ -53,14 +53,19 @@ export interface ReplayPlan {
   sqlStatements: number;
 }
 
-function requireRevision(value: unknown): string {
+export interface BoundedRevisionLabels {
+  input: string;
+  operation: string;
+}
+
+export function requireBoundedRevision(value: unknown, labels: BoundedRevisionLabels): string {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new GitError("EINVAL", "replay source revision is required");
+    throw new GitError("EINVAL", `${labels.input} revision is required`);
   }
   if (value.length > MAX_REPLAY_REVISION_CODE_UNITS) {
     throw new GitError(
       "E2BIG",
-      `replay source revision exceeds ${MAX_REPLAY_REVISION_CODE_UNITS} code units`,
+      `${labels.input} revision exceeds ${MAX_REPLAY_REVISION_CODE_UNITS} code units`,
     );
   }
   return value;
@@ -90,7 +95,7 @@ function readCommit(repo: Repository, oid: string): Commit {
   return parseCommit(object.data);
 }
 
-function peelCommit(repo: Repository, start: string): string {
+function peelCommit(repo: Repository, start: string, operation: string): string {
   let oid = start;
   const seen = new Set<string>();
   for (let hops = 0; ; hops++) {
@@ -100,7 +105,7 @@ function peelCommit(repo: Repository, start: string): string {
     if (metadata === undefined) throw new ObjectNotFoundError(oid);
     if (metadata.type === "commit" || metadata.type !== "tag") return oid;
     if (metadata.size > MAX_INDEXED_COMMIT_BYTES) {
-      throw new CorruptError(`tag ${oid} exceeds the replay metadata size limit`);
+      throw new CorruptError(`tag ${oid} exceeds the ${operation} metadata size limit`);
     }
     const object = repo.read(oid);
     if (
@@ -129,13 +134,13 @@ function resolveBase(repo: Repository, base: string): string {
   throw new RefNotFoundError(base);
 }
 
-function revisionOrdinal(digits: string): number {
+function revisionOrdinal(digits: string, operation: string): number {
   if (digits === "") return 1;
   let value = 0;
   for (let index = 0; index < digits.length; index++) {
     const digit = digits.charCodeAt(index) - 0x30;
     if (value > Math.floor((Number.MAX_SAFE_INTEGER - digit) / 10)) {
-      throw new GitError("E2BIG", "replay revision ordinal exceeds the safe integer range");
+      throw new GitError("E2BIG", `${operation} revision ordinal exceeds the safe integer range`);
     }
     value = value * 10 + digit;
   }
@@ -148,11 +153,15 @@ function parent(
   which: number,
   expression: string,
   traversal: RevisionTraversal,
+  labels: BoundedRevisionLabels,
 ): string {
   if (traversal.hops >= MAX_REPLAY_REVISION_HOPS) {
-    throw new GitError("E2BIG", `replay revision exceeds ${MAX_REPLAY_REVISION_HOPS} parent hops`);
+    throw new GitError(
+      "E2BIG",
+      `${labels.operation} revision exceeds ${MAX_REPLAY_REVISION_HOPS} parent hops`,
+    );
   }
-  const commitOid = peelCommit(repo, oid);
+  const commitOid = peelCommit(repo, oid, labels.operation);
   if (!traversal.commits.has(commitOid)) traversal.commits.add(commitOid);
   const next = readCommit(repo, commitOid).parent[which - 1];
   if (next === undefined) throw new RefNotFoundError(expression);
@@ -164,7 +173,11 @@ function parent(
   return next;
 }
 
-function resolveRevision(repo: Repository, expression: string): string {
+function resolveRevision(
+  repo: Repository,
+  expression: string,
+  labels: BoundedRevisionLabels,
+): string {
   const trimmed = expression.trim();
   if (trimmed === "") throw new RefNotFoundError(expression);
   let split = trimmed.length;
@@ -189,26 +202,35 @@ function resolveRevision(repo: Repository, expression: string): string {
       digits += unit;
       position++;
     }
-    const ordinal = revisionOrdinal(digits);
+    const ordinal = revisionOrdinal(digits, labels.operation);
     if (operator === "^") {
       if (ordinal === 0) {
-        oid = peelCommit(repo, oid);
+        oid = peelCommit(repo, oid, labels.operation);
       } else {
-        oid = parent(repo, oid, ordinal, expression, traversal);
+        oid = parent(repo, oid, ordinal, expression, traversal, labels);
       }
       continue;
     }
     if (ordinal > MAX_REPLAY_REVISION_HOPS - traversal.hops) {
       throw new GitError(
         "E2BIG",
-        `replay revision exceeds ${MAX_REPLAY_REVISION_HOPS} parent hops`,
+        `${labels.operation} revision exceeds ${MAX_REPLAY_REVISION_HOPS} parent hops`,
       );
     }
     for (let hop = 0; hop < ordinal; hop++) {
-      oid = parent(repo, oid, 1, expression, traversal);
+      oid = parent(repo, oid, 1, expression, traversal, labels);
     }
   }
-  return peelCommit(repo, oid);
+  return peelCommit(repo, oid, labels.operation);
+}
+
+/** Resolve and peel one revision through bounded, authoritative metadata reads. */
+export function resolveBoundedCommitRevision(
+  repo: Repository,
+  value: unknown,
+  labels: BoundedRevisionLabels,
+): string {
+  return resolveRevision(repo, requireBoundedRevision(value, labels), labels);
 }
 
 function requireMainline(
@@ -269,13 +291,17 @@ function incomingLabel(
 
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
 export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
-  const sourceRevision = requireRevision(input.source);
+  const revisionLabels: BoundedRevisionLabels = {
+    input: "replay source",
+    operation: "replay",
+  };
+  const sourceRevision = requireBoundedRevision(input.source, revisionLabels);
   if (!isOid(input.currentOid)) {
     throw new GitError("EINVAL", "replay current commit must be a full object id");
   }
 
   const currentCommit = readCommit(repo, input.currentOid);
-  const sourceOid = resolveRevision(repo, sourceRevision);
+  const sourceOid = resolveRevision(repo, sourceRevision, revisionLabels);
   const sourceCommit = readCommit(repo, sourceOid);
   const mainline = requireMainline(input.kind, sourceCommit.parent.length, input.mainline);
   const selectedParentOid =
