@@ -8,9 +8,42 @@
 import { isOid, utf8, utf8Decoder } from "../core/bytes.js";
 import { CorruptError } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
+import {
+  MAX_MERGE_IDENTITY_BYTES,
+  MAX_MERGE_LABEL_BYTES,
+  MAX_MERGE_MESSAGE_BYTES,
+  MAX_MERGE_PATH_BYTES,
+  MAX_MERGE_REF_BYTES,
+  MAX_MERGE_STATE_BYTES,
+  MAX_MERGE_TOUCHED_PATHS,
+  type MergeIndexSnapshot,
+  type MergeSavedIdentity,
+  type MergeStateMetadata,
+  type MergeTouchedPath,
+  type MergeWorktreeSnapshot,
+  requireMergeInteger,
+  requireMergeMode,
+  requireMergeNullableInteger,
+  requireMergeOid,
+  requireMergePhase,
+  requireMergePurpose,
+  requireMergeText,
+} from "../core/ops/merge-state.js";
+import {
+  type MergeOperationStateMetadata,
+  mergeOperationState,
+  type OperationStepMetadata,
+  operationJournalIntegrityOid,
+  operationJournalRetainedBytes,
+  operationJournalV10IntegrityOid,
+  operationJournalV10RetainedBytes,
+  operationStepsForState,
+  type ReplayStateMetadata,
+} from "../core/ops/operation-state.js";
+import { comparePaths } from "../core/streams.js";
 import { blob, type SqlDatabase } from "./db.js";
 
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 /** SQLite queue record, four integer fields, and bounded error fields. */
 export const TREE_QUEUE_ROW_FIXED_BYTES = 64 + 4 * 8 + 96;
 
@@ -32,6 +65,70 @@ const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
   object_size INTEGER NOT NULL,
   cache_bytes INTEGER NOT NULL,
   PRIMARY KEY (repo_id, oid)
+) WITHOUT ROWID`;
+
+const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_state (
+  repo_id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('merge', 'cherry-pick', 'revert', 'rebase')),
+  original_head_ref TEXT NOT NULL,
+  original_head_oid TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('conflicted', 'ready', 'empty', 'running')),
+  empty_reason TEXT CHECK (empty_reason IN ('source', 'result')),
+  current_parent_oid TEXT,
+  incoming_parent_oid TEXT,
+  upstream_oid TEXT,
+  base_oid TEXT,
+  mode TEXT CHECK (mode IN ('commit', 'no-commit')),
+  current_step INTEGER NOT NULL,
+  step_count INTEGER NOT NULL,
+  current_label TEXT NOT NULL,
+  incoming_label TEXT NOT NULL,
+  message TEXT NOT NULL,
+  author_name TEXT,
+  author_email TEXT,
+  committer_name TEXT,
+  committer_email TEXT,
+  touched_count INTEGER NOT NULL,
+  retained_bytes INTEGER NOT NULL,
+  integrity_oid TEXT NOT NULL,
+  CHECK (
+    (kind = 'merge' AND phase IN ('conflicted', 'ready') AND empty_reason IS NULL
+       AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NOT NULL
+       AND upstream_oid IS NULL AND base_oid IS NULL AND mode IS NOT NULL
+       AND current_step = 0 AND step_count = 0
+       AND (phase != 'ready' OR mode = 'no-commit'))
+    OR
+    (kind IN ('cherry-pick', 'revert') AND phase IN ('conflicted', 'empty')
+       AND current_parent_oid IS NULL AND incoming_parent_oid IS NULL
+       AND upstream_oid IS NULL AND base_oid IS NULL AND mode IS NULL
+       AND current_step = 0 AND step_count = 1
+       AND ((phase = 'conflicted' AND empty_reason IS NULL)
+         OR (phase = 'empty' AND empty_reason IS NOT NULL)))
+    OR
+    (kind = 'rebase' AND phase IN ('running', 'conflicted') AND empty_reason IS NULL
+       AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NULL
+       AND upstream_oid IS NOT NULL AND base_oid IS NOT NULL AND mode IS NULL
+       AND typeof(current_step) = 'integer' AND current_step >= 0
+       AND typeof(step_count) = 'integer' AND step_count >= 1
+       AND current_step <= step_count
+       AND (phase != 'conflicted' OR current_step < step_count))
+  ),
+  CHECK ((author_name IS NULL) = (author_email IS NULL)),
+  CHECK ((committer_name IS NULL) = (committer_email IS NULL))
+)`;
+
+const OPERATION_STEPS_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_steps (
+  repo_id INTEGER NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
+  source_oid TEXT NOT NULL,
+  selected_parent_oid TEXT,
+  mainline INTEGER CHECK (mainline IS NULL OR (typeof(mainline) = 'integer' AND mainline >= 1)),
+  outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'applied', 'skipped')),
+  result_oid TEXT,
+  PRIMARY KEY (repo_id, ordinal),
+  CHECK ((outcome = 'applied' AND result_oid IS NOT NULL)
+      OR (outcome IN ('pending', 'skipped') AND result_oid IS NULL)),
+  CHECK (mainline IS NULL OR selected_parent_oid IS NOT NULL)
 ) WITHOUT ROWID`;
 
 const STATEMENTS = [
@@ -97,46 +194,11 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, path)
    ) WITHOUT ROWID`,
 
-  // One durable, incomplete integration operation per repository. Applying is
-  // never persisted: the enclosing database transaction makes it atomic.
-  `CREATE TABLE IF NOT EXISTS git_operation_state (
-     repo_id INTEGER PRIMARY KEY,
-     kind TEXT NOT NULL CHECK (kind IN ('merge', 'cherry-pick', 'revert')),
-     original_head_ref TEXT NOT NULL,
-     original_head_oid TEXT NOT NULL,
-     phase TEXT NOT NULL CHECK (phase IN ('conflicted', 'ready', 'empty')),
-     empty_reason TEXT CHECK (empty_reason IN ('source', 'result')),
-     current_parent_oid TEXT,
-     incoming_parent_oid TEXT,
-     mode TEXT CHECK (mode IN ('commit', 'no-commit')),
-     source_oid TEXT,
-     selected_parent_oid TEXT,
-     mainline INTEGER,
-     current_label TEXT NOT NULL,
-     incoming_label TEXT NOT NULL,
-     message TEXT NOT NULL,
-     author_name TEXT,
-     author_email TEXT,
-     committer_name TEXT,
-     committer_email TEXT,
-     touched_count INTEGER NOT NULL,
-     retained_bytes INTEGER NOT NULL,
-     integrity_oid TEXT NOT NULL,
-     CHECK (
-       (kind = 'merge' AND phase IN ('conflicted', 'ready') AND empty_reason IS NULL
-          AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NOT NULL
-          AND mode IS NOT NULL AND source_oid IS NULL AND selected_parent_oid IS NULL
-          AND mainline IS NULL AND (phase != 'ready' OR mode = 'no-commit'))
-       OR
-       (kind IN ('cherry-pick', 'revert') AND phase IN ('conflicted', 'empty')
-          AND current_parent_oid IS NULL AND incoming_parent_oid IS NULL AND mode IS NULL
-          AND source_oid IS NOT NULL
-          AND ((phase = 'conflicted' AND empty_reason IS NULL)
-            OR (phase = 'empty' AND empty_reason IS NOT NULL)))
-     ),
-     CHECK ((author_name IS NULL) = (author_email IS NULL)),
-     CHECK ((committer_name IS NULL) = (committer_email IS NULL))
-   )`,
+  // One durable incomplete operation header; ordered replay state lives in
+  // `git_operation_steps` and touched rows belong only to a suspended step.
+  OPERATION_STATE_TABLE,
+
+  OPERATION_STEPS_TABLE,
 
   // Original identities for only paths owned by the operation. Physical paths
   // include conflict relocations; logical_path ties them back to the index path.
@@ -387,7 +449,444 @@ const STATEMENTS = [
 // v6 adds inert index baseline and dirty-path state for sparse status queries.
 // v7 adds source-qualified tree entry lookup by raw name bytes. v8 adds the
 // durable merge journal; v9 binds its rows to one deterministic identity. v10
-// generalizes that authenticated journal to merge and one-commit replay.
+// generalizes that journal to replay. v11 moves replay sources into ordered steps.
+
+interface V10OperationRow {
+  repo_id: unknown;
+  kind: unknown;
+  original_head_ref: unknown;
+  original_head_oid: unknown;
+  phase: unknown;
+  empty_reason: unknown;
+  current_parent_oid: unknown;
+  incoming_parent_oid: unknown;
+  mode: unknown;
+  source_oid: unknown;
+  selected_parent_oid: unknown;
+  mainline: unknown;
+  current_label: unknown;
+  incoming_label: unknown;
+  message: unknown;
+  author_name: unknown;
+  author_email: unknown;
+  committer_name: unknown;
+  committer_email: unknown;
+  touched_count: unknown;
+  retained_bytes: unknown;
+  integrity_oid: unknown;
+}
+
+interface V10TouchedRow {
+  ordinal: unknown;
+  path: unknown;
+  logical_path: unknown;
+  purpose: unknown;
+  index_stage: unknown;
+  index_mode: unknown;
+  index_oid: unknown;
+  index_size: unknown;
+  index_mtime: unknown;
+  index_ino: unknown;
+  index_rev: unknown;
+  worktree_kind: unknown;
+  worktree_mode: unknown;
+  worktree_oid: unknown;
+  worktree_revision: unknown;
+}
+
+function migrationIdentity(
+  name: unknown,
+  email: unknown,
+  label: string,
+): MergeSavedIdentity | null {
+  if (name === null && email === null) return null;
+  if (name === null || email === null) {
+    throw new CorruptError(`operation ${label} identity row is incomplete`);
+  }
+  return {
+    name: requireMergeText(name, `${label} name`),
+    email: requireMergeText(email, `${label} email`),
+  };
+}
+
+function migrationIndex(row: V10TouchedRow): MergeIndexSnapshot | null {
+  const fields = [
+    row.index_stage,
+    row.index_mode,
+    row.index_oid,
+    row.index_size,
+    row.index_mtime,
+    row.index_ino,
+    row.index_rev,
+  ];
+  if (fields.every((field) => field === null)) return null;
+  if (row.index_stage !== 0) throw new CorruptError("merge index snapshot has an invalid stage");
+  return {
+    stage: 0,
+    mode: requireMergeInteger(row.index_mode, "index mode"),
+    oid: requireMergeOid(row.index_oid, "index oid"),
+    size: requireMergeNullableInteger(row.index_size, "index size"),
+    mtime: requireMergeNullableInteger(row.index_mtime, "index mtime"),
+    ino: requireMergeNullableInteger(row.index_ino, "index inode"),
+    rev: requireMergeNullableInteger(row.index_rev, "index revision"),
+  };
+}
+
+function migrationWorktree(row: V10TouchedRow): MergeWorktreeSnapshot {
+  const kind = requireMergeText(row.worktree_kind, "worktree kind");
+  if (kind === "absent") {
+    if (row.worktree_mode !== null || row.worktree_oid !== null || row.worktree_revision !== null) {
+      throw new CorruptError("absent merge worktree snapshot retained metadata");
+    }
+    return { kind };
+  }
+  const mode = requireMergeInteger(row.worktree_mode, "worktree mode");
+  const revision = requireMergeInteger(row.worktree_revision, "worktree revision");
+  if (kind === "directory") {
+    if (row.worktree_oid !== null) {
+      throw new CorruptError("merge directory snapshot retained an object id");
+    }
+    return { kind, mode, revision };
+  }
+  if (kind === "file" || kind === "symlink") {
+    return { kind, mode, oid: requireMergeOid(row.worktree_oid, "worktree oid"), revision };
+  }
+  throw new CorruptError("merge journal has an invalid worktree kind");
+}
+
+function migrationTouched(db: SqlDatabase, repoId: number, count: number): MergeTouchedPath[] {
+  if (count > MAX_MERGE_TOUCHED_PATHS) {
+    throw new CorruptError("operation journal retained too many touched paths");
+  }
+  const touched: MergeTouchedPath[] = [];
+  let previousPath: string | null = null;
+  for (const raw of db.iterate(
+    `SELECT CASE WHEN typeof(ordinal) = 'integer'
+                          AND ordinal >= 0 AND ordinal < ${MAX_MERGE_TOUCHED_PATHS}
+                 THEN ordinal END AS ordinal,
+            CASE WHEN typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ${MAX_MERGE_PATH_BYTES}
+                 THEN path END AS path,
+            CASE WHEN typeof(logical_path) = 'text'
+                       AND length(CAST(logical_path AS BLOB)) <= ${MAX_MERGE_PATH_BYTES}
+                 THEN logical_path END AS logical_path,
+            CASE WHEN typeof(purpose) = 'text' AND length(CAST(purpose AS BLOB)) <= 19
+                 THEN purpose END AS purpose,
+            index_stage, index_mode,
+            CASE WHEN index_oid IS NULL THEN NULL
+                 WHEN typeof(index_oid) = 'text' AND length(CAST(index_oid AS BLOB)) = 40
+                 THEN index_oid ELSE 0 END AS index_oid,
+            index_size, index_mtime, index_ino, index_rev,
+            CASE WHEN typeof(worktree_kind) = 'text'
+                       AND length(CAST(worktree_kind AS BLOB)) <= 9
+                 THEN worktree_kind END AS worktree_kind,
+            worktree_mode,
+            CASE WHEN worktree_oid IS NULL THEN NULL
+                 WHEN typeof(worktree_oid) = 'text' AND length(CAST(worktree_oid AS BLOB)) = 40
+                 THEN worktree_oid ELSE 0 END AS worktree_oid,
+            worktree_revision
+       FROM git_operation_touched WHERE repo_id = ? ORDER BY ordinal`,
+    repoId,
+  )) {
+    const row: V10TouchedRow = {
+      ordinal: raw.ordinal,
+      path: raw.path,
+      logical_path: raw.logical_path,
+      purpose: raw.purpose,
+      index_stage: raw.index_stage,
+      index_mode: raw.index_mode,
+      index_oid: raw.index_oid,
+      index_size: raw.index_size,
+      index_mtime: raw.index_mtime,
+      index_ino: raw.index_ino,
+      index_rev: raw.index_rev,
+      worktree_kind: raw.worktree_kind,
+      worktree_mode: raw.worktree_mode,
+      worktree_oid: raw.worktree_oid,
+      worktree_revision: raw.worktree_revision,
+    };
+    const ordinal = requireMergeInteger(row.ordinal, "touched-path ordinal");
+    if (ordinal !== touched.length || touched.length >= count) {
+      throw new CorruptError("operation touched-path ordinals are not contiguous");
+    }
+    const entry: MergeTouchedPath = {
+      path: requireMergeText(row.path, "touched path"),
+      logicalPath: requireMergeText(row.logical_path, "logical path"),
+      purpose: requireMergePurpose(row.purpose),
+      index: migrationIndex(row),
+      worktree: migrationWorktree(row),
+    };
+    if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+      throw new CorruptError("operation touched paths are not in strict Git path order");
+    }
+    touched.push(entry);
+    previousPath = entry.path;
+  }
+  if (touched.length !== count) {
+    throw new CorruptError("operation touched-path count does not match its rows");
+  }
+  return touched;
+}
+
+function insertMigratedOperation(
+  db: SqlDatabase,
+  repoId: number,
+  state: MergeOperationStateMetadata | ReplayStateMetadata,
+  steps: readonly OperationStepMetadata[],
+  touched: readonly MergeTouchedPath[],
+  retainedBytes: number,
+  integrityOid: string,
+): void {
+  db.run(
+    `INSERT INTO git_operation_state
+       (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+        current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
+        current_step, step_count, current_label, incoming_label, message,
+        author_name, author_email, committer_name, committer_email,
+        touched_count, retained_bytes, integrity_oid)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    repoId,
+    state.kind,
+    state.originalHeadRef,
+    state.originalHeadOid,
+    state.phase,
+    state.kind === "merge" ? null : state.emptyReason,
+    state.kind === "merge" ? state.currentParentOid : null,
+    state.kind === "merge" ? state.incomingParentOid : null,
+    state.kind === "merge" ? state.mode : null,
+    steps.length,
+    state.currentLabel,
+    state.incomingLabel,
+    state.message,
+    state.author?.name ?? null,
+    state.author?.email ?? null,
+    state.committer?.name ?? null,
+    state.committer?.email ?? null,
+    touched.length,
+    retainedBytes,
+    integrityOid,
+  );
+  for (let ordinal = 0; ordinal < steps.length; ordinal++) {
+    const step = steps[ordinal];
+    if (step === undefined) throw new CorruptError("v10 migration lost an operation step");
+    db.run(
+      `INSERT INTO git_operation_steps
+         (repo_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      repoId,
+      ordinal,
+      step.sourceOid,
+      step.selectedParentOid,
+      step.mainline,
+      step.outcome,
+      step.resultOid,
+    );
+  }
+}
+
+function migrateV10OperationJournal(db: SqlDatabase): void {
+  db.run("ALTER TABLE git_operation_state RENAME TO git_operation_state_v10");
+  db.run(OPERATION_STATE_TABLE);
+  for (const raw of db.iterate(
+    `SELECT CASE WHEN typeof(repo_id) = 'integer' AND repo_id >= 0
+                            AND repo_id <= ${Number.MAX_SAFE_INTEGER}
+                 THEN repo_id END AS repo_id,
+            CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= 11
+                 THEN kind END AS kind,
+            CASE WHEN typeof(original_head_ref) = 'text'
+                       AND length(CAST(original_head_ref AS BLOB)) <= ${MAX_MERGE_REF_BYTES}
+                 THEN original_head_ref END AS original_head_ref,
+            CASE WHEN typeof(original_head_oid) = 'text'
+                       AND length(CAST(original_head_oid AS BLOB)) = 40
+                 THEN original_head_oid END AS original_head_oid,
+            CASE WHEN typeof(phase) = 'text' AND length(CAST(phase AS BLOB)) <= 10
+                 THEN phase END AS phase,
+            CASE WHEN empty_reason IS NULL THEN NULL
+                 WHEN typeof(empty_reason) = 'text' AND length(CAST(empty_reason AS BLOB)) <= 6
+                 THEN empty_reason ELSE 0 END AS empty_reason,
+            CASE WHEN current_parent_oid IS NULL THEN NULL
+                 WHEN typeof(current_parent_oid) = 'text'
+                       AND length(CAST(current_parent_oid AS BLOB)) = 40
+                 THEN current_parent_oid ELSE 0 END AS current_parent_oid,
+            CASE WHEN incoming_parent_oid IS NULL THEN NULL
+                 WHEN typeof(incoming_parent_oid) = 'text'
+                       AND length(CAST(incoming_parent_oid AS BLOB)) = 40
+                 THEN incoming_parent_oid ELSE 0 END AS incoming_parent_oid,
+            CASE WHEN mode IS NULL THEN NULL
+                 WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
+                 THEN mode ELSE 0 END AS mode,
+            CASE WHEN source_oid IS NULL THEN NULL
+                 WHEN typeof(source_oid) = 'text' AND length(CAST(source_oid AS BLOB)) = 40
+                 THEN source_oid ELSE 0 END AS source_oid,
+            CASE WHEN selected_parent_oid IS NULL THEN NULL
+                 WHEN typeof(selected_parent_oid) = 'text'
+                       AND length(CAST(selected_parent_oid AS BLOB)) = 40
+                 THEN selected_parent_oid ELSE 0 END AS selected_parent_oid,
+            CASE WHEN mainline IS NULL THEN NULL
+                 WHEN typeof(mainline) = 'integer' AND mainline >= 1
+                      AND mainline <= ${Number.MAX_SAFE_INTEGER}
+                 THEN mainline ELSE -1 END AS mainline,
+            CASE WHEN typeof(current_label) = 'text'
+                       AND length(CAST(current_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
+                 THEN current_label END AS current_label,
+            CASE WHEN typeof(incoming_label) = 'text'
+                       AND length(CAST(incoming_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
+                 THEN incoming_label END AS incoming_label,
+            CASE WHEN typeof(message) = 'text'
+                       AND length(CAST(message AS BLOB)) <= ${MAX_MERGE_MESSAGE_BYTES}
+                 THEN message END AS message,
+            CASE WHEN author_name IS NULL THEN NULL
+                 WHEN typeof(author_name) = 'text'
+                       AND length(CAST(author_name AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                 THEN author_name ELSE 0 END AS author_name,
+            CASE WHEN author_email IS NULL THEN NULL
+                 WHEN typeof(author_email) = 'text'
+                       AND length(CAST(author_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                 THEN author_email ELSE 0 END AS author_email,
+            CASE WHEN committer_name IS NULL THEN NULL
+                 WHEN typeof(committer_name) = 'text'
+                       AND length(CAST(committer_name AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                 THEN committer_name ELSE 0 END AS committer_name,
+            CASE WHEN committer_email IS NULL THEN NULL
+                 WHEN typeof(committer_email) = 'text'
+                       AND length(CAST(committer_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
+                 THEN committer_email ELSE 0 END AS committer_email,
+            CASE WHEN typeof(touched_count) = 'integer' AND touched_count >= 0
+                       AND touched_count <= ${MAX_MERGE_TOUCHED_PATHS}
+                 THEN touched_count END AS touched_count,
+            CASE WHEN typeof(retained_bytes) = 'integer' AND retained_bytes >= 0
+                       AND retained_bytes <= ${MAX_MERGE_STATE_BYTES}
+                 THEN retained_bytes END AS retained_bytes,
+            CASE WHEN typeof(integrity_oid) = 'text'
+                       AND length(CAST(integrity_oid AS BLOB)) = 40
+                 THEN integrity_oid END AS integrity_oid
+       FROM git_operation_state_v10 ORDER BY repo_id`,
+  )) {
+    const row: V10OperationRow = {
+      repo_id: raw.repo_id,
+      kind: raw.kind,
+      original_head_ref: raw.original_head_ref,
+      original_head_oid: raw.original_head_oid,
+      phase: raw.phase,
+      empty_reason: raw.empty_reason,
+      current_parent_oid: raw.current_parent_oid,
+      incoming_parent_oid: raw.incoming_parent_oid,
+      mode: raw.mode,
+      source_oid: raw.source_oid,
+      selected_parent_oid: raw.selected_parent_oid,
+      mainline: raw.mainline,
+      current_label: raw.current_label,
+      incoming_label: raw.incoming_label,
+      message: raw.message,
+      author_name: raw.author_name,
+      author_email: raw.author_email,
+      committer_name: raw.committer_name,
+      committer_email: raw.committer_email,
+      touched_count: raw.touched_count,
+      retained_bytes: raw.retained_bytes,
+      integrity_oid: raw.integrity_oid,
+    };
+    const repoId = requireMergeInteger(row.repo_id, "repository id");
+    const common = {
+      originalHeadRef: requireMergeText(row.original_head_ref, "original HEAD ref"),
+      originalHeadOid: requireMergeOid(row.original_head_oid, "original HEAD"),
+      currentLabel: requireMergeText(row.current_label, "current label"),
+      incomingLabel: requireMergeText(row.incoming_label, "incoming label"),
+      message: requireMergeText(row.message, "message"),
+      author: migrationIdentity(row.author_name, row.author_email, "author"),
+      committer: migrationIdentity(row.committer_name, row.committer_email, "committer"),
+    };
+    const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
+    const touched = migrationTouched(db, repoId, touchedCount);
+    const storedBytes = requireMergeInteger(row.retained_bytes, "retained-byte count");
+    const storedIntegrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
+    let state: MergeOperationStateMetadata | ReplayStateMetadata;
+    let steps: readonly OperationStepMetadata[];
+    let legacyBytes: number;
+    let legacyIntegrityOid: string;
+    if (row.kind === "merge") {
+      if (
+        row.empty_reason !== null ||
+        row.source_oid !== null ||
+        row.selected_parent_oid !== null ||
+        row.mainline !== null
+      ) {
+        throw new CorruptError("v10 merge journal retained replay fields");
+      }
+      const mergeState: MergeStateMetadata = {
+        ...common,
+        currentParentOid: requireMergeOid(row.current_parent_oid, "current parent"),
+        incomingParentOid: requireMergeOid(row.incoming_parent_oid, "incoming parent"),
+        phase: requireMergePhase(row.phase),
+        mode: requireMergeMode(row.mode),
+      };
+      state = mergeOperationState(mergeState);
+      steps = [];
+      legacyBytes = operationJournalRetainedBytes(state, touched, steps);
+      legacyIntegrityOid = operationJournalIntegrityOid(state, touched, steps);
+    } else if (row.kind === "cherry-pick" || row.kind === "revert") {
+      if (
+        row.current_parent_oid !== null ||
+        row.incoming_parent_oid !== null ||
+        row.mode !== null
+      ) {
+        throw new CorruptError("v10 replay journal retained merge fields");
+      }
+      if (row.phase !== "conflicted" && row.phase !== "empty") {
+        throw new CorruptError("replay journal has an invalid phase");
+      }
+      if (
+        row.empty_reason !== null &&
+        row.empty_reason !== "source" &&
+        row.empty_reason !== "result"
+      ) {
+        throw new CorruptError("replay journal has an invalid empty reason");
+      }
+      const mainline = row.mainline === null ? null : requireMergeInteger(row.mainline, "mainline");
+      if (mainline === 0) throw new CorruptError("replay mainline is not positive");
+      const replayState: ReplayStateMetadata = {
+        kind: row.kind,
+        ...common,
+        phase: row.phase,
+        emptyReason: row.empty_reason,
+        sourceOid: requireMergeOid(row.source_oid, "source"),
+        selectedParentOid:
+          row.selected_parent_oid === null
+            ? null
+            : requireMergeOid(row.selected_parent_oid, "selected parent"),
+        mainline,
+      };
+      state = replayState;
+      steps = operationStepsForState(replayState);
+      legacyBytes = operationJournalV10RetainedBytes(replayState, touched);
+      legacyIntegrityOid = operationJournalV10IntegrityOid(replayState, touched);
+    } else {
+      throw new CorruptError("v10 operation journal has an invalid kind");
+    }
+    if (legacyBytes !== storedBytes) {
+      throw new CorruptError("v10 operation retained-byte count does not match its rows");
+    }
+    if (legacyIntegrityOid !== storedIntegrityOid) {
+      throw new CorruptError("v10 operation integrity identity does not match its rows");
+    }
+    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
+    const integrityOid = operationJournalIntegrityOid(state, touched, steps);
+    insertMigratedOperation(db, repoId, state, steps, touched, retainedBytes, integrityOid);
+  }
+  const orphaned = db.scalar<unknown>(
+    `SELECT EXISTS(
+       SELECT 1 FROM git_operation_touched touched
+        WHERE NOT EXISTS (
+          SELECT 1 FROM git_operation_state_v10 state WHERE state.repo_id = touched.repo_id
+        ) LIMIT 1
+     )`,
+  );
+  if (orphaned !== 0 && orphaned !== 1) {
+    throw new CorruptError("v10 operation orphan probe returned an invalid value");
+  }
+  if (orphaned === 1) throw new CorruptError("v10 touched rows exist without operation state");
+  db.run("DROP TABLE git_operation_state_v10");
+}
+
 function migrate(db: SqlDatabase, from: number): void {
   if (from < 2) {
     db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
@@ -421,12 +920,12 @@ function migrate(db: SqlDatabase, from: number): void {
       db.run(
         `INSERT INTO git_operation_state
            (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
-            current_parent_oid, incoming_parent_oid, mode, source_oid,
-            selected_parent_oid, mainline, current_label, incoming_label, message,
+            current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
+            current_step, step_count, current_label, incoming_label, message,
             author_name, author_email, committer_name, committer_email,
             touched_count, retained_bytes, integrity_oid)
          SELECT repo_id, 'merge', original_head_ref, original_head_oid, phase, NULL,
-                current_parent_oid, incoming_parent_oid, mode, NULL, NULL, NULL,
+                current_parent_oid, incoming_parent_oid, NULL, NULL, mode, 0, 0,
                 current_label, incoming_label, message, author_name, author_email,
                 committer_name, committer_email, touched_count, retained_bytes, integrity_oid
            FROM git_merge_state`,
@@ -445,6 +944,7 @@ function migrate(db: SqlDatabase, from: number): void {
       db.run("DROP TABLE git_merge_state");
     }
   }
+  if (from === 10) migrateV10OperationJournal(db);
 }
 
 export function initializeGitSchema(db: SqlDatabase): void {

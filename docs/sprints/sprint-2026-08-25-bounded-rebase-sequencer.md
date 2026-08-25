@@ -288,3 +288,13 @@ gates run serially through `cpu-lease`.
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim it to a one-line pointer ("→ ADR-0007"). -->
+
+- 2026-08-25, WU1 pre-review: v10 → v11 migration must validate the legacy
+  retained-byte count and integrity vector before re-authenticating transformed
+  rows. The v11 seam must also authenticate the complete rebase topology and
+  expose one whole-journal CAS transition; later WUs do not own schema/store.
+- 2026-08-25, WU1 diff review: journal reads validate anchors by object type,
+  the complete source chain through original HEAD, result parents, and monotonic
+  CAS transitions. They deliberately do not walk the upstream graph on every
+  state read; WU2 selects that relationship and WU4 must revalidate it before
+  using resumed state so ordinary mutation interlocks stay bounded.

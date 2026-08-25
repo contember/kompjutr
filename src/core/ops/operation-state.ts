@@ -1,4 +1,4 @@
-// Durable, bounded state shared by merge and one-commit replay operations.
+// Durable, bounded state shared by merge and sequenced replay operations.
 
 import { isOid, utf8 } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
@@ -22,20 +22,19 @@ import {
   validateMergeTouchedPath,
 } from "./merge-state.js";
 
-export type OperationKind = "merge" | "cherry-pick" | "revert";
-export type ReplayKind = Exclude<OperationKind, "merge">;
+export const MAX_OPERATION_STEPS = 4_096;
+
+export type OperationKind = "merge" | "cherry-pick" | "revert" | "rebase";
+export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayStatePhase = "conflicted" | "empty";
+export type RebaseStatePhase = "running" | "conflicted";
+export type OperationStepOutcome = "pending" | "applied" | "skipped";
 
 export type MergeOperationStateMetadata = MergeStateMetadata & { kind: "merge" };
 
-interface ReplayStateFields {
+interface OperationCommonStateFields {
   originalHeadRef: string;
   originalHeadOid: string;
-  phase: ReplayStatePhase;
-  emptyReason: ReplayEmptyReason | null;
-  sourceOid: string;
-  selectedParentOid: string | null;
-  mainline: number | null;
   currentLabel: string;
   incomingLabel: string;
   message: string;
@@ -43,13 +42,42 @@ interface ReplayStateFields {
   committer: MergeSavedIdentity | null;
 }
 
+interface ReplayStateFields extends OperationCommonStateFields {
+  phase: ReplayStatePhase;
+  emptyReason: ReplayEmptyReason | null;
+  sourceOid: string;
+  selectedParentOid: string | null;
+  mainline: number | null;
+}
+
 export type ReplayStateMetadata = ReplayStateFields &
   ({ kind: "cherry-pick" } | { kind: "revert" });
 
-export type OperationStateMetadata = MergeOperationStateMetadata | ReplayStateMetadata;
+export interface RebaseStateMetadata extends OperationCommonStateFields {
+  kind: "rebase";
+  phase: RebaseStatePhase;
+  upstreamOid: string;
+  baseOid: string;
+  currentParentOid: string;
+  currentStep: number;
+}
+
+export interface OperationStepMetadata {
+  sourceOid: string;
+  selectedParentOid: string | null;
+  mainline: number | null;
+  outcome: OperationStepOutcome;
+  resultOid: string | null;
+}
+
+export type OperationStateMetadata =
+  | MergeOperationStateMetadata
+  | ReplayStateMetadata
+  | RebaseStateMetadata;
 
 interface OperationJournalFields<S extends OperationStateMetadata> {
   state: S;
+  steps: readonly OperationStepMetadata[];
   touched: readonly MergeTouchedPath[];
   retainedBytes: number;
   integrityOid: string;
@@ -64,9 +92,15 @@ export type CherryPickJournal = OperationJournalFields<
 export type RevertJournal = OperationJournalFields<ReplayStateMetadata & { kind: "revert" }> & {
   kind: "revert";
 };
-export type OperationJournal = MergeOperationJournal | CherryPickJournal | RevertJournal;
+export type RebaseJournal = OperationJournalFields<RebaseStateMetadata> & { kind: "rebase" };
+export type OperationJournal =
+  | MergeOperationJournal
+  | CherryPickJournal
+  | RevertJournal
+  | RebaseJournal;
 
 const REPLAY_STATE_FIXED_BYTES = 2 * 1024;
+const OPERATION_STEP_FIXED_BYTES = 256;
 
 function checkedAdd(left: number, right: number): number {
   if (
@@ -164,37 +198,12 @@ function validateIdentity(identity: MergeSavedIdentity | null, label: string): n
   return checkedAdd(name, email);
 }
 
-export function validateReplayStateMetadata(state: ReplayStateMetadata): number {
+function validateOperationCommonState(state: OperationCommonStateFields): number {
   let bytes = checkedAdd(REPLAY_STATE_FIXED_BYTES, validateOriginalHeadRef(state.originalHeadRef));
-  const requiredOids: readonly (readonly [string, string])[] = [
-    ["original HEAD", state.originalHeadOid],
-    ["source", state.sourceOid],
-  ];
-  for (const [label, oid] of requiredOids) {
-    if (!isOid(oid)) throw new CorruptError(`replay ${label} has an invalid object id`);
-    bytes = checkedAdd(bytes, 40);
+  if (!isOid(state.originalHeadOid)) {
+    throw new CorruptError("replay original HEAD has an invalid object id");
   }
-  if (state.selectedParentOid !== null) {
-    if (!isOid(state.selectedParentOid)) {
-      throw new CorruptError("replay selected parent has an invalid object id");
-    }
-    bytes = checkedAdd(bytes, 40);
-  }
-  if (state.mainline !== null && (!Number.isSafeInteger(state.mainline) || state.mainline < 1)) {
-    throw new CorruptError("replay mainline is not a safe positive integer");
-  }
-  if (state.mainline !== null && state.selectedParentOid === null) {
-    throw new CorruptError("replay mainline has no selected parent");
-  }
-  if (state.phase !== "conflicted" && state.phase !== "empty") {
-    throw new CorruptError("replay journal has an invalid phase");
-  }
-  if (
-    (state.phase === "conflicted" && state.emptyReason !== null) ||
-    (state.phase === "empty" && state.emptyReason !== "source" && state.emptyReason !== "result")
-  ) {
-    throw new CorruptError("replay journal has an invalid empty reason");
-  }
+  bytes = checkedAdd(bytes, 40);
   const currentLabel = boundedTextBytes(
     state.currentLabel,
     "current label",
@@ -221,14 +230,159 @@ export function validateReplayStateMetadata(state: ReplayStateMetadata): number 
   return bytes;
 }
 
+export function validateOperationStepMetadata(step: OperationStepMetadata): number {
+  let bytes = OPERATION_STEP_FIXED_BYTES;
+  if (!isOid(step.sourceOid)) {
+    throw new CorruptError("operation step source has an invalid object id");
+  }
+  bytes = checkedAdd(bytes, 40);
+  if (step.selectedParentOid !== null) {
+    if (!isOid(step.selectedParentOid)) {
+      throw new CorruptError("operation step selected parent has an invalid object id");
+    }
+    bytes = checkedAdd(bytes, 40);
+  }
+  if (step.mainline !== null && (!Number.isSafeInteger(step.mainline) || step.mainline < 1)) {
+    throw new CorruptError("operation step mainline is not a safe positive integer");
+  }
+  if (step.mainline !== null && step.selectedParentOid === null) {
+    throw new CorruptError("operation step mainline has no selected parent");
+  }
+  if (step.outcome !== "pending" && step.outcome !== "applied" && step.outcome !== "skipped") {
+    throw new CorruptError("operation step has an invalid outcome");
+  }
+  if (step.outcome === "applied") {
+    if (step.resultOid === null || !isOid(step.resultOid)) {
+      throw new CorruptError("applied operation step has an invalid result object id");
+    }
+    bytes = checkedAdd(bytes, 40);
+  } else if (step.resultOid !== null) {
+    throw new CorruptError("unapplied operation step retained a result object id");
+  }
+  return bytes;
+}
+
+function replayStep(state: ReplayStateMetadata): OperationStepMetadata {
+  return {
+    sourceOid: state.sourceOid,
+    selectedParentOid: state.selectedParentOid,
+    mainline: state.mainline,
+    outcome: "pending",
+    resultOid: null,
+  };
+}
+
+export function operationStepsForState(
+  state: Exclude<OperationStateMetadata, RebaseStateMetadata>,
+): readonly OperationStepMetadata[] {
+  return state.kind === "merge" ? [] : [replayStep(state)];
+}
+
+function validateReplayHeader(state: ReplayStateMetadata): number {
+  const bytes = validateOperationCommonState(state);
+  if (state.phase !== "conflicted" && state.phase !== "empty") {
+    throw new CorruptError("replay journal has an invalid phase");
+  }
+  if (
+    (state.phase === "conflicted" && state.emptyReason !== null) ||
+    (state.phase === "empty" && state.emptyReason !== "source" && state.emptyReason !== "result")
+  ) {
+    throw new CorruptError("replay journal has an invalid empty reason");
+  }
+  return bytes;
+}
+
+export function validateReplayStateMetadata(state: ReplayStateMetadata): number {
+  return checkedAdd(
+    validateReplayHeader(state),
+    validateOperationStepMetadata(replayStep(state)) - OPERATION_STEP_FIXED_BYTES,
+  );
+}
+
+function sameStep(left: OperationStepMetadata, right: OperationStepMetadata): boolean {
+  return (
+    left.sourceOid === right.sourceOid &&
+    left.selectedParentOid === right.selectedParentOid &&
+    left.mainline === right.mainline &&
+    left.outcome === right.outcome &&
+    left.resultOid === right.resultOid
+  );
+}
+
+function validateSequencedState(
+  state: ReplayStateMetadata | RebaseStateMetadata,
+  steps: readonly OperationStepMetadata[],
+): number {
+  if (steps.length > MAX_OPERATION_STEPS) {
+    throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
+  }
+  if (state.kind !== "rebase") {
+    const expected = replayStep(state);
+    if (steps.length !== 1 || steps[0] === undefined || !sameStep(steps[0], expected)) {
+      throw new CorruptError("one-commit replay journal does not contain its pending source step");
+    }
+    return validateReplayHeader(state);
+  }
+  if (steps.length === 0) throw new CorruptError("rebase journal has no replay steps");
+  let bytes = validateOperationCommonState(state);
+  const anchors: readonly (readonly [string, string])[] = [
+    ["upstream", state.upstreamOid],
+    ["base", state.baseOid],
+    ["current parent", state.currentParentOid],
+  ];
+  for (const [label, oid] of anchors) {
+    if (!isOid(oid)) throw new CorruptError(`rebase ${label} has an invalid object id`);
+    bytes = checkedAdd(bytes, 40);
+  }
+  if (state.phase !== "running" && state.phase !== "conflicted") {
+    throw new CorruptError("rebase journal has an invalid phase");
+  }
+  if (
+    !Number.isSafeInteger(state.currentStep) ||
+    state.currentStep < 0 ||
+    state.currentStep > steps.length
+  ) {
+    throw new CorruptError("rebase current step is outside the replay sequence");
+  }
+  let currentParentOid = state.upstreamOid;
+  for (let ordinal = 0; ordinal < steps.length; ordinal++) {
+    const step = steps[ordinal];
+    if (step === undefined) throw new CorruptError("rebase step sequence is sparse");
+    if (ordinal < state.currentStep) {
+      if (step.outcome === "pending") {
+        throw new CorruptError("rebase completed prefix retained a pending step");
+      }
+      if (step.outcome === "applied") {
+        if (step.resultOid === null) throw new CorruptError("applied rebase step lost its result");
+        currentParentOid = step.resultOid;
+      }
+    } else if (step.outcome !== "pending") {
+      throw new CorruptError("rebase pending suffix retained a completed step");
+    }
+  }
+  if (state.currentParentOid !== currentParentOid) {
+    throw new CorruptError("rebase current parent differs from the replay cursor");
+  }
+  if (state.phase === "conflicted" && state.currentStep === steps.length) {
+    throw new CorruptError("completed rebase cursor cannot be conflicted");
+  }
+  return bytes;
+}
+
 export function operationJournalRetainedBytes(
   state: OperationStateMetadata,
   touched: readonly MergeTouchedPath[],
+  steps?: readonly OperationStepMetadata[],
 ): number {
   if (state.kind === "merge") {
+    if (steps !== undefined && steps.length !== 0) {
+      throw new CorruptError("merge journal retained replay steps");
+    }
     const { kind: _kind, ...mergeState } = state;
     return mergeJournalRetainedBytes(mergeState, touched);
   }
+  const sequence = steps ?? (state.kind === "rebase" ? undefined : operationStepsForState(state));
+  if (sequence === undefined) throw new CorruptError("rebase journal is missing its replay steps");
   if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
     throw new GitError(
       "E2BIG",
@@ -238,7 +392,19 @@ export function operationJournalRetainedBytes(
   if (state.phase === "conflicted" && touched.length === 0) {
     throw new CorruptError("a conflicted replay journal must retain a touched path");
   }
-  let bytes = validateReplayStateMetadata(state);
+  if (state.kind === "rebase" && state.phase === "running" && touched.length !== 0) {
+    throw new CorruptError("a running rebase journal retained touched paths");
+  }
+  let bytes = validateSequencedState(state, sequence);
+  for (const step of sequence) {
+    bytes = checkedAdd(bytes, validateOperationStepMetadata(step));
+    if (bytes > MAX_MERGE_STATE_BYTES) {
+      throw new GitError(
+        "E2BIG",
+        `operation journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`,
+      );
+    }
+  }
   for (const entry of touched) {
     bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
     if (bytes > MAX_MERGE_STATE_BYTES) {
@@ -277,15 +443,57 @@ function touchedVector(entry: MergeTouchedPath): readonly unknown[] {
   return [entry.path, entry.logicalPath, entry.purpose, index, worktree];
 }
 
+function stepVector(step: OperationStepMetadata): readonly unknown[] {
+  return [step.sourceOid, step.selectedParentOid, step.mainline, step.outcome, step.resultOid];
+}
+
+function operationHeaderVector(
+  state: ReplayStateMetadata | RebaseStateMetadata,
+): readonly unknown[] {
+  const common: readonly unknown[] = [
+    state.originalHeadRef,
+    state.originalHeadOid,
+    state.phase,
+    state.currentLabel,
+    state.incomingLabel,
+    state.message,
+    savedIdentityVector(state.author),
+    savedIdentityVector(state.committer),
+  ];
+  return state.kind === "rebase"
+    ? [...common, state.upstreamOid, state.baseOid, state.currentParentOid, state.currentStep]
+    : [...common, state.emptyReason];
+}
+
 export function operationJournalIntegrityOid(
   state: OperationStateMetadata,
   touched: readonly MergeTouchedPath[],
+  steps?: readonly OperationStepMetadata[],
 ): string {
-  operationJournalRetainedBytes(state, touched);
   if (state.kind === "merge") {
+    operationJournalRetainedBytes(state, touched, steps);
     const { kind: _kind, ...mergeState } = state;
     return mergeJournalIntegrityOid(mergeState, touched);
   }
+  const sequence = steps ?? (state.kind === "rebase" ? undefined : operationStepsForState(state));
+  if (sequence === undefined) throw new CorruptError("rebase journal is missing its replay steps");
+  operationJournalRetainedBytes(state, touched, sequence);
+  const payload: readonly unknown[] = [
+    3,
+    state.kind,
+    operationHeaderVector(state),
+    sequence.map(stepVector),
+    touched.map(touchedVector),
+  ];
+  return hashObject("blob", utf8.encode(JSON.stringify(payload)));
+}
+
+/** Verify the authenticated vector written by schema v10 before migrating it. */
+export function operationJournalV10IntegrityOid(
+  state: ReplayStateMetadata,
+  touched: readonly MergeTouchedPath[],
+): string {
+  operationJournalV10RetainedBytes(state, touched);
   const payload: readonly unknown[] = [
     2,
     state.kind,
@@ -308,6 +516,32 @@ export function operationJournalIntegrityOid(
   return hashObject("blob", utf8.encode(JSON.stringify(payload)));
 }
 
+export function operationJournalV10RetainedBytes(
+  state: ReplayStateMetadata,
+  touched: readonly MergeTouchedPath[],
+): number {
+  if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
+    throw new GitError(
+      "E2BIG",
+      `operation journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`,
+    );
+  }
+  if (state.phase === "conflicted" && touched.length === 0) {
+    throw new CorruptError("a conflicted replay journal must retain a touched path");
+  }
+  let bytes = validateReplayStateMetadata(state);
+  for (const entry of touched) {
+    bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
+    if (bytes > MAX_MERGE_STATE_BYTES) {
+      throw new GitError(
+        "E2BIG",
+        `operation journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`,
+      );
+    }
+  }
+  return bytes;
+}
+
 export function mergeOperationState(state: MergeStateMetadata): MergeOperationStateMetadata {
   return { kind: "merge", ...state };
 }
@@ -325,9 +559,12 @@ export function operationAlreadyActive(kind: OperationKind): GitError {
 
 export function operationNotActive(kind: OperationKind): GitError {
   if (kind === "merge") return mergeNotActive();
-  return kind === "cherry-pick"
-    ? new GitError("ENOCHERRYPICK", "no cherry-pick operation is active")
-    : new GitError("ENOREVERT", "no revert operation is active");
+  if (kind === "cherry-pick") {
+    return new GitError("ENOCHERRYPICK", "no cherry-pick operation is active");
+  }
+  return kind === "revert"
+    ? new GitError("ENOREVERT", "no revert operation is active")
+    : new GitError("ENOREBASE", "no rebase operation is active");
 }
 
 export function operationKindMismatch(expected: OperationKind, actual: OperationKind): GitError {

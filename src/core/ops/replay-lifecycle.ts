@@ -38,7 +38,7 @@ import { treeStream } from "./tree-stream.js";
 
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
 const REPLAY_FIXED_SQL_STATEMENTS = 30;
-const OPERATION_STATE_TRANSITION_SQL_STATEMENTS = 9;
+const OPERATION_STATE_TRANSITION_SQL_STATEMENTS = 11;
 
 export interface ReplayStartOptions {
   source: string;
@@ -255,14 +255,13 @@ function requireOriginalSnapshots(repo: Repository, journal: OperationJournal): 
 function requireOwnership(
   repo: Repository,
   worktree: Worktree,
-  journal: OperationJournal,
+  journal: CherryPickJournal | RevertJournal,
   incomingLabelStyle: ReplayIncomingLabelStyle,
 ): {
   plan: ReplayPlan;
   sqlStatements: number;
   reservation: ReturnType<Repository["store"]["reserveMemory"]>;
 } {
-  if (journal.kind === "merge") throw new GitError("EOPMISMATCH", "expected replay operation");
   requireOriginalSnapshots(repo, journal);
   const plan = planForState(repo, journal.state, incomingLabelStyle);
   const reservation = reserveIntegrationPlan(repo, plan.integration);

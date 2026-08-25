@@ -131,7 +131,7 @@ describe("durable merge journal", () => {
       touched: paths,
       retainedBytes: mergeJournalRetainedBytes(state, paths),
     });
-    expect(db.storage.statementCount).toBe(3);
+    expect(db.storage.statementCount).toBe(4);
   });
 
   it("persists ready no-commit state and optional explicit identities", () => {
@@ -186,13 +186,14 @@ describe("durable merge journal", () => {
     expect(store.readMergeState()).toBeNull();
   });
 
-  it("removes both merge tables when the repository is destroyed", () => {
+  it("removes every operation journal table when the repository is destroyed", () => {
     const { db, store } = open();
     store.writeMergeState(metadata(), touched());
 
     store.destroy();
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_steps")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
   });
 

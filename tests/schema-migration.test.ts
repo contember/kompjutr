@@ -6,6 +6,17 @@
 
 import { describe, expect, it } from "vitest";
 import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
+import {
+  type MergeStateMetadata,
+  type MergeTouchedPath,
+  mergeJournalIntegrityOid,
+  mergeJournalRetainedBytes,
+} from "../src/core/ops/merge-state.js";
+import {
+  operationJournalV10IntegrityOid,
+  operationJournalV10RetainedBytes,
+  type ReplayStateMetadata,
+} from "../src/core/ops/operation-state.js";
 import { initializeFsSchema, ROOT_INODE } from "../src/fs/schema.js";
 import { initializeGitSchema, SCHEMA_VERSION } from "../src/sqlite/schema.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -26,6 +37,220 @@ function createV1(db: TestDatabase): void {
 
 function columnsOf(db: TestDatabase, table: string): string[] {
   return db.all<{ name: string }>(`PRAGMA table_info(${table})`).map((row) => row.name);
+}
+
+function createV10OperationStateTable(db: TestDatabase): void {
+  db.run(`CREATE TABLE git_operation_state_v10 (
+    repo_id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL,
+    original_head_ref TEXT NOT NULL,
+    original_head_oid TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    empty_reason TEXT,
+    current_parent_oid TEXT,
+    incoming_parent_oid TEXT,
+    mode TEXT,
+    source_oid TEXT,
+    selected_parent_oid TEXT,
+    mainline INTEGER,
+    current_label TEXT NOT NULL,
+    incoming_label TEXT NOT NULL,
+    message TEXT NOT NULL,
+    author_name TEXT,
+    author_email TEXT,
+    committer_name TEXT,
+    committer_email TEXT,
+    touched_count INTEGER NOT NULL,
+    retained_bytes INTEGER NOT NULL,
+    integrity_oid TEXT NOT NULL
+  )`);
+}
+
+function finishV10Downgrade(db: TestDatabase): void {
+  db.run("DROP TABLE git_operation_steps");
+  db.run("DROP TABLE git_operation_state");
+  db.run("ALTER TABLE git_operation_state_v10 RENAME TO git_operation_state");
+  db.run("UPDATE git_meta SET value = '10' WHERE key = 'schema_version'");
+}
+
+function downgradeReplayJournalToV10(
+  db: TestDatabase,
+  state: ReplayStateMetadata,
+  touched: readonly MergeTouchedPath[],
+): void {
+  createV10OperationStateTable(db);
+  db.run(
+    `INSERT INTO git_operation_state_v10
+       (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+        current_parent_oid, incoming_parent_oid, mode, source_oid, selected_parent_oid,
+        mainline, current_label, incoming_label, message, author_name, author_email,
+        committer_name, committer_email, touched_count, retained_bytes, integrity_oid)
+     VALUES (1, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    state.kind,
+    state.originalHeadRef,
+    state.originalHeadOid,
+    state.phase,
+    state.emptyReason,
+    state.sourceOid,
+    state.selectedParentOid,
+    state.mainline,
+    state.currentLabel,
+    state.incomingLabel,
+    state.message,
+    state.author?.name ?? null,
+    state.author?.email ?? null,
+    state.committer?.name ?? null,
+    state.committer?.email ?? null,
+    touched.length,
+    operationJournalV10RetainedBytes(state, touched),
+    operationJournalV10IntegrityOid(state, touched),
+  );
+  finishV10Downgrade(db);
+}
+
+function replayMigrationFixture(
+  kind: "cherry-pick" | "revert",
+  phase: "conflicted" | "empty",
+  emptyReason: "source" | "result" | null,
+) {
+  const db = new TestDatabase();
+  const database = new SqliteGitDatabase(db);
+  const repository = database.create("/repo", "ref: refs/heads/main");
+  const store = database.open(repository);
+  const tree = store.write("tree", serializeTree([]));
+  const person = {
+    name: "Fixture",
+    email: "fixture@example.com",
+    timestamp: 1_700_000_000,
+    timezoneOffset: 0,
+  };
+  const original = store.write(
+    "commit",
+    serializeCommit({ tree, parent: [], author: person, committer: person, message: "base\n" }),
+  );
+  const source = store.write(
+    "commit",
+    serializeCommit({
+      tree,
+      parent: [original],
+      author: person,
+      committer: person,
+      message: "source\n",
+    }),
+  );
+  store.setRef("refs/heads/main", original);
+  const state: ReplayStateMetadata = {
+    kind,
+    originalHeadRef: "refs/heads/main",
+    originalHeadOid: original,
+    phase,
+    emptyReason,
+    sourceOid: source,
+    selectedParentOid: original,
+    mainline: null,
+    currentLabel: "HEAD",
+    incomingLabel: source.slice(0, 7),
+    message: "source\n",
+    author: null,
+    committer: null,
+  };
+  const touched: readonly MergeTouchedPath[] =
+    phase === "conflicted"
+      ? [
+          {
+            path: "file.txt",
+            logicalPath: "file.txt",
+            purpose: "primary",
+            index: null,
+            worktree: { kind: "absent" },
+          },
+        ]
+      : [];
+  store.writeOperationState(state, touched);
+  downgradeReplayJournalToV10(db, state, touched);
+  return { db, repository, state, touched };
+}
+
+function mergeMigrationFixture(phase: "conflicted" | "ready") {
+  const db = new TestDatabase();
+  const database = new SqliteGitDatabase(db);
+  const repository = database.create("/repo", "ref: refs/heads/main");
+  const store = database.open(repository);
+  const tree = store.write("tree", serializeTree([]));
+  const person = {
+    name: "Fixture",
+    email: "fixture@example.com",
+    timestamp: 1_700_000_000,
+    timezoneOffset: 0,
+  };
+  const current = store.write(
+    "commit",
+    serializeCommit({ tree, parent: [], author: person, committer: person, message: "base\n" }),
+  );
+  const incoming = store.write(
+    "commit",
+    serializeCommit({
+      tree,
+      parent: [current],
+      author: person,
+      committer: person,
+      message: "topic\n",
+    }),
+  );
+  const state: MergeStateMetadata = {
+    originalHeadRef: "refs/heads/main",
+    originalHeadOid: current,
+    currentParentOid: current,
+    incomingParentOid: incoming,
+    phase,
+    mode: phase === "ready" ? "no-commit" : "commit",
+    currentLabel: "HEAD",
+    incomingLabel: "topic",
+    message: "Merge topic\n",
+    author: null,
+    committer: null,
+  };
+  const touched: readonly MergeTouchedPath[] =
+    phase === "conflicted"
+      ? [
+          {
+            path: "file.txt",
+            logicalPath: "file.txt",
+            purpose: "primary",
+            index: null,
+            worktree: { kind: "absent" },
+          },
+        ]
+      : [];
+  store.writeMergeState(state, touched);
+  createV10OperationStateTable(db);
+  db.run(
+    `INSERT INTO git_operation_state_v10
+       (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+        current_parent_oid, incoming_parent_oid, mode, source_oid, selected_parent_oid,
+        mainline, current_label, incoming_label, message, author_name, author_email,
+        committer_name, committer_email, touched_count, retained_bytes, integrity_oid)
+     VALUES (1, 'merge', ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL,
+             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    state.originalHeadRef,
+    state.originalHeadOid,
+    state.phase,
+    state.currentParentOid,
+    state.incomingParentOid,
+    state.mode,
+    state.currentLabel,
+    state.incomingLabel,
+    state.message,
+    state.author?.name ?? null,
+    state.author?.email ?? null,
+    state.committer?.name ?? null,
+    state.committer?.email ?? null,
+    touched.length,
+    mergeJournalRetainedBytes(state, touched),
+    mergeJournalIntegrityOid(state, touched),
+  );
+  finishV10Downgrade(db);
+  return { db, repository, state, touched };
 }
 
 interface IndexColumn {
@@ -91,10 +316,11 @@ describe("git schema", () => {
       "empty_reason",
       "current_parent_oid",
       "incoming_parent_oid",
+      "upstream_oid",
+      "base_oid",
       "mode",
-      "source_oid",
-      "selected_parent_oid",
-      "mainline",
+      "current_step",
+      "step_count",
       "current_label",
       "incoming_label",
       "message",
@@ -105,6 +331,15 @@ describe("git schema", () => {
       "touched_count",
       "retained_bytes",
       "integrity_oid",
+    ]);
+    expect(columnsOf(db, "git_operation_steps")).toEqual([
+      "repo_id",
+      "ordinal",
+      "source_oid",
+      "selected_parent_oid",
+      "mainline",
+      "outcome",
+      "result_oid",
     ]);
     expect(columnsOf(db, "git_operation_touched")).toEqual([
       "repo_id",
@@ -417,12 +652,14 @@ describe("git schema", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
     db.run("DROP TABLE git_operation_touched");
+    db.run("DROP TABLE git_operation_steps");
     db.run("DROP TABLE git_operation_state");
     db.run("UPDATE git_meta SET value = '7' WHERE key = 'schema_version'");
 
     initializeGitSchema(db);
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_steps")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_touched")).toBe(0);
     expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
       String(SCHEMA_VERSION),
@@ -448,6 +685,7 @@ describe("git schema", () => {
          FROM git_operation_touched WHERE 0`,
     );
     db.run("DROP TABLE git_operation_touched");
+    db.run("DROP TABLE git_operation_steps");
     db.run("DROP TABLE git_operation_state");
     db.run(
       `INSERT INTO git_merge_state
@@ -545,6 +783,7 @@ describe("git schema", () => {
          FROM git_operation_touched`,
     );
     db.run("DROP TABLE git_operation_touched");
+    db.run("DROP TABLE git_operation_steps");
     db.run("DROP TABLE git_operation_state");
     db.run("UPDATE git_meta SET value = '9' WHERE key = 'schema_version'");
 
@@ -559,6 +798,127 @@ describe("git schema", () => {
     const cold = new SqliteGitDatabase(db).open(repository);
     expect(cold.requireMergeState().state).toEqual(state);
     expect(cold.requireMergeState().touched).toEqual(touched);
+  });
+
+  it("migrates every active v10 one-commit replay shape into one pending step", () => {
+    const witnesses: {
+      kind: "cherry-pick" | "revert";
+      phase: "conflicted" | "empty";
+      reason: "source" | "result" | null;
+    }[] = [];
+    const kinds: readonly ("cherry-pick" | "revert")[] = ["cherry-pick", "revert"];
+    for (const kind of kinds) {
+      witnesses.push({ kind, phase: "conflicted", reason: null });
+      witnesses.push({ kind, phase: "empty", reason: "source" });
+      witnesses.push({ kind, phase: "empty", reason: "result" });
+    }
+    for (const witness of witnesses) {
+      const { db, repository, state, touched } = replayMigrationFixture(
+        witness.kind,
+        witness.phase,
+        witness.reason,
+      );
+
+      initializeGitSchema(db);
+
+      const journal = new SqliteGitDatabase(db)
+        .open(repository)
+        .requireOperationState(witness.kind);
+      expect(journal.state, `${witness.kind} ${witness.phase} ${witness.reason}`).toEqual(state);
+      expect(journal.steps).toEqual([
+        {
+          sourceOid: state.sourceOid,
+          selectedParentOid: state.selectedParentOid,
+          mainline: state.mainline,
+          outcome: "pending",
+          resultOid: null,
+        },
+      ]);
+      expect(journal.touched).toEqual(touched);
+      expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+        String(SCHEMA_VERSION),
+      );
+    }
+  });
+
+  it("reconstructs authenticated conflicted and ready v10 merge journals", () => {
+    const phases: readonly ("conflicted" | "ready")[] = ["conflicted", "ready"];
+    for (const phase of phases) {
+      const { db, repository, state, touched } = mergeMigrationFixture(phase);
+
+      initializeGitSchema(db);
+
+      const journal = new SqliteGitDatabase(db).open(repository).requireMergeState();
+      expect(journal.state).toEqual(state);
+      expect(journal.touched).toEqual(touched);
+      expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_steps")).toBe(0);
+    }
+  });
+
+  it("does not invent a replay step when a v10 operation already completed cleanly", () => {
+    const { db } = replayMigrationFixture("cherry-pick", "empty", "result");
+    db.run("DELETE FROM git_operation_touched");
+    db.run("DELETE FROM git_operation_state");
+
+    initializeGitSchema(db);
+
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_steps")).toBe(0);
+  });
+
+  it("rejects corrupt v10 byte accounting and integrity instead of authenticating it", () => {
+    const corruptions: readonly ((db: TestDatabase) => void)[] = [
+      (db) => db.run("UPDATE git_operation_state SET retained_bytes = retained_bytes + 1"),
+      (db) => db.run("UPDATE git_operation_state SET source_oid = original_head_oid"),
+    ];
+    for (const corrupt of corruptions) {
+      const { db } = replayMigrationFixture("revert", "empty", "source");
+      corrupt(db);
+
+      expect(() => initializeGitSchema(db)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+        "10",
+      );
+      expect(columnsOf(db, "git_operation_state")).toContain("source_oid");
+      expect(columnsOf(db, "git_operation_steps")).toEqual([]);
+    }
+  });
+
+  it("rejects unknown v10 kinds, cross-kind fields, and oversized numeric blobs", () => {
+    const corruptions: readonly (() => TestDatabase)[] = [
+      () => {
+        const { db } = replayMigrationFixture("revert", "empty", "source");
+        db.run("UPDATE git_operation_state SET kind = 'unknown'");
+        return db;
+      },
+      () => {
+        const { db } = mergeMigrationFixture("ready");
+        db.run("UPDATE git_operation_state SET source_oid = original_head_oid");
+        return db;
+      },
+      () => {
+        const { db } = replayMigrationFixture("cherry-pick", "empty", "result");
+        db.run("UPDATE git_operation_state SET current_parent_oid = original_head_oid");
+        return db;
+      },
+      () => {
+        const { db } = replayMigrationFixture("revert", "empty", "source");
+        db.run("UPDATE git_operation_state SET mainline = zeroblob(4096)");
+        return db;
+      },
+    ];
+    for (const corrupt of corruptions) {
+      const db = corrupt();
+
+      expect(() => initializeGitSchema(db)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
+        "10",
+      );
+    }
   });
 
   it("uses the tree name-bytes index for source-qualified point lookups", () => {
@@ -631,6 +991,7 @@ describe("git schema", () => {
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
     expect(columnsOf(db, "git_operation_state")).not.toHaveLength(0);
+    expect(columnsOf(db, "git_operation_steps")).not.toHaveLength(0);
     expect(columnsOf(db, "git_operation_touched")).not.toHaveLength(0);
     expect(treeNameBytesIndexColumns(db)).not.toHaveLength(0);
   });

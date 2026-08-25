@@ -31,18 +31,22 @@ import {
 } from "../core/ops/merge-state.js";
 import {
   type CherryPickJournal,
+  MAX_OPERATION_STEPS,
   type MergeOperationJournal,
   mergeJournalFromOperation,
   mergeOperationState,
   type OperationJournal,
   type OperationKind,
   type OperationStateMetadata,
+  type OperationStepMetadata,
   operationAlreadyActive,
   operationJournalIntegrityOid,
   operationJournalRetainedBytes,
   operationKindMismatch,
   operationNotActive,
-  type ReplayStateMetadata,
+  operationStepsForState,
+  type RebaseJournal,
+  type RebaseStateMetadata,
   type RevertJournal,
 } from "../core/ops/operation-state.js";
 import { Sha1 } from "../core/sha1.js";
@@ -116,6 +120,7 @@ const CONTENT_ID_PAGE = 4096;
 /** A blob batch shares the pack reader's conservative memory budget. */
 export const MAX_BLOB_BATCH_BYTES = MAX_PACK_BLOB_BATCH_BYTES;
 const MAX_BLOB_BATCH_OIDS = 4096;
+export const MAX_LOG_STATE_BYTES = 32 * 1024 * 1024;
 
 /** Index rows per round trip. This is the memory bound of a scan. */
 const DEFAULT_INDEX_PAGE = 1000;
@@ -206,10 +211,11 @@ interface OperationStateRow {
   empty_reason: unknown;
   current_parent_oid: unknown;
   incoming_parent_oid: unknown;
+  upstream_oid: unknown;
+  base_oid: unknown;
   mode: unknown;
-  source_oid: unknown;
-  selected_parent_oid: unknown;
-  mainline: unknown;
+  current_step: unknown;
+  step_count: unknown;
   current_label: unknown;
   incoming_label: unknown;
   message: unknown;
@@ -220,6 +226,15 @@ interface OperationStateRow {
   touched_count: unknown;
   retained_bytes: unknown;
   integrity_oid: unknown;
+}
+
+interface OperationStepRow {
+  ordinal: unknown;
+  source_oid: unknown;
+  selected_parent_oid: unknown;
+  mainline: unknown;
+  outcome: unknown;
+  result_oid: unknown;
 }
 
 interface OperationTouchedRow {
@@ -256,6 +271,15 @@ interface PersistedOperationTouched {
   worktreeMode: number | null;
   worktreeOid: string | null;
   worktreeRevision: number | null;
+}
+
+interface PersistedOperationStep {
+  ordinal: number;
+  sourceOid: string;
+  selectedParentOid: string | null;
+  mainline: number | null;
+  outcome: string;
+  resultOid: string | null;
 }
 
 export type InitialStateResult<T> = { available: false } | { available: true; value: T };
@@ -648,7 +672,9 @@ function operationIdentityFromRow(
 }
 
 function requireOperationKind(value: unknown): OperationKind {
-  if (value === "merge" || value === "cherry-pick" || value === "revert") return value;
+  if (value === "merge" || value === "cherry-pick" || value === "revert" || value === "rebase") {
+    return value;
+  }
   throw new CorruptError("operation journal has an invalid kind");
 }
 
@@ -663,8 +689,30 @@ function requireNullableMainline(value: unknown): number | null {
   return mainline;
 }
 
-function operationMetadataFromRow(row: OperationStateRow): OperationStateMetadata {
+function operationStepFromRow(row: OperationStepRow): OperationStepMetadata {
+  const outcome = row.outcome;
+  if (outcome !== "pending" && outcome !== "applied" && outcome !== "skipped") {
+    throw new CorruptError("operation step row has an invalid outcome");
+  }
+  return {
+    sourceOid: requireMergeOid(row.source_oid, "step source"),
+    selectedParentOid: requireNullableOperationOid(row.selected_parent_oid, "step parent"),
+    mainline: requireNullableMainline(row.mainline),
+    outcome,
+    resultOid: requireNullableOperationOid(row.result_oid, "step result"),
+  };
+}
+
+function operationMetadataFromRow(
+  row: OperationStateRow,
+  steps: readonly OperationStepMetadata[],
+): OperationStateMetadata {
   const kind = requireOperationKind(row.kind);
+  const currentStep = requireMergeInteger(row.current_step, "current step");
+  const stepCount = requireMergeInteger(row.step_count, "step count");
+  if (stepCount !== steps.length) {
+    throw new CorruptError("operation step count does not match its rows");
+  }
   const common = {
     originalHeadRef: requireMergeText(row.original_head_ref, "original HEAD ref"),
     originalHeadOid: requireMergeOid(row.original_head_oid, "original HEAD"),
@@ -677,9 +725,10 @@ function operationMetadataFromRow(row: OperationStateRow): OperationStateMetadat
   if (kind === "merge") {
     if (
       row.empty_reason !== null ||
-      row.source_oid !== null ||
-      row.selected_parent_oid !== null ||
-      row.mainline !== null
+      row.upstream_oid !== null ||
+      row.base_oid !== null ||
+      currentStep !== 0 ||
+      stepCount !== 0
     ) {
       throw new CorruptError("merge journal retained replay metadata");
     }
@@ -692,7 +741,33 @@ function operationMetadataFromRow(row: OperationStateRow): OperationStateMetadat
       mode: requireMergeMode(row.mode),
     };
   }
-  if (row.current_parent_oid !== null || row.incoming_parent_oid !== null || row.mode !== null) {
+  if (kind === "rebase") {
+    if (row.empty_reason !== null || row.incoming_parent_oid !== null || row.mode !== null) {
+      throw new CorruptError("rebase journal retained one-shot operation metadata");
+    }
+    const phase = row.phase;
+    if (phase !== "running" && phase !== "conflicted") {
+      throw new CorruptError("rebase journal has an invalid phase");
+    }
+    return {
+      kind,
+      ...common,
+      phase,
+      upstreamOid: requireMergeOid(row.upstream_oid, "upstream"),
+      baseOid: requireMergeOid(row.base_oid, "base"),
+      currentParentOid: requireMergeOid(row.current_parent_oid, "current parent"),
+      currentStep,
+    };
+  }
+  if (
+    row.current_parent_oid !== null ||
+    row.incoming_parent_oid !== null ||
+    row.upstream_oid !== null ||
+    row.base_oid !== null ||
+    row.mode !== null ||
+    currentStep !== 0 ||
+    stepCount !== 1
+  ) {
     throw new CorruptError("replay journal retained merge metadata");
   }
   const phase = row.phase;
@@ -703,27 +778,123 @@ function operationMetadataFromRow(row: OperationStateRow): OperationStateMetadat
   if (emptyReason !== null && emptyReason !== "source" && emptyReason !== "result") {
     throw new CorruptError("replay journal has an invalid empty reason");
   }
+  const step = steps[0];
+  if (step === undefined) throw new CorruptError("one-commit replay journal lost its source step");
   return {
     kind,
     ...common,
     phase,
     emptyReason,
-    sourceOid: requireMergeOid(row.source_oid, "source"),
-    selectedParentOid: requireNullableOperationOid(row.selected_parent_oid, "selected parent"),
-    mainline: requireNullableMainline(row.mainline),
+    sourceOid: step.sourceOid,
+    selectedParentOid: step.selectedParentOid,
+    mainline: step.mainline,
   };
 }
 
 function operationJournal(
   state: OperationStateMetadata,
+  steps: readonly OperationStepMetadata[],
   touched: readonly MergeTouchedPath[],
   retainedBytes: number,
   integrityOid: string,
 ): OperationJournal {
-  const fields = { touched, retainedBytes, integrityOid };
+  const fields = { steps, touched, retainedBytes, integrityOid };
   if (state.kind === "merge") return { kind: state.kind, state, ...fields };
   if (state.kind === "cherry-pick") return { kind: state.kind, state, ...fields };
+  if (state.kind === "revert") return { kind: state.kind, state, ...fields };
   return { kind: state.kind, state, ...fields };
+}
+
+function sameOperationStep(left: OperationStepMetadata, right: OperationStepMetadata): boolean {
+  return (
+    left.sourceOid === right.sourceOid &&
+    left.selectedParentOid === right.selectedParentOid &&
+    left.mainline === right.mainline &&
+    left.outcome === right.outcome &&
+    left.resultOid === right.resultOid
+  );
+}
+
+function requireInitialRebaseJournal(
+  state: RebaseStateMetadata,
+  steps: readonly OperationStepMetadata[],
+  touched: readonly MergeTouchedPath[],
+): void {
+  if (
+    state.phase !== "running" ||
+    state.currentStep !== 0 ||
+    touched.length !== 0 ||
+    steps.some((step) => step.outcome !== "pending")
+  ) {
+    throw new CorruptError("initial rebase journal is not an untouched pending sequence");
+  }
+}
+
+function requireRebaseJournalTransition(
+  current: RebaseJournal,
+  state: RebaseStateMetadata,
+  steps: readonly OperationStepMetadata[],
+  touched: readonly MergeTouchedPath[],
+): void {
+  if (
+    state.originalHeadRef !== current.state.originalHeadRef ||
+    state.originalHeadOid !== current.state.originalHeadOid ||
+    state.upstreamOid !== current.state.upstreamOid ||
+    state.baseOid !== current.state.baseOid ||
+    steps.length !== current.steps.length
+  ) {
+    throw new GitError("EOPMISMATCH", "rebase anchors or replay queue changed during transition");
+  }
+  for (let ordinal = 0; ordinal < steps.length; ordinal++) {
+    const before = current.steps[ordinal];
+    const after = steps[ordinal];
+    if (
+      before === undefined ||
+      after === undefined ||
+      before.sourceOid !== after.sourceOid ||
+      before.selectedParentOid !== after.selectedParentOid ||
+      before.mainline !== after.mainline
+    ) {
+      throw new GitError("EOPMISMATCH", "rebase replay queue changed during transition");
+    }
+  }
+  if (
+    state.currentStep === current.state.currentStep &&
+    current.state.phase === "running" &&
+    state.phase === "conflicted" &&
+    touched.length > 0 &&
+    steps.every((step, ordinal) => {
+      const before = current.steps[ordinal];
+      return before !== undefined && sameOperationStep(before, step);
+    })
+  ) {
+    return;
+  }
+  if (
+    state.currentStep === current.state.currentStep + 1 &&
+    state.phase === "running" &&
+    touched.length === 0
+  ) {
+    for (let ordinal = 0; ordinal < steps.length; ordinal++) {
+      const before = current.steps[ordinal];
+      const after = steps[ordinal];
+      if (before === undefined || after === undefined) {
+        throw new GitError("EOPMISMATCH", "rebase replay queue changed during transition");
+      }
+      if (ordinal === current.state.currentStep) {
+        if (
+          before.outcome !== "pending" ||
+          (after.outcome !== "applied" && after.outcome !== "skipped")
+        ) {
+          throw new GitError("EOPMISMATCH", "rebase current step has an invalid transition");
+        }
+      } else if (!sameOperationStep(before, after)) {
+        throw new GitError("EOPMISMATCH", "rebase completed or pending steps changed");
+      }
+    }
+    return;
+  }
+  throw new GitError("EOPMISMATCH", "rebase journal transition is not contiguous");
 }
 
 function operationIndexFromRow(row: OperationTouchedRow): MergeIndexSnapshot | null {
@@ -803,6 +974,20 @@ function persistedOperationTouched(
     worktreeMode: worktree.kind === "absent" ? null : worktree.mode,
     worktreeOid: worktree.kind === "file" || worktree.kind === "symlink" ? worktree.oid : null,
     worktreeRevision: worktree.kind === "absent" ? null : worktree.revision,
+  };
+}
+
+function persistedOperationStep(
+  step: OperationStepMetadata,
+  ordinal: number,
+): PersistedOperationStep {
+  return {
+    ordinal,
+    sourceOid: step.sourceOid,
+    selectedParentOid: step.selectedParentOid,
+    mainline: step.mainline,
+    outcome: step.outcome,
+    resultOid: step.resultOid,
   };
 }
 
@@ -2501,6 +2686,13 @@ export class RepoStore {
                    WHEN typeof(incoming_parent_oid) = 'text'
                          AND length(CAST(incoming_parent_oid AS BLOB)) = 40
                    THEN incoming_parent_oid ELSE 0 END AS incoming_parent_oid,
+              CASE WHEN upstream_oid IS NULL THEN NULL
+                   WHEN typeof(upstream_oid) = 'text'
+                         AND length(CAST(upstream_oid AS BLOB)) = 40
+                   THEN upstream_oid ELSE 0 END AS upstream_oid,
+              CASE WHEN base_oid IS NULL THEN NULL
+                   WHEN typeof(base_oid) = 'text' AND length(CAST(base_oid AS BLOB)) = 40
+                   THEN base_oid ELSE 0 END AS base_oid,
               CASE WHEN typeof(phase) = 'text' AND length(CAST(phase AS BLOB)) <= 10
                    THEN phase END AS phase,
               CASE WHEN empty_reason IS NULL THEN NULL
@@ -2510,14 +2702,12 @@ export class RepoStore {
               CASE WHEN mode IS NULL THEN NULL
                    WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
                    THEN mode ELSE 0 END AS mode,
-              CASE WHEN source_oid IS NULL THEN NULL
-                   WHEN typeof(source_oid) = 'text' AND length(CAST(source_oid AS BLOB)) = 40
-                   THEN source_oid ELSE 0 END AS source_oid,
-              CASE WHEN selected_parent_oid IS NULL THEN NULL
-                   WHEN typeof(selected_parent_oid) = 'text'
-                         AND length(CAST(selected_parent_oid AS BLOB)) = 40
-                   THEN selected_parent_oid ELSE 0 END AS selected_parent_oid,
-              mainline,
+              CASE WHEN typeof(current_step) = 'integer'
+                         AND current_step >= 0 AND current_step <= ${MAX_OPERATION_STEPS}
+                   THEN current_step END AS current_step,
+              CASE WHEN typeof(step_count) = 'integer'
+                         AND step_count >= 0 AND step_count <= ${MAX_OPERATION_STEPS}
+                   THEN step_count END AS step_count,
               CASE WHEN typeof(current_label) = 'text'
                          AND length(CAST(current_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
                    THEN current_label END AS current_label,
@@ -2553,15 +2743,24 @@ export class RepoStore {
     if (row === undefined) {
       const orphaned = requireBooleanProbe(
         this.#db.scalar<unknown>(
-          "SELECT EXISTS(SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1)",
+          `SELECT EXISTS(
+             SELECT 1 FROM git_operation_steps WHERE repo_id = ?
+             UNION ALL
+             SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1
+           )`,
+          this.#repoId,
           this.#repoId,
         ),
-        "operation touched-path orphan probe",
+        "operation child-row orphan probe",
       );
-      if (orphaned) throw new CorruptError("touched paths exist without operation state");
+      if (orphaned) throw new CorruptError("operation child rows exist without operation state");
       return null;
     }
 
+    const stepCount = requireMergeInteger(row.step_count, "step count");
+    if (stepCount > MAX_OPERATION_STEPS) {
+      throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
+    }
     const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
     const storedBytes = requireMergeInteger(row.retained_bytes, "retained-byte count");
     if (touchedCount > MAX_MERGE_TOUCHED_PATHS) {
@@ -2570,7 +2769,51 @@ export class RepoStore {
     if (storedBytes > MAX_MERGE_STATE_BYTES) {
       throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`);
     }
-    const state = operationMetadataFromRow(row);
+    const steps: OperationStepMetadata[] = [];
+    for (const raw of this.#db.iterate(
+      `SELECT CASE WHEN typeof(ordinal) = 'integer'
+                            AND ordinal >= 0 AND ordinal < ${MAX_OPERATION_STEPS}
+                   THEN ordinal END AS ordinal,
+              CASE WHEN typeof(source_oid) = 'text'
+                         AND length(CAST(source_oid AS BLOB)) = 40
+                   THEN source_oid END AS source_oid,
+              CASE WHEN selected_parent_oid IS NULL THEN NULL
+                   WHEN typeof(selected_parent_oid) = 'text'
+                         AND length(CAST(selected_parent_oid AS BLOB)) = 40
+                   THEN selected_parent_oid ELSE 0 END AS selected_parent_oid,
+              CASE WHEN mainline IS NULL THEN NULL
+                   WHEN typeof(mainline) = 'integer' AND mainline >= 1
+                        AND mainline <= ${Number.MAX_SAFE_INTEGER}
+                   THEN mainline ELSE -1 END AS mainline,
+              CASE WHEN typeof(outcome) = 'text' AND length(CAST(outcome AS BLOB)) <= 7
+                   THEN outcome END AS outcome,
+              CASE WHEN result_oid IS NULL THEN NULL
+                   WHEN typeof(result_oid) = 'text' AND length(CAST(result_oid AS BLOB)) = 40
+                   THEN result_oid ELSE 0 END AS result_oid
+         FROM git_operation_steps WHERE repo_id = ? ORDER BY ordinal`,
+      this.#repoId,
+    )) {
+      const stepRow: OperationStepRow = {
+        ordinal: raw.ordinal,
+        source_oid: raw.source_oid,
+        selected_parent_oid: raw.selected_parent_oid,
+        mainline: raw.mainline,
+        outcome: raw.outcome,
+        result_oid: raw.result_oid,
+      };
+      const ordinal = requireMergeInteger(stepRow.ordinal, "step ordinal");
+      if (ordinal !== steps.length) {
+        throw new CorruptError("operation step ordinals are not contiguous");
+      }
+      if (steps.length >= stepCount || steps.length >= MAX_OPERATION_STEPS) {
+        throw new CorruptError("operation journal yielded too many steps");
+      }
+      steps.push(operationStepFromRow(stepRow));
+    }
+    if (steps.length !== stepCount) {
+      throw new CorruptError("operation step count does not match its rows");
+    }
+    const state = operationMetadataFromRow(row, steps);
 
     const touched: MergeTouchedPath[] = [];
     let previousPath: string | null = null;
@@ -2635,23 +2878,36 @@ export class RepoStore {
     if (touched.length !== touchedCount) {
       throw new CorruptError("merge journal touched-path count does not match its rows");
     }
-    const retainedBytes = operationJournalRetainedBytes(state, touched);
+    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
     if (retainedBytes !== storedBytes) {
       throw new CorruptError("merge journal retained-byte count does not match its rows");
     }
     const integrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
-    if (operationJournalIntegrityOid(state, touched) !== integrityOid) {
+    if (operationJournalIntegrityOid(state, touched, steps) !== integrityOid) {
       throw new CorruptError("operation journal integrity identity does not match its rows");
     }
-    const journal = operationJournal(state, touched, retainedBytes, integrityOid);
+    const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
     this.#validateOperationObjects(journal);
     return journal;
   }
 
   /** Atomically create one bounded operation journal; an existing operation wins. */
   writeOperationState(state: OperationStateMetadata, touched: readonly MergeTouchedPath[]): void {
-    const retainedBytes = operationJournalRetainedBytes(state, touched);
-    const integrityOid = operationJournalIntegrityOid(state, touched);
+    if (state.kind === "rebase") {
+      throw new CorruptError("rebase creation requires an explicit replay sequence");
+    }
+    this.writeOperationJournal(state, operationStepsForState(state), touched);
+  }
+
+  /** Atomically create a complete authenticated operation header and child rows. */
+  writeOperationJournal(
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+  ): void {
+    if (state.kind === "rebase") requireInitialRebaseJournal(state, steps, touched);
+    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
+    const integrityOid = operationJournalIntegrityOid(state, touched, steps);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
@@ -2662,73 +2918,117 @@ export class RepoStore {
 
     this.#db.transactionSync(() => {
       this.requireNoOperationState();
-      this.#validateOperationObjects(operationJournal(state, touched, retainedBytes, integrityOid));
-      this.#db.run(
-        `INSERT INTO git_operation_state
-           (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
-            current_parent_oid, incoming_parent_oid, mode, source_oid,
-            selected_parent_oid, mainline, current_label, incoming_label,
-            message, author_name, author_email, committer_name, committer_email,
-            touched_count, retained_bytes, integrity_oid)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        this.#repoId,
-        state.kind,
-        state.originalHeadRef,
-        state.originalHeadOid,
-        state.phase,
-        state.kind === "merge" ? null : state.emptyReason,
-        state.kind === "merge" ? state.currentParentOid : null,
-        state.kind === "merge" ? state.incomingParentOid : null,
-        state.kind === "merge" ? state.mode : null,
-        state.kind === "merge" ? null : state.sourceOid,
-        state.kind === "merge" ? null : state.selectedParentOid,
-        state.kind === "merge" ? null : state.mainline,
-        state.currentLabel,
-        state.incomingLabel,
-        state.message,
-        state.author?.name ?? null,
-        state.author?.email ?? null,
-        state.committer?.name ?? null,
-        state.committer?.email ?? null,
-        touched.length,
-        retainedBytes,
-        integrityOid,
-      );
-
-      function* rows(): Generator<PersistedOperationTouched> {
-        for (let ordinal = 0; ordinal < touched.length; ordinal++) {
-          yield persistedOperationTouched(touched[ordinal]!, ordinal);
-        }
-      }
-      for (const page of jsonPages(rows(), "operation touched path")) {
-        this.#db.run(
-          `INSERT INTO git_operation_touched
-             (repo_id, ordinal, path, logical_path, purpose,
-              index_stage, index_mode, index_oid, index_size, index_mtime,
-              index_ino, index_rev, worktree_kind, worktree_mode,
-              worktree_oid, worktree_revision)
-           SELECT ?,
-                  json_extract(value, '$.ordinal'),
-                  json_extract(value, '$.path'),
-                  json_extract(value, '$.logicalPath'),
-                  json_extract(value, '$.purpose'),
-                  json_extract(value, '$.indexStage'),
-                  json_extract(value, '$.indexMode'),
-                  json_extract(value, '$.indexOid'),
-                  json_extract(value, '$.indexSize'),
-                  json_extract(value, '$.indexMtime'),
-                  json_extract(value, '$.indexIno'),
-                  json_extract(value, '$.indexRev'),
-                  json_extract(value, '$.worktreeKind'),
-                  json_extract(value, '$.worktreeMode'),
-                  json_extract(value, '$.worktreeOid'),
-                  json_extract(value, '$.worktreeRevision')
-             FROM json_each(?) ORDER BY CAST(json_extract(value, '$.ordinal') AS INTEGER)`,
-          this.#repoId,
-          page,
-        );
-      }
+      const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
+      this.#validateOperationObjects(journal);
+      this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
+      this.#insertOperationSteps(steps);
+      this.#insertOperationTouched(touched);
     });
+  }
+
+  #insertOperationHeader(
+    state: OperationStateMetadata,
+    stepCount: number,
+    touchedCount: number,
+    retainedBytes: number,
+    integrityOid: string,
+  ): void {
+    this.#db.run(
+      `INSERT INTO git_operation_state
+         (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+          current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
+          current_step, step_count, current_label, incoming_label, message,
+          author_name, author_email, committer_name, committer_email,
+          touched_count, retained_bytes, integrity_oid)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      this.#repoId,
+      state.kind,
+      state.originalHeadRef,
+      state.originalHeadOid,
+      state.phase,
+      state.kind === "cherry-pick" || state.kind === "revert" ? state.emptyReason : null,
+      state.kind === "merge" || state.kind === "rebase" ? state.currentParentOid : null,
+      state.kind === "merge" ? state.incomingParentOid : null,
+      state.kind === "rebase" ? state.upstreamOid : null,
+      state.kind === "rebase" ? state.baseOid : null,
+      state.kind === "merge" ? state.mode : null,
+      state.kind === "rebase" ? state.currentStep : 0,
+      stepCount,
+      state.currentLabel,
+      state.incomingLabel,
+      state.message,
+      state.author?.name ?? null,
+      state.author?.email ?? null,
+      state.committer?.name ?? null,
+      state.committer?.email ?? null,
+      touchedCount,
+      retainedBytes,
+      integrityOid,
+    );
+  }
+
+  #insertOperationSteps(steps: readonly OperationStepMetadata[]): void {
+    function* rows(): Generator<PersistedOperationStep> {
+      for (let ordinal = 0; ordinal < steps.length; ordinal++) {
+        const step = steps[ordinal];
+        if (step === undefined) throw new CorruptError("operation step sequence is sparse");
+        yield persistedOperationStep(step, ordinal);
+      }
+    }
+    for (const page of jsonPages(rows(), "operation step")) {
+      this.#db.run(
+        `INSERT INTO git_operation_steps
+           (repo_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
+         SELECT ?,
+                json_extract(value, '$.ordinal'),
+                json_extract(value, '$.sourceOid'),
+                json_extract(value, '$.selectedParentOid'),
+                json_extract(value, '$.mainline'),
+                json_extract(value, '$.outcome'),
+                json_extract(value, '$.resultOid')
+           FROM json_each(?) ORDER BY CAST(json_extract(value, '$.ordinal') AS INTEGER)`,
+        this.#repoId,
+        page,
+      );
+    }
+  }
+
+  #insertOperationTouched(touched: readonly MergeTouchedPath[]): void {
+    function* rows(): Generator<PersistedOperationTouched> {
+      for (let ordinal = 0; ordinal < touched.length; ordinal++) {
+        const entry = touched[ordinal];
+        if (entry === undefined) throw new CorruptError("operation touched sequence is sparse");
+        yield persistedOperationTouched(entry, ordinal);
+      }
+    }
+    for (const page of jsonPages(rows(), "operation touched path")) {
+      this.#db.run(
+        `INSERT INTO git_operation_touched
+           (repo_id, ordinal, path, logical_path, purpose,
+            index_stage, index_mode, index_oid, index_size, index_mtime,
+            index_ino, index_rev, worktree_kind, worktree_mode,
+            worktree_oid, worktree_revision)
+         SELECT ?,
+                json_extract(value, '$.ordinal'),
+                json_extract(value, '$.path'),
+                json_extract(value, '$.logicalPath'),
+                json_extract(value, '$.purpose'),
+                json_extract(value, '$.indexStage'),
+                json_extract(value, '$.indexMode'),
+                json_extract(value, '$.indexOid'),
+                json_extract(value, '$.indexSize'),
+                json_extract(value, '$.indexMtime'),
+                json_extract(value, '$.indexIno'),
+                json_extract(value, '$.indexRev'),
+                json_extract(value, '$.worktreeKind'),
+                json_extract(value, '$.worktreeMode'),
+                json_extract(value, '$.worktreeOid'),
+                json_extract(value, '$.worktreeRevision')
+           FROM json_each(?) ORDER BY CAST(json_extract(value, '$.ordinal') AS INTEGER)`,
+        this.#repoId,
+        page,
+      );
+    }
   }
 
   #validateOperationObjects(journal: OperationJournal): void {
@@ -2746,14 +3046,22 @@ export class RepoStore {
     if (journal.state.kind === "merge") {
       add({ oid: journal.state.currentParentOid, type: "commit", label: "current parent" });
       add({ oid: journal.state.incomingParentOid, type: "commit", label: "incoming parent" });
-    } else {
-      add({ oid: journal.state.sourceOid, type: "commit", label: "source" });
-      if (journal.state.selectedParentOid !== null) {
+    } else if (journal.state.kind === "rebase") {
+      add({ oid: journal.state.upstreamOid, type: "commit", label: "upstream" });
+      add({ oid: journal.state.baseOid, type: "commit", label: "base" });
+      add({ oid: journal.state.currentParentOid, type: "commit", label: "current parent" });
+    }
+    for (const step of journal.steps) {
+      add({ oid: step.sourceOid, type: "commit", label: "step source" });
+      if (step.selectedParentOid !== null) {
         add({
-          oid: journal.state.selectedParentOid,
+          oid: step.selectedParentOid,
           type: "commit",
-          label: "selected parent",
+          label: "step selected parent",
         });
+      }
+      if (step.resultOid !== null) {
+        add({ oid: step.resultOid, type: "commit", label: "step result" });
       }
     }
     for (const entry of journal.touched) {
@@ -2773,57 +3081,170 @@ export class RepoStore {
       }
     }
 
-    let info: ObjectReadInfo[];
-    try {
-      info = this.objectInfo([...expected.keys()]);
-    } catch (error) {
-      if (hasErrorCode(error, "ENOTFOUND")) {
-        throw new CorruptError("operation journal references a missing object", { cause: error });
+    let page: string[] = [];
+    const validatePage = (): void => {
+      if (page.length === 0) return;
+      let info: ObjectReadInfo[];
+      try {
+        info = this.objectInfo(page);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOTFOUND")) {
+          throw new CorruptError("operation journal references a missing object", { cause: error });
+        }
+        throw error;
       }
-      throw error;
-    }
-    for (const object of info) {
-      const wanted = expected.get(object.oid);
-      if (wanted === undefined || object.type !== wanted.type) {
-        throw new CorruptError(
-          `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
-        );
+      for (const object of info) {
+        const wanted = expected.get(object.oid);
+        if (wanted === undefined || object.type !== wanted.type) {
+          throw new CorruptError(
+            `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
+          );
+        }
       }
+      page = [];
+    };
+    for (const oid of expected.keys()) {
+      page.push(oid);
+      if (page.length === MAX_BLOB_BATCH_OIDS) validatePage();
     }
-    if (journal.kind !== "merge") this.#validateReplayParentSelection(journal.state);
+    validatePage();
+    if (journal.kind !== "merge") this.#validateReplayTopology(journal);
   }
 
-  #validateReplayParentSelection(state: ReplayStateMetadata): void {
-    const batch = this.readObjects([state.sourceOid], { budgetBytes: MAX_INDEXED_COMMIT_BYTES });
-    const object = batch.objects.get(state.sourceOid);
-    if (object === undefined || batch.remaining.length !== 0 || object.type !== "commit") {
-      throw new CorruptError("replay source did not produce one complete commit object");
+  #validateReplayTopology(journal: CherryPickJournal | RevertJournal | RebaseJournal): void {
+    if (journal.kind !== "rebase") {
+      const step = journal.steps[0];
+      if (step === undefined) throw new CorruptError("one-commit replay lost its source step");
+      this.#validateOperationCommitBodies([step.sourceOid], 0, (_oid, source) => {
+        this.#validateReplayParentSelection(step, source.commit.parent);
+      });
+      return;
     }
-    const source = prepareCommitCache({
-      repoId: this.#repoId,
-      oid: state.sourceOid,
-      data: object.data,
-    });
-    const parents = source.commit.parent;
+    let expectedSourceParent = journal.state.baseOid;
+    let sourceOrdinal = 0;
+    let retainedBytes = this.#validateOperationCommitBodies(
+      journal.steps.map((step) => step.sourceOid),
+      0,
+      (_oid, source) => {
+        const step = journal.steps[sourceOrdinal++];
+        if (step === undefined) throw new CorruptError("rebase source sequence is incomplete");
+        const parents = source.commit.parent;
+        if (
+          parents.length !== 1 ||
+          parents[0] !== expectedSourceParent ||
+          step.selectedParentOid !== expectedSourceParent ||
+          step.mainline !== null
+        ) {
+          throw new CorruptError("rebase source steps are not an oldest-first linear sequence");
+        }
+        expectedSourceParent = step.sourceOid;
+      },
+    );
+    if (expectedSourceParent !== journal.state.originalHeadOid) {
+      throw new CorruptError("rebase source sequence does not end at the original HEAD");
+    }
+
+    const applied = journal.steps.filter((step) => step.outcome === "applied");
+    let expectedResultParent = journal.state.upstreamOid;
+    let resultOrdinal = 0;
+    retainedBytes = this.#validateOperationCommitBodies(
+      applied.map((step) => {
+        if (step.resultOid === null) throw new CorruptError("applied rebase step lost its result");
+        return step.resultOid;
+      }),
+      retainedBytes,
+      (_oid, result) => {
+        const step = applied[resultOrdinal++];
+        if (step === undefined || step.resultOid === null) {
+          throw new CorruptError("rebase result sequence is incomplete");
+        }
+        if (result.commit.parent.length !== 1 || result.commit.parent[0] !== expectedResultParent) {
+          throw new CorruptError("applied rebase result has an invalid replay parent");
+        }
+        expectedResultParent = step.resultOid;
+      },
+    );
+    if (retainedBytes > MAX_LOG_STATE_BYTES) {
+      throw new GitError(
+        "E2BIG",
+        `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
+      );
+    }
+  }
+
+  #validateOperationCommitBodies(
+    oids: readonly string[],
+    initialBytes: number,
+    visit: (oid: string, commit: CommitCacheEntry) => void,
+  ): number {
+    let retainedBytes = initialBytes;
+    const seen = new Set<string>();
+    for (let offset = 0; offset < oids.length; offset += MAX_BLOB_BATCH_OIDS) {
+      const page = oids.slice(offset, offset + MAX_BLOB_BATCH_OIDS);
+      for (const oid of page) {
+        if (seen.has(oid)) throw new CorruptError("operation commit sequence contains a cycle");
+        seen.add(oid);
+      }
+      let remaining = page;
+      while (remaining.length > 0) {
+        const available = MAX_LOG_STATE_BYTES - retainedBytes;
+        if (available <= 0) {
+          throw new GitError(
+            "E2BIG",
+            `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
+          );
+        }
+        let batch: ObjectReadBatch;
+        try {
+          batch = this.readObjects(remaining, {
+            budgetBytes: Math.min(MAX_BLOB_BATCH_BYTES, available),
+          });
+        } catch (error) {
+          if (hasErrorCode(error, "EFBIG")) {
+            throw new GitError(
+              "E2BIG",
+              `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
+              { cause: error },
+            );
+          }
+          throw error;
+        }
+        if (batch.objects.size === 0 || batch.bytes <= 0) {
+          throw new CorruptError("operation commit validation made no progress");
+        }
+        retainedBytes += batch.bytes;
+        for (const [oid, object] of batch.objects) {
+          if (object.type !== "commit") {
+            throw new CorruptError("operation step did not produce a complete commit object");
+          }
+          visit(oid, prepareCommitCache({ repoId: this.#repoId, oid, data: object.data }));
+        }
+        remaining = batch.remaining;
+      }
+    }
+    return retainedBytes;
+  }
+
+  #validateReplayParentSelection(step: OperationStepMetadata, parents: readonly string[]): void {
     if (parents.length === 0) {
-      if (state.selectedParentOid !== null || state.mainline !== null) {
+      if (step.selectedParentOid !== null || step.mainline !== null) {
         throw new CorruptError("root replay source retained a selected parent or mainline");
       }
       return;
     }
     if (parents.length === 1) {
       if (
-        state.selectedParentOid !== parents[0] ||
-        (state.mainline !== null && state.mainline !== 1)
+        step.selectedParentOid !== parents[0] ||
+        (step.mainline !== null && step.mainline !== 1)
       ) {
         throw new CorruptError("single-parent replay selection differs from its source commit");
       }
       return;
     }
     if (
-      state.mainline === null ||
-      state.mainline > parents.length ||
-      state.selectedParentOid !== parents[state.mainline - 1]
+      step.mainline === null ||
+      step.mainline > parents.length ||
+      step.selectedParentOid !== parents[step.mainline - 1]
     ) {
       throw new CorruptError("merge replay selection differs from its source commit");
     }
@@ -2831,6 +3252,9 @@ export class RepoStore {
 
   /** Replace authenticated metadata while retaining the exact touched snapshot. */
   replaceOperationState(expectedIntegrityOid: string, state: OperationStateMetadata): void {
+    if (state.kind === "rebase") {
+      throw new GitError("EOPMISMATCH", "rebase replacement requires a whole-journal transition");
+    }
     if (!isOid(expectedIntegrityOid)) {
       throw new GitError("EINVAL", "expected operation integrity identity is invalid");
     }
@@ -2843,29 +3267,29 @@ export class RepoStore {
       if (current.integrityOid !== expectedIntegrityOid) {
         throw new GitError("EOPMISMATCH", "operation state changed before replacement");
       }
-      const retainedBytes = operationJournalRetainedBytes(state, current.touched);
-      const integrityOid = operationJournalIntegrityOid(state, current.touched);
+      const retainedBytes = operationJournalRetainedBytes(state, current.touched, current.steps);
+      const integrityOid = operationJournalIntegrityOid(state, current.touched, current.steps);
       this.#validateOperationObjects(
-        operationJournal(state, current.touched, retainedBytes, integrityOid),
+        operationJournal(state, current.steps, current.touched, retainedBytes, integrityOid),
       );
       this.#db.run(
         `UPDATE git_operation_state
             SET original_head_ref = ?, original_head_oid = ?, phase = ?, empty_reason = ?,
-                current_parent_oid = ?, incoming_parent_oid = ?, mode = ?, source_oid = ?,
-                selected_parent_oid = ?, mainline = ?, current_label = ?, incoming_label = ?,
+                current_parent_oid = ?, incoming_parent_oid = ?, upstream_oid = ?, base_oid = ?,
+                mode = ?, current_step = ?, current_label = ?, incoming_label = ?,
                 message = ?, author_name = ?, author_email = ?, committer_name = ?,
                 committer_email = ?, retained_bytes = ?, integrity_oid = ?
           WHERE repo_id = ? AND integrity_oid = ?`,
         state.originalHeadRef,
         state.originalHeadOid,
         state.phase,
-        state.kind === "merge" ? null : state.emptyReason,
+        state.kind === "cherry-pick" || state.kind === "revert" ? state.emptyReason : null,
         state.kind === "merge" ? state.currentParentOid : null,
         state.kind === "merge" ? state.incomingParentOid : null,
+        null,
+        null,
         state.kind === "merge" ? state.mode : null,
-        state.kind === "merge" ? null : state.sourceOid,
-        state.kind === "merge" ? null : state.selectedParentOid,
-        state.kind === "merge" ? null : state.mainline,
+        0,
         state.currentLabel,
         state.incomingLabel,
         state.message,
@@ -2881,6 +3305,51 @@ export class RepoStore {
     });
   }
 
+  /** Compare-and-swap one complete journal transition, including child rows. */
+  replaceOperationJournal(
+    expectedIntegrityOid: string,
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+  ): void {
+    if (!isOid(expectedIntegrityOid)) {
+      throw new GitError("EINVAL", "expected operation integrity identity is invalid");
+    }
+    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
+    const integrityOid = operationJournalIntegrityOid(state, touched, steps);
+    let previousPath: string | null = null;
+    for (const entry of touched) {
+      if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+        throw new CorruptError("operation touched paths are not in strict Git path order");
+      }
+      previousPath = entry.path;
+    }
+    this.#db.transactionSync(() => {
+      const current = this.readOperationState();
+      if (current === null) throw operationNotActive(state.kind);
+      if (current.kind !== state.kind) throw operationKindMismatch(state.kind, current.kind);
+      if (current.integrityOid !== expectedIntegrityOid) {
+        throw new GitError("EOPMISMATCH", "operation state changed before replacement");
+      }
+      if (current.kind === "rebase") {
+        if (state.kind !== "rebase") throw operationKindMismatch(state.kind, current.kind);
+        requireRebaseJournalTransition(current, state, steps, touched);
+      }
+      const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
+      this.#validateOperationObjects(journal);
+      this.#db.run("DELETE FROM git_operation_touched WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_operation_steps WHERE repo_id = ?", this.#repoId);
+      this.#db.run(
+        "DELETE FROM git_operation_state WHERE repo_id = ? AND integrity_oid = ?",
+        this.#repoId,
+        expectedIntegrityOid,
+      );
+      this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
+      this.#insertOperationSteps(steps);
+      this.#insertOperationTouched(touched);
+    });
+  }
+
   /** Clear operation metadata and touched snapshots, including corrupt orphans. */
   clearOperationState(): boolean {
     return this.#db.transactionSync(() => {
@@ -2889,14 +3358,18 @@ export class RepoStore {
           `SELECT EXISTS(
              SELECT 1 FROM git_operation_state WHERE repo_id = ?
              UNION ALL
+             SELECT 1 FROM git_operation_steps WHERE repo_id = ?
+             UNION ALL
              SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1
            )`,
+          this.#repoId,
           this.#repoId,
           this.#repoId,
         ),
         "operation state clear probe",
       );
       this.#db.run("DELETE FROM git_operation_touched WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_operation_steps WHERE repo_id = ?", this.#repoId);
       this.#db.run("DELETE FROM git_operation_state WHERE repo_id = ?", this.#repoId);
       return existed;
     });
@@ -2911,6 +3384,7 @@ export class RepoStore {
   requireOperationState(kind: "merge"): MergeOperationJournal;
   requireOperationState(kind: "cherry-pick"): CherryPickJournal;
   requireOperationState(kind: "revert"): RevertJournal;
+  requireOperationState(kind: "rebase"): RebaseJournal;
   requireOperationState(kind: OperationKind): OperationJournal;
   requireOperationState(kind: OperationKind): OperationJournal {
     const journal = this.readOperationState();
@@ -2918,6 +3392,7 @@ export class RepoStore {
     if (journal.kind !== kind) throw operationKindMismatch(kind, journal.kind);
     if (journal.kind === "merge") return journal;
     if (journal.kind === "cherry-pick") return journal;
+    if (journal.kind === "revert") return journal;
     return journal;
   }
 
@@ -3346,6 +3821,7 @@ export class RepoStore {
         "git_index_dirty",
         "git_index_state",
         "git_operation_touched",
+        "git_operation_steps",
         "git_operation_state",
         "git_refs",
         "git_blob_ids",
