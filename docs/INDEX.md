@@ -17,6 +17,9 @@ decisions → reference → archive.
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
 
+- [`sprints/sprint-2026-08-25-status-and-rename-correctness.md`](sprints/sprint-2026-08-25-status-and-rename-correctness.md)
+  — planned native conflict truth, status option reachability, branch metadata,
+  and bounded exact rename detection.
 - [`sprints/sprint-2026-08-25-release-correctness-baseline.md`](sprints/sprint-2026-08-25-release-correctness-baseline.md)
   — implementation is complete; the first hosted CI run remains.
 
@@ -24,10 +27,11 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
+- The status and rename correctness sprint is ready to execute from a green
+  76-test targeted baseline.
 - The release correctness baseline awaits its first hosted GitHub CI witness.
-- The next silent-divergence targets are unmerged status and rename detection.
-- Stash can now build on the authenticated operation-step journal and shared
-  integration engine.
+- Storage-contract work follows after the remaining scheduled silent Git
+  divergences are removed.
 
 ## Key reference
 
