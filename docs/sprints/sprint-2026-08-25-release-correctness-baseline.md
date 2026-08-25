@@ -20,13 +20,9 @@ tarball, test and runtime SQLite agree on foreign keys, ordinary commit and
 native `rm` match Git's safe defaults, and OID storage has an accepted ADR before
 production data makes the choice expensive.
 
-Scheduled backlog: [05](../backlog/05-ci-and-release-gates.md),
-[19](../backlog/19-foreign-key-enforcement-parity.md),
-[22](../backlog/22-oid-column-encoding.md),
-[30](../backlog/30-rm-removes-worktree-files.md), and
-[32](../backlog/32-refuse-empty-commits.md). Item 22 is consumed only if the ADR
-keeps hex `TEXT`; a BLOB decision leaves a narrowed migration follow-up paired
-with [21](../backlog/21-narrow-parsed-tree-keys.md).
+Scheduled backlog: [05](../backlog/05-ci-and-release-gates.md), 19, 22, 30, and
+32. WU2–WU5 consumed their items. Item 05 remains open until the first hosted CI
+run passes.
 
 ## Refs re-verified at HEAD (2026-08-25, `97066d0`)
 
@@ -349,7 +345,9 @@ number measured without a lease may enter ADR 0005 or reference docs.
 - 2026-08-25 execution: WU2–WU5 shipped. The full suite passes with 95 files,
   1,674 passed tests, and 5 skipped tests. Typecheck, Biome, and the production
   build pass. The package smoke also passes for both isolated consumers.
-- 2026-08-25 blocker: WU1 is implemented and verified locally, but the checkout
-  has no Git remote and `matej21/kompjutr` does not exist. The package manifest
-  needs the canonical public GitHub `owner/repo` before the release unit can be
-  committed and this sprint can close.
+- 2026-08-25 resolution: the canonical source is `contember/kompjutr`. The public
+  repository now exists, the package manifest records it, and WU1 passed the
+  exact-tarball smoke gate before commit.
+- 2026-08-25 blocker: WU1 still needs its hosted acceptance witness. The new
+  public repository is empty, so GitHub Actions cannot run until the local
+  history is explicitly pushed.

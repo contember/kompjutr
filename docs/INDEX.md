@@ -18,15 +18,14 @@ decisions → reference → archive.
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
 
 - [`sprints/sprint-2026-08-25-release-correctness-baseline.md`](sprints/sprint-2026-08-25-release-correctness-baseline.md)
-  — release gates, SQLite contract evidence, OID decision, and safe Git mutation
-  defaults.
+  — implementation is complete; the first hosted CI run remains.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The release correctness baseline sprint is active: CI/artifact gates,
-  foreign-key evidence, OID encoding, empty commits, and native `rm` semantics.
+- The release correctness baseline awaits its first hosted GitHub CI witness.
+- The next silent-divergence targets are unmerged status and rename detection.
 - Stash can now build on the authenticated operation-step journal and shared
   integration engine.
 
@@ -35,6 +34,8 @@ decisions → reference → archive.
 - [`reference/architecture.md`](reference/architecture.md) — current runtime architecture and limits.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
 - [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.
+- [`reference/oid-encoding-measurement.md`](reference/oid-encoding-measurement.md) — measured TEXT-versus-BLOB OID evidence.
+- [`reference/release.md`](reference/release.md) — CI gates and the tag-driven release process.
 - [`reference/shell.md`](reference/shell.md) — current shell surface and deliberate limits.
 
 ## Decisions
@@ -42,6 +43,8 @@ decisions → reference → archive.
 - [`decisions/0001-own-the-standalone-sqlite-runtime.md`](decisions/0001-own-the-standalone-sqlite-runtime.md)
 - [`decisions/0002-compile-shell-commands-to-bounded-queries.md`](decisions/0002-compile-shell-commands-to-bounded-queries.md)
 - [`decisions/0003-port-xdiff-text-merge.md`](decisions/0003-port-xdiff-text-merge.md)
+- [`decisions/0004-foreign-key-enforcement.md`](decisions/0004-foreign-key-enforcement.md)
+- [`decisions/0005-keep-oid-columns-as-text.md`](decisions/0005-keep-oid-columns-as-text.md)
 
 ## Historical records
 

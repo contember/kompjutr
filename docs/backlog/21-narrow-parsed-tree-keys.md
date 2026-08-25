@@ -59,4 +59,4 @@ Acceptance:
 `src/sqlite/store.ts`, `src/sqlite/packs.ts`, `src/core/ops/tree-stream.ts`,
 migrations, `tests/schema-migration.test.ts`, `bench/`
 
-<!-- Origin: git schema architecture review, 2026-08-24. Related: ./22-oid-column-encoding.md -->
+<!-- Origin: git schema architecture review, 2026-08-24. Related: ../decisions/0005-keep-oid-columns-as-text.md -->

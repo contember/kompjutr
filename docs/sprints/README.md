@@ -22,5 +22,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 <!-- one line per active sprint; empty between sprints -->
 
 - [`sprint-2026-08-25-release-correctness-baseline.md`](sprint-2026-08-25-release-correctness-baseline.md)
-  — trustworthy CI artifacts, explicit SQLite enforcement, deliberate OID
-  storage, and Git-safe commit/rm defaults.
+  — local implementation and gates pass; hosted GitHub CI remains to be witnessed.
