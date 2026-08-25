@@ -3,6 +3,10 @@
   "version": "0.0.0",
   "description": "SQLite-native filesystem and git backend for Cloudflare Workers.",
   "license": "MIT AND LGPL-2.1-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/contember/kompjutr.git"
+  },
   "type": "module",
   "sideEffects": false,
   "exports": {
@@ -45,6 +49,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "package:smoke": "node scripts/package-smoke.mjs",
     "format": "biome format --write .",
     "check": "biome check .",
     "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts",

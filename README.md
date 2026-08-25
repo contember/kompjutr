@@ -151,6 +151,17 @@ Next.js workflow. Older comparisons are historical pre-standalone evidence.
 Experimental. The standalone API and compatibility adapter are tested, but the
 remaining wall-time gaps above still block a performance-complete release.
 
+## Development and releases
+
+Maintainer checks use Node.js 24 and npm 11. Pull requests and changes to `main`
+must pass formatting and lint checks, type checking, the full test suite, the
+production build, and an isolated-consumer smoke test of the packed npm artifact.
+Benchmarks are measured separately and do not run in ordinary CI.
+
+Publishing is tag-driven and runs only in GitHub Actions. See the
+[release runbook](docs/reference/release.md) for the supported toolchain, package
+gate, and release sequence. Do not publish this package from a local checkout.
+
 ## Credits
 
 The pack-native object store is based on ideas from dgit. Adapted files retain
