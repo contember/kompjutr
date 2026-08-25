@@ -18,6 +18,7 @@ export type { CatFileResult, CommitView, TreeEntryView } from "./reads.js";
 export type OrdinaryStatusIndexCode = " " | "A" | "M" | "D";
 export type OrdinaryStatusWorktreeCode = " " | "A" | "M" | "D" | "?";
 export type UnmergedStatusCode = "A" | "D" | "U";
+export type IgnoredStatusCode = "!";
 
 export interface OrdinaryStatusEntry {
   path: string;
@@ -27,8 +28,8 @@ export interface OrdinaryStatusEntry {
 
 export interface StatusEntry {
   path: string;
-  index: OrdinaryStatusIndexCode | UnmergedStatusCode;
-  worktree: OrdinaryStatusWorktreeCode | UnmergedStatusCode;
+  index: OrdinaryStatusIndexCode | UnmergedStatusCode | IgnoredStatusCode;
+  worktree: OrdinaryStatusWorktreeCode | UnmergedStatusCode | IgnoredStatusCode;
 }
 
 /**

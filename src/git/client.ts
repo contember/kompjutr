@@ -118,7 +118,15 @@ import {
   reset as resetOp,
   rm as rmOp,
 } from "../core/ops/staging.js";
-import { type CleanOptions, clean as cleanOp, eagerStatus } from "../core/ops/status.js";
+import {
+  type CleanOptions,
+  clean as cleanOp,
+  eagerStatus,
+  type StatusBranch,
+  type StatusOptions,
+  type StatusReportOptions,
+  statusBranch,
+} from "../core/ops/status.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import type { Repository } from "../core/repository.js";
 import type { SparseWorkspaceSource } from "../core/sparse-workspace.js";
@@ -134,6 +142,9 @@ export type GitFetchOptions = FetchOptions;
 export type GitInitOptions = InitOptions;
 export type GitDiffOptions = DiffOptions & GitDirOptions;
 export type GitCleanOptions = Omit<CleanOptions, "excludeRoots" | "ignores"> & GitDirOptions;
+export type GitStatusOptions = Omit<StatusOptions, "excludeRoots" | "ignores"> & GitDirOptions;
+export type GitStatusReportOptions = Omit<StatusReportOptions, "excludeRoots" | "ignores"> &
+  GitDirOptions;
 export type GitAddOptions = Omit<AddOptions, "excludeRoots"> & GitDirOptions;
 export type GitRmOptions = Omit<RmOptions, "excludeRoots"> & GitDirOptions;
 export type GitResetOptions = ResetOptions & GitDirOptions;
@@ -166,11 +177,17 @@ export interface GitCatFileResult {
   bytes: Uint8Array;
 }
 
+export interface GitStatusReport {
+  entries: StatusEntry[];
+  branch?: StatusBranch;
+}
+
 export interface Git {
   clone(input: GitCloneOptions): Promise<void>;
   fetch(input?: GitFetchOptions): Promise<FetchResult>;
   init(input?: GitInitOptions): Promise<void>;
-  status(input?: GitDirOptions): Promise<StatusEntry[]>;
+  status(input?: GitStatusOptions): Promise<StatusEntry[]>;
+  statusReport(input?: GitStatusReportOptions): Promise<GitStatusReport>;
   diff(input?: GitDiffOptions): Promise<string>;
   diffSummary(input?: GitDiffOptions): Promise<DiffSummaryEntry[]>;
   clean(input?: GitCleanOptions): Promise<string[]>;
@@ -280,14 +297,33 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       initRepository(context, input);
     },
     async status(input = {}) {
-      const repo = at(input.dir);
-      return eagerStatus(repo, context.worktree, { excludeRoots: excludeRoots(repo) }, context).map(
-        (row) => ({
-          path: row.path,
-          index: row.index,
-          worktree: row.worktree,
-        }),
-      );
+      const { dir, ...statusOptions } = input;
+      const repo = at(dir);
+      return eagerStatus(
+        repo,
+        context.worktree,
+        { ...statusOptions, excludeRoots: excludeRoots(repo) },
+        context,
+      ).map((row) => ({
+        path: row.path,
+        index: row.index,
+        worktree: row.worktree,
+      }));
+    },
+    async statusReport(input = {}) {
+      const { branch, dir, ...statusOptions } = input;
+      const repo = at(dir);
+      const entries = eagerStatus(
+        repo,
+        context.worktree,
+        { ...statusOptions, excludeRoots: excludeRoots(repo) },
+        context,
+      ).map((row) => ({
+        path: row.path,
+        index: row.index,
+        worktree: row.worktree,
+      }));
+      return branch === true ? { entries, branch: statusBranch(repo) } : { entries };
     },
     async diff(input = {}) {
       return diffOp(at(input.dir), context.worktree, input, context.sparseWorkspace);

@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import type {
   GitCherryPickContinueOptions,
   GitCherryPickOptions,
+  StatusReport as GitCoreStatusReport,
   Git as GitEntrypointGit,
+  GitStatusOptions as GitEntrypointStatusOptions,
+  GitStatusReport as GitEntrypointStatusReport,
+  GitStatusReportOptions as GitEntrypointStatusReportOptions,
   GitRebaseContinueOptions,
   GitRebaseOptions,
   RebaseResult as GitRebaseResult,
@@ -14,6 +18,7 @@ import type {
 import type {
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
   GitCherryPickOptions as RootCherryPickOptions,
+  StatusReport as RootCoreStatusReport,
   Git as RootGit,
   GitRebaseContinueOptions as RootRebaseContinueOptions,
   GitRebaseOptions as RootRebaseOptions,
@@ -22,6 +27,9 @@ import type {
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
   GitRevertOptions as RootRevertOptions,
+  GitStatusOptions as RootStatusOptions,
+  GitStatusReport as RootStatusReport,
+  GitStatusReportOptions as RootStatusReportOptions,
 } from "../src/index.js";
 
 interface ReplayMethods {
@@ -120,5 +128,33 @@ describe("public replay exports", () => {
       "conflicted",
     ]);
     expect([rootReplayMethods, gitEntrypointReplayMethods]).toHaveLength(2);
+  });
+});
+
+describe("public status exports", () => {
+  it("exposes matching native option and report types from both entrypoints", () => {
+    const rootOptions: RootStatusOptions = {
+      dir: "/repo",
+      paths: ["src"],
+      includeIgnored: true,
+      untrackedFiles: "all",
+    };
+    const gitOptions: GitEntrypointStatusOptions = rootOptions;
+    const rootReportOptions: RootStatusReportOptions = { ...rootOptions, branch: true };
+    const gitReportOptions: GitEntrypointStatusReportOptions = rootReportOptions;
+    const rootReport: RootStatusReport = {
+      entries: [{ path: "ignored.log", index: "!", worktree: "!" }],
+      branch: { oid: null, head: "main" },
+    };
+    const gitReport: GitEntrypointStatusReport = rootReport;
+    const rootCore: RootCoreStatusReport = { entries: [], branch: rootReport.branch };
+    const gitCore: GitCoreStatusReport = rootCore;
+
+    expect([
+      gitOptions.dir,
+      gitReportOptions.branch,
+      gitReport.entries[0]?.worktree,
+      gitCore.branch?.head,
+    ]).toEqual(["/repo", true, "!", "main"]);
   });
 });

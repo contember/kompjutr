@@ -12,6 +12,7 @@ import {
   status,
   statusIndexRetainedBytes,
   statusMatrix,
+  statusReport,
 } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -541,23 +542,38 @@ describe("status", () => {
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "-uall"));
   });
 
-  it("keeps ignored paths out by default and reports them as untracked on request", async () => {
-    const { workspace } = await build({
+  it("keeps ignored paths out by default and matches git --ignored", async () => {
+    const { fixture, workspace } = await build({
       name: "ignored",
-      commits: [[...BASE, { op: "write", path: ".gitignore", content: "*.log\n" }]],
+      commits: [[...BASE, { op: "write", path: ".gitignore", content: "*.log\nignored-dir/\n" }]],
       mutate: [
         { op: "write", path: "debug.log", content: "noise\n" },
         { op: "write", path: "fresh.txt", content: "fresh\n" },
+        { op: "write", path: "ignored-dir/deep/a.txt", content: "ignored\n" },
+        { op: "write", path: "mixed/a.log", content: "ignored\n" },
+        { op: "write", path: "mixed/z.txt", content: "visible\n" },
       ],
     });
     expect(status(workspace.repo, workspace.worktree).map((entry) => entry.path)).toEqual([
       "fresh.txt",
+      "mixed/",
     ]);
     const withIgnored = status(workspace.repo, workspace.worktree, { includeIgnored: true });
-    expect(withIgnored.map((entry) => `${entry.index}${entry.worktree} ${entry.path}`)).toEqual([
-      " ? debug.log",
-      " ? fresh.txt",
-    ]);
+    expect(formatPorcelainV1(withIgnored)).toBe(gitStatus(fixture, "--porcelain=v1", "--ignored"));
+    expect(formatShort(withIgnored)).toBe(gitStatus(fixture, "--short", "--ignored"));
+    expect(formatPorcelainV2(withIgnored)).toBe(gitStatus(fixture, "--porcelain=v2", "--ignored"));
+
+    const all = status(workspace.repo, workspace.worktree, {
+      includeIgnored: true,
+      untrackedFiles: "all",
+    });
+    expect(formatPorcelainV1(all)).toBe(gitStatus(fixture, "--porcelain=v1", "--ignored", "-uall"));
+    expect(formatPorcelainV2(all)).toBe(gitStatus(fixture, "--porcelain=v2", "--ignored", "-uall"));
+    expect(all.find((entry) => entry.path === "debug.log")).toMatchObject({
+      ignored: true,
+      index: "!",
+      worktree: "!",
+    });
   });
 
   it("never ignores a tracked file", async () => {
@@ -605,6 +621,82 @@ describe("status", () => {
       ["src/nested.txt", 1, 1, 1],
     ]);
   });
+
+  it("matches porcelain v2 branch headers for unborn and detached HEAD", async () => {
+    const unborn = makeRepo("/");
+    const unbornReport = statusReport(unborn.repo, unborn.worktree, { branch: true });
+    expect(formatPorcelainV2(unbornReport.entries, unbornReport.branch)).toBe(
+      "# branch.oid (initial)\n# branch.head main\n",
+    );
+    expect(statusReport(unborn.repo, unborn.worktree)).toEqual({ entries: [] });
+    expect(status(unborn.repo, unborn.worktree)).toEqual([]);
+
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("base.txt", "base\n").commit("base");
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.store);
+    checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+    const attached = statusReport(workspace.repo, workspace.worktree, { branch: true });
+    expect(formatPorcelainV2(attached.entries, attached.branch)).toBe(
+      gitStatus(fixture, "--porcelain=v2", "--branch"),
+    );
+    fixture.git("remote", "add", "origin", "https://example.invalid/repo.git");
+    fixture.git("config", "branch.main.remote", "origin");
+    fixture.git("config", "branch.main.merge", "refs/heads/missing");
+    workspace.repo.store.configSet("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+    workspace.repo.store.configSet("branch.main.remote", "origin");
+    workspace.repo.store.configSet("branch.main.merge", "refs/heads/missing");
+    const missingTracking = statusReport(workspace.repo, workspace.worktree, { branch: true });
+    expect(formatPorcelainV2(missingTracking.entries, missingTracking.branch)).toBe(
+      gitStatus(fixture, "--porcelain=v2", "--branch"),
+    );
+    const oid = fixture.git("rev-parse", "HEAD");
+    fixture.git("checkout", "-q", "--detach");
+    workspace.repo.store.setHead(oid);
+
+    const detached = statusReport(workspace.repo, workspace.worktree, { branch: true });
+    expect(formatPorcelainV2(detached.entries, detached.branch)).toBe(
+      gitStatus(fixture, "--porcelain=v2", "--branch"),
+    );
+  });
+
+  for (const state of [
+    { name: "up to date", ahead: false, behind: false },
+    { name: "ahead", ahead: true, behind: false },
+    { name: "behind", ahead: false, behind: true },
+    { name: "diverged", ahead: true, behind: true },
+  ]) {
+    it(`matches porcelain v2 branch headers when ${state.name}`, async () => {
+      const fixture = new GitFixture().init();
+      fixtures.push(fixture);
+      fixture.write("base.txt", "base\n").commit("base");
+      fixture.git("branch", "upstream");
+      if (state.behind) {
+        fixture.git("checkout", "-q", "upstream");
+        fixture.git("commit", "-q", "--allow-empty", "-m", "upstream");
+        fixture.git("checkout", "-q", "main");
+      }
+      if (state.ahead) fixture.git("commit", "-q", "--allow-empty", "-m", "current");
+      fixture.git("update-ref", "refs/remotes/origin/upstream", "refs/heads/upstream");
+      fixture.git("config", "remote.origin.url", "https://example.invalid/repo.git");
+      fixture.git("config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+      fixture.git("config", "branch.main.remote", "origin");
+      fixture.git("config", "branch.main.merge", "refs/heads/upstream");
+
+      const workspace = makeRepo("/");
+      await importFixture(fixture, workspace.repo.store);
+      checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
+      workspace.repo.store.configSet("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+      workspace.repo.store.configSet("branch.main.remote", "origin");
+      workspace.repo.store.configSet("branch.main.merge", "refs/heads/upstream");
+
+      const report = statusReport(workspace.repo, workspace.worktree, { branch: true });
+      expect(formatPorcelainV2(report.entries, report.branch)).toBe(
+        gitStatus(fixture, "--porcelain=v2", "--branch"),
+      );
+    });
+  }
 });
 
 describe("status cost", () => {

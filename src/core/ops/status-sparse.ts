@@ -10,6 +10,7 @@ import type { TargetEntry } from "./checkout.js";
 import {
   type BufferedStatusRow,
   flushStatusRows,
+  ignoredRow,
   octalMode,
   oneStatusIndexGroup,
   type StatusDetail,
@@ -195,7 +196,10 @@ export function sparseStatus(
     if (untracked && options.includeIgnored !== true && ignored) {
       retained.set(path, SPARSE_WORKTREE_DIRTY);
     } else if (untracked) {
-      buffered.push({ kind: "ready", detail: untrackedRow(path) });
+      buffered.push({
+        kind: "ready",
+        detail: ignored ? ignoredRow(path) : untrackedRow(path),
+      });
     } else if (group?.kind === "unmerged") {
       buffered.push({ kind: "ready", detail: unmergedRow(group, worktreePath) });
     } else {

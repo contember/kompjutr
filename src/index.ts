@@ -33,8 +33,13 @@ export {
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
+  type StatusBranch,
   type StatusDetail,
+  type StatusOptions,
+  type StatusReport,
+  type StatusReportOptions,
   status,
+  statusReport,
   statusStream,
 } from "./core/ops/status.js";
 export { Repository } from "./core/repository.js";
@@ -74,6 +79,9 @@ export {
   type GitRebaseOptions,
   type GitRevertContinueOptions,
   type GitRevertOptions,
+  type GitStatusOptions,
+  type GitStatusReport,
+  type GitStatusReportOptions,
 } from "./git/client.js";
 export {
   type Async,

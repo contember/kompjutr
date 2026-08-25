@@ -132,6 +132,12 @@ export function createSqliteGitClient(
               `Computer status cannot represent conflict at ${row.path}`,
             );
           }
+          if (row.ignored === true) {
+            throw new GitError(
+              "EUNSUPPORTED",
+              `Computer status cannot represent ignored path ${row.path}`,
+            );
+          }
           return { path: row.path, index: row.index, worktree: row.worktree };
         });
       },

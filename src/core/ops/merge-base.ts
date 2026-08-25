@@ -11,6 +11,8 @@ export const MAX_MERGE_BASE_RETAINED_BYTES = MAX_LOG_STATE_BYTES;
 export const MAX_MERGE_BASES = 64;
 /** Two commit-type checks, two indexed root checks, two graph cursors, and one shallow read. */
 export const MERGE_BASE_SQL_STATEMENTS = 7;
+/** Ahead/behind uses the same validated roots and indexed graph cursors as merge-base. */
+export const AHEAD_BEHIND_SQL_STATEMENTS = 7;
 
 const CURRENT = 1;
 const INCOMING = 2;
@@ -46,6 +48,14 @@ export interface MergeBaseInput {
   currentOid: string;
   incomingOid: string;
   limits?: MergeBaseLimits;
+}
+
+export interface AheadBehindResult {
+  ahead: number;
+  behind: number;
+  commits: number;
+  retainedBytes: number;
+  sqlStatements: number;
 }
 
 interface ResolvedLimits {
@@ -212,14 +222,17 @@ function result(
   };
 }
 
-/** Select ancestry mode and all best common ancestors without mutating repository state. */
-export function selectMergeBases(repo: Repository, input: MergeBaseInput): MergeBaseSelection {
+function reachableGraph(
+  repo: Repository,
+  input: MergeBaseInput,
+  requiredSqlStatements: number,
+): GraphState {
   if (!isOid(input.currentOid) || !isOid(input.incomingOid)) {
     throw new GitError("EINVAL", "merge-base inputs must be full object ids");
   }
   const limits = resolveLimits(input.limits);
-  if (limits.maxSqlStatements < MERGE_BASE_SQL_STATEMENTS) {
-    throw new GitError("E2BIG", `merge-base requires ${MERGE_BASE_SQL_STATEMENTS} SQL statements`);
+  if (limits.maxSqlStatements < requiredSqlStatements) {
+    throw new GitError("E2BIG", `merge-base requires ${requiredSqlStatements} SQL statements`);
   }
   const currentType = repo.typeOf(input.currentOid);
   if (currentType !== "commit") {
@@ -232,6 +245,31 @@ export function selectMergeBases(repo: Repository, input: MergeBaseInput): Merge
   const state: GraphState = { nodes: new Map(), retainedBytes: 0 };
   addReachable(repo, input.currentOid, CURRENT, limits, state);
   addReachable(repo, input.incomingOid, INCOMING, limits, state);
+  return state;
+}
+
+/** Count commits reachable from only one side of two bounded indexed histories. */
+export function countAheadBehind(repo: Repository, input: MergeBaseInput): AheadBehindResult {
+  const state = reachableGraph(repo, input, AHEAD_BEHIND_SQL_STATEMENTS);
+  let ahead = 0;
+  let behind = 0;
+  for (const node of state.nodes.values()) {
+    if (node.sides === CURRENT) ahead++;
+    else if (node.sides === INCOMING) behind++;
+  }
+  return {
+    ahead,
+    behind,
+    commits: state.nodes.size,
+    retainedBytes: state.retainedBytes,
+    sqlStatements: AHEAD_BEHIND_SQL_STATEMENTS,
+  };
+}
+
+/** Select ancestry mode and all best common ancestors without mutating repository state. */
+export function selectMergeBases(repo: Repository, input: MergeBaseInput): MergeBaseSelection {
+  const limits = resolveLimits(input.limits);
+  const state = reachableGraph(repo, input, MERGE_BASE_SQL_STATEMENTS);
 
   if (state.nodes.get(input.incomingOid)?.sides === BOTH) {
     return result("already-merged", [input.incomingOid], state);

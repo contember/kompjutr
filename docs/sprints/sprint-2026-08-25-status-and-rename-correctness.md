@@ -322,3 +322,12 @@ updating `docs/reference/git-support.md`, running `npm run check`,
   merge, cherry-pick, revert, and rebase witnesses report `UU`; the Computer
   facade rejects unrepresentable conflict rows with `EUNMERGED`. Verification:
   status 66/66, sparse status 18/18, client 17/17, and typecheck pass.
+- 2026-08-25 — WU2 complete. Native `Git.status()` now exposes path, ignored,
+  and untracked expansion options while retaining nested-repository exclusion.
+  Ignored rows use Git's `!!`/`!` codes. Additive core and native
+  `statusReport()` APIs expose validated HEAD and upstream metadata; ahead and
+  behind counts use two bounded indexed graph cursors and seven SQL statements.
+  Real Git parity covers unborn, attached, detached, missing tracking,
+  up-to-date, ahead, behind, diverged, and shallow histories. Computer 0.2.1 was
+  re-verified as `dir`-only and remains unchanged. Verification: five focused
+  files, 116/116 tests; typecheck and docs lint pass.

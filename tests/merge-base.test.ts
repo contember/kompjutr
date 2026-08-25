@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AHEAD_BEHIND_SQL_STATEMENTS,
+  countAheadBehind,
   MAX_MERGE_BASES,
   MERGE_BASE_SQL_STATEMENTS,
   selectMergeBases,
@@ -45,6 +47,17 @@ function compareOids(left: string, right: string): number {
 function gitBases(fixture: GitFixture, left: string, right: string): string[] {
   const output = fixture.git("merge-base", "--all", left, right);
   return output === "" ? [] : output.split("\n").sort(compareOids);
+}
+
+function gitAheadBehind(
+  fixture: GitFixture,
+  current: string,
+  incoming: string,
+): { ahead: number; behind: number } {
+  const output = fixture.git("rev-list", "--left-right", "--count", `${current}...${incoming}`);
+  const [ahead, behind] = output.split(/\s+/).map(Number);
+  if (ahead === undefined || behind === undefined) throw new Error("git returned invalid counts");
+  return { ahead, behind };
 }
 
 function divergentFixture(): {
@@ -115,6 +128,38 @@ describe("bounded merge-base selection", () => {
     }
   });
 
+  it("counts bounded ahead and behind histories with one graph traversal per side", () => {
+    const { fixture, current, incoming } = divergentFixture();
+    try {
+      const { db, store, repo } = harness();
+      importReachable(store, fixture, [current, incoming]);
+      db.storage.resetCounters();
+
+      expect(countAheadBehind(repo, { currentOid: current, incomingOid: incoming })).toMatchObject({
+        ...gitAheadBehind(fixture, current, incoming),
+        commits: 3,
+        sqlStatements: AHEAD_BEHIND_SQL_STATEMENTS,
+      });
+      expect(db.storage.statementCount).toBe(AHEAD_BEHIND_SQL_STATEMENTS);
+      expect(() =>
+        countAheadBehind(new Repository(store, "/repo"), {
+          currentOid: current,
+          incomingOid: incoming,
+          limits: { maxCommits: 2 },
+        }),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      const blob = store.write("blob", new Uint8Array([1]));
+      expect(() =>
+        countAheadBehind(new Repository(store, "/repo"), {
+          currentOid: current,
+          incomingOid: blob,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    } finally {
+      fixture.dispose();
+    }
+  });
+
   it("distinguishes unrelated histories from a shallow proof boundary", () => {
     const unrelated = new GitFixture().init();
     try {
@@ -150,6 +195,12 @@ describe("bounded merge-base selection", () => {
           incomingOid: shallow.incoming,
         }),
       ).toMatchObject({ kind: "shallow", bases: [], commits: 3 });
+      expect(
+        countAheadBehind(shallowHarness.repo, {
+          currentOid: shallow.current,
+          incomingOid: shallow.incoming,
+        }),
+      ).toMatchObject(gitAheadBehind(shallow.fixture, shallow.current, shallow.incoming));
     } finally {
       shallow.fixture.dispose();
     }

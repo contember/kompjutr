@@ -6,7 +6,12 @@ import type { Repository } from "../repository.js";
 import { comparePaths } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import type { TargetEntry } from "./checkout.js";
-import type { OrdinaryStatusEntry, StatusEntry, UnmergedStatusCode } from "./kinds.js";
+import type {
+  IgnoredStatusCode,
+  OrdinaryStatusEntry,
+  StatusEntry,
+  UnmergedStatusCode,
+} from "./kinds.js";
 import { validateMergePath } from "./merge-state.js";
 import {
   type HashedPath,
@@ -43,6 +48,7 @@ export interface StatusHashObserver {
  * anything wanting Computer's narrower shape can use it as-is.
  */
 export interface OrdinaryStatusDetail extends OrdinaryStatusEntry {
+  readonly ignored?: false;
   readonly unmerged?: false;
   /** Mode in HEAD, in the index and on disk; "000000" where absent. */
   headMode: string;
@@ -54,6 +60,7 @@ export interface OrdinaryStatusDetail extends OrdinaryStatusEntry {
 }
 
 export interface UnmergedStatusDetail extends StatusEntry {
+  readonly ignored?: false;
   readonly unmerged: true;
   index: UnmergedStatusCode;
   worktree: UnmergedStatusCode;
@@ -66,7 +73,14 @@ export interface UnmergedStatusDetail extends StatusEntry {
   incomingOid: string;
 }
 
-export type StatusDetail = OrdinaryStatusDetail | UnmergedStatusDetail;
+export interface IgnoredStatusDetail extends StatusEntry {
+  readonly ignored: true;
+  readonly unmerged?: false;
+  index: IgnoredStatusCode;
+  worktree: IgnoredStatusCode;
+}
+
+export type StatusDetail = OrdinaryStatusDetail | UnmergedStatusDetail | IgnoredStatusDetail;
 
 export type StatusIndexGroup =
   | { kind: "tracked"; path: string; entry: IndexEntry }
@@ -92,7 +106,7 @@ export interface StatusOptions {
   paths?: string[];
   /** Roots of repositories nested inside this one; their files are theirs. */
   excludeRoots?: string[];
-  /** Report ignored paths too, as untracked. git's `--ignored`. */
+  /** Report ignored paths too. git's `--ignored`. */
   includeIgnored?: boolean;
   /** Override the ignore rules. Defaults to the working tree's `.gitignore`s. */
   ignores?: IgnoreMatcher;
@@ -342,6 +356,10 @@ function statusDetail(
 
 export function untrackedRow(path: string): StatusDetail {
   return statusDetail(path, " ", "?", ABSENT_MODE, ABSENT_MODE, ABSENT_MODE, ZERO_OID, ZERO_OID);
+}
+
+export function ignoredRow(path: string): IgnoredStatusDetail {
+  return { ignored: true, path, index: "!", worktree: "!" };
 }
 
 export function unmergedRow(

@@ -300,8 +300,15 @@ describe("sparse eager status", () => {
         ignored.worktree,
         { includeIgnored: true },
         sparseTrackerContext(ignored),
-      ).map((row) => row.path),
-    ).toEqual(["ignored/"]);
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        ignored: true,
+        path: "ignored/noisy.log",
+        index: "!",
+        worktree: "!",
+      }),
+    ]);
   });
 
   it("chooses normal-untracked fallback before hashing a tracked candidate", () => {

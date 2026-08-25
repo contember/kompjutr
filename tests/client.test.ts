@@ -113,6 +113,35 @@ afterAll(() => {
 });
 
 describe("createSqliteGitClient", () => {
+  it("exposes native status options and keeps nested repositories excluded", async () => {
+    const { git, workspace } = makeNativeGit();
+    await git.init({ dir: "/" });
+    await commitFile(git, workspace, "/", ".gitignore", "*.log\n", "ignore logs");
+    await git.init({ dir: "/nested" });
+    writeWorkFile(workspace, "/nested/inside.txt", "nested\n");
+    writeWorkFile(workspace, "/debug.log", "ignored\n");
+    writeWorkFile(workspace, "/fresh/a.txt", "a\n");
+    writeWorkFile(workspace, "/fresh/b.txt", "b\n");
+
+    await expect(git.status()).resolves.toEqual([{ path: "fresh/", index: " ", worktree: "?" }]);
+    await expect(git.status({ paths: ["fresh"], untrackedFiles: "all" })).resolves.toEqual([
+      { path: "fresh/a.txt", index: " ", worktree: "?" },
+      { path: "fresh/b.txt", index: " ", worktree: "?" },
+    ]);
+    await expect(
+      git.status({ paths: ["debug.log"], includeIgnored: true, untrackedFiles: "all" }),
+    ).resolves.toEqual([{ path: "debug.log", index: "!", worktree: "!" }]);
+
+    const report = await git.statusReport({ branch: true, paths: ["fresh"] });
+    expect(report).toEqual({
+      entries: [{ path: "fresh/", index: " ", worktree: "?" }],
+      branch: { oid: expect.any(String), head: "main" },
+    });
+    await expect(git.statusReport({ paths: ["fresh"] })).resolves.toEqual({
+      entries: [{ path: "fresh/", index: " ", worktree: "?" }],
+    });
+  });
+
   it("drives a full local cycle through workspace.git", async () => {
     const { workspace, storage } = makeWorkspace();
     const git = workspace.git;

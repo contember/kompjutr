@@ -55,23 +55,26 @@ repository behind.
 
 ## Working tree and index
 
-### `git status` — `status()`, `statusStream()`, formatters
+### `git status` — `status()`, `statusReport()`, `statusStream()`, formatters
 
 | Git | kompjutr | |
 |---|---|---|
 | `--porcelain=v1` | `formatPorcelainV1(entries)` | ✔ |
-| `--porcelain=v2` | `formatPorcelainV2(details)` | ✔ file rows and `?` rows |
+| `--porcelain=v2` | `formatPorcelainV2(details, branch?)` | ✔ ordinary, unmerged, untracked, ignored, and optional branch rows |
 | `--short` | `formatShort(entries)` | ✔ |
-| `-- <paths>` | `StatusOptions.paths` | ~ exact path or directory prefix, no globs; **not reachable through `Git.status()`** — use the exported `status()` op |
-| `--ignored` | `StatusOptions.includeIgnored` | ~ same restriction as above |
-| `--untracked-files=normal\|all` | `StatusOptions.untrackedFiles` | ~ same restriction as above |
-| `-b`, `--branch` header | — | ✘ formatters emit path rows only |
+| `-- <paths>` | `GitStatusOptions.paths` | ~ exact path or directory prefix, no globs |
+| `--ignored` | `GitStatusOptions.includeIgnored` | ✔ ignored entries use `!!` in v1/short and `!` in v2 |
+| `--untracked-files=normal\|all` | `GitStatusOptions.untrackedFiles` | ✔ |
+| `-b`, `--branch` header | `statusReport({ branch: true })` | ✔ `oid`, `head`, configured upstream, and bounded ahead/behind counts |
 | rename detection (`R`) | — | ✘ a rename is a delete plus an add |
-| unmerged codes (`U`, `AA`, `DD`) | — | ✘ status reads stage 0; a conflicted path reports as modified. Use `readOperationState()` to detect a pending merge or replay |
+| unmerged codes (`U`, `AA`, `DD`) | `StatusDetail.unmerged` | ✔ all seven legal index-stage shapes and porcelain v2 `u` rows |
 
-`Git.status()` returns `StatusEntry[]` (`index` and `worktree` codes drawn from
-`" " A M D` plus `?` for untracked). `StatusDetail` adds HEAD/index/worktree
-modes and oids.
+`status()` and `Git.status()` remain array-returning APIs. `statusReport()` and
+`Git.statusReport()` add an object result only when callers need branch
+metadata. `StatusEntry` uses `" " A M D ? ! U`; `StatusDetail` adds the modes
+and OIDs required by ordinary and unmerged porcelain v2 rows. The Computer
+compatibility facade keeps its pinned `dir`-only input and rejects unmerged rows
+that its installed interface cannot express.
 
 ### `git add` — `add()`
 

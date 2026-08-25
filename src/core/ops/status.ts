@@ -7,19 +7,23 @@
 // untouched tree therefore reads no file content at all.
 
 import type { IndexEntry } from "../../sqlite/store.js";
+import { isOid, utf8 } from "../bytes.js";
 import type { GitContext } from "../context.js";
-import { GitError } from "../errors.js";
+import { CorruptError, GitError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
+import { requireBranchRef } from "../protocol/receive-pack.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { matchesPaths, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
+import { countAheadBehind } from "./merge-base.js";
 import {
   type BufferedStatusRow,
   flushStatusRows,
+  ignoredRow,
   type StatusDetail,
   type StatusOptions,
   statusIndexGroups,
@@ -39,6 +43,31 @@ import {
 } from "./worktree-io.js";
 
 export type { StatusDetail, StatusOptions } from "./status-rows.js";
+
+const HEADS = "refs/heads/";
+const STATUS_BRANCH_REF_BYTES = 1_024;
+const STATUS_REMOTE_BYTES = 255;
+const STATUS_FETCH_BYTES = 2_048;
+
+export interface StatusBranch {
+  /** Full commit OID, or null for an unborn branch. */
+  oid: string | null;
+  /** Checked-out branch name, or null for detached HEAD. */
+  head: string | null;
+  upstream?: string;
+  ahead?: number;
+  behind?: number;
+}
+
+export interface StatusReport {
+  entries: StatusDetail[];
+  branch?: StatusBranch;
+}
+
+export interface StatusReportOptions extends StatusOptions {
+  /** Include porcelain-v2 branch metadata. */
+  branch?: boolean;
+}
 
 /** Retained index, directory and tracked-path state for one status call. */
 export const STATUS_RETAINED_BYTES = 16 * 1024 * 1024;
@@ -76,6 +105,118 @@ export function status(
   return [...statusStream(repo, worktree, options)].sort((left, right) =>
     comparePaths(left.path, right.path),
   );
+}
+
+/** Eager status plus optional porcelain-v2 branch metadata. */
+export function statusReport(
+  repo: Repository,
+  worktree: Worktree,
+  options: StatusReportOptions = {},
+): StatusReport {
+  const { branch, ...statusOptions } = options;
+  const entries = status(repo, worktree, statusOptions);
+  return branch === true ? { entries, branch: statusBranch(repo) } : { entries };
+}
+
+/** Read and validate HEAD, its configured upstream, and bounded graph counts. */
+export function statusBranch(repo: Repository): StatusBranch {
+  const rawHead: unknown = repo.store.head();
+  if (typeof rawHead !== "string") throw new CorruptError("repository HEAD is not text");
+
+  let oid: string | null;
+  let head: string | null;
+  let headRef: string | undefined;
+  if (rawHead.startsWith("ref: ")) {
+    headRef = boundedBranchRef(rawHead.slice(5).trim(), "status HEAD ref");
+    head = headRef.slice(HEADS.length);
+    oid = directRefOid(repo, headRef);
+  } else {
+    if (!isOid(rawHead)) throw new CorruptError("detached HEAD is not a full object id");
+    oid = rawHead;
+    head = null;
+  }
+  if (oid !== null && repo.typeOf(oid) !== "commit") {
+    throw new CorruptError("status HEAD does not point to a commit");
+  }
+
+  const base: StatusBranch = { oid, head };
+  if (headRef === undefined) return base;
+  const upstream = statusUpstream(repo, headRef);
+  if (upstream === undefined) return base;
+  if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
+  const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
+  return {
+    ...base,
+    upstream: upstream.name,
+    ahead: counts.ahead,
+    behind: counts.behind,
+  };
+}
+
+interface ResolvedStatusUpstream {
+  name: string;
+  oid: string | null;
+}
+
+function statusUpstream(repo: Repository, headRef: string): ResolvedStatusUpstream | undefined {
+  const branch = headRef.slice(HEADS.length);
+  const remote = repo.store.configGetBounded(`branch.${branch}.remote`, STATUS_REMOTE_BYTES);
+  const configuredMerge = repo.store.configGetBounded(
+    `branch.${branch}.merge`,
+    STATUS_BRANCH_REF_BYTES,
+  );
+  if (remote === undefined || configuredMerge === undefined) return undefined;
+  const mergeRef = boundedBranchRef(configuredMerge, "status upstream ref");
+  const upstreamBranch = mergeRef.slice(HEADS.length);
+
+  if (remote === ".") {
+    return { name: upstreamBranch, oid: directRefOid(repo, mergeRef) };
+  }
+  requireStatusRemote(remote);
+  const fetch = repo.store.configGetBounded(`remote.${remote}.fetch`, STATUS_FETCH_BYTES);
+  const expected = `refs/heads/*:refs/remotes/${remote}/*`;
+  if (fetch !== expected && fetch !== `+${expected}`) return undefined;
+  const trackingRef = `refs/remotes/${remote}/${upstreamBranch}`;
+  return {
+    name: `${remote}/${upstreamBranch}`,
+    oid: directRefOid(repo, trackingRef),
+  };
+}
+
+function boundedBranchRef(value: string, label: string): string {
+  if (utf8.encode(value).length > STATUS_BRANCH_REF_BYTES) {
+    throw new GitError("E2BIG", `${label} exceeds ${STATUS_BRANCH_REF_BYTES} bytes`);
+  }
+  return requireBranchRef(value.startsWith("refs/") ? value : `${HEADS}${value}`);
+}
+
+function requireStatusRemote(remote: string): void {
+  if (
+    remote.length === 0 ||
+    remote.startsWith("/") ||
+    remote.endsWith("/") ||
+    remote.includes("//") ||
+    remote.includes("..") ||
+    remote.includes("@{") ||
+    remote.includes("\\")
+  ) {
+    throw new GitError("EINVAL", `invalid status remote ${remote}`);
+  }
+  for (const character of remote) {
+    const code = character.charCodeAt(0);
+    if (code <= 0x20 || code === 0x7f || "~^:?*[".includes(character)) {
+      throw new GitError("EINVAL", `invalid status remote ${remote}`);
+    }
+  }
+}
+
+function directRefOid(repo: Repository, ref: string): string | null {
+  const target: unknown = repo.store.getRef(ref);
+  if (target === null) return null;
+  if (typeof target !== "string" || !isOid(target)) {
+    throw new CorruptError(`status ref ${ref} does not contain a full object id`);
+  }
+  return target;
 }
 
 /** Eager status with an optional same-database sparse fast path. */
@@ -144,7 +285,8 @@ function* statusStreamInternal(
   const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
   const buffered: BufferedStatusRow[] = [];
   let sourceRows = 0;
-  let collapsed: string | null = null;
+  let collapsedIgnored: string | null = null;
+  let collapsedUntracked: string | null = null;
 
   for (const row of joinSorted3(
     treeStream(repo, headTreeOid),
@@ -168,10 +310,8 @@ function* statusStreamInternal(
       // A tracked path is never also untracked, whatever is on disk.
     } else if (row.c !== undefined) {
       seed?.observeUntracked(row.path);
-      if (
-        isExcluded(row.path, excluded) ||
-        (options.includeIgnored !== true && ignores.ignores(row.path, false))
-      ) {
+      const ignored = ignores.ignores(row.path, false);
+      if (isExcluded(row.path, excluded) || (options.includeIgnored !== true && ignored)) {
         if (sourceRows >= STATUS_WINDOW_ROWS) {
           yield* flushStatusRows(repo, worktree, buffered, seed);
           sourceRows = 0;
@@ -180,16 +320,22 @@ function* statusStreamInternal(
       }
       let path = row.path;
       if (collapse) {
-        if (collapsed !== null && path.startsWith(`${collapsed}/`)) {
+        if (
+          (collapsedIgnored !== null && path.startsWith(`${collapsedIgnored}/`)) ||
+          (!ignored && collapsedUntracked !== null && path.startsWith(`${collapsedUntracked}/`))
+        ) {
           if (sourceRows >= STATUS_WINDOW_ROWS) {
             yield* flushStatusRows(repo, worktree, buffered, seed);
             sourceRows = 0;
           }
           continue;
         }
-        const directory = shallowestUntrackedDirectory(path, snapshot.trackedDirs);
+        const directory = ignored
+          ? shallowestIgnoredDirectory(path, snapshot.trackedDirs, ignores)
+          : shallowestUntrackedDirectory(path, snapshot.trackedDirs);
         if (directory !== null && matchesPaths(directory, options.paths)) {
-          collapsed = directory;
+          if (ignored) collapsedIgnored = directory;
+          else collapsedUntracked = directory;
           path = `${directory}/`;
         }
       }
@@ -198,7 +344,7 @@ function* statusStreamInternal(
         // A tracked file replaced by a directory is a deletion, not a new directory.
         (!collapse || !snapshot.trackedPaths.has(stripSlash(path)))
       ) {
-        buffered.push({ kind: "ready", detail: untrackedRow(path) });
+        buffered.push({ kind: "ready", detail: ignored ? ignoredRow(path) : untrackedRow(path) });
       }
     }
 
@@ -349,6 +495,19 @@ function shallowestUntrackedDirectory(file: string, tracked: Set<string>): strin
   return null;
 }
 
+function shallowestIgnoredDirectory(
+  file: string,
+  tracked: Set<string>,
+  ignores: IgnoreMatcher,
+): string | null {
+  const parts = file.split("/");
+  for (let depth = 1; depth < parts.length; depth++) {
+    const directory = parts.slice(0, depth).join("/");
+    if (!tracked.has(directory) && ignores.ignores(directory, true)) return directory;
+  }
+  return null;
+}
+
 function stripSlash(path: string): string {
   return path.endsWith("/") ? path.slice(0, -1) : path;
 }
@@ -415,10 +574,11 @@ function worktreeOid(
 
 // -- formatters --------------------------------------------------------
 
-/** `git status --porcelain=v2`. */
-export function formatPorcelainV2(entries: StatusDetail[]): string {
-  const lines: string[] = [];
+/** `git status --porcelain=v2`, with optional `--branch` headers. */
+export function formatPorcelainV2(entries: StatusDetail[], branch?: StatusBranch): string {
+  const lines = branch === undefined ? [] : formatStatusBranch(branch);
   for (const entry of entries) {
+    if (entry.ignored === true || entry.worktree === "?") continue;
     if (entry.unmerged === true) {
       lines.push(
         `u ${entry.index}${entry.worktree} N... ` +
@@ -427,7 +587,6 @@ export function formatPorcelainV2(entries: StatusDetail[]): string {
       );
       continue;
     }
-    if (entry.worktree === "?") continue;
     lines.push(
       `1 ${v2Code(entry.index)}${v2Code(entry.worktree)} N... ` +
         `${entry.headMode} ${entry.indexMode} ${entry.worktreeMode} ` +
@@ -435,17 +594,38 @@ export function formatPorcelainV2(entries: StatusDetail[]): string {
     );
   }
   for (const entry of entries) if (entry.worktree === "?") lines.push(`? ${entry.path}`);
+  for (const entry of entries) if (entry.ignored === true) lines.push(`! ${entry.path}`);
   return join(lines);
+}
+
+function formatStatusBranch(branch: StatusBranch): string[] {
+  const lines = [
+    `# branch.oid ${branch.oid ?? "(initial)"}`,
+    `# branch.head ${branch.head ?? "(detached)"}`,
+  ];
+  if (branch.upstream !== undefined) lines.push(`# branch.upstream ${branch.upstream}`);
+  if (branch.ahead !== undefined || branch.behind !== undefined) {
+    if (
+      branch.upstream === undefined ||
+      branch.ahead === undefined ||
+      branch.behind === undefined
+    ) {
+      throw new GitError("EINVAL", "status branch counts require an upstream and both counts");
+    }
+    lines.push(`# branch.ab +${branch.ahead} -${branch.behind}`);
+  }
+  return lines;
 }
 
 /** `git status --porcelain=v1`. */
 export function formatPorcelainV1(entries: StatusEntry[]): string {
   const lines: string[] = [];
   for (const entry of entries) {
-    if (entry.worktree === "?") continue;
+    if (entry.worktree === "?" || entry.worktree === "!") continue;
     lines.push(`${entry.index}${entry.worktree} ${entry.path}`);
   }
   for (const entry of entries) if (entry.worktree === "?") lines.push(`?? ${entry.path}`);
+  for (const entry of entries) if (entry.worktree === "!") lines.push(`!! ${entry.path}`);
   return join(lines);
 }
 
