@@ -17,18 +17,13 @@ decisions → reference → archive.
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
 
-- [`sprints/sprint-2026-08-25-status-and-rename-correctness.md`](sprints/sprint-2026-08-25-status-and-rename-correctness.md)
-  — planned native conflict truth, status option reachability, branch metadata,
-  and bounded exact rename detection.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The status and rename correctness sprint is ready to execute from a green
-  76-test targeted baseline.
-- Storage-contract work follows after the remaining scheduled silent Git
-  divergences are removed.
+- Storage-contract work is next now that the scheduled silent Git divergences
+  are removed.
 
 ## Key reference
 
@@ -49,6 +44,8 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-25-status-and-rename-correctness.md`](archive/sprint-2026-08-25-status-and-rename-correctness.md)
+  — unmerged status truth, native status reports, and bounded exact renames.
 - [`archive/sprint-2026-08-25-release-correctness-baseline.md`](archive/sprint-2026-08-25-release-correctness-baseline.md)
   — verified CI and package release gates, explicit SQLite enforcement, measured
   OID storage, and Git-safe mutation defaults.

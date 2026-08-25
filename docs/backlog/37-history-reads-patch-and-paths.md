@@ -29,8 +29,8 @@ re-implementing a tree walk on top of the public surface.
 - Keep both inside the operation statement budget and the existing bounded-walk
   limits; a history that cannot be filtered within them fails closed.
 - Real Git parity tests for a root commit, a merge commit, a path-filtered log
-  across renames (add/delete until [34](34-rename-detection.md) lands), a path
-  with no history, and a depth-bounded filtered log.
+  across exact renames (and add/delete for move-plus-edit), a path with no
+  history, and a depth-bounded filtered log.
 
 ## Touch points
 

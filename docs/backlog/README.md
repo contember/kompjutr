@@ -20,9 +20,7 @@ not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
-  [31](31-status-unmerged-and-options.md) ·
-  [33](33-branch-delete-merged-check.md) ·
-  [34](34-rename-detection.md)
+  [33](33-branch-delete-merged-check.md)
 - **A — blocks a common workflow, loudly.** The call fails or the capability is
   absent; no data is at risk.
   [35](35-staged-diff.md) ·
@@ -53,35 +51,31 @@ This is the default priority at the current HEAD, not scheduling state. Items in
 the same phase may run in parallel, but a blocked item must not move ahead of its
 blocker. Re-evaluate the order after each phase as production evidence arrives.
 
-1. **Remove remaining silent Git divergences:**
-   [31](31-status-unmerged-and-options.md) and
-   [34](34-rename-detection.md). Correct plausible-but-wrong results before
-   adding more surface area.
-2. **Settle storage contracts before data volume grows:**
+1. **Settle storage contracts before data volume grows:**
    [20](20-blob-id-mapping-role-and-growth.md),
    [21](21-narrow-parsed-tree-keys.md), and
    [23](23-write-time-checks-on-derived-tables.md).
-3. **Build recovery before destructive maintenance:**
+2. **Build recovery before destructive maintenance:**
    [12](12-reflogs-and-ref-recovery.md), then
    [33](33-branch-delete-merged-check.md) and
    [04](04-repack-and-garbage-collection.md). Reflogs are the retention and
    recovery prerequisite for both follow-ups.
-4. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
+3. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
    [11](11-production-do-regression-probe.md), and
    [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
    work unit; the production probe is now unblocked by the verified CI/release
    seam.
-5. **Add the highest-return daily workflows:**
+4. **Add the highest-return daily workflows:**
    [38](38-clone-depth-and-deepening.md), [28](28-pull-rebase.md),
    [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
    [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
    [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
-6. **Broaden management and diagnostic surfaces:**
+5. **Broaden management and diagnostic surfaces:**
    [18](18-branch-and-remote-management.md),
    [08](08-extend-push-refspecs.md), [25](25-rebase-targets-and-roots.md),
    [39](39-plumbing-read-surface.md), and
    [17](17-integrity-audit-and-snapshots.md).
-7. **Defer until a concrete workload justifies them:**
+6. **Defer until a concrete workload justifies them:**
    [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
    [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md). Item 29 also
    remains blocked by 12.
@@ -112,9 +106,7 @@ focused sprint.
 - [27 — Replay merge topology during rebase](27-rebase-merges.md)
 - [28 — Compose pull with native rebase](28-pull-rebase.md)
 - [29 — Update dependent refs after rebase](29-rebase-update-refs.md)
-- [31 — Report unmerged paths in `status` and expose its full option set](31-status-unmerged-and-options.md)
 - [33 — Enforce the merged check on branch deletion](33-branch-delete-merged-check.md)
-- [34 — Detect renames in status and diff](34-rename-detection.md)
 - [35 — Add a staged diff mode](35-staged-diff.md)
 - [36 — Support glob pathspecs](36-glob-pathspecs.md)
 - [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)

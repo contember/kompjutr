@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Status and rename correctness](sprint-2026-08-25-status-and-rename-correctness.md)
+  — truthful unmerged status, native status options and branch metadata, and
+  bounded exact rename detection.
 - [Release correctness baseline](sprint-2026-08-25-release-correctness-baseline.md)
   — verified CI and exact-package gates with explicit storage and safe Git
   mutation contracts.

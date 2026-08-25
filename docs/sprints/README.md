@@ -20,6 +20,3 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 <!-- one line per active sprint; empty between sprints -->
-
-- [`sprint-2026-08-25-status-and-rename-correctness.md`](sprint-2026-08-25-status-and-rename-correctness.md)
-  — ready to remove unmerged-status lies and add bounded exact rename detection.

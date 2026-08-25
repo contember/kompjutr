@@ -1,10 +1,13 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-08-25.** Native status now reports every legal
+> unmerged index shape, exposes path/ignored/untracked options and bounded branch
+> metadata, and emits exact staged renames. Native diff and summary emit exact
+> `R100` moves. The Computer facade preserves its pinned shapes by rejecting
+> unmerged status and disabling rename detection. Commit map: plan → `328144e`;
+> WU1 → `52c8e0b`; WU2 → `c114edf`; WU3 → `9ad5af0`; WU4 → `44a1cf6`.
+> Verification: `npm run check`; leased `npm run typecheck`; leased full suite —
+> 96 files and 1,705 tests passed, 5 skipped; leased `npm run build`; leased
+> `npm run package:smoke`; docs lint. Backlog closed: 31 and 34. Deferred:
+> similarity-scored renames, copy detection, and staged diff.
 
 # Sprint — Status and rename correctness (2026-08-25)
 
@@ -12,8 +15,7 @@ On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
 exact file moves without weakening the bounded merge-join cost model or silently
 changing the Computer compatibility contract.
 
-**Theme.** Backlogs [31](../backlog/31-status-unmerged-and-options.md) and
-[34](../backlog/34-rename-detection.md) are the remaining scheduled Tier S Git
+**Theme.** Backlogs 31 and 34 are the remaining scheduled Tier S Git
 parity gaps. They belong together because both require status rows to model more
 than independent `A`/`M`/`D` paths, both change porcelain output and public view
 types, and both need an all-or-nothing classification pass over path-ordered
@@ -226,7 +228,7 @@ compatibility and public-export tests, `docs/reference/git-support.md`.
 ## Out of scope (explicit)
 
 - Similarity-scored rename detection and copy detection. Exact OID pairing is
-  the accepted scope of [34](../backlog/34-rename-detection.md); move-plus-edit
+  the accepted scope; move-plus-edit
   remains A/D and must be recorded as partial support, not disguised as parity.
 - Staged-only diff selection (`git diff --cached`) and broader patch/history
   reads — backlogs [35](../backlog/35-staged-diff.md) and

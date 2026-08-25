@@ -265,9 +265,8 @@ sprint.
   focused local workerd FK witness needed for its decision.
 - Worktree wall-time optimization and timing gates in ordinary CI — backlog
   [10](../backlog/10-worktree-wall-time.md).
-- Unmerged status and rename detection — backlogs
-  [31](../backlog/31-status-unmerged-and-options.md) and
-  [34](../backlog/34-rename-detection.md) remain the next silent-divergence phase.
+- Unmerged status and exact rename detection shipped independently in the
+  [status and rename correctness sprint](sprint-2026-08-25-status-and-rename-correctness.md).
 - Creating the first version tag, changing `0.0.0`, or publishing a release while
   running this sprint. WU1 creates the CI-only path; a later explicit release
   action uses it.
