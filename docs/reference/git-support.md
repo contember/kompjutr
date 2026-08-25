@@ -443,3 +443,8 @@ Git path, and the 4,096-step cap on a rebase or replay journal.
   `:(exclude)`, no `:(icase)`, no leading `:/`.
 - Paths order by UTF-8 bytes, matching Git and SQLite `BINARY` — never by
   JavaScript string comparison.
+
+---
+
+The gaps in this document are ranked by severity in
+[`../backlog/README.md`](../backlog/README.md#git-parity-tiers).
