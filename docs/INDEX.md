@@ -20,8 +20,6 @@ decisions → reference → archive.
 - [`sprints/sprint-2026-08-25-status-and-rename-correctness.md`](sprints/sprint-2026-08-25-status-and-rename-correctness.md)
   — planned native conflict truth, status option reachability, branch metadata,
   and bounded exact rename detection.
-- [`sprints/sprint-2026-08-25-release-correctness-baseline.md`](sprints/sprint-2026-08-25-release-correctness-baseline.md)
-  — implementation is complete; the first hosted CI run remains.
 
 ## What's hot
 
@@ -29,7 +27,6 @@ decisions → reference → archive.
      If everything is "hot", nothing is. -->
 - The status and rename correctness sprint is ready to execute from a green
   76-test targeted baseline.
-- The release correctness baseline awaits its first hosted GitHub CI witness.
 - Storage-contract work follows after the remaining scheduled silent Git
   divergences are removed.
 
@@ -52,6 +49,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-25-release-correctness-baseline.md`](archive/sprint-2026-08-25-release-correctness-baseline.md)
+  — verified CI and package release gates, explicit SQLite enforcement, measured
+  OID storage, and Git-safe mutation defaults.
 - [`archive/sprint-2026-08-25-bounded-rebase-sequencer.md`](archive/sprint-2026-08-25-bounded-rebase-sequencer.md)
   — bounded linear rebase with authenticated restart-safe sequencing.
 - [`archive/sprint-2026-08-24-cherry-pick-and-revert.md`](archive/sprint-2026-08-24-cherry-pick-and-revert.md)

@@ -21,10 +21,9 @@ streams. Success means conflicts cannot masquerade as ordinary deletions, the
 native facade reaches the status options already implemented in core, and a
 pure move is one `R100` change in native status and diff.
 
-The active release-correctness sprint is independent: its local implementation
-and gates are complete, and only the first hosted CI witness remains. This
-sprint may start before that external witness, but it does not close or replace
-the release sprint.
+The archived release-correctness sprint is independent. Its local and hosted
+gates pass; this sprint builds on that verified baseline without changing the
+release path.
 
 ## Refs re-verified at HEAD (2026-08-25, `36593b3`)
 
@@ -247,8 +246,9 @@ compatibility and public-export tests, `docs/reference/git-support.md`.
   backlogs [12](../backlog/12-reflogs-and-ref-recovery.md),
   [33](../backlog/33-branch-delete-merged-check.md), and
   [04](../backlog/04-repack-and-garbage-collection.md).
-- Closing the release-correctness sprint or publishing a release. Its hosted CI
-  witness remains a separate external gate.
+- Publishing a release. The tag workflow is checked in, but configuring the
+  `npm` environment and trusted publisher, selecting the first version, and
+  pushing its tag remain separate explicit actions.
 
 ## Decisions
 

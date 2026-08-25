@@ -1,7 +1,7 @@
 ---
 id: 11
 title: Add a production Durable Object regression probe
-blocked-by: [./05-ci-and-release-gates.md]
+blocked-by: []
 ---
 
 # 11 — Add a production Durable Object regression probe

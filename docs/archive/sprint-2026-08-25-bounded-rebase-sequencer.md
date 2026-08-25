@@ -249,9 +249,8 @@ not a parallel follow-up.
   still owns stale-ref checks and restart safety for its journal transitions.
 - Stash operations. Backlog [06](../backlog/06-stash-operations.md) depends on the
   step journal but keeps its own commit shape and conflict parity sprint.
-- Pulling CI/release work into the feature sprint — backlog
-  [05](../backlog/05-ci-and-release-gates.md) remains the next release-readiness
-  sprint.
+- Pulling CI/release work into the feature sprint — backlog 05 remained the next
+  release-readiness sprint.
 
 ## Decisions
 

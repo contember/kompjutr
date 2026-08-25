@@ -1,10 +1,20 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-08-25.** CI now verifies the functional suite,
+> production build, and one exact package tarball on every pull request and push
+> to `main`; a tag workflow is checked in to repeat those gates before its OIDC
+> publish job. SQLite foreign keys are explicit, persisted OIDs remain TEXT by
+> measured decision, ordinary empty commits fail closed, and native `rm` uses
+> Git-safe defaults while the compatibility facade keeps its declared contract.
+> Commit map: plan → `5938935`; WU1 → `983eecd`; WU2 → `55c78d3`; WU3 →
+> `bebaf6f`; WU4 → `573f75d`; WU5 → `d5c8d74`; integration fixes → `7f1b6b0`;
+> docs integration → `b9b48d1`; hosted-gate fixes → `06ab593`, `9af6c51`.
+> Verification: local check, typecheck, build, exact-tarball smoke, and leased
+> full suite; hosted CI run
+> [32873652211](https://github.com/contember/kompjutr/actions/runs/32873652211)
+> passed 95 files and 1,674 tests with 5 intentional skips, then built and
+> smoke-tested the package. Backlog closed: 05, 19, 22, 30, and 32. Deferred:
+> the `npm` GitHub environment, npm trusted publisher, first version/tag and
+> publication, the production Durable Object probe, storage-key rebuilds, and
+> wall-time work including one isolated 120.36 ms read-gate signal.
 
 # Sprint — Release correctness baseline (2026-08-25)
 
@@ -20,9 +30,8 @@ tarball, test and runtime SQLite agree on foreign keys, ordinary commit and
 native `rm` match Git's safe defaults, and OID storage has an accepted ADR before
 production data makes the choice expensive.
 
-Scheduled backlog: [05](../backlog/05-ci-and-release-gates.md), 19, 22, 30, and
-32. WU2–WU5 consumed their items. Item 05 remains open until the first hosted CI
-run passes.
+Scheduled backlog: 05, 19, 22, 30, and 32. All five items closed with this
+sprint.
 
 ## Refs re-verified at HEAD (2026-08-25, `6236815`)
 
@@ -351,3 +360,11 @@ number measured without a lease may enter ADR 0005 or reference docs.
 - 2026-08-25 blocker: WU1 still needs its hosted acceptance witness. The new
   public repository is empty, so GitHub Actions cannot run until the local
   history is explicitly pushed.
+- 2026-08-25 resolution: the reviewed public history was pushed. The first
+  hosted run exposed a missing `rg` prerequisite and host-sensitive read timing
+  assertions in the ordinary functional suite.
+- 2026-08-25 closure: CI and release verification now provision `rg`; read
+  timing checks opt in through `KOMPJUTR_TIMING_GATE=1`. The second hosted run
+  passed every repository and package gate. An isolated leased timing run kept
+  the unchanged 100 ms ceiling and recorded one 120.36 ms result for follow-up
+  with backlog 10.

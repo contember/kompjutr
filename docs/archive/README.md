@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Release correctness baseline](sprint-2026-08-25-release-correctness-baseline.md)
+  — verified CI and exact-package gates with explicit storage and safe Git
+  mutation contracts.
 - [Bounded rebase sequencer](sprint-2026-08-25-bounded-rebase-sequencer.md)
   — authenticated bounded linear replay with restart-safe recovery and one
   final branch publication.

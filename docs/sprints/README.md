@@ -23,5 +23,3 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 - [`sprint-2026-08-25-status-and-rename-correctness.md`](sprint-2026-08-25-status-and-rename-correctness.md)
   — ready to remove unmerged-status lies and add bounded exact rename detection.
-- [`sprint-2026-08-25-release-correctness-baseline.md`](sprint-2026-08-25-release-correctness-baseline.md)
-  — local implementation and gates pass; hosted GitHub CI remains to be witnessed.
