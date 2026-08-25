@@ -48,11 +48,17 @@ export interface CheckoutOptions {
   preserveMatchingIndex?: boolean;
   /** Remove worktree entries whose type prevents materialising the target. */
   restoreStructure?: boolean;
+  /** Discard conflict stages before hard materialisation. */
+  discardUnmerged?: boolean;
+  /** Bound each paged worktree traversal used by checkout. */
+  maxWorktreeRowsPerPass?: number;
 }
 
 const CHECKOUT_WINDOW_ROWS = 1_000;
 const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_PATH_FIXED_BYTES = 96;
+const CHECKOUT_UNMERGED_PATHS = 10_000;
+const CHECKOUT_UNMERGED_BYTES = 4 * 1024 * 1024;
 
 /**
  * Bring the working tree and the index to `treeOid`. Entries already
@@ -65,6 +71,9 @@ export function checkoutTree(
   treeOid: string | null,
   options: CheckoutOptions = {},
 ): void {
+  if (options.discardUnmerged === true) {
+    discardUnmergedPaths(repo, worktree, options.maxWorktreeRowsPerPass);
+  }
   const preservedRemovals =
     options.restoreStructure === true
       ? restoreStructuralConflicts(repo, worktree, treeOid, options)
@@ -110,7 +119,10 @@ export function checkoutTree(
     for (const row of joinSorted3(
       treeStream(repo, treeOid),
       stageZero(repo.store.indexScan()),
-      walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
+      boundedCheckoutWorktreeEntries(
+        walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
+        options.maxWorktreeRowsPerPass,
+      ),
       { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
     )) {
       const entry = row.a;
@@ -134,6 +146,60 @@ export function checkoutTree(
   });
 }
 
+function discardUnmergedPaths(
+  repo: Repository,
+  worktree: Worktree,
+  maxWorktreeRows: number | undefined,
+): void {
+  const paths: string[] = [];
+  let previousUnmerged: string | null = null;
+  let retainedBytes = 0;
+  for (const entry of repo.store.indexScan()) {
+    if (entry.stage === 0 || entry.path === previousUnmerged) continue;
+    previousUnmerged = entry.path;
+    if (paths.length >= CHECKOUT_UNMERGED_PATHS) {
+      throw new GitError("E2BIG", `checkout conflicts exceed ${CHECKOUT_UNMERGED_PATHS} paths`);
+    }
+    retainedBytes += CHECKOUT_PATH_FIXED_BYTES + entry.path.length * 2;
+    if (retainedBytes > CHECKOUT_UNMERGED_BYTES) {
+      throw new GitError(
+        "E2BIG",
+        `checkout conflict paths exceed ${CHECKOUT_UNMERGED_BYTES} bytes`,
+      );
+    }
+    paths.push(entry.path);
+  }
+  if (paths.length === 0) return;
+
+  const physical: string[] = [];
+  for (const row of joinSorted(
+    paths,
+    boundedCheckoutWorktreeEntries(
+      walkWorktreeEntriesStream(worktree, repo.root, {
+        includeIgnored: true,
+        filesOnly: true,
+      }),
+      maxWorktreeRows,
+    ),
+    { left: (path) => path, right: (entry) => entry.path },
+  )) {
+    if (row.left !== undefined && row.right !== undefined) physical.push(row.left);
+  }
+  for (let offset = 0; offset < physical.length; offset += CHECKOUT_WINDOW_ROWS) {
+    worktree.removeFiles(
+      physical
+        .slice(offset, offset + CHECKOUT_WINDOW_ROWS)
+        .map((path) => joinPath(repo.root, path)),
+    );
+  }
+  repo.store.indexApply((sink) => {
+    for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
+      for (const path of paths.slice(offset, offset + CHECKOUT_WINDOW_ROWS)) sink.remove(path);
+      sink.flush();
+    }
+  });
+}
+
 interface StructuralPath {
   path: string;
   type: "file" | "dir" | "symlink";
@@ -153,7 +219,7 @@ function restoreStructuralConflicts(
   for (const row of joinSorted3(
     treeStream(repo, treeOid),
     stageZero(repo.store.indexScan()),
-    walkStructuralPaths(worktree, repo.root),
+    walkStructuralPaths(worktree, repo.root, options.maxWorktreeRowsPerPass),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
     while (
@@ -249,14 +315,37 @@ function restoreStructuralConflicts(
   return preservedRemovals;
 }
 
-function* walkStructuralPaths(worktree: Worktree, root: string): Generator<StructuralPath> {
+function* boundedCheckoutWorktreeEntries(
+  entries: Iterable<WorktreePath>,
+  maxRows: number | undefined,
+): Generator<WorktreePath> {
+  let rows = 0;
+  for (const entry of entries) {
+    if (maxRows !== undefined && rows >= maxRows) {
+      throw new GitError("E2BIG", `checkout worktree scan exceeds ${maxRows} rows`);
+    }
+    rows++;
+    yield entry;
+  }
+}
+
+function* walkStructuralPaths(
+  worktree: Worktree,
+  root: string,
+  maxRows?: number,
+): Generator<StructuralPath> {
   const lexicalRoot = root.replace(/\/+$/, "") || "/";
   const base = worktree.realpath(lexicalRoot);
   let after: string | undefined;
+  let rows = 0;
   while (true) {
     const entries = worktree.scan(base, { after, limit: CHECKOUT_WINDOW_ROWS });
     if (entries.length === 0) return;
     for (const entry of entries) {
+      if (maxRows !== undefined && rows >= maxRows) {
+        throw new GitError("E2BIG", `checkout structural scan exceeds ${maxRows} rows`);
+      }
+      rows++;
       after = entry.path;
       const path = relativeTo(base, entry.path);
       if (path !== null && path !== "") yield { path, type: entry.type };

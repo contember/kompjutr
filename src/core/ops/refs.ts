@@ -267,6 +267,61 @@ export function checkoutBlockers(
   prune: boolean,
   limits?: CheckoutBlockerLimits,
 ): CheckoutBlockers {
+  return checkoutBlockersAgainst(repo, worktree, repo.headTree(), tree, paths, prune, limits);
+}
+
+/** Checkout safety when an operation's checked-out baseline is not the published HEAD tree. */
+export function checkoutBlockersAgainst(
+  repo: Repository,
+  worktree: Worktree,
+  baselineTree: string | null,
+  tree: string | null,
+  paths: string[] | undefined,
+  prune: boolean,
+  limits?: CheckoutBlockerLimits,
+): CheckoutBlockers {
+  return checkoutBlockersAgainstMode(
+    repo,
+    worktree,
+    baselineTree,
+    tree,
+    paths,
+    prune,
+    limits,
+    false,
+  );
+}
+
+/** Checkout safety for a sequencer hard reset that intentionally discards tracked edits. */
+export function hardResetBlockersAgainst(
+  repo: Repository,
+  worktree: Worktree,
+  baselineTree: string | null,
+  tree: string | null,
+  limits: CheckoutBlockerLimits,
+): CheckoutBlockers {
+  return checkoutBlockersAgainstMode(
+    repo,
+    worktree,
+    baselineTree,
+    tree,
+    undefined,
+    true,
+    limits,
+    true,
+  );
+}
+
+function checkoutBlockersAgainstMode(
+  repo: Repository,
+  worktree: Worktree,
+  baselineTree: string | null,
+  tree: string | null,
+  paths: string[] | undefined,
+  prune: boolean,
+  limits: CheckoutBlockerLimits | undefined,
+  discardTrackedChanges: boolean,
+): CheckoutBlockers {
   const tracked: string[] = [];
   const untracked: string[] = [];
   const dirtyCandidates: GuardCandidate[] = [];
@@ -275,7 +330,7 @@ export function checkoutBlockers(
   const untrackedAncestors: PendingTarget[] = [];
   const budget = new CheckoutGuardBudget();
 
-  for (const row of checkoutGuardRows(repo, worktree, tree)) {
+  for (const row of checkoutGuardRows(repo, worktree, baselineTree, tree)) {
     if (limits !== undefined) {
       if (limits.rows >= limits.maxRows) {
         throw new GitError("E2BIG", `checkout guard exceeds ${limits.maxRows} source rows`);
@@ -285,7 +340,11 @@ export function checkoutBlockers(
     expireRanges(pendingTargets, row.path, budget);
     expireRanges(pendingTrackedPaths, row.path, budget);
     expireRanges(untrackedAncestors, row.path, budget);
-    if (row.worktree !== undefined && row.index === undefined) {
+    if (
+      row.worktree !== undefined &&
+      row.index === undefined &&
+      (!discardTrackedChanges || row.head === undefined)
+    ) {
       for (let index = pendingTargets.length - 1; index >= 0; index--) {
         const pending = pendingTargets[index]!;
         if (!row.path.startsWith(`${pending.path}/`)) continue;
@@ -313,6 +372,10 @@ export function checkoutBlockers(
       // Only the checkout that prunes would remove this path.
       if (!prune || existing === undefined) continue;
     } else if (existing === undefined) {
+      if (discardTrackedChanges && row.head !== undefined) {
+        if (row.worktree === undefined) retainRange(pendingTrackedPaths, row.path, budget);
+        continue;
+      }
       const ancestor = findAncestor(untrackedAncestors, row.path);
       if (ancestor !== undefined) {
         convertRangeToBlocker(untrackedAncestors, ancestor, untracked, budget);
@@ -333,7 +396,13 @@ export function checkoutBlockers(
     if (ancestor !== undefined) {
       budget.release(ancestor.bytes);
       untrackedAncestors.splice(untrackedAncestors.indexOf(ancestor), 1);
-      retainBlocker(tracked, row.path, budget);
+      retainBlocker(discardTrackedChanges ? untracked : tracked, row.path, budget);
+      continue;
+    }
+    if (discardTrackedChanges) {
+      if (target !== undefined && row.worktree === undefined) {
+        retainRange(pendingTrackedPaths, row.path, budget);
+      }
       continue;
     }
     if (changesIndex && differsFromHead(existing, row.head)) {
@@ -376,9 +445,10 @@ interface CheckoutGuardRow {
 function* checkoutGuardRows(
   repo: Repository,
   worktree: Worktree,
+  baselineTree: string | null,
   tree: string | null,
 ): Generator<CheckoutGuardRow> {
-  const trees = joinSorted(treeStream(repo, tree), treeStream(repo, repo.headTree()), {
+  const trees = joinSorted(treeStream(repo, tree), treeStream(repo, baselineTree), {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
   });

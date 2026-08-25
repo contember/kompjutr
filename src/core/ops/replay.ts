@@ -1,18 +1,29 @@
 // Pure one-commit replay planning shared by cherry-pick and revert.
 
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
+import type { MemoryReservation } from "../../sqlite/memory.js";
+import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "../bytes.js";
 import type { TextMergeOptions } from "../diff/xmerge.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
-import { type Commit, hashObject, parseCommit, parseTag } from "../objects.js";
+import { type Commit, hashObject, parseReplayCommit, parseTag } from "../objects.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { type IntegrationLimits, type IntegrationPlan, planIntegration } from "./integration.js";
+import { MAX_OPERATION_STEPS } from "./operation-state.js";
 
 export const MAX_REPLAY_REVISION_CODE_UNITS = 1_024;
 export const MAX_REPLAY_REVISION_HOPS = 32;
 export const MAX_REPLAY_TAG_HOPS = 16;
 // Covers bounded revision/tag peeling and authoritative commit-object reads.
 export const MAX_REPLAY_METADATA_SQL_STATEMENTS = 256;
+export const MAX_REPLAY_PREFLIGHT_BYTES = 32 * 1024 * 1024;
+export const MAX_REPLAY_PREFLIGHT_READ_CALLS = MAX_REPLAY_PREFLIGHT_BYTES / MAX_BLOB_BATCH_BYTES;
+export const REPLAY_PREFLIGHT_HEADROOM_BYTES = 16 * 1024 * 1024;
+export const MAX_REPLAY_PLAN_METADATA_BYTES = 8 * 1024 * 1024;
+const MAX_REPLAY_PREFLIGHT_INPUT_OIDS = MAX_OPERATION_STEPS * 2 + 1;
+const MAX_REPLAY_PREFLIGHT_UNIQUE_OIDS = MAX_OPERATION_STEPS + 2;
+const MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE = 4_096;
 
 export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";
@@ -26,6 +37,8 @@ export interface ReplayInput {
   limits?: IntegrationLimits;
   /** Select Git's command-specific sequencer label or the planner's tree label. */
   incomingLabelStyle?: ReplayIncomingLabelStyle;
+  /** Caller-owned bytes retained while integration planning runs. */
+  integrationCallerRetainedBytes?: number;
 }
 
 export interface ReplayLabels {
@@ -49,8 +62,18 @@ export interface ReplayPlan {
   incomingTreeOid: string | null;
   labels: ReplayLabels;
   integration: IntegrationPlan;
+  /** Replay metadata retained beside the integration plan. */
+  retainedBytes: number;
   /** Conservative metadata work, excluding the integration plan's own reads. */
   sqlStatements: number;
+}
+
+export interface FixedReplayStepInput {
+  sourceOid: string;
+  selectedParentOid: string | null;
+  currentOid: string;
+  callerRetainedBytes?: number;
+  limits?: IntegrationLimits;
 }
 
 export interface BoundedRevisionLabels {
@@ -76,6 +99,30 @@ interface RevisionTraversal {
   readonly commits: Set<string>;
 }
 
+function checkedRetainedAdd(total: number, bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > Number.MAX_SAFE_INTEGER - total) {
+    throw new GitError("E2BIG", "replay metadata retained-byte accounting overflow");
+  }
+  return total + bytes;
+}
+
+function commitRetainedBytes(commit: Commit): number {
+  let bytes = 768;
+  for (const value of [
+    commit.tree,
+    ...commit.parent,
+    commit.author.name,
+    commit.author.email,
+    commit.committer.name,
+    commit.committer.email,
+    commit.gpgsig ?? "",
+    commit.message,
+  ]) {
+    bytes = checkedRetainedAdd(bytes, retainedStringBytes(value));
+  }
+  return bytes;
+}
+
 function readCommit(repo: Repository, oid: string): Commit {
   const metadata = repo.store.typeAndSize(oid);
   if (metadata === null) throw new ObjectNotFoundError(oid);
@@ -92,7 +139,100 @@ function readCommit(repo: Repository, oid: string): Commit {
   if (object.data.length !== metadata.size || hashObject("commit", object.data) !== oid) {
     throw new CorruptError(`commit ${oid} does not match its authoritative object metadata`);
   }
-  return parseCommit(object.data);
+  return parseReplayCommit(object.data);
+}
+
+export interface ReplayCommitPreflight {
+  bytes: number;
+  readCalls: number;
+  sqlStatements: number;
+}
+
+/** Validate every source commit before a sequencer creates durable state. */
+export function preflightReplayCommitObjects(
+  repo: Repository,
+  sourceOids: readonly string[],
+): ReplayCommitPreflight {
+  const reservation = repo.store.reserveMemory();
+  reservation.set("other", REPLAY_PREFLIGHT_HEADROOM_BYTES);
+  try {
+    return preflightReplayCommitObjectsInternal(repo, sourceOids);
+  } finally {
+    reservation.dispose();
+  }
+}
+
+function preflightReplayCommitObjectsInternal(
+  repo: Repository,
+  sourceOids: readonly string[],
+): ReplayCommitPreflight {
+  if (sourceOids.length > MAX_REPLAY_PREFLIGHT_INPUT_OIDS) {
+    throw new GitError(
+      "E2BIG",
+      `replay commit preflight exceeds ${MAX_REPLAY_PREFLIGHT_INPUT_OIDS} inputs`,
+    );
+  }
+  const unique = [...new Set(sourceOids)];
+  if (unique.length > MAX_REPLAY_PREFLIGHT_UNIQUE_OIDS) {
+    throw new GitError(
+      "E2BIG",
+      `replay commit preflight exceeds ${MAX_REPLAY_PREFLIGHT_UNIQUE_OIDS} commits`,
+    );
+  }
+  let bytes = 0;
+  let metadataCalls = 0;
+  for (let offset = 0; offset < unique.length; offset += MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE) {
+    const page = unique.slice(offset, offset + MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE);
+    const info = repo.store.objectInfo(page);
+    metadataCalls++;
+    for (let ordinal = 0; ordinal < info.length; ordinal++) {
+      const object = info[ordinal];
+      const oid = page[ordinal];
+      if (object === undefined || oid === undefined || object.oid !== oid) {
+        throw new CorruptError("replay commit preflight metadata is incomplete");
+      }
+      if (object.type !== "commit") throw new CorruptError(`${oid} is not a commit`);
+      if (object.size > MAX_INDEXED_COMMIT_BYTES) {
+        throw new CorruptError(`commit ${oid} exceeds the indexed commit size limit`);
+      }
+      if (object.size > MAX_REPLAY_PREFLIGHT_BYTES - bytes) {
+        throw new GitError(
+          "E2BIG",
+          `replay source commits exceed ${MAX_REPLAY_PREFLIGHT_BYTES} bytes`,
+        );
+      }
+      bytes += object.size;
+    }
+  }
+  let readCalls = 0;
+  for (let offset = 0; offset < unique.length; offset += MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE) {
+    let remaining = unique.slice(offset, offset + MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE);
+    while (remaining.length > 0) {
+      if (readCalls >= MAX_REPLAY_PREFLIGHT_READ_CALLS) {
+        throw new GitError(
+          "E2BIG",
+          `replay source commits require more than ${MAX_REPLAY_PREFLIGHT_READ_CALLS} reads`,
+        );
+      }
+      const batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
+      if (batch.objects.size === 0 || batch.remaining.length >= remaining.length) {
+        throw new CorruptError("replay commit preflight made no progress");
+      }
+      for (const [oid, object] of batch.objects) {
+        if (
+          object.type !== "commit" ||
+          object.data.length > MAX_INDEXED_COMMIT_BYTES ||
+          hashObject("commit", object.data) !== oid
+        ) {
+          throw new CorruptError(`commit ${oid} failed authoritative replay preflight`);
+        }
+        parseReplayCommit(object.data);
+      }
+      remaining = batch.remaining;
+      readCalls++;
+    }
+  }
+  return { bytes, readCalls, sqlStatements: metadataCalls + readCalls * 8 };
 }
 
 function peelCommit(repo: Repository, start: string, operation: string): string {
@@ -291,6 +431,14 @@ function incomingLabel(
 
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
 export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
+  return planReplayInternal(repo, input, null);
+}
+
+function planReplayInternal(
+  repo: Repository,
+  input: ReplayInput,
+  metadataReservation: MemoryReservation | null,
+): ReplayPlan {
   const revisionLabels: BoundedRevisionLabels = {
     input: "replay source",
     operation: "replay",
@@ -329,6 +477,25 @@ export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
         sourceCommit.message,
       ),
   };
+  let retainedBytes = checkedRetainedAdd(
+    commitRetainedBytes(currentCommit),
+    commitRetainedBytes(sourceCommit),
+  );
+  for (const value of [
+    sourceOid,
+    selectedParentOid ?? "",
+    input.currentOid,
+    ...Object.values(labels),
+  ]) {
+    retainedBytes = checkedRetainedAdd(retainedBytes, retainedStringBytes(value));
+  }
+  if (retainedBytes > MAX_REPLAY_PLAN_METADATA_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `replay metadata exceeds ${MAX_REPLAY_PLAN_METADATA_BYTES} retained bytes`,
+    );
+  }
+  metadataReservation?.set("other", retainedBytes);
   const integration = planIntegration(repo, {
     baseTreeOid,
     currentTreeOid: currentCommit.tree,
@@ -338,6 +505,10 @@ export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
       labels,
     },
     limits: input.limits,
+    callerRetainedBytes: checkedRetainedAdd(
+      input.integrationCallerRetainedBytes ?? 0,
+      retainedBytes,
+    ),
   });
 
   return {
@@ -355,6 +526,74 @@ export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
     incomingTreeOid,
     labels,
     integration,
+    retainedBytes,
     sqlStatements: MAX_REPLAY_METADATA_SQL_STATEMENTS,
   };
+}
+
+/** Build one cherry-pick plan from immutable sequencer OIDs and verify its parent selection. */
+export function planFixedReplayStep(repo: Repository, input: FixedReplayStepInput): ReplayPlan {
+  return planFixedReplayStepInternal(repo, input, null);
+}
+
+function planFixedReplayStepInternal(
+  repo: Repository,
+  input: FixedReplayStepInput,
+  metadataReservation: MemoryReservation | null,
+): ReplayPlan {
+  if (!isOid(input.sourceOid) || !isOid(input.currentOid)) {
+    throw new GitError("EINVAL", "rebase replay step requires full object ids");
+  }
+  if (input.selectedParentOid !== null && !isOid(input.selectedParentOid)) {
+    throw new GitError("EINVAL", "rebase replay step selected parent is invalid");
+  }
+  const plan = planReplayInternal(
+    repo,
+    {
+      kind: "cherry-pick",
+      source: input.sourceOid,
+      currentOid: input.currentOid,
+      incomingLabelStyle: "source-subject",
+      integrationCallerRetainedBytes: input.callerRetainedBytes,
+      limits: input.limits,
+    },
+    metadataReservation,
+  );
+  if (
+    plan.sourceOid !== input.sourceOid ||
+    plan.selectedParentOid !== input.selectedParentOid ||
+    plan.mainline !== null
+  ) {
+    throw new GitError("ECORRUPT", "rebase replay step differs from its authenticated queue");
+  }
+  return plan;
+}
+
+export interface RetainedReplayPlan {
+  plan: ReplayPlan;
+  release(): void;
+}
+
+/** Keep replay metadata coordinated from its first allocation through caller release. */
+export function planRetainedFixedReplayStep(
+  repo: Repository,
+  input: FixedReplayStepInput,
+): RetainedReplayPlan {
+  const reservation = repo.store.reserveMemory();
+  reservation.set("other", MAX_REPLAY_PLAN_METADATA_BYTES);
+  try {
+    const plan = planFixedReplayStepInternal(repo, input, reservation);
+    let active = true;
+    return {
+      plan,
+      release(): void {
+        if (!active) throw new Error("retained replay plan was already released");
+        active = false;
+        reservation.dispose();
+      },
+    };
+  } catch (error) {
+    reservation.dispose();
+    throw error;
+  }
 }

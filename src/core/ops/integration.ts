@@ -101,6 +101,8 @@ export interface IntegrationInput {
   incomingTreeOid: string | null;
   text?: TextMergeOptions;
   limits?: IntegrationLimits;
+  /** Caller-owned bytes that remain live for the full planning call. */
+  callerRetainedBytes?: number;
 }
 
 export interface VirtualAncestorIntegrationInput extends IntegrationInput {
@@ -803,8 +805,17 @@ function planIntegrationInternal(
 ): IntegrationPlan {
   const reservation = repo.store.reserveMemory();
   try {
+    const externalBytes =
+      input.callerRetainedBytes === undefined
+        ? 0
+        : boundedLimit(
+            input.callerRetainedBytes,
+            MAX_OPERATION_MEMORY_BYTES,
+            "caller retained byte",
+          );
+    const exclusiveBytes = MAX_OPERATION_MEMORY_BYTES - externalBytes;
     // Exclude yielded pack ingest before opening any tree cursor or retaining plan state.
-    reservation.set("other", MAX_OPERATION_MEMORY_BYTES);
+    reservation.set("other", exclusiveBytes);
     const limits = resolveLimits(input.limits);
     const structure = classifyIntegrationStructure(repo, {
       baseTreeOid: input.baseTreeOid,
@@ -894,7 +905,7 @@ function planIntegrationInternal(
       staticEntries.length * ID_VECTOR_ENTRY_BYTES,
       "static plan vector",
     );
-    requireCallerHeadroom(staticBytes);
+    requireCallerHeadroom(checkedAdd(externalBytes, staticBytes, "caller state"));
 
     let resolvedBytes = 0;
     let remaining = requestedOids;
@@ -915,21 +926,22 @@ function planIntegrationInternal(
           );
         }
         const beforeRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        requireCallerHeadroom(beforeRead);
+        requireCallerHeadroom(checkedAdd(externalBytes, beforeRead, "caller state"));
         const mapHeadroom = Math.min(remaining.length, 4096) * BLOB_MAP_ENTRY_BYTES;
-        const available = PACK_BLOB_CALLER_HEADROOM_BYTES - beforeRead - mapHeadroom;
+        const available =
+          PACK_BLOB_CALLER_HEADROOM_BYTES - externalBytes - beforeRead - mapHeadroom;
         if (available <= 0) {
           throw new GitError("E2BIG", "integration has no caller headroom for another blob batch");
         }
         const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, available);
-        reservation.set("other", MAX_OPERATION_MEMORY_BYTES);
+        reservation.set("other", exclusiveBytes);
         const batch = repo.readBlobs(remaining, { budgetBytes });
         blobReadCalls++;
         validateBlobBatch(remaining, batch.blobs, batch.remaining, batch.bytes);
         for (const [oid, data] of batch.blobs) loaded.set(oid, data);
         remaining = batch.remaining;
         const afterRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        requireCallerHeadroom(afterRead);
+        requireCallerHeadroom(checkedAdd(externalBytes, afterRead, "caller state"));
         reservation.set("other", afterRead);
         continue;
       }

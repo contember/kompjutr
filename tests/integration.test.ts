@@ -12,6 +12,7 @@ import {
   MAX_INTEGRATION_TREE_STATEMENTS,
   planIntegration,
 } from "../src/core/ops/integration.js";
+import { reserveIntegrationPlan } from "../src/core/ops/integration-worktree.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -107,6 +108,33 @@ describe("bounded three-way integration plan", () => {
       expect(blocker.currentBytes).toBe(1);
     } finally {
       blocker.dispose();
+    }
+    assertCoordinatorIdle(store);
+  });
+
+  it("coordinates retained caller state through planning and maximum rebase execution reserve", () => {
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const tree = writeTree(store, { file: { content: "same\n" } });
+    const repo = new Repository(store, "/repo");
+    const journal = store.reserveMemory();
+    journal.set("other", 4 * 1024 * 1024);
+    try {
+      const plan = planIntegration(repo, {
+        baseTreeOid: tree.tree,
+        currentTreeOid: tree.tree,
+        incomingTreeOid: tree.tree,
+        callerRetainedBytes: journal.currentBytes,
+      });
+      expect(plan.memoryHighWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES - journal.currentBytes);
+      const execution = reserveIntegrationPlan(
+        repo,
+        { ...plan, retainedBytes: 26 * 1024 * 1024 },
+        8 * 1024 * 1024,
+      );
+      execution.dispose();
+    } finally {
+      journal.dispose();
     }
     assertCoordinatorIdle(store);
   });

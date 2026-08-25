@@ -10,10 +10,10 @@ import { type IntegrationPlan, MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ } from "
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import { projectMergePlan } from "./merge-projection.js";
 import type { MergeTouchedPath } from "./merge-state.js";
-import { checkoutBlockers } from "./refs.js";
+import { checkoutBlockers, checkoutBlockersAgainst } from "./refs.js";
 import { preflightTreeBuild, type TreeBuildPreflightStats } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
-import { walkWorktreeEntriesStream } from "./worktree-io.js";
+import { type DirtyPathLimits, dirtyPathStream, walkWorktreeEntriesStream } from "./worktree-io.js";
 
 export const MAX_INTEGRATION_INDEX_ENTRIES = 10_000;
 export const MAX_INTEGRATION_INDEX_PATH_BYTES = 4 * 1024 * 1024;
@@ -24,10 +24,27 @@ export const INTEGRATION_GUARD_SQL_STATEMENTS = 300;
 export const INTEGRATION_COLLISION_SQL_STATEMENTS = 160;
 const MAX_REPOSITORY_ROWS = 50_000;
 const MAX_GUARD_HASH_BYTES = 32 * 1024 * 1024;
-const EXECUTION_HEADROOM_BYTES = 24 * 1024 * 1024;
+export const INTEGRATION_EXECUTION_HEADROOM_BYTES = 24 * 1024 * 1024;
 const MAX_RELOCATION_COLLISIONS = 1_000;
 
-export type IntegrationOperation = "merge" | "cherry-pick" | "revert";
+function dirtyPathLimits(): DirtyPathLimits {
+  return {
+    maxIndexRows: MAX_INTEGRATION_INDEX_ENTRIES,
+    indexRows: 0,
+    maxWorktreeRows: MAX_REPOSITORY_ROWS,
+    worktreeRows: 0,
+    maxHashCandidates: MAX_INTEGRATION_INDEX_ENTRIES,
+    hashCandidates: 0,
+    maxHashBytes: MAX_GUARD_HASH_BYTES,
+    hashBytes: 0,
+    maxHashRangeReads: 64,
+    hashRangeReads: 0,
+    maxHashBatches: 10,
+    hashBatches: 0,
+  };
+}
+
+export type IntegrationOperation = "merge" | "cherry-pick" | "revert" | "rebase";
 
 function indexEntry(path: string, mode: string, oid: string): IndexEntry {
   return {
@@ -107,9 +124,13 @@ export function requireBoundedIntegrationIndex(repo: Repository): TreeBuildPrefl
 export function reserveIntegrationPlan(
   repo: Repository,
   plan: IntegrationPlan,
+  callerRetainedBytes = 0,
 ): ReturnType<Repository["store"]["reserveMemory"]> {
   const reservation = repo.store.reserveMemory();
-  reservation.set("other", plan.retainedBytes + EXECUTION_HEADROOM_BYTES);
+  reservation.set(
+    "other",
+    callerRetainedBytes + plan.retainedBytes + INTEGRATION_EXECUTION_HEADROOM_BYTES,
+  );
   return reservation;
 }
 
@@ -117,7 +138,7 @@ export function reserveIntegrationExecution(
   repo: Repository,
 ): ReturnType<Repository["store"]["reserveMemory"]> {
   const reservation = repo.store.reserveMemory();
-  reservation.set("other", EXECUTION_HEADROOM_BYTES);
+  reservation.set("other", INTEGRATION_EXECUTION_HEADROOM_BYTES);
   return reservation;
 }
 
@@ -166,15 +187,30 @@ export function integrationIndexMatchesTree(repo: Repository, treeOid: string): 
   return true;
 }
 
+export function requireCleanIntegrationWorktree(
+  repo: Repository,
+  worktree: Worktree,
+  operation: IntegrationOperation,
+): void {
+  const dirty = dirtyPathStream(repo, worktree, undefined, dirtyPathLimits()).next();
+  if (dirty.done !== true) {
+    throw new GitError(
+      "ECHECKOUTFAIL",
+      `cannot ${operation}: tracked working tree changes are present at ${dirty.value}`,
+    );
+  }
+}
+
 export function requireSafeIntegrationWorktree(
   repo: Repository,
   worktree: Worktree,
   incomingTree: string | null,
   paths: readonly string[],
   operation: IntegrationOperation,
+  baselineTree?: string | null,
 ): void {
   if (paths.length === 0) return;
-  const blockers = checkoutBlockers(repo, worktree, incomingTree, [...paths], true, {
+  const limits = {
     maxRows: MAX_REPOSITORY_ROWS,
     maxHashBytes: MAX_GUARD_HASH_BYTES,
     rows: 0,
@@ -185,7 +221,19 @@ export function requireSafeIntegrationWorktree(
     hashCandidates: 0,
     maxHashBatches: 1,
     hashBatches: 0,
-  });
+  };
+  const blockers =
+    baselineTree === undefined
+      ? checkoutBlockers(repo, worktree, incomingTree, [...paths], true, limits)
+      : checkoutBlockersAgainst(
+          repo,
+          worktree,
+          baselineTree,
+          incomingTree,
+          [...paths],
+          true,
+          limits,
+        );
   if (blockers.tracked.length > 0) {
     throw new GitError(
       "ECHECKOUTFAIL",

@@ -6,7 +6,7 @@
 // elsewhere.
 
 import { concat, isOid, toHex, utf8, utf8Decoder } from "./bytes.js";
-import { CorruptError } from "./errors.js";
+import { CorruptError, GitError } from "./errors.js";
 import { Sha1 } from "./sha1.js";
 import { comparePaths } from "./streams.js";
 
@@ -182,7 +182,11 @@ function splitHeaders(text: string): HeaderBlock {
 // -- commit -----------------------------------------------------------
 
 export function parseCommit(data: Uint8Array): Commit {
-  const { headers, message } = splitHeaders(utf8Decoder.decode(data));
+  return parseCommitText(utf8Decoder.decode(data));
+}
+
+function parseCommitText(text: string): Commit {
+  const { headers, message } = splitHeaders(text);
   const commit: Commit = {
     tree: "",
     parent: [],
@@ -217,6 +221,24 @@ export function parseCommit(data: Uint8Array): Commit {
   }
   if (!sawTree) throw new CorruptError("commit is missing its tree header");
   return commit;
+}
+
+/** Replayed commits must round-trip through the string-only commit writer. */
+export function parseReplayCommit(data: Uint8Array): Commit {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(data);
+  } catch {
+    throw new GitError("EUNSUPPORTED", "replay does not support non-UTF-8 commit objects");
+  }
+  const blank = text.indexOf("\n\n");
+  const head = blank < 0 ? text : text.slice(0, blank);
+  for (const line of head.split("\n")) {
+    if (line.startsWith("encoding ")) {
+      throw new GitError("EUNSUPPORTED", "replay does not support commit encoding headers");
+    }
+  }
+  return parseCommitText(text);
 }
 
 export function serializeCommit(commit: Commit): Uint8Array {

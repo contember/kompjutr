@@ -9,6 +9,7 @@ import { subtreeSuccessor } from "../../fs/path.js";
 import type { ScanEntry } from "../../fs/types.js";
 import type { IndexEntry } from "../../sqlite/store.js";
 import { toHex, utf8 } from "../bytes.js";
+import { GitError } from "../errors.js";
 import type { IgnoreMatcher } from "../ignore/index.js";
 import { hashObject, objectHeader } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
@@ -436,8 +437,28 @@ function hashLargeFile(
  * `checkout` needs it to refuse to overwrite local changes without ever
  * pulling in HEAD comparison.
  */
-export function dirtyPaths(repo: Repository, worktree: Worktree, paths?: string[]): string[] {
-  return [...dirtyPathStream(repo, worktree, paths)];
+export interface DirtyPathLimits {
+  maxIndexRows: number;
+  indexRows: number;
+  maxWorktreeRows: number;
+  worktreeRows: number;
+  maxHashCandidates: number;
+  hashCandidates: number;
+  maxHashBytes: number;
+  hashBytes: number;
+  maxHashRangeReads: number;
+  hashRangeReads: number;
+  maxHashBatches: number;
+  hashBatches: number;
+}
+
+export function dirtyPaths(
+  repo: Repository,
+  worktree: Worktree,
+  paths?: string[],
+  limits?: DirtyPathLimits,
+): string[] {
+  return [...dirtyPathStream(repo, worktree, paths, limits)];
 }
 
 /** The same comparison, lazily, over a paged index scan. */
@@ -445,6 +466,7 @@ export function* dirtyPathStream(
   repo: Repository,
   worktree: Worktree,
   paths?: string[],
+  limits?: DirtyPathLimits,
 ): Generator<string> {
   let root: string | null = null;
   let scanned: Generator<ScanEntry> | null = null;
@@ -483,6 +505,31 @@ export function* dirtyPathStream(
       needsHash.push(found);
     }
 
+    if (limits !== undefined && needsHash.length > 0) {
+      if (limits.hashBatches >= limits.maxHashBatches) {
+        throw new GitError("E2BIG", `dirty-path hashing exceeds ${limits.maxHashBatches} batches`);
+      }
+      if (needsHash.length > limits.maxHashCandidates - limits.hashCandidates) {
+        throw new GitError("E2BIG", `dirty-path hashing exceeds ${limits.maxHashCandidates} paths`);
+      }
+      limits.hashBatches++;
+      limits.hashCandidates += needsHash.length;
+      const rangeReads = worktreeHashRangeReads(needsHash);
+      if (rangeReads > limits.maxHashRangeReads - limits.hashRangeReads) {
+        throw new GitError(
+          "E2BIG",
+          `dirty-path hashing exceeds ${limits.maxHashRangeReads} range reads`,
+        );
+      }
+      limits.hashRangeReads += rangeReads;
+      for (const candidate of needsHash) {
+        if (candidate.stat.size > limits.maxHashBytes - limits.hashBytes) {
+          throw new GitError("E2BIG", `dirty-path hashing exceeds ${limits.maxHashBytes} bytes`);
+        }
+        limits.hashBytes += candidate.stat.size;
+      }
+    }
+
     const hashes = hashWorktreePathsAtRoot(repo, worktree, root, needsHash, { write: false });
     for (const candidate of needsHash) {
       const found = hashes.get(candidate.path);
@@ -499,13 +546,19 @@ export function* dirtyPathStream(
   };
 
   for (const entry of repo.store.indexScan()) {
+    if (limits !== undefined) {
+      if (limits.indexRows >= limits.maxIndexRows) {
+        throw new GitError("E2BIG", `dirty-path scan exceeds ${limits.maxIndexRows} index rows`);
+      }
+      limits.indexRows++;
+    }
     if (entry.stage !== 0) continue;
     if (paths !== undefined && !withinPathspec(entry.path, paths, false)) continue;
 
     if (scanned === null) {
       const canonical = worktree.realpath(repo.root);
       root = canonical;
-      scanned = scanWorktreeEntries(worktree, canonical);
+      scanned = scanWorktreeEntries(worktree, canonical, limits);
       current = scanned.next();
     }
     if (root === null || current === null) throw new Error("dirty path scan has no cursor");
@@ -538,12 +591,27 @@ export function* dirtyPathStream(
 }
 
 /** Files and symlinks from a paged scan over an already canonical root. */
-function* scanWorktreeEntries(worktree: Worktree, root: string): Generator<ScanEntry> {
+function* scanWorktreeEntries(
+  worktree: Worktree,
+  root: string,
+  limits?: DirtyPathLimits,
+): Generator<ScanEntry> {
   let after: string | undefined;
   while (true) {
     const page = worktree.scan(root, { after, filesOnly: true, limit: SCAN_PAGE });
     if (page.length === 0) return;
-    yield* page;
+    for (const entry of page) {
+      if (limits !== undefined) {
+        if (limits.worktreeRows >= limits.maxWorktreeRows) {
+          throw new GitError(
+            "E2BIG",
+            `dirty-path scan exceeds ${limits.maxWorktreeRows} worktree rows`,
+          );
+        }
+        limits.worktreeRows++;
+      }
+      yield entry;
+    }
     if (page.length < SCAN_PAGE) return;
     after = page[page.length - 1]?.path;
   }

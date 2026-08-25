@@ -126,6 +126,15 @@ export class GitFixture {
     return new Uint8Array(this.gitBinary("cat-file", "-p", oid));
   }
 
+  writeObject(type: "blob" | "tree" | "commit" | "tag", data: Uint8Array): string {
+    return execFileSync("git", ["hash-object", "-t", type, "-w", "--stdin"], {
+      cwd: this.dir,
+      env: ENV,
+      input: data,
+      encoding: "utf8",
+    }).trim();
+  }
+
   dispose(): void {
     rmSync(this.dir, { recursive: true, force: true });
   }

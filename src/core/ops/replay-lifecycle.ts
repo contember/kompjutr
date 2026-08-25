@@ -264,7 +264,7 @@ function requireOwnership(
 } {
   requireOriginalSnapshots(repo, journal);
   const plan = planForState(repo, journal.state, incomingLabelStyle);
-  const reservation = reserveIntegrationPlan(repo, plan.integration);
+  const reservation = reserveIntegrationPlan(repo, plan.integration, plan.retainedBytes);
   try {
     const omitted = new Set(journal.touched.map((entry) => entry.path));
     const projected = projectIntegrationWithCollisions(
@@ -326,7 +326,7 @@ export function startReplay(
     });
     const message = input.message ?? policy.defaultMessage(plan);
     const prior = replayStartSqlStatements(plan);
-    const reservation = reserveIntegrationPlan(repo, plan.integration);
+    const reservation = reserveIntegrationPlan(repo, plan.integration, plan.retainedBytes);
     try {
       if (plan.integration.entries.length === 0) {
         requireSql(prior);

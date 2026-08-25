@@ -2497,6 +2497,31 @@ export class RepoStore {
     );
   }
 
+  /** Move one direct ref only if it still contains the caller's observed OID. */
+  updateRefExpected(name: string, expectedOid: string, targetOid: string): void {
+    if (name === "HEAD" || !isOid(expectedOid) || !isOid(targetOid)) {
+      throw new GitError("EINVAL", "conditional ref update requires a direct ref and full OIDs");
+    }
+    const row = this.#db.one<{ name: unknown; target: unknown }>(
+      `UPDATE git_refs SET target = ?
+        WHERE repo_id = ? AND name = ? AND target = ?
+        RETURNING name, target`,
+      targetOid,
+      this.#repoId,
+      name,
+      expectedOid,
+    );
+    if (row === undefined) {
+      throw new GitError("ESTALEHEAD", `ref ${name} changed before conditional update`);
+    }
+    if (typeof row.name !== "string" || typeof row.target !== "string") {
+      throw new CorruptError("conditional ref update returned invalid SQL fields");
+    }
+    if (row.name !== name || row.target !== targetOid) {
+      throw new CorruptError("conditional ref update returned an unexpected row");
+    }
+  }
+
   deleteRef(name: string): void {
     this.#db.run("DELETE FROM git_refs WHERE repo_id = ? AND name = ?", this.#repoId, name);
   }

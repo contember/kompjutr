@@ -25,8 +25,10 @@ import {
   mergeOperationState,
   type OperationJournal,
   type OperationStateMetadata,
+  type OperationStepMetadata,
   operationJournalIntegrityOid,
   operationJournalRetainedBytes,
+  type RebaseStateMetadata,
 } from "./operation-state.js";
 
 const APPLY_SCAN_PAGE = 1_000;
@@ -67,6 +69,12 @@ export interface MergeApplyOptions {
 export interface OperationApplyOptions {
   priorSqlStatements?: number;
   suspendedState: OperationStateMetadata | null;
+}
+
+interface ActiveRebaseApply {
+  expectedIntegrityOid: string;
+  conflictState: RebaseStateMetadata | null;
+  steps: readonly OperationStepMetadata[];
 }
 
 export interface OperationApplyResult {
@@ -888,15 +896,43 @@ function structuralRemovals(
 }
 
 /** Apply inside the caller's transaction so journal and mutations commit together. */
-export function applyProjectedOperation(
+function applyProjectedOperationInternal(
   repo: Repository,
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   options: OperationApplyOptions,
+  activeRebase: ActiveRebaseApply | null,
 ): OperationApplyResult {
   validateEntries(entries);
-  repo.store.requireNoOperationState();
-  const suspendedState = options.suspendedState;
+  if (activeRebase === null) {
+    repo.store.requireNoOperationState();
+  } else {
+    if (options.suspendedState !== null) {
+      throw new CorruptError("rebase apply supplied two journal transitions");
+    }
+    const current = repo.store.requireOperationState("rebase");
+    if (current.integrityOid !== activeRebase.expectedIntegrityOid) {
+      throw new GitError("EOPMISMATCH", "rebase operation changed before apply");
+    }
+    if (
+      current.steps.length !== activeRebase.steps.length ||
+      current.steps.some((step, ordinal) => {
+        const supplied = activeRebase.steps[ordinal];
+        return (
+          supplied === undefined ||
+          step.sourceOid !== supplied.sourceOid ||
+          step.selectedParentOid !== supplied.selectedParentOid ||
+          step.mainline !== supplied.mainline ||
+          step.outcome !== supplied.outcome ||
+          step.resultOid !== supplied.resultOid
+        );
+      })
+    ) {
+      throw new GitError("EOPMISMATCH", "rebase apply queue differs from its active journal");
+    }
+  }
+  const suspendedState = activeRebase?.conflictState ?? options.suspendedState;
+  const suspendedSteps = activeRebase?.steps;
 
   const specs = touchedSpecs(entries);
   const owned = specs.map((spec) => spec.path);
@@ -930,7 +966,9 @@ export function applyProjectedOperation(
   const contentBytes = contentObjectSizes.reduce((total, size) => total + size, 0);
   const removals = structuralRemovals(entries, worktreeRows.entries);
   const journalRetainedBytes =
-    suspendedState === null ? 0 : operationJournalRetainedBytes(suspendedState, previewTouched);
+    suspendedState === null
+      ? 0
+      : operationJournalRetainedBytes(suspendedState, previewTouched, suspendedSteps);
   const estimate = calculateMergeApplySqlStatements(options.priorSqlStatements ?? 0, {
     worktreeScanPages: worktreeRows.pages,
     indexScanRows: indexRows,
@@ -961,7 +999,7 @@ export function applyProjectedOperation(
     const root = worktree.realpath(repo.root);
     const snapshotOids = snapshotWorktreeObjects(repo, worktree, root, drafts, calls);
     touched = touchedFromDrafts(drafts, snapshotOids);
-    operationJournalRetainedBytes(suspendedState, touched);
+    operationJournalRetainedBytes(suspendedState, touched, suspendedSteps);
   }
 
   const contentOids = contentObjects(repo, entries);
@@ -977,9 +1015,65 @@ export function applyProjectedOperation(
   applyIndex(repo, entries, specs);
   if (touched !== null) {
     if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
-    repo.store.writeOperationState(suspendedState, touched);
+    if (activeRebase === null) {
+      repo.store.writeOperationState(suspendedState, touched);
+    } else {
+      repo.store.replaceOperationJournal(
+        activeRebase.expectedIntegrityOid,
+        suspendedState,
+        activeRebase.steps,
+        touched,
+      );
+    }
   }
   return { touched, sqlStatements: estimate.applySqlStatements };
+}
+
+/** Apply a normal operation inside its caller-owned transaction. */
+export function applyProjectedOperation(
+  repo: Repository,
+  worktree: Worktree,
+  entries: readonly ProjectedMergeEntry[],
+  options: OperationApplyOptions,
+): OperationApplyResult {
+  return applyProjectedOperationInternal(repo, worktree, entries, options, null);
+}
+
+export interface ProjectedRebaseTransitionOptions<T> extends ActiveRebaseApply {
+  priorSqlStatements?: number;
+  onClean: (applied: OperationApplyResult) => T;
+}
+
+export type ProjectedRebaseTransitionResult<T> =
+  | { outcome: "clean"; value: T }
+  | { outcome: "conflicted" };
+
+/** Own the transaction that couples active-rebase mutation to its journal transition. */
+export function applyProjectedRebaseTransition<T>(
+  repo: Repository,
+  worktree: Worktree,
+  entries: readonly ProjectedMergeEntry[],
+  options: ProjectedRebaseTransitionOptions<T>,
+): ProjectedRebaseTransitionResult<T> {
+  return repo.store.db.transactionSync(() => {
+    const applied = applyProjectedOperationInternal(
+      repo,
+      worktree,
+      entries,
+      { priorSqlStatements: options.priorSqlStatements, suspendedState: null },
+      options,
+    );
+    if (options.conflictState !== null) {
+      if (applied.touched === null) {
+        throw new CorruptError("conflicted rebase apply omitted its ownership snapshot");
+      }
+      return { outcome: "conflicted" };
+    }
+    if (applied.touched !== null) {
+      throw new CorruptError("clean rebase apply unexpectedly retained ownership snapshots");
+    }
+    return { outcome: "clean", value: options.onClean(applied) };
+  });
 }
 
 export function applyProjectedMerge(
@@ -1250,11 +1344,18 @@ export function restoreProjectedOperation(
   journal: OperationJournal,
   options: OperationRestoreOptions = {},
 ): void {
-  const retainedBytes = operationJournalRetainedBytes(journal.state, journal.touched);
+  const retainedBytes = operationJournalRetainedBytes(
+    journal.state,
+    journal.touched,
+    journal.steps,
+  );
   if (retainedBytes !== journal.retainedBytes) {
     throw new CorruptError("operation journal retained-byte count is stale");
   }
-  if (operationJournalIntegrityOid(journal.state, journal.touched) !== journal.integrityOid) {
+  if (
+    operationJournalIntegrityOid(journal.state, journal.touched, journal.steps) !==
+    journal.integrityOid
+  ) {
     throw new CorruptError("operation journal integrity identity is stale");
   }
   let previous: string | null = null;
