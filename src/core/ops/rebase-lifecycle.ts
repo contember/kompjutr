@@ -24,6 +24,7 @@ import {
   requireSafeIntegrationWorktree,
   reserveIntegrationPlan,
 } from "./integration-worktree.js";
+import type { RebaseResult } from "./kinds.js";
 import { applyProjectedRebaseTransition } from "./merge-apply.js";
 import { MERGE_BASE_SQL_STATEMENTS, selectMergeBases } from "./merge-base.js";
 import { MAX_MERGE_STATE_BYTES, MAX_MERGE_TOUCHED_PATHS } from "./merge-state.js";
@@ -75,16 +76,7 @@ export interface RebaseContinueOptions {
   env?: Record<string, string>;
 }
 
-export type RebaseLifecycleResult =
-  | { outcome: "up-to-date"; oid: string }
-  | {
-      outcome: "completed";
-      oid: string;
-      replayed: number;
-      skipped: number;
-      fastForward: boolean;
-    }
-  | { outcome: "conflicted"; replayed: number; skipped: number };
+export type RebaseLifecycleResult = RebaseResult;
 
 function checkedStatements(total: number, additional: number): number {
   if (

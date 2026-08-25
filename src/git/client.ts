@@ -38,6 +38,7 @@ import type {
   DiffSummaryEntry,
   MergeResult,
   PushResult,
+  RebaseResult,
   RemoteView,
   ReplayResult,
   StatusEntry,
@@ -76,6 +77,14 @@ import {
   show as showOp,
   type TreeEntryView,
 } from "../core/ops/reads.js";
+import {
+  type RebaseContinueOptions,
+  type RebaseStartOptions,
+  rebaseAbort as rebaseAbortOp,
+  rebaseContinue as rebaseContinueOp,
+  rebase as rebaseOp,
+  rebaseSkip as rebaseSkipOp,
+} from "../core/ops/rebase.js";
 import {
   type BranchDeleteOptions,
   type BranchOptions,
@@ -135,6 +144,8 @@ export type GitCherryPickOptions = CherryPickOptions & GitDirOptions;
 export type GitCherryPickContinueOptions = CherryPickContinueOptions & GitDirOptions;
 export type GitRevertOptions = RevertOptions & GitDirOptions;
 export type GitRevertContinueOptions = RevertContinueOptions & GitDirOptions;
+export type GitRebaseOptions = RebaseStartOptions & GitDirOptions;
+export type GitRebaseContinueOptions = RebaseContinueOptions & GitDirOptions;
 export type GitBranchOptions = BranchOptions & GitDirOptions;
 export type GitBranchDeleteOptions = BranchDeleteOptions & GitDirOptions;
 export type GitTagOptions = TagOptions & GitDirOptions;
@@ -202,6 +213,10 @@ export interface Git {
   revertContinue(input?: GitRevertContinueOptions): Promise<ReplayResult>;
   revertSkip(input?: GitDirOptions): Promise<void>;
   revertAbort(input?: GitDirOptions): Promise<void>;
+  rebase(input: GitRebaseOptions): Promise<RebaseResult>;
+  rebaseContinue(input?: GitRebaseContinueOptions): Promise<RebaseResult>;
+  rebaseSkip(input?: GitRebaseContinueOptions): Promise<RebaseResult>;
+  rebaseAbort(input?: GitDirOptions): Promise<void>;
   stashPush(input?: GitDirOptions): Promise<never>;
   stashList(input?: GitDirOptions): Promise<never>;
   stashPop(input?: GitDirOptions): Promise<never>;
@@ -257,7 +272,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       await cloneOp(context, input);
     },
     async fetch(input = {}) {
-      return fetchInto(context, at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoOperationState();
+      return fetchInto(context, repo, input);
     },
     async init(input = {}) {
       initRepository(context, input);
@@ -346,16 +363,22 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       branchOp(repo, input);
     },
     async branchDelete(input) {
-      branchDeleteOp(at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoOperationState();
+      branchDeleteOp(repo, input);
     },
     async branchList(input = {}) {
       return branchListOp(at(input.dir));
     },
     async tag(input) {
-      tagOp(at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoOperationState();
+      tagOp(repo, input);
     },
     async tagDelete(input) {
-      tagDeleteOp(at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoOperationState();
+      tagDeleteOp(repo, input);
     },
     async tagList(input = {}) {
       return tagListOp(at(input.dir));
@@ -397,10 +420,13 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       updateRefOp(repo, input);
     },
     async push(input = {}) {
-      return pushOp(context, at(input.dir), input);
+      const repo = at(input.dir);
+      repo.store.requireNoOperationState();
+      return pushOp(context, repo, input);
     },
     async pull(input = {}) {
       const repo = at(input.dir);
+      repo.store.requireNoOperationState();
       return pullOp(context, repo, context.worktree, input);
     },
     async merge(input) {
@@ -436,6 +462,18 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async revertAbort(input = {}) {
       revertAbortOp(at(input.dir), context.worktree);
+    },
+    async rebase(input) {
+      return rebaseOp(context, at(input.dir), context.worktree, input);
+    },
+    async rebaseContinue(input = {}) {
+      return rebaseContinueOp(context, at(input.dir), context.worktree, input);
+    },
+    async rebaseSkip(input = {}) {
+      return rebaseSkipOp(context, at(input.dir), context.worktree, input);
+    },
+    async rebaseAbort(input = {}) {
+      rebaseAbortOp(at(input.dir), context.worktree);
     },
     async stashPush() {
       throw new UnsupportedOperationError("stash push");

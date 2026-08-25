@@ -72,3 +72,14 @@ export type ReplayResult =
   | { outcome: "committed"; oid: string }
   | { outcome: "conflicted" }
   | { outcome: "empty"; reason: ReplayEmptyReason };
+
+export type RebaseResult =
+  | { outcome: "up-to-date"; oid: string }
+  | {
+      outcome: "completed";
+      oid: string;
+      replayed: number;
+      skipped: number;
+      fastForward: boolean;
+    }
+  | { outcome: "conflicted"; replayed: number; skipped: number };

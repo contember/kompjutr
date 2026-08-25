@@ -32,14 +32,17 @@ function makeWorkspace(): { workspace: Workspace; storage: SqliteTestStorage } {
 
 function makeNativeGit(): { git: Git; workspace: TestWorkspace } {
   const workspace = makeTestWorkspace();
-  const git = createGit()({
+  return { git: bindNativeGit(workspace), workspace };
+}
+
+function bindNativeGit(workspace: TestWorkspace): Git {
+  return createGit()({
     database: workspace.database,
     worktree: workspace.worktree,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
     defaultIdentity: IDENTITY,
   });
-  return { git, workspace };
 }
 
 async function commitFile(
@@ -53,6 +56,55 @@ async function commitFile(
   writeWorkFile(workspace, `${dir === "/" ? "" : dir}/${path}`, contents);
   await git.add({ dir, paths: [path] });
   return (await git.commit({ dir, message })).oid;
+}
+
+async function conflictingRebase(): Promise<{
+  git: Git;
+  workspace: TestWorkspace;
+  dir: string;
+  original: string;
+  upstream: string;
+}> {
+  const { git, workspace } = makeNativeGit();
+  const dir = "/rebase";
+  await git.init({ dir });
+  await commitFile(git, workspace, dir, "shared.txt", "base\n", "base");
+  await git.branch({ dir, name: "upstream" });
+  await git.branch({ dir, name: "spare" });
+  await git.tag({ dir, name: "before-rebase" });
+  await git.checkout({ dir, ref: "upstream" });
+  const upstream = await commitFile(git, workspace, dir, "shared.txt", "upstream\n", "upstream");
+  await git.checkout({ dir, ref: "main" });
+  const original = await commitFile(git, workspace, dir, "shared.txt", "current\n", "current");
+  await expect(git.rebase({ dir, upstream: "upstream" })).resolves.toEqual({
+    outcome: "conflicted",
+    replayed: 0,
+    skipped: 0,
+  });
+  return { git, workspace, dir, original, upstream };
+}
+
+async function modifyDeleteRebase(): Promise<{
+  git: Git;
+  workspace: TestWorkspace;
+  dir: string;
+  original: string;
+}> {
+  const { git, workspace } = makeNativeGit();
+  const dir = "/modify-delete";
+  await git.init({ dir });
+  await commitFile(git, workspace, dir, "deleted.txt", "base\n", "base");
+  await git.branch({ dir, name: "upstream" });
+  await git.checkout({ dir, ref: "upstream" });
+  await commitFile(git, workspace, dir, "deleted.txt", "upstream\n", "upstream modifies");
+  await git.checkout({ dir, ref: "main" });
+  workspace.worktree.removeFiles([`${dir}/deleted.txt`]);
+  await git.add({ dir, paths: ["deleted.txt"] });
+  const original = (await git.commit({ dir, message: "current deletes" })).oid;
+  await expect(git.rebase({ dir, upstream: "upstream" })).resolves.toMatchObject({
+    outcome: "conflicted",
+  });
+  return { git, workspace, dir, original };
 }
 
 const fixtures: GitFixture[] = [];
@@ -393,6 +445,116 @@ describe("createSqliteGitClient", () => {
     });
     await expect(git.revertSkip({ dir })).rejects.toMatchObject({ code: "ENOREVERT" });
     await expect(git.revertAbort({ dir })).rejects.toMatchObject({ code: "ENOREVERT" });
+  });
+
+  it("routes rebase continue, skip, and abort through a reopened native client", async () => {
+    const continued = await conflictingRebase();
+    const continuedGit = bindNativeGit(continued.workspace);
+    writeWorkFile(continued.workspace, `${continued.dir}/shared.txt`, "resolved\n");
+    await continuedGit.add({ dir: continued.dir, paths: ["shared.txt"] });
+    await expect(continuedGit.rebaseContinue({ dir: continued.dir })).resolves.toMatchObject({
+      outcome: "completed",
+      replayed: 1,
+      skipped: 0,
+      fastForward: false,
+    });
+    expect(
+      continued.workspace.workspace.fs.readFileSync(`${continued.dir}/shared.txt`, "utf8"),
+    ).toBe("resolved\n");
+
+    const skipped = await conflictingRebase();
+    const skippedGit = bindNativeGit(skipped.workspace);
+    await expect(skippedGit.rebaseSkip({ dir: skipped.dir })).resolves.toEqual({
+      outcome: "completed",
+      oid: skipped.upstream,
+      replayed: 0,
+      skipped: 1,
+      fastForward: false,
+    });
+    expect(skipped.workspace.workspace.fs.readFileSync(`${skipped.dir}/shared.txt`, "utf8")).toBe(
+      "upstream\n",
+    );
+
+    const aborted = await conflictingRebase();
+    const abortedGit = bindNativeGit(aborted.workspace);
+    await expect(abortedGit.rebaseAbort({ dir: aborted.dir })).resolves.toBeUndefined();
+    await expect(abortedGit.revParse({ dir: aborted.dir, ref: "HEAD" })).resolves.toBe(
+      aborted.original,
+    );
+    expect(aborted.workspace.workspace.fs.readFileSync(`${aborted.dir}/shared.txt`, "utf8")).toBe(
+      "current\n",
+    );
+    await expect(abortedGit.rebaseContinue({ dir: aborted.dir })).rejects.toMatchObject({
+      code: "ENOREBASE",
+    });
+    await expect(abortedGit.rebaseSkip({ dir: aborted.dir })).rejects.toMatchObject({
+      code: "ENOREBASE",
+    });
+    await expect(abortedGit.rebaseAbort({ dir: aborted.dir })).rejects.toMatchObject({
+      code: "ENOREBASE",
+    });
+  });
+
+  it("enforces rebase operation interlocks and lets hard reset clear recovery state", async () => {
+    const { git, workspace, dir, original } = await conflictingRebase();
+    const source = await git.revParse({ dir, ref: "upstream" });
+
+    await expect(git.status({ dir })).resolves.toBeDefined();
+    await expect(git.diff({ dir })).resolves.toBeDefined();
+    writeWorkFile(workspace, `${dir}/added.txt`, "resolution work\n");
+    await expect(git.add({ dir, paths: ["added.txt"] })).resolves.toBeUndefined();
+    await expect(git.rm({ dir, paths: ["added.txt"] })).resolves.toBeUndefined();
+
+    const blocked = [
+      () => git.fetch({ dir }),
+      () => git.clean({ dir }),
+      () => git.reset({ dir }),
+      () => git.commit({ dir, message: "blocked" }),
+      () => git.branch({ dir, name: "blocked" }),
+      () => git.branchDelete({ dir, name: "spare" }),
+      () => git.tag({ dir, name: "blocked" }),
+      () => git.tagDelete({ dir, name: "before-rebase" }),
+      () => git.checkout({ dir, ref: "upstream" }),
+      () => git.updateRef({ dir, ref: "refs/heads/blocked", value: source }),
+      () => git.push({ dir }),
+      () => git.pull({ dir }),
+      () => git.merge({ dir, theirs: "upstream" }),
+      () => git.cherryPick({ dir, source }),
+      () => git.revert({ dir, source }),
+      () => git.rebase({ dir, upstream: "upstream" }),
+    ];
+    for (const call of blocked) {
+      await expect(call()).rejects.toMatchObject({ code: "EOPACTIVE" });
+    }
+    await expect(git.mergeContinue({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+    await expect(git.cherryPickContinue({ dir })).rejects.toMatchObject({
+      code: "EOPMISMATCH",
+    });
+    await expect(git.revertContinue({ dir })).rejects.toMatchObject({ code: "EOPMISMATCH" });
+
+    await git.reset({ dir, hard: true });
+
+    await expect(git.revParse({ dir, ref: "HEAD" })).resolves.toBe(original);
+    const repository = workspace.database.find(dir);
+    if (repository === null) throw new Error("rebase repository is missing");
+    expect(workspace.database.open(repository).readOperationState()).toBeNull();
+  });
+
+  it("hard reset removes modify-delete conflict content before clearing rebase recovery", async () => {
+    const { git, workspace, dir, original } = await modifyDeleteRebase();
+    const repository = workspace.database.find(dir);
+    if (repository === null) throw new Error("modify-delete repository is missing");
+    const store = workspace.database.open(repository);
+    expect(store.hasConflicts()).toBe(true);
+    expect(workspace.worktree.stat(`${dir}/deleted.txt`)).not.toBeNull();
+
+    await git.reset({ dir, hard: true });
+
+    await expect(git.revParse({ dir, ref: "HEAD" })).resolves.toBe(original);
+    expect(store.indexEntries()).toEqual([]);
+    expect(store.hasConflicts()).toBe(false);
+    expect(workspace.worktree.stat(`${dir}/deleted.txt`)).toBeNull();
+    expect(store.readOperationState()).toBeNull();
   });
 
   it("fails explicitly for methods that remain unsupported", async () => {

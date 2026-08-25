@@ -328,18 +328,10 @@ function hardReset(repo: Repository, worktree: Worktree, ref?: string): void {
   const tree = commit === null ? null : repo.readCommit(commit).tree;
   const head = repo.head();
   if (commit !== null && head.ref !== null) repo.store.setRef(head.ref, commit);
-
-  if (repo.store.hasConflicts()) {
-    const stages = new Set<string>();
-    for (const entry of repo.store.indexEntries()) {
-      if (entry.stage !== 0) stages.add(entry.path);
-    }
-    repo.store.db.transactionSync(() => {
-      for (const path of stages) repo.store.indexRemove(path);
-    });
-  }
-
-  checkoutTree(repo, worktree, tree);
+  checkoutTree(repo, worktree, tree, {
+    discardUnmerged: true,
+    restoreStructure: true,
+  });
 }
 
 function targetCommit(repo: Repository, ref?: string): string | null {

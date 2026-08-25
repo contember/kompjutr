@@ -20,6 +20,7 @@ export type {
   DiffSummaryEntry,
   MergeResult,
   PushResult,
+  RebaseResult,
   RefUpdateStatus,
   RemoteView,
   ReplayEmptyReason,
@@ -69,6 +70,8 @@ export {
   type GitMergeContinueOptions,
   type GitMergeOptions,
   type GitPullOptions,
+  type GitRebaseContinueOptions,
+  type GitRebaseOptions,
   type GitRevertContinueOptions,
   type GitRevertOptions,
 } from "./git/client.js";

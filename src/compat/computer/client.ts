@@ -110,7 +110,9 @@ export function createSqliteGitClient(
         await cloneOp(ctx(), input);
       },
       async fetch(input = {}) {
-        return fetchInto(ctx(), at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoOperationState();
+        return fetchInto(ctx(), repo, input);
       },
       async init(input = {}) {
         initRepository(ctx(), input);
@@ -191,16 +193,22 @@ export function createSqliteGitClient(
         branchOp(repo, input);
       },
       async branchDelete(input) {
-        branchDeleteOp(at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoOperationState();
+        branchDeleteOp(repo, input);
       },
       async branchList(input = {}) {
         return branchListOp(at(input.dir));
       },
       async tag(input) {
-        tagOp(at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoOperationState();
+        tagOp(repo, input);
       },
       async tagDelete(input) {
-        tagDeleteOp(at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoOperationState();
+        tagDeleteOp(repo, input);
       },
       async tagList(input = {}) {
         return tagListOp(at(input.dir));
@@ -247,10 +255,13 @@ export function createSqliteGitClient(
       // Phase 5 and beyond. The object satisfies the interface so a caller
       // can bind it today and find out precisely what is missing.
       async push(input = {}) {
-        return pushOp(ctx(), at(input.dir), input);
+        const repo = at(input.dir);
+        repo.store.requireNoOperationState();
+        return pushOp(ctx(), repo, input);
       },
       async pull(input = {}) {
         const repo = at(input.dir);
+        repo.store.requireNoOperationState();
         await pullOp(ctx(), repo, ctx().worktree, input, { persistConflicts: false });
       },
       async merge(input) {

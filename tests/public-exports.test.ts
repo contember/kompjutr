@@ -3,6 +3,9 @@ import type {
   GitCherryPickContinueOptions,
   GitCherryPickOptions,
   Git as GitEntrypointGit,
+  GitRebaseContinueOptions,
+  GitRebaseOptions,
+  RebaseResult as GitRebaseResult,
   ReplayEmptyReason as GitReplayEmptyReason,
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
@@ -12,6 +15,9 @@ import type {
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
   GitCherryPickOptions as RootCherryPickOptions,
   Git as RootGit,
+  GitRebaseContinueOptions as RootRebaseContinueOptions,
+  GitRebaseOptions as RootRebaseOptions,
+  RebaseResult as RootRebaseResult,
   ReplayEmptyReason as RootReplayEmptyReason,
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
@@ -27,6 +33,10 @@ interface ReplayMethods {
   revertContinue(input?: RootRevertContinueOptions): Promise<RootReplayResult>;
   revertSkip(input?: { dir?: string }): Promise<void>;
   revertAbort(input?: { dir?: string }): Promise<void>;
+  rebase(input: RootRebaseOptions): Promise<RootRebaseResult>;
+  rebaseContinue(input?: RootRebaseContinueOptions): Promise<RootRebaseResult>;
+  rebaseSkip(input?: RootRebaseContinueOptions): Promise<RootRebaseResult>;
+  rebaseAbort(input?: { dir?: string }): Promise<void>;
 }
 
 function rootReplayMethods(git: RootGit): ReplayMethods {
@@ -39,6 +49,10 @@ function rootReplayMethods(git: RootGit): ReplayMethods {
     revertContinue: git.revertContinue,
     revertSkip: git.revertSkip,
     revertAbort: git.revertAbort,
+    rebase: git.rebase,
+    rebaseContinue: git.rebaseContinue,
+    rebaseSkip: git.rebaseSkip,
+    rebaseAbort: git.rebaseAbort,
   };
 }
 
@@ -52,6 +66,10 @@ function gitEntrypointReplayMethods(git: GitEntrypointGit): ReplayMethods {
     revertContinue: git.revertContinue,
     revertSkip: git.revertSkip,
     revertAbort: git.revertAbort,
+    rebase: git.rebase,
+    rebaseContinue: git.rebaseContinue,
+    rebaseSkip: git.rebaseSkip,
+    rebaseAbort: git.rebaseAbort,
   };
 }
 
@@ -69,6 +87,16 @@ describe("public replay exports", () => {
     const gitReason: GitReplayEmptyReason = rootReason;
     const rootResult: RootReplayResult = { outcome: "empty", reason: rootReason };
     const gitResult: GitReplayResult = rootResult;
+    const rootRebase: RootRebaseOptions = { upstream: "main", dir: "/repo" };
+    const gitRebase: GitRebaseOptions = rootRebase;
+    const rootRebaseContinue: RootRebaseContinueOptions = { dir: "/repo" };
+    const gitRebaseContinue: GitRebaseContinueOptions = rootRebaseContinue;
+    const rootRebaseResult: RootRebaseResult = {
+      outcome: "conflicted",
+      replayed: 1,
+      skipped: 0,
+    };
+    const gitRebaseResult: GitRebaseResult = rootRebaseResult;
 
     expect([
       gitCherryPick.source,
@@ -77,7 +105,20 @@ describe("public replay exports", () => {
       gitRevertContinue.dir,
       gitReason,
       gitResult.outcome,
-    ]).toEqual(["HEAD", "continue", "HEAD", "/repo", "result", "empty"]);
+      gitRebase.upstream,
+      gitRebaseContinue.dir,
+      gitRebaseResult.outcome,
+    ]).toEqual([
+      "HEAD",
+      "continue",
+      "HEAD",
+      "/repo",
+      "result",
+      "empty",
+      "main",
+      "/repo",
+      "conflicted",
+    ]);
     expect([rootReplayMethods, gitEntrypointReplayMethods]).toHaveLength(2);
   });
 });

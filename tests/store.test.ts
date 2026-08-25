@@ -74,6 +74,7 @@ describe("repository registry", () => {
       "git_object_chunks",
       "git_objects",
       "git_operation_state",
+      "git_operation_steps",
       "git_operation_touched",
       "git_pack_data",
       "git_pack_meta",
