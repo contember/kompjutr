@@ -346,3 +346,10 @@ number measured without a lease may enter ADR 0005 or reference docs.
   unstaging. WU5 changes the native default only and pins compatibility to
   `cached: true` plus `recursive: true`. Native directory removal requires the
   new explicit `recursive` option.
+- 2026-08-25 execution: WU2–WU5 shipped. The full suite passes with 95 files,
+  1,674 passed tests, and 5 skipped tests. Typecheck, Biome, and the production
+  build pass. The package smoke also passes for both isolated consumers.
+- 2026-08-25 blocker: WU1 is implemented and verified locally, but the checkout
+  has no Git remote and `matej21/kompjutr` does not exist. The package manifest
+  needs the canonical public GitHub `owner/repo` before the release unit can be
+  committed and this sprint can close.

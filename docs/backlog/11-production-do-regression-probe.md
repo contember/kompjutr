@@ -23,6 +23,8 @@ integration operations do not have a repeatable release regression lane.
   audit on a release candidate.
 - Record operation SQL counts, external wall time, platform analytics, response
   correctness, and state correctness after a fresh Durable Object instance.
+- Record `PRAGMA foreign_keys` before and after Git-store initialization, then
+  again after reopening the production Durable Object.
 - Restart the Durable Object at rebase journal boundaries and verify that refs,
   index, worktree, and unpublished replay commits recover together.
 - Separate application failures, storage resets, and isolate resets. Never infer

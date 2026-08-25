@@ -1,13 +1,14 @@
 # OID encoding measurement
 
-**Decision result:** keep persisted OIDs as lowercase hexadecimal `TEXT`. A
-20-byte `BLOB` reduced the representative database by 7.6% with a real pack and
-24.3% without pack payload, but it made decoded tree traversal 60.0–75.6% slower
-and point lookup 14.5–16.7% slower. The current JavaScript API uses hex strings,
-so the BLOB result pays conversion on every boundary.
+In this measurement, a 20-byte `BLOB` reduced the representative database by
+7.6% with a real pack and 24.3% without pack payload, but it made decoded tree
+traversal 60.0–75.6% slower and point lookup 14.5–16.7% slower. The current
+JavaScript API uses hex strings, so the BLOB result pays conversion on every
+boundary.
 
-This is the evidence for [ADR 0005](../decisions/0005-keep-oid-columns-as-text.md).
-The reproducible harness is [`bench/oid-encoding.ts`](../../bench/oid-encoding.ts).
+[ADR 0005](../decisions/0005-keep-oid-columns-as-text.md) records the separate
+storage decision that used this evidence. The reproducible harness is
+[`bench/oid-encoding.ts`](../../bench/oid-encoding.ts).
 
 ## Reproduce from a clean checkout
 
@@ -224,9 +225,9 @@ All values are nanoseconds in execution order.
 - Boundary encode: `32624680, 35023488, 33274236, 33827235, 40204138, 38452472, 45081440, 33865575, 39394025, 42218146, 44577752, 38818306`
 - Boundary decode: `12067724, 11776457, 11838041, 11893192, 11351855, 11874717, 12252674, 11338951, 12136520, 12119419, 11535413, 11515737`
 
-## Limitations and reopening signal
+## Limitations
 
-This is a decision prototype, not a production migration benchmark:
+This is an encoding prototype, not a production migration benchmark:
 
 - It uses local `node:sqlite`, not Durable Object SQL. Worker-side synchronous
   wall time is not observable, so this evidence does not claim a production
@@ -241,7 +242,3 @@ This is a decision prototype, not a production migration benchmark:
   claim about typical compressed Git object size.
 - Timing is one leased local run on one machine, in fixed TEXT-then-BLOB order.
   The raw samples preserve the observed variance; no cold-cache claim is made.
-
-Reopen ADR 0005 if the core API adopts binary OIDs, persisted size becomes a
-measured production limit, or a Durable Object statement/row probe shows that
-the smaller B-trees offset conversion and migration cost in complete operations.

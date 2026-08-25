@@ -89,9 +89,26 @@ A pathspec that matches nothing throws `PathspecNotFoundError`.
 
 | Git | kompjutr | |
 |---|---|---|
-| `<pathspec>...` | `paths` | ~ exact or directory prefix; a directory prefix is implicitly recursive |
-| `--cached` | — | ~ **this is the only behaviour**: `rm()` removes index entries and leaves the working-tree file in place |
-| `-f`, `--ignore-unmatch`, `-r` | — | ✘ (`-r` is implicit; an unmatched pathspec always throws) |
+| `<pathspec>...` | `paths` | ~ exact path or directory prefix; no globs or pathspec magic |
+| default | `cached: false` (default) | ✔ removes matching index entries and working-tree files |
+| `--cached` | `cached: true` | ✔ removes only matching index entries |
+| `-f` | `force: true` | ✔ bypasses content safety, not structural, matching, or resource checks |
+| `-r` | `recursive: true` | ✔ required when a pathspec selects directory descendants |
+| `--ignore-unmatch` | — | ✘ an unmatched pathspec throws `EPATHSPEC` |
+
+Without `force`, remove-and-unstage accepts a missing working-tree file, or a
+path whose index matches HEAD and whose working tree matches the index. Cached
+removal accepts a path when either the index matches HEAD or the working tree
+matches the index. Other staged or working-tree changes throw
+`EUNSAFEREMOVE` before mutation. Paths with unmerged index stages are exempt
+from content safety and may be removed as conflict resolution.
+
+A directory pathspec without `recursive` throws `EISDIR`. An indexed file that
+is a working-tree directory also throws `EISDIR`, even with `force`. Removal and
+index updates are atomic. Empty parent directories are pruned, but untracked
+contents are retained. Symlinks are removed without following their targets.
+The native client never removes index entries or working-tree paths beneath a
+registered nested repository root.
 
 ### `git reset` — `reset()`
 
@@ -154,7 +171,7 @@ Output is a `diff --git` patch with correct `new file` / `deleted file` /
 | committer override | `committer` | ✔ |
 | `GIT_AUTHOR_*` / `GIT_COMMITTER_*` | `env` | ~ read from the passed record only, never from `process.env` |
 | `-a` | `add({ all: true, trackedOnly: true })` first | ~ separate call |
-| `--allow-empty` | — | ~ implicit: an empty commit is always allowed |
+| `--allow-empty` | `allowEmpty: true` | ✔ native only |
 | continue a merge | `commit()` during a pending merge finalizes it | ✔ `--amend` is rejected there |
 | `-F <file>`, `-S`, `--fixup`, `--squash`, `--no-verify` | — | ✘ (no hooks and no signing exist) |
 
@@ -162,6 +179,12 @@ Identity resolution order: explicit option → amended commit (author only) →
 `env` → `user.name`/`user.email` → the binding's `defaultIdentity`. A source
 wins only when it supplies both name and email; none left throws
 `MissingIdentityError`.
+
+An ordinary commit refuses a tree identical to its first parent with
+`EEMPTYCOMMIT` unless the native caller sets `allowEmpty`. The same default
+refuses an empty root commit; a non-empty root commit succeeds. Amend and
+integration continuation keep their own semantics and may create a commit
+without an ordinary tree change.
 
 ### `git log` — `log()`
 
@@ -424,6 +447,9 @@ merge — with these differences:
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
+- `rm()` remains cached-only, recursive, and unconditional: it removes matching
+  index entries without changing working-tree bytes or applying native content
+  safety checks;
 - `pull` returns `void` rather than a `MergeResult`.
 
 ## Limits
