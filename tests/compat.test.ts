@@ -8,6 +8,29 @@ import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 describe("Computer client operation interlocks", () => {
+  it("keeps Computer rm cached-only, recursive, and unconditional", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({
+      storage,
+      git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
+      defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
+    });
+    await workspace.git.init({});
+    await workspace.fs.mkdir("/dir", { recursive: true });
+    await workspace.fs.writeFile("/dir/a.txt", "one\n");
+    await workspace.fs.writeFile("/dir/b.txt", "two\n");
+    await workspace.git.add({ paths: ["dir"] });
+    await workspace.fs.writeFile("/dir/a.txt", "staged\n");
+    await workspace.git.add({ paths: ["dir/a.txt"] });
+    await workspace.fs.writeFile("/dir/a.txt", "working tree\n");
+
+    await expect(workspace.git.rm({ paths: ["dir"] })).resolves.toBeUndefined();
+
+    await expect(workspace.git.lsFiles()).resolves.toEqual([]);
+    await expect(workspace.fs.readFile("/dir/a.txt", "utf8")).resolves.toBe("working tree\n");
+    await expect(workspace.fs.readFile("/dir/b.txt", "utf8")).resolves.toBe("two\n");
+  });
+
   it("blocks commit during replay and clears any operation on hard reset", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({

@@ -144,7 +144,12 @@ export function createSqliteGitClient(
         addOp(repo, ctx().worktree, { ...input, excludeRoots: excludeRoots(repo) });
       },
       async rm(input) {
-        rmOp(at(input.dir), ctx().worktree, input);
+        rmOp(at(input.dir), ctx().worktree, {
+          ...input,
+          cached: true,
+          force: true,
+          recursive: true,
+        });
       },
       async reset(input = {}) {
         const repo = at(input.dir);

@@ -174,6 +174,23 @@ describe("createSqliteGitClient", () => {
     expect(view.author).toMatchObject(IDENTITY);
   });
 
+  it("keeps native rm inside its repository and nested-root boundaries", async () => {
+    const { git, workspace } = makeNativeGit();
+    await git.init({ dir: "/" });
+    writeWorkFile(workspace, "/top.txt", "top\n");
+    writeWorkFile(workspace, "/nested/owned-by-parent.txt", "nested\n");
+    await git.add({ dir: "/", paths: ["."], all: true });
+    await git.commit({ dir: "/", message: "parent" });
+    await git.init({ dir: "/nested" });
+
+    await git.rm({ dir: "/", paths: ["."], recursive: true });
+
+    await expect(git.lsFiles({ dir: "/" })).resolves.toEqual(["nested/owned-by-parent.txt"]);
+    expect(workspace.worktree.stat("/top.txt")).toBeNull();
+    expect(workspace.worktree.stat("/nested/owned-by-parent.txt")).not.toBeNull();
+    await expect(git.repoRoot({ dir: "/nested" })).resolves.toBe("/nested");
+  });
+
   it("clones a remote and reports structured progress", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
@@ -503,7 +520,7 @@ describe("createSqliteGitClient", () => {
     await expect(git.diff({ dir })).resolves.toBeDefined();
     writeWorkFile(workspace, `${dir}/added.txt`, "resolution work\n");
     await expect(git.add({ dir, paths: ["added.txt"] })).resolves.toBeUndefined();
-    await expect(git.rm({ dir, paths: ["added.txt"] })).resolves.toBeUndefined();
+    await expect(git.rm({ dir, paths: ["added.txt"], force: true })).resolves.toBeUndefined();
 
     const blocked = [
       () => git.fetch({ dir }),

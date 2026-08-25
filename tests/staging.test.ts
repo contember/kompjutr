@@ -248,7 +248,22 @@ describe("add", () => {
 });
 
 describe("rm", () => {
-  it("unstages a path without touching the working tree", () => {
+  it("removes a clean tracked path from the index and working tree", async () => {
+    const fixture = newFixture();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+
+    rm(workspace.repo, workspace.worktree, { paths: ["a.txt"] });
+    fixture.git("rm", "-q", "a.txt");
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(lsFiles(workspace.repo)).toEqual(["b.txt"]);
+    expect(workspace.worktree.stat("/a.txt")).toBeNull();
+  });
+
+  it("keeps cached removals in the working tree", () => {
     const fixture = newFixture();
     const workspace = makeRepo("/");
     writeBoth(workspace, fixture, "a.txt", "a\n");
@@ -256,12 +271,262 @@ describe("rm", () => {
     add(workspace.repo, workspace.worktree, { paths: ["."] });
     fixture.git("add", ".");
 
-    rm(workspace.repo, workspace.worktree, { paths: ["a.txt"] });
+    rm(workspace.repo, workspace.worktree, { paths: ["a.txt"], cached: true });
     fixture.git("rm", "--cached", "-q", "a.txt");
 
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
-    expect(lsFiles(workspace.repo)).toEqual(["b.txt"]);
     expect(workspace.worktree.stat("/a.txt")).not.toBeNull();
+  });
+
+  it("matches Git's HEAD/index/worktree safety matrix", async () => {
+    const cases: Array<{
+      name: string;
+      stage?: string;
+      worktree?: string;
+      missing?: boolean;
+      cached?: boolean;
+      succeeds: boolean;
+    }> = [
+      { name: "staged", stage: "index\n", succeeds: false },
+      { name: "worktree", worktree: "worktree\n", succeeds: false },
+      { name: "both", stage: "index\n", worktree: "worktree\n", succeeds: false },
+      { name: "already missing", missing: true, succeeds: true },
+      { name: "staged then missing", stage: "index\n", missing: true, succeeds: true },
+      { name: "cached staged", stage: "index\n", cached: true, succeeds: true },
+      { name: "cached worktree", worktree: "worktree\n", cached: true, succeeds: true },
+      {
+        name: "cached both",
+        stage: "index\n",
+        worktree: "worktree\n",
+        cached: true,
+        succeeds: false,
+      },
+    ];
+
+    for (const scenario of cases) {
+      const fixture = newFixture();
+      fixture.write("file.txt", "head\n");
+      fixture.commit("base");
+      const workspace = await clonedFrom(fixture);
+      if (scenario.stage !== undefined) {
+        writeBoth(workspace, fixture, "file.txt", scenario.stage);
+        add(workspace.repo, workspace.worktree, { paths: ["file.txt"] });
+        fixture.git("add", "file.txt");
+      }
+      if (scenario.worktree !== undefined) {
+        writeBoth(workspace, fixture, "file.txt", scenario.worktree);
+      }
+      if (scenario.missing === true) removeBoth(workspace, fixture, "file.txt");
+
+      const gitArgs = scenario.cached ? ["--cached", "-q", "file.txt"] : ["-q", "file.txt"];
+      if (scenario.succeeds) {
+        rm(workspace.repo, workspace.worktree, {
+          paths: ["file.txt"],
+          cached: scenario.cached,
+        });
+        fixture.git("rm", ...gitArgs);
+        expect(indexLines(workspace.repo), scenario.name).toEqual(gitIndexLines(fixture));
+      } else {
+        expect(
+          () =>
+            rm(workspace.repo, workspace.worktree, {
+              paths: ["file.txt"],
+              cached: scenario.cached,
+            }),
+          scenario.name,
+        ).toThrow(expect.objectContaining({ code: "EUNSAFEREMOVE" }));
+        expect(() => fixture.git("rm", ...gitArgs), scenario.name).toThrow();
+        expect(lsFiles(workspace.repo), scenario.name).toEqual(["file.txt"]);
+        expect(workspace.worktree.stat("/file.txt"), scenario.name).not.toBeNull();
+      }
+    }
+  });
+
+  it("allows a newly staged missing path and requires force while it exists", () => {
+    const fixture = newFixture();
+    const workspace = makeRepo("/");
+    writeBoth(workspace, fixture, "new.txt", "new\n");
+    add(workspace.repo, workspace.worktree, { paths: ["new.txt"] });
+    fixture.git("add", "new.txt");
+
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["new.txt"] })).toThrow(
+      expect.objectContaining({ code: "EUNSAFEREMOVE" }),
+    );
+    expect(() => fixture.git("rm", "-q", "new.txt")).toThrow();
+
+    removeBoth(workspace, fixture, "new.txt");
+    rm(workspace.repo, workspace.worktree, { paths: ["new.txt"] });
+    fixture.git("rm", "-q", "new.txt");
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+
+    const forcedFixture = newFixture();
+    const forced = makeRepo("/");
+    writeBoth(forced, forcedFixture, "new.txt", "new\n");
+    add(forced.repo, forced.worktree, { paths: ["new.txt"] });
+    forcedFixture.git("add", "new.txt");
+
+    rm(forced.repo, forced.worktree, { paths: ["new.txt"], force: true });
+    forcedFixture.git("rm", "-fq", "new.txt");
+    expect(indexLines(forced.repo)).toEqual(gitIndexLines(forcedFixture));
+    expect(forced.worktree.stat("/new.txt")).toBeNull();
+  });
+
+  it("requires recursive for directories and prunes only empty parents", async () => {
+    const fixture = newFixture();
+    fixture.write("dir/tracked.txt", "tracked\n");
+    fixture.write("gone/nested/tracked.txt", "gone\n");
+    fixture.commit("base");
+    fixture.write("dir/untracked.txt", "untracked\n");
+    const workspace = await clonedFrom(fixture);
+    writeBoth(workspace, fixture, "dir/untracked.txt", "untracked\n");
+
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["dir", "unmatched"] })).toThrow(
+      expect.objectContaining({ code: "EISDIR" }),
+    );
+    expect(() => fixture.git("rm", "-q", "--", "dir", "unmatched")).toThrow(/not removing 'dir'/);
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["unmatched", "dir"] })).toThrow(
+      expect.objectContaining({ code: "EPATHSPEC" }),
+    );
+    expect(() => fixture.git("rm", "-q", "--", "unmatched", "dir")).toThrow(/pathspec 'unmatched'/);
+
+    rm(workspace.repo, workspace.worktree, { paths: ["dir", "gone/"], recursive: true });
+    fixture.git("rm", "-qr", "--", "dir", "gone/");
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(workspace.worktree.stat("/gone")).toBeNull();
+    expect(workspace.worktree.stat("/dir")?.type).toBe("dir");
+    expect(utf8Decoder.decode(workspace.worktree.readFile("/dir/untracked.txt"))).toBe(
+      "untracked\n",
+    );
+  });
+
+  it("refuses an indexed file replaced by a working-tree directory", async () => {
+    const cases = [
+      { name: "plain", options: {}, git: [] },
+      { name: "recursive", options: { recursive: true }, git: ["-r"] },
+      {
+        name: "recursive force",
+        options: { recursive: true, force: true },
+        git: ["-r", "-f"],
+      },
+    ];
+    for (const scenario of cases) {
+      const fixture = newFixture();
+      fixture.write("file", "tracked\n");
+      fixture.commit("base");
+      const workspace = await clonedFrom(fixture);
+      removeBoth(workspace, fixture, "file");
+      writeBoth(workspace, fixture, "file/untracked.txt", "untracked\n");
+
+      expect(
+        () =>
+          rm(workspace.repo, workspace.worktree, {
+            paths: ["file"],
+            ...scenario.options,
+          }),
+        scenario.name,
+      ).toThrow(expect.objectContaining({ code: "EISDIR" }));
+      expect(() => fixture.git("rm", "-q", ...scenario.git, "--", "file"), scenario.name).toThrow();
+      expect(lsFiles(workspace.repo), scenario.name).toEqual(["file"]);
+      expect(workspace.worktree.stat("/file/untracked.txt"), scenario.name).not.toBeNull();
+    }
+  });
+
+  it("preserves whitespace and terminal-slash pathspec semantics", async () => {
+    const fixture = newFixture();
+    fixture.write(" file ", "spaces\n");
+    fixture.write("file", "plain\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+
+    rm(workspace.repo, workspace.worktree, { paths: [" file "] });
+    fixture.git("rm", "-q", "--", " file ");
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(workspace.worktree.stat("/ file ")).toBeNull();
+
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, { paths: ["file/"], recursive: true }),
+    ).toThrow(expect.objectContaining({ code: "EPATHSPEC" }));
+    expect(() => fixture.git("rm", "-qr", "--", "file/")).toThrow(/pathspec 'file\/'/);
+    expect(lsFiles(workspace.repo)).toEqual(["file"]);
+    expect(workspace.worktree.stat("/file")).not.toBeNull();
+  });
+
+  it("hashes authoritative bytes instead of trusting blob-id mappings", async () => {
+    const fixture = newFixture();
+    fixture.write("file.txt", "head\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+    const entry = workspace.repo.store.indexGet("file.txt");
+    if (entry === null) throw new Error("fixture index entry is missing");
+    const forgedContentId = utf8.encode("forged-content-id");
+    workspace.worktree.writeFiles([
+      {
+        path: "/file.txt",
+        bytes: utf8.encode("different\n"),
+        contentId: forgedContentId,
+      },
+    ]);
+    workspace.repo.store.upsertBlobIds([{ contentId: forgedContentId, oid: entry.oid }]);
+
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["file.txt"] })).toThrow(
+      expect.objectContaining({ code: "EUNSAFEREMOVE" }),
+    );
+
+    expect(lsFiles(workspace.repo)).toEqual(["file.txt"]);
+    expect(utf8Decoder.decode(workspace.worktree.readFile("/file.txt"))).toBe("different\n");
+  });
+
+  it("removes symlinks without following their targets", async () => {
+    const fixture = newFixture();
+    fixture.write("target.txt", "target\n");
+    fixture.symlink("target.txt", "link");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+
+    rm(workspace.repo, workspace.worktree, { paths: ["link"] });
+    fixture.git("rm", "-q", "link");
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(workspace.worktree.stat("/link")).toBeNull();
+    expect(utf8Decoder.decode(workspace.worktree.readFile("/target.txt"))).toBe("target\n");
+  });
+
+  it("removes unmerged stages as a conflict resolution", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/conflict.txt", "conflict\n");
+    for (const stage of [1, 2, 3]) {
+      workspace.repo.store.indexPut({
+        path: "conflict.txt",
+        stage,
+        mode: 0o100644,
+        oid: String(stage).repeat(40),
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+
+    rm(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
+
+    expect(workspace.repo.store.indexEntries()).toEqual([]);
+    expect(workspace.worktree.stat("/conflict.txt")).toBeNull();
+  });
+
+  it("rolls filesystem and index removal back together", async () => {
+    const fixture = newFixture();
+    fixture.write("file.txt", "content\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+    workspace.storage.db.exec(`CREATE TRIGGER fail_rm_index
+      BEFORE DELETE ON git_index BEGIN SELECT RAISE(ABORT, 'injected index failure'); END`);
+
+    expect(() => rm(workspace.repo, workspace.worktree, { paths: ["file.txt"] })).toThrow(
+      /injected index failure/,
+    );
+
+    expect(lsFiles(workspace.repo)).toEqual(["file.txt"]);
+    expect(utf8Decoder.decode(workspace.worktree.readFile("/file.txt"))).toBe("content\n");
   });
 
   it("reports a pathspec that is not in the index", () => {
@@ -270,6 +535,44 @@ describe("rm", () => {
     expect(() => rm(workspace.repo, workspace.worktree, { paths: ["a.txt"] })).toThrow(
       /pathspec 'a.txt' did not match any files/,
     );
+  });
+
+  it("bounds pathspec count, UTF-8 length, and retained state before mutation", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/file.txt", "content\n");
+    add(workspace.repo, workspace.worktree, { paths: ["file.txt"] });
+    const assertUnchanged = (): void => {
+      expect(lsFiles(workspace.repo)).toEqual(["file.txt"]);
+      expect(utf8Decoder.decode(workspace.worktree.readFile("/file.txt"))).toBe("content\n");
+    };
+
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: Array.from({ length: 10_001 }, () => "file.txt"),
+        force: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    assertUnchanged();
+
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: ["x".repeat(2_201)],
+        force: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    assertUnchanged();
+
+    const suffix = "y".repeat(2_080);
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: Array.from(
+          { length: 4_000 },
+          (_, index) => `p${index.toString().padStart(4, "0")}-${suffix}`,
+        ),
+        force: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    assertUnchanged();
   });
 });
 
@@ -409,9 +712,10 @@ describe("cost", () => {
     expect(new Set(stagedChanged)).toEqual(new Set(changed));
 
     workspace.storage.resetCounters();
-    rm(workspace.repo, worktree, { paths: ["."] });
+    rm(workspace.repo, worktree, { paths: ["."], force: true, recursive: true });
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
     expect(workspace.repo.store.indexEntries()).toEqual([]);
+    expect(workspace.worktree.scan("/", { filesOnly: true, limit: 1 })).toEqual([]);
   });
 
   it("stages 100 explicit paths without retaining an oversized index", () => {
@@ -446,5 +750,32 @@ describe("cost", () => {
       true,
     );
     expect(workspace.repo.store.indexGet(paths[100] ?? "")?.oid).toBe(originalOid);
+  });
+
+  it("fails rm before mutation when retained state exceeds 16 MiB", () => {
+    const workspace = makeRepo("/");
+    const oid = workspace.repo.store.write("blob", utf8.encode("x\n"));
+    const suffix = "x".repeat(2_000);
+    const entries = Array.from({ length: 4_000 }, (_, index) => ({
+      path: `f${index.toString().padStart(4, "0")}-${suffix}`,
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: null,
+      mtime: null,
+      ino: null,
+    }));
+    workspace.repo.store.indexReplace(entries);
+
+    expect(() =>
+      rm(workspace.repo, workspace.worktree, {
+        paths: ["."],
+        cached: true,
+        force: true,
+        recursive: true,
+      }),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+
+    expect(workspace.repo.store.indexEntries()).toHaveLength(entries.length);
   });
 });

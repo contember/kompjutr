@@ -48,6 +48,8 @@ export interface WalkOptions {
   includeIgnored?: boolean;
   /** Skip directory rows when no directory-level pruning is needed. */
   filesOnly?: boolean;
+  /** Yield directory metadata after using it to prune the walk. */
+  includeDirectories?: boolean;
 }
 
 /** A repo-relative path and the metadata carried by its scan row. */
@@ -170,6 +172,10 @@ export function* walkWorktreeEntriesStream(
           options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true;
         if (outsidePathspec || ignored) {
           pruned.push(prunedRange(entry.path));
+          continue;
+        }
+        if (options.includeDirectories === true) {
+          yield { path: relative, stat: statFromScan(entry) };
         }
         continue;
       }

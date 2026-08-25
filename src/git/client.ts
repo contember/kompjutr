@@ -135,7 +135,7 @@ export type GitInitOptions = InitOptions;
 export type GitDiffOptions = DiffOptions & GitDirOptions;
 export type GitCleanOptions = Omit<CleanOptions, "excludeRoots" | "ignores"> & GitDirOptions;
 export type GitAddOptions = Omit<AddOptions, "excludeRoots"> & GitDirOptions;
-export type GitRmOptions = RmOptions & GitDirOptions;
+export type GitRmOptions = Omit<RmOptions, "excludeRoots"> & GitDirOptions;
 export type GitResetOptions = ResetOptions & GitDirOptions;
 export type GitCommitOptions = CommitOptions & GitDirOptions;
 export type GitMergeOptions = MergeOptions & GitDirOptions;
@@ -305,7 +305,8 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       addOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
     },
     async rm(input) {
-      rmOp(at(input.dir), context.worktree, input);
+      const repo = at(input.dir);
+      rmOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
     },
     async reset(input = {}) {
       const repo = at(input.dir);
