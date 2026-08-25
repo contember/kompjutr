@@ -331,3 +331,11 @@ updating `docs/reference/git-support.md`, running `npm run check`,
   up-to-date, ahead, behind, diverged, and shallow histories. Computer 0.2.1 was
   re-verified as `dir`-only and remains unchanged. Verification: five focused
   files, 116/116 tests; typecheck and docs lint pass.
+- 2026-08-25 — WU3 complete. A pure bounded classifier now pairs equal OIDs
+  within compatible regular-file or symlink mode classes. It follows Git's
+  destination-path order, prefers an available same-basename source without
+  reserving sources for later destinations, and uses UTF-8 path ordering. The
+  10,000-candidate and 16 MiB retained-state caps fall back all at once. Shared
+  option resolution implements explicit value over `status.renames` or
+  `diff.renames` over the enabled default, including Git's `copies` value.
+  Verification: rename classifier 10/10 and typecheck pass.
