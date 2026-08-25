@@ -8,3 +8,6 @@ gets pulled into a `../sprints/` plan) or it's **deleted**. It is never a place 
 decided work or status.
 
 <!-- index the ideas here, one line each -->
+
+- [`local-sqlite-git-runtime.md`](local-sqlite-git-runtime.md) — keep Git state
+  in SQLite while materialising a local working tree on disk.
