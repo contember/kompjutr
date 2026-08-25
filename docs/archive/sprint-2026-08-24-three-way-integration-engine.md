@@ -172,10 +172,11 @@ Consumed backlog item 02, deleted on ship, and implements
   This sprint accepts tree OIDs and returns a plan only.
 - Fast-forward and divergent pull shipped in the later
   [complete pull sprint](./sprint-2026-08-24-complete-pull.md).
-- Stash and rebase remain consumers in
-  [backlog item 06](../backlog/06-stash-operations.md) and
-  [backlog item 07](../backlog/07-rebase.md). Cherry-pick and revert shipped in
-  the later [replay lifecycle sprint](./sprint-2026-08-24-cherry-pick-and-revert.md).
+- Stash remains a consumer in
+  [backlog item 06](../backlog/06-stash-operations.md). Rebase shipped in the
+  later [bounded rebase sprint](./sprint-2026-08-25-bounded-rebase-sequencer.md),
+  and cherry-pick and revert shipped in the later
+  [replay lifecycle sprint](./sprint-2026-08-24-cherry-pick-and-revert.md).
 - Rename detection, attributes, custom merge drivers, and submodule checkout are
   follow-on behavior. The initial classifier reports renames as delete/add and
   gitlinks as identities or conflicts only.

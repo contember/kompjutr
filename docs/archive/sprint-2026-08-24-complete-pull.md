@@ -216,9 +216,11 @@ Consumed backlog items 01 and 03, which were deleted on ship.
 
 ## Out of scope (explicit)
 
-- Rebase-based pull and `pull.rebase` execution remain part of
-  [backlog item 07](../backlog/07-rebase.md). A non-false rebase request fails
-  explicitly; it never falls back to merge.
+- Rebase-based pull and `pull.rebase` execution remain out of scope. Native
+  rebase shipped later in the
+  [bounded rebase sprint](./sprint-2026-08-25-bounded-rebase-sequencer.md), but a
+  non-false pull-rebase request still fails explicitly; it never falls back to
+  merge.
 - Typed upstream setters, branch rename, remote rename, URL mutation, and custom
   tracking cleanup remain in
   [backlog item 18](../backlog/18-branch-and-remote-management.md). Pull consumes

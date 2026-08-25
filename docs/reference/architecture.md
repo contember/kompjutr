@@ -64,6 +64,8 @@ Repository state is relational rather than a fake `.git` tree:
 - `git_pack_*` stores received pack bytes and their index.
 - `git_tree_*` stores source-qualified parsed tree edges.
 - `git_commits` stores validated parsed commit projections.
+- `git_operation_state`, `git_operation_steps`, and `git_operation_touched`
+  store one authenticated bounded recovery journal per repository.
 
 No operation depends on a `.git` directory.
 
@@ -215,10 +217,10 @@ a new committer identity. Revert creates new author and committer identities and
 uses Git-compatible default messages. A caller can override the supported
 message and identity fields through the native `Git` methods.
 
-Conflicts and cherry-pick empty results persist schema-v10 operation metadata
+Conflicts and cherry-pick empty results persist one schema-v11 operation step
 plus bounded snapshots for only replay-owned paths. Continue validates the
-authoritative source, selected parent, original HEAD, labels, and saved path
-ownership before committing. Skip and abort restore the original index and
+authoritative source, selected parent, original HEAD, labels, step row, and saved
+path ownership before committing. Skip and abort restore the original index and
 worktree state for those paths and preserve unrelated content. Each recovery
 method requires its matching operation kind; ordinary commit cannot bypass a
 pending replay.
@@ -230,6 +232,46 @@ Cherry-pick suspends both empty outcomes for explicit cancellation, matching
 Git's active empty-pick state. Revert completes an empty operation immediately.
 All planning, apply, recovery, and journal-transition statements are composed
 into the fail-closed operation limit before writes become visible.
+
+## Rebase lifecycle
+
+Native rebase targets the checked-out symbolic local branch and accepts one
+upstream revision. A bounded graph plan requires one unique merge base and a
+linear first-parent range of at most 4,096 commits. It rejects selected merge
+commits, ambiguous bases, unrelated or incomplete shallow histories, oversized
+revision input, and capacity failures before creating recovery state.
+
+The complete oldest-first replay queue is stored in ordered
+`git_operation_steps` rows. Its integrity identity binds the original branch and
+OID, resolved upstream and base, current cursor and parent, every source and
+selected parent, per-step outcome and result OID, and any suspended touched-path
+snapshots. Journal reads validate row types, order, retained bytes, object
+authority, result-parent continuity, and topology before resumed work uses the
+state. Existing cherry-pick and revert journals use the same table as one-step
+sequences.
+
+Each source delta reuses the replay planner and three-way integration engine.
+Clean results create unpublished commits whose parent is the previous replay
+result. The source author, author date, and exact valid UTF-8 message are
+preserved; the committer is refreshed. Source-empty commits remain in the
+rewritten history, while patches that become empty against the new parent are
+skipped. Unsupported encoded or invalid-UTF-8 source messages fail before the
+initial baseline or journal becomes visible.
+
+The checked-out branch remains at its original OID while the index and worktree
+track the current replay parent. Every cursor transition is its own bounded
+transaction. Conflicts persist authenticated ownership for the current step;
+`rebaseContinue()`, `rebaseSkip()`, and `rebaseAbort()` work after a cold reopen.
+Abort restores the original tree, index, and worktree. After the last step, one
+expected-old-OID update publishes the branch and clears the journal atomically.
+
+`RebaseResult` distinguishes `up-to-date`, `conflicted`, and `completed` and
+reports replayed and skipped counts where applicable. The native client exposes
+the lifecycle methods; the Computer compatibility contract has no rebase
+surface. While an operation is active, status, diff, add, and rm remain
+available for conflict resolution. Ref-changing and network mutation methods
+reject before writes, and hard reset atomically restores HEAD while clearing the
+journal, including conflict-only paths absent from the target tree.
 
 ## Pull composition
 

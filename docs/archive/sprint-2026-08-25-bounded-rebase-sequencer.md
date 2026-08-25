@@ -1,3 +1,16 @@
+> **OUTCOME — shipped 2026-08-25.** The native client now supports bounded
+> non-interactive rebase for one checked-out linear branch, including no-op,
+> fast-forward, clean replay, conflict, continue, skip, abort, cold restart, and
+> one final compare-and-set branch publication. Schema v11 adds an authenticated
+> operation-step journal shared with one-commit replay; intermediate rewritten
+> commits remain unpublished until the sequence completes. Commit map: plan →
+> `291fb0f`; WU1 → `9385859`; WU2 → `d8693a8`; WU3 → `d9fd8d4`; WU4 →
+> `4c5b36b`; WU5 → `5bd16c3`. Verification: `npm run typecheck`; `npm run
+> check`; leased full suite — 94 files and 1,650 tests passed, 5 skipped; leased
+> production build; docs lint. Backlog closed: 07 and 24. Deferred: interactive
+> rebase, merge replay, `--onto`/`--root`, pull-rebase, reflogs, stash, and the
+> other explicit non-goals below.
+
 # Sprint — Bounded rebase sequencer (2026-08-25)
 
 **Goal.** Deliver a bounded, restart-safe native rebase for one checked-out
@@ -11,9 +24,8 @@ the checked-out branch moves exactly once after the sequence completes, and any
 suspended or rejected outcome remains recoverable without relying on a `.git`
 directory.
 
-Consumes backlog items [24](../backlog/24-operation-step-journal.md) and
-[07](../backlog/07-rebase.md). Backlog 24 is the first implementation unit, not a
-parallel follow-up.
+Consumed backlog items 24 and 07. Backlog 24 was the first implementation unit,
+not a parallel follow-up.
 
 ## Refs re-verified at HEAD (2026-08-25, `7b5bc3c`)
 
@@ -306,3 +318,11 @@ gates run serially through `cpu-lease`.
   revision resolver without changing replay validation precedence. Planner
   limits are lower-only, so exact step, retained-byte, and graph boundaries are
   testable without weakening the production ceilings.
+- 2026-08-25, WU4 review: exact 4,096-step preflight required paging both
+  authoritative metadata and object reads. Hard skip, abort, and reset discard
+  conflict stages before materializing the authenticated target, including
+  modify/delete paths absent from that tree.
+- 2026-08-25, WU5 review: the native API owns rebase recovery while the Computer
+  facade keeps its installed method surface. Public ref and network mutations
+  reject active operations before writes; status, diff, add, rm, and atomic hard
+  reset remain available for recovery.

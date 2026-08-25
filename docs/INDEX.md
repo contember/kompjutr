@@ -16,21 +16,20 @@ decisions → reference → archive.
 ## Active sprints
 
 <!-- list the sprint files currently in sprints/ ; empty between sprints -->
-- [`sprints/sprint-2026-08-25-bounded-rebase-sequencer.md`](sprints/sprint-2026-08-25-bounded-rebase-sequencer.md)
-  — authenticated bounded rebase for one checked-out linear branch.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The bounded rebase sequencer is active; its first unit adds an authenticated
-  operation-step journal before replay execution.
 - CI and release gates remain the next release-readiness priority.
+- Stash can now build on the authenticated operation-step journal and shared
+  integration engine.
 
 ## Key reference
 
 - [`reference/architecture.md`](reference/architecture.md) — current runtime architecture and limits.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
+- [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.
 - [`reference/shell.md`](reference/shell.md) — current shell surface and deliberate limits.
 
 ## Decisions
@@ -41,6 +40,8 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-25-bounded-rebase-sequencer.md`](archive/sprint-2026-08-25-bounded-rebase-sequencer.md)
+  — bounded linear rebase with authenticated restart-safe sequencing.
 - [`archive/sprint-2026-08-24-cherry-pick-and-revert.md`](archive/sprint-2026-08-24-cherry-pick-and-revert.md)
   — bounded one-commit replay and inversion with restart-safe recovery.
 - [`archive/sprint-2026-08-24-complete-pull.md`](archive/sprint-2026-08-24-complete-pull.md)

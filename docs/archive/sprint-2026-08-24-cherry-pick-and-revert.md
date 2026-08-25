@@ -25,8 +25,9 @@ operation commits atomically, leaves one explicit recoverable state, or changes
 nothing.
 
 Consumed backlog item 14, which was deleted on ship, and established the
-one-commit replay seam needed by the later [rebase](../backlog/07-rebase.md)
-sprint without implementing a sequencer here.
+one-commit replay seam used by the later
+[bounded rebase sprint](./sprint-2026-08-25-bounded-rebase-sequencer.md) without
+implementing a sequencer here.
 
 ## Refs re-verified at HEAD (2026-08-24, `ba85a8b`)
 
@@ -259,9 +260,10 @@ sprint without implementing a sequencer here.
 ## Out of scope (explicit)
 
 - Multiple commits, revision ranges, todo lists, reordering, squashing, and any
-  multi-step sequencer remain in [backlog item 07](../backlog/07-rebase.md).
-  This sprint deliberately establishes only one replay item and one active
-  source commit.
+  multi-step sequencer were deferred to the later
+  [bounded rebase sprint](./sprint-2026-08-25-bounded-rebase-sequencer.md). This
+  sprint deliberately establishes only one replay item and one active source
+  commit.
 - `--no-commit`, batch cherry-pick/revert, `--quit`, editable instruction lists,
   `-x` provenance trailers, signing, hooks, rerere, strategy selection, custom
   merge drivers, and commit-message editors are not introduced.

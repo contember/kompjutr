@@ -20,5 +20,3 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 ## Active
 
 <!-- one line per active sprint; empty between sprints -->
-- [Bounded rebase sequencer](sprint-2026-08-25-bounded-rebase-sequencer.md) —
-  authenticated multi-step replay with one final branch publication.

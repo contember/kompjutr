@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Bounded rebase sequencer](sprint-2026-08-25-bounded-rebase-sequencer.md)
+  — authenticated bounded linear replay with restart-safe recovery and one
+  final branch publication.
 - [Cherry-pick and revert lifecycle](sprint-2026-08-24-cherry-pick-and-revert.md)
   — bounded one-commit replay and inversion with restart-safe recovery.
 - [Complete pull](sprint-2026-08-24-complete-pull.md) — bounded configured-

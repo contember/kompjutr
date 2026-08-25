@@ -49,12 +49,13 @@ fs.writeFileSync("/src/index.ts", "export const value = 1;\n");
 The native client supports repository initialization, clone, fetch, pull,
 single-branch Smart HTTP push, status, staging, commit, log, diff, checkout,
 branches, tags, refs, config, remotes, local two-head merge, one-commit
-cherry-pick and revert, and the plumbing operations exposed by `Git`. Pull
-fetches the configured upstream and delegates fast-forward or divergent
-integration to the native merge lifecycle. Merge supports fast-forward, forced
-merge commits, clean and conflicted integration, `commit: false`, restart-safe
-continue, and path-scoped abort for the checked-out branch. Unsupported commands
-fail with `EUNSUPPORTED` instead of falling back to another implementation.
+cherry-pick and revert, bounded linear rebase, and the plumbing operations
+exposed by `Git`. Pull fetches the configured upstream and delegates fast-forward
+or divergent integration to the native merge lifecycle. Merge supports
+fast-forward, forced merge commits, clean and conflicted integration, `commit:
+false`, restart-safe continue, and path-scoped abort for the checked-out branch.
+Unsupported commands fail with `EUNSUPPORTED` instead of falling back to another
+implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });
@@ -72,6 +73,13 @@ tree unchanged. Cherry-pick keeps either empty result active until
 `cherryPickSkip()` or `cherryPickAbort()`; revert treats an empty result as a
 completed no-op. Recovery methods are operation-specific and reject the wrong
 or missing operation state.
+
+`rebase({ upstream })` replays one checked-out linear branch and returns a
+`RebaseResult`: `up-to-date`, `conflicted`, or `completed` with the final OID and
+replayed/skipped counts. The branch remains at its original OID while replay is
+in progress. Continue, skip, and abort survive a workspace restart, and the
+completed branch publishes once after every step succeeds. Interactive rebase,
+merge replay, `--onto`, `--root`, and pull-rebase are not part of this surface.
 
 Push creates, fast-forwards, force-updates, or deletes one `refs/heads/*` ref.
 It streams a replayable full-object pack and updates the local remote-tracking
@@ -118,7 +126,8 @@ const workspace = new Workspace({
 Native pull returns the same structured outcomes as merge and preserves
 restart-safe conflict or no-commit state. The compatibility interface returns
 `void` as declared by Computer; if integration conflicts, it rolls back the local
-index and worktree while retaining the successful fetch and tracking ref.
+index and worktree while retaining the successful fetch and tracking ref. The
+installed Computer Git contract has no rebase methods; rebase is native-only.
 
 ## Resource model
 

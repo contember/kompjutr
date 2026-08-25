@@ -17,7 +17,6 @@ unwieldy; numbers stay folder-local.
 - [04 — Add incremental repack and garbage collection](04-repack-and-garbage-collection.md)
 - [05 — Establish CI and release gates](05-ci-and-release-gates.md)
 - [06 — Implement stash operations](06-stash-operations.md)
-- [07 — Implement rebase](07-rebase.md)
 - [08 — Extend push refspec support](08-extend-push-refspecs.md)
 - [09 — Add outbound delta compression](09-outbound-delta-compression.md)
 - [10 — Close worktree wall-time gaps](10-worktree-wall-time.md)
@@ -33,4 +32,3 @@ unwieldy; numbers stay folder-local.
 - [21 — Narrow the parsed-tree table keys and remove the duplicated entry name](21-narrow-parsed-tree-keys.md)
 - [22 — Decide the OID column encoding before data volume locks it in](22-oid-column-encoding.md)
 - [23 — Add write-time CHECK constraints to the derived commit and tree tables](23-write-time-checks-on-derived-tables.md)
-- [24 — Add an operation step table before rebase and stash extend the journal](24-operation-step-journal.md)

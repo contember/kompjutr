@@ -1,7 +1,7 @@
 ---
 id: 06
 title: Implement stash operations
-blocked-by: [./24-operation-step-journal.md]
+blocked-by: []
 ---
 
 # 06 — Implement stash operations
@@ -13,7 +13,8 @@ native, recoverable snapshots of index and worktree changes.
 
 All stash methods are unsupported-operation stubs. Callers cannot temporarily
 clear changes before checkout or pull, and a safe pop needs the same conflict
-machinery as a three-way merge.
+machinery as a three-way merge. The authenticated operation-step journal is
+available for bounded sequencing and recovery.
 
 ## Approach / acceptance
 
