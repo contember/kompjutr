@@ -123,6 +123,7 @@ import {
   clean as cleanOp,
   eagerStatus,
   type StatusBranch,
+  type StatusDetail,
   type StatusOptions,
   type StatusReportOptions,
   statusBranch,
@@ -304,11 +305,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
         context.worktree,
         { ...statusOptions, excludeRoots: excludeRoots(repo) },
         context,
-      ).map((row) => ({
-        path: row.path,
-        index: row.index,
-        worktree: row.worktree,
-      }));
+      ).map(publicStatusEntry);
     },
     async statusReport(input = {}) {
       const { branch, dir, ...statusOptions } = input;
@@ -318,11 +315,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
         context.worktree,
         { ...statusOptions, excludeRoots: excludeRoots(repo) },
         context,
-      ).map((row) => ({
-        path: row.path,
-        index: row.index,
-        worktree: row.worktree,
-      }));
+      ).map(publicStatusEntry);
       return branch === true ? { entries, branch: statusBranch(repo) } : { entries };
     },
     async diff(input = {}) {
@@ -525,4 +518,17 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       throw new UnsupportedOperationError("the argv entry point");
     },
   };
+}
+
+function publicStatusEntry(row: StatusDetail): StatusEntry {
+  if (row.renamed === true) {
+    return {
+      path: row.path,
+      index: row.index,
+      worktree: row.worktree,
+      originalPath: row.originalPath,
+      similarity: row.similarity,
+    };
+  }
+  return { path: row.path, index: row.index, worktree: row.worktree };
 }

@@ -267,6 +267,37 @@ describe("sparse eager status", () => {
     ]).toContainEqual({ path: "conflict.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY });
   });
 
+  it("matches full status for an exact staged rename", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/old.txt", "same\n");
+    commitFiles(workspace, ["old.txt"]);
+    sealIndexTracker(workspace);
+
+    workspace.worktree.unlink("/old.txt");
+    workspace.repo.store.indexRemove("old.txt");
+    writeWorkFile(workspace, "/new.txt", "same\n");
+    stageWorktreePaths(workspace, ["new.txt"]);
+
+    const expected = status(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
+    expect(
+      eagerStatus(
+        workspace.repo,
+        new NoScanWorktree(workspace.worktree),
+        { untrackedFiles: "all" },
+        sparseTrackerContext(workspace),
+      ),
+    ).toEqual(expected);
+    expect(expected).toEqual([
+      expect.objectContaining({
+        path: "new.txt",
+        originalPath: "old.txt",
+        similarity: 100,
+        index: "R",
+        worktree: " ",
+      }),
+    ]);
+  });
+
   it("falls back for normal untracked collapsing and stays sparse for all", () => {
     const normal = makeRepo("/");
     sealIndexTracker(normal);

@@ -19,6 +19,7 @@ export type OrdinaryStatusIndexCode = " " | "A" | "M" | "D";
 export type OrdinaryStatusWorktreeCode = " " | "A" | "M" | "D" | "?";
 export type UnmergedStatusCode = "A" | "D" | "U";
 export type IgnoredStatusCode = "!";
+export type RenameStatusCode = "R";
 
 export interface OrdinaryStatusEntry {
   path: string;
@@ -28,8 +29,12 @@ export interface OrdinaryStatusEntry {
 
 export interface StatusEntry {
   path: string;
-  index: OrdinaryStatusIndexCode | UnmergedStatusCode | IgnoredStatusCode;
+  index: OrdinaryStatusIndexCode | UnmergedStatusCode | IgnoredStatusCode | RenameStatusCode;
   worktree: OrdinaryStatusWorktreeCode | UnmergedStatusCode | IgnoredStatusCode;
+  /** Source path for a staged exact rename. */
+  originalPath?: string;
+  /** Exact renames currently report only 100. */
+  similarity?: 100;
 }
 
 /**
@@ -42,9 +47,11 @@ export type StatusRow = [filepath: string, head: number, workdir: number, stage:
 
 export interface DiffSummaryEntry {
   path: string;
-  status: "A" | "M" | "D";
+  status: "A" | "M" | "D" | "R";
   insertions: number;
   deletions: number;
+  originalPath?: string;
+  similarity?: 100;
 }
 
 export interface CommitResult {

@@ -66,15 +66,19 @@ repository behind.
 | `--ignored` | `GitStatusOptions.includeIgnored` | ✔ ignored entries use `!!` in v1/short and `!` in v2 |
 | `--untracked-files=normal\|all` | `GitStatusOptions.untrackedFiles` | ✔ |
 | `-b`, `--branch` header | `statusReport({ branch: true })` | ✔ `oid`, `head`, configured upstream, and bounded ahead/behind counts |
-| rename detection (`R`) | — | ✘ a rename is a delete plus an add |
+| rename detection (`R`) | `GitStatusOptions.renames` | ~ exact OID moves only; defaults on |
 | unmerged codes (`U`, `AA`, `DD`) | `StatusDetail.unmerged` | ✔ all seven legal index-stage shapes and porcelain v2 `u` rows |
 
 `status()` and `Git.status()` remain array-returning APIs. `statusReport()` and
 `Git.statusReport()` add an object result only when callers need branch
-metadata. `StatusEntry` uses `" " A M D ? ! U`; `StatusDetail` adds the modes
-and OIDs required by ordinary and unmerged porcelain v2 rows. The Computer
-compatibility facade keeps its pinned `dir`-only input and rejects unmerged rows
-that its installed interface cannot express.
+metadata. `StatusEntry` uses `" " A M D ? ! U R`. An exact rename row uses the
+destination as `path`, carries the source as `originalPath`, and reports
+`similarity: 100`. `StatusDetail` adds the modes and OIDs required by ordinary,
+unmerged, and rename porcelain v2 rows. Exact detection pairs equal authoritative
+blob OIDs within compatible regular-file or symlink mode classes. It honours an
+explicit `renames` value before `status.renames`, then defaults on. The Computer
+compatibility facade keeps its pinned `dir`-only input, disables rename detection,
+and rejects unmerged rows that its installed interface cannot express.
 
 ### `git add` — `add()`
 
@@ -155,12 +159,17 @@ registered nested repository root.
 | `-U<n>` | `context` | ✔ |
 | `--abbrev=<n>` | `abbrev` (default 7) | ✔ |
 | `-- <paths>` | `paths` | ~ exact or directory prefix, no globs |
-| `--numstat` | `diffSummary()` | ~ returns `{ path, status, insertions, deletions }` objects, not text |
-| `-M`, `-C` (rename/copy detection) | — | ✘ status is only `A`, `M`, `D` |
+| `--numstat` | `diffSummary()` | ~ returns structured objects; exact renames have `R`, source path, similarity 100, and zero line delta |
+| `-M100%` (exact rename detection) | `renames` | ~ equal authoritative blob OIDs and compatible modes only; defaults on |
+| similarity-scored `-M<n>`, `-C` | — | ✘ move-plus-edit remains a complete add/delete pair |
 | `--stat`, `--color`, `--word-diff`, `--binary` | — | ✘ binary files emit `Binary files a/… and b/… differ` |
 
 Output is a `diff --git` patch with correct `new file` / `deleted file` /
-`old mode` / `new mode` / `index` headers.
+`old mode` / `new mode` / `index` headers. Exact moves use `similarity index
+100%`, `rename from`, and `rename to` headers. Explicit `renames` overrides
+`diff.renames`; the default is enabled. Detection retains at most 10,000
+candidates and 16 MiB. Exceeding either cap disables all pairing for that
+operation and returns the complete add/delete output.
 
 ## Commits and history
 

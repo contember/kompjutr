@@ -137,13 +137,22 @@ describe("public status exports", () => {
       dir: "/repo",
       paths: ["src"],
       includeIgnored: true,
+      renames: true,
       untrackedFiles: "all",
     };
     const gitOptions: GitEntrypointStatusOptions = rootOptions;
     const rootReportOptions: RootStatusReportOptions = { ...rootOptions, branch: true };
     const gitReportOptions: GitEntrypointStatusReportOptions = rootReportOptions;
     const rootReport: RootStatusReport = {
-      entries: [{ path: "ignored.log", index: "!", worktree: "!" }],
+      entries: [
+        {
+          path: "new.txt",
+          originalPath: "old.txt",
+          similarity: 100,
+          index: "R",
+          worktree: " ",
+        },
+      ],
       branch: { oid: null, head: "main" },
     };
     const gitReport: GitEntrypointStatusReport = rootReport;
@@ -152,9 +161,10 @@ describe("public status exports", () => {
 
     expect([
       gitOptions.dir,
+      gitOptions.renames,
       gitReportOptions.branch,
-      gitReport.entries[0]?.worktree,
+      gitReport.entries[0]?.originalPath,
       gitCore.branch?.head,
-    ]).toEqual(["/repo", true, "!", "main"]);
+    ]).toEqual(["/repo", true, true, "old.txt", "main"]);
   });
 });

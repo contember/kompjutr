@@ -9,10 +9,12 @@ import type { TargetEntry } from "./checkout.js";
 import type {
   IgnoredStatusCode,
   OrdinaryStatusEntry,
+  RenameStatusCode,
   StatusEntry,
   UnmergedStatusCode,
 } from "./kinds.js";
 import { validateMergePath } from "./merge-state.js";
+import type { ExactRename } from "./rename-detection.js";
 import {
   type HashedPath,
   hashExactWorktreePaths,
@@ -49,6 +51,7 @@ export interface StatusHashObserver {
  */
 export interface OrdinaryStatusDetail extends OrdinaryStatusEntry {
   readonly ignored?: false;
+  readonly renamed?: false;
   readonly unmerged?: false;
   /** Mode in HEAD, in the index and on disk; "000000" where absent. */
   headMode: string;
@@ -61,6 +64,7 @@ export interface OrdinaryStatusDetail extends OrdinaryStatusEntry {
 
 export interface UnmergedStatusDetail extends StatusEntry {
   readonly ignored?: false;
+  readonly renamed?: false;
   readonly unmerged: true;
   index: UnmergedStatusCode;
   worktree: UnmergedStatusCode;
@@ -75,12 +79,32 @@ export interface UnmergedStatusDetail extends StatusEntry {
 
 export interface IgnoredStatusDetail extends StatusEntry {
   readonly ignored: true;
+  readonly renamed?: false;
   readonly unmerged?: false;
   index: IgnoredStatusCode;
   worktree: IgnoredStatusCode;
 }
 
-export type StatusDetail = OrdinaryStatusDetail | UnmergedStatusDetail | IgnoredStatusDetail;
+export interface RenameStatusDetail extends StatusEntry {
+  readonly ignored?: false;
+  readonly renamed: true;
+  readonly unmerged?: false;
+  index: RenameStatusCode;
+  worktree: OrdinaryStatusEntry["worktree"];
+  originalPath: string;
+  similarity: 100;
+  headMode: string;
+  indexMode: string;
+  worktreeMode: string;
+  headOid: string;
+  indexOid: string;
+}
+
+export type StatusDetail =
+  | OrdinaryStatusDetail
+  | UnmergedStatusDetail
+  | IgnoredStatusDetail
+  | RenameStatusDetail;
 
 export type StatusIndexGroup =
   | { kind: "tracked"; path: string; entry: IndexEntry }
@@ -115,6 +139,8 @@ export interface StatusOptions {
    * one `dir/` entry; "all" lists every file under it.
    */
   untrackedFiles?: "normal" | "all";
+  /** Detect staged exact renames. Explicit values override `status.renames`. */
+  renames?: boolean;
 }
 
 /** Group a validated `(path, stage)` index stream without retaining the index. */
@@ -360,6 +386,33 @@ export function untrackedRow(path: string): StatusDetail {
 
 export function ignoredRow(path: string): IgnoredStatusDetail {
   return { ignored: true, path, index: "!", worktree: "!" };
+}
+
+export function renameRow(
+  rename: ExactRename,
+  destination: OrdinaryStatusDetail,
+): RenameStatusDetail {
+  if (
+    destination.index !== "A" ||
+    destination.path !== rename.destination.path ||
+    destination.indexMode !== rename.destination.mode ||
+    destination.indexOid !== rename.destination.oid
+  ) {
+    throw new CorruptError("status rename destination does not match its staged addition");
+  }
+  return {
+    renamed: true,
+    path: destination.path,
+    originalPath: rename.source.path,
+    similarity: 100,
+    index: "R",
+    worktree: destination.worktree,
+    headMode: rename.source.mode,
+    indexMode: destination.indexMode,
+    worktreeMode: destination.worktreeMode,
+    headOid: rename.source.oid,
+    indexOid: destination.indexOid,
+  };
 }
 
 export function unmergedRow(

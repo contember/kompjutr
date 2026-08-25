@@ -142,6 +142,59 @@ describe("createSqliteGitClient", () => {
     });
   });
 
+  it("reports exact renames natively without widening the Computer facade", async () => {
+    const { workspace, storage } = makeWorkspace();
+    const compat = workspace.git;
+    await compat.init({});
+    await workspace.fs.writeFile("/old.txt", "same\n");
+    await compat.add({ paths: ["old.txt"] });
+    await compat.commit({ message: "base" });
+
+    await workspace.fs.rm("/old.txt");
+    await workspace.fs.writeFile("/new.txt", "same\n");
+    await compat.add({ paths: ["."], all: true });
+
+    const native = createGit()({
+      database: new SqliteGitDatabase(new TestDatabase(storage)),
+      worktree: new ComputerWorktree(workspace.provider()),
+      now: () => 1_600_000_000_000,
+      timezoneOffset: () => 0,
+      defaultIdentity: IDENTITY,
+    });
+    await expect(native.status()).resolves.toEqual([
+      {
+        path: "new.txt",
+        originalPath: "old.txt",
+        similarity: 100,
+        index: "R",
+        worktree: " ",
+      },
+    ]);
+    await expect(native.diffSummary()).resolves.toEqual([
+      {
+        path: "new.txt",
+        originalPath: "old.txt",
+        similarity: 100,
+        status: "R",
+        insertions: 0,
+        deletions: 0,
+      },
+    ]);
+    await expect(native.diff()).resolves.toContain(
+      "similarity index 100%\nrename from old.txt\nrename to new.txt\n",
+    );
+
+    await expect(compat.status()).resolves.toEqual([
+      { path: "new.txt", index: "A", worktree: " " },
+      { path: "old.txt", index: "D", worktree: " " },
+    ]);
+    await expect(compat.diffSummary()).resolves.toEqual([
+      { path: "new.txt", status: "A", insertions: 1, deletions: 0 },
+      { path: "old.txt", status: "D", insertions: 0, deletions: 1 },
+    ]);
+    await expect(compat.diff()).resolves.not.toContain("similarity index");
+  });
+
   it("drives a full local cycle through workspace.git", async () => {
     const { workspace, storage } = makeWorkspace();
     const git = workspace.git;

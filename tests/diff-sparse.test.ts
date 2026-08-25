@@ -111,6 +111,38 @@ describe("sparse diff", () => {
     );
   });
 
+  it("matches the full path for an exact staged rename", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/old.txt", "same\n");
+    commitPaths(workspace, ["old.txt"], "initial");
+    sealIndexTracker(workspace);
+
+    workspace.worktree.unlink("/old.txt");
+    workspace.repo.store.indexRemove("old.txt");
+    writeWorkFile(workspace, "/new.txt", "same\n");
+    stageWorktreePaths(workspace, ["new.txt"]);
+
+    const expectedPatch = diff(workspace.repo, workspace.worktree);
+    const expectedSummary = diffSummary(workspace.repo, workspace.worktree);
+    const worktree = new NoScanWorktree(workspace.worktree);
+    expect(diff(workspace.repo, worktree, {}, requireSparseWorkspace(workspace))).toBe(
+      expectedPatch,
+    );
+    expect(diffSummary(workspace.repo, worktree, {}, requireSparseWorkspace(workspace))).toEqual(
+      expectedSummary,
+    );
+    expect(expectedSummary).toEqual([
+      {
+        path: "new.txt",
+        originalPath: "old.txt",
+        similarity: 100,
+        status: "R",
+        insertions: 0,
+        deletions: 0,
+      },
+    ]);
+  });
+
   it("uses the tracker baseline for a custom ref and respects pathspecs", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "one\n");
@@ -292,7 +324,8 @@ describe("sparse diff", () => {
 
     const statements = [...workspace.storage.histogram.entries()];
     expect(statements.find(([query]) => query.includes("before_root, after_root"))?.[1]).toBe(1);
-    expect(statements.find(([query]) => query.includes("root_oid, path_cap"))?.[1]).toBe(2);
+    // The full identity prepass and output traversal each walk both trees.
+    expect(statements.find(([query]) => query.includes("root_oid, path_cap"))?.[1]).toBe(4);
     expect(statements.some(([query]) => query.includes("wanted(ordinal, oid)"))).toBe(false);
     expect(worktree.bulkReadPaths).toEqual([]);
     expect(workspace.database.db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids") ?? 0).toBe(

@@ -120,7 +120,10 @@ export function createSqliteGitClient(
 
       async status(input = {}) {
         const repo = at(input.dir);
-        const rows = statusOp(repo, ctx().worktree, { excludeRoots: excludeRoots(repo) });
+        const rows = statusOp(repo, ctx().worktree, {
+          excludeRoots: excludeRoots(repo),
+          renames: false,
+        });
         // Projected to exactly what the interface declares. StatusDetail is
         // a superset, and handing it back would be a silent shape change
         // for anyone comparing or serialising the result. Callers wanting
@@ -138,14 +141,35 @@ export function createSqliteGitClient(
               `Computer status cannot represent ignored path ${row.path}`,
             );
           }
+          if (row.renamed === true) {
+            throw new GitError(
+              "EUNSUPPORTED",
+              `Computer status cannot represent rename at ${row.path}`,
+            );
+          }
           return { path: row.path, index: row.index, worktree: row.worktree };
         });
       },
       async diff(input = {}) {
-        return diffOp(at(input.dir), ctx().worktree, input);
+        return diffOp(at(input.dir), ctx().worktree, { ...input, renames: false });
       },
       async diffSummary(input = {}) {
-        return diffSummaryOp(at(input.dir), ctx().worktree, input);
+        return diffSummaryOp(at(input.dir), ctx().worktree, { ...input, renames: false }).map(
+          (row) => {
+            if (row.status === "R") {
+              throw new GitError(
+                "EUNSUPPORTED",
+                `Computer diff summary cannot represent rename at ${row.path}`,
+              );
+            }
+            return {
+              path: row.path,
+              status: row.status,
+              insertions: row.insertions,
+              deletions: row.deletions,
+            };
+          },
+        );
       },
       async clean(input = {}) {
         const repo = at(input.dir);

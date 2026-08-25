@@ -187,6 +187,35 @@ function buildStatusScale(
   return { workspace, entries };
 }
 
+function stageScaleMove(workspace: TestRepository, entries: readonly IndexEntry[]): void {
+  const bytes = utf8.encode("contents\n");
+  const oid = entries[0]?.oid;
+  if (oid === undefined) throw new Error("scale move needs at least one source");
+  workspace.worktree.removeFiles(entries.map((entry) => `/${entry.path}`));
+  const paths = entries.map((entry) => entry.path.replace("old/", "new/"));
+  workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+  const stats = new Map(
+    workspace.worktree
+      .scan("/new", { filesOnly: true, limit: paths.length + 1 })
+      .map((entry) => [entry.path.slice(1), entry]),
+  );
+  workspace.repo.store.indexReplace(
+    paths.map((path): IndexEntry => {
+      const stat = stats.get(path);
+      if (stat === undefined) throw new Error(`moved scale path was not written: ${path}`);
+      return {
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: stat.size,
+        mtime: stat.mtime,
+        ino: stat.ino,
+      };
+    }),
+  );
+}
+
 function indexScanStatements(workspace: TestRepository): number {
   for (const [query, count] of workspace.storage.histogram ?? []) {
     if (query.startsWith("SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index")) {
@@ -542,6 +571,80 @@ describe("status", () => {
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "-uall"));
   });
 
+  it("matches Git for an exact staged rename with a regular mode change", async () => {
+    const { fixture, workspace } = await build({
+      name: "exact staged rename",
+      commits: [[{ op: "write", path: "plain.txt", content: "same\n" }]],
+      mutate: [
+        { op: "gitRemove", path: "plain.txt" },
+        { op: "write", path: "moved/executable.txt", content: "same\n", executable: true },
+        { op: "stage", path: "moved/executable.txt" },
+      ],
+    });
+
+    const entries = status(workspace.repo, workspace.worktree);
+    expect(entries).toEqual([
+      expect.objectContaining({
+        renamed: true,
+        path: "moved/executable.txt",
+        originalPath: "plain.txt",
+        similarity: 100,
+        index: "R",
+        worktree: " ",
+        headMode: "100644",
+        indexMode: "100755",
+      }),
+    ]);
+    expect(formatPorcelainV1(entries)).toBe(gitStatus(fixture, "--porcelain=v1"));
+    expect(formatShort(entries)).toBe(gitStatus(fixture, "--short"));
+    expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2"));
+
+    const disabled = status(workspace.repo, workspace.worktree, { renames: false });
+    expect(formatPorcelainV1(disabled)).toBe(gitStatus(fixture, "--porcelain=v1", "--no-renames"));
+    const destinationOnly = status(workspace.repo, workspace.worktree, {
+      paths: ["moved"],
+      renames: true,
+    });
+    expect(formatPorcelainV2(destinationOnly)).toBe(
+      gitStatus(fixture, "--porcelain=v2", "--", "moved"),
+    );
+  });
+
+  it("applies explicit rename options over config and keeps move-plus-edit exact-only", async () => {
+    const exact = await build({
+      name: "rename config",
+      commits: [[{ op: "write", path: "old.txt", content: "same\n" }]],
+      mutate: [
+        { op: "gitRemove", path: "old.txt" },
+        { op: "write", path: "new.txt", content: "same\n" },
+        { op: "stage", path: "new.txt" },
+      ],
+    });
+    exact.fixture.git("config", "status.renames", "false");
+    exact.workspace.repo.store.configSet("status.renames", "false");
+    expect(formatPorcelainV1(status(exact.workspace.repo, exact.workspace.worktree))).toBe(
+      gitStatus(exact.fixture, "--porcelain=v1"),
+    );
+    expect(
+      formatPorcelainV1(status(exact.workspace.repo, exact.workspace.worktree, { renames: true })),
+    ).toBe(gitStatus(exact.fixture, "--porcelain=v1", "--renames"));
+
+    const edited = await build({
+      name: "exact-only move plus edit",
+      commits: [[{ op: "write", path: "old.txt", content: "before\n" }]],
+      mutate: [
+        { op: "gitRemove", path: "old.txt" },
+        { op: "write", path: "new.txt", content: "after\n" },
+        { op: "stage", path: "new.txt" },
+      ],
+    });
+    const entries = status(edited.workspace.repo, edited.workspace.worktree);
+    expect(entries.map((entry) => entry.index)).toEqual(["A", "D"]);
+    expect(formatPorcelainV1(entries)).toBe(
+      gitStatus(edited.fixture, "--porcelain=v1", "--find-renames=100%"),
+    );
+  });
+
   it("keeps ignored paths out by default and matches git --ignored", async () => {
     const { fixture, workspace } = await build({
       name: "ignored",
@@ -774,7 +877,8 @@ describe("status cost", () => {
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    expect(indexScanStatements(workspace)).toBe(20);
+    // Snapshot + status merge + bounded rename identity prepass.
+    expect(indexScanStatements(workspace)).toBe(30);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -789,7 +893,7 @@ describe("status cost", () => {
     expect(result).toHaveLength(1_000);
     expect(result.every((entry) => entry.worktree === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    expect(indexScanStatements(workspace)).toBe(20);
+    expect(indexScanStatements(workspace)).toBe(30);
     expect(worktree.bulkReadPaths).toHaveLength(1_000);
     expect(new Set(worktree.bulkReadPaths)).toEqual(
       new Set(changed.map((entry) => `/${entry.path}`)),
@@ -812,7 +916,7 @@ describe("status cost", () => {
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
-    expect(indexScanStatements(workspace)).toBe(50);
+    expect(indexScanStatements(workspace)).toBe(75);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -828,8 +932,25 @@ describe("status cost", () => {
     expect(result.map((entry) => entry.path)).toEqual(expectedPaths);
     expect(result.every((entry) => entry.index === " " && entry.worktree === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
-    expect(indexScanStatements(workspace)).toBe(50);
+    expect(indexScanStatements(workspace)).toBe(75);
     expect(worktree.bulkReadPaths).toEqual(expectedPaths.map((path) => `/${path}`));
+  });
+
+  it("falls back to every add and delete above the exact-rename candidate cap", () => {
+    const { workspace, entries } = buildStatusScale(5_001, 100, "old/");
+    stageScaleMove(workspace, entries);
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+
+    workspace.storage.resetCounters();
+    const result = status(workspace.repo, worktree);
+
+    expect(result).toHaveLength(10_002);
+    expect(result.filter((entry) => entry.index === "A")).toHaveLength(5_001);
+    expect(result.filter((entry) => entry.index === "D")).toHaveLength(5_001);
+    expect(result.some((entry) => entry.index === "R")).toBe(false);
+    expect(result.some((entry) => "originalPath" in entry)).toBe(false);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(worktree.bulkReadPaths).toEqual([]);
   });
 
   it("does not infer an oid-shaped content identity and learns it after hashing", () => {

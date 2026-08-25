@@ -13,6 +13,8 @@ export interface DiffOptions {
   context?: number;
   /** Length of the abbreviated oids on `index` lines. */
   abbrev?: number;
+  /** Detect exact renames. Explicit values override `diff.renames`. */
+  renames?: boolean;
 }
 
 export interface EndpointIdentity {

@@ -339,3 +339,12 @@ updating `docs/reference/git-support.md`, running `npm run check`,
   option resolution implements explicit value over `status.renames` or
   `diff.renames` over the enabled default, including Git's `copies` value.
   Verification: rename classifier 10/10 and typecheck pass.
+- 2026-08-25 — WU4 complete. Native status, patch, and summary now emit exact
+  `R100` moves with source paths while the Computer facade explicitly preserves
+  its existing A/D arrays and patch shape. Full and sparse status/diff paths use
+  the same classifier; bounded sparse identities are reused for output instead
+  of traversed twice. A 10,002-candidate integration witness proves cap overflow
+  returns every one of 5,001 additions and deletions with no partial rename.
+  The 24,252-file witnesses remain below 1,000 SQL statements and read no clean
+  blob bodies. Verification: eight focused files, 155/155 tests; check and
+  typecheck pass.

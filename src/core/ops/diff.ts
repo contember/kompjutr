@@ -26,6 +26,12 @@ import {
 } from "./diff-internal.js";
 import type { DiffSummaryEntry } from "./kinds.js";
 import { treeOf } from "./reads.js";
+import {
+  type ExactRename,
+  type ExactRenameClassification,
+  ExactRenameClassifier,
+  renameDetectionEnabled,
+} from "./rename-detection.js";
 import { sparseCommitPair, sparseWorkingCandidates } from "./sparse-diff.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
@@ -53,6 +59,8 @@ interface Endpoint {
 
 interface FileChange {
   path: string;
+  originalPath?: string;
+  similarity?: 100;
   before: Endpoint | null;
   after: Endpoint | null;
 }
@@ -70,6 +78,21 @@ export function diff(
   for (const change of collect(repo, worktree, options, sparseWorkspace)) {
     const before = change.before;
     const after = change.after;
+    if (
+      change.originalPath !== undefined &&
+      change.similarity !== undefined &&
+      before !== null &&
+      after !== null
+    ) {
+      let header = `diff --git a/${change.originalPath} b/${change.path}\n`;
+      if (before.mode !== after.mode) {
+        header += `old mode ${before.mode}\nnew mode ${after.mode}\n`;
+      }
+      out +=
+        `${header}similarity index ${change.similarity}%\n` +
+        `rename from ${change.originalPath}\nrename to ${change.path}\n`;
+      continue;
+    }
     const left = before === null ? "/dev/null" : `a/${change.path}`;
     const right = after === null ? "/dev/null" : `b/${change.path}`;
 
@@ -125,6 +148,17 @@ export function diffSummary(
 ): DiffSummaryEntry[] {
   const out: DiffSummaryEntry[] = [];
   for (const change of collect(repo, worktree, options, sparseWorkspace)) {
+    if (change.originalPath !== undefined && change.similarity !== undefined) {
+      out.push({
+        path: change.path,
+        originalPath: change.originalPath,
+        similarity: change.similarity,
+        status: "R",
+        insertions: 0,
+        deletions: 0,
+      });
+      continue;
+    }
     const status = change.before === null ? "A" : change.after === null ? "D" : "M";
     if (change.before?.oid === change.after?.oid) {
       out.push({ path: change.path, status, insertions: 0, deletions: 0 });
@@ -159,35 +193,125 @@ function* collect(
   options: DiffOptions,
   sparseWorkspace: SparseWorkspaceSource | undefined,
 ): Generator<FileChange> {
+  const sparse = boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
+  if (sparse !== null) {
+    yield* collectPendingChanges(
+      repo,
+      worktree,
+      sparse,
+      classifyDiffRenames(repo, options, sparse),
+    );
+    return;
+  }
+  const classification = classifyDiffRenames(
+    repo,
+    options,
+    pendingChanges(repo, worktree, options, true),
+  );
+  yield* collectPendingChanges(
+    repo,
+    worktree,
+    pendingChanges(repo, worktree, options),
+    classification,
+  );
+}
+
+function* collectPendingChanges(
+  repo: Repository,
+  worktree: Worktree,
+  changes: Iterable<PendingChange>,
+  classification: ExactRenameClassification | undefined,
+): Generator<FileChange> {
+  const sources =
+    classification?.kind === "classified"
+      ? new Set(classification.renames.map((rename) => rename.source.path))
+      : new Set<string>();
+  const destinations =
+    classification?.kind === "classified"
+      ? new Map(classification.renames.map((rename) => [rename.destination.path, rename]))
+      : new Map<string, ExactRename>();
+  const pending: PendingChange[] = [];
+  for (const change of changes) {
+    if (sources.has(change.path)) continue;
+    const rename = destinations.get(change.path);
+    if (rename !== undefined) {
+      yield* hydrateChanges(repo, worktree, pending);
+      yield exactRenameChange(rename, change);
+      continue;
+    }
+    pending.push(change);
+    if (pending.length >= DIFF_WINDOW_ROWS) yield* hydrateChanges(repo, worktree, pending);
+  }
+  yield* hydrateChanges(repo, worktree, pending);
+}
+
+function classifyDiffRenames(
+  repo: Repository,
+  options: DiffOptions,
+  changes: Iterable<PendingChange>,
+): ExactRenameClassification | undefined {
+  if (!renameDetectionEnabled(repo, "diff", options.renames)) return undefined;
+  const classifier = new ExactRenameClassifier();
+  for (const change of changes) {
+    let retained = true;
+    if (change.before !== null && change.after === null) {
+      retained = classifier.addSource({
+        path: change.path,
+        mode: change.before.mode,
+        oid: change.before.oid,
+      });
+    } else if (change.before === null && change.after !== null) {
+      retained = classifier.addDestination({
+        path: change.path,
+        mode: change.after.mode,
+        oid: change.after.oid,
+      });
+    }
+    if (!retained) break;
+  }
+  return classifier.finish();
+}
+
+function boundedSparsePendingChanges(
+  repo: Repository,
+  worktree: Worktree,
+  options: DiffOptions,
+  sparseWorkspace: SparseWorkspaceSource | undefined,
+): PendingChange[] | null {
+  const fromTreeOid = resolveFrom(repo, options);
+  if (options.to !== undefined) {
+    return sparseCommitPair(repo, fromTreeOid, treeOf(repo, repo.revParse(options.to)), options);
+  }
+  if (sparseWorkspace === undefined) return null;
+  const candidates = sparseWorkingCandidates(repo, sparseWorkspace, fromTreeOid, options);
+  if (candidates === null) return null;
+  return [...resolveWorkingCandidateIdentities(repo, worktree, candidates, true)];
+}
+
+function* pendingChanges(
+  repo: Repository,
+  worktree: Worktree,
+  options: DiffOptions,
+  renameCandidatesOnly = false,
+): Generator<PendingChange> {
   const fromTreeOid = resolveFrom(repo, options);
   const byPath = { left: (entry: TargetEntry) => entry.path };
 
   if (options.to !== undefined) {
     const toTreeOid = treeOf(repo, repo.revParse(options.to));
-    const sparse = sparseCommitPair(repo, fromTreeOid, toTreeOid, options);
-    if (sparse !== null) {
-      yield* hydrateChanges(repo, worktree, sparse);
-      return;
-    }
     const from = treeStream(repo, fromTreeOid);
     const to = treeStream(repo, toTreeOid);
-    const pending: PendingChange[] = [];
     for (const row of joinSorted(from, to, { ...byPath, right: (entry) => entry.path })) {
       if (!matchesPaths(row.path, options.paths)) continue;
       const change = compareIdentities(row.path, treeIdentity(row.left), treeIdentity(row.right));
-      if (change !== null) pending.push(change);
-      if (pending.length >= DIFF_WINDOW_ROWS) yield* hydrateChanges(repo, worktree, pending);
+      if (
+        change !== null &&
+        (!renameCandidatesOnly || (change.before === null) !== (change.after === null))
+      ) {
+        yield change;
+      }
     }
-    yield* hydrateChanges(repo, worktree, pending);
     return;
-  }
-
-  if (sparseWorkspace !== undefined) {
-    const sparse = sparseWorkingCandidates(repo, sparseWorkspace, fromTreeOid, options);
-    if (sparse !== null) {
-      yield* resolveWorkingCandidates(repo, worktree, sparse, true);
-      return;
-    }
   }
 
   // The working-tree side covers only paths git would consider — those in
@@ -213,6 +337,8 @@ function* collect(
   )) {
     if (!matchesPaths(row.path, options.paths)) continue;
     if (row.a === undefined && row.b === undefined) continue;
+    const worktreePresent = row.c !== undefined && row.c.stat.type !== "dir";
+    if (renameCandidatesOnly && (row.a === undefined) === !worktreePresent) continue;
     candidates.push({
       path: row.path,
       before: row.a,
@@ -220,20 +346,34 @@ function* collect(
       worktree: row.c,
     });
     if (candidates.length >= DIFF_WINDOW_ROWS) {
-      yield* resolveWorkingCandidates(repo, worktree, candidates);
+      yield* resolveWorkingCandidateIdentities(
+        repo,
+        worktree,
+        candidates,
+        false,
+        renameCandidatesOnly,
+      );
     }
   }
-  yield* resolveWorkingCandidates(repo, worktree, candidates);
+  yield* resolveWorkingCandidateIdentities(repo, worktree, candidates, false, renameCandidatesOnly);
 }
 
-function* resolveWorkingCandidates(
+function* resolveWorkingCandidateIdentities(
   repo: Repository,
   worktree: Worktree,
   candidates: WorkingCandidate[],
   exact = false,
-): Generator<FileChange> {
+  renameCandidatesOnly = false,
+): Generator<PendingChange> {
   if (candidates.length === 0) return;
-  const rows = candidates.splice(0);
+  const sourceRows = candidates.splice(0);
+  const rows = renameCandidatesOnly
+    ? sourceRows.filter((row) => {
+        const worktreePresent = row.worktree !== undefined && row.worktree.stat.type !== "dir";
+        return (row.before === undefined) !== !worktreePresent;
+      })
+    : sourceRows;
+  if (rows.length === 0) return;
   const expected: BlobIdMapping[] = [];
   for (const row of rows) {
     const mapping = expectedWorktreeMapping(row);
@@ -269,7 +409,6 @@ function* resolveWorkingCandidates(
     }),
   );
 
-  const changes: PendingChange[] = [];
   for (const row of rows) {
     const cached = cachedWorktreeOid(row.index, row.worktree);
     const hashed = hashes.get(row.path);
@@ -283,9 +422,32 @@ function* resolveWorkingCandidates(
             worktree: row.worktree,
           };
     const change = compareIdentities(row.path, treeIdentity(row.before), after);
-    if (change !== null) changes.push(change);
+    if (
+      change !== null &&
+      (!renameCandidatesOnly || (change.before === null) !== (change.after === null))
+    ) {
+      yield change;
+    }
   }
-  yield* hydrateChanges(repo, worktree, changes);
+}
+
+function exactRenameChange(rename: ExactRename, destination: PendingChange): FileChange {
+  if (
+    destination.before !== null ||
+    destination.after === null ||
+    destination.path !== rename.destination.path ||
+    destination.after.mode !== rename.destination.mode ||
+    destination.after.oid !== rename.destination.oid
+  ) {
+    throw new CorruptError("diff rename destination does not match its addition");
+  }
+  return {
+    path: rename.destination.path,
+    originalPath: rename.source.path,
+    similarity: rename.similarity,
+    before: { mode: rename.source.mode, oid: rename.source.oid, bytes: null },
+    after: { mode: rename.destination.mode, oid: rename.destination.oid, bytes: null },
+  };
 }
 
 function expectedWorktreeOid(row: WorkingCandidate): string | undefined {

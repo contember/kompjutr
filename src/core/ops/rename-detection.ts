@@ -75,53 +75,84 @@ export function renameDetectionEnabled(
   throw new GitError("EINVAL", `config ${path} has invalid boolean value ${configured}`);
 }
 
+/** Incremental form for one bounded identity prepass. */
+export class ExactRenameClassifier {
+  readonly #limits: ResolvedRenameLimits;
+  readonly #buckets = new Map<string, RenameBucket>();
+  #candidateCount = 0;
+  #retainedBytes = 0;
+  #fallback = false;
+
+  constructor(limits?: ExactRenameLimits) {
+    this.#limits = resolveLimits(limits);
+  }
+
+  addSource(candidate: ExactRenameCandidate): boolean {
+    return this.#retain(candidate, "source");
+  }
+
+  addDestination(candidate: ExactRenameCandidate): boolean {
+    return this.#retain(candidate, "destination");
+  }
+
+  finish(): ExactRenameClassification {
+    if (this.#fallback) {
+      return {
+        kind: "fallback",
+        renames: [],
+        candidateCount: this.#candidateCount,
+        retainedBytes: this.#retainedBytes,
+      };
+    }
+    const renames: ExactRename[] = [];
+    for (const bucket of this.#buckets.values()) pairBucket(bucket, renames);
+    renames.sort((left, right) => comparePaths(left.destination.path, right.destination.path));
+    return {
+      kind: "classified",
+      renames,
+      candidateCount: this.#candidateCount,
+      retainedBytes: this.#retainedBytes,
+    };
+  }
+
+  #retain(candidate: ExactRenameCandidate, side: "source" | "destination"): boolean {
+    if (this.#fallback) return false;
+    const bytes = exactRenameCandidateRetainedBytes(candidate);
+    this.#candidateCount++;
+    if (
+      this.#candidateCount > this.#limits.maxCandidates ||
+      bytes > this.#limits.maxRetainedBytes - this.#retainedBytes
+    ) {
+      this.#fallback = true;
+      return false;
+    }
+    this.#retainedBytes += bytes;
+    const key = `${candidate.oid}:${modeClass(candidate.mode)}`;
+    let bucket = this.#buckets.get(key);
+    if (bucket === undefined) {
+      bucket = { sources: [], destinations: [] };
+      this.#buckets.set(key, bucket);
+    }
+    if (side === "source") bucket.sources.push(candidate);
+    else bucket.destinations.push(candidate);
+    return true;
+  }
+}
+
 /** Pair exact blob identities without reading objects or repository state. */
 export function classifyExactRenames(
   deletions: Iterable<ExactRenameCandidate>,
   additions: Iterable<ExactRenameCandidate>,
   limits?: ExactRenameLimits,
 ): ExactRenameClassification {
-  const resolved = resolveLimits(limits);
-  const buckets = new Map<string, RenameBucket>();
-  let candidateCount = 0;
-  let retainedBytes = 0;
-
-  const retain = (candidate: ExactRenameCandidate, side: "source" | "destination"): boolean => {
-    const bytes = exactRenameCandidateRetainedBytes(candidate);
-    candidateCount++;
-    if (
-      candidateCount > resolved.maxCandidates ||
-      bytes > resolved.maxRetainedBytes - retainedBytes
-    ) {
-      return false;
-    }
-    retainedBytes += bytes;
-    const key = `${candidate.oid}:${modeClass(candidate.mode)}`;
-    let bucket = buckets.get(key);
-    if (bucket === undefined) {
-      bucket = { sources: [], destinations: [] };
-      buckets.set(key, bucket);
-    }
-    if (side === "source") bucket.sources.push(candidate);
-    else bucket.destinations.push(candidate);
-    return true;
-  };
-
+  const classifier = new ExactRenameClassifier(limits);
   for (const candidate of deletions) {
-    if (!retain(candidate, "source")) {
-      return { kind: "fallback", renames: [], candidateCount, retainedBytes };
-    }
+    if (!classifier.addSource(candidate)) return classifier.finish();
   }
   for (const candidate of additions) {
-    if (!retain(candidate, "destination")) {
-      return { kind: "fallback", renames: [], candidateCount, retainedBytes };
-    }
+    if (!classifier.addDestination(candidate)) return classifier.finish();
   }
-
-  const renames: ExactRename[] = [];
-  for (const bucket of buckets.values()) pairBucket(bucket, renames);
-  renames.sort((left, right) => comparePaths(left.destination.path, right.destination.path));
-  return { kind: "classified", renames, candidateCount, retainedBytes };
+  return classifier.finish();
 }
 
 /** Retained charge reserves the candidate plus its future basename index. */

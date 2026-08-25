@@ -15,15 +15,22 @@ import { joinPath, relativeTo } from "../paths.js";
 import { requireBranchRef } from "../protocol/receive-pack.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
-import { comparePaths, joinSorted3 } from "../streams.js";
+import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { matchesPaths, treeEntries } from "./checkout.js";
 import type { StatusEntry, StatusRow } from "./kinds.js";
 import { countAheadBehind } from "./merge-base.js";
 import {
+  type ExactRenameClassification,
+  ExactRenameClassifier,
+  renameDetectionEnabled,
+} from "./rename-detection.js";
+import {
   type BufferedStatusRow,
   flushStatusRows,
   ignoredRow,
+  octalMode,
+  renameRow,
   type StatusDetail,
   type StatusOptions,
   statusIndexGroups,
@@ -241,9 +248,13 @@ export function eagerStatus(
   if (!state.available) {
     const baselineTreeOid = repo.headTree();
     const seed = new FullStatusTrackerSeed();
-    const rows = [...statusStreamInternal(repo, worktree, options, baselineTreeOid, seed)].sort(
-      (left, right) => comparePaths(left.path, right.path),
-    );
+    const renames = classifyStatusRenames(repo, baselineTreeOid, options);
+    const rows = [
+      ...applyStatusRenames(
+        statusStreamInternal(repo, worktree, options, baselineTreeOid, seed),
+        renames,
+      ),
+    ].sort((left, right) => comparePaths(left.path, right.path));
     if (seed.resealable) {
       tracker.reseal(repo.store.repoId, baselineTreeOid, seed.entries());
     }
@@ -251,7 +262,13 @@ export function eagerStatus(
   }
 
   const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
-  return sparse ?? status(repo, worktree, options);
+  if (sparse === null) return status(repo, worktree, options);
+  if (sparse.length === 0) {
+    renameDetectionEnabled(repo, "status", options.renames);
+    return sparse;
+  }
+  const renames = classifyStatusRenames(repo, repo.headTree(), options);
+  return [...applyStatusRenames(sparse, renames)];
 }
 
 /**
@@ -268,7 +285,72 @@ export function* statusStream(
   worktree: Worktree,
   options: StatusOptions = {},
 ): Generator<StatusDetail> {
-  yield* statusStreamInternal(repo, worktree, options, repo.headTree());
+  const headTreeOid = repo.headTree();
+  const renames = classifyStatusRenames(repo, headTreeOid, options);
+  yield* applyStatusRenames(statusStreamInternal(repo, worktree, options, headTreeOid), renames);
+}
+
+function classifyStatusRenames(
+  repo: Repository,
+  headTreeOid: string | null,
+  options: StatusOptions,
+): ExactRenameClassification | undefined {
+  if (!renameDetectionEnabled(repo, "status", options.renames)) return undefined;
+  const classifier = new ExactRenameClassifier();
+  for (const row of joinSorted(
+    treeStream(repo, headTreeOid),
+    statusIndexGroups(repo.store.indexScan()),
+    {
+      left: (entry) => entry.path,
+      right: (entry) => entry.path,
+    },
+  )) {
+    if (!matchesPaths(row.path, options.paths) || row.right?.kind === "unmerged") continue;
+    const head = row.left;
+    const index = row.right?.entry;
+    let retained = true;
+    if (head !== undefined && index === undefined && isRenameMode(head.mode)) {
+      retained = classifier.addSource({ path: row.path, mode: head.mode, oid: head.oid });
+    } else if (head === undefined && index !== undefined && index.mode !== 0o160000) {
+      retained = classifier.addDestination({
+        path: row.path,
+        mode: octalMode(index.mode),
+        oid: index.oid,
+      });
+    }
+    if (!retained) break;
+  }
+  return classifier.finish();
+}
+
+function* applyStatusRenames(
+  rows: Iterable<StatusDetail>,
+  classification: ExactRenameClassification | undefined,
+): Generator<StatusDetail> {
+  if (classification === undefined || classification.kind === "fallback") {
+    yield* rows;
+    return;
+  }
+  const sources = new Set(classification.renames.map((rename) => rename.source.path));
+  const destinations = new Map(
+    classification.renames.map((rename) => [rename.destination.path, rename]),
+  );
+  for (const row of rows) {
+    if (sources.has(row.path)) continue;
+    const rename = destinations.get(row.path);
+    if (rename === undefined) {
+      yield row;
+      continue;
+    }
+    if (row.ignored === true || row.unmerged === true || row.renamed === true) {
+      throw new CorruptError("status rename destination is not an ordinary staged addition");
+    }
+    yield renameRow(rename, row);
+  }
+}
+
+function isRenameMode(mode: string): boolean {
+  return mode === "100644" || mode === "100755" || mode === "120000";
 }
 
 function* statusStreamInternal(
@@ -587,6 +669,15 @@ export function formatPorcelainV2(entries: StatusDetail[], branch?: StatusBranch
       );
       continue;
     }
+    if (entry.renamed === true) {
+      lines.push(
+        `2 ${entry.index}${v2Code(entry.worktree)} N... ` +
+          `${entry.headMode} ${entry.indexMode} ${entry.worktreeMode} ` +
+          `${entry.headOid} ${entry.indexOid} R${entry.similarity} ` +
+          `${entry.path}\t${entry.originalPath}`,
+      );
+      continue;
+    }
     lines.push(
       `1 ${v2Code(entry.index)}${v2Code(entry.worktree)} N... ` +
         `${entry.headMode} ${entry.indexMode} ${entry.worktreeMode} ` +
@@ -622,6 +713,10 @@ export function formatPorcelainV1(entries: StatusEntry[]): string {
   const lines: string[] = [];
   for (const entry of entries) {
     if (entry.worktree === "?" || entry.worktree === "!") continue;
+    if (entry.originalPath !== undefined) {
+      lines.push(`${entry.index}${entry.worktree} ${entry.originalPath} -> ${entry.path}`);
+      continue;
+    }
     lines.push(`${entry.index}${entry.worktree} ${entry.path}`);
   }
   for (const entry of entries) if (entry.worktree === "?") lines.push(`?? ${entry.path}`);
@@ -631,8 +726,7 @@ export function formatPorcelainV1(entries: StatusEntry[]): string {
 
 /**
  * `git status --short`. Identical to porcelain v1 over the states this
- * package models — the two differ only on colour, renames and path
- * quoting, none of which are represented in a `StatusEntry`.
+ * package models — the two differ only on colour and path quoting.
  */
 export function formatShort(entries: StatusEntry[]): string {
   return formatPorcelainV1(entries);
@@ -674,6 +768,7 @@ export function clean(repo: Repository, worktree: Worktree, options: CleanOption
     paths: options.paths,
     excludeRoots: options.excludeRoots,
     ignores,
+    renames: false,
   };
   const collapsed = untrackedEntries(repo, worktree, statusOptions);
   if (options.directories !== true) {

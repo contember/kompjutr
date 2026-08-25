@@ -10,6 +10,7 @@ import { diffText } from "../src/core/diff/index.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import { diff, diffSummary } from "../src/core/ops/diff.js";
+import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -167,6 +168,7 @@ async function open(setup: (fixture: GitFixture) => void): Promise<Pair> {
 
 function writeBoth(pair: Pair, path: string, content: string | Uint8Array, mode = 0o644): void {
   pair.fixture.write(path, content);
+  if (mode !== 0o644) pair.fixture.chmod(path, mode);
   const bytes = typeof content === "string" ? utf8.encode(content) : content;
   pair.workspace.worktree.writeFiles([{ path: `/${path}`, bytes, mode }]);
 }
@@ -179,6 +181,12 @@ function removeBoth(pair: Pair, path: string): void {
 function chmodBoth(pair: Pair, path: string, mode: number): void {
   pair.fixture.chmod(path, mode);
   pair.workspace.worktree.chmod(`/${path}`, mode);
+}
+
+function stageWorkspace(pair: Pair, path: string): void {
+  const hashed = hashWorktreePath(pair.workspace.repo, pair.workspace.worktree, path);
+  if (hashed === null) throw new Error(`nothing to stage at ${path}`);
+  pair.workspace.repo.store.indexPut(indexEntryFor(path, hashed));
 }
 
 /** git's own bytes, untrimmed. */
@@ -280,6 +288,36 @@ function buildDiffScale(
   return { workspace, entries };
 }
 
+function commitScaleMove(workspace: TestRepository, entries: readonly IndexEntry[]): void {
+  const bytes = utf8.encode("contents\n");
+  const oid = entries[0]?.oid;
+  if (oid === undefined) throw new Error("scale move needs at least one source");
+  workspace.worktree.removeFiles(entries.map((entry) => `/${entry.path}`));
+  const paths = entries.map((entry) => entry.path.replace("old/", "new/"));
+  workspace.worktree.writeFiles(paths.map((path) => ({ path: `/${path}`, bytes })));
+  const stats = new Map(
+    workspace.worktree
+      .scan("/new", { filesOnly: true, limit: paths.length + 1 })
+      .map((entry) => [entry.path.slice(1), entry]),
+  );
+  workspace.repo.store.indexReplace(
+    paths.map((path): IndexEntry => {
+      const stat = stats.get(path);
+      if (stat === undefined) throw new Error(`moved scale path was not written: ${path}`);
+      return {
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: stat.size,
+        mtime: stat.mtime,
+        ino: stat.ino,
+      };
+    }),
+  );
+  commit(workspace.context, workspace.repo, { message: "move" });
+}
+
 describe("diff", () => {
   it("matches git diff over the working tree", async () => {
     const pair = await workingTreeFixture();
@@ -366,6 +404,49 @@ describe("diff", () => {
     removeBoth(pair, "old.dat");
     expect(diff(pair.workspace.repo, pair.workspace.worktree)).toBe(gitDiff(pair));
   });
+
+  it("matches Git's exact rename patch, mode headers, filters, and option precedence", async () => {
+    const pair = await open((fixture) => {
+      fixture.write("plain.txt", "same\n");
+      fixture.commit("first");
+    });
+    removeBoth(pair, "plain.txt");
+    pair.workspace.repo.store.indexRemove("plain.txt");
+    writeBoth(pair, "moved/executable.txt", "same\n", 0o755);
+    stageWorkspace(pair, "moved/executable.txt");
+    pair.fixture.git("add", "-A");
+
+    expect(diff(pair.workspace.repo, pair.workspace.worktree)).toBe(gitDiff(pair, "HEAD"));
+    expect(diff(pair.workspace.repo, pair.workspace.worktree, { renames: false })).toBe(
+      gitDiff(pair, "HEAD", "--no-renames"),
+    );
+    expect(diff(pair.workspace.repo, pair.workspace.worktree, { paths: ["moved"] })).toBe(
+      gitDiff(pair, "HEAD", "--", "moved"),
+    );
+
+    pair.fixture.git("config", "diff.renames", "false");
+    pair.workspace.repo.store.configSet("diff.renames", "false");
+    expect(diff(pair.workspace.repo, pair.workspace.worktree)).toBe(gitDiff(pair, "HEAD"));
+    expect(diff(pair.workspace.repo, pair.workspace.worktree, { renames: true })).toBe(
+      gitDiff(pair, "HEAD", "--find-renames=100%"),
+    );
+  });
+
+  it("leaves move-plus-edit as complete add/delete output under exact detection", async () => {
+    const pair = await open((fixture) => {
+      fixture.write("old.txt", "before\n");
+      fixture.commit("first");
+    });
+    removeBoth(pair, "old.txt");
+    pair.workspace.repo.store.indexRemove("old.txt");
+    writeBoth(pair, "new.txt", "after\n");
+    stageWorkspace(pair, "new.txt");
+    pair.fixture.git("add", "-A");
+
+    expect(diff(pair.workspace.repo, pair.workspace.worktree)).toBe(
+      gitDiff(pair, "HEAD", "--find-renames=100%"),
+    );
+  });
 });
 
 describe("diffSummary", () => {
@@ -424,6 +505,37 @@ describe("diffSummary", () => {
     );
   });
 
+  it("reports one exact rename with its source and no line delta", async () => {
+    const pair = await open((fixture) => {
+      fixture.write("old.txt", "same\n");
+      fixture.commit("first");
+      fixture.write("new/deeper.txt", "same\n");
+      fixture.remove("old.txt");
+      fixture.commit("second");
+    });
+    const summary = diffSummary(pair.workspace.repo, pair.workspace.worktree, {
+      ref: "HEAD~1",
+      to: "HEAD",
+    });
+
+    expect(summary).toEqual([
+      {
+        path: "new/deeper.txt",
+        originalPath: "old.txt",
+        similarity: 100,
+        status: "R",
+        insertions: 0,
+        deletions: 0,
+      },
+    ]);
+    expect(`R100\t${summary[0]?.originalPath}\t${summary[0]?.path}`).toBe(
+      nameStatus(pair, "HEAD~1", "HEAD", "--find-renames=100%")[0],
+    );
+    expect(diff(pair.workspace.repo, pair.workspace.worktree, { ref: "HEAD~1", to: "HEAD" })).toBe(
+      gitDiff(pair, "HEAD~1", "HEAD", "--find-renames=100%"),
+    );
+  });
+
   it("uses bounded bulk reads for exactly 1,000 changed files", () => {
     const { workspace, entries } = buildDiffScale();
     const worktree = new BulkOnlyWorktree(workspace.worktree);
@@ -460,8 +572,9 @@ describe("diffSummary", () => {
 
     workspace.storage.resetCounters();
     expect(diffSummary(workspace.repo, worktree)).toEqual([]);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(130);
-    expect(workspace.storage.rowCount).toBeLessThanOrEqual(76_000);
+    // The exact-rename identity prepass adds one bounded traversal.
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(160);
+    expect(workspace.storage.rowCount).toBeLessThanOrEqual(150_000);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -475,10 +588,27 @@ describe("diffSummary", () => {
     const summary = diffSummary(workspace.repo, worktree);
     expect(summary.map((entry) => entry.path)).toEqual(changed.map((entry) => entry.path));
     expect(summary.every((entry) => entry.status === "M")).toBe(true);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(130);
-    expect(workspace.storage.rowCount).toBeLessThanOrEqual(76_000);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(160);
+    expect(workspace.storage.rowCount).toBeLessThanOrEqual(150_000);
     const reads = new Map<string, number>();
     for (const path of worktree.bulkReadPaths) reads.set(path, (reads.get(path) ?? 0) + 1);
     expect(reads).toEqual(new Map(changed.map((entry) => [`/${entry.path}`, 2])));
+  });
+
+  it("falls back to every add and delete above the exact-rename candidate cap", () => {
+    const { workspace, entries } = buildDiffScale(5_001, 100, { pathPrefix: "old/" });
+    commitScaleMove(workspace, entries);
+    const worktree = new BulkOnlyWorktree(workspace.worktree);
+
+    workspace.storage.resetCounters();
+    const summary = diffSummary(workspace.repo, worktree, { ref: "HEAD~1", to: "HEAD" });
+
+    expect(summary).toHaveLength(10_002);
+    expect(summary.filter((entry) => entry.status === "A")).toHaveLength(5_001);
+    expect(summary.filter((entry) => entry.status === "D")).toHaveLength(5_001);
+    expect(summary.some((entry) => entry.status === "R")).toBe(false);
+    expect(summary.every((entry) => entry.originalPath === undefined)).toBe(true);
+    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(worktree.bulkReadPaths).toEqual([]);
   });
 });
