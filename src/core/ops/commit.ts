@@ -6,7 +6,12 @@ import { GitError, MissingIdentityError } from "../errors.js";
 import { type Commit, type Person, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import type { CommitResult } from "./kinds.js";
-import { buildTreeInBatch } from "./tree-build.js";
+import { MAX_MERGE_IDENTITY_BYTES, MAX_MERGE_MESSAGE_BYTES } from "./merge-state.js";
+import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js";
+
+const OBJECT_BATCH_BYTES = 1024 * 1024;
+const OBJECT_BATCH_COUNT = 4_096;
+const TREE_INDEX_ROWS = 2_048;
 
 /** Mirrors Computer's `GitCommitOptions`, minus `dir` — the repository is already resolved. */
 export interface CommitOptions {
@@ -30,6 +35,41 @@ export interface IndexedCommitOptions {
   expectedHead: ResolvedHead;
 }
 
+export interface UnpublishedCommitOptions {
+  message: string;
+  parent: readonly string[];
+  identities: CommitIdentities;
+}
+
+export interface UnpublishedCommitResult {
+  oid: string;
+  tree: string;
+}
+
+type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
+
+/** Conservatively account for one bounded index-tree and commit materialization. */
+export function commitMaterializationSqlStatements(stats: TreeBuildPreflightStats): number {
+  const objects = stats.treeObjects + 1;
+  const payloadBytes =
+    stats.serializedTreeBytes +
+    stats.treeObjects * 1_024 +
+    MAX_MERGE_MESSAGE_BYTES +
+    4 * MAX_MERGE_IDENTITY_BYTES +
+    1_024;
+  const payloadPages = Math.max(1, Math.ceil(payloadBytes / OBJECT_BATCH_BYTES));
+  const flushes = Math.ceil(objects / OBJECT_BATCH_COUNT) + payloadPages;
+  const indexedRows = stats.leafEntries + stats.treeObjects - 1;
+  return (
+    20 +
+    flushes * 6 +
+    payloadPages * 2 +
+    Math.ceil(indexedRows / TREE_INDEX_ROWS) * 2 +
+    Math.ceil(stats.treeObjects / TREE_INDEX_ROWS) * 2 +
+    Math.ceil(stats.leafEntries / 2_048)
+  );
+}
+
 export function commit(
   context: GitContext,
   repo: Repository,
@@ -45,7 +85,7 @@ export function commit(
     const amended = options.amend === true ? readAmended(repo, head) : undefined;
     const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
     const identities = resolveIdentity(context, repo, options, amended);
-    return writeCommitIndex(repo, {
+    return publishCommit(repo, {
       message: options.message,
       parent,
       identities,
@@ -63,31 +103,48 @@ export function commitIndex(repo: Repository, options: IndexedCommitOptions): Co
     if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
     }
-    return writeCommitIndex(repo, options);
+    return publishCommit(repo, options);
   });
 }
 
-/** Caller owns the transaction and has already validated `expectedHead`. */
-function writeCommitIndex(repo: Repository, options: IndexedCommitOptions): CommitResult {
+/** Caller owns the transaction; this writes authoritative objects but never publishes a ref. */
+export function writeUnpublishedCommit(
+  repo: Repository,
+  options: UnpublishedCommitOptions,
+): UnpublishedCommitResult {
+  return writeCommitObjects(repo, options, { mode: "exact", value: options.message });
+}
+
+/** Materialize the stage-zero index through one shared object encoder. */
+function writeCommitObjects(
+  repo: Repository,
+  options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
+  message: CommitMessage,
+): UnpublishedCommitResult {
   // A paged scan, so the index never exists as one array alongside the build.
-  const oid = repo.store.writeObjects((batch) => {
+  return repo.store.writeObjects((batch) => {
     const tree = buildTreeInBatch(batch, repo.store.indexScan({ pageSize: 2048 }));
-    return batch.write(
+    const oid = batch.write(
       "commit",
       serializeCommit({
         tree,
         parent: [...options.parent],
         author: options.identities.author,
         committer: options.identities.committer,
-        message: cleanMessage(options.message),
+        message: message.mode === "clean" ? cleanMessage(message.value) : message.value,
       }),
     );
+    return { oid, tree };
   });
+}
 
+/** Caller owns the transaction and has already validated `expectedHead`. */
+function publishCommit(repo: Repository, options: IndexedCommitOptions): CommitResult {
+  const result = writeCommitObjects(repo, options, { mode: "clean", value: options.message });
   // A symbolic HEAD on an unborn branch creates the branch here.
-  if (options.expectedHead.ref === null) repo.store.setHead(oid);
-  else repo.store.setRef(options.expectedHead.ref, oid);
-  return { oid };
+  if (options.expectedHead.ref === null) repo.store.setHead(result.oid);
+  else repo.store.setRef(options.expectedHead.ref, result.oid);
+  return { oid: result.oid };
 }
 
 /**

@@ -5,14 +5,11 @@ import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
+import { commitMaterializationSqlStatements } from "./commit.js";
 import { type IntegrationPlan, MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ } from "./integration.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import { projectMergePlan } from "./merge-projection.js";
-import {
-  MAX_MERGE_IDENTITY_BYTES,
-  MAX_MERGE_MESSAGE_BYTES,
-  type MergeTouchedPath,
-} from "./merge-state.js";
+import type { MergeTouchedPath } from "./merge-state.js";
 import { checkoutBlockers } from "./refs.js";
 import { preflightTreeBuild, type TreeBuildPreflightStats } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
@@ -29,9 +26,6 @@ const MAX_REPOSITORY_ROWS = 50_000;
 const MAX_GUARD_HASH_BYTES = 32 * 1024 * 1024;
 const EXECUTION_HEADROOM_BYTES = 24 * 1024 * 1024;
 const MAX_RELOCATION_COLLISIONS = 1_000;
-const OBJECT_BATCH_BYTES = 1024 * 1024;
-const OBJECT_BATCH_COUNT = 4_096;
-const TREE_INDEX_ROWS = 2_048;
 
 export type IntegrationOperation = "merge" | "cherry-pick" | "revert";
 
@@ -52,26 +46,7 @@ export function integrationSqlStatements(plan: IntegrationPlan, treeStatements: 
   return treeStatements + plan.blobReadCalls * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
 }
 
-export function integrationCommitSqlStatements(stats: TreeBuildPreflightStats): number {
-  const objects = stats.treeObjects + 1;
-  const payloadBytes =
-    stats.serializedTreeBytes +
-    stats.treeObjects * 1_024 +
-    MAX_MERGE_MESSAGE_BYTES +
-    4 * MAX_MERGE_IDENTITY_BYTES +
-    1_024;
-  const payloadPages = Math.max(1, Math.ceil(payloadBytes / OBJECT_BATCH_BYTES));
-  const flushes = Math.ceil(objects / OBJECT_BATCH_COUNT) + payloadPages;
-  const indexedRows = stats.leafEntries + stats.treeObjects - 1;
-  return (
-    20 +
-    flushes * 6 +
-    payloadPages * 2 +
-    Math.ceil(indexedRows / TREE_INDEX_ROWS) * 2 +
-    Math.ceil(stats.treeObjects / TREE_INDEX_ROWS) * 2 +
-    Math.ceil(stats.leafEntries / 2_048)
-  );
-}
+export const integrationCommitSqlStatements = commitMaterializationSqlStatements;
 
 export const MAX_INTEGRATION_COMMIT_SQL_STATEMENTS = integrationCommitSqlStatements({
   leafEntries: MAX_INTEGRATION_INDEX_ENTRIES,

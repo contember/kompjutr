@@ -298,3 +298,7 @@ gates run serially through `cpu-lease`.
   CAS transitions. They deliberately do not walk the upstream graph on every
   state read; WU2 selects that relationship and WU4 must revalidate it before
   using resumed state so ordinary mutation interlocks stay bounded.
+- 2026-08-25, WU3 review: the unpublished commit writer owns exact source
+  messages, including empty and non-canonical messages, while public commit
+  paths retain their existing cleanup. Commit materialization now exposes one
+  shared preflight cost model and leaves ref publication to its caller.

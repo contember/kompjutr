@@ -6,7 +6,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
-import { commit, commitIndex, resolveIdentity } from "../src/core/ops/commit.js";
+import { type Person, serializeCommit } from "../src/core/objects.js";
+import {
+  commit,
+  commitIndex,
+  resolveIdentity,
+  writeUnpublishedCommit,
+} from "../src/core/ops/commit.js";
 import { log } from "../src/core/ops/reads.js";
 import { buildTree } from "../src/core/ops/tree-build.js";
 import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/core/ops/worktree-io.js";
@@ -207,6 +213,113 @@ describe("history", () => {
 });
 
 describe("explicit-parent commit seam", () => {
+  it("writes an authoritative commit without changing any ref", () => {
+    const repo = mirror();
+    repo.write("a.txt", "one\n");
+    const first = repo.expectSameCommit("first");
+    repo.write("a.txt", "rewritten\n");
+    stageAll(repo.workspace);
+    const before = {
+      head: repo.workspace.repo.store.head(),
+      refs: repo.workspace.repo.store.listRefs(),
+    };
+    const author: Person = {
+      name: "Original Author",
+      email: "author@example.com",
+      timestamp: 1_234_567_890,
+      timezoneOffset: -60,
+    };
+    const committer: Person = {
+      name: "Replay Committer",
+      email: "committer@example.com",
+      timestamp: 1_345_678_901,
+      timezoneOffset: 330,
+    };
+    const message = "\nrewritten message\r\n\n";
+
+    const result = repo.workspace.repo.store.db.transactionSync(() =>
+      writeUnpublishedCommit(repo.workspace.repo, {
+        message,
+        parent: [first, first],
+        identities: { author, committer },
+      }),
+    );
+
+    expect(repo.workspace.repo.store.head()).toBe(before.head);
+    expect(repo.workspace.repo.store.listRefs()).toEqual(before.refs);
+    expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(first);
+    const expected = {
+      tree: result.tree,
+      parent: [first, first],
+      author,
+      committer,
+      message,
+    };
+    expect(repo.workspace.repo.readCommit(result.oid)).toEqual(expected);
+    expect(repo.workspace.repo.read(result.oid)).toEqual({
+      type: "commit",
+      data: serializeCommit(expected),
+    });
+    expect(repo.workspace.repo.resolveTreePath(result.tree, "a.txt")?.oid).toBe(
+      repo.workspace.repo.store.indexGet("a.txt", 0)?.oid,
+    );
+    expect(repo.workspace.repo.store.cachedCommit(result.oid)?.commit).toEqual(
+      repo.workspace.repo.readCommit(result.oid),
+    );
+  });
+
+  it("preserves an empty unpublished message", () => {
+    const workspace = makeRepo("/");
+    const before = workspace.repo.head();
+
+    const result = workspace.repo.store.db.transactionSync(() =>
+      writeUnpublishedCommit(workspace.repo, {
+        message: "",
+        parent: [],
+        identities: {
+          author: {
+            name: "Author",
+            email: "author@example.com",
+            timestamp: 1,
+            timezoneOffset: 0,
+          },
+          committer: {
+            name: "Committer",
+            email: "committer@example.com",
+            timestamp: 2,
+            timezoneOffset: 0,
+          },
+        },
+      }),
+    );
+
+    expect(workspace.repo.readCommit(result.oid).message).toBe("");
+    expect(workspace.repo.head()).toEqual(before);
+  });
+
+  it("publishes the same object through the checked commit seam", () => {
+    const repo = mirror();
+    repo.write("a.txt", "one\n");
+    const first = repo.expectSameCommit("first");
+    repo.write("a.txt", "two\n");
+    stageAll(repo.workspace);
+    const expectedHead = repo.workspace.repo.head();
+    const options = {
+      message: "second\n",
+      parent: [first],
+      identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
+    };
+
+    const unpublished = repo.workspace.repo.store.db.transactionSync(() =>
+      writeUnpublishedCommit(repo.workspace.repo, options),
+    );
+    const published = commitIndex(repo.workspace.repo, { ...options, expectedHead });
+
+    expect(published.oid).toBe(unpublished.oid);
+    expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(unpublished.oid);
+    expect(repo.workspace.repo.readCommit(published.oid).tree).toBe(unpublished.tree);
+  });
+
   it("writes ordered merge parents", () => {
     const repo = mirror();
     repo.write("a.txt", "one\n");
