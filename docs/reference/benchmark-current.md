@@ -1,6 +1,6 @@
 # Current benchmark snapshot
 
-Measured 2026-08-24 at commit `e51d419` on Linux 6.17 and Node 24.4.0:
+Measured 2026-08-24 at commit `a531efa` on Linux 6.17 and Node 24.4.0:
 
 ```bash
 cpu-lease run -n 2 --no-smt -- npm run bench:nextjs

@@ -3,9 +3,9 @@
 > continue, skip, and abort outcomes. Both commands share one authenticated
 > schema-v10 operation journal and one three-tree replay lifecycle; Computer
 > compatibility remains unchanged because its installed interface has no replay
-> methods. Commit map: plan → `ba58f56`; WU1 → `a55ed53`; WU2 → `0c40e45`;
-> WU3 → `36989c5`; shared conflict-label seam → `3dc9b69`; WU4 → `1a8df50`;
-> WU5 → `8bf6c6d`. Verification: `npm run check`; `npm run typecheck`; leased
+> methods. Commit map: plan → `269ccd1`; WU1 → `433cf66`; WU2 → `bab9220`;
+> WU3 → `cac20de`; shared conflict-label seam → `8a72a04`; WU4 → `ada9b22`;
+> WU5 → `7334387`. Verification: `npm run check`; `npm run typecheck`; leased
 > full suite — 90 files and 1,590 tests passed, 5 skipped; leased production
 > build; docs lint. Backlog closed: 14. Deferred: multi-commit rebase and
 > sequencing, reflogs, rename detection, custom merge drivers, signing, hooks,
@@ -29,7 +29,7 @@ one-commit replay seam used by the later
 [bounded rebase sprint](./sprint-2026-08-25-bounded-rebase-sequencer.md) without
 implementing a sequencer here.
 
-## Refs re-verified at HEAD (2026-08-24, `ba85a8b`)
+## Refs re-verified at HEAD (2026-08-24, `f9e3f7e`)
 
 - ✔ The native `Git` surface has merge recovery and stash stubs but no
   cherry-pick or revert methods or types — `src/git/client.ts:102`,
@@ -128,7 +128,7 @@ implementing a sequencer here.
   `commit()`, and hard-reset cleanup. Reopen schema versions 8 and 9 with clean,
   conflicted, ready, corrupt, and orphaned merge rows before choosing the
   migration shape. Prove the existing merge error codes and result shapes at
-  `ba85a8b` before changing storage.
+  `f9e3f7e` before changing storage.
 - **Scope.** Migrate the single durable journal to an operation-kind-aware
   representation for `merge`, `cherry-pick`, and `revert`. Keep one active
   operation per repository and one shared, path-ordered touched snapshot. Store

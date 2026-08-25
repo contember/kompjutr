@@ -4,8 +4,8 @@
 > one final compare-and-set branch publication. Schema v11 adds an authenticated
 > operation-step journal shared with one-commit replay; intermediate rewritten
 > commits remain unpublished until the sequence completes. Commit map: plan →
-> `291fb0f`; WU1 → `9385859`; WU2 → `d8693a8`; WU3 → `d9fd8d4`; WU4 →
-> `4c5b36b`; WU5 → `5bd16c3`. Verification: `npm run typecheck`; `npm run
+> `7409937`; WU1 → `31d588a`; WU2 → `98a49dd`; WU3 → `fba5d3f`; WU4 →
+> `1104999`; WU5 → `244cd03`. Verification: `npm run typecheck`; `npm run
 > check`; leased full suite — 94 files and 1,650 tests passed, 5 skipped; leased
 > production build; docs lint. Backlog closed: 07 and 24. Deferred: interactive
 > rebase, merge replay, `--onto`/`--root`, pull-rebase, reflogs, stash, and the
@@ -27,7 +27,7 @@ directory.
 Consumed backlog items 24 and 07. Backlog 24 was the first implementation unit,
 not a parallel follow-up.
 
-## Refs re-verified at HEAD (2026-08-25, `7b5bc3c`)
+## Refs re-verified at HEAD (2026-08-25, `6370657`)
 
 - ✔ Schema v10 has one wide `git_operation_state` row for `merge`,
   `cherry-pick`, and `revert`, plus a path-ordered touched snapshot. It has no

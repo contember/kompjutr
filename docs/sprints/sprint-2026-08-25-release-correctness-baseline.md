@@ -24,7 +24,7 @@ Scheduled backlog: [05](../backlog/05-ci-and-release-gates.md), 19, 22, 30, and
 32. WU2–WU5 consumed their items. Item 05 remains open until the first hosted CI
 run passes.
 
-## Refs re-verified at HEAD (2026-08-25, `97066d0`)
+## Refs re-verified at HEAD (2026-08-25, `6236815`)
 
 - ✔ There is no checked-in `.github/` workflow. The package is still `0.0.0`,
   while `check`, `typecheck`, `test`, and `build` already exist as independent

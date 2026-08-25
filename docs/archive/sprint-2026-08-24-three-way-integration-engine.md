@@ -1,8 +1,8 @@
 > **OUTCOME — shipped 2026-08-24.** Delivered a mutation-free, bounded
 > three-tree integration engine with byte-exact xdiff text merge, structural and
 > binary conflict stages, batched loose/packed blob reads, and fail-closed SQL,
-> memory, trust, and output gates. Commit map: WU1 → `c4746f0`; WU2 → `cb5e596`
-> with trust fix `9951095`; WU3 → `705431c`; WU4 → `aa33001` and `a16a0cd`.
+> memory, trust, and output gates. Commit map: WU1 → `cb7cb6c`; WU2 → `8694fca`
+> with trust fix `a647f7a`; WU3 → `f49ec94`; WU4 → `672b2cc` and `b7d1759`.
 > Verification: `npm run check`; `npm run typecheck`; leased full suite — 75
 > files, 1,422 passed, 5 skipped; leased production build. Backlog closed: 02.
 > Deferred: public merge lifecycle and physical file/directory conflict
@@ -24,7 +24,7 @@ separate concern.
 Consumed backlog item 02, deleted on ship, and implements
 [ADR 0003](../decisions/0003-port-xdiff-text-merge.md).
 
-## Refs re-verified at HEAD (2026-08-24, `5546a94`)
+## Refs re-verified at HEAD (2026-08-24, `85aa456`)
 
 - ✔ The xdiff boundary is already isolated under LGPL-2.1-or-later, but it only
   exposes two-input line diff and unified output today — `src/core/diff/index.ts:1`,

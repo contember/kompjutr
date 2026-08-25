@@ -3,9 +3,9 @@
 > abort outcomes for the checked-out branch; the compatibility client exposes
 > atomic single-shot merge. Recovery state is authenticated in schema v9, and
 > graph, guard, tree, SQL, and memory limits fail closed. Commit map: WU1 →
-> `6215367`, `497fb7a`; WU2 → `99dfad0`, `12f4f13`, `e84695f`; WU3 →
-> `ad7bd90`, `e8e030e`, `c52491e`; WU4 → `c1c783f`, `49c2d19`; WU5 →
-> `49c2d19`. Verification: `npm run check`; `npm run typecheck`; leased full
+> `326eabf`, `e600a08`; WU2 → `dc1c631`, `aad460b`, `6fcea86`; WU3 →
+> `fdaaec6`, `a36b4cb`, `40105a1`; WU4 → `d1e3202`, `b9b44ed`; WU5 →
+> `b9b44ed`. Verification: `npm run check`; `npm run typecheck`; leased full
 > suite — 82 files, 1,494 passed, 5 skipped; leased production build. Backlog
 > closed: 19. Deferred: pull composition, octopus/unrelated/detached merges,
 > rename detection, custom drivers, signing, hooks, and other listed non-goals.
@@ -24,7 +24,7 @@ atomically, leaves an explicit resumable state, or changes nothing.
 Consumed backlog item 19 and builds directly on the archived
 [three-way integration sprint](./sprint-2026-08-24-three-way-integration-engine.md).
 
-## Refs re-verified at HEAD (2026-08-24, `fb12702`)
+## Refs re-verified at HEAD (2026-08-24, `d0d7a87`)
 
 - ✔ Native `Git.merge()` is still an unsupported stub, while the exported
   `MergeResult` already carries the Computer-compatible `oid`, `alreadyMerged`,

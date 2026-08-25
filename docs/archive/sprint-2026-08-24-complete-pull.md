@@ -4,11 +4,11 @@
 > integration to the complete merge lifecycle. Native conflicts and no-commit
 > results remain restart-safe; compatibility conflicts roll local integration
 > back while retaining fetched objects and tracking refs. Commit map: WU1–WU3 →
-> `2e5f36b`; WU4 → `2e5f36b` plus this archive commit. Verification: `npm run
+> `1c9539f`; WU4 → `1c9539f` plus this archive commit. Verification: `npm run
 > check`; `npm run typecheck`; 150 targeted integration tests; leased production
 > build; leased full suite — 82 files and 1,530 tests passed, 5 skipped, with one
 > unchanged `reads.test.ts` 100 ms wall-clock witness failing at 106.63 ms and
-> reproducing on parent `aa3785e` at 112.64 ms. Backlog closed: 01 and 03.
+> reproducing on parent `c223c09` at 112.64 ms. Backlog closed: 01 and 03.
 > Deferred: rebase, abortable network operations, general interleaving coverage,
 > and the other explicit non-goals below.
 
@@ -28,7 +28,7 @@ successful fetch.
 
 Consumed backlog items 01 and 03, which were deleted on ship.
 
-## Refs re-verified at HEAD (2026-08-24, `9058b51`)
+## Refs re-verified at HEAD (2026-08-24, `6fec57f`)
 
 - ✔ Native `Git.pull()` still accepts only `GitDirOptions`, returns `never`, and
   throws `EUNSUPPORTED`; merge immediately beside it is live —
@@ -308,5 +308,5 @@ unit.
   fetched OID in conflict markers, and covers every captured HEAD/upstream field.
 - 2026-08-24 — The leased full suite had one unrelated timing failure in
   `reads.test.ts`. An isolated no-SMT run reproduced it on the sprint parent
-  `aa3785e`, so it is recorded as a baseline gate exception rather than attributed
+  `c223c09`, so it is recorded as a baseline gate exception rather than attributed
   to pull.
