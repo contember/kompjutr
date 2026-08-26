@@ -67,8 +67,12 @@ and patch interchange.
 |---|---|---|
 | `--initial-branch=<name>` | `defaultBranch` (default `main`) | ★ ✔ |
 | `--bare` | `bare` | ~ recorded as `core.bare` only; every repository is effectively bare, since the object database is never a directory |
-| working directory, `git -C <dir>` | `dir` (default `/`) | ★ ✔ several repositories may share one workspace |
+| working directory, `git -C <dir>` | `dir` (default `/`) | ★ ~ several repositories may share one workspace; `init()` records the checkout in SQLite but does not create `dir` in the filesystem |
 | `--template`, `--separate-git-dir`, `--shared` | — | ✘ |
+
+If `dir` did not exist before `init()`, walking the fresh checkout root returns
+`ENOENT` until a write or explicit directory creation materialises it. Both the
+native and Computer surfaces use this database-only creation path.
 
 ### `git clone` — `clone()`
 
@@ -115,13 +119,14 @@ checkout; another attachment fails with `EBRANCHINUSE` and has no force bypass.
 
 | Git | kompjutr | |
 |---|---|---|
-| `--porcelain=v1` | `formatPorcelainV1(entries)` | ★ ✔ |
-| `--porcelain=v2` | `formatPorcelainV2(details, branch?)` | ✔ ordinary, unmerged, untracked, ignored, and optional branch rows |
-| `--short` | `formatShort(entries)` | ★ ✔ |
-| `-z` (NUL-framed output) | — | ★ ✘ the formatters emit newline-framed text; a caller that needs framing-safe paths reads `StatusEntry[]` directly |
+| `--porcelain=v1` | `formatPorcelainV1(entries, options?)` | ★ ✔ |
+| `--porcelain=v2` | `formatPorcelainV2(details, branch?, options?)` | ✔ ordinary, unmerged, untracked, ignored, and optional branch rows |
+| `--short` | `formatShort(entries, options?)` | ★ ✔ |
+| `core.quotePath` | `statusFormatOptions(repo, overrides?)` | ✔ Git boolean syntax, default `true`; an explicit `quotePath` override wins |
+| `-z` (NUL-framed output) | `zeroTerminate: true` | ★ ✔ disables quoting, NUL-terminates every record and branch header, and emits a rename as destination NUL source NUL |
 | `-- <paths>` | `GitStatusOptions.paths` | ~ exact path or directory prefix, no globs |
 | `--ignored` | `GitStatusOptions.includeIgnored` | ✔ ignored entries use `!!` in v1/short and `!` in v2 |
-| `--untracked-files=normal\|all` | `GitStatusOptions.untrackedFiles` | ✔ |
+| `--untracked-files=no\|normal\|all` | `GitStatusOptions.untrackedFiles` | ✔ default `normal`; `no` suppresses untracked and ignored rows, `normal` collapses wholly untracked directories, and `all` lists their files |
 | `-b`, `--branch` header | `statusReport({ branch: true })` | ✔ `oid`, `head`, configured upstream, and bounded ahead/behind counts |
 | rename detection (`R`) | `GitStatusOptions.renames` | ~ exact OID moves only; defaults on |
 | unmerged codes (`U`, `AA`, `DD`) | `StatusDetail.unmerged` | ★ ✔ all seven legal index-stage shapes and porcelain v2 `u` rows |
@@ -137,6 +142,34 @@ explicit `renames` value before `status.renames`, then defaults on. The Computer
 compatibility facade keeps its pinned `dir`-only input, disables rename detection,
 and rejects unmerged rows that its installed interface cannot express.
 
+In newline mode the formatters use Git's C quoting for control bytes, double
+quotes, and backslashes. With `quotePath: true`, they also octal-escape each
+non-ASCII UTF-8 byte; `false` leaves valid non-ASCII text raw while still
+quoting unsafe ASCII. Porcelain v1 and short also quote leading or trailing
+spaces, and quote either side of a rename when it contains the literal ` -> `;
+porcelain v2 does not quote a path solely for those conditions. Rename paths
+are always processed independently. The formatters and `statusFormatOptions()`
+are standalone exports from `kompjutr` and `kompjutr/git`, not methods on `Git`
+or the Computer compatibility client. Formatting fails with `E2BIG` rather
+than exceeding its bounded record or output budget.
+
+Git tree names may contain arbitrary non-NUL bytes; kompjutr's path model is
+valid UTF-8 only. Invalid UTF-8 in an authoritative tree name fails with
+`EUNSUPPORTED` before a loose object is published or a pack becomes readable,
+and raw SQL tree-name bytes are validated again during traversal. NUL and
+ill-formed UTF-16 are also rejected at the public formatter boundary.
+
+When a path exists in HEAD, has been removed from the index, and still exists
+in the working tree — the `rm({ cached: true })` shape — status emits both the
+staged deletion and a separate untracked row. The second row follows the same
+ignore and `untrackedFiles` rules as any other untracked path: it is omitted by
+`no`, collapsed by `normal`, listed individually by `all`, or reported as
+ignored when `includeIgnored` requests ignored rows. Status groups ordinary
+rows before untracked rows and ignored rows in eager `status()` and
+`statusReport()` arrays, and therefore in formatted output, with UTF-8 byte
+ordering inside each group. The staged deletion thus precedes the same path's
+untracked row; `statusStream()` remains path/window ordered.
+
 ### `git add` — `add()`
 
 | Git | kompjutr | |
@@ -145,9 +178,12 @@ and rejects unmerged rows that its installed interface cannot express.
 | `-A`, `--all` | `all` | ★ ✔ |
 | `-u`, `--update` | `trackedOnly` (with `all`) | ✔ this is the `commit -a` shape |
 | `-f`, `--force` | `force` | ★ ✔ stage an ignored path |
+| explicitly named ignored path without `--force` | default | ★ ~ succeeds without changing the index, matching isomorphic-git and the Computer contract; the Git CLI fails |
 | `-p`, `-i`, `-N`, `--renormalize` | — | ✘ |
 
-A pathspec that matches nothing throws `PathspecNotFoundError`.
+A pathspec that matches nothing throws `PathspecNotFoundError`. An ignored path
+exists and therefore counts as a match even when it is skipped; `force: true`
+stages it.
 
 ### `git rm` — `rm()`
 
@@ -275,7 +311,8 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 
 | Syntax | |
 |---|---|
-| `HEAD`, branch, tag, `refs/...` | ★ ✔ annotated tags peel to their commit |
+| `HEAD`, branch, lightweight tag, `refs/...` | ★ ✔ resolves the ref's direct object id |
+| annotated tag of a commit | ✔ the bare name remains the tag-object id, matching Git; `^0` peels it to the commit |
 | full 40-char oid | ★ ✔ |
 | abbreviated oid | ✔ resolved by unique prefix |
 | `<rev>~<n>`, `<rev>^<n>`, `<rev>^0` | ★ ✔ chained suffixes allowed |
@@ -308,10 +345,24 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 |---|---|---|
 | `git branch <name> [<start>]` | `name`, `startPoint` | ★ ✔ start point peels annotated tags |
 | `-f`, `--force` | `force` | ✔ |
-| `-d` / `-D` | `branchDelete({ name })` | ★ ~ one spelling; refuses the checked-out branch (`EBRANCHFAIL`), does **not** check whether the branch is merged, and retains bounded recovery history after deletion |
+| `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; retains bounded recovery history |
+| `-D` | `branchDelete({ name, force: true })` | ✔ bypasses only the reachability proof |
 | `--list` | `branchList()` | ✔ names only |
 | `--show-current` | `currentBranch()` | ★ ✔ `undefined` on a detached HEAD |
 | `-m` (rename), `--set-upstream-to`, `--contains`, `-v` | — | ★ ✘ set upstream through `configSet("branch.<n>.remote"/"…merge")`; rename is create-plus-delete |
+
+Safe deletion prefers the branch's configured local or remote-tracking
+upstream when that direct target exists. Otherwise it compares with the active
+checkout's HEAD commit, including a detached HEAD. Invalid, corrupt, or
+over-bound upstream configuration fails closed; shallow or over-budget graph
+proofs fail with `ESHALLOW` or `E2BIG` rather than deleting.
+
+Every checkout in the shared repository is checked before deletion. A branch
+attached to any checkout fails with `EBRANCHFAIL`, even with `force`. Force also
+does not bypass authoritative commit validation, structural bounds, or the
+transactional expected-tip guard that prevents deleting a concurrently moved
+ref. The Computer interface has no `force` field, so its `branchDelete()`
+exposes only the safe default.
 
 ### `git tag` — `tag()`, `tagDelete()`, `tagList()`
 
@@ -361,22 +412,31 @@ consumed inside clone, fetch and push, and never surfaced to the caller.
 | Git | kompjutr | |
 |---|---|---|
 | `<remote>` / explicit URL | `remote` (default `origin`), `url` | ★ ✔ |
-| `<refspec>` | `ref`, `remoteRef` | ★ ~ one branch selector, not refspec syntax — no wildcards, no leading `+`, no namespace outside `refs/heads/*` |
+| no ref selector | default | ✔ fetches every advertised `refs/heads/*`; `singleBranch: true` selects the remote HEAD branch instead |
+| `<refspec>` | `ref`, `remoteRef` | ★ ~ one exact advertised ref selector, not refspec syntax — no wildcards or leading `+` |
 | `FETCH_HEAD` | `fetchHead` in the result | ★ ~ an oid, not a written ref: `reset --hard FETCH_HEAD` becomes `reset({ ref: fetchHead })` |
 | `--depth <n>` | `depth` | ✔ shallow boundaries are recorded and honoured |
-| `--single-branch` | `singleBranch` | ✔ |
-| `--tags` | `tags` | ✔ |
+| `--single-branch` | `singleBranch: true` | ✔ |
+| default tag following | `tags: undefined` | ✔ auto-follows advertised tags whose peeled targets were already held or become held through the selected coverage; an explicit ref selector does not auto-follow other tags |
+| `--tags` | `tags: true` | ✔ fetches every advertised tag |
+| `--no-tags` | `tags: false` | ✔ disables automatic tag following |
 | `--prune` | `prune` | ✔ |
 | `--all`, `--unshallow`, `--deepen`, `--filter`, `--recurse-submodules` | — | ✘ |
 
 Returns `{ defaultBranch, fetchHead }`. Only a complete, validated pack becomes
-readable; an interrupted ingest cannot move a ref.
+readable; an interrupted ingest cannot move a ref. A selected tag is still
+fetched when it is itself the explicit selector. Tag publication authenticates
+annotated chains and never clobbers a different existing local tag. Auto-follow
+silently preserves an existing local tag, while `tags: true` and an explicitly
+selected tag reject a different local target with `ETAGFAIL` and publish no
+refs.
 
 ### `git pull` — `pull()`
 
 | Git | kompjutr | |
 |---|---|---|
 | `<remote> <branch>` | `remote`, `url`, `ref`, `remoteRef` | ✔ falls back to `branch.<n>.remote` / `branch.<n>.merge` |
+| fetch all configured heads / one upstream | `singleBranch` | ~ defaults to canonical all-head coverage for a configured pull; `true` limits head coverage to the upstream |
 | `--ff` (default) / `--no-ff` | `fastForward` | ✔ also reads `pull.ff` |
 | `--ff-only` | `fastForwardOnly` | ✔ |
 | `--no-commit` | `commit: false` | ~ native only |
@@ -385,10 +445,21 @@ readable; an interrupted ingest cannot move a ref.
 | local-path remote | — | ✘ throws `UnsupportedOperationError` |
 | `--autostash`, `--recurse-submodules` | — | ✘ |
 
-Pull targets the checked-out symbolic branch only. Because no SQLite
-transaction spans an HTTP await, a successful fetch stays visible even if the
-integration afterwards refuses (`ESTALEHEAD`, `ESTALEUPSTREAM`, dirty worktree,
-fast-forward-only, or a conflict).
+Pull targets the checked-out symbolic branch only. Its default fetch coverage
+accepts only the canonical
+`+refs/heads/*:refs/remotes/<remote>/*` mapping, updates every advertised head
+and auto-followed tag in that coverage, but integrates exactly the configured or
+explicit upstream commit. A different configured `remote.<name>.fetch` refspec
+fails with `EUNSUPPORTED`; it is not partially interpreted. Setting
+`singleBranch` to `true` limits head coverage to the upstream. A configured
+upstream still auto-follows tags whose peeled targets were already held or
+become held through that coverage, while an explicit `remoteRef` defaults to
+exact, tagless coverage unless `singleBranch: false` requests canonical
+coverage.
+
+Because no SQLite transaction spans an HTTP await, a successful fetch stays
+visible even if the integration afterwards refuses (`ESTALEHEAD`,
+`ESTALEUPSTREAM`, dirty worktree, fast-forward-only, or a conflict).
 
 ### `git push` — `push()`
 
@@ -410,6 +481,14 @@ throws `EDETACHED`.
 All four commands below use the same bounded three-way engine and the same
 durable operation journal, so each survives a Durable Object restart mid-way.
 
+When the two sides put a regular or executable file and a symlink at the same
+path, the symlink stays at the logical path and the regular side is materialised
+at a collision-checked `~<label>` relocation, matching Git. Index stages are
+split by mode class; when a merge base exists, its stage follows the primary or
+relocated path with the same mode class. Continue and abort authenticate both
+physical paths after a reopen. A distinct-type conflict involving a gitlink
+cannot be materialised and fails atomically with `EUNSUPPORTED`.
+
 ### `git merge` — `merge()`, `mergeContinue()`, `mergeAbort()`
 
 | Git | kompjutr | |
@@ -428,7 +507,7 @@ durable operation journal, so each survives a Durable Object restart mid-way.
 | `--allow-unrelated-histories` | — | ✘ unrelated histories are refused |
 
 Conflicts write index stages 1–3 plus marker bytes. A file/directory conflict
-relocates the file side to a collision-checked `~<label>` path.
+also relocates the file side to a collision-checked `~<label>` path.
 
 ### `git cherry-pick` — `cherryPick()` + `…Continue/Skip/Abort()`
 
@@ -507,17 +586,19 @@ Keys the engine actually reads:
 | `user.name`, `user.email` | commit identity |
 | `remote.<name>.url` | fetch/clone/push URL |
 | `remote.<name>.pushurl` | push URL override |
-| `remote.<name>.fetch` | written by clone; not used as a refspec matcher |
-| `branch.<name>.remote`, `branch.<name>.merge` | upstream for pull and push |
+| `remote.<name>.fetch` | written by clone; pull's all-head coverage requires the canonical mapping, status and safe branch deletion recognise its tracking namespace, and standalone `fetch()` does not parse it |
+| `branch.<name>.remote`, `branch.<name>.merge` | upstream for pull, push, status metadata, and safe branch deletion |
 | `pull.ff` | pull fast-forward policy |
 | `pull.rebase` | recognised, then rejected |
+| `core.quotePath` | read by `statusFormatOptions()`; defaults to true |
+| `status.renames`, `diff.renames` | default exact-rename detection for the respective operation |
 | `core.bare` | recorded by `init({ bare: true })`, otherwise inert |
 
 Every other key is stored and returned verbatim but has **no effect** —
 including `core.autocrlf`, `core.fileMode`, `core.ignorecase`,
-`merge.conflictStyle`, and anything under `diff.*` or `gc.*`. The reference
-workload also sets `core.quotePath`, `safe.directory`, `init.defaultBranch` and
-`credential.helper`; all four are inert here.
+`merge.conflictStyle`, other keys under `status.*` or `diff.*`, and anything
+under `gc.*`. The reference workload also sets `safe.directory`,
+`init.defaultBranch` and `credential.helper`; those three are inert here.
 
 ## Not implemented
 
@@ -555,6 +636,11 @@ merge — with these differences:
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
+- `branchDelete()` has no `force` option on the installed Computer interface,
+  so it always uses the native operation's safe merged check;
+- `status()` accepts only `dir` on the installed Computer interface; native
+  callers own `untrackedFiles`, ignored-row, rename, and formatted-output
+  choices;
 - `rm()` remains cached-only, recursive, and unconditional: it removes matching
   index entries without changing working-tree bytes or applying native content
   safety checks;
@@ -574,6 +660,10 @@ limited to 1,024 code units and 32 total `^`/`~` traversals. Divergence retains 
 most 50,000 commits and 32 MiB. A raw-ref name and returned target are each at
 most 1,024 UTF-8 bytes.
 
+Status formatting accepts at most 65,536 output records and 16 MiB of encoded
+output, with a separate 16 MiB retained-string budget. It rejects the first
+excess with `E2BIG` and never truncates.
+
 One shared store has at most 1,024 checkouts. A checkout root is at most 4,096
 UTF-8 bytes, raw `HEAD` is at most 1,024 bytes, and one complete checkout listing
 retains at most 6 MiB. An active reflog-root scan fails closed above 9,727
@@ -591,12 +681,12 @@ headroom total at most 100 MiB minus one byte.
 
 What the ★ marks add up to. Anything the workload issues that is not named below
 is already served by the surface as it stands: clone by branch, add / rm / reset /
-checkout / clean, commit, status (v1 and short, including unmerged rows), merge
-`--ff-only`, rebase with continue and abort plus index-stage conflict resolution,
-branch create and delete, remote add / remove / list, fetch of one branch, force
-push of one branch, linked-checkout add / list / remove / prune, caller-selected
-divergence, offline raw-ref reads, and every local read the agent makes. The
-consumer adapter is outside this package.
+checkout / clean, commit, status (v1 and short, including unmerged rows and NUL
+framing), merge `--ff-only`, rebase with continue and abort plus index-stage
+conflict resolution, branch create and delete, remote add / remove / list, fetch
+of one branch, force push of one branch, linked-checkout add / list / remove /
+prune, caller-selected divergence, offline raw-ref reads, and every local read
+the agent makes. The consumer adapter is outside this package.
 
 ### Hard gaps — no route through the current surface
 
@@ -612,7 +702,7 @@ consumer adapter is outside this package.
 | `diff --binary --full-index <a> <b>` | producing the patch that re-apply consumes ([backlog 44](../backlog/44-patch-interchange.md)) |
 | `update-ref <ref> <new> <old>` compare-and-swap | publishing a rebase result only if the branch has not moved meanwhile ([backlog 39](../backlog/39-plumbing-read-surface.md)) |
 | `rev-parse <rev>^{commit}` / `^{tree}` / `<rev>:<path>` | snapshot parent and tree probes, and a lockfile-changed check ([backlog 46](../backlog/46-rev-parse-revision-syntax.md)) |
-| `status -z`, `diff -z` | NUL-framed path lists parsed by the orchestrator ([backlog 45](../backlog/45-framing-safe-porcelain-output.md)) |
+| `diff -z` | NUL-framed diff path lists parsed by the orchestrator; status formatters already provide NUL framing |
 
 ### Adaptable — the capability exists under another shape
 
