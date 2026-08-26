@@ -155,10 +155,20 @@ export const find: Command = (context) => {
         const absolute = `${start === "/" ? "" : start}/*${trailingLiteral(namePattern ?? "")}`;
         const sql = sqlGlobFor(absolute);
         if (sql !== null) {
-          for (const path of context.fs.glob(start, sql, { limit: 100_000 })) {
-            if (matcher.test(path)) yield encode(`${path}\n`);
+          const pageSize = Math.min(1_000, Math.max(1, (context.limitHint ?? 500) * 2));
+          let after: string | undefined;
+          for (;;) {
+            const page = context.fs.globPage(
+              start,
+              sql,
+              after === undefined ? { limit: pageSize } : { after, limit: pageSize },
+            );
+            for (const path of page.paths) {
+              if (matcher.test(path)) yield encode(`${path}\n`);
+            }
+            if (page.next === null) return;
+            after = page.next;
           }
-          return;
         }
       }
 

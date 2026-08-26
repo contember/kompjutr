@@ -69,6 +69,19 @@ export interface ScanOptions {
   filesOnly?: boolean;
 }
 
+export interface GlobOptions {
+  /** Resume strictly after this canonical path. */
+  after?: string;
+  /** Defaults to 1,000 and cannot exceed 1,000. */
+  limit?: number;
+}
+
+export interface GlobPage {
+  paths: string[];
+  /** Re-call with this cursor. `null` proves this was the final page. */
+  next: string | null;
+}
+
 /** A regular file proven to have contiguous content at discovery time. */
 export interface RegularFileHandle {
   /** Absolute, canonical, real path. */
@@ -248,6 +261,9 @@ export interface Filesystem {
    * The platform caps a GLOB pattern at 50 bytes.
    */
   glob(root: string, pattern: string, options?: { limit?: number }): string[];
+
+  /** A completeness-bearing, keyset-paged glob for bounded consumers. */
+  globPage(root: string, pattern: string, options?: GlobOptions): GlobPage;
 
   // -- bulk writes ---------------------------------------------------
 

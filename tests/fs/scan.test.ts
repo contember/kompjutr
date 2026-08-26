@@ -13,7 +13,7 @@ import { comparePaths, subtreeSuccessor } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
 import { realpath } from "../../src/fs/store/resolve.js";
-import { discoverFiles, glob, scan } from "../../src/fs/store/scan.js";
+import { discoverFiles, glob, globPage, scan } from "../../src/fs/store/scan.js";
 import { writeFiles } from "../../src/fs/store/write.js";
 import {
   type EntryType,
@@ -582,6 +582,29 @@ describe("glob", () => {
       "/repo/src/d00/f001.txt",
       "/repo/src/d00/f002.txt",
     ]);
+  });
+
+  it("pages with an explicit completeness cursor", () => {
+    const first = globPage(BIG.db, BIG.root, "*.txt", { limit: 3 });
+    expect(first.paths).toEqual([
+      "/repo/src/d00/f000.txt",
+      "/repo/src/d00/f001.txt",
+      "/repo/src/d00/f002.txt",
+    ]);
+    expect(first.next).toBe(first.paths[2]);
+
+    const second = globPage(BIG.db, BIG.root, "*.txt", {
+      after: first.next ?? undefined,
+      limit: 3,
+    });
+    expect(second.paths[0]).toBe("/repo/src/d00/f003.txt");
+    expect(new Set([...first.paths, ...second.paths]).size).toBe(6);
+  });
+
+  it("proves completion when the result exactly fills a page", () => {
+    const found = globPage(BIG.db, BIG.root, "*/d01/f00*.txt", { limit: 10 });
+    expect(found.paths).toHaveLength(10);
+    expect(found.next).toBeNull();
   });
 
   it("finds non-ASCII names", () => {

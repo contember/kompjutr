@@ -22,6 +22,11 @@ import {
 } from "./context.js";
 import { compileGlob, sqlGlobFor } from "./glob.js";
 
+const ARGUMENT_COUNT_MAX = 10_000;
+const ARGUMENT_BYTES_MAX = 1_000_000;
+const PATH_PAGE_MAX = 1_000;
+const ENCODER = new TextEncoder();
+
 export interface ExecOptions {
   readonly fs: Filesystem;
   readonly cwd: string;
@@ -202,14 +207,30 @@ function* empty(): ByteStream {
  */
 function expandArguments(args: readonly Argument[], fs: BoundedFs, cwd: string): readonly string[] {
   const out: string[] = [];
+  let bytes = 0;
+  const push = (value: string): void => {
+    const nextBytes = bytes + ENCODER.encode(value).byteLength;
+    if (out.length >= ARGUMENT_COUNT_MAX || nextBytes > ARGUMENT_BYTES_MAX) {
+      throw new ShellLimitError(
+        "arguments",
+        `E2BIG: expanded argv exceeds ${ARGUMENT_COUNT_MAX} entries or ${ARGUMENT_BYTES_MAX} bytes`,
+      );
+    }
+    out.push(value);
+    bytes = nextBytes;
+  };
+
   for (const arg of args) {
     if (arg.kind === "literal") {
-      out.push(arg.value);
+      push(arg.value);
       continue;
     }
-    const matches = expandGlob(arg.pattern, fs, cwd);
-    if (matches.length === 0) out.push(arg.pattern);
-    else out.push(...matches);
+    let matched = false;
+    for (const match of expandGlob(arg.pattern, fs, cwd)) {
+      push(match);
+      matched = true;
+    }
+    if (!matched) push(arg.pattern);
   }
   return out;
 }
@@ -230,7 +251,7 @@ function single(arg: Argument, fs: BoundedFs, cwd: string): string {
  * a shell's does not. Over the ceiling the narrowing is dropped and the
  * subtree is scanned instead — correct either way, only slower.
  */
-function expandGlob(pattern: string, fs: BoundedFs, cwd: string): string[] {
+function* expandGlob(pattern: string, fs: BoundedFs, cwd: string): Generator<string> {
   const absolute = pattern.startsWith("/") ? normalize(pattern) : join(cwd, pattern);
   const fixed = absolute.slice(0, Math.max(0, absolute.search(/[*?[]/)));
   const root = fixed.includes("/") ? fixed.slice(0, fixed.lastIndexOf("/")) || "/" : "/";
@@ -238,21 +259,34 @@ function expandGlob(pattern: string, fs: BoundedFs, cwd: string): string[] {
 
   const sql = sqlGlobFor(absolute);
   if (sql !== null) {
-    return fs.glob(root, sql, { limit: 10_000 }).filter((path) => matcher.test(path));
+    let after: string | undefined;
+    for (;;) {
+      const page = fs.globPage(
+        root,
+        sql,
+        after === undefined ? { limit: PATH_PAGE_MAX } : { after, limit: PATH_PAGE_MAX },
+      );
+      for (const path of page.paths) {
+        if (matcher.test(path)) yield path;
+      }
+      if (page.next === null) return;
+      after = page.next;
+    }
   }
 
-  const found: string[] = [];
   let after: string | undefined;
   for (;;) {
-    const page = fs.scan(root, after === undefined ? { limit: 1_000 } : { after, limit: 1_000 });
+    const page = fs.scan(
+      root,
+      after === undefined ? { limit: PATH_PAGE_MAX } : { after, limit: PATH_PAGE_MAX },
+    );
     for (const entry of page) {
-      if (matcher.test(entry.path)) found.push(entry.path);
+      if (matcher.test(entry.path)) yield entry.path;
     }
-    if (page.length < 1_000) break;
+    if (page.length < PATH_PAGE_MAX) return;
     after = page[page.length - 1]?.path;
-    if (after === undefined) break;
+    if (after === undefined) return;
   }
-  return found;
 }
 
 export function resolve(cwd: string, path: string): string {

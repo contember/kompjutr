@@ -13,6 +13,8 @@ import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
   Filesystem,
+  GlobOptions,
+  GlobPage,
   HandleReadBatch,
   ReadBatch,
   RealPath,
@@ -43,9 +45,9 @@ export const DEFAULT_LIMITS: Limits = {
 
 /** Raised when a ceiling is hit. Carries which one, so the message can say. */
 export class ShellLimitError extends Error {
-  readonly limit: "operations" | "output";
+  readonly limit: "arguments" | "operations" | "output";
 
-  constructor(limit: "operations" | "output", message: string) {
+  constructor(limit: "arguments" | "operations" | "output", message: string) {
     super(message);
     this.name = "ShellLimitError";
     this.limit = limit;
@@ -155,6 +157,11 @@ export class BoundedFs {
   glob(root: string, pattern: string, options?: { limit?: number }): string[] {
     this.#charge();
     return this.fs.glob(root, pattern, options);
+  }
+
+  globPage(root: string, pattern: string, options?: GlobOptions): GlobPage {
+    this.#charge();
+    return this.fs.globPage(root, pattern, options);
   }
 
   writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {

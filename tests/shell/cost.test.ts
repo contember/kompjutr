@@ -186,6 +186,18 @@ describe("the cheap commands stay cheap", () => {
   });
 });
 
+describe("paged find", () => {
+  it("lets a trailing head stop indexed discovery", () => {
+    const fixture = tree(2_000);
+    const bounded = fixture.shell.run("find /repo/src -name '*.ts' | head -5");
+    const unbounded = fixture.shell.run("find /repo/src -name '*.ts'");
+
+    expect(bounded.stdout.split("\n").filter(Boolean)).toHaveLength(5);
+    expect(unbounded.stdout.split("\n").filter(Boolean)).toHaveLength(2_000);
+    expect(bounded.operations).toBeLessThan(unbounded.operations);
+  });
+});
+
 describe("bounds hold even when the agent forgets them", () => {
   it("truncates output rather than filling a context window", () => {
     const storage = new SqliteTestStorage();

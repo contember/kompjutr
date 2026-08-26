@@ -6,7 +6,12 @@ import { currentRev } from "./store/meta.js";
 import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "./store/resolve.js";
-import { discoverFiles, glob as scanGlob, scan as scanPage } from "./store/scan.js";
+import {
+  discoverFiles,
+  glob as scanGlob,
+  globPage as scanGlobPage,
+  scan as scanPage,
+} from "./store/scan.js";
 import { discoverFilesContaining } from "./store/search.js";
 import {
   makeDirectories as makeStoredDirectories,
@@ -17,6 +22,8 @@ import type {
   ContentSearchPage,
   Filesystem,
   FilesystemOptions,
+  GlobOptions,
+  GlobPage,
   ReadBatch,
   RemoveOptions,
   ScanEntry,
@@ -33,7 +40,11 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
 
   const ops = createFilesystemOps(db, { now });
   const scanRoots = new Map<string, ReturnType<typeof realpath>>();
-  const mutated = (): void => scanRoots.clear();
+  const globRoots = new Map<string, ReturnType<typeof realpath>>();
+  const mutated = (): void => {
+    scanRoots.clear();
+    globRoots.clear();
+  };
 
   const readFiles = (paths: readonly string[], readOptions?: { budget?: number }): ReadBatch => {
     const resolved = realpaths(db, paths);
@@ -104,6 +115,14 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     readFileHandles: (handles, handleOptions) => readFileHandles(db, handles, handleOptions),
     readFiles,
     glob: (root, pattern, globOptions) => scanGlob(db, realpath(db, root), pattern, globOptions),
+    globPage(root: string, pattern: string, globOptions: GlobOptions = {}): GlobPage {
+      let resolved = globRoots.get(root);
+      if (resolved === undefined || globOptions.after === undefined) resolved = realpath(db, root);
+      const page = scanGlobPage(db, resolved, pattern, globOptions);
+      if (page.next === null) globRoots.delete(root);
+      else globRoots.set(root, resolved);
+      return page;
+    },
     writeFiles(entries: readonly WriteEntry[], writeOptions?: WriteOptions): void {
       writeStoredFiles(db, entries, writeOptions, now);
       mutated();

@@ -122,3 +122,19 @@ describe("a tree bigger than one discovery page", () => {
     expect(shell.run("grep -rl NEEDLE /repo/src").stdout).toBe("/repo/src/zz-last.ts\n");
   });
 });
+
+describe("argument expansion bounds", () => {
+  it("fails closed on the first path beyond the argv cap", () => {
+    fs.writeFiles(
+      Array.from({ length: 10_001 }, (_, index) => ({
+        path: `/repo/glob/f${String(index).padStart(5, "0")}.txt`,
+        bytes: new Uint8Array(0),
+      })),
+    );
+
+    const run = shell.run("echo /repo/glob/*.txt");
+    expect(run.exitCode).toBe(2);
+    expect(run.stdout).toBe("");
+    expect(run.stderr).toContain("E2BIG");
+  });
+});

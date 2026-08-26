@@ -14,6 +14,8 @@ import {
   type DiscoverFilesOptions,
   type DiscoverFilesPage,
   type EntryType,
+  type GlobOptions,
+  type GlobPage,
   type RealPath,
   type RegularFileHandle,
   S_IFDIR,
@@ -317,4 +319,32 @@ export function glob(
   return db
     .all<{ path: string }>(GLOB_SQL, lower, upper, pattern, options.limit ?? -1)
     .map((row) => row.path);
+}
+
+/** A completeness-bearing glob page, ordered by the path primary key. */
+export function globPage(
+  db: SqlDatabase,
+  root: RealPath,
+  pattern: string,
+  options: GlobOptions = {},
+): GlobPage {
+  validatePattern(pattern, "globPage");
+  const limit = options.limit ?? DISCOVERY_PAGE_MAX;
+  if (!Number.isInteger(limit) || limit < 1 || limit > DISCOVERY_PAGE_MAX) {
+    throw new Error(
+      `globPage: limit must be an integer from 1 to ${DISCOVERY_PAGE_MAX}, got ${limit}`,
+    );
+  }
+
+  const { lower, upper } = subtreeBounds(root);
+  const after =
+    options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
+  const found = db
+    .all<{ path: string }>(GLOB_SQL, after, upper, pattern, limit + 1)
+    .map((row) => row.path);
+  const paths = found.slice(0, limit);
+  return {
+    paths,
+    next: found.length > limit ? (paths[paths.length - 1] ?? null) : null,
+  };
 }
