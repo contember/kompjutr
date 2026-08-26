@@ -338,3 +338,24 @@ counts are recorded in the archived outcome.
   9,329-ref mutation shape enumerates every root in one statement; 11,264 rows
   are accepted and 11,265 fail closed. Root verification passed the 158-test
   focused set, the final 20/20 reflog API set, leased typecheck, and Biome checks.
+- 2026-08-26 — WU2 integration lifecycle landed in `21fc1ea`. Merge journals
+  authenticate whether continuation belongs to `merge` or `pull`; callers cannot
+  choose the reason after restart. Merge, cherry-pick, revert, and rebase publish
+  exact actor/time/reason metadata, direct refs before causal `HEAD`, no history
+  on stale CAS, and one final rebase publication. Independent lifecycle review
+  approved the contract; the pre-cleanup focused suite passed 169/169 tests.
+- 2026-08-26 — The owner confirmed that no Git schema version had been deployed
+  and requested final cleanup instead of preserving development-only upgrades.
+  The v11–v14 migration chain, frozen schemas, and legacy journal encoders were
+  removed in `21fc1ea`; the complete current Git schema is now one version-1
+  initializer. Reopen validates every current object exactly, refuses partial,
+  aliased, oversized, or unsupported schemas before mutation, and retains less
+  than 100 MiB of untrusted metadata. Fresh initialization uses 45 statements
+  and exact reopen uses two. Final schema review approved after 15/15 tests.
+- 2026-08-26 — WU2 network metadata landed in `62105b3`. Clone/fetch/prune,
+  successful push tracking, and pull preserve their two-phase visibility and
+  exact reasons. A failed clone removes provisional history; a rejected pull
+  leaves fetched tracking history but no local `pull` entry; stale or failed
+  pushes write none. The 1/1,000/9,329-ref fetch/prune witnesses use 29/13,
+  29/13, and 41/25 statements. Network verification passed 65/65 tests, and the
+  combined post-cleanup regression set passed 274/274 tests.
