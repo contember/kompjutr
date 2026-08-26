@@ -470,13 +470,14 @@ describe("parsed commit cache", () => {
   });
 
   it("destroy removes derived commit rows with the repository", () => {
-    const store = open();
+    const db = new TestDatabase();
+    const store = open(db);
     store.write("commit", serializeCommit(fixture()));
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
 
     store.destroy();
 
-    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
   });
 
   it("walks one source-validated graph cursor without object payload reads", () => {
