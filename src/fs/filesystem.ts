@@ -1,4 +1,5 @@
 import type { SqlDatabase } from "../sqlite/db.js";
+import { filesystemError } from "./errors.js";
 import { assertComputerImportCurrent } from "./import.js";
 import { createFilesystemOps } from "./ops.js";
 import { initializeFsSchema } from "./schema.js";
@@ -15,6 +16,7 @@ import {
   scan as scanPage,
 } from "./store/scan.js";
 import { discoverFilesContaining } from "./store/search.js";
+import { TOUCH_PATH_LIMIT, touchFiles as touchStoredFiles } from "./store/touch.js";
 import {
   makeDirectories as makeStoredDirectories,
   writeFiles as writeStoredFiles,
@@ -35,6 +37,7 @@ import type {
   RemoveOptions,
   ScanEntry,
   ScanOptions,
+  TouchOptions,
   WriteEntry,
   WriteOptions,
 } from "./types.js";
@@ -166,6 +169,13 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
       const copied = copyStoredFiles(db, resolved, copyOptions, now);
       if (copied > 0) mutated();
       return { copied, remaining: entries.slice(copied) };
+    },
+    touchFiles(paths: readonly string[], touchOptions: TouchOptions = {}): void {
+      if (paths.length > TOUCH_PATH_LIMIT) {
+        throw filesystemError("E2BIG", `touch accepts at most ${TOUCH_PATH_LIMIT} paths`);
+      }
+      touchStoredFiles(db, realpaths(db, paths), touchOptions.mtime ?? now(), touchOptions.create);
+      if (paths.length > 0) mutated();
     },
     makeDirectories(paths: readonly string[]): void {
       makeStoredDirectories(db, paths, now);

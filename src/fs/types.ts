@@ -220,6 +220,13 @@ export interface CopyBatch {
   remaining: CopyEntry[];
 }
 
+export interface TouchOptions {
+  /** Milliseconds. Defaults to the filesystem clock. */
+  mtime?: number;
+  /** Create missing regular files. Default true. */
+  create?: boolean;
+}
+
 export interface RemoveOptions {
   /** Remove directories and everything under them. Default false. */
   recursive?: boolean;
@@ -325,6 +332,9 @@ export interface Filesystem {
 
   /** Copy entries inside SQLite; file BLOBs never enter the isolate. */
   copyFiles(entries: readonly CopyEntry[], options?: CopyOptions): CopyBatch;
+
+  /** Update timestamps as one preflighted mutation without reading content. */
+  touchFiles(paths: readonly string[], options?: TouchOptions): void;
 
   /** Create directories, parents included. Existing ones are left alone. */
   makeDirectories(paths: readonly string[]): void;

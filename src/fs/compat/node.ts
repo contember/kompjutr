@@ -91,6 +91,7 @@ type ReadFileOptions = BufferEncoding | { encoding?: BufferEncoding | null } | n
 type WriteFileOptions = BufferEncoding | { encoding?: BufferEncoding; mode?: number };
 type MkdirOptions = { recursive?: boolean; mode?: number };
 type NodeRmOptions = { recursive?: boolean; force?: boolean };
+type TimeLike = number | string | Date;
 
 interface FdState {
   path: string;
@@ -340,6 +341,27 @@ export class NodeFsCompat {
 
   chmod(path: string, mode: number): Promise<void> {
     this.chmodSync(path, mode);
+    return Promise.resolve();
+  }
+
+  utimesSync(path: string, _atime: TimeLike, mtime: TimeLike): void {
+    this.fs.touchFiles([path], { create: false, mtime: timeMilliseconds(mtime, "utimes") });
+  }
+
+  utimes(path: string, atime: TimeLike, mtime: TimeLike): Promise<void> {
+    this.utimesSync(path, atime, mtime);
+    return Promise.resolve();
+  }
+
+  futimesSync(fd: number, _atime: TimeLike, mtime: TimeLike): void {
+    this.fs.touchFiles([this.#fd(fd).path], {
+      create: false,
+      mtime: timeMilliseconds(mtime, "futimes"),
+    });
+  }
+
+  futimes(fd: number, atime: TimeLike, mtime: TimeLike): Promise<void> {
+    this.futimesSync(fd, atime, mtime);
     return Promise.resolve();
   }
 
@@ -799,6 +821,14 @@ function countOption(value: number | undefined, name: string): number | undefine
   if (!Number.isSafeInteger(value) || value < 0)
     throw new TypeError(`walk ${name} must be a non-negative safe integer`);
   return value;
+}
+
+function timeMilliseconds(value: TimeLike, syscall: string): number {
+  const milliseconds = value instanceof Date ? value.getTime() : Number(value) * 1_000;
+  if (!Number.isFinite(milliseconds) || !Number.isSafeInteger(Math.trunc(milliseconds))) {
+    throw filesystemError("EINVAL", syscall, undefined, "invalid time");
+  }
+  return Math.trunc(milliseconds);
 }
 
 function pathDepth(path: string): number {

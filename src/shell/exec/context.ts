@@ -28,6 +28,7 @@ import type {
   ScanEntry,
   ScanOptions,
   Stat,
+  TouchOptions,
   WriteEntry,
   WriteOptions,
 } from "../../fs/types.js";
@@ -182,6 +183,11 @@ export class BoundedFs {
   copyFiles(entries: readonly CopyEntry[], options?: CopyOptions): CopyBatch {
     this.#charge();
     return this.fs.copyFiles(entries, options);
+  }
+
+  touchFiles(paths: readonly string[], options?: TouchOptions): void {
+    this.#charge();
+    this.fs.touchFiles(paths, options);
   }
 
   makeDirectories(paths: readonly string[]): void {

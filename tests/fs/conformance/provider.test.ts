@@ -14,9 +14,10 @@ import { copyFiles } from "../../../src/fs/store/copy.js";
 import { currentRev } from "../../../src/fs/store/meta.js";
 import { readFileHandles, readFiles } from "../../../src/fs/store/read.js";
 import { removeFiles } from "../../../src/fs/store/remove.js";
-import { realpath, realpathsNoFollow } from "../../../src/fs/store/resolve.js";
+import { realpath, realpaths, realpathsNoFollow } from "../../../src/fs/store/resolve.js";
 import { discoverFiles, glob, globPage, listEntries, scan } from "../../../src/fs/store/scan.js";
 import { discoverFilesContaining } from "../../../src/fs/store/search.js";
+import { touchFiles } from "../../../src/fs/store/touch.js";
 import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
 import type { Filesystem } from "../../../src/fs/types.js";
 import { TestDatabase } from "../../helpers/db.js";
@@ -60,6 +61,8 @@ function createTestProvider(): NodeFsCompat {
       const copied = copyFiles(db, resolved, options);
       return { copied, remaining: entries.slice(copied) };
     },
+    touchFiles: (paths, options) =>
+      touchFiles(db, realpaths(db, paths), options?.mtime ?? FIXED_TIME, options?.create),
     makeDirectories: (paths) => makeDirectories(db, paths),
     removeFiles: (paths, options) => removeFiles(db, paths, options),
     withReadScope: (work) => work(),
@@ -231,6 +234,19 @@ describe("NodeFsCompat — provider shape", () => {
     expect(() => provider.copyFileSync("/dir-link", "/nope")).toThrowError(
       expect.objectContaining({ code: "EISDIR" }),
     );
+  });
+
+  it("utimesSync and futimesSync update mtime without changing content", () => {
+    const provider = createTestProvider();
+    provider.writeFileSync("/file", "content");
+
+    provider.utimesSync("/file", 2, 3);
+    expect(provider.statSync("/file").mtimeMs).toBe(3_000);
+    const fd = provider.openSync("/file", "r");
+    provider.futimesSync(fd, 4, new Date(5_000));
+
+    expect(provider.statSync("/file").mtimeMs).toBe(5_000);
+    expect(provider.readFileSync("/file", "utf8")).toBe("content");
   });
 
   it("realpathSync canonicalises and resolves links", () => {

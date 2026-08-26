@@ -5,8 +5,8 @@
 // `rm -rf` on a 5,000-file tree O(1) rather than O(files).
 
 import { basename, join } from "../../fs/path.js";
-import type { CopyEntry, WriteEntry } from "../../fs/types.js";
-import { type ByteStream, encode } from "../exec/bytes.js";
+import type { CopyEntry } from "../../fs/types.js";
+import type { ByteStream } from "../exec/bytes.js";
 import { type Command, type CommandContext, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { parseFlags, UsageError } from "./flags.js";
@@ -174,20 +174,15 @@ export const mkdir: Command = (context) => {
 };
 
 export const touch: Command = (context) => {
-  if (context.argv.length === 0) return fail(context, "missing file operand", 2);
-  const entries: WriteEntry[] = [];
-  for (const operand of context.argv) {
-    const path = resolve(context.cwd, operand);
-    const stat = context.fs.stat(path);
-    // An existing file keeps its bytes; only the timestamp moves.
-    entries.push(
-      stat === null
-        ? { path, bytes: encode("") }
-        : { path, bytes: context.fs.readFile(path), mode: stat.mode & 0o7777 },
-    );
+  try {
+    const parsed = parseFlags(context.argv, { boolean: new Set(), valued: new Set() });
+    if (parsed.operands.length === 0) return fail(context, "missing file operand", 2);
+    context.fs.touchFiles(parsed.operands.map((operand) => resolve(context.cwd, operand)));
+    return result(nothing());
+  } catch (error) {
+    if (error instanceof UsageError) return fail(context, error.message, 2);
+    throw error;
   }
-  context.fs.writeFiles(entries);
-  return result(nothing());
 };
 
 export const fileCommands: ReadonlyMap<string, Command> = new Map([

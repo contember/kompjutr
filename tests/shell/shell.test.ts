@@ -352,6 +352,35 @@ describe("writing", () => {
     expect(shell.run("mkdir -p /repo/a/b/c").exitCode).toBe(0);
     expect(shell.run("ls /repo/a/b").stdout).toBe("c\n");
   });
+
+  it("touches files, directories, and symlink targets without reading content", () => {
+    let current = 2_000;
+    const touchFs = createFilesystem(new TestDatabase(), { now: () => current });
+    const contentId = new Uint8Array([9, 8, 7]);
+    touchFs.writeFiles([
+      { path: "/repo/file", bytes: ENCODER.encode("content"), mtime: 1_000, contentId },
+      { path: "/repo/directory", mtime: 1_000 },
+      { path: "/repo/link", target: "/repo/file", mtime: 1_000 },
+    ]);
+    const guarded: Filesystem = {
+      ...touchFs,
+      readFile: () => {
+        throw new Error("touch read content");
+      },
+      readFiles: () => {
+        throw new Error("touch read content");
+      },
+    };
+    const touchShell = createShell({ fs: guarded, cwd: "/repo" });
+    current = 3_000;
+
+    expect(touchShell.run("touch file directory link missing").exitCode).toBe(0);
+    expect(touchFs.stat("/repo/file")).toMatchObject({ mtime: 3_000, contentId });
+    expect(touchFs.stat("/repo/directory")?.mtime).toBe(3_000);
+    expect(touchFs.stat("/repo/link")?.mtime).toBe(1_000);
+    expect(touchFs.stat("/repo/missing")).toMatchObject({ type: "file", size: 0 });
+    expect(touchShell.run("touch -h file").exitCode).toBe(2);
+  });
 });
 
 describe("sed ships two forms", () => {
