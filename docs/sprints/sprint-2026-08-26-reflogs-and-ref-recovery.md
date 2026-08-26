@@ -78,15 +78,21 @@ matrix and recovery witnesses pass.
   bulk tracking-ref behavior before fixing the row semantics.
 - **Scope.** Add schema-v13 reflog state and entry tables with a repository-wide
   monotonic ordinal and a `(repo_id, ref_name, ordinal)` read index. Store
-  nullable old/new OIDs, bounded ref/reason and optional actor fields, integer
-  timestamp/timezone fields, and enough raw-`HEAD` transition information to
-  distinguish a same-OID branch switch. Validate affinities, lengths, OIDs,
-  ordinals, and cross-field shapes both in DDL and on every read. Replace the
+  nullable old/new raw targets and resolved OIDs, bounded ref/reason and optional
+  actor fields, and integer timestamp/timezone fields. Raw targets distinguish
+  absence, direct OIDs, dangling/cyclic symbolic refs, and same-OID retargets;
+  resolved OIDs remain nullable for absent, unborn, or dangling endpoints.
+  Validate affinities, lengths, OIDs, ordinals, and cross-field shapes both in
+  DDL and on every read. Replace the
   five independent write paths with one nested-transaction-safe store seam that
   captures the prior row, applies direct puts/deletes or a raw `HEAD` change,
   appends all required log rows, advances ordinals, and enforces retention
-  atomically. Keep bulk changes JSON-paged and set-based. Migrate v12 by creating
-  empty history; never invent entries for movements that predate v13.
+  atomically. Keep the five existing public method signatures as compatibility
+  wrappers. Preserve bulk final-state semantics: deletes apply before puts and
+  the last duplicate put wins, but history records one pre-state to final-state
+  event per changed ref. Keep bulk changes bounded, JSON-paged, and set-based.
+  Migrate v12 by creating empty history; never invent entries for movements that
+  predate v13.
 - **Acceptance / witness.** Fresh and genuine v12 databases reach v13 with
   identical current refs and empty history. A failed mutation or migration
   leaves both ref and log unchanged. Creation, deletion, detached/symbolic HEAD,
@@ -159,8 +165,9 @@ matrix and recovery witnesses pass.
   stream of distinct active old/new OIDs for future maintenance.
 - **Acceptance / witness.** Listing returns stable, complete pages at 0, 1, 100,
   1,000, and one-over-limit inputs. `HEAD@{0}` through the retained boundary
-  resolves identically to the corresponding listed new OID and composes with
-  the existing bounded `^`/`~` suffixes. Recovery recreates a deleted branch,
+  resolves identically to the corresponding listed non-null new OID and composes
+  with the existing bounded `^`/`~` suffixes; a null selected endpoint fails
+  deterministically. Recovery recreates a deleted branch,
   can select either endpoint, records its own entry, and rejects an expired,
   null, missing-object, corrupt, or stale candidate without mutation. The root
   stream excludes expired entries, deduplicates OIDs in SQL, uses one lazy
@@ -230,8 +237,9 @@ matrix and recovery witnesses pass.
 - The store owns old/new capture, log insertion, ordinal allocation, pruning,
   and ref mutation in one synchronous transaction. Core operations own the
   bounded reason and best available actor metadata.
-- Log resolved OID endpoints, with null only for direct-ref creation/deletion.
-  A raw `HEAD` target change is still an event when both resolved OIDs match.
+- Log bounded raw targets and resolved OID endpoints. Raw null means a named row
+  is absent; OID null may also mean an unborn or dangling symbolic endpoint. A
+  raw target change is still an event when both resolved OIDs match or are null.
   Keep deleted-ref history for the active window instead of copying Git's
   deletion of the per-ref log.
 - Actor identity is optional. Existing commit-like operations reuse their
@@ -288,3 +296,8 @@ counts are recorded in the archived outcome.
   current ref-mutation seams, the 9,329-ref bulk witness, public API gaps, and
   live Git behavior for commit, amend, checkout, reset, branch creation, and
   branch deletion.
+- 2026-08-26 — Independent WU1 step reviews found that nullable OIDs alone cannot
+  represent supported dangling/cyclic symbolic refs or unborn `HEAD`. The frozen
+  row contract now stores bounded raw and resolved endpoints for every entry,
+  keeps existing `RepoStore` signatures as wrappers, and preserves bulk final-
+  state semantics while logging one pre-to-final event per ref.
