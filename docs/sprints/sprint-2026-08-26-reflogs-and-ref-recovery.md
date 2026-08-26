@@ -316,3 +316,17 @@ counts are recorded in the archived outcome.
 - 2026-08-26 — Owner approved both WU2 exceptions. The compatibility change is
   limited to internal context plumbing with no public facade change; branch
   creation plus checkout becomes one atomic operation.
+- 2026-08-26 — WU2a landed in `a991971`. A closed reason union and typed actor/
+  time constructors now drive commit, branch, tag, checkout, hard reset, and
+  plumbing publication; the native and compatibility clients only plumb
+  context. Full checkout and branch-create-plus-checkout are atomic, detached
+  reset moves raw `HEAD`, setup imports leave empty history, and unpublished
+  rebase commits keep their materialization-only cost model. Independent review
+  closed ordinary/sparse rollback, detached-reset, and statement-model findings.
+  The root verification passed 162/162 focused tests, leased typecheck, and the
+  full Biome check; the large sparse checkout witness uses exactly 59 statements.
+- 2026-08-26 — WU3 review froze exclusive ordinal paging, an atomic CAS recovery
+  reasoned `recover-ref`, a lazy validated active-root stream, and decimal
+  `HEAD@{n}`. Because the existing suffix parser was unbounded, WU3 also caps a
+  revision expression at 1,024 code units and 32 total traversal operations;
+  overflow fails with `E2BIG`.
