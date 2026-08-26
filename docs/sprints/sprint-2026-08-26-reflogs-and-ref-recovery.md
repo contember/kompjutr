@@ -301,3 +301,15 @@ counts are recorded in the archived outcome.
   row contract now stores bounded raw and resolved endpoints for every entry,
   keeps existing `RepoStore` signatures as wrappers, and preserves bulk final-
   state semantics while logging one pre-to-final event per ref.
+- 2026-08-26 — WU1 landed in `2a95c4e`. Schema v13 now owns reflog state and
+  entries through lifecycle foreign keys; one atomic store seam validates and
+  logs raw/resolved transitions, nullable-expected CAS, causal `HEAD`, pruning,
+  and byte-ordered bulk updates under a shared 64 MiB retained-memory budget.
+  Independent review closed endpoint, rollback, and bound-before-allocation
+  findings. Focused verification passed 90/90 tests, leased typecheck, and the
+  full Biome check; the 9,329-ref witness stayed below 24 SQL statements.
+- 2026-08-26 — WU2 caller review found two scope decisions before implementation:
+  complete metadata plumbing needs mechanical internal changes in the Computer
+  compatibility client despite the explicit facade exclusion, and atomic
+  branch-create-plus-checkout needs one outer transaction to avoid publishing a
+  branch/reflog entry when checkout later refuses.
