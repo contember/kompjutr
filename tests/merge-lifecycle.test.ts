@@ -7,6 +7,10 @@ import type { GitContext } from "../src/core/context.js";
 import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { merge, mergeAbort, mergeContinue } from "../src/core/ops/merge.js";
+import {
+  MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS,
+  operationRefLogMetadata,
+} from "../src/core/ops/ref-log.js";
 import { add } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git } from "../src/git/client.js";
@@ -103,7 +107,7 @@ function crissCrossDivergence(): CrissCrossHistory {
 }
 
 async function clonedFrom(fixture: GitFixture): Promise<TestRepository> {
-  const workspace = makeRepo("/");
+  const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
   await importFixture(fixture, workspace.repo.store);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", IDENTITY.name);
@@ -131,7 +135,9 @@ function gitIndexLines(fixture: GitFixture): string[] {
 }
 
 function reopen(workspace: TestRepository): { context: GitContext; repo: Repository } {
-  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+    now: workspace.context.now,
+  });
   const row = database.find("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
@@ -156,6 +162,8 @@ function snapshot(workspace: TestRepository): {
   objects: number;
   conflict: string | null;
   sentinel: string | null;
+  reflogEntries: number;
+  reflogOrdinal: number;
 } {
   return {
     refs: workspace.repo.store.listRefs(),
@@ -163,6 +171,16 @@ function snapshot(workspace: TestRepository): {
     objects: workspace.repo.store.objectCount(),
     conflict: textAt(workspace, "conflict.txt"),
     sentinel: textAt(workspace, "sentinel.txt"),
+    reflogEntries:
+      workspace.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ) ?? -1,
+    reflogOrdinal:
+      workspace.repo.store.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ) ?? -1,
   };
 }
 
@@ -223,6 +241,64 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
     expect(workspace.repo.store.indexGet("staged.txt")).toEqual(staged);
     expect(workspace.repo.store.readMergeState()).toBeNull();
+    const named = workspace.repo.store.reflog("refs/heads/main")[0];
+    const head = workspace.repo.store.reflog("HEAD")[0];
+    expect(named).toMatchObject({
+      oldOid: base,
+      newOid: incoming,
+      actor: IDENTITY,
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+      reason: "merge: fast-forward",
+    });
+    expect(head).toMatchObject({
+      oldOid: base,
+      newOid: incoming,
+      actor: IDENTITY,
+      reason: "merge: fast-forward",
+    });
+    if (named === undefined || head === undefined)
+      throw new Error("fast-forward reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
+  });
+
+  it("selects pull publication reasons through the typed merge origin", async () => {
+    const fastForwardFixture = newFixture();
+    fastForwardFixture.write("base.txt", "base\n");
+    fastForwardFixture.commit("base");
+    fastForwardFixture.git("checkout", "-q", "-b", "topic");
+    fastForwardFixture.write("topic.txt", "topic\n");
+    fastForwardFixture.commit("topic");
+    fastForwardFixture.git("checkout", "-q", "main");
+    const fastForward = await clonedFrom(fastForwardFixture);
+
+    merge(
+      fastForward.context,
+      fastForward.repo,
+      fastForward.worktree,
+      { theirs: "topic" },
+      { origin: "pull" },
+    );
+    expect(fastForward.repo.store.reflog("refs/heads/main")[0]?.reason).toBe("pull: fast-forward");
+
+    const history = cleanDivergence();
+    const committed = await clonedFrom(history.fixture);
+    const result = merge(
+      committed.context,
+      committed.repo,
+      committed.worktree,
+      { theirs: "topic" },
+      { origin: "pull" },
+    );
+    if (result.oid === undefined) throw new Error("pull-selected merge returned no commit");
+    expect(committed.repo.store.reflog("refs/heads/main")[0]).toMatchObject({
+      oldOid: history.current,
+      newOid: result.oid,
+      actor: IDENTITY,
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+      reason: "pull: merge",
+    });
   });
 
   it("refuses a fast-forward while the index has unrelated unresolved stages", async () => {
@@ -248,6 +324,8 @@ describe("merge lifecycle", () => {
     expect(snapshot(workspace)).toEqual(before);
     expect(workspace.repo.head().oid).toBe(current);
     expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
   });
 
   it("rejects large dirty-file hashing before the merge SQL limit", async () => {
@@ -289,7 +367,76 @@ describe("merge lifecycle", () => {
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(history.fixture));
     expect(textAt(workspace, "main.txt")).toBe("main\n");
     expect(textAt(workspace, "topic.txt")).toBe("topic\n");
+    const named = workspace.repo.store.reflog("refs/heads/main")[0];
+    const head = workspace.repo.store.reflog("HEAD")[0];
+    expect(named).toMatchObject({
+      oldOid: history.current,
+      newOid: expected,
+      actor: IDENTITY,
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+      reason: "merge: commit",
+    });
+    expect(head).toMatchObject({
+      oldOid: history.current,
+      newOid: expected,
+      reason: "merge: commit",
+    });
+    if (named === undefined || head === undefined) throw new Error("merge reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
+  });
+
+  it("rolls back a clean merge when publication fails after the ref mutation", async () => {
+    const history = cleanDivergence();
+    const workspace = await clonedFrom(history.fixture);
+    const before = snapshot(workspace);
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+      originalUpdate(mutation, metadata);
+      throw new Error("late merge publication fault");
+    };
+
+    expect(() =>
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+    ).toThrow("late merge publication fault");
+
+    expect(snapshot(workspace)).toEqual(before);
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+  });
+
+  it("bounds configured reflog identity reads and skips them for an explicit actor", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Configured");
+    workspace.repo.store.configSet("user.email", "configured@example.com");
+    workspace.storage.resetCounters();
+
+    expect(
+      operationRefLogMetadata(workspace.context, workspace.repo, "merge: fast-forward").actor,
+    ).toEqual({
+      name: "Configured",
+      email: "configured@example.com",
+    });
+    expect(workspace.storage.statementCount).toBe(MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS);
+
+    workspace.storage.resetCounters();
+    expect(
+      operationRefLogMetadata(workspace.context, workspace.repo, "merge: fast-forward", {
+        identity: { name: "Explicit", email: "explicit@example.com" },
+      }).actor,
+    ).toEqual({ name: "Explicit", email: "explicit@example.com" });
+    expect(workspace.storage.statementCount).toBe(0);
+  });
+
+  it("rejects angle brackets in an optional reflog actor", () => {
+    const workspace = makeRepo("/");
+
+    expect(
+      operationRefLogMetadata(workspace.context, workspace.repo, "merge: fast-forward", {
+        identity: { name: "Invalid <Actor", email: "invalid>actor@example.com" },
+      }).actor,
+    ).toBeNull();
   });
 
   it("persists a no-commit merge across reopen and continues with ordered parents", async () => {
@@ -297,14 +444,19 @@ describe("merge lifecycle", () => {
     const workspace = await clonedFrom(history.fixture);
 
     expect(
-      merge(workspace.context, workspace.repo, workspace.worktree, {
-        theirs: "topic",
-        commit: false,
-      }),
+      merge(
+        workspace.context,
+        workspace.repo,
+        workspace.worktree,
+        { theirs: "topic", commit: false },
+        { origin: "pull" },
+      ),
     ).toEqual({ pendingCommit: true });
     expect(workspace.repo.head().oid).toBe(history.current);
     expect(workspace.repo.store.requireMergeState().state.phase).toBe("ready");
     expect(textAt(workspace, "topic.txt")).toBe("topic\n");
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
 
     const cold = reopen(workspace);
     const result = mergeContinue(cold.context, cold.repo);
@@ -312,6 +464,16 @@ describe("merge lifecycle", () => {
     if (result.oid === undefined) throw new Error("merge continuation returned no oid");
     expect(cold.repo.readCommit(result.oid).parent).toEqual([history.current, history.incoming]);
     expect(cold.repo.store.readMergeState()).toBeNull();
+    expect(cold.repo.store.reflog("refs/heads/main")).toEqual([
+      expect.objectContaining({
+        oldOid: history.current,
+        newOid: result.oid,
+        actor: IDENTITY,
+        timestamp: 1_577_836_800,
+        timezoneOffset: 0,
+        reason: "pull: merge",
+      }),
+    ]);
   });
 
   it("rejects before publishing a pending merge that exceeds the continuation index bound", () => {
@@ -487,6 +649,8 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "conflict.txt")).toBe(gitMarkers);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(history.fixture));
     expect(workspace.repo.store.requireMergeState().state.phase).toBe("conflicted");
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
 
     writeWorkFile(workspace, "/conflict.txt", "resolved\n");
     add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
@@ -503,6 +667,16 @@ describe("merge lifecycle", () => {
     expect(commit.message).toBe(`${history.fixture.git("log", "-1", "--format=%B", expected)}\n`);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(history.fixture));
     expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([
+      expect.objectContaining({
+        oldOid: history.current,
+        newOid: expected,
+        actor: IDENTITY,
+        timestamp: 1_577_836_800,
+        timezoneOffset: 0,
+        reason: "merge: commit",
+      }),
+    ]);
   });
 
   it("aborts with exact index and owned-path restoration while preserving sentinels", async () => {

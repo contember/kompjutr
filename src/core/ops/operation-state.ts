@@ -488,60 +488,6 @@ export function operationJournalIntegrityOid(
   return hashObject("blob", utf8.encode(JSON.stringify(payload)));
 }
 
-/** Verify the authenticated vector written by schema v10 before migrating it. */
-export function operationJournalV10IntegrityOid(
-  state: ReplayStateMetadata,
-  touched: readonly MergeTouchedPath[],
-): string {
-  operationJournalV10RetainedBytes(state, touched);
-  const payload: readonly unknown[] = [
-    2,
-    state.kind,
-    [
-      state.originalHeadRef,
-      state.originalHeadOid,
-      state.phase,
-      state.emptyReason,
-      state.sourceOid,
-      state.selectedParentOid,
-      state.mainline,
-      state.currentLabel,
-      state.incomingLabel,
-      state.message,
-      savedIdentityVector(state.author),
-      savedIdentityVector(state.committer),
-    ],
-    touched.map(touchedVector),
-  ];
-  return hashObject("blob", utf8.encode(JSON.stringify(payload)));
-}
-
-export function operationJournalV10RetainedBytes(
-  state: ReplayStateMetadata,
-  touched: readonly MergeTouchedPath[],
-): number {
-  if (touched.length > MAX_MERGE_TOUCHED_PATHS) {
-    throw new GitError(
-      "E2BIG",
-      `operation journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`,
-    );
-  }
-  if (state.phase === "conflicted" && touched.length === 0) {
-    throw new CorruptError("a conflicted replay journal must retain a touched path");
-  }
-  let bytes = validateReplayStateMetadata(state);
-  for (const entry of touched) {
-    bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
-    if (bytes > MAX_MERGE_STATE_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `operation journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`,
-      );
-    }
-  }
-  return bytes;
-}
-
 export function mergeOperationState(state: MergeStateMetadata): MergeOperationStateMetadata {
   return { kind: "merge", ...state };
 }

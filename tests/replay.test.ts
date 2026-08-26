@@ -579,8 +579,9 @@ describe("one-commit replay planner", () => {
     const { store, repo } = harness();
     const rootTree = tree(store, "root\n");
     const root = commit(store, rootTree.tree, [], "root");
-    const exact = "r".repeat(MAX_REPLAY_REVISION_CODE_UNITS);
-    store.setRef(`refs/heads/${exact}`, root);
+    const prefix = "refs/heads/";
+    const exact = `${prefix}${"r".repeat(MAX_REPLAY_REVISION_CODE_UNITS - prefix.length)}`;
+    store.setRef(exact, root);
 
     expect(
       planReplay(repo, { kind: "cherry-pick", source: exact, currentOid: root }).sourceOid,

@@ -45,7 +45,7 @@ function fixture(): GitFixture {
 }
 
 async function imported(source: GitFixture): Promise<TestRepository> {
-  const workspace = makeRepo("/");
+  const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
   await importFixture(source, workspace.repo.store);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", "Fixture");
@@ -54,7 +54,9 @@ async function imported(source: GitFixture): Promise<TestRepository> {
 }
 
 function reopen(workspace: TestRepository): { context: GitContext; repo: Repository } {
-  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+    now: workspace.context.now,
+  });
   const row = database.find("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
@@ -251,10 +253,10 @@ describe("rebase restart recovery", () => {
     const second = source.commit("two");
     source.git("checkout", "-q", "-b", "behind", first);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.updateRefExpected.bind(workspace.repo.store);
-    workspace.repo.store.updateRefExpected = (name, expectedOid, targetOid) => {
-      workspace.repo.store.setRef(name, second);
-      originalUpdate(name, expectedOid, targetOid);
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+      originalUpdate({ puts: [{ name: "refs/heads/behind", target: second }] }, metadata);
+      return originalUpdate(mutation, metadata);
     };
 
     expect(() =>
@@ -266,6 +268,8 @@ describe("rebase restart recovery", () => {
       true,
     );
     expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.store.reflog("refs/heads/behind")).toEqual([]);
+    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
   });
 
   it("rolls conflict files and stages back when journal suspension fails", async () => {
@@ -467,9 +471,9 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.updateRefExpected.bind(workspace.repo.store);
-    workspace.repo.store.updateRefExpected = (name, expectedOid, targetOid) => {
-      originalUpdate(name, expectedOid, targetOid);
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+      originalUpdate(mutation, metadata);
       throw new Error("restart before publication");
     };
 
@@ -479,7 +483,16 @@ describe("rebase restart recovery", () => {
     const durable = reopen(workspace);
     const journal = durable.repo.store.requireOperationState("rebase");
     expect(journal.state.currentStep).toBe(journal.steps.length);
+    expect(journal.state.committer).toEqual({
+      name: "Fixture",
+      email: "fixture@example.com",
+    });
     expect(durable.repo.head().oid).toBe(original);
+    expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
+    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
+    durable.repo.store.configSet("user.name", "Changed after restart");
+    durable.repo.store.configSet("user.email", "changed@example.com");
+    workspace.tick(60_000);
 
     const result: RebaseLifecycleResult = rebaseContinue(
       durable.context,
@@ -490,15 +503,59 @@ describe("rebase restart recovery", () => {
     if (result.outcome !== "completed") throw new Error("rebase did not complete");
     expect(durable.repo.head().oid).toBe(result.oid);
     expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.store.reflog("refs/heads/current")).toEqual([
+      expect.objectContaining({
+        oldOid: original,
+        newOid: result.oid,
+        actor: { name: "Fixture", email: "fixture@example.com" },
+        timestamp: 1_577_836_860,
+        timezoneOffset: 0,
+        reason: "rebase: replay",
+      }),
+    ]);
+  });
+
+  it("retains a completed journal when the final CAS is stale without allocating history", async () => {
+    const source = fixture();
+    const { original, upstream } = history(source);
+    const workspace = await imported(source);
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+      workspace.repo.store.db.run(
+        "UPDATE git_refs SET target = ? WHERE repo_id = ? AND name = 'refs/heads/current'",
+        upstream,
+        workspace.repo.store.repoId,
+      );
+      return originalUpdate(mutation, metadata);
+    };
+
+    expect(() =>
+      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+    ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
+
+    const durable = reopen(workspace);
+    const journal = durable.repo.store.requireOperationState("rebase");
+    expect(journal.state.currentStep).toBe(journal.steps.length);
+    expect(durable.repo.head().oid).toBe(original);
+    expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
+    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
+
+    const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
+    expect(result.outcome).toBe("completed");
+    const named = durable.repo.store.reflog("refs/heads/current")[0];
+    const head = durable.repo.store.reflog("HEAD")[0];
+    if (named === undefined || head === undefined) throw new Error("rebase reflog is missing");
+    expect(named.ordinal).toBe(1);
+    expect(head.ordinal).toBe(2);
   });
 
   it("aborts a cold completed pre-publication journal back to original HEAD", async () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.updateRefExpected.bind(workspace.repo.store);
-    workspace.repo.store.updateRefExpected = (name, expectedOid, targetOid) => {
-      originalUpdate(name, expectedOid, targetOid);
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+      originalUpdate(mutation, metadata);
       throw new Error("restart before completed abort");
     };
     expect(() =>
@@ -514,6 +571,8 @@ describe("rebase restart recovery", () => {
     expect(integrationIndexMatchesTree(durable.repo, durable.repo.readCommit(original).tree)).toBe(
       true,
     );
+    expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
+    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
   });
 
   it("rejects a stale checked-out branch without clearing recovery state", async () => {

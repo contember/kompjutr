@@ -12,6 +12,7 @@ import type { Person } from "../objects.js";
 import type { Repository } from "../repository.js";
 
 const MAX_IDENTITY_BYTES = 1_024;
+export const MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS = 4;
 
 export type RefLogReason =
   | "commit (initial)"
@@ -127,15 +128,13 @@ export function operationRefLogMetadata(
   sources: OptionalRefLogIdentity = {},
 ): RefLogMetadata {
   const env = sources.env ?? {};
-  const config = configuredIdentity(repo);
-  const actor =
-    validActor(sources.identity) ??
-    validActor({
-      name: env.GIT_COMMITTER_NAME ?? env.GIT_AUTHOR_NAME,
-      email: env.GIT_COMMITTER_EMAIL ?? env.GIT_AUTHOR_EMAIL,
-    }) ??
-    config ??
-    validActor(context.defaultIdentity);
+  let actor = validActor(sources.identity);
+  actor ??= validActor({
+    name: env.GIT_COMMITTER_NAME ?? env.GIT_AUTHOR_NAME,
+    email: env.GIT_COMMITTER_EMAIL ?? env.GIT_AUTHOR_EMAIL,
+  });
+  actor ??= configuredIdentity(repo);
+  actor ??= validActor(context.defaultIdentity);
   return stampedMetadata(context, actor, reason);
 }
 
@@ -198,7 +197,9 @@ function validIdentityText(value: string | undefined): value is string {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const unit = value.charCodeAt(index);
-    if (unit === 0 || unit === 0x0a || unit === 0x0d) return false;
+    if (unit === 0 || unit === 0x0a || unit === 0x0d || unit === 0x3c || unit === 0x3e) {
+      return false;
+    }
     if (unit >= 0xd800 && unit <= 0xdbff) {
       const low = value.charCodeAt(index + 1);
       if (low < 0xdc00 || low > 0xdfff) return false;

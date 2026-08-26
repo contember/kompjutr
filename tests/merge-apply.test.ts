@@ -28,6 +28,7 @@ function metadata(repo: Repository, mode: "commit" | "no-commit" = "commit"): Me
     currentParentOid: current,
     incomingParentOid: incoming,
     mode,
+    mergeOrigin: "merge",
     currentLabel: "HEAD",
     incomingLabel: "topic",
     message: "Merge branch 'topic'\n",

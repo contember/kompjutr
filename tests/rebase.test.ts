@@ -26,7 +26,7 @@ function fixture(): GitFixture {
 }
 
 async function imported(source: GitFixture): Promise<TestRepository> {
-  const workspace = makeRepo("/");
+  const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
   await importFixture(source, workspace.repo.store);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", "Fixture");
@@ -40,7 +40,9 @@ function textAt(workspace: TestRepository, path: string): string | null {
 }
 
 function reopenRepo(workspace: TestRepository): Repository {
-  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+    now: workspace.context.now,
+  });
   const row = database.find("/");
   if (row === null) throw new Error("reopened repository is missing");
   return new Repository(database.open(row), "/");
@@ -87,11 +89,11 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
     source.git("rebase", "upstream");
     const expected = source.git("rev-parse", "HEAD");
-    const originalUpdate = workspace.repo.store.updateRefExpected.bind(workspace.repo.store);
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
     let publications = 0;
-    workspace.repo.store.updateRefExpected = (name, expectedOid, targetOid) => {
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
       publications++;
-      originalUpdate(name, expectedOid, targetOid);
+      return originalUpdate(mutation, metadata);
     };
 
     const result = rebase(workspace.context, workspace.repo, workspace.worktree, {
@@ -117,6 +119,23 @@ describe("rebase lifecycle", () => {
     expect(workspace.repo.store.readOperationState()).toBeNull();
     expect(publications).toBe(1);
     expect(original).not.toBe(expected);
+    const named = workspace.repo.store.reflog("refs/heads/current")[0];
+    const head = workspace.repo.store.reflog("HEAD")[0];
+    expect(named).toMatchObject({
+      oldOid: original,
+      newOid: expected,
+      actor: { name: final.committer.name, email: final.committer.email },
+      timestamp: final.committer.timestamp,
+      timezoneOffset: final.committer.timezoneOffset,
+      reason: "rebase: replay",
+    });
+    expect(head).toMatchObject({
+      oldOid: original,
+      newOid: expected,
+      reason: "rebase: replay",
+    });
+    if (named === undefined || head === undefined) throw new Error("rebase reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
   });
 
   it("handles up-to-date and fast-forward histories without a journal", async () => {
@@ -128,7 +147,13 @@ describe("rebase lifecycle", () => {
 
     source.git("checkout", "-q", "-b", "behind", first);
     const behind = await imported(source);
-    expect(rebase(behind.context, behind.repo, behind.worktree, { upstream: second })).toEqual({
+    const fastActor = { name: "Fast Forward", email: "fast-forward@example.com" };
+    expect(
+      rebase(behind.context, behind.repo, behind.worktree, {
+        upstream: second,
+        committer: fastActor,
+      }),
+    ).toEqual({
       outcome: "completed",
       oid: second,
       replayed: 0,
@@ -136,6 +161,25 @@ describe("rebase lifecycle", () => {
       fastForward: true,
     });
     expect(behind.repo.store.readOperationState()).toBeNull();
+    const named = behind.repo.store.reflog("refs/heads/behind")[0];
+    const head = behind.repo.store.reflog("HEAD")[0];
+    expect(named).toMatchObject({
+      oldOid: first,
+      newOid: second,
+      actor: fastActor,
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+      reason: "rebase: fast-forward",
+    });
+    expect(head).toMatchObject({
+      oldOid: first,
+      newOid: second,
+      reason: "rebase: fast-forward",
+    });
+    if (named === undefined || head === undefined) {
+      throw new Error("fast-forward rebase reflog is missing");
+    }
+    expect(head.ordinal).toBe(named.ordinal + 1);
 
     source.git("checkout", "-q", "main");
     const current = await imported(source);
@@ -144,6 +188,8 @@ describe("rebase lifecycle", () => {
       oid: second,
     });
     expect(current.repo.store.readOperationState()).toBeNull();
+    expect(current.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(current.repo.store.reflog("HEAD")).toEqual([]);
   });
 
   it("retains a source-empty commit with its exact message and drops a result-empty commit", async () => {
@@ -178,19 +224,34 @@ describe("rebase lifecycle", () => {
     const redundantUpstream = redundantSource.commit("upstream adds change");
     redundantSource.git("checkout", "-q", "-b", "current", redundantBase);
     redundantSource.write("same.txt", "same\n");
-    redundantSource.commit("current adds same change");
+    const redundantOriginal = redundantSource.commit("current adds same change");
     const redundantWorkspace = await imported(redundantSource);
+    redundantWorkspace.repo.store.configUnset("user.name");
+    redundantWorkspace.repo.store.configUnset("user.email");
 
-    expect(
-      rebase(redundantWorkspace.context, redundantWorkspace.repo, redundantWorkspace.worktree, {
+    const redundantResult = rebase(
+      redundantWorkspace.context,
+      redundantWorkspace.repo,
+      redundantWorkspace.worktree,
+      {
         upstream: redundantUpstream,
-      }),
-    ).toEqual({
+        committer: { name: "Invalid <Actor", email: "invalid>actor@example.com" },
+      },
+    );
+    expect(redundantResult).toEqual({
       outcome: "completed",
       oid: redundantUpstream,
       replayed: 0,
       skipped: 1,
       fastForward: false,
+    });
+    expect(redundantWorkspace.repo.store.reflog("refs/heads/current")[0]).toMatchObject({
+      oldOid: redundantOriginal,
+      newOid: redundantUpstream,
+      actor: null,
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+      reason: "rebase: replay",
     });
   });
 

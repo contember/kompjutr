@@ -7,46 +7,13 @@
 
 import { CorruptError, GitError } from "../core/errors.js";
 import {
-  MAX_MERGE_IDENTITY_BYTES,
-  MAX_MERGE_LABEL_BYTES,
-  MAX_MERGE_MESSAGE_BYTES,
-  MAX_MERGE_PATH_BYTES,
-  MAX_MERGE_REF_BYTES,
-  MAX_MERGE_STATE_BYTES,
-  MAX_MERGE_TOUCHED_PATHS,
-  type MergeIndexSnapshot,
-  type MergeSavedIdentity,
-  type MergeStateMetadata,
-  type MergeTouchedPath,
-  type MergeWorktreeSnapshot,
-  requireMergeInteger,
-  requireMergeMode,
-  requireMergeNullableInteger,
-  requireMergeOid,
-  requireMergePhase,
-  requireMergePurpose,
-  requireMergeText,
-} from "../core/ops/merge-state.js";
-import {
-  type MergeOperationStateMetadata,
-  mergeOperationState,
-  type OperationStepMetadata,
-  operationJournalIntegrityOid,
-  operationJournalRetainedBytes,
-  operationJournalV10IntegrityOid,
-  operationJournalV10RetainedBytes,
-  operationStepsForState,
-  type ReplayStateMetadata,
-} from "../core/ops/operation-state.js";
-import { comparePaths } from "../core/streams.js";
-import {
   BLOB_ID_GENERATION_EXHAUSTED,
   MAX_BLOB_ID_CACHE_ROWS,
   MAX_CACHED_CONTENT_ID_BYTES,
 } from "./blob-id-cache.js";
 import type { SqlDatabase } from "./db.js";
-import { migrateV12 } from "./schema-migration-v12.js";
-import { migrateV13, REFLOG_SCHEMA_STATEMENTS } from "./schema-migration-v13.js";
+import { OPERATION_STATE_TABLE } from "./operation-schema.js";
+import { REFLOG_SCHEMA_STATEMENTS } from "./reflog-schema.js";
 
 export {
   createTreeIndexSink,
@@ -59,7 +26,7 @@ export {
   type TreeStorage,
 } from "./tree-index.js";
 
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 1;
 export { MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 
 const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
@@ -83,56 +50,6 @@ const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
   cache_bytes INTEGER NOT NULL CHECK (typeof(cache_bytes) = 'integer' AND cache_bytes >= 0),
   PRIMARY KEY (repo_id, oid)
 ) WITHOUT ROWID`;
-
-const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_state (
-  repo_id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('merge', 'cherry-pick', 'revert', 'rebase')),
-  original_head_ref TEXT NOT NULL,
-  original_head_oid TEXT NOT NULL,
-  phase TEXT NOT NULL CHECK (phase IN ('conflicted', 'ready', 'empty', 'running')),
-  empty_reason TEXT CHECK (empty_reason IN ('source', 'result')),
-  current_parent_oid TEXT,
-  incoming_parent_oid TEXT,
-  upstream_oid TEXT,
-  base_oid TEXT,
-  mode TEXT CHECK (mode IN ('commit', 'no-commit')),
-  current_step INTEGER NOT NULL,
-  step_count INTEGER NOT NULL,
-  current_label TEXT NOT NULL,
-  incoming_label TEXT NOT NULL,
-  message TEXT NOT NULL,
-  author_name TEXT,
-  author_email TEXT,
-  committer_name TEXT,
-  committer_email TEXT,
-  touched_count INTEGER NOT NULL,
-  retained_bytes INTEGER NOT NULL,
-  integrity_oid TEXT NOT NULL,
-  CHECK (
-    (kind = 'merge' AND phase IN ('conflicted', 'ready') AND empty_reason IS NULL
-       AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NOT NULL
-       AND upstream_oid IS NULL AND base_oid IS NULL AND mode IS NOT NULL
-       AND current_step = 0 AND step_count = 0
-       AND (phase != 'ready' OR mode = 'no-commit'))
-    OR
-    (kind IN ('cherry-pick', 'revert') AND phase IN ('conflicted', 'empty')
-       AND current_parent_oid IS NULL AND incoming_parent_oid IS NULL
-       AND upstream_oid IS NULL AND base_oid IS NULL AND mode IS NULL
-       AND current_step = 0 AND step_count = 1
-       AND ((phase = 'conflicted' AND empty_reason IS NULL)
-         OR (phase = 'empty' AND empty_reason IS NOT NULL)))
-    OR
-    (kind = 'rebase' AND phase IN ('running', 'conflicted') AND empty_reason IS NULL
-       AND current_parent_oid IS NOT NULL AND incoming_parent_oid IS NULL
-       AND upstream_oid IS NOT NULL AND base_oid IS NOT NULL AND mode IS NULL
-       AND typeof(current_step) = 'integer' AND current_step >= 0
-       AND typeof(step_count) = 'integer' AND step_count >= 1
-       AND current_step <= step_count
-       AND (phase != 'conflicted' OR current_step < step_count))
-  ),
-  CHECK ((author_name IS NULL) = (author_email IS NULL)),
-  CHECK ((committer_name IS NULL) = (committer_email IS NULL))
-)`;
 
 const OPERATION_STEPS_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_steps (
   repo_id INTEGER NOT NULL,
@@ -587,453 +504,53 @@ const STATEMENTS = [
    END`,
 ] as const;
 
-// v1 -> v2 added `git_blob_ids`, `git_commits` and `git_objects.stored`.
-// v3 added parsed tree tables. v4 replaces the incomplete, unused commit
-// projection. v5 records the monotonic filesystem revision in index stat data.
-// v6 adds inert index baseline and dirty-path state for sparse status queries.
-// v7 adds source-qualified tree entry lookup by raw name bytes. v8 adds the
-// durable merge journal; v9 binds its rows to one deterministic identity. v10
-// generalizes that journal to replay. v11 moves replay sources into ordered steps.
-
-interface V10OperationRow {
-  repo_id: unknown;
-  kind: unknown;
-  original_head_ref: unknown;
-  original_head_oid: unknown;
-  phase: unknown;
-  empty_reason: unknown;
-  current_parent_oid: unknown;
-  incoming_parent_oid: unknown;
-  mode: unknown;
-  source_oid: unknown;
-  selected_parent_oid: unknown;
-  mainline: unknown;
-  current_label: unknown;
-  incoming_label: unknown;
-  message: unknown;
-  author_name: unknown;
-  author_email: unknown;
-  committer_name: unknown;
-  committer_email: unknown;
-  touched_count: unknown;
-  retained_bytes: unknown;
-  integrity_oid: unknown;
+interface ExpectedSchemaObject {
+  type: string;
+  sql: string;
 }
 
-interface V10TouchedRow {
-  ordinal: unknown;
-  path: unknown;
-  logical_path: unknown;
-  purpose: unknown;
-  index_stage: unknown;
-  index_mode: unknown;
-  index_oid: unknown;
-  index_size: unknown;
-  index_mtime: unknown;
-  index_ino: unknown;
-  index_rev: unknown;
-  worktree_kind: unknown;
-  worktree_mode: unknown;
-  worktree_oid: unknown;
-  worktree_revision: unknown;
+function expectedSchemaObject(statement: string): [string, ExpectedSchemaObject] {
+  const match = /^CREATE (TABLE|INDEX|VIEW|TRIGGER) IF NOT EXISTS ([a-z_]+)/.exec(statement);
+  const type = match?.[1]?.toLowerCase();
+  const name = match?.[2];
+  if (type === undefined || name === undefined) {
+    throw new Error("git schema contains an unrecognized definition");
+  }
+  return [name, { type, sql: statement.replace(" IF NOT EXISTS", "") }];
 }
 
-function migrationIdentity(
-  name: unknown,
-  email: unknown,
-  label: string,
-): MergeSavedIdentity | null {
-  if (name === null && email === null) return null;
-  if (name === null || email === null) {
-    throw new CorruptError(`operation ${label} identity row is incomplete`);
-  }
-  return {
-    name: requireMergeText(name, `${label} name`),
-    email: requireMergeText(email, `${label} email`),
-  };
+const EXPECTED_SCHEMA_OBJECTS = new Map(STATEMENTS.map(expectedSchemaObject));
+if (EXPECTED_SCHEMA_OBJECTS.size !== STATEMENTS.length) {
+  throw new Error("git schema contains duplicate definitions");
 }
 
-function migrationIndex(row: V10TouchedRow): MergeIndexSnapshot | null {
-  const fields = [
-    row.index_stage,
-    row.index_mode,
-    row.index_oid,
-    row.index_size,
-    row.index_mtime,
-    row.index_ino,
-    row.index_rev,
-  ];
-  if (fields.every((field) => field === null)) return null;
-  if (row.index_stage !== 0) throw new CorruptError("merge index snapshot has an invalid stage");
-  return {
-    stage: 0,
-    mode: requireMergeInteger(row.index_mode, "index mode"),
-    oid: requireMergeOid(row.index_oid, "index oid"),
-    size: requireMergeNullableInteger(row.index_size, "index size"),
-    mtime: requireMergeNullableInteger(row.index_mtime, "index mtime"),
-    ino: requireMergeNullableInteger(row.index_ino, "index inode"),
-    rev: requireMergeNullableInteger(row.index_rev, "index revision"),
-  };
-}
-
-function migrationWorktree(row: V10TouchedRow): MergeWorktreeSnapshot {
-  const kind = requireMergeText(row.worktree_kind, "worktree kind");
-  if (kind === "absent") {
-    if (row.worktree_mode !== null || row.worktree_oid !== null || row.worktree_revision !== null) {
-      throw new CorruptError("absent merge worktree snapshot retained metadata");
-    }
-    return { kind };
-  }
-  const mode = requireMergeInteger(row.worktree_mode, "worktree mode");
-  const revision = requireMergeInteger(row.worktree_revision, "worktree revision");
-  if (kind === "directory") {
-    if (row.worktree_oid !== null) {
-      throw new CorruptError("merge directory snapshot retained an object id");
-    }
-    return { kind, mode, revision };
-  }
-  if (kind === "file" || kind === "symlink") {
-    return { kind, mode, oid: requireMergeOid(row.worktree_oid, "worktree oid"), revision };
-  }
-  throw new CorruptError("merge journal has an invalid worktree kind");
-}
-
-function migrationTouched(db: SqlDatabase, repoId: number, count: number): MergeTouchedPath[] {
-  if (count > MAX_MERGE_TOUCHED_PATHS) {
-    throw new CorruptError("operation journal retained too many touched paths");
-  }
-  const touched: MergeTouchedPath[] = [];
-  let previousPath: string | null = null;
-  for (const raw of db.iterate(
-    `SELECT CASE WHEN typeof(ordinal) = 'integer'
-                          AND ordinal >= 0 AND ordinal < ${MAX_MERGE_TOUCHED_PATHS}
-                 THEN ordinal END AS ordinal,
-            CASE WHEN typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ${MAX_MERGE_PATH_BYTES}
-                 THEN path END AS path,
-            CASE WHEN typeof(logical_path) = 'text'
-                       AND length(CAST(logical_path AS BLOB)) <= ${MAX_MERGE_PATH_BYTES}
-                 THEN logical_path END AS logical_path,
-            CASE WHEN typeof(purpose) = 'text' AND length(CAST(purpose AS BLOB)) <= 19
-                 THEN purpose END AS purpose,
-            index_stage, index_mode,
-            CASE WHEN index_oid IS NULL THEN NULL
-                 WHEN typeof(index_oid) = 'text' AND length(CAST(index_oid AS BLOB)) = 40
-                 THEN index_oid ELSE 0 END AS index_oid,
-            index_size, index_mtime, index_ino, index_rev,
-            CASE WHEN typeof(worktree_kind) = 'text'
-                       AND length(CAST(worktree_kind AS BLOB)) <= 9
-                 THEN worktree_kind END AS worktree_kind,
-            worktree_mode,
-            CASE WHEN worktree_oid IS NULL THEN NULL
-                 WHEN typeof(worktree_oid) = 'text' AND length(CAST(worktree_oid AS BLOB)) = 40
-                 THEN worktree_oid ELSE 0 END AS worktree_oid,
-            worktree_revision
-       FROM git_operation_touched WHERE repo_id = ? ORDER BY ordinal`,
-    repoId,
-  )) {
-    const row: V10TouchedRow = {
-      ordinal: raw.ordinal,
-      path: raw.path,
-      logical_path: raw.logical_path,
-      purpose: raw.purpose,
-      index_stage: raw.index_stage,
-      index_mode: raw.index_mode,
-      index_oid: raw.index_oid,
-      index_size: raw.index_size,
-      index_mtime: raw.index_mtime,
-      index_ino: raw.index_ino,
-      index_rev: raw.index_rev,
-      worktree_kind: raw.worktree_kind,
-      worktree_mode: raw.worktree_mode,
-      worktree_oid: raw.worktree_oid,
-      worktree_revision: raw.worktree_revision,
-    };
-    const ordinal = requireMergeInteger(row.ordinal, "touched-path ordinal");
-    if (ordinal !== touched.length || touched.length >= count) {
-      throw new CorruptError("operation touched-path ordinals are not contiguous");
-    }
-    const entry: MergeTouchedPath = {
-      path: requireMergeText(row.path, "touched path"),
-      logicalPath: requireMergeText(row.logical_path, "logical path"),
-      purpose: requireMergePurpose(row.purpose),
-      index: migrationIndex(row),
-      worktree: migrationWorktree(row),
-    };
-    if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-      throw new CorruptError("operation touched paths are not in strict Git path order");
-    }
-    touched.push(entry);
-    previousPath = entry.path;
-  }
-  if (touched.length !== count) {
-    throw new CorruptError("operation touched-path count does not match its rows");
-  }
-  return touched;
-}
-
-function insertMigratedOperation(
-  db: SqlDatabase,
-  repoId: number,
-  state: MergeOperationStateMetadata | ReplayStateMetadata,
-  steps: readonly OperationStepMetadata[],
-  touched: readonly MergeTouchedPath[],
-  retainedBytes: number,
-  integrityOid: string,
-): void {
-  db.run(
-    `INSERT INTO git_operation_state
-       (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
-        current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
-        current_step, step_count, current_label, incoming_label, message,
-        author_name, author_email, committer_name, committer_email,
-        touched_count, retained_bytes, integrity_oid)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    repoId,
-    state.kind,
-    state.originalHeadRef,
-    state.originalHeadOid,
-    state.phase,
-    state.kind === "merge" ? null : state.emptyReason,
-    state.kind === "merge" ? state.currentParentOid : null,
-    state.kind === "merge" ? state.incomingParentOid : null,
-    state.kind === "merge" ? state.mode : null,
-    steps.length,
-    state.currentLabel,
-    state.incomingLabel,
-    state.message,
-    state.author?.name ?? null,
-    state.author?.email ?? null,
-    state.committer?.name ?? null,
-    state.committer?.email ?? null,
-    touched.length,
-    retainedBytes,
-    integrityOid,
+const schemaTextEncoder = new TextEncoder();
+let maxSchemaObjectNameBytes = 0;
+let maxSchemaObjectDefinitionBytes = 0;
+for (const [name, definition] of EXPECTED_SCHEMA_OBJECTS) {
+  maxSchemaObjectNameBytes = Math.max(
+    maxSchemaObjectNameBytes,
+    schemaTextEncoder.encode(name).length,
   );
-  for (let ordinal = 0; ordinal < steps.length; ordinal++) {
-    const step = steps[ordinal];
-    if (step === undefined) throw new CorruptError("v10 migration lost an operation step");
-    db.run(
-      `INSERT INTO git_operation_steps
-         (repo_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      repoId,
-      ordinal,
-      step.sourceOid,
-      step.selectedParentOid,
-      step.mainline,
-      step.outcome,
-      step.resultOid,
-    );
-  }
-}
-
-function migrateV10OperationJournal(db: SqlDatabase): void {
-  db.run("ALTER TABLE git_operation_state RENAME TO git_operation_state_v10");
-  db.run(OPERATION_STATE_TABLE);
-  for (const raw of db.iterate(
-    `SELECT CASE WHEN typeof(repo_id) = 'integer' AND repo_id >= 0
-                            AND repo_id <= ${Number.MAX_SAFE_INTEGER}
-                 THEN repo_id END AS repo_id,
-            CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= 11
-                 THEN kind END AS kind,
-            CASE WHEN typeof(original_head_ref) = 'text'
-                       AND length(CAST(original_head_ref AS BLOB)) <= ${MAX_MERGE_REF_BYTES}
-                 THEN original_head_ref END AS original_head_ref,
-            CASE WHEN typeof(original_head_oid) = 'text'
-                       AND length(CAST(original_head_oid AS BLOB)) = 40
-                 THEN original_head_oid END AS original_head_oid,
-            CASE WHEN typeof(phase) = 'text' AND length(CAST(phase AS BLOB)) <= 10
-                 THEN phase END AS phase,
-            CASE WHEN empty_reason IS NULL THEN NULL
-                 WHEN typeof(empty_reason) = 'text' AND length(CAST(empty_reason AS BLOB)) <= 6
-                 THEN empty_reason ELSE 0 END AS empty_reason,
-            CASE WHEN current_parent_oid IS NULL THEN NULL
-                 WHEN typeof(current_parent_oid) = 'text'
-                       AND length(CAST(current_parent_oid AS BLOB)) = 40
-                 THEN current_parent_oid ELSE 0 END AS current_parent_oid,
-            CASE WHEN incoming_parent_oid IS NULL THEN NULL
-                 WHEN typeof(incoming_parent_oid) = 'text'
-                       AND length(CAST(incoming_parent_oid AS BLOB)) = 40
-                 THEN incoming_parent_oid ELSE 0 END AS incoming_parent_oid,
-            CASE WHEN mode IS NULL THEN NULL
-                 WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
-                 THEN mode ELSE 0 END AS mode,
-            CASE WHEN source_oid IS NULL THEN NULL
-                 WHEN typeof(source_oid) = 'text' AND length(CAST(source_oid AS BLOB)) = 40
-                 THEN source_oid ELSE 0 END AS source_oid,
-            CASE WHEN selected_parent_oid IS NULL THEN NULL
-                 WHEN typeof(selected_parent_oid) = 'text'
-                       AND length(CAST(selected_parent_oid AS BLOB)) = 40
-                 THEN selected_parent_oid ELSE 0 END AS selected_parent_oid,
-            CASE WHEN mainline IS NULL THEN NULL
-                 WHEN typeof(mainline) = 'integer' AND mainline >= 1
-                      AND mainline <= ${Number.MAX_SAFE_INTEGER}
-                 THEN mainline ELSE -1 END AS mainline,
-            CASE WHEN typeof(current_label) = 'text'
-                       AND length(CAST(current_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
-                 THEN current_label END AS current_label,
-            CASE WHEN typeof(incoming_label) = 'text'
-                       AND length(CAST(incoming_label AS BLOB)) <= ${MAX_MERGE_LABEL_BYTES}
-                 THEN incoming_label END AS incoming_label,
-            CASE WHEN typeof(message) = 'text'
-                       AND length(CAST(message AS BLOB)) <= ${MAX_MERGE_MESSAGE_BYTES}
-                 THEN message END AS message,
-            CASE WHEN author_name IS NULL THEN NULL
-                 WHEN typeof(author_name) = 'text'
-                       AND length(CAST(author_name AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
-                 THEN author_name ELSE 0 END AS author_name,
-            CASE WHEN author_email IS NULL THEN NULL
-                 WHEN typeof(author_email) = 'text'
-                       AND length(CAST(author_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
-                 THEN author_email ELSE 0 END AS author_email,
-            CASE WHEN committer_name IS NULL THEN NULL
-                 WHEN typeof(committer_name) = 'text'
-                       AND length(CAST(committer_name AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
-                 THEN committer_name ELSE 0 END AS committer_name,
-            CASE WHEN committer_email IS NULL THEN NULL
-                 WHEN typeof(committer_email) = 'text'
-                       AND length(CAST(committer_email AS BLOB)) <= ${MAX_MERGE_IDENTITY_BYTES}
-                 THEN committer_email ELSE 0 END AS committer_email,
-            CASE WHEN typeof(touched_count) = 'integer' AND touched_count >= 0
-                       AND touched_count <= ${MAX_MERGE_TOUCHED_PATHS}
-                 THEN touched_count END AS touched_count,
-            CASE WHEN typeof(retained_bytes) = 'integer' AND retained_bytes >= 0
-                       AND retained_bytes <= ${MAX_MERGE_STATE_BYTES}
-                 THEN retained_bytes END AS retained_bytes,
-            CASE WHEN typeof(integrity_oid) = 'text'
-                       AND length(CAST(integrity_oid AS BLOB)) = 40
-                 THEN integrity_oid END AS integrity_oid
-       FROM git_operation_state_v10 ORDER BY repo_id`,
-  )) {
-    const row: V10OperationRow = {
-      repo_id: raw.repo_id,
-      kind: raw.kind,
-      original_head_ref: raw.original_head_ref,
-      original_head_oid: raw.original_head_oid,
-      phase: raw.phase,
-      empty_reason: raw.empty_reason,
-      current_parent_oid: raw.current_parent_oid,
-      incoming_parent_oid: raw.incoming_parent_oid,
-      mode: raw.mode,
-      source_oid: raw.source_oid,
-      selected_parent_oid: raw.selected_parent_oid,
-      mainline: raw.mainline,
-      current_label: raw.current_label,
-      incoming_label: raw.incoming_label,
-      message: raw.message,
-      author_name: raw.author_name,
-      author_email: raw.author_email,
-      committer_name: raw.committer_name,
-      committer_email: raw.committer_email,
-      touched_count: raw.touched_count,
-      retained_bytes: raw.retained_bytes,
-      integrity_oid: raw.integrity_oid,
-    };
-    const repoId = requireMergeInteger(row.repo_id, "repository id");
-    const common = {
-      originalHeadRef: requireMergeText(row.original_head_ref, "original HEAD ref"),
-      originalHeadOid: requireMergeOid(row.original_head_oid, "original HEAD"),
-      currentLabel: requireMergeText(row.current_label, "current label"),
-      incomingLabel: requireMergeText(row.incoming_label, "incoming label"),
-      message: requireMergeText(row.message, "message"),
-      author: migrationIdentity(row.author_name, row.author_email, "author"),
-      committer: migrationIdentity(row.committer_name, row.committer_email, "committer"),
-    };
-    const touchedCount = requireMergeInteger(row.touched_count, "touched-path count");
-    const touched = migrationTouched(db, repoId, touchedCount);
-    const storedBytes = requireMergeInteger(row.retained_bytes, "retained-byte count");
-    const storedIntegrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
-    let state: MergeOperationStateMetadata | ReplayStateMetadata;
-    let steps: readonly OperationStepMetadata[];
-    let legacyBytes: number;
-    let legacyIntegrityOid: string;
-    if (row.kind === "merge") {
-      if (
-        row.empty_reason !== null ||
-        row.source_oid !== null ||
-        row.selected_parent_oid !== null ||
-        row.mainline !== null
-      ) {
-        throw new CorruptError("v10 merge journal retained replay fields");
-      }
-      const mergeState: MergeStateMetadata = {
-        ...common,
-        currentParentOid: requireMergeOid(row.current_parent_oid, "current parent"),
-        incomingParentOid: requireMergeOid(row.incoming_parent_oid, "incoming parent"),
-        phase: requireMergePhase(row.phase),
-        mode: requireMergeMode(row.mode),
-      };
-      state = mergeOperationState(mergeState);
-      steps = [];
-      legacyBytes = operationJournalRetainedBytes(state, touched, steps);
-      legacyIntegrityOid = operationJournalIntegrityOid(state, touched, steps);
-    } else if (row.kind === "cherry-pick" || row.kind === "revert") {
-      if (
-        row.current_parent_oid !== null ||
-        row.incoming_parent_oid !== null ||
-        row.mode !== null
-      ) {
-        throw new CorruptError("v10 replay journal retained merge fields");
-      }
-      if (row.phase !== "conflicted" && row.phase !== "empty") {
-        throw new CorruptError("replay journal has an invalid phase");
-      }
-      if (
-        row.empty_reason !== null &&
-        row.empty_reason !== "source" &&
-        row.empty_reason !== "result"
-      ) {
-        throw new CorruptError("replay journal has an invalid empty reason");
-      }
-      const mainline = row.mainline === null ? null : requireMergeInteger(row.mainline, "mainline");
-      if (mainline === 0) throw new CorruptError("replay mainline is not positive");
-      const replayState: ReplayStateMetadata = {
-        kind: row.kind,
-        ...common,
-        phase: row.phase,
-        emptyReason: row.empty_reason,
-        sourceOid: requireMergeOid(row.source_oid, "source"),
-        selectedParentOid:
-          row.selected_parent_oid === null
-            ? null
-            : requireMergeOid(row.selected_parent_oid, "selected parent"),
-        mainline,
-      };
-      state = replayState;
-      steps = operationStepsForState(replayState);
-      legacyBytes = operationJournalV10RetainedBytes(replayState, touched);
-      legacyIntegrityOid = operationJournalV10IntegrityOid(replayState, touched);
-    } else {
-      throw new CorruptError("v10 operation journal has an invalid kind");
-    }
-    if (legacyBytes !== storedBytes) {
-      throw new CorruptError("v10 operation retained-byte count does not match its rows");
-    }
-    if (legacyIntegrityOid !== storedIntegrityOid) {
-      throw new CorruptError("v10 operation integrity identity does not match its rows");
-    }
-    const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
-    const integrityOid = operationJournalIntegrityOid(state, touched, steps);
-    insertMigratedOperation(db, repoId, state, steps, touched, retainedBytes, integrityOid);
-  }
-  const orphaned = db.scalar<unknown>(
-    `SELECT EXISTS(
-       SELECT 1 FROM git_operation_touched touched
-        WHERE NOT EXISTS (
-          SELECT 1 FROM git_operation_state_v10 state WHERE state.repo_id = touched.repo_id
-        ) LIMIT 1
-     )`,
+  maxSchemaObjectDefinitionBytes = Math.max(
+    maxSchemaObjectDefinitionBytes,
+    schemaTextEncoder.encode(definition.sql).length,
   );
-  if (orphaned !== 0 && orphaned !== 1) {
-    throw new CorruptError("v10 operation orphan probe returned an invalid value");
-  }
-  if (orphaned === 1) throw new CorruptError("v10 touched rows exist without operation state");
-  db.run("DROP TABLE git_operation_state_v10");
+}
+const MAX_SCHEMA_OBJECT_ROWS = EXPECTED_SCHEMA_OBJECTS.size + 1;
+const MAX_SCHEMA_OBJECT_RETAINED_BYTES = 100 * 1024 * 1024;
+const MAX_SCHEMA_VERSION_BYTES = String(Number.MAX_SAFE_INTEGER).length;
+const SCHEMA_OBJECT_FIXED_BYTES = 1024 * 1024;
+const maxSchemaObjectRetainedBytes =
+  MAX_SCHEMA_OBJECT_ROWS *
+  (SCHEMA_OBJECT_FIXED_BYTES + 2 * (maxSchemaObjectNameBytes + maxSchemaObjectDefinitionBytes + 7));
+if (maxSchemaObjectRetainedBytes >= MAX_SCHEMA_OBJECT_RETAINED_BYTES) {
+  throw new Error("git schema definitions exceed their retained-memory bound");
 }
 
 const MAX_SCHEMA_INITIALIZATION_STATEMENTS = 999;
 
-class MigrationDatabase implements SqlDatabase {
+class SchemaDatabase implements SqlDatabase {
   #statements = 0;
 
   constructor(private readonly inner: SqlDatabase) {}
@@ -1075,193 +592,151 @@ class MigrationDatabase implements SqlDatabase {
   }
 }
 
-function tableExists(db: SqlDatabase, name: string): boolean {
-  const exists = db.scalar<unknown>(
-    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)",
-    name,
-  );
-  if (exists !== 0 && exists !== 1) throw new CorruptError("schema table probe is invalid");
-  return exists === 1;
-}
-
-const V11_REQUIRED_TABLES = [
-  "git_repositories",
-  "git_refs",
-  "git_config",
-  "git_index",
-  "git_index_state",
-  "git_index_dirty",
-  "git_operation_state",
-  "git_operation_steps",
-  "git_operation_touched",
-  "git_shallow",
-  "git_objects",
-  "git_object_chunks",
-  "git_pack_meta",
-  "git_pack_data",
-  "git_pack_objects",
-  "git_pack_pending",
-];
-
-const V12_REQUIRED_TABLES = [
-  ...V11_REQUIRED_TABLES,
-  "git_blob_ids",
-  "git_blob_id_state",
-  "git_commits",
-  "git_tree_sources",
-  "git_tree_entries",
-  "git_tree_effective",
-];
-
-const V13_REQUIRED_TABLES = [...V12_REQUIRED_TABLES, "git_reflog_state", "git_reflog_entries"];
-
-function requireExistingSchema(db: SqlDatabase, version: number): void {
-  const required =
-    version === 13
-      ? V13_REQUIRED_TABLES
-      : version === 12
-        ? V12_REQUIRED_TABLES
-        : version === 11
-          ? V11_REQUIRED_TABLES
-          : ["git_objects"];
-  const found = new Set<string>();
+function readSchemaObjects(db: SqlDatabase): Map<string, ExpectedSchemaObject> {
+  const objects = new Map<string, ExpectedSchemaObject>();
+  let retainedBytes = 0;
   for (const row of db.iterate(
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name GLOB 'git_*'",
+    `SELECT
+       CASE WHEN typeof(name) = 'text'
+                  AND length(CAST(name AS BLOB)) BETWEEN 1 AND ${maxSchemaObjectNameBytes}
+            THEN name END AS name,
+       CASE WHEN typeof(name) = 'text'
+                  AND length(CAST(name AS BLOB)) BETWEEN 1 AND ${maxSchemaObjectNameBytes}
+            THEN length(CAST(name AS BLOB)) END AS name_bytes,
+       CASE WHEN typeof(type) = 'text' AND length(CAST(type AS BLOB)) BETWEEN 4 AND 7
+            THEN type END AS type,
+       CASE WHEN typeof(sql) = 'text'
+                  AND length(CAST(sql AS BLOB)) BETWEEN 1 AND ${maxSchemaObjectDefinitionBytes}
+            THEN sql END AS sql,
+       CASE WHEN typeof(sql) = 'text'
+                  AND length(CAST(sql AS BLOB)) BETWEEN 1 AND ${maxSchemaObjectDefinitionBytes}
+            THEN length(CAST(sql AS BLOB)) END AS sql_bytes,
+       CASE WHEN typeof(name) = 'text'
+                  AND length(CAST(name AS BLOB)) BETWEEN 1 AND ${maxSchemaObjectNameBytes}
+                  AND typeof(type) = 'text' AND length(CAST(type AS BLOB)) BETWEEN 4 AND 7
+                  AND typeof(sql) = 'text'
+                  AND length(CAST(sql AS BLOB)) BETWEEN 1 AND ${maxSchemaObjectDefinitionBytes}
+            THEN 0 ELSE 1 END AS invalid
+     FROM sqlite_schema
+     WHERE substr(name, 1, 4) COLLATE NOCASE = 'git_'
+     LIMIT ${MAX_SCHEMA_OBJECT_ROWS}`,
   )) {
-    if (typeof row.name !== "string") throw new CorruptError("git schema table probe is invalid");
-    found.add(row.name);
+    if (row.invalid !== 0 && row.invalid !== 1) {
+      throw new CorruptError("git schema object bound sentinel is invalid");
+    }
+    if (row.invalid === 1) {
+      throw new CorruptError("git schema object exceeds its read bound");
+    }
+    if (
+      typeof row.name !== "string" ||
+      typeof row.name_bytes !== "number" ||
+      !Number.isSafeInteger(row.name_bytes) ||
+      row.name_bytes < 1 ||
+      row.name_bytes > maxSchemaObjectNameBytes ||
+      typeof row.type !== "string" ||
+      typeof row.sql !== "string" ||
+      typeof row.sql_bytes !== "number" ||
+      !Number.isSafeInteger(row.sql_bytes) ||
+      row.sql_bytes < 1 ||
+      row.sql_bytes > maxSchemaObjectDefinitionBytes ||
+      !["table", "index", "view", "trigger"].includes(row.type)
+    ) {
+      throw new CorruptError("git schema object probe is invalid");
+    }
+    const rowRetainedBytes = SCHEMA_OBJECT_FIXED_BYTES + 2 * (row.name_bytes + row.sql_bytes + 7);
+    if (rowRetainedBytes >= MAX_SCHEMA_OBJECT_RETAINED_BYTES - retainedBytes) {
+      throw new CorruptError("git schema objects exceed their aggregate read bound");
+    }
+    retainedBytes += rowRetainedBytes;
+    if (objects.has(row.name)) throw new CorruptError("git schema contains a duplicate object");
+    objects.set(row.name, { type: row.type, sql: row.sql });
+    if (objects.size > EXPECTED_SCHEMA_OBJECTS.size) {
+      throw new CorruptError(`git schema contains unexpected object ${row.name}`);
+    }
   }
-  const missing = required.find((name) => !found.has(name));
-  if (missing !== undefined) {
-    throw new CorruptError(`git schema version ${version} is missing required table ${missing}`);
+  return objects;
+}
+
+function requireCurrentSchemaObject(
+  objects: ReadonlyMap<string, ExpectedSchemaObject>,
+  name: string,
+): void {
+  const expected = EXPECTED_SCHEMA_OBJECTS.get(name);
+  if (expected === undefined) throw new Error(`git schema has no definition for ${name}`);
+  const actual = objects.get(name);
+  if (actual === undefined) {
+    throw new CorruptError(`git schema is missing required ${expected.type} ${name}`);
+  }
+  if (actual.type !== expected.type) {
+    throw new CorruptError(
+      `git schema object ${name} is a ${actual.type}, expected ${expected.type}`,
+    );
+  }
+  if (actual.sql !== expected.sql) {
+    throw new CorruptError(`git schema object ${name} does not match its current definition`);
   }
 }
 
-function migrate(db: SqlDatabase, from: number): void {
-  if (from < 2) {
-    db.run("ALTER TABLE git_objects ADD COLUMN stored TEXT NOT NULL DEFAULT 'zlib'");
+function requireCurrentSchema(objects: ReadonlyMap<string, ExpectedSchemaObject>): void {
+  for (const name of EXPECTED_SCHEMA_OBJECTS.keys()) {
+    requireCurrentSchemaObject(objects, name);
   }
-  if (from < 4) {
-    db.run("DROP TABLE git_commits");
-    db.run(COMMIT_TABLE);
-  }
-  if (from < 5) {
-    const hasRevision = db
-      .all<{ name: string }>("PRAGMA table_info(git_index)")
-      .some((column) => column.name === "rev");
-    if (!hasRevision) db.run("ALTER TABLE git_index ADD COLUMN rev INTEGER");
-  }
-  if (from < 9) {
-    const legacyColumns = db.all<{ name: string }>("PRAGMA table_info(git_merge_state)");
-    const hasLegacyJournal = legacyColumns.some((column) => column.name === "repo_id");
-    const hasIntegrity = legacyColumns.some((column) => column.name === "integrity_oid");
-    if (hasLegacyJournal && !hasIntegrity) {
-      db.run("ALTER TABLE git_merge_state ADD COLUMN integrity_oid TEXT NOT NULL DEFAULT ''");
-      // A v8 journal cannot be authenticated after the upgrade.
-      db.run("DELETE FROM git_merge_touched");
-      db.run("DELETE FROM git_merge_state");
+  for (const name of objects.keys()) {
+    if (!EXPECTED_SCHEMA_OBJECTS.has(name)) {
+      throw new CorruptError(`git schema contains unexpected object ${name}`);
     }
   }
-  if (from < 10) {
-    const legacy = db
-      .all<{ name: string }>("PRAGMA table_info(git_merge_state)")
-      .some((column) => column.name === "repo_id");
-    if (legacy) {
-      db.run(
-        `INSERT INTO git_operation_state
-           (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
-            current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
-            current_step, step_count, current_label, incoming_label, message,
-            author_name, author_email, committer_name, committer_email,
-            touched_count, retained_bytes, integrity_oid)
-         SELECT repo_id, 'merge', original_head_ref, original_head_oid, phase, NULL,
-                current_parent_oid, incoming_parent_oid, NULL, NULL, mode, 0, 0,
-                current_label, incoming_label, message, author_name, author_email,
-                committer_name, committer_email, touched_count, retained_bytes, integrity_oid
-           FROM git_merge_state`,
-      );
-      db.run(
-        `INSERT INTO git_operation_touched
-           (repo_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
-            index_oid, index_size, index_mtime, index_ino, index_rev, worktree_kind,
-            worktree_mode, worktree_oid, worktree_revision)
-         SELECT repo_id, ordinal, path, logical_path, purpose, index_stage, index_mode,
-                index_oid, index_size, index_mtime, index_ino, index_rev, worktree_kind,
-                worktree_mode, worktree_oid, worktree_revision
-           FROM git_merge_touched`,
-      );
-      db.run("DROP TABLE git_merge_touched");
-      db.run("DROP TABLE git_merge_state");
-    }
+}
+
+function requireCurrentVersion(db: SqlDatabase): void {
+  const row = db.one<{ value: unknown; invalid: unknown }>(
+    `SELECT
+       CASE WHEN typeof(value) = 'text'
+                  AND length(CAST(value AS BLOB)) BETWEEN 0 AND ${MAX_SCHEMA_VERSION_BYTES}
+            THEN value END AS value,
+       CASE WHEN typeof(value) = 'text'
+                  AND length(CAST(value AS BLOB)) BETWEEN 0 AND ${MAX_SCHEMA_VERSION_BYTES}
+            THEN 0 ELSE 1 END AS invalid
+     FROM git_meta WHERE key = 'schema_version'`,
+  );
+  if (row === undefined) throw new CorruptError("git schema version is missing");
+  if (row.invalid !== 0 && row.invalid !== 1) {
+    throw new CorruptError("git schema version bound sentinel is invalid");
   }
-  if (from === 10) migrateV10OperationJournal(db);
-  if (from < 12) migrateV12(db, STATEMENTS);
-  if (from < 13) migrateV13(db);
+  if (row.invalid === 1) throw new CorruptError("git schema version exceeds its read bound");
+  const recorded = row.value;
+  if (typeof recorded !== "string" || !/^[1-9]\d*$/.test(recorded)) {
+    throw new CorruptError("git schema has an invalid version");
+  }
+  const version = Number(recorded);
+  if (!Number.isSafeInteger(version)) throw new CorruptError("git schema has an invalid version");
+  if (version !== SCHEMA_VERSION) {
+    throw new CorruptError(
+      `git schema version ${version} is unsupported; expected ${SCHEMA_VERSION}`,
+    );
+  }
 }
 
 export function initializeGitSchema(db: SqlDatabase): void {
   db.transactionSync(() => {
-    const bounded = new MigrationDatabase(db);
-    const [meta] = STATEMENTS;
-    const hadMeta = tableExists(bounded, "git_meta");
-    if (!hadMeta) {
-      const existing = bounded.scalar<unknown>(
-        "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name GLOB 'git_*'",
-      );
-      if (!Number.isSafeInteger(existing) || typeof existing !== "number" || existing < 0) {
-        throw new CorruptError("git schema table count is invalid");
-      }
-      if (existing !== 0) {
+    const bounded = new SchemaDatabase(db);
+    const before = readSchemaObjects(bounded);
+    if (before.size !== 0) {
+      if (!before.has("git_meta")) {
         throw new CorruptError("git schema metadata is missing from an existing database");
       }
-      bounded.run(meta);
+      requireCurrentSchemaObject(before, "git_meta");
+      requireCurrentVersion(bounded);
+      requireCurrentSchema(before);
+      return;
     }
-    const recorded = bounded.scalar<unknown>(
-      "SELECT value FROM git_meta WHERE key = 'schema_version'",
-    );
-    if (recorded !== undefined && (typeof recorded !== "string" || !/^[1-9]\d*$/.test(recorded))) {
-      throw new CorruptError("git schema has an invalid version");
-    }
-    const previous = recorded === undefined ? undefined : Number(recorded);
-    if (previous !== undefined && !Number.isSafeInteger(previous)) {
-      throw new CorruptError("git schema has an invalid version");
-    }
-    if (previous !== undefined && previous > SCHEMA_VERSION) {
-      throw new CorruptError(
-        `git schema version ${previous} is newer than supported version ${SCHEMA_VERSION}`,
-      );
-    }
-    if (previous === undefined && hadMeta) {
-      const existing = bounded.scalar<unknown>(
-        "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name != 'git_meta' AND name GLOB 'git_*'",
-      );
-      if (existing !== 0) {
-        throw new CorruptError("git schema version is missing from an existing database");
-      }
-    }
-    if (previous !== undefined) requireExistingSchema(bounded, previous);
-
-    const hasLegacyV11Shape = previous !== undefined && previous < 12;
-    const hasLegacyV12Shape = previous !== undefined && previous < 13;
-    for (const statement of STATEMENTS) {
-      if (
-        hasLegacyV11Shape &&
-        (statement.includes("git_tree_") || statement.includes("git_blob_id"))
-      ) {
-        continue;
-      }
-      if (hasLegacyV12Shape && REFLOG_SCHEMA_STATEMENTS.includes(statement)) continue;
-      bounded.run(statement);
-    }
-
-    // 0 means a fresh database: the CREATEs above already carry the current shape.
-    if (previous !== undefined && previous < SCHEMA_VERSION) migrate(bounded, previous);
 
     for (const statement of STATEMENTS) bounded.run(statement);
-
     bounded.run(
-      "INSERT OR REPLACE INTO git_meta (key, value) VALUES ('schema_version', ?)",
+      "INSERT INTO git_meta (key, value) VALUES ('schema_version', ?)",
       String(SCHEMA_VERSION),
     );
+    requireCurrentSchema(readSchemaObjects(bounded));
+    requireCurrentVersion(bounded);
   });
 }

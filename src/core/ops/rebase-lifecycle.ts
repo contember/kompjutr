@@ -1,7 +1,7 @@
 // Restart-safe execution of one authenticated linear rebase sequence.
 
 import { MAX_OPERATION_MEMORY_BYTES } from "../../sqlite/memory.js";
-import type { IndexEntry } from "../../sqlite/store.js";
+import { type IndexEntry, MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
@@ -36,6 +36,11 @@ import type {
 import { MAX_OPERATION_STEPS } from "./operation-state.js";
 import { planRebase } from "./rebase-plan.js";
 import {
+  MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS,
+  operationRefLogMetadata,
+  persistedRefLogMetadata,
+} from "./ref-log.js";
+import {
   type CheckoutBlockerLimits,
   checkoutBlockersAgainst,
   hardResetBlockersAgainst,
@@ -53,6 +58,7 @@ const REBASE_BASELINE_MAX_ENTRIES = 4_096;
 const REBASE_BASELINE_MAX_BYTES = 32 * 1024 * 1024;
 const REBASE_INTEGRATION_PLAN_BYTES = 20 * 1024 * 1024;
 const REBASE_INTEGRATION_OVERHEAD_BYTES = 2 * 1024 * 1024;
+const REBASE_FINAL_PUBLICATION_SQL_STATEMENTS = 32 + MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS;
 if (
   MAX_MERGE_STATE_BYTES +
     MAX_REPLAY_PLAN_METADATA_BYTES +
@@ -367,6 +373,7 @@ function initialState(
   head: { ref: string; oid: string },
   upstreamOid: string,
   baseOid: string,
+  committer: GitIdentity | null,
 ): RebaseStateMetadata {
   return {
     kind: "rebase",
@@ -381,7 +388,7 @@ function initialState(
     incomingLabel: "REBASE_HEAD",
     message: "",
     author: null,
-    committer: null,
+    committer,
   };
 }
 
@@ -413,6 +420,7 @@ function advance(
   journal: RebaseJournal,
   outcome: "applied" | "skipped",
   resultOid: string | null,
+  committer?: GitIdentity,
 ): void {
   const steps = nextSteps(journal, outcome, resultOid);
   repo.store.replaceOperationJournal(
@@ -422,6 +430,7 @@ function advance(
       phase: "running",
       currentStep: journal.state.currentStep + 1,
       currentParentOid: resultOid ?? journal.state.currentParentOid,
+      committer: committer ?? journal.state.committer,
     },
     steps,
     [],
@@ -553,12 +562,13 @@ function applyOneStep(
               integrationCommitMaterializationSqlStatements(treeStats),
               replayPlanSqlStatements(plan),
             );
+            const identities = stepIdentities(context, repo, plan, options);
             const result = writeUnpublishedCommit(repo, {
               message: plan.sourceCommit.message,
               parent: [journal.state.currentParentOid],
-              identities: stepIdentities(context, repo, plan, options),
+              identities,
             });
-            advance(repo, journal, "applied", result.oid);
+            advance(repo, journal, "applied", result.oid, identities.committer);
             return "advanced";
           }
           if (plan.integration.entries.length === 0) {
@@ -608,12 +618,13 @@ function applyOneStep(
                 advance(repo, journal, "skipped", null);
                 return "advanced";
               }
+              const identities = stepIdentities(context, repo, plan, options);
               const result = writeUnpublishedCommit(repo, {
                 message: plan.sourceCommit.message,
                 parent: [journal.state.currentParentOid],
-                identities: stepIdentities(context, repo, plan, options),
+                identities,
               });
-              advance(repo, journal, "applied", result.oid);
+              advance(repo, journal, "applied", result.oid, identities.committer);
               return "advanced";
             },
           });
@@ -723,7 +734,11 @@ function requireConflictSnapshots(repo: Repository, journal: RebaseJournal): voi
   }
 }
 
-function publishCompleted(repo: Repository, worktree: Worktree): RebaseLifecycleResult {
+function publishCompleted(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+): RebaseLifecycleResult {
   return repo.store.db.transactionSync(() => {
     const journal = repo.store.requireOperationState("rebase");
     requireOriginalHead(repo, journal.state);
@@ -734,11 +749,21 @@ function publishCompleted(repo: Repository, worktree: Worktree): RebaseLifecycle
     if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
       throw new CorruptError("completed rebase baseline changed before publication");
     }
-    requireTransitionBudget(journal, 32);
-    repo.store.updateRefExpected(
-      journal.state.originalHeadRef,
-      journal.state.originalHeadOid,
-      journal.state.currentParentOid,
+    requireTransitionBudget(journal, REBASE_FINAL_PUBLICATION_SQL_STATEMENTS);
+    repo.store.mutateRefs(
+      {
+        expected: {
+          name: journal.state.originalHeadRef,
+          target: journal.state.originalHeadOid,
+        },
+        puts: [
+          {
+            name: journal.state.originalHeadRef,
+            target: journal.state.currentParentOid,
+          },
+        ],
+      },
+      persistedRefLogMetadata(context, journal.state.committer, "rebase: replay"),
     );
     repo.store.clearOperationState();
     return {
@@ -783,7 +808,7 @@ function driveRebase(
       return { outcome: "conflicted", replayed: state.replayed, skipped: state.skipped };
     }
     if (state.currentStep === state.stepCount) {
-      return publishCompleted(repo, worktree);
+      return publishCompleted(context, repo, worktree);
     }
     applyOneStep(context, repo, worktree, state.integrityOid, options);
   }
@@ -827,7 +852,9 @@ export function startRebase(
           plan.relation === "replay" ? REBASE_JOURNAL_CREATE_SQL_STATEMENTS : 0,
           baseline.sqlStatements +
             (abortBaseline?.sqlStatements ?? 0) +
-            (replayPreflight?.sqlStatements ?? 0),
+            (replayPreflight?.sqlStatements ?? 0) +
+            MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS +
+            (plan.relation === "fast-forward" ? MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS : 0),
         ),
       );
       materializeTree(repo, worktree, originalTree, baseline);
@@ -836,11 +863,24 @@ export function startRebase(
         throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
       }
       if (plan.relation === "fast-forward") {
-        repo.store.updateRefExpected(head.ref, head.oid, plan.upstreamOid);
+        repo.store.mutateRefs(
+          {
+            expected: { name: head.ref, target: head.oid },
+            puts: [{ name: head.ref, target: plan.upstreamOid }],
+          },
+          operationRefLogMetadata(context, repo, "rebase: fast-forward", {
+            identity: options.committer,
+            env: options.env,
+          }),
+        );
         return { relation: plan.relation, oid: plan.upstreamOid };
       }
+      const actor = operationRefLogMetadata(context, repo, "rebase: replay", {
+        identity: options.committer,
+        env: options.env,
+      }).actor;
       repo.store.writeOperationJournal(
-        initialState(head, plan.upstreamOid, plan.baseOid),
+        initialState(head, plan.upstreamOid, plan.baseOid, actor),
         plan.steps,
         [],
       );
@@ -919,12 +959,13 @@ export function continueRebase(
             hardMaterializeTree(repo, worktree, currentTree, baseline);
             advance(repo, current, "skipped", null);
           } else {
+            const identities = stepIdentities(context, repo, plan, options);
             const result = writeUnpublishedCommit(repo, {
               message: plan.sourceCommit.message,
               parent: [current.state.currentParentOid],
-              identities: stepIdentities(context, repo, plan, options),
+              identities,
             });
-            advance(repo, current, "applied", result.oid);
+            advance(repo, current, "applied", result.oid, identities.committer);
           }
         } finally {
           planReservation.dispose();

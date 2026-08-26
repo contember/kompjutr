@@ -33,7 +33,7 @@ function fixture(): GitFixture {
 }
 
 async function imported(source: GitFixture): Promise<TestRepository> {
-  const workspace = makeRepo("/");
+  const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
   await importFixture(source, workspace.repo.store);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", IDENTITY.name);
@@ -42,7 +42,9 @@ async function imported(source: GitFixture): Promise<TestRepository> {
 }
 
 function reopen(workspace: TestRepository): { context: GitContext; repo: Repository } {
-  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+    now: workspace.context.now,
+  });
   const row = database.find("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
@@ -62,6 +64,8 @@ function durableSnapshot(workspace: TestRepository): {
   state: ReturnType<Repository["store"]["readOperationState"]>;
   index: ReturnType<Repository["store"]["indexGet"]>[];
   conflict: string | null;
+  reflogEntries: number;
+  reflogOrdinal: number;
 } {
   const row = workspace.storage.sql
     .exec<{ count: number }>("SELECT COUNT(*) AS count FROM git_objects")
@@ -78,6 +82,16 @@ function durableSnapshot(workspace: TestRepository): {
       workspace.repo.store.indexGet("conflict.txt", 3),
     ],
     conflict: textAt(workspace, "conflict.txt"),
+    reflogEntries:
+      workspace.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ) ?? -1,
+    reflogOrdinal:
+      workspace.repo.store.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ) ?? -1,
   };
 }
 
@@ -168,9 +182,9 @@ describe("cherry-pick lifecycle", () => {
           return result;
         };
       } else {
-        const original = workspace.repo.store.setRef.bind(workspace.repo.store);
-        workspace.repo.store.setRef = (name, target) => {
-          original(name, target);
+        const original = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+        workspace.repo.store.mutateRefs = (mutation, metadata) => {
+          original(mutation, metadata);
           throw new Error("fault ref");
         };
       }
@@ -207,6 +221,21 @@ describe("cherry-pick lifecycle", () => {
     expect(commit.message).toBe(original.message);
     expect(textAt(workspace, "picked.txt")).toBe("picked\n");
     expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([
+      expect.objectContaining({
+        oldOid: base,
+        newOid: result.oid,
+        actor: IDENTITY,
+        timestamp: commit.committer.timestamp,
+        timezoneOffset: commit.committer.timezoneOffset,
+        reason: "cherry-pick",
+      }),
+    ]);
+    const named = workspace.repo.store.reflog("refs/heads/main")[0];
+    const head = workspace.repo.store.reflog("HEAD")[0];
+    expect(head).toMatchObject({ oldOid: base, newOid: result.oid, reason: "cherry-pick" });
+    if (named === undefined || head === undefined) throw new Error("cherry-pick reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
   });
 
   it("applies a root commit relative to the empty tree", async () => {
@@ -272,6 +301,8 @@ describe("cherry-pick lifecycle", () => {
       cherryPickSkip(cold.repo, workspace.worktree);
       expect(cold.repo.store.readOperationState()).toBeNull();
       expect(cold.repo.has(base)).toBe(true);
+      expect(cold.repo.store.reflog("refs/heads/main")).toEqual([]);
+      expect(cold.repo.store.reflog("HEAD")).toEqual([]);
     }
   });
 
@@ -299,6 +330,8 @@ describe("cherry-pick lifecycle", () => {
     expect(textAt(workspace, "conflict.txt")).toContain(
       `>>>>>>> ${picked.slice(0, 7)} (topic subject)`,
     );
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
 
     workspace.tick(60_000);
     const cold = reopen(workspace);
@@ -319,6 +352,21 @@ describe("cherry-pick lifecycle", () => {
       timezoneOffset: workspace.context.timezoneOffset(),
     });
     expect(cold.repo.store.readOperationState()).toBeNull();
+    expect(cold.repo.store.reflog("refs/heads/main")).toEqual([
+      expect.objectContaining({
+        oldOid: current,
+        newOid: result.oid,
+        actor: IDENTITY,
+        timestamp: commit.committer.timestamp,
+        timezoneOffset: commit.committer.timezoneOffset,
+        reason: "cherry-pick",
+      }),
+    ]);
+    const named = cold.repo.store.reflog("refs/heads/main")[0];
+    const head = cold.repo.store.reflog("HEAD")[0];
+    expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "cherry-pick" });
+    if (named === undefined || head === undefined) throw new Error("cherry-pick reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
   });
 
   it("continues a modify/delete conflict after native rm resolution", async () => {
@@ -370,6 +418,8 @@ describe("cherry-pick lifecycle", () => {
     expect(workspace.repo.store.requireOperationState("cherry-pick").state.phase).toBe("empty");
     cherryPickAbort(workspace.repo, workspace.worktree);
     expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
   });
 
   it("restores owned paths on abort after partial resolution and preserves unrelated paths", async () => {

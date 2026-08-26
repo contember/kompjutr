@@ -1,6 +1,10 @@
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
-import type { IndexEntry, ObjectBatch } from "../../sqlite/store.js";
+import {
+  type IndexEntry,
+  MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS,
+  type ObjectBatch,
+} from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
 import { hashObject, type ObjectType, serializeCommit } from "../objects.js";
@@ -38,10 +42,16 @@ import { selectMergeBases } from "./merge-base.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import {
   type MergeJournal,
+  type MergeOrigin,
   type MergeStateMetadata,
   type MergeTouchedPath,
   validateMergeStateMetadata,
 } from "./merge-state.js";
+import {
+  MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS,
+  operationRefLogMetadata,
+  type RefLogReason,
+} from "./ref-log.js";
 import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
 
@@ -78,11 +88,23 @@ export interface MergeContinueOptions {
   env?: Record<string, string>;
 }
 
+export type { MergeOrigin } from "./merge-state.js";
+
 export interface MergeBehavior {
   /** Compatibility clients cannot reach native continue/abort after a conflict. */
   persistConflicts?: boolean;
   /** Pull supplies the remote branch label without changing revision lookup. */
   incomingLabel?: string;
+  /** Select pull-specific publication reasons without changing merge mechanics. */
+  origin?: MergeOrigin;
+}
+
+function mergeReason(
+  origin: MergeOrigin | undefined,
+  phase: "fast-forward" | "commit",
+): RefLogReason {
+  if (origin === "pull") return phase === "fast-forward" ? "pull: fast-forward" : "pull: merge";
+  return phase === "fast-forward" ? "merge: fast-forward" : "merge: commit";
 }
 
 function requireMergeRevision(value: unknown, label: string): string {
@@ -446,6 +468,7 @@ function metadata(
   currentLabel: string,
   nextLabel: string,
   options: MergeOptions,
+  mergeOrigin: MergeOrigin,
 ): Omit<MergeStateMetadata, "phase"> {
   return {
     originalHeadRef: head.ref,
@@ -453,6 +476,7 @@ function metadata(
     currentParentOid: head.oid,
     incomingParentOid: incomingOid,
     mode: options.commit === false ? "no-commit" : "commit",
+    mergeOrigin,
     currentLabel,
     incomingLabel: nextLabel,
     message: options.message ?? defaultMessage(nextLabel),
@@ -550,6 +574,10 @@ function mergeInTransaction(
     sqlStatements:
       selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + INTEGRATION_GUARD_SQL_STATEMENTS,
   };
+  if (isFastForward) {
+    budget.sqlStatements +=
+      MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS + MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS;
+  }
   if (!isFastForward) {
     requireBoundedIntegrationIndex(repo);
     requireCleanIntegrationIndex(repo, currentTree, "merge");
@@ -608,13 +636,28 @@ function mergeInTransaction(
       currentLabel,
       nextLabel,
       isFastForward ? { ...options, commit: true } : options,
+      behavior.origin ?? "merge",
     );
     mergeMetadata.message = messageWithConflicts(mergeMetadata.message, conflicts);
     const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata, {
       priorSqlStatements: budget.sqlStatements,
     });
     if (isFastForward) {
-      repo.store.setRef(head.ref, incomingOid);
+      repo.store.mutateRefs(
+        {
+          expected: { name: head.ref, target: head.oid },
+          puts: [{ name: head.ref, target: incomingOid }],
+        },
+        operationRefLogMetadata(
+          context,
+          repo,
+          mergeReason(mergeMetadata.mergeOrigin, "fast-forward"),
+          {
+            identity: options.committer ?? options.author,
+            env: options.env,
+          },
+        ),
+      );
       return { oid: incomingOid, fastForward: true };
     }
     requireBoundedIntegrationIndex(repo);
@@ -634,7 +677,7 @@ function mergeInTransaction(
       parent: [head.oid, incomingOid],
       identities,
       expectedHead: head,
-      refLogReason: "merge: commit",
+      refLogReason: mergeReason(mergeMetadata.mergeOrigin, "commit"),
     });
   } finally {
     reservation.dispose();
@@ -682,7 +725,7 @@ export function mergeContinue(
         parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
         identities,
         expectedHead: head,
-        refLogReason: "merge: commit",
+        refLogReason: mergeReason(journal.state.mergeOrigin, "commit"),
       });
       repo.store.clearMergeState();
       return result;

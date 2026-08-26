@@ -17,6 +17,7 @@ const MERGE_TOUCHED_FIXED_BYTES = 768;
 
 export type MergeStatePhase = "conflicted" | "ready";
 export type MergeStateMode = "commit" | "no-commit";
+export type MergeOrigin = "merge" | "pull";
 export type MergeTouchedPurpose = "primary" | "current-relocation" | "incoming-relocation";
 
 export interface MergeSavedIdentity {
@@ -31,6 +32,7 @@ export interface MergeStateMetadata {
   incomingParentOid: string;
   phase: MergeStatePhase;
   mode: MergeStateMode;
+  mergeOrigin: MergeOrigin;
   currentLabel: string;
   incomingLabel: string;
   message: string;
@@ -201,6 +203,13 @@ export function requireMergeMode(value: unknown): MergeStateMode {
   return value;
 }
 
+export function requireMergeOrigin(value: unknown): MergeOrigin {
+  if (value !== "merge" && value !== "pull") {
+    throw new CorruptError("merge journal has an invalid origin");
+  }
+  return value;
+}
+
 export function requireMergePurpose(value: unknown): MergeTouchedPurpose {
   if (value !== "primary" && value !== "current-relocation" && value !== "incoming-relocation") {
     throw new CorruptError("merge journal has an invalid touched-path purpose");
@@ -284,6 +293,7 @@ export function validateMergeStateMetadata(state: MergeStateMetadata): number {
   if (state.phase === "ready" && state.mode !== "no-commit") {
     throw new CorruptError("a ready merge journal must be a no-commit merge");
   }
+  bytes = checkedAdd(bytes, requireMergeOrigin(state.mergeOrigin).length);
   const currentLabelBytes = boundedTextBytes(
     state.currentLabel,
     "current label",
@@ -431,7 +441,7 @@ export function mergeJournalIntegrityOid(
 ): string {
   mergeJournalRetainedBytes(state, touched);
   const payload: readonly unknown[] = [
-    1,
+    2,
     [
       state.originalHeadRef,
       state.originalHeadOid,
@@ -439,6 +449,7 @@ export function mergeJournalIntegrityOid(
       state.incomingParentOid,
       state.phase,
       state.mode,
+      state.mergeOrigin,
       state.currentLabel,
       state.incomingLabel,
       state.message,

@@ -27,7 +27,7 @@ function fixture(): GitFixture {
 }
 
 async function imported(source: GitFixture): Promise<TestRepository> {
-  const workspace = makeRepo("/");
+  const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
   await importFixture(source, workspace.repo.store);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", REVERTER.name);
@@ -36,7 +36,9 @@ async function imported(source: GitFixture): Promise<TestRepository> {
 }
 
 function reopen(workspace: TestRepository): { context: GitContext; repo: Repository } {
-  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+    now: workspace.context.now,
+  });
   const row = database.find("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
@@ -94,6 +96,50 @@ describe("revert lifecycle", () => {
     expect(textAt(workspace, "tracked.txt")).toBe("base\n");
     expect(textAt(workspace, "later.txt")).toBe("later\n");
     expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([
+      expect.objectContaining({
+        oldOid: current,
+        newOid: result.oid,
+        actor: REVERTER,
+        timestamp: commit.committer.timestamp,
+        timezoneOffset: commit.committer.timezoneOffset,
+        reason: "revert",
+      }),
+    ]);
+    const named = workspace.repo.store.reflog("refs/heads/main")[0];
+    const head = workspace.repo.store.reflog("HEAD")[0];
+    expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "revert" });
+    if (named === undefined || head === undefined) throw new Error("revert reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
+  });
+
+  it("rolls back a clean revert when publication fails after the ref mutation", async () => {
+    const source = fixture();
+    source.write("tracked.txt", "base\n");
+    source.commit("base");
+    source.write("tracked.txt", "changed\n");
+    const reverted = source.commit("change");
+    source.write("later.txt", "later\n");
+    const current = source.commit("later");
+    const workspace = await imported(source);
+    const beforeObjects = workspace.repo.store.objectCount();
+    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+      originalUpdate(mutation, metadata);
+      throw new Error("late revert publication fault");
+    };
+
+    expect(() =>
+      revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
+    ).toThrow("late revert publication fault");
+
+    expect(workspace.repo.head().oid).toBe(current);
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    expect(textAt(workspace, "tracked.txt")).toBe("changed\n");
+    expect(textAt(workspace, "later.txt")).toBe("later\n");
+    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
   });
 
   it("reverts a root commit relative to the empty tree", async () => {
@@ -139,6 +185,8 @@ describe("revert lifecycle", () => {
       ).toThrow(expect.objectContaining({ code: "EINVAL" }));
       expect(rejected.repo.head()).toEqual(before);
       expect(rejected.repo.store.readOperationState()).toBeNull();
+      expect(rejected.repo.store.reflog("refs/heads/main")).toEqual([]);
+      expect(rejected.repo.store.reflog("HEAD")).toEqual([]);
     }
 
     const workspace = await imported(source);
@@ -183,6 +231,8 @@ describe("revert lifecycle", () => {
       ).toEqual({ outcome: "empty", reason: kind });
       expect(workspace.repo.head()).toEqual(before);
       expect(workspace.repo.store.readOperationState()).toBeNull();
+      expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+      expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
       expect(() => revertContinue(workspace.context, workspace.repo)).toThrow(
         expect.objectContaining({ code: "ENOREVERT" }),
       );
@@ -214,6 +264,8 @@ describe("revert lifecycle", () => {
     expect(textAt(workspace, "conflict.txt")).toContain(
       `>>>>>>> parent of ${reverted.slice(0, 7)} (source subject)`,
     );
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
+    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
 
     workspace.tick(60_000);
     const cold = reopen(workspace);
@@ -227,6 +279,21 @@ describe("revert lifecycle", () => {
     expect(commit.author).toMatchObject({ ...REVERTER, timestamp: 1_577_836_860 });
     expect(commit.committer).toEqual(commit.author);
     expect(cold.repo.store.readOperationState()).toBeNull();
+    expect(cold.repo.store.reflog("refs/heads/main")).toEqual([
+      expect.objectContaining({
+        oldOid: current,
+        newOid: result.oid,
+        actor: REVERTER,
+        timestamp: commit.committer.timestamp,
+        timezoneOffset: commit.committer.timezoneOffset,
+        reason: "revert",
+      }),
+    ]);
+    const named = cold.repo.store.reflog("refs/heads/main")[0];
+    const head = cold.repo.store.reflog("HEAD")[0];
+    expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "revert" });
+    if (named === undefined || head === undefined) throw new Error("revert reflog is missing");
+    expect(head.ordinal).toBe(named.ordinal + 1);
   });
 
   it("continues a revert modify/delete conflict after native rm resolution", async () => {

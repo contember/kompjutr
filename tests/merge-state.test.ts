@@ -50,6 +50,7 @@ function metadata(overrides: Partial<MergeStateMetadata> = {}): MergeStateMetada
     incomingParentOid: INCOMING,
     phase: "conflicted",
     mode: "commit",
+    mergeOrigin: "merge",
     currentLabel: "HEAD",
     incomingLabel: "topic",
     message: "Merge topic\n",
@@ -132,6 +133,30 @@ describe("durable merge journal", () => {
       retainedBytes: mergeJournalRetainedBytes(state, paths),
     });
     expect(db.storage.statementCount).toBe(4);
+  });
+
+  it("requires a valid authenticated merge origin in DDL and cold reads", () => {
+    const ddl = open();
+    ddl.store.writeMergeState(metadata(), touched());
+    expect(() =>
+      ddl.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE repo_id = 1"),
+    ).toThrow();
+
+    const tampered = open();
+    tampered.store.writeMergeState(metadata(), touched());
+    tampered.db.run("UPDATE git_operation_state SET merge_origin = 'pull' WHERE repo_id = 1");
+    expect(() => tampered.store.readMergeState()).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+
+    const invalid = open();
+    invalid.store.writeMergeState(metadata(), touched());
+    invalid.db.run("PRAGMA ignore_check_constraints = ON");
+    invalid.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE repo_id = 1");
+    invalid.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() => invalid.store.readMergeState()).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 
   it("persists ready no-commit state and optional explicit identities", () => {

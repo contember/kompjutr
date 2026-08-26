@@ -25,6 +25,7 @@ import {
   requireMergeMode,
   requireMergeNullableInteger,
   requireMergeOid,
+  requireMergeOrigin,
   requireMergePhase,
   requireMergePurpose,
   requireMergeText,
@@ -76,7 +77,6 @@ import {
 export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_CACHED_CONTENT_ID_BYTES } from "./blob-id-cache.js";
-import { initializeGitSchema } from "./schema.js";
 import {
   MAX_REFLOG_IDENTITY_BYTES,
   MAX_REFLOG_ORDINAL,
@@ -86,7 +86,8 @@ import {
   MAX_REFLOG_STATE_BYTES,
   MAX_REFLOG_STATE_ROWS,
   MAX_REFLOG_TIMEZONE_MINUTES,
-} from "./schema-migration-v13.js";
+} from "./reflog-schema.js";
+import { initializeGitSchema } from "./schema.js";
 import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
 import {
   iterateTree,
@@ -312,6 +313,7 @@ interface OperationStateRow {
   upstream_oid: unknown;
   base_oid: unknown;
   mode: unknown;
+  merge_origin: unknown;
   current_step: unknown;
   step_count: unknown;
   current_label: unknown;
@@ -1291,10 +1293,16 @@ function operationMetadataFromRow(
       incomingParentOid: requireMergeOid(row.incoming_parent_oid, "incoming parent"),
       phase: requireMergePhase(row.phase),
       mode: requireMergeMode(row.mode),
+      mergeOrigin: requireMergeOrigin(row.merge_origin),
     };
   }
   if (kind === "rebase") {
-    if (row.empty_reason !== null || row.incoming_parent_oid !== null || row.mode !== null) {
+    if (
+      row.empty_reason !== null ||
+      row.incoming_parent_oid !== null ||
+      row.mode !== null ||
+      row.merge_origin !== null
+    ) {
       throw new CorruptError("rebase journal retained one-shot operation metadata");
     }
     const phase = row.phase;
@@ -1317,6 +1325,7 @@ function operationMetadataFromRow(
     row.upstream_oid !== null ||
     row.base_oid !== null ||
     row.mode !== null ||
+    row.merge_origin !== null ||
     currentStep !== 0 ||
     stepCount !== 1
   ) {
@@ -3733,6 +3742,9 @@ export class RepoStore {
               CASE WHEN mode IS NULL THEN NULL
                    WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 9
                    THEN mode ELSE 0 END AS mode,
+              CASE WHEN merge_origin IS NULL THEN NULL
+                   WHEN typeof(merge_origin) = 'text' AND length(CAST(merge_origin AS BLOB)) <= 5
+                   THEN merge_origin ELSE 0 END AS merge_origin,
               CASE WHEN typeof(current_step) = 'integer'
                          AND current_step >= 0 AND current_step <= ${MAX_OPERATION_STEPS}
                    THEN current_step END AS current_step,
@@ -3967,11 +3979,11 @@ export class RepoStore {
     this.#db.run(
       `INSERT INTO git_operation_state
          (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
-          current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode,
+          current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode, merge_origin,
           current_step, step_count, current_label, incoming_label, message,
           author_name, author_email, committer_name, committer_email,
           touched_count, retained_bytes, integrity_oid)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       this.#repoId,
       state.kind,
       state.originalHeadRef,
@@ -3983,6 +3995,7 @@ export class RepoStore {
       state.kind === "rebase" ? state.upstreamOid : null,
       state.kind === "rebase" ? state.baseOid : null,
       state.kind === "merge" ? state.mode : null,
+      state.kind === "merge" ? state.mergeOrigin : null,
       state.kind === "rebase" ? state.currentStep : 0,
       stepCount,
       state.currentLabel,
@@ -4307,7 +4320,7 @@ export class RepoStore {
         `UPDATE git_operation_state
             SET original_head_ref = ?, original_head_oid = ?, phase = ?, empty_reason = ?,
                 current_parent_oid = ?, incoming_parent_oid = ?, upstream_oid = ?, base_oid = ?,
-                mode = ?, current_step = ?, current_label = ?, incoming_label = ?,
+                mode = ?, merge_origin = ?, current_step = ?, current_label = ?, incoming_label = ?,
                 message = ?, author_name = ?, author_email = ?, committer_name = ?,
                 committer_email = ?, retained_bytes = ?, integrity_oid = ?
           WHERE repo_id = ? AND integrity_oid = ?`,
@@ -4320,6 +4333,7 @@ export class RepoStore {
         null,
         null,
         state.kind === "merge" ? state.mode : null,
+        state.kind === "merge" ? state.mergeOrigin : null,
         0,
         state.currentLabel,
         state.incomingLabel,
