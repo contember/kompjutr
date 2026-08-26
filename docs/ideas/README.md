@@ -11,3 +11,6 @@ decided work or status.
 
 - [`local-sqlite-git-runtime.md`](local-sqlite-git-runtime.md) — keep Git state
   in SQLite while materialising a local working tree on disk.
+- [`git-server-inside-the-durable-object.md`](git-server-inside-the-durable-object.md)
+  — answer Smart HTTP from the Durable Object so a `git` client can clone,
+  fetch, and push against it.
