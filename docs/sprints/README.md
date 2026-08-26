@@ -19,4 +19,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-<!-- one line per active sprint; empty between sprints -->
+- [Storage contracts and derived-table hardening](sprint-2026-08-26-storage-contracts.md)
+  — bounded opaque content identities, narrow parsed-tree storage, and
+  write-time guards in one authoritative schema migration.

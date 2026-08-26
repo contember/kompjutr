@@ -15,15 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-<!-- list the sprint files currently in sprints/ ; empty between sprints -->
-
+- [`sprints/sprint-2026-08-26-storage-contracts.md`](sprints/sprint-2026-08-26-storage-contracts.md)
+  — bounded content-identity cache, narrow tree projections, and guarded writes.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Storage-contract work is next now that the scheduled silent Git divergences
-  are removed.
+- Storage-contract work is active: schema v12 settles blob-identity lifecycle,
+  parsed-tree storage, authoritative migration, and derived-row write guards.
 
 ## Key reference
 
