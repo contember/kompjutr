@@ -49,6 +49,125 @@ function seedRefLog(
 ): void {
   db.transactionSync(() => {
     db.run("DELETE FROM git_reflog_entries WHERE repo_id = ?", repoId);
+    db.run("DELETE FROM git_checkout_reflog_entries WHERE repo_id = ?", repoId);
+    db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", repoId);
+    if (count === 0) return;
+    const sequence = `WITH RECURSIVE sequence(ordinal) AS (
+         VALUES (1)
+         UNION ALL
+         SELECT ordinal + 1 FROM sequence WHERE ordinal < ?
+       )`;
+    const endpoints = `SELECT ordinal,
+              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END AS old_raw,
+              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END AS new_raw,
+              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END AS old_oid,
+              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END AS new_oid,
+              ? - (ordinal % 3) AS timestamp
+         FROM sequence`;
+    if (ref === "HEAD") {
+      const checkoutId = db.scalar<unknown>(
+        "SELECT id FROM git_checkouts WHERE repo_id = ? AND is_primary = 1",
+        repoId,
+      );
+      if (typeof checkoutId !== "number" || !Number.isSafeInteger(checkoutId) || checkoutId < 1) {
+        throw new Error("seed checkout is missing");
+      }
+      db.run(
+        `${sequence}
+       INSERT INTO git_checkout_reflog_entries
+         (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       SELECT ?, ?, ordinal, old_raw, new_raw, old_oid, new_oid,
+              NULL, NULL, timestamp, 0, 'seed-' || ordinal
+         FROM (${endpoints})`,
+        count,
+        checkoutId,
+        repoId,
+        FIRST,
+        SECOND,
+        SECOND,
+        FIRST,
+        FIRST,
+        SECOND,
+        SECOND,
+        FIRST,
+        timestamp,
+      );
+    } else {
+      db.run(
+        `${sequence}
+       INSERT INTO git_reflog_entries
+         (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       SELECT ?, ?, ordinal, old_raw, new_raw, old_oid, new_oid,
+              NULL, NULL, timestamp, 0, 'seed-' || ordinal
+         FROM (${endpoints})`,
+        count,
+        repoId,
+        ref,
+        FIRST,
+        SECOND,
+        SECOND,
+        FIRST,
+        FIRST,
+        SECOND,
+        SECOND,
+        FIRST,
+        timestamp,
+      );
+    }
+    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", count, repoId);
+  });
+}
+
+function appendRefLog(db: SqlDatabase, repoId: number, ref: string, ordinal: number): void {
+  db.transactionSync(() => {
+    if (ref === "HEAD") {
+      const checkoutId = db.scalar<unknown>(
+        "SELECT id FROM git_checkouts WHERE repo_id = ? AND is_primary = 1",
+        repoId,
+      );
+      if (typeof checkoutId !== "number" || !Number.isSafeInteger(checkoutId) || checkoutId < 1) {
+        throw new Error("append checkout is missing");
+      }
+      db.run(
+        `INSERT INTO git_checkout_reflog_entries
+         (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, 'append')`,
+        checkoutId,
+        repoId,
+        ordinal,
+        FIRST,
+        THIRD,
+        FIRST,
+        THIRD,
+        NOW_SECONDS,
+      );
+    } else {
+      db.run(
+        `INSERT INTO git_reflog_entries
+         (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, 'append')`,
+        repoId,
+        ref,
+        ordinal,
+        FIRST,
+        THIRD,
+        FIRST,
+        THIRD,
+        NOW_SECONDS,
+      );
+    }
+    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", ordinal, repoId);
+  });
+}
+
+function seedDistinctActiveRefLogs(db: SqlDatabase, repoId: number, count: number): void {
+  db.transactionSync(() => {
+    db.run("DELETE FROM git_reflog_entries WHERE repo_id = ?", repoId);
+    db.run("DELETE FROM git_checkout_reflog_entries WHERE repo_id = ?", repoId);
     db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", repoId);
     if (count === 0) return;
     db.run(
@@ -60,16 +179,15 @@ function seedRefLog(
        INSERT INTO git_reflog_entries
          (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
           actor_name, actor_email, timestamp, timezone, reason)
-       SELECT ?, ?, ordinal,
+       SELECT ?, 'refs/tags/root-' || printf('%04d', ordinal), ordinal,
               CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
               CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
               CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
               CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
-              NULL, NULL, ? - (ordinal % 3), 0, 'seed-' || ordinal
+              NULL, NULL, ?, 0, 'active-root-' || ordinal
          FROM sequence`,
       count,
       repoId,
-      ref,
       FIRST,
       SECOND,
       SECOND,
@@ -78,29 +196,9 @@ function seedRefLog(
       SECOND,
       SECOND,
       FIRST,
-      timestamp,
-    );
-    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", count, repoId);
-  });
-}
-
-function appendRefLog(db: SqlDatabase, repoId: number, ref: string, ordinal: number): void {
-  db.transactionSync(() => {
-    db.run(
-      `INSERT INTO git_reflog_entries
-         (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
-          actor_name, actor_email, timestamp, timezone, reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, 0, 'append')`,
-      repoId,
-      ref,
-      ordinal,
-      FIRST,
-      THIRD,
-      FIRST,
-      THIRD,
       NOW_SECONDS,
     );
-    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", ordinal, repoId);
+    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", count, repoId);
   });
 }
 
@@ -529,7 +627,7 @@ describe("active reflog roots", () => {
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 1_025);
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
     workspace.repo.store.db.run(
-      `UPDATE git_reflog_entries
+      `UPDATE git_checkout_reflog_entries
           SET old_raw = ?, old_oid = ?, new_raw = ?, new_oid = ?
         WHERE repo_id = ? AND ordinal = 1`,
       THIRD,
@@ -566,7 +664,7 @@ describe("active reflog roots", () => {
     expect(db.closedIterators).toBe(1);
   });
 
-  it("enumerates the valid 9,329-ref mutation shape in one statement", () => {
+  it("enumerates the valid 9,329-ref mutation shape in one validated traversal", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     const refs = Array.from({ length: 9_329 }, (_, index) => ({
       name: `refs/remotes/origin/branch-${index.toString().padStart(4, "0")}`,
@@ -579,7 +677,7 @@ describe("active reflog roots", () => {
     expect(roots).toHaveLength(9_329);
     expect(roots[0]).toBe("0".repeat(40));
     expect(roots.at(-1)).toBe((9_328).toString(16).padStart(40, "0"));
-    expect(workspace.storage.statementCount).toBe(1);
+    expect(workspace.storage.statementCount).toBe(3);
   });
 
   it("accepts the exact SQL-state budget and rejects one physical row over before grouping", () => {
@@ -587,20 +685,23 @@ describe("active reflog roots", () => {
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
     const repository = database.create("/repo", "ref: refs/heads/main");
     const store = database.open(repository);
-    seedRefLog(db, store.repoId, "HEAD", MAX_REFLOG_ROOT_SCAN_ENTRIES);
+    seedDistinctActiveRefLogs(db, store.repoId, MAX_REFLOG_ROOT_SCAN_ENTRIES);
     db.forbidAll = true;
     db.iterateCalls = 0;
 
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?", store.repoId),
+    ).toBe(9_727);
     expect([...store.activeRefLogOids()]).toEqual([FIRST, SECOND]);
     expect(db.iterateCalls).toBe(1);
 
-    appendRefLog(db, store.repoId, "HEAD", MAX_REFLOG_ROOT_SCAN_ENTRIES + 1);
+    appendRefLog(db, store.repoId, "refs/tags/root-overflow", MAX_REFLOG_ROOT_SCAN_ENTRIES + 1);
     db.iterateCalls = 0;
     db.closedIterators = 0;
     const over = store.activeRefLogOids();
     expect(() => over.next()).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(db.iterateCalls).toBe(1);
-    expect(db.closedIterators).toBe(1);
+    expect(db.iterateCalls).toBe(0);
+    expect(db.closedIterators).toBe(0);
   });
 
   it("validates every retained row before yielding a root", () => {
@@ -608,13 +709,52 @@ describe("active reflog roots", () => {
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 3);
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
     workspace.repo.store.db.run(
-      "UPDATE git_reflog_entries SET old_oid = NULL WHERE repo_id = ? AND ordinal = 1",
+      "UPDATE git_checkout_reflog_entries SET old_oid = NULL WHERE repo_id = ? AND ordinal = 1",
       workspace.repo.store.repoId,
     );
     workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
 
     const roots = workspace.repo.activeRefLogOids();
     expect(() => roots.next()).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("fails closed on persisted cross-owner checkout reflog corruption", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
+    const first = database.createRepository("/first", "ref: refs/heads/main");
+    const second = database.createRepository("/second", "ref: refs/heads/main");
+    const secondStore = database.open(second);
+    db.run(
+      `INSERT INTO git_checkout_reflog_entries
+         (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       VALUES (?, ?, 1, ?, ?, ?, ?, NULL, NULL, ?, 0, 'cross-owner')`,
+      first.checkoutId,
+      first.id,
+      FIRST,
+      SECOND,
+      FIRST,
+      SECOND,
+      NOW_SECONDS,
+    );
+    db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", first.id);
+    db.run("PRAGMA foreign_keys = OFF");
+    try {
+      db.run(
+        "UPDATE git_checkout_reflog_entries SET repo_id = ? WHERE checkout_id = ?",
+        second.id,
+        first.checkoutId,
+      );
+      db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", first.id);
+      db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", second.id);
+    } finally {
+      db.run("PRAGMA foreign_keys = ON");
+    }
+    expect(db.scalar<unknown>("PRAGMA foreign_keys")).toBe(1);
+
+    expect(() => secondStore.activeRefLogOids().next()).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 
   it("routes negative and non-integer ordinals through corruption validation", () => {
@@ -624,7 +764,7 @@ describe("active reflog roots", () => {
       seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 3);
       workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
       workspace.repo.store.db.run(
-        "UPDATE git_reflog_entries SET ordinal = ? WHERE repo_id = ? AND ordinal = 1",
+        "UPDATE git_checkout_reflog_entries SET ordinal = ? WHERE repo_id = ? AND ordinal = 1",
         ordinal,
         workspace.repo.store.repoId,
       );

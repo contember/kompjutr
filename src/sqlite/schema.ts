@@ -1,9 +1,5 @@
-// The whole git repository lives in these tables. There is no `.git`
-// directory anywhere: HEAD, refs, config, the index, the object database
-// and every received packfile are rows.
-//
-// Every table except the registry carries `repo_id`, so one workspace can
-// hold several repositories side by side.
+// The whole Git store and its checkouts live in these tables. Shared rows use
+// `repo_id`; worktree-private rows use `checkout_id`.
 
 import { CorruptError, GitError } from "../core/errors.js";
 import {
@@ -27,6 +23,8 @@ export {
 } from "./tree-index.js";
 
 export const SCHEMA_VERSION = 1;
+export const MAX_CHECKOUTS_PER_REPOSITORY = 1_024;
+export const MAX_CHECKOUT_ROOT_BYTES = 4_096;
 export { MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 
 const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
@@ -48,21 +46,25 @@ const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
   gpgsig BLOB CHECK (gpgsig IS NULL OR typeof(gpgsig) = 'blob'),
   object_size INTEGER NOT NULL CHECK (typeof(object_size) = 'integer' AND object_size >= 0),
   cache_bytes INTEGER NOT NULL CHECK (typeof(cache_bytes) = 'integer' AND cache_bytes >= 0),
-  PRIMARY KEY (repo_id, oid)
+  PRIMARY KEY (repo_id, oid),
+  FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
 ) WITHOUT ROWID`;
 
 const OPERATION_STEPS_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_steps (
-  repo_id INTEGER NOT NULL,
+  checkout_id INTEGER NOT NULL CHECK (
+    typeof(checkout_id) = 'integer' AND checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+  ),
   ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal >= 0),
   source_oid TEXT NOT NULL,
   selected_parent_oid TEXT,
   mainline INTEGER CHECK (mainline IS NULL OR (typeof(mainline) = 'integer' AND mainline >= 1)),
   outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'applied', 'skipped')),
   result_oid TEXT,
-  PRIMARY KEY (repo_id, ordinal),
+  PRIMARY KEY (checkout_id, ordinal),
   CHECK ((outcome = 'applied' AND result_oid IS NOT NULL)
       OR (outcome IN ('pending', 'skipped') AND result_oid IS NULL)),
-  CHECK (mainline IS NULL OR selected_parent_oid IS NOT NULL)
+  CHECK (mainline IS NULL OR selected_parent_oid IS NOT NULL),
+  FOREIGN KEY (checkout_id) REFERENCES git_operation_state (checkout_id) ON DELETE CASCADE
 ) WITHOUT ROWID`;
 
 const STATEMENTS = [
@@ -71,21 +73,76 @@ const STATEMENTS = [
      value TEXT NOT NULL
    )`,
 
-  // Registry. `root` is the absolute working-tree root inside the
-  // workspace; a repository is resolved for a cwd by finding the nearest
-  // registered ancestor. `head` holds HEAD's raw value: either
-  // "ref: refs/heads/<name>" or a 40-hex oid when detached.
+  // Shared store identity. Working-tree routing belongs to git_checkouts.
   `CREATE TABLE IF NOT EXISTS git_repositories (
-     id INTEGER PRIMARY KEY,
-     root TEXT NOT NULL UNIQUE,
-     head TEXT NOT NULL
+     id INTEGER PRIMARY KEY CHECK (
+       typeof(id) = 'integer' AND id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     )
    )`,
+
+  `CREATE TABLE IF NOT EXISTS git_checkouts (
+     id INTEGER PRIMARY KEY CHECK (
+       typeof(id) = 'integer' AND id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     repo_id INTEGER NOT NULL CHECK (
+       typeof(repo_id) = 'integer' AND repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     root TEXT NOT NULL UNIQUE CHECK (
+       typeof(root) = 'text'
+       AND length(CAST(root AS BLOB)) BETWEEN 1 AND ${MAX_CHECKOUT_ROOT_BYTES}
+       AND substr(root, 1, 1) = '/'
+       AND (root = '/' OR substr(root, -1) != '/')
+       AND instr(root, char(0)) = 0
+       AND instr(root, '//') = 0
+       AND root NOT IN ('/.', '/..')
+       AND instr(root, '/./') = 0
+       AND instr(root, '/../') = 0
+       AND substr(root, -2) != '/.'
+       AND substr(root, -3) != '/..'
+     ),
+     head TEXT NOT NULL CHECK (
+       typeof(head) = 'text'
+       AND length(CAST(head AS BLOB)) BETWEEN 1 AND 1024
+       AND instr(head, char(0)) = 0
+       AND instr(head, char(10)) = 0
+       AND instr(head, char(13)) = 0
+       AND (
+         (length(CAST(head AS BLOB)) = 40 AND head NOT GLOB '*[^0-9a-f]*')
+         OR (
+           substr(head, 1, 5) = 'ref: '
+           AND length(CAST(head AS BLOB)) > 5
+           AND substr(head, 6) != 'HEAD'
+           AND substr(head, 6, 5) != 'ref: '
+         )
+       )
+     ),
+     is_primary INTEGER NOT NULL CHECK (
+       typeof(is_primary) = 'integer' AND is_primary IN (0, 1)
+     ),
+     UNIQUE (id, repo_id),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
+   )`,
+
+  `CREATE UNIQUE INDEX IF NOT EXISTS git_checkouts_primary
+     ON git_checkouts (repo_id) WHERE is_primary = 1`,
+
+  `CREATE UNIQUE INDEX IF NOT EXISTS git_checkouts_attached_branch
+     ON git_checkouts (repo_id, head)
+     WHERE substr(head, 1, 16) = 'ref: refs/heads/'
+       AND length(CAST(head AS BLOB)) > 16`,
+
+  `CREATE TRIGGER IF NOT EXISTS git_checkouts_identity_immutable
+     BEFORE UPDATE OF id, repo_id, root, is_primary ON git_checkouts
+     BEGIN
+       SELECT RAISE(ABORT, 'checkout identity is immutable');
+     END`,
 
   `CREATE TABLE IF NOT EXISTS git_refs (
      repo_id INTEGER NOT NULL,
      name TEXT NOT NULL,
      target TEXT NOT NULL,
-     PRIMARY KEY (repo_id, name)
+     PRIMARY KEY (repo_id, name),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   ...REFLOG_SCHEMA_STATEMENTS,
@@ -97,14 +154,15 @@ const STATEMENTS = [
      path TEXT NOT NULL,
      seq INTEGER NOT NULL,
      value TEXT NOT NULL,
-     PRIMARY KEY (repo_id, path, seq)
+     PRIMARY KEY (repo_id, path, seq),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   // Git's logical index, not the .git/index binary format. The trailing
   // columns cache what the working tree looked like when the entry was
   // written, so an unchanged file does not have to be re-hashed.
   `CREATE TABLE IF NOT EXISTS git_index (
-     repo_id INTEGER NOT NULL,
+     checkout_id INTEGER NOT NULL,
      path TEXT NOT NULL,
      stage INTEGER NOT NULL,
      mode INTEGER NOT NULL,
@@ -113,21 +171,24 @@ const STATEMENTS = [
      mtime INTEGER,
      ino INTEGER,
      rev INTEGER,
-     PRIMARY KEY (repo_id, path, stage)
+     PRIMARY KEY (checkout_id, path, stage),
+     FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
    )`,
 
   `CREATE TABLE IF NOT EXISTS git_index_state (
-     repo_id INTEGER PRIMARY KEY,
+     checkout_id INTEGER PRIMARY KEY,
      baseline_tree_oid TEXT,
      format INTEGER NOT NULL CHECK (format = 1),
-     complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+     complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+     FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
    )`,
 
   `CREATE TABLE IF NOT EXISTS git_index_dirty (
-     repo_id INTEGER NOT NULL,
+     checkout_id INTEGER NOT NULL,
      path TEXT NOT NULL,
      flags INTEGER NOT NULL CHECK (typeof(flags) = 'integer' AND flags IN (1, 2, 3)),
-     PRIMARY KEY (repo_id, path)
+     PRIMARY KEY (checkout_id, path),
+     FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
    ) WITHOUT ROWID`,
 
   // One durable incomplete operation header; ordered replay state lives in
@@ -139,7 +200,7 @@ const STATEMENTS = [
   // Original identities for only paths owned by the operation. Physical paths
   // include conflict relocations; logical_path ties them back to the index path.
   `CREATE TABLE IF NOT EXISTS git_operation_touched (
-     repo_id INTEGER NOT NULL,
+     checkout_id INTEGER NOT NULL,
      ordinal INTEGER NOT NULL,
      path TEXT NOT NULL,
      logical_path TEXT NOT NULL,
@@ -159,8 +220,8 @@ const STATEMENTS = [
      worktree_mode INTEGER,
      worktree_oid TEXT,
      worktree_revision INTEGER,
-     PRIMARY KEY (repo_id, ordinal),
-     UNIQUE (repo_id, path),
+     PRIMARY KEY (checkout_id, ordinal),
+     UNIQUE (checkout_id, path),
      CHECK (
        (index_stage IS NULL AND index_mode IS NULL AND index_oid IS NULL
           AND index_size IS NULL AND index_mtime IS NULL AND index_ino IS NULL
@@ -174,7 +235,8 @@ const STATEMENTS = [
           AND worktree_oid IS NOT NULL AND worktree_revision IS NOT NULL)
        OR (worktree_kind = 'directory' AND worktree_mode IS NOT NULL
           AND worktree_oid IS NULL AND worktree_revision IS NOT NULL)
-     )
+     ),
+     FOREIGN KEY (checkout_id) REFERENCES git_operation_state (checkout_id) ON DELETE CASCADE
    ) WITHOUT ROWID`,
 
   // The working tree's opaque content ids mapped to blob oids. A file whose
@@ -190,12 +252,14 @@ const STATEMENTS = [
      ),
      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
      generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 1),
-     PRIMARY KEY (repo_id, content_id)
+     PRIMARY KEY (repo_id, content_id),
+     FOREIGN KEY (repo_id) REFERENCES git_blob_id_state (repo_id) ON DELETE CASCADE
    ) WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_blob_id_state (
      repo_id INTEGER PRIMARY KEY CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
-     generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0)
+     generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 0),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   `CREATE INDEX IF NOT EXISTS git_blob_ids_by_generation
@@ -269,7 +333,8 @@ const STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS git_shallow (
      repo_id INTEGER NOT NULL,
      oid TEXT NOT NULL,
-     PRIMARY KEY (repo_id, oid)
+     PRIMARY KEY (repo_id, oid),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   // Loose objects: everything created locally, zlib-deflated and chunked.
@@ -284,7 +349,8 @@ const STATEMENTS = [
      size INTEGER NOT NULL CHECK (typeof(size) = 'integer' AND size >= 0),
      stored TEXT NOT NULL DEFAULT 'zlib'
        CHECK (typeof(stored) = 'text' AND stored IN ('zlib','raw')),
-     PRIMARY KEY (repo_id, oid)
+     PRIMARY KEY (repo_id, oid),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   // Full parsed commits for graph walks and reads. This remains a derived
@@ -296,7 +362,8 @@ const STATEMENTS = [
      oid TEXT NOT NULL,
      seq INTEGER NOT NULL,
      data BLOB NOT NULL,
-     PRIMARY KEY (repo_id, oid, seq)
+     PRIMARY KEY (repo_id, oid, seq),
+     FOREIGN KEY (repo_id, oid) REFERENCES git_objects (repo_id, oid) ON DELETE CASCADE
    )`,
 
   // Received packs are kept verbatim, still compressed. `state` is
@@ -310,7 +377,8 @@ const STATEMENTS = [
      count INTEGER NOT NULL CHECK (typeof(count) = 'integer' AND count >= 0),
      state TEXT NOT NULL CHECK (typeof(state) = 'text' AND state IN ('pending','complete')),
      created INTEGER NOT NULL CHECK (typeof(created) = 'integer' AND created >= 0),
-     PRIMARY KEY (repo_id, pack_id)
+     PRIMARY KEY (repo_id, pack_id),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   `CREATE TABLE IF NOT EXISTS git_pack_data (
@@ -318,7 +386,8 @@ const STATEMENTS = [
      pack_id INTEGER NOT NULL,
      seq INTEGER NOT NULL,
      data BLOB NOT NULL,
-     PRIMARY KEY (repo_id, pack_id, seq)
+     PRIMARY KEY (repo_id, pack_id, seq),
+     FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    )`,
 
   `CREATE TABLE IF NOT EXISTS git_pack_objects (
@@ -334,7 +403,8 @@ const STATEMENTS = [
      base_oid TEXT CHECK (
        base_oid IS NULL OR (typeof(base_oid) = 'text' AND length(CAST(base_oid AS BLOB)) = 40)
      ),
-     PRIMARY KEY (repo_id, oid)
+     PRIMARY KEY (repo_id, oid),
+     FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    )`,
 
   `CREATE INDEX IF NOT EXISTS git_pack_objects_loc
@@ -351,7 +421,8 @@ const STATEMENTS = [
      entry_size INTEGER NOT NULL,
      base_oid TEXT,
      base_offset INTEGER,
-     PRIMARY KEY (repo_id, pack_id, offset)
+     PRIMARY KEY (repo_id, pack_id, offset),
+     FOREIGN KEY (repo_id, pack_id) REFERENCES git_pack_meta (repo_id, pack_id) ON DELETE CASCADE
    )`,
 
   `CREATE TABLE IF NOT EXISTS git_tree_sources (
@@ -373,7 +444,8 @@ const STATEMENTS = [
        (complete = 1 AND typeof(base_cost) = 'integer' AND base_cost >= 0)
      ),
      UNIQUE (repo_id, tree_oid, storage, source_id),
-     UNIQUE (source_key, repo_id, tree_oid)
+     UNIQUE (source_key, repo_id, tree_oid),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
 
   `CREATE TABLE IF NOT EXISTS git_tree_entries (
@@ -419,6 +491,7 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, tree_oid),
      FOREIGN KEY (source_key, repo_id, tree_oid)
        REFERENCES git_tree_sources (source_key, repo_id, tree_oid)
+       ON DELETE CASCADE
    ) WITHOUT ROWID`,
 
   `CREATE TRIGGER IF NOT EXISTS git_tree_effective_loose_insert
@@ -510,7 +583,9 @@ interface ExpectedSchemaObject {
 }
 
 function expectedSchemaObject(statement: string): [string, ExpectedSchemaObject] {
-  const match = /^CREATE (TABLE|INDEX|VIEW|TRIGGER) IF NOT EXISTS ([a-z_]+)/.exec(statement);
+  const match = /^CREATE (?:UNIQUE )?(TABLE|INDEX|VIEW|TRIGGER) IF NOT EXISTS ([a-z_]+)/.exec(
+    statement,
+  );
   const type = match?.[1]?.toLowerCase();
   const name = match?.[2];
   if (type === undefined || name === undefined) {

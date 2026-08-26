@@ -104,6 +104,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -117,6 +118,7 @@ describe("SQLite sparse workspace source", () => {
     try {
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -132,6 +134,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -139,7 +142,7 @@ describe("SQLite sparse workspace source", () => {
         maxRetainedBytes: MAX_SPARSE_WORKSPACE_RETAINED_BYTES,
       }),
     ).toEqual({ available: true, rows: [], retainedBytes: 0 });
-    expect(workspace.storage.statementCount).toBe(0);
+    expect(workspace.storage.statementCount).toBe(1);
   });
 
   it("hydrates exact tree, index, and worktree leaves in path order", () => {
@@ -150,6 +153,7 @@ describe("SQLite sparse workspace source", () => {
 
     const result = source.hydrate({
       repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.store.checkoutId,
       root: "/",
       baselineTreeOid: tree,
       currentTreeOid: tree,
@@ -184,16 +188,16 @@ describe("SQLite sparse workspace source", () => {
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     const tree = workspace.repo.headTree();
     expect(
-      resealIndexTracker(workspace.database.db, workspace.repo.store.repoId, tree, [
+      resealIndexTracker(workspace.database.db, workspace.repo.store.checkoutId, tree, [
         { path: "a.txt", flags: INDEX_DIRTY },
       ]),
     ).toBe(true);
 
-    expect(source.readState(workspace.repo.store.repoId)).toEqual({
+    expect(source.readState(workspace.repo.store.checkoutId)).toEqual({
       available: true,
       baselineTreeOid: tree,
     });
-    expect([...source.dirtyPaths(workspace.repo.store.repoId)]).toEqual([
+    expect([...source.dirtyPaths(workspace.repo.store.checkoutId)]).toEqual([
       { path: "a.txt", flags: INDEX_DIRTY },
     ]);
   });
@@ -206,6 +210,7 @@ describe("SQLite sparse workspace source", () => {
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     const request = {
       repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.store.checkoutId,
       root: "/",
       baselineTreeOid: tree,
       currentTreeOid: null,
@@ -243,6 +248,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -266,6 +272,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -291,6 +298,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -312,6 +320,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -349,6 +358,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -403,6 +413,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: root,
         currentTreeOid: null,
@@ -414,13 +425,17 @@ describe("SQLite sparse workspace source", () => {
   it("returns all index stages and guards malformed index payloads", () => {
     const workspace = committedWorkspace();
     const repoId = workspace.repo.store.repoId;
+    const checkoutId = workspace.repo.store.checkoutId;
     const oid = "1".repeat(40);
-    workspace.database.db.run("DELETE FROM git_index WHERE repo_id = ? AND path = 'a.txt'", repoId);
+    workspace.database.db.run(
+      "DELETE FROM git_index WHERE checkout_id = ? AND path = 'a.txt'",
+      checkoutId,
+    );
     for (const stage of [1, 2, 3]) {
       workspace.database.db.run(
-        `INSERT INTO git_index (repo_id, path, stage, mode, oid)
+        `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
          VALUES (?, 'a.txt', ?, ?, ?)`,
-        repoId,
+        checkoutId,
         stage,
         0o100644,
         oid,
@@ -429,6 +444,7 @@ describe("SQLite sparse workspace source", () => {
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     const request = {
       repoId,
+      checkoutId,
       root: "/",
       baselineTreeOid: null,
       currentTreeOid: null,
@@ -440,17 +456,17 @@ describe("SQLite sparse workspace source", () => {
       expect(result.rows[0]?.index.map((entry) => entry.stage)).toEqual([1, 2, 3]);
 
     workspace.database.db.run(
-      "UPDATE git_index SET stage = 4 WHERE repo_id = ? AND path = 'a.txt' AND stage = 3",
-      repoId,
+      "UPDATE git_index SET stage = 4 WHERE checkout_id = ? AND path = 'a.txt' AND stage = 3",
+      checkoutId,
     );
     expect(() => source.hydrate(request)).toThrowError(/malformed/);
     workspace.database.db.run(
-      "UPDATE git_index SET stage = 3 WHERE repo_id = ? AND path = 'a.txt' AND stage = 4",
-      repoId,
+      "UPDATE git_index SET stage = 3 WHERE checkout_id = ? AND path = 'a.txt' AND stage = 4",
+      checkoutId,
     );
     workspace.database.db.run(
-      "UPDATE git_index SET oid = zeroblob(4194305) WHERE repo_id = ? AND path = 'a.txt' AND stage = 2",
-      repoId,
+      "UPDATE git_index SET oid = zeroblob(4194305) WHERE checkout_id = ? AND path = 'a.txt' AND stage = 2",
+      checkoutId,
     );
     expect(() => source.hydrate(request)).toThrowError(/malformed row/);
   });
@@ -464,6 +480,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       createSqliteSparseWorkspaceSource(dangling.database.db).hydrate({
         repoId: dangling.repo.store.repoId,
+        checkoutId: dangling.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -478,6 +495,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       createSqliteSparseWorkspaceSource(large.database.db).hydrate({
         repoId: large.repo.store.repoId,
+        checkoutId: large.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -492,6 +510,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       createSqliteSparseWorkspaceSource(symlink.database.db).hydrate({
         repoId: symlink.repo.store.repoId,
+        checkoutId: symlink.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -537,6 +556,7 @@ describe("SQLite sparse workspace source", () => {
     try {
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -562,6 +582,7 @@ describe("SQLite sparse workspace source", () => {
     try {
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -577,6 +598,7 @@ describe("SQLite sparse workspace source", () => {
     try {
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: `/${"a".repeat(4_096)}`,
         baselineTreeOid: tree,
         currentTreeOid: null,
@@ -595,6 +617,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -607,6 +630,7 @@ describe("SQLite sparse workspace source", () => {
     try {
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
@@ -631,6 +655,7 @@ describe("SQLite sparse workspace source", () => {
 
     const result = source.hydrate({
       repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.store.checkoutId,
       root: "/",
       baselineTreeOid: tree,
       currentTreeOid: null,
@@ -646,7 +671,7 @@ describe("SQLite sparse workspace source", () => {
     expect(workspace.storage.rowCount).toBe(2_001);
   });
 
-  it("uses zero SQL for an empty hydration", () => {
+  it("validates checkout ownership for an empty hydration in one statement", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     workspace.storage.resetCounters();
@@ -654,13 +679,45 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: null,
         currentTreeOid: null,
         paths: [],
       }),
     ).toEqual({ available: true, rows: [], retainedBytes: 0 });
-    expect(workspace.storage.statementCount).toBe(0);
+    expect(workspace.storage.statementCount).toBe(1);
+  });
+
+  it("requires the exact unequal shared and checkout identities", () => {
+    const workspace = committedWorkspace();
+    const repoId = workspace.repo.store.repoId;
+    const checkoutId = 101;
+    workspace.worktree.mkdir("/secondary");
+    workspace.database.db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (?, ?, '/secondary', ?, 0)`,
+      checkoutId,
+      repoId,
+      "1".repeat(40),
+    );
+    const source = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const request = {
+      repoId,
+      checkoutId,
+      root: "/secondary",
+      baselineTreeOid: null,
+      currentTreeOid: null,
+      paths: [],
+    };
+
+    expect(source.hydrate(request)).toEqual({ available: true, rows: [], retainedBytes: 0 });
+    expect(() => source.hydrate({ ...request, repoId: repoId + 1 })).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() =>
+      source.hydrate({ ...request, checkoutId: workspace.repo.store.checkoutId }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
   });
 
   it("falls back when distinct touched sources exceed the cumulative row cap by one", () => {
@@ -681,6 +738,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: wide,
         currentTreeOid: narrow,
@@ -719,6 +777,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: tree,
@@ -738,6 +797,7 @@ describe("SQLite sparse workspace source", () => {
     expect(
       source.hydrate({
         repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.store.checkoutId,
         root: "/",
         baselineTreeOid: tree,
         currentTreeOid: null,

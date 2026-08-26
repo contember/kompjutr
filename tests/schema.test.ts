@@ -17,6 +17,36 @@ interface SchemaDefinition extends SchemaObject {
   sql: string;
 }
 
+const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
+  ["git_meta", "global"],
+  ["git_repositories", "shared"],
+  ["git_refs", "shared"],
+  ["git_reflog_state", "shared"],
+  ["git_reflog_entries", "shared"],
+  ["git_config", "shared"],
+  ["git_blob_id_state", "shared"],
+  ["git_blob_ids", "shared"],
+  ["git_shallow", "shared"],
+  ["git_objects", "shared"],
+  ["git_commits", "shared"],
+  ["git_object_chunks", "shared"],
+  ["git_pack_meta", "shared"],
+  ["git_pack_data", "shared"],
+  ["git_pack_objects", "shared"],
+  ["git_pack_pending", "shared"],
+  ["git_tree_sources", "shared"],
+  ["git_tree_entries", "shared"],
+  ["git_tree_effective", "shared"],
+  ["git_checkouts", "checkout"],
+  ["git_checkout_reflog_entries", "checkout"],
+  ["git_index", "checkout"],
+  ["git_index_state", "checkout"],
+  ["git_index_dirty", "checkout"],
+  ["git_operation_state", "checkout"],
+  ["git_operation_steps", "checkout"],
+  ["git_operation_touched", "checkout"],
+]);
+
 const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_blob_id_state" },
   { type: "view", name: "git_blob_id_updates" },
@@ -26,6 +56,13 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "trigger", name: "git_blob_id_updates_mapping" },
   { type: "table", name: "git_blob_ids" },
   { type: "index", name: "git_blob_ids_by_generation" },
+  { type: "table", name: "git_checkout_reflog_entries" },
+  { type: "index", name: "git_checkout_reflog_entries_by_ordinal" },
+  { type: "index", name: "git_checkout_reflog_entries_by_timestamp" },
+  { type: "table", name: "git_checkouts" },
+  { type: "index", name: "git_checkouts_attached_branch" },
+  { type: "trigger", name: "git_checkouts_identity_immutable" },
+  { type: "index", name: "git_checkouts_primary" },
   { type: "table", name: "git_commits" },
   { type: "table", name: "git_config" },
   { type: "table", name: "git_index" },
@@ -63,7 +100,8 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
 
 const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] = [
   ["git_meta", ["key", "value"]],
-  ["git_repositories", ["id", "root", "head"]],
+  ["git_repositories", ["id"]],
+  ["git_checkouts", ["id", "repo_id", "root", "head", "is_primary"]],
   ["git_refs", ["repo_id", "name", "target"]],
   ["git_reflog_state", ["repo_id", "next_ordinal"]],
   [
@@ -83,14 +121,31 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "reason",
     ],
   ],
+  [
+    "git_checkout_reflog_entries",
+    [
+      "checkout_id",
+      "repo_id",
+      "ordinal",
+      "old_raw",
+      "new_raw",
+      "old_oid",
+      "new_oid",
+      "actor_name",
+      "actor_email",
+      "timestamp",
+      "timezone",
+      "reason",
+    ],
+  ],
   ["git_config", ["repo_id", "path", "seq", "value"]],
-  ["git_index", ["repo_id", "path", "stage", "mode", "oid", "size", "mtime", "ino", "rev"]],
-  ["git_index_state", ["repo_id", "baseline_tree_oid", "format", "complete"]],
-  ["git_index_dirty", ["repo_id", "path", "flags"]],
+  ["git_index", ["checkout_id", "path", "stage", "mode", "oid", "size", "mtime", "ino", "rev"]],
+  ["git_index_state", ["checkout_id", "baseline_tree_oid", "format", "complete"]],
+  ["git_index_dirty", ["checkout_id", "path", "flags"]],
   [
     "git_operation_state",
     [
-      "repo_id",
+      "checkout_id",
       "kind",
       "original_head_ref",
       "original_head_oid",
@@ -119,7 +174,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   [
     "git_operation_steps",
     [
-      "repo_id",
+      "checkout_id",
       "ordinal",
       "source_oid",
       "selected_parent_oid",
@@ -131,7 +186,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   [
     "git_operation_touched",
     [
-      "repo_id",
+      "checkout_id",
       "ordinal",
       "path",
       "logical_path",
@@ -246,6 +301,23 @@ function columnsOf(db: TestDatabase, table: string): string[] {
   return db.all<{ name: string }>(`PRAGMA table_info(${table})`).map((row) => row.name);
 }
 
+function primaryKeyOf(db: TestDatabase, table: string): string[] {
+  return db
+    .all<{ name: string }>(`SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk`, table)
+    .map((row) => row.name);
+}
+
+function cascadeForeignKeysOf(
+  db: TestDatabase,
+  table: string,
+): Array<{ table: string; from: string; to: string }> {
+  return db.all<{ table: string; from: string; to: string }>(
+    `SELECT "table", "from", "to" FROM pragma_foreign_key_list(?)
+      WHERE on_delete = 'CASCADE' ORDER BY id, seq`,
+    table,
+  );
+}
+
 class FailVersionWriteDatabase implements SqlDatabase {
   constructor(private readonly inner: TestDatabase) {}
 
@@ -289,11 +361,66 @@ describe("git schema", () => {
     }
   });
 
+  it("executes the shared and checkout ownership matrix with exact keys and cascades", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    const tables = db.all<{ name: string }>(
+      `SELECT name FROM sqlite_schema
+        WHERE type = 'table' AND substr(name, 1, 4) = 'git_'
+        ORDER BY name COLLATE BINARY`,
+    );
+    expect(tables).toHaveLength(TABLE_OWNERSHIP.size);
+    for (const { name } of tables) expect(TABLE_OWNERSHIP.has(name), name).toBe(true);
+
+    for (const [table, owner] of TABLE_OWNERSHIP) {
+      const columns = columnsOf(db, table);
+      if (owner === "checkout" && table !== "git_checkouts") {
+        expect(columns, table).toContain("checkout_id");
+      }
+      if (owner === "shared" && table !== "git_tree_entries") {
+        expect(columns, table).not.toContain("checkout_id");
+      }
+    }
+    expect(primaryKeyOf(db, "git_repositories")).toEqual(["id"]);
+    expect(primaryKeyOf(db, "git_checkouts")).toEqual(["id"]);
+    expect(primaryKeyOf(db, "git_index")).toEqual(["checkout_id", "path", "stage"]);
+    expect(primaryKeyOf(db, "git_index_state")).toEqual(["checkout_id"]);
+    expect(primaryKeyOf(db, "git_index_dirty")).toEqual(["checkout_id", "path"]);
+    expect(primaryKeyOf(db, "git_operation_state")).toEqual(["checkout_id"]);
+    expect(primaryKeyOf(db, "git_operation_steps")).toEqual(["checkout_id", "ordinal"]);
+    expect(primaryKeyOf(db, "git_operation_touched")).toEqual(["checkout_id", "ordinal"]);
+    expect(primaryKeyOf(db, "git_checkout_reflog_entries")).toEqual(["checkout_id", "ordinal"]);
+
+    expect(cascadeForeignKeysOf(db, "git_checkouts")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    for (const table of ["git_index", "git_index_state", "git_index_dirty"]) {
+      expect(cascadeForeignKeysOf(db, table), table).toEqual([
+        { table: "git_checkouts", from: "checkout_id", to: "id" },
+      ]);
+    }
+    expect(cascadeForeignKeysOf(db, "git_operation_state")).toEqual([
+      { table: "git_checkouts", from: "checkout_id", to: "id" },
+    ]);
+    for (const table of ["git_operation_steps", "git_operation_touched"]) {
+      expect(cascadeForeignKeysOf(db, table), table).toEqual([
+        { table: "git_operation_state", from: "checkout_id", to: "checkout_id" },
+      ]);
+    }
+    expect(cascadeForeignKeysOf(db, "git_checkout_reflog_entries")).toEqual([
+      { table: "git_reflog_state", from: "repo_id", to: "repo_id" },
+      { table: "git_checkouts", from: "checkout_id", to: "id" },
+      { table: "git_checkouts", from: "repo_id", to: "repo_id" },
+    ]);
+  });
+
   it("keeps current schema data unchanged when reopened", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
+    db.run("INSERT INTO git_repositories (id) VALUES (1)");
     db.run(
-      "INSERT INTO git_repositories (id, root, head) VALUES (1, '/repo', 'ref: refs/heads/main')",
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (17, 1, '/repo', 'ref: refs/heads/main', 1)`,
     );
     db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (1, 0)");
     const before = schemaObjects(db);
@@ -301,11 +428,66 @@ describe("git schema", () => {
     initializeGitSchema(db);
 
     expect(schemaObjects(db)).toEqual(before);
-    expect(db.one("SELECT id, root, head FROM git_repositories")).toEqual({
-      id: 1,
+    expect(db.one("SELECT id, repo_id, root, head, is_primary FROM git_checkouts")).toEqual({
+      id: 17,
+      repo_id: 1,
       root: "/repo",
       head: "ref: refs/heads/main",
+      is_primary: 1,
     });
+  });
+
+  it("enforces immutable bounded checkout identity and validates one primary", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    db.run("INSERT INTO git_repositories (id) VALUES (41), (42), (43)");
+    const exactRoot = `/${"a".repeat(4_095)}`;
+    db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (101, 41, ?, 'ref: refs/heads/unborn', 1)`,
+      exactRoot,
+    );
+    expect(db.scalar<number>("SELECT length(CAST(root AS BLOB)) FROM git_checkouts")).toBe(4_096);
+    expect(() =>
+      db.run(
+        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+         VALUES (102, 42, ?, ?, 1)`,
+        `/${"b".repeat(4_096)}`,
+        "1".repeat(40),
+      ),
+    ).toThrow(/CHECK/);
+    expect(() =>
+      db.run(
+        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+         VALUES (103, 42, ?, ?, 1)`,
+        exactRoot,
+        "1".repeat(40),
+      ),
+    ).toThrow(/UNIQUE/);
+    expect(() =>
+      db.run(
+        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+         VALUES (104, 41, '/other', 'ref: refs/heads/other', 1)`,
+      ),
+    ).toThrow(/UNIQUE/);
+    expect(() =>
+      db.run(
+        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+         VALUES (105, 41, '/attached', 'ref: refs/heads/unborn', 0)`,
+      ),
+    ).toThrow(/UNIQUE/);
+    expect(() => db.run("UPDATE git_checkouts SET root = '/moved' WHERE id = 101")).toThrow(
+      /immutable/,
+    );
+
+    db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (143, 43, '/no-primary', ?, 0)`,
+      "1".repeat(40),
+    );
+    expect(() => database.openShared(43)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 
   it("enforces current reflog lifecycle foreign keys", () => {
@@ -316,8 +498,19 @@ describe("git schema", () => {
       `INSERT INTO git_reflog_entries
          (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
           actor_name, actor_email, timestamp, timezone, reason)
-       VALUES (?, 'HEAD', 1, NULL, 'ref: refs/heads/main', NULL, NULL,
+       VALUES (?, 'refs/tags/x', 1, NULL, ?, NULL, ?,
                NULL, NULL, 0, 0, 'init')`,
+      repository.id,
+      "1".repeat(40),
+      "1".repeat(40),
+    );
+    db.run(
+      `INSERT INTO git_checkout_reflog_entries
+         (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+          actor_name, actor_email, timestamp, timezone, reason)
+       VALUES (?, ?, 2, NULL, 'ref: refs/heads/main', NULL, NULL,
+               NULL, NULL, 0, 0, 'init')`,
+      repository.checkoutId,
       repository.id,
     );
 
@@ -325,6 +518,7 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_reflog_state")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_checkout_reflog_entries")).toBe(0);
     expect(() =>
       db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (99, 0)"),
     ).toThrow(/FOREIGN KEY/);
@@ -333,8 +527,13 @@ describe("git schema", () => {
   it("enforces authenticated merge-origin operation constraints", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
+    db.run("INSERT INTO git_repositories (id) VALUES (1)");
+    db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (17, 1, '/repo', 'ref: refs/heads/main', 1)`,
+    );
     const insert = `INSERT INTO git_operation_state
-       (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+       (checkout_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
         current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode, merge_origin,
         current_step, step_count, current_label, incoming_label, message,
         author_name, author_email, committer_name, committer_email,
@@ -343,8 +542,8 @@ describe("git schema", () => {
              'no-commit', ?, 0, 0, 'HEAD', 'topic', '', NULL, NULL, NULL, NULL, 0, 0, ?)`;
     const oid = "1".repeat(40);
 
-    expect(() => db.run(insert, 1, oid, oid, "2".repeat(40), null, "3".repeat(40))).toThrow();
-    db.run(insert, 1, oid, oid, "2".repeat(40), "merge", "3".repeat(40));
+    expect(() => db.run(insert, 17, oid, oid, "2".repeat(40), null, "3".repeat(40))).toThrow();
+    db.run(insert, 17, oid, oid, "2".repeat(40), "merge", "3".repeat(40));
     expect(db.scalar<string>("SELECT merge_origin FROM git_operation_state")).toBe("merge");
     expect(() => db.run("UPDATE git_operation_state SET kind = 'rebase'")).toThrow();
   });
@@ -422,8 +621,10 @@ describe("git schema", () => {
   it("rejects unsupported recorded versions without changing current data", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
+    db.run("INSERT INTO git_repositories (id) VALUES (1)");
     db.run(
-      "INSERT INTO git_repositories (id, root, head) VALUES (1, '/repo', 'ref: refs/heads/main')",
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (17, 1, '/repo', 'ref: refs/heads/main', 1)`,
     );
     db.run("UPDATE git_meta SET value = '2' WHERE key = 'schema_version'");
     const before = schemaObjects(db);
@@ -432,7 +633,7 @@ describe("git schema", () => {
 
     expect(schemaObjects(db)).toEqual(before);
     expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("2");
-    expect(db.scalar<string>("SELECT root FROM git_repositories WHERE id = 1")).toBe("/repo");
+    expect(db.scalar<string>("SELECT root FROM git_checkouts WHERE id = 17")).toBe("/repo");
   });
 
   it("rejects invalid or missing schema metadata", () => {

@@ -357,7 +357,7 @@ function tryInitialClone(context: GitContext, repo: Repository, treeOid: string)
         ),
       (state) => {
         if (state.available && state.value !== null && context.indexTracker !== undefined) {
-          context.indexTracker.reseal(repo.store.repoId, treeOid, state.value);
+          context.indexTracker.reseal(repo.store.checkoutId, treeOid, state.value);
         }
       },
     );

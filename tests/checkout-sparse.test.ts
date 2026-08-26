@@ -278,6 +278,7 @@ describe("sparse checkout", () => {
     const exactRetainedBytes = 1_420 + largeTarget.length * 2 + 20;
     const exact = source.hydrate({
       repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.store.checkoutId,
       root: "/",
       baselineTreeOid: null,
       currentTreeOid: null,
@@ -292,8 +293,8 @@ describe("sparse checkout", () => {
 
     probe.rawSymlinkTargets = 0;
     const constrainedSource: SparseWorkspaceSource = {
-      readState: (repoId) => source.readState(repoId),
-      dirtyPaths: (repoId) => source.dirtyPaths(repoId),
+      readState: (checkoutId) => source.readState(checkoutId),
+      dirtyPaths: (checkoutId) => source.dirtyPaths(checkoutId),
       hydrate: (request) =>
         source.hydrate({ ...request, maxRetainedBytes: exactRetainedBytes - 1 }),
     };
@@ -416,16 +417,16 @@ describe("sparse checkout", () => {
     expect(worktree.reads).toBe(0);
     expect(worktree.rangeReads).toBe(0);
     expect(worktree.bulkReadPaths).toEqual([]);
-    expect(workspace.storage.statementCount).toBe(59);
+    expect(workspace.storage.statementCount).toBe(61);
     expect(workspace.storage.rowCount).toBeLessThan(10_000);
     expect(workspace.repo.head().oid).toBe(target);
-    expect(workspace.context.sparseWorkspace?.readState(workspace.repo.store.repoId)).toEqual({
+    expect(workspace.context.sparseWorkspace?.readState(workspace.repo.store.checkoutId)).toEqual({
       available: true,
       baselineTreeOid: workspace.repo.headTree(),
     });
-    expect([...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId)]).toEqual(
-      [],
-    );
+    expect([
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.checkoutId),
+    ]).toEqual([]);
   });
 
   it("matches structural checkout semantics for clean force", () => {
@@ -497,8 +498,8 @@ describe("sparse checkout", () => {
     const unavailable = makeChangedFiles(2, 1);
     const source = requireSparseWorkspace(unavailable.workspace);
     const unavailableSource: SparseWorkspaceSource = {
-      readState: (repoId) => source.readState(repoId),
-      dirtyPaths: (repoId) => source.dirtyPaths(repoId),
+      readState: (checkoutId) => source.readState(checkoutId),
+      dirtyPaths: (checkoutId) => source.dirtyPaths(checkoutId),
       hydrate: () => ({ available: false }),
     };
     const unavailableWorktree = new NoScanWorktree(unavailable.workspace.worktree);
@@ -574,8 +575,8 @@ describe("sparse checkout", () => {
     const corrupt = makeChangedFiles(2, 1);
     const source = requireSparseWorkspace(corrupt.workspace);
     const corruptSource: SparseWorkspaceSource = {
-      readState: (repoId) => source.readState(repoId),
-      dirtyPaths: (repoId) => source.dirtyPaths(repoId),
+      readState: (checkoutId) => source.readState(checkoutId),
+      dirtyPaths: (checkoutId) => source.dirtyPaths(checkoutId),
       hydrate(request) {
         const result = source.hydrate(request);
         if (!result.available) return result;

@@ -42,14 +42,14 @@ function invalidPathSql(path: string): string {
 }
 
 function ownerRows(paths: string): string {
-  return `SELECT r.id AS repo_id,
-                 CASE WHEN r.root = '/' THEN substr(p.path, 2)
-                      WHEN p.path = r.root THEN ''
-                      ELSE substr(p.path, length(r.root) + 2) END AS relative
+  return `SELECT checkout.id AS checkout_id,
+                 CASE WHEN checkout.root = '/' THEN substr(p.path, 2)
+                      WHEN p.path = checkout.root THEN ''
+                      ELSE substr(p.path, length(checkout.root) + 2) END AS relative
             FROM (${paths}) p
-            JOIN git_repositories r ON r.id = (
+            JOIN git_checkouts checkout ON checkout.id = (
               SELECT candidate.id
-                FROM git_repositories candidate
+                FROM git_checkouts candidate
                WHERE candidate.root = '/'
                   OR p.path = candidate.root
                   OR substr(p.path, 1, length(candidate.root) + 1) = candidate.root || '/'
@@ -66,20 +66,20 @@ function worktreeJournal(paths: string): string {
   return `UPDATE git_index_state
              SET complete = 0
            WHERE complete = 1
-             AND repo_id IN (
-               SELECT repo_id FROM (${owners}) owners WHERE ${invalid}
+             AND checkout_id IN (
+               SELECT checkout_id FROM (${owners}) owners WHERE ${invalid}
              );
-          INSERT INTO git_index_dirty (repo_id, path, flags)
-          SELECT repo_id, relative, ${WORKTREE_DIRTY}
+          INSERT INTO git_index_dirty (checkout_id, path, flags)
+          SELECT checkout_id, relative, ${WORKTREE_DIRTY}
             FROM (${owners}) owners
            WHERE NOT (${invalidPathSql("relative")})
              AND relative <> '.gitignore'
              AND substr(relative, -11) <> '/.gitignore'
              AND EXISTS (
                SELECT 1 FROM git_index_state state
-                WHERE state.repo_id = owners.repo_id AND state.complete = 1
+                WHERE state.checkout_id = owners.checkout_id AND state.complete = 1
              )
-          ON CONFLICT (repo_id, path) DO UPDATE
+          ON CONFLICT (checkout_id, path) DO UPDATE
           SET flags = flags | excluded.flags;`;
 }
 
@@ -87,19 +87,19 @@ function indexUpsert(row: "OLD" | "NEW", flags: number): string {
   const invalid = invalidPathSql(`${row}.path`);
   return `UPDATE git_index_state
              SET complete = 0
-           WHERE repo_id = ${row}.repo_id AND complete = 1 AND (${invalid});
-          INSERT INTO git_index_dirty (repo_id, path, flags)
-          SELECT ${row}.repo_id, ${row}.path, ${flags}
+           WHERE checkout_id = ${row}.checkout_id AND complete = 1 AND (${invalid});
+          INSERT INTO git_index_dirty (checkout_id, path, flags)
+          SELECT ${row}.checkout_id, ${row}.path, ${flags}
            WHERE NOT (${invalid})
              AND EXISTS (
                SELECT 1 FROM git_index_state state
-                WHERE state.repo_id = ${row}.repo_id AND state.complete = 1
+                WHERE state.checkout_id = ${row}.checkout_id AND state.complete = 1
              )
-          ON CONFLICT (repo_id, path) DO UPDATE
+          ON CONFLICT (checkout_id, path) DO UPDATE
           SET flags = flags | excluded.flags;`;
 }
 
-const INDEX_SEMANTIC_CHANGE = `OLD.repo_id IS NOT NEW.repo_id
+const INDEX_SEMANTIC_CHANGE = `OLD.checkout_id IS NOT NEW.checkout_id
   OR OLD.path IS NOT NEW.path
   OR OLD.stage IS NOT NEW.stage
   OR OLD.mode IS NOT NEW.mode
@@ -185,15 +185,15 @@ const TRIGGERS = [
        "SELECT path FROM fs_paths WHERE inode = OLD.inode UNION SELECT path FROM fs_paths WHERE inode = NEW.inode",
      )}
    END`,
-  `CREATE TRIGGER IF NOT EXISTS index_tracker_repository_insert
-   AFTER INSERT ON git_repositories
+  `CREATE TRIGGER IF NOT EXISTS index_tracker_checkout_insert
+   AFTER INSERT ON git_checkouts
    BEGIN
-     INSERT OR IGNORE INTO git_index_state (repo_id, baseline_tree_oid, format, complete)
+     INSERT OR IGNORE INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
      VALUES (NEW.id, NULL, ${TRACKER_FORMAT}, 0);
      UPDATE git_index_state
         SET complete = 0
-      WHERE repo_id = (
-        SELECT ancestor.id FROM git_repositories ancestor
+      WHERE checkout_id = (
+        SELECT ancestor.id FROM git_checkouts ancestor
          WHERE ancestor.id <> NEW.id
            AND (ancestor.root = '/'
              OR NEW.root = ancestor.root
@@ -202,15 +202,13 @@ const TRIGGERS = [
          LIMIT 1
       );
    END`,
-  `CREATE TRIGGER IF NOT EXISTS index_tracker_repository_delete
-   AFTER DELETE ON git_repositories
+  `CREATE TRIGGER IF NOT EXISTS index_tracker_checkout_delete
+   AFTER DELETE ON git_checkouts
    BEGIN
-     DELETE FROM git_index_dirty WHERE repo_id = OLD.id;
-     DELETE FROM git_index_state WHERE repo_id = OLD.id;
      UPDATE git_index_state
         SET complete = 0
-      WHERE repo_id = (
-        SELECT ancestor.id FROM git_repositories ancestor
+      WHERE checkout_id = (
+        SELECT ancestor.id FROM git_checkouts ancestor
          WHERE ancestor.root = '/'
             OR OLD.root = ancestor.root
             OR substr(OLD.root, 1, length(ancestor.root) + 1) = ancestor.root || '/'
@@ -218,33 +216,6 @@ const TRIGGERS = [
          LIMIT 1
       );
    END`,
-  `CREATE TRIGGER IF NOT EXISTS index_tracker_repository_root_update
-   AFTER UPDATE OF root ON git_repositories WHEN OLD.root IS NOT NEW.root
-   BEGIN
-     UPDATE git_index_state SET complete = 0 WHERE repo_id = NEW.id;
-     UPDATE git_index_state
-        SET complete = 0
-      WHERE repo_id IN (
-        SELECT ancestor.id FROM git_repositories ancestor
-         WHERE ancestor.id <> NEW.id
-           AND (ancestor.root = '/'
-             OR OLD.root = ancestor.root
-             OR substr(OLD.root, 1, length(ancestor.root) + 1) = ancestor.root || '/')
-         ORDER BY length(ancestor.root) DESC, ancestor.id DESC
-         LIMIT 1
-      );
-     UPDATE git_index_state
-        SET complete = 0
-      WHERE repo_id IN (
-        SELECT ancestor.id FROM git_repositories ancestor
-         WHERE ancestor.id <> NEW.id
-           AND (ancestor.root = '/'
-             OR NEW.root = ancestor.root
-             OR substr(NEW.root, 1, length(ancestor.root) + 1) = ancestor.root || '/')
-         ORDER BY length(ancestor.root) DESC, ancestor.id DESC
-         LIMIT 1
-      );
-  END`,
 ];
 
 function triggerName(definition: string): string {
@@ -265,8 +236,10 @@ function normalizedSql(sql: string): string {
     .replace(/^CREATE TRIGGER IF NOT EXISTS /, "CREATE TRIGGER ");
 }
 
-function validateRepoId(repoId: number): void {
-  if (!Number.isSafeInteger(repoId) || repoId <= 0) throw new CorruptError("invalid repository id");
+function validateCheckoutId(checkoutId: number): void {
+  if (!Number.isSafeInteger(checkoutId) || checkoutId <= 0) {
+    throw new CorruptError("invalid checkout id");
+  }
 }
 
 function validRelativePath(path: string): boolean {
@@ -358,15 +331,15 @@ function encodedEntryBytes(entry: IndexTrackerDirty): number {
   return bytes;
 }
 
-function insertPage(db: SqlDatabase, repoId: number, page: IndexTrackerDirty[]): void {
+function insertPage(db: SqlDatabase, checkoutId: number, page: IndexTrackerDirty[]): void {
   const json = JSON.stringify(page.map((entry) => [entry.path, entry.flags]));
   db.run(
-    `INSERT INTO git_index_dirty (repo_id, path, flags)
+    `INSERT INTO git_index_dirty (checkout_id, path, flags)
      SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]')
        FROM json_each(?)
       WHERE true
-     ON CONFLICT (repo_id, path) DO UPDATE SET flags = flags | excluded.flags`,
-    repoId,
+     ON CONFLICT (checkout_id, path) DO UPDATE SET flags = flags | excluded.flags`,
+    checkoutId,
     json,
   );
 }
@@ -393,15 +366,15 @@ export function initializeIndexTracker(db: SqlDatabase): void {
       for (const trigger of TRIGGERS) db.run(trigger);
     }
     db.run(
-      `INSERT OR IGNORE INTO git_index_state (repo_id, baseline_tree_oid, format, complete)
-       SELECT id, NULL, ?, 0 FROM git_repositories`,
+      `INSERT OR IGNORE INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
+       SELECT id, NULL, ?, 0 FROM git_checkouts`,
       TRACKER_FORMAT,
     );
   });
 }
 
-export function readIndexTrackerState(db: SqlDatabase, repoId: number): IndexTrackerState {
-  validateRepoId(repoId);
+export function readIndexTrackerState(db: SqlDatabase, checkoutId: number): IndexTrackerState {
+  validateCheckoutId(checkoutId);
   const row = db.one<Record<string, unknown>>(
     `SELECT CASE
               WHEN baseline_tree_oid IS NULL THEN NULL
@@ -415,8 +388,8 @@ export function readIndexTrackerState(db: SqlDatabase, repoId: number): IndexTra
                  THEN 1 ELSE 0 END AS baseline_valid,
             CASE WHEN typeof(format) = 'integer' THEN format END AS format,
             CASE WHEN typeof(complete) = 'integer' THEN complete END AS complete
-       FROM git_index_state WHERE repo_id = ?`,
-    repoId,
+       FROM git_index_state WHERE checkout_id = ?`,
+    checkoutId,
   );
   if (
     row === undefined ||
@@ -435,7 +408,7 @@ export function readIndexTrackerState(db: SqlDatabase, repoId: number): IndexTra
 
 function* dirtyRows(
   db: SqlDatabase,
-  repoId: number,
+  checkoutId: number,
   pageRows: number,
 ): Generator<IndexTrackerDirty> {
   let after: string | null = null;
@@ -458,9 +431,9 @@ function* dirtyRows(
               CASE WHEN typeof(flags) = 'integer' AND flags IN (1, 2, 3)
                    THEN flags END AS guarded_flags
          FROM git_index_dirty
-        WHERE repo_id = ? AND (? IS NULL OR path > ? COLLATE BINARY)
+        WHERE checkout_id = ? AND (? IS NULL OR path > ? COLLATE BINARY)
         ORDER BY path COLLATE BINARY LIMIT ?`,
-      repoId,
+      checkoutId,
       after,
       after,
       pageRows + 1,
@@ -499,60 +472,69 @@ function* dirtyRows(
 
 export function iterateIndexTrackerDirty(
   db: SqlDatabase,
-  repoId: number,
+  checkoutId: number,
   pageRows: number = DEFAULT_PAGE_ROWS,
 ): Iterable<IndexTrackerDirty> {
-  validateRepoId(repoId);
+  validateCheckoutId(checkoutId);
   if (!Number.isSafeInteger(pageRows) || pageRows <= 0 || pageRows > MAX_PAGE_ROWS) {
     throw new CorruptError("invalid index tracker page size");
   }
-  return dirtyRows(db, repoId, pageRows);
+  return dirtyRows(db, checkoutId, pageRows);
 }
 
-export function invalidateIndexTracker(db: SqlDatabase, repoId: number): void {
-  validateRepoId(repoId);
+export function invalidateIndexTracker(db: SqlDatabase, checkoutId: number): void {
+  validateCheckoutId(checkoutId);
   db.run(
-    `INSERT INTO git_index_state (repo_id, baseline_tree_oid, format, complete)
+    `INSERT INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
      VALUES (?, NULL, ?, 0)
-     ON CONFLICT (repo_id) DO UPDATE SET complete = 0`,
-    repoId,
+     ON CONFLICT (checkout_id) DO UPDATE SET complete = 0`,
+    checkoutId,
     TRACKER_FORMAT,
   );
 }
 
 export function resealIndexTracker(
   db: SqlDatabase,
-  repoId: number,
+  checkoutId: number,
   baselineTreeOid: string | null,
   entries: Iterable<IndexTrackerDirty>,
 ): boolean {
-  validateRepoId(repoId);
+  validateCheckoutId(checkoutId);
   if (baselineTreeOid !== null && !isOid(baselineTreeOid)) {
     throw new CorruptError("invalid index tracker baseline tree");
   }
   return db.transactionSync(() => {
-    const repository = db.one<Record<string, unknown>>(
-      "SELECT root FROM git_repositories WHERE id = ?",
-      repoId,
+    const checkout = db.one<Record<string, unknown>>(
+      `SELECT checkout.root, checkout.repo_id
+         FROM git_checkouts checkout WHERE checkout.id = ?`,
+      checkoutId,
     );
-    if (repository === undefined) return false;
+    if (checkout === undefined) return false;
     db.run(
-      `INSERT INTO git_index_state (repo_id, baseline_tree_oid, format, complete)
+      `INSERT INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
        VALUES (?, NULL, ?, 0)
-       ON CONFLICT (repo_id) DO UPDATE SET complete = 0`,
-      repoId,
+       ON CONFLICT (checkout_id) DO UPDATE SET complete = 0`,
+      checkoutId,
       TRACKER_FORMAT,
     );
-    if (typeof repository.root !== "string" || !validRoot(repository.root)) return false;
+    if (
+      typeof checkout.repo_id !== "number" ||
+      !Number.isSafeInteger(checkout.repo_id) ||
+      checkout.repo_id < 1 ||
+      typeof checkout.root !== "string" ||
+      !validRoot(checkout.root)
+    ) {
+      throw new CorruptError("index tracker checkout row is malformed");
+    }
     const root = db.one<Record<string, unknown>>(
       `SELECT nodes.type AS type
          FROM fs_paths paths JOIN fs_nodes nodes ON nodes.inode = paths.inode
         WHERE paths.path = ?`,
-      repository.root,
+      checkout.root,
     );
     if (root === undefined || root.type !== "dir") return false;
 
-    db.run("DELETE FROM git_index_dirty WHERE repo_id = ?", repoId);
+    db.run("DELETE FROM git_index_dirty WHERE checkout_id = ?", checkoutId);
     let page: IndexTrackerDirty[] = [];
     let pageBytes = 2;
     let totalRows = 0;
@@ -567,7 +549,7 @@ export function resealIndexTracker(
         page.length === MAX_PAGE_ROWS ||
         pageBytes + bytes + (page.length === 0 ? 0 : 1) > MAX_PAGE_BYTES
       ) {
-        insertPage(db, repoId, page);
+        insertPage(db, checkoutId, page);
         page = [];
         pageBytes = 2;
       }
@@ -575,14 +557,14 @@ export function resealIndexTracker(
       pageBytes += bytes + (page.length === 1 ? 0 : 1);
       totalRows++;
     }
-    if (page.length !== 0) insertPage(db, repoId, page);
+    if (page.length !== 0) insertPage(db, checkoutId, page);
     db.run(
       `UPDATE git_index_state
           SET baseline_tree_oid = ?, format = ?, complete = 1
-        WHERE repo_id = ?`,
+        WHERE checkout_id = ?`,
       baselineTreeOid,
       TRACKER_FORMAT,
-      repoId,
+      checkoutId,
     );
     return true;
   });

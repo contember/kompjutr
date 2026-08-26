@@ -66,10 +66,10 @@ export function trySparseCleanCheckout(
   if (source === undefined || tracker === undefined) return false;
 
   const baselineTreeOid = repo.headTree();
-  const state = source.readState(repo.store.repoId);
+  const state = source.readState(repo.store.checkoutId);
   if (!state.available || state.baselineTreeOid !== baselineTreeOid) return false;
   try {
-    for (const _entry of source.dirtyPaths(repo.store.repoId)) return false;
+    for (const _entry of source.dirtyPaths(repo.store.checkoutId)) return false;
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) return false;
     throw error;
@@ -89,6 +89,7 @@ export function trySparseCleanCheckout(
   try {
     hydrated = source.hydrate({
       repoId: repo.store.repoId,
+      checkoutId: repo.store.checkoutId,
       root: repo.root,
       baselineTreeOid,
       currentTreeOid: targetTreeOid,

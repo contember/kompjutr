@@ -95,7 +95,7 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      ),
      PRIMARY KEY (repo_id, ordinal),
      CHECK ((actor_name IS NULL) = (actor_email IS NULL)),
-     CHECK (ref_name = 'HEAD' OR old_raw IS NOT new_raw OR old_oid IS NOT new_oid),
+     CHECK (ref_name != 'HEAD' AND (old_raw IS NOT new_raw OR old_oid IS NOT new_oid)),
      CHECK (
        (old_raw IS NULL AND old_oid IS NULL)
        OR (typeof(old_raw) = 'text' AND ${oidSql("old_raw")} AND old_oid = old_raw)
@@ -114,4 +114,82 @@ export const REFLOG_SCHEMA_STATEMENTS = [
 
   `CREATE INDEX IF NOT EXISTS git_reflog_entries_by_timestamp
      ON git_reflog_entries (repo_id, timestamp, ordinal)`,
+
+  `CREATE TABLE IF NOT EXISTS git_checkout_reflog_entries (
+     checkout_id INTEGER NOT NULL CHECK (
+       typeof(checkout_id) = 'integer' AND checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     repo_id INTEGER NOT NULL CHECK (
+       typeof(repo_id) = 'integer' AND repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     ordinal INTEGER NOT NULL CHECK (
+       typeof(ordinal) = 'integer'
+       AND ordinal >= 1
+       AND ordinal <= ${MAX_REFLOG_ORDINAL}
+     ),
+     old_raw TEXT CHECK (
+       old_raw IS NULL OR (
+         typeof(old_raw) = 'text'
+         AND length(CAST(old_raw AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_RAW_TARGET_BYTES}
+       )
+     ),
+     new_raw TEXT CHECK (
+       new_raw IS NULL OR (
+         typeof(new_raw) = 'text'
+         AND length(CAST(new_raw AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_RAW_TARGET_BYTES}
+       )
+     ),
+     old_oid TEXT CHECK (
+       old_oid IS NULL OR (typeof(old_oid) = 'text' AND ${oidSql("old_oid")})
+     ),
+     new_oid TEXT CHECK (
+       new_oid IS NULL OR (typeof(new_oid) = 'text' AND ${oidSql("new_oid")})
+     ),
+     actor_name TEXT CHECK (
+       actor_name IS NULL OR (
+         typeof(actor_name) = 'text'
+         AND length(CAST(actor_name AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_IDENTITY_BYTES}
+       )
+     ),
+     actor_email TEXT CHECK (
+       actor_email IS NULL OR (
+         typeof(actor_email) = 'text'
+         AND length(CAST(actor_email AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_IDENTITY_BYTES}
+       )
+     ),
+     timestamp INTEGER NOT NULL CHECK (
+       typeof(timestamp) = 'integer'
+       AND timestamp >= 0
+       AND timestamp <= ${MAX_REFLOG_ORDINAL}
+     ),
+     timezone INTEGER NOT NULL CHECK (
+       typeof(timezone) = 'integer'
+       AND timezone BETWEEN -${MAX_REFLOG_TIMEZONE_MINUTES} AND ${MAX_REFLOG_TIMEZONE_MINUTES}
+     ),
+     reason TEXT NOT NULL CHECK (
+       typeof(reason) = 'text'
+       AND length(CAST(reason AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_REASON_BYTES}
+     ),
+     PRIMARY KEY (checkout_id, ordinal),
+     CHECK ((actor_name IS NULL) = (actor_email IS NULL)),
+     CHECK (
+       (old_raw IS NULL AND old_oid IS NULL)
+       OR (typeof(old_raw) = 'text' AND ${oidSql("old_raw")} AND old_oid = old_raw)
+       OR (${symbolicRawSql("old_raw")})
+     ),
+     CHECK (
+       (new_raw IS NULL AND new_oid IS NULL)
+       OR (typeof(new_raw) = 'text' AND ${oidSql("new_raw")} AND new_oid = new_raw)
+       OR (${symbolicRawSql("new_raw")})
+     ),
+     FOREIGN KEY (checkout_id, repo_id)
+       REFERENCES git_checkouts (id, repo_id) ON DELETE CASCADE,
+     FOREIGN KEY (repo_id) REFERENCES git_reflog_state (repo_id) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
+
+  `CREATE INDEX IF NOT EXISTS git_checkout_reflog_entries_by_ordinal
+     ON git_checkout_reflog_entries (repo_id, ordinal)`,
+
+  `CREATE INDEX IF NOT EXISTS git_checkout_reflog_entries_by_timestamp
+     ON git_checkout_reflog_entries (repo_id, timestamp, ordinal)`,
 ] as const;

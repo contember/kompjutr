@@ -37,6 +37,7 @@ export interface SparseWorkspaceRow {
 
 export interface SparseWorkspaceRequest {
   repoId: number;
+  checkoutId: number;
   root: string;
   baselineTreeOid: string | null;
   currentTreeOid: string | null;
@@ -51,7 +52,7 @@ export type SparseWorkspaceResult =
 
 /** Optional same-database fast path. Generic clients omit this capability. */
 export interface SparseWorkspaceSource {
-  readState(repoId: number): SparseWorkspaceState;
-  dirtyPaths(repoId: number): Iterable<SparseWorkspaceDirty>;
+  readState(checkoutId: number): SparseWorkspaceState;
+  dirtyPaths(checkoutId: number): Iterable<SparseWorkspaceDirty>;
   hydrate(request: SparseWorkspaceRequest): SparseWorkspaceResult;
 }

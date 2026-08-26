@@ -87,7 +87,11 @@ import {
   MAX_REFLOG_STATE_ROWS,
   MAX_REFLOG_TIMEZONE_MINUTES,
 } from "./reflog-schema.js";
-import { initializeGitSchema } from "./schema.js";
+import {
+  initializeGitSchema,
+  MAX_CHECKOUT_ROOT_BYTES,
+  MAX_CHECKOUTS_PER_REPOSITORY,
+} from "./schema.js";
 import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
 import {
   iterateTree,
@@ -170,6 +174,7 @@ export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
   (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / (2 * REFLOG_ROOT_ENDPOINT_BYTES),
 );
 const MAX_REF_MUTATION_INPUTS = 100_000;
+const MAX_GLOBAL_CHECKOUT_LIST = 8_192;
 const REF_ROW_RETAINED_BYTES = 256;
 const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
 const REF_MUTATION_EVENT_RETAINED_BYTES = 2_048;
@@ -178,7 +183,7 @@ export const MAX_REF_MUTATION_RETAINED_BYTES = 64 * 1024 * 1024;
 export const REF_MUTATION_FIXED_RETAINED_BYTES =
   REF_MUTATION_SQL_HEADROOM_BYTES + REF_ROW_RETAINED_BYTES + 2 * MAX_REFLOG_RAW_TARGET_BYTES;
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
-export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 8;
+export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 10;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
@@ -188,9 +193,20 @@ export interface StoreOptions extends PackCacheOptions {
 }
 
 export interface RepositoryRow {
+  /** Shared store id retained for one-checkout compatibility. */
   id: number;
+  checkoutId: number;
   root: string;
   head: string;
+  isPrimary: boolean;
+}
+
+export interface CheckoutRow {
+  id: number;
+  repoId: number;
+  root: string;
+  head: string;
+  isPrimary: boolean;
 }
 
 export interface RefRow {
@@ -254,6 +270,10 @@ interface RefLogEvent {
   timestamp: number;
   timezoneOffset: number;
   reason: string;
+}
+
+interface CheckoutRefLogEvent extends RefLogEvent {
+  checkoutId: number;
 }
 
 interface NormalizedRefMutation {
@@ -871,6 +891,13 @@ function validateRefLogRootScanBudget(value: unknown): void {
   }
 }
 
+function isAttachedBranchUniqueConstraint(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("UNIQUE constraint failed: git_checkouts.repo_id, git_checkouts.head")
+  );
+}
+
 function requireRefLogHeader(row: Record<string, unknown>, repoId: number): number {
   if (row.repo_id !== repoId) throw new CorruptError("reflog header belongs to another repository");
   requireRawRefTarget(row.head, "stored HEAD target", "stored");
@@ -889,8 +916,8 @@ function requireRefLogHeader(row: Record<string, unknown>, repoId: number): numb
           1,
           MAX_REFLOG_ORDINAL,
         );
-  if ((nextOrdinal === 0 && latest !== null) || (nextOrdinal !== 0 && latest !== nextOrdinal)) {
-    throw new CorruptError("reflog state does not match its newest entry");
+  if ((nextOrdinal === 0 && latest !== null) || (latest ?? 0) > nextOrdinal) {
+    throw new CorruptError("reflog state precedes its newest entry");
   }
   return nextOrdinal;
 }
@@ -962,6 +989,17 @@ export function refMutationCreateRetainedBytes(row: RefRow): number {
     REF_MUTATION_EVENT_RETAINED_BYTES +
     4 * (nameBytes + targetBytes)
   );
+}
+
+export function refMutationCheckoutRetainedBytes(checkout: { root: string; head: string }): number {
+  const root = requireCheckoutRoot(checkout.root, "stored");
+  const head = requireRawRefTarget(checkout.head, "stored HEAD target", "stored");
+  const retained =
+    1_024 +
+    2 *
+      (checkoutTextEncoder.encode(root).byteLength +
+        boundedRefText(head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored"));
+  return Math.ceil(retained / 4) * 4;
 }
 
 function normalizeRefMutation(
@@ -1663,11 +1701,62 @@ export interface IndexSink {
   flush(): void;
 }
 
-/** Normalise an absolute workspace path: no trailing slash, always leading. */
+/** Canonicalise an absolute workspace path without consulting the filesystem. */
 export function normalizeRoot(path: string): string {
-  const trimmed = path.replace(/\/+$/, "");
-  if (trimmed === "") return "/";
-  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  const segments: string[] = [];
+  for (const segment of (path.startsWith("/") ? path : `/${path}`).split("/")) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") segments.pop();
+    else segments.push(segment);
+  }
+  return segments.length === 0 ? "/" : `/${segments.join("/")}`;
+}
+
+const checkoutTextEncoder = new TextEncoder();
+
+function requireSafeId(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new CorruptError(`${label} is not a safe positive integer`);
+  }
+  return value;
+}
+
+function requireCheckoutRoot(value: unknown, source: "input" | "stored"): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    if (source === "stored") throw new CorruptError("checkout root is invalid");
+    throw new GitError("EINVAL", "checkout root is invalid");
+  }
+  const canonical = normalizeRoot(value);
+  const bytes = checkoutTextEncoder.encode(canonical).byteLength;
+  if (bytes > MAX_CHECKOUT_ROOT_BYTES) {
+    if (source === "stored") throw new CorruptError("checkout root exceeds its stored byte bound");
+    throw new GitError("E2BIG", `checkout root exceeds ${MAX_CHECKOUT_ROOT_BYTES} UTF-8 bytes`);
+  }
+  if (source === "stored" && canonical !== value) {
+    throw new CorruptError("checkout root is not canonical");
+  }
+  return canonical;
+}
+
+function requireStoredCheckoutRow(row: Record<string, unknown>): CheckoutRow {
+  const id = requireSafeId(row.checkout_id, "checkout id");
+  const repoId = requireSafeId(row.repo_id, "checkout repository id");
+  const root = requireCheckoutRoot(row.root, "stored");
+  const head = requireRawRefTarget(row.head, "stored HEAD target", "stored");
+  if (row.is_primary !== 0 && row.is_primary !== 1) {
+    throw new CorruptError("checkout primary marker is invalid");
+  }
+  return { id, repoId, root, head, isPrimary: row.is_primary === 1 };
+}
+
+function compatibilityRepositoryRow(checkout: CheckoutRow): RepositoryRow {
+  return {
+    id: checkout.repoId,
+    checkoutId: checkout.id,
+    root: checkout.root,
+    head: checkout.head,
+    isPrimary: checkout.isPrimary,
+  };
 }
 
 /** Every ancestor of `path`, nearest first, ending at "/". */
@@ -1691,15 +1780,290 @@ function enforceForeignKeys(db: SqlDatabase): void {
   }
 }
 
-/**
- * Owns the schema and the repository registry. One instance per
- * workspace database; `open()` hands out per-repository stores over the
- * database-wide object and pack-row caches.
- */
+/** Canonical resources shared by every checkout view of one Git store. */
+export class SharedRepoStore {
+  readonly db: SqlDatabase;
+  readonly repoId: number;
+  readonly objects: ByteLru<string, RawObject>;
+  readonly packRows: ByteLru<string, Uint8Array>;
+  readonly memory: MemoryCoordinator;
+  readonly cacheNamespace: string;
+  #packs: PackStore | null = null;
+  #operations: CheckoutStore | null = null;
+  #cacheGeneration = 0;
+  #hasLoose: boolean;
+
+  constructor(
+    db: SqlDatabase,
+    repoId: number,
+    storeGeneration: number,
+    objects: ByteLru<string, RawObject>,
+    packRows: ByteLru<string, Uint8Array>,
+    memory: MemoryCoordinator,
+  ) {
+    this.db = db;
+    this.repoId = repoId;
+    this.objects = objects;
+    this.packRows = packRows;
+    this.memory = memory;
+    this.cacheNamespace = `${repoId}:${storeGeneration}`;
+    const hasLoose = db.scalar<unknown>(
+      "SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)",
+      repoId,
+    );
+    if (hasLoose !== 0 && hasLoose !== 1) {
+      throw new CorruptError("loose object availability probe returned an invalid value");
+    }
+    this.#hasLoose = hasLoose === 1;
+  }
+
+  installPacks(packs: PackStore): PackStore {
+    if (this.#packs === null) this.#packs = packs;
+    return this.#packs;
+  }
+
+  installOperations(operations: CheckoutStore): void {
+    if (operations.sharedRepoId !== this.repoId) {
+      throw new CorruptError("shared operations facade belongs to another repository");
+    }
+    if (this.#operations === null) this.#operations = operations;
+  }
+
+  #ops(): CheckoutStore {
+    if (this.#operations === null) {
+      throw new CorruptError("shared repository operations facade is unavailable");
+    }
+    return this.#operations;
+  }
+
+  get packs(): PackStore | null {
+    return this.#packs;
+  }
+
+  get hasLoose(): boolean {
+    return this.#hasLoose;
+  }
+
+  markLoose(): void {
+    this.#hasLoose = true;
+  }
+
+  objectCacheKey(oid: string): string {
+    return `${this.cacheNamespace}:${this.#cacheGeneration}:loose:${oid}`;
+  }
+
+  clearCaches(): void {
+    this.#cacheGeneration++;
+    this.#packs?.clearCaches();
+    this.#hasLoose = false;
+  }
+
+  cacheBytes(): { objects: number; chunks: number } {
+    return this.#ops().cacheBytes();
+  }
+
+  reserveMemory(): MemoryReservation {
+    return this.memory.reserve();
+  }
+
+  lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
+    return this.#ops().lookupBlobIds(contentIds);
+  }
+
+  blobIdMismatches(expected: Iterable<BlobIdMapping>): Map<number, string | null> {
+    return this.#ops().blobIdMismatches(expected);
+  }
+
+  upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
+    this.#ops().upsertBlobIds(mappings);
+  }
+
+  has(oid: string): boolean {
+    return this.#ops().has(oid);
+  }
+
+  hasAll(oids: Iterable<string>): Set<string> {
+    return this.#ops().hasAll(oids);
+  }
+
+  missing(oids: Iterable<string>): string[] {
+    return this.#ops().missing(oids);
+  }
+
+  typeAndSize(oid: string): { type: ObjectType; size: number } | null {
+    return this.#ops().typeAndSize(oid);
+  }
+
+  read(oid: string): RawObject | null {
+    return this.#ops().read(oid);
+  }
+
+  objectInfo(oids: readonly string[]): ObjectReadInfo[] {
+    return this.#ops().objectInfo(oids);
+  }
+
+  readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
+    return this.#ops().readObjects(oids, options);
+  }
+
+  readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
+    return this.#ops().readBlobs(oids, options);
+  }
+
+  *walkTree(treeOid: string): Generator<WalkTreeEntry> {
+    yield* this.#ops().walkTree(treeOid);
+  }
+
+  *walkTreeDiff(
+    beforeTreeOid: string | null,
+    afterTreeOid: string | null,
+  ): Generator<WalkTreeDiffEntry> {
+    yield* this.#ops().walkTreeDiff(beforeTreeOid, afterTreeOid);
+  }
+
+  *walkTreeDiffObjects(
+    beforeTreeOid: string | null,
+    afterTreeOid: string,
+  ): Generator<WalkTreeDiffObject> {
+    yield* this.#ops().walkTreeDiffObjects(beforeTreeOid, afterTreeOid);
+  }
+
+  write(type: ObjectType, data: Uint8Array): string {
+    return this.#ops().write(type, data);
+  }
+
+  writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
+    return this.#ops().writeStream(type, size, chunks);
+  }
+
+  writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
+    return this.#ops().writeBatch(options);
+  }
+
+  writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
+    return this.#ops().writeObjects(body, options);
+  }
+
+  readChunks(oid: string): Iterable<Uint8Array> | null {
+    return this.#ops().readChunks(oid);
+  }
+
+  resolvePrefix(prefix: string): string | null {
+    return this.#ops().resolvePrefix(prefix);
+  }
+
+  objectCount(): number {
+    return this.#ops().objectCount();
+  }
+
+  getRef(name: string): string | null {
+    if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
+    return this.#ops().getRef(name);
+  }
+
+  setRef(name: string, target: string): void {
+    if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
+    this.#ops().setRef(name, target);
+  }
+
+  updateRefExpected(name: string, expectedOid: string, targetOid: string): void {
+    this.#ops().updateRefExpected(name, expectedOid, targetOid);
+  }
+
+  deleteRef(name: string): void {
+    if (name === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
+    this.#ops().deleteRef(name);
+  }
+
+  updateRefs(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
+    this.#ops().updateRefs(puts, deletes);
+  }
+
+  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    if (mutation.head !== undefined) throw new GitError("EINVAL", "HEAD belongs to a checkout");
+    return this.#ops().mutateRefs(mutation, metadata);
+  }
+
+  listRefs(prefix = ""): RefRow[] {
+    return this.#ops().listRefs(prefix);
+  }
+
+  reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {
+    if (refName === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
+    return this.#ops().reflog(refName, options);
+  }
+
+  activeRefLogOids(): Generator<string> {
+    return this.#ops().activeRefLogOids();
+  }
+
+  configGetAll(path: string): string[] {
+    return this.#ops().configGetAll(path);
+  }
+
+  configGet(path: string): string | undefined {
+    return this.#ops().configGet(path);
+  }
+
+  configGetBounded(path: string, maxBytes: number): string | undefined {
+    return this.#ops().configGetBounded(path, maxBytes);
+  }
+
+  configSet(path: string, value: string): void {
+    this.#ops().configSet(path, value);
+  }
+
+  configAdd(path: string, value: string): void {
+    this.#ops().configAdd(path, value);
+  }
+
+  configUnset(path: string): void {
+    this.#ops().configUnset(path);
+  }
+
+  configPaths(prefix: string): string[] {
+    return this.#ops().configPaths(prefix);
+  }
+
+  cachedCommit(oid: string): CommitCacheEntry | null {
+    return this.#ops().cachedCommit(oid);
+  }
+
+  prepareCommit(oid: string, data: Uint8Array): CommitCacheEntry {
+    return this.#ops().prepareCommit(oid, data);
+  }
+
+  cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
+    return this.#ops().cacheCommit(oid, data);
+  }
+
+  cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
+    return this.#ops().cacheCommits(entries);
+  }
+
+  commitGraph(rootOid: string, limits: CommitGraphLimits = {}): Iterable<CommitCacheEntry> {
+    return this.#ops().commitGraph(rootOid, limits);
+  }
+
+  shallow(): Set<string> {
+    return this.#ops().shallow();
+  }
+
+  setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
+    this.#ops().setShallow(add, remove);
+  }
+
+  destroy(): void {
+    this.#ops().destroy();
+  }
+}
+
+/** Owns the schema plus shared-store and checkout facade registries. */
 export class SqliteGitDatabase {
   readonly #db: SqlDatabase;
   readonly #options: StoreOptions;
-  readonly #stores = new Map<number, RepoStore>();
+  readonly #sharedStores = new Map<number, SharedRepoStore>();
+  readonly #checkoutStores = new Map<number, RepoStore>();
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packRows: ByteLru<string, Uint8Array>;
   readonly #memory = new MemoryCoordinator();
@@ -1724,121 +2088,336 @@ export class SqliteGitDatabase {
     return this.#db;
   }
 
-  /** The repository whose root is the nearest registered ancestor of `dir`. */
-  find(dir: string): RepositoryRow | null {
-    for (const candidate of ancestors(dir)) {
-      const row = this.#db.one<RepositoryRow>(
-        "SELECT id, root, head FROM git_repositories WHERE root = ?",
-        candidate,
-      );
-      if (row !== undefined) return row;
-    }
-    return null;
-  }
-
-  at(root: string): RepositoryRow | null {
-    return (
-      this.#db.one<RepositoryRow>(
-        "SELECT id, root, head FROM git_repositories WHERE root = ?",
-        normalizeRoot(root),
-      ) ?? null
+  /** The checkout whose root is the nearest registered ancestor of `dir`. */
+  findCheckout(dir: string): CheckoutRow | null {
+    const path = normalizeRoot(dir);
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts
+        WHERE root = '/' OR root = ? OR substr(?, 1, length(root) + 1) = root || '/'
+        ORDER BY length(CAST(root AS BLOB)) DESC, id DESC
+        LIMIT 1`,
+      path,
+      path,
     );
+    return row === undefined ? null : requireStoredCheckoutRow(row);
   }
 
-  list(): RepositoryRow[] {
-    return this.#db.all<RepositoryRow>("SELECT id, root, head FROM git_repositories ORDER BY root");
+  checkoutAt(root: string): CheckoutRow | null {
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts WHERE root = ?`,
+      requireCheckoutRoot(root, "input"),
+    );
+    return row === undefined ? null : requireStoredCheckoutRow(row);
   }
 
-  create(root: string, head: string): RepositoryRow {
-    const normalized = normalizeRoot(root);
+  listCheckouts(repoId: number): CheckoutRow[] {
+    if (!Number.isSafeInteger(repoId) || repoId < 1) {
+      throw new GitError("EINVAL", "repository id must be a safe positive integer");
+    }
+    const rows: CheckoutRow[] = [];
+    let primaryCount = 0;
+    let previousRoot: string | null = null;
+    for (const raw of this.#db.iterate(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts WHERE repo_id = ?
+         ORDER BY root COLLATE BINARY LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+      repoId,
+    )) {
+      const row = requireStoredCheckoutRow(raw);
+      if (row.repoId !== repoId) {
+        throw new CorruptError("checkout listing crossed repository boundaries");
+      }
+      if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+        throw new CorruptError("checkout roots are not in strict byte order");
+      }
+      previousRoot = row.root;
+      rows.push(row);
+      if (row.isPrimary) primaryCount++;
+      if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+        throw new GitError("E2BIG", "checkout listing exceeds its retained bound");
+      }
+    }
+    if (rows.length > 0 && primaryCount !== 1) {
+      throw new CorruptError("repository must have exactly one primary checkout");
+    }
+    return rows;
+  }
+
+  #listRoutingCheckouts(): CheckoutRow[] {
+    const rows: CheckoutRow[] = [];
+    const primaryCounts = new Map<number, number>();
+    const checkoutCounts = new Map<number, number>();
+    let previousRoot: string | null = null;
+    for (const raw of this.#db.iterate(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts ORDER BY root COLLATE BINARY LIMIT ${MAX_GLOBAL_CHECKOUT_LIST + 1}`,
+    )) {
+      const row = requireStoredCheckoutRow(raw);
+      if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+        throw new CorruptError("checkout roots are not in strict byte order");
+      }
+      previousRoot = row.root;
+      rows.push(row);
+      primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
+      const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
+      if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
+        throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
+      }
+      checkoutCounts.set(row.repoId, checkoutCount);
+      if (rows.length > MAX_GLOBAL_CHECKOUT_LIST) {
+        throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
+      }
+    }
+    for (const count of primaryCounts.values()) {
+      if (count !== 1) throw new CorruptError("repository must have exactly one primary checkout");
+    }
+    return rows;
+  }
+
+  createRepository(root: string, head: string): RepositoryRow {
+    const normalized = requireCheckoutRoot(root, "input");
     const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     return this.#db.transactionSync(() => {
-      const nextId =
-        (this.#db.scalar<number | null>("SELECT MAX(id) FROM git_repositories") ?? 0) + 1;
+      const lastRepoId = this.#db.scalar<unknown>("SELECT MAX(id) FROM git_repositories");
+      const lastCheckoutId = this.#db.scalar<unknown>("SELECT MAX(id) FROM git_checkouts");
+      const repoId =
+        lastRepoId === null ? 1 : requireSafeId(lastRepoId, "latest repository id") + 1;
+      const checkoutId =
+        lastCheckoutId === null ? 1 : requireSafeId(lastCheckoutId, "latest checkout id") + 1;
+      if (!Number.isSafeInteger(repoId) || !Number.isSafeInteger(checkoutId)) {
+        throw new GitError("E2BIG", "store or checkout id space is exhausted");
+      }
+      this.#db.run("INSERT INTO git_repositories (id) VALUES (?)", repoId);
       this.#db.run(
-        "INSERT INTO git_repositories (id, root, head) VALUES (?, ?, ?)",
-        nextId,
+        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+         VALUES (?, ?, ?, ?, 1)`,
+        checkoutId,
+        repoId,
         normalized,
         checkedHead,
       );
-      this.#db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)", nextId);
-      return { id: nextId, root: normalized, head: checkedHead };
+      this.#db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)", repoId);
+      this.#db.run(
+        `INSERT OR IGNORE INTO git_index_state
+           (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
+        checkoutId,
+      );
+      return { id: repoId, checkoutId, root: normalized, head: checkedHead, isPrimary: true };
     });
   }
 
-  open(repository: RepositoryRow): RepoStore {
-    const existing = this.#stores.get(repository.id);
+  openShared(repoId: number): SharedRepoStore {
+    if (!Number.isSafeInteger(repoId) || repoId < 1) {
+      throw new GitError("EINVAL", "repository id must be a safe positive integer");
+    }
+    const existing = this.#sharedStores.get(repoId);
     if (existing !== undefined) return existing;
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repository.id AS repo_id,
+              count(checkout.id) AS checkout_count,
+              coalesce(sum(checkout.is_primary), 0) AS primary_count
+         FROM git_repositories repository
+         LEFT JOIN git_checkouts checkout ON checkout.repo_id = repository.id
+        WHERE repository.id = ? GROUP BY repository.id`,
+      repoId,
+    );
+    if (row === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
+    if (requireSafeId(row.repo_id, "repository id") !== repoId) {
+      throw new CorruptError("repository lookup returned another repository");
+    }
+    const checkoutCount = requireSafeRefLogInteger(
+      row.checkout_count,
+      "repository checkout count",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
+      throw new GitError("E2BIG", "repository exceeds 1,024 checkouts");
+    }
+    const primaryCount = requireSafeRefLogInteger(
+      row.primary_count,
+      "repository primary checkout count",
+      0,
+      checkoutCount,
+    );
+    if (primaryCount !== 1)
+      throw new CorruptError("repository must have exactly one primary checkout");
     if (!Number.isSafeInteger(this.#nextStoreGeneration)) {
       throw new GitError("E2BIG", "repository store generation is exhausted");
     }
     const generation = this.#nextStoreGeneration++;
-    // Destroying a repository evicts its store, so a reused id can never
-    // hand back the previous repository's caches.
-    const store = new RepoStore(
+    const store = new SharedRepoStore(
       this.#db,
-      repository,
+      repoId,
       generation,
       this.#objects,
       this.#packRows,
       this.#memory,
-      this.#options,
-      () => this.#stores.delete(repository.id),
     );
-    this.#stores.set(repository.id, store);
+    this.#sharedStores.set(repoId, store);
+    const primaryRaw = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts WHERE repo_id = ? AND is_primary = 1`,
+      repoId,
+    );
+    if (primaryRaw === undefined) throw new CorruptError("repository primary checkout is missing");
+    const primary = requireStoredCheckoutRow(primaryRaw);
+    const primaryStore = new RepoStore(store, primary, this.#options, () =>
+      this.destroyRepository(repoId),
+    );
+    this.#checkoutStores.set(primary.id, primaryStore);
+    return store;
+  }
+
+  openCheckout(checkout: CheckoutRow | number): RepoStore {
+    const checkoutId =
+      typeof checkout === "number" ? checkout : requireSafeId(checkout.id, "checkout id");
+    const existing = this.#checkoutStores.get(checkoutId);
+    if (existing !== undefined) {
+      if (
+        typeof checkout !== "number" &&
+        (checkout.repoId !== existing.sharedRepoId ||
+          checkout.root !== existing.root ||
+          checkout.head !== existing.head() ||
+          checkout.isPrimary !== existing.isPrimary)
+      ) {
+        throw new CorruptError("cached checkout identity does not match its requested row");
+      }
+      return existing;
+    }
+    const raw = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts WHERE id = ?`,
+      checkoutId,
+    );
+    if (raw === undefined) throw new GitError("ENOTFOUND", "checkout does not exist");
+    const stored = requireStoredCheckoutRow(raw);
+    if (typeof checkout !== "number") {
+      if (
+        checkout.repoId !== stored.repoId ||
+        checkout.root !== stored.root ||
+        checkout.head !== stored.head ||
+        checkout.isPrimary !== stored.isPrimary
+      ) {
+        throw new CorruptError("checkout identity changed before it was opened");
+      }
+    }
+    const shared = this.openShared(stored.repoId);
+    const installed = this.#checkoutStores.get(checkoutId);
+    if (installed !== undefined) return installed;
+    const store = new RepoStore(shared, stored, this.#options, () =>
+      this.destroyRepository(stored.repoId),
+    );
+    this.#checkoutStores.set(checkoutId, store);
+    return store;
+  }
+
+  destroyRepository(repoId: number): void {
+    if (!Number.isSafeInteger(repoId) || repoId < 1) {
+      throw new GitError("EINVAL", "repository id must be a safe positive integer");
+    }
+    this.#db.run("DELETE FROM git_repositories WHERE id = ?", repoId);
+    const shared = this.#sharedStores.get(repoId);
+    shared?.clearCaches();
+    this.#sharedStores.delete(repoId);
+    for (const [checkoutId, store] of this.#checkoutStores) {
+      if (store.sharedRepoId === repoId) this.#checkoutStores.delete(checkoutId);
+    }
+  }
+
+  /** Compatibility registry view until Repository becomes explicitly checkout-bound. */
+  find(dir: string): RepositoryRow | null {
+    const checkout = this.findCheckout(dir);
+    return checkout === null ? null : compatibilityRepositoryRow(checkout);
+  }
+
+  at(root: string): RepositoryRow | null {
+    const checkout = this.checkoutAt(root);
+    return checkout === null ? null : compatibilityRepositoryRow(checkout);
+  }
+
+  list(): RepositoryRow[] {
+    return this.#listRoutingCheckouts().map(compatibilityRepositoryRow);
+  }
+
+  create(root: string, head: string): RepositoryRow {
+    return this.createRepository(root, head);
+  }
+
+  open(repository: RepositoryRow): RepoStore {
+    if (requireSafeId(repository.id, "repository id") < 1) {
+      throw new CorruptError("repository id is invalid");
+    }
+    const store = this.openCheckout(repository.checkoutId);
+    if (
+      store.sharedRepoId !== repository.id ||
+      store.root !== repository.root ||
+      store.head() !== repository.head
+    ) {
+      throw new CorruptError("repository compatibility row changed before it was opened");
+    }
     return store;
   }
 }
 
-/** Objects, refs, config and index for one repository. */
-export class RepoStore {
+/** Checkout-bound storage view; RepoStore below is its compatibility name. */
+export class CheckoutStore {
+  readonly shared: SharedRepoStore;
   readonly #db: SqlDatabase;
   readonly #repoId: number;
+  readonly #checkoutId: number;
   readonly #root: string;
+  readonly #isPrimary: boolean;
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packs: PackStore;
   readonly #memory: MemoryCoordinator;
-  readonly #cacheNamespace: string;
-  #cacheGeneration = 0;
-  #hasLoose: boolean;
   readonly #onDestroy: (() => void) | undefined;
   readonly #now: () => number;
 
   constructor(
-    db: SqlDatabase,
-    repository: RepositoryRow,
-    storeGeneration: number,
-    objects: ByteLru<string, RawObject>,
-    packRows: ByteLru<string, Uint8Array>,
-    memory: MemoryCoordinator,
+    shared: SharedRepoStore,
+    checkout: CheckoutRow,
     options: StoreOptions = {},
     onDestroy?: () => void,
   ) {
+    if (
+      requireSafeId(checkout.id, "checkout id") < 1 ||
+      requireSafeId(checkout.repoId, "checkout repository id") !== shared.repoId ||
+      requireCheckoutRoot(checkout.root, "stored") !== checkout.root ||
+      requireRawRefTarget(checkout.head, "stored HEAD target", "stored") !== checkout.head
+    ) {
+      throw new CorruptError("checkout facade identity is invalid");
+    }
+    this.shared = shared;
     this.#onDestroy = onDestroy;
     this.#now = options.now ?? Date.now;
-    this.#db = db;
-    this.#repoId = repository.id;
-    this.#root = repository.root;
-    this.#objects = objects;
-    this.#memory = memory;
-    this.#cacheNamespace = `${repository.id}:${storeGeneration}`;
-    this.#packs = new PackStore(
-      db,
-      repository.id,
-      this.#objects,
-      packRows,
-      memory,
-      this.#cacheNamespace,
-      (oid) => this.#readLoose(oid),
-      (oids) => this.#readLooseObjects(oids),
-      (oids) => this.#looseObjectMetadata(oids),
-      options,
-    );
-    this.#hasLoose =
-      (this.#db.scalar<number>(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)",
-        this.#repoId,
-      ) ?? 0) > 0;
+    this.#db = shared.db;
+    this.#repoId = shared.repoId;
+    this.#checkoutId = checkout.id;
+    this.#root = checkout.root;
+    this.#isPrimary = checkout.isPrimary;
+    this.#objects = shared.objects;
+    this.#memory = shared.memory;
+    const existingPacks = shared.packs;
+    this.#packs =
+      existingPacks ??
+      shared.installPacks(
+        new PackStore(
+          this.#db,
+          this.#repoId,
+          this.#objects,
+          shared.packRows,
+          this.#memory,
+          shared.cacheNamespace,
+          (oid) => this.#readLoose(oid),
+          (oids) => this.#readLooseObjects(oids),
+          (oids) => this.#looseObjectMetadata(oids),
+          options,
+        ),
+      );
+    shared.installOperations(this);
   }
 
   get db(): SqlDatabase {
@@ -1849,8 +2428,20 @@ export class RepoStore {
     return this.#repoId;
   }
 
+  get sharedRepoId(): number {
+    return this.#repoId;
+  }
+
+  get checkoutId(): number {
+    return this.#checkoutId;
+  }
+
   get root(): string {
     return this.#root;
+  }
+
+  get isPrimary(): boolean {
+    return this.#isPrimary;
   }
 
   get packs(): PackStore {
@@ -2007,7 +2598,7 @@ export class RepoStore {
   }
 
   has(oid: string): boolean {
-    if (this.#hasLoose && this.#looseRow(oid) !== null) return true;
+    if (this.shared.hasLoose && this.#looseRow(oid) !== null) return true;
     return this.#packs.typeAndSize(oid) !== null;
   }
 
@@ -2055,7 +2646,7 @@ export class RepoStore {
   }
 
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {
-    if (this.#hasLoose) {
+    if (this.shared.hasLoose) {
       const row = this.#looseRow(oid);
       if (row !== null) return { type: row.type, size: row.size };
     }
@@ -2381,7 +2972,7 @@ export class RepoStore {
         requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
       }
     });
-    this.#hasLoose = true;
+    this.shared.markLoose();
     this.#objects.set(this.#objectCacheKey(oid), { type, data });
     return oid;
   }
@@ -2482,7 +3073,7 @@ export class RepoStore {
           requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
         }
       });
-      this.#hasLoose = true;
+      this.shared.markLoose();
       return oid;
     }
 
@@ -2573,7 +3164,7 @@ export class RepoStore {
         requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
       }
     });
-    this.#hasLoose = true;
+    this.shared.markLoose();
     return oid;
   }
 
@@ -2749,7 +3340,7 @@ export class RepoStore {
       );
       requireCommitCacheWrites(insertCommitCaches(this.#db, commitEntries), commitEntries.length);
     });
-    if (wroteLoose) this.#hasLoose = true;
+    if (wroteLoose) this.shared.markLoose();
   }
 
   /**
@@ -2761,7 +3352,7 @@ export class RepoStore {
   readChunks(oid: string): Iterable<Uint8Array> | null {
     const cached = this.#objects.get(this.#objectCacheKey(oid));
     if (cached !== undefined) return [cached.data];
-    if (this.#hasLoose) {
+    if (this.shared.hasLoose) {
       const row = this.#looseRow(oid);
       if (row !== null) return this.#looseChunks(oid, parseLooseEncoding(row.stored));
     }
@@ -2810,7 +3401,7 @@ export class RepoStore {
   resolvePrefix(prefix: string): string | null {
     if (prefix.length === 40) return this.has(prefix) ? prefix : null;
     const found = new Set<string>();
-    if (this.#hasLoose) {
+    if (this.shared.hasLoose) {
       const upper = nextPrefix(prefix);
       for (const row of this.#db.all<{ oid: string }>(
         "SELECT oid FROM git_objects WHERE repo_id = ? AND oid >= ? AND oid < ? LIMIT 2",
@@ -2843,7 +3434,7 @@ export class RepoStore {
   }
 
   #readLoose(oid: string): RawObject | null {
-    if (!this.#hasLoose) return null;
+    if (!this.shared.hasLoose) return null;
     const row = this.#looseRow(oid);
     if (row === null) return null;
     const chunks = this.#db.all<{ data: unknown }>(
@@ -3113,34 +3704,78 @@ export class RepoStore {
   #mutateRefs(normalized: NormalizedRefMutation, checkedMetadata: RefLogMetadata): boolean {
     return this.#db.transactionSync(() => {
       const header = this.#db.one<{
-        head: unknown;
+        repo_id: unknown;
+        checkout_id: unknown;
         next_ordinal: unknown;
         latest_ordinal: unknown;
       }>(
-        `SELECT repository.head, state.next_ordinal,
-                (SELECT max(entry.ordinal) FROM git_reflog_entries entry
-                  WHERE entry.repo_id = repository.id) AS latest_ordinal
+        `SELECT repository.id AS repo_id, checkout.id AS checkout_id, state.next_ordinal,
+                (SELECT max(ordinal) FROM (
+                   SELECT entry.ordinal FROM git_reflog_entries entry
+                    WHERE entry.repo_id = repository.id
+                   UNION ALL
+                   SELECT entry.ordinal FROM git_checkout_reflog_entries entry
+                    WHERE entry.repo_id = repository.id
+                 )) AS latest_ordinal
            FROM git_repositories repository
            JOIN git_reflog_state state ON state.repo_id = repository.id
-          WHERE repository.id = ?`,
+           JOIN git_checkouts checkout ON checkout.repo_id = repository.id
+          WHERE repository.id = ? AND checkout.id = ?`,
         this.#repoId,
+        this.#checkoutId,
       );
       if (header === undefined) {
         throw new CorruptError("repository is missing its reflog state");
       }
-      const oldHead = requireRawRefTarget(header.head, "stored HEAD target", "stored");
+      if (
+        requireSafeId(header.repo_id, "reflog repository id") !== this.#repoId ||
+        requireSafeId(header.checkout_id, "reflog checkout id") !== this.#checkoutId
+      ) {
+        throw new CorruptError("reflog header crossed a checkout boundary");
+      }
       const nextOrdinal = requireSafeRefLogInteger(
         header.next_ordinal,
         "reflog next ordinal",
         0,
         MAX_REFLOG_ORDINAL,
       );
-      if (
-        (nextOrdinal === 0 && header.latest_ordinal !== null) ||
-        (nextOrdinal !== 0 && header.latest_ordinal !== nextOrdinal)
-      ) {
-        throw new CorruptError("reflog state does not match its newest entry");
+      const latestOrdinal =
+        header.latest_ordinal === null
+          ? null
+          : requireSafeRefLogInteger(
+              header.latest_ordinal,
+              "newest reflog ordinal",
+              1,
+              MAX_REFLOG_ORDINAL,
+            );
+      if ((nextOrdinal === 0 && latestOrdinal !== null) || (latestOrdinal ?? 0) > nextOrdinal) {
+        throw new CorruptError("reflog state precedes its newest entry");
       }
+
+      const checkouts: CheckoutRow[] = [];
+      let selected: CheckoutRow | null = null;
+      let previousCheckoutId = 0;
+      for (const raw of this.#db.iterate(
+        `SELECT id AS checkout_id, repo_id, root, head, is_primary
+           FROM git_checkouts WHERE repo_id = ? ORDER BY id
+           LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+        this.#repoId,
+      )) {
+        const checkout = requireStoredCheckoutRow(raw);
+        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
+          throw new CorruptError("reflog checkout scan crossed or reordered repositories");
+        }
+        previousCheckoutId = checkout.id;
+        normalized.budget.charge(refMutationCheckoutRetainedBytes(checkout));
+        checkouts.push(checkout);
+        if (checkout.id === this.#checkoutId) selected = checkout;
+        if (checkouts.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
+        }
+      }
+      if (selected === null)
+        throw new CorruptError("selected checkout disappeared during ref mutation");
+      const oldHead = selected.head;
 
       const before = new Map<string, string>();
       let rows = 0;
@@ -3196,6 +3831,34 @@ export class RepoStore {
         return beforeTarget(name);
       };
       const newHead = normalized.head ?? oldHead;
+      const newAttachedBranch = rawSymbolicTarget(newHead);
+      const attachedBranchOwner = (): CheckoutRow | null => {
+        if (newAttachedBranch?.startsWith("refs/heads/") !== true) return null;
+        const owner = this.#db.one<Record<string, unknown>>(
+          `SELECT id AS checkout_id, repo_id, root, head, is_primary
+             FROM git_checkouts
+            WHERE repo_id = ? AND head = ? AND id != ?
+            LIMIT 1`,
+          this.#repoId,
+          newHead,
+          this.#checkoutId,
+        );
+        if (owner === undefined) return null;
+        const checkedOwner = requireStoredCheckoutRow(owner);
+        if (checkedOwner.repoId !== this.#repoId || checkedOwner.head !== newHead) {
+          throw new CorruptError("attached branch ownership crossed a repository boundary");
+        }
+        return checkedOwner;
+      };
+      if (newHead !== oldHead) {
+        const owner = attachedBranchOwner();
+        if (owner !== null) {
+          throw new GitError(
+            "EBRANCHINUSE",
+            `branch ${newAttachedBranch} is already attached to checkout ${owner.root}`,
+          );
+        }
+      }
 
       const changedNames = new Set<string>();
       for (const name of normalized.deletes) {
@@ -3215,13 +3878,13 @@ export class RepoStore {
         }
       }
       const orderedNames = [...changedNames].sort(comparePaths);
-      const pending: Omit<RefLogEvent, "ordinal">[] = [];
+      const pendingDirect: Omit<RefLogEvent, "ordinal">[] = [];
       for (const name of orderedNames) {
         const oldRaw = beforeTarget(name);
         const newRaw = afterTarget(name);
         const oldOid = resolveRawRef(oldRaw, beforeTarget);
         const newOid = resolveRawRef(newRaw, afterTarget);
-        pending.push({
+        pendingDirect.push({
           refName: name,
           oldRaw,
           newRaw,
@@ -3234,40 +3897,53 @@ export class RepoStore {
           reason: checkedMetadata.reason,
         });
       }
-      const oldHeadOid = resolveRawRef(oldHead, beforeTarget);
-      const newHeadOid = resolveRawRef(newHead, afterTarget);
-      const checkedOutRef = rawSymbolicTarget(oldHead);
-      const causalHeadChange = checkedOutRef !== null && changedNames.has(checkedOutRef);
-      if (oldHead !== newHead || oldHeadOid !== newHeadOid || causalHeadChange) {
-        normalized.budget.charge(refLogEventRetainedBytes("HEAD", oldHead, newHead));
-        pending.push({
-          refName: "HEAD",
-          oldRaw: oldHead,
-          newRaw: newHead,
-          oldOid: oldHeadOid,
-          newOid: newHeadOid,
-          actorName: checkedMetadata.actor?.name ?? null,
-          actorEmail: checkedMetadata.actor?.email ?? null,
-          timestamp: checkedMetadata.timestamp,
-          timezoneOffset: checkedMetadata.timezoneOffset,
-          reason: checkedMetadata.reason,
-        });
+      const pendingHeads: { checkoutId: number; event: Omit<RefLogEvent, "ordinal"> }[] = [];
+      for (const checkout of checkouts) {
+        const checkoutNewHead = checkout.id === this.#checkoutId ? newHead : checkout.head;
+        const attached = rawSymbolicTarget(checkout.head);
+        const causalHeadChange = attached?.startsWith("refs/heads/") && changedNames.has(attached);
+        const oldHeadOid = resolveRawRef(checkout.head, beforeTarget);
+        const newHeadOid = resolveRawRef(checkoutNewHead, afterTarget);
+        if (checkout.head !== checkoutNewHead || oldHeadOid !== newHeadOid || causalHeadChange) {
+          normalized.budget.charge(
+            refLogEventRetainedBytes("HEAD", checkout.head, checkoutNewHead),
+          );
+          pendingHeads.push({
+            checkoutId: checkout.id,
+            event: {
+              refName: "HEAD",
+              oldRaw: checkout.head,
+              newRaw: checkoutNewHead,
+              oldOid: oldHeadOid,
+              newOid: newHeadOid,
+              actorName: checkedMetadata.actor?.name ?? null,
+              actorEmail: checkedMetadata.actor?.email ?? null,
+              timestamp: checkedMetadata.timestamp,
+              timezoneOffset: checkedMetadata.timezoneOffset,
+              reason: checkedMetadata.reason,
+            },
+          });
+        }
       }
-      if (pending.length === 0) return false;
-      if (pending.length > MAX_REFLOG_ORDINAL - nextOrdinal) {
+      const eventCount = pendingDirect.length + pendingHeads.length;
+      if (eventCount === 0) return false;
+      if (eventCount > MAX_REFLOG_ORDINAL - nextOrdinal) {
         throw new GitError("E2BIG", "repository reflog ordinal is exhausted");
       }
 
-      const events: RefLogEvent[] = pending.map((event, index) => ({
+      const events: RefLogEvent[] = pendingDirect.map((event, index) => ({
         ...event,
         ordinal: nextOrdinal + index + 1,
       }));
-      const deleted = events
-        .filter((event) => event.refName !== "HEAD" && event.newRaw === null)
-        .map((event) => event.refName);
+      const checkoutEvents: CheckoutRefLogEvent[] = pendingHeads.map((pending, index) => ({
+        ...pending.event,
+        checkoutId: pending.checkoutId,
+        ordinal: nextOrdinal + events.length + index + 1,
+      }));
+      const deleted = events.filter((event) => event.newRaw === null).map((event) => event.refName);
       const put: RefRow[] = [];
       for (const event of events) {
-        if (event.refName !== "HEAD" && event.newRaw !== null) {
+        if (event.newRaw !== null) {
           put.push({ name: event.refName, target: event.newRaw });
         }
       }
@@ -3291,7 +3967,36 @@ export class RepoStore {
         );
       }
       if (newHead !== oldHead) {
-        this.#db.run("UPDATE git_repositories SET head = ? WHERE id = ?", newHead, this.#repoId);
+        let updated: Record<string, unknown> | undefined;
+        try {
+          updated = this.#db.one<Record<string, unknown>>(
+            `UPDATE git_checkouts SET head = ?
+              WHERE id = ? AND repo_id = ? AND head = ?
+              RETURNING id AS checkout_id, repo_id, root, head, is_primary`,
+            newHead,
+            this.#checkoutId,
+            this.#repoId,
+            oldHead,
+          );
+        } catch (error) {
+          if (isAttachedBranchUniqueConstraint(error)) {
+            const owner = attachedBranchOwner();
+            if (owner !== null) {
+              throw new GitError(
+                "EBRANCHINUSE",
+                `branch ${newAttachedBranch} is already attached to checkout ${owner.root}`,
+                { cause: error },
+              );
+            }
+          }
+          throw error;
+        }
+        if (updated === undefined)
+          throw new CorruptError("selected checkout HEAD changed during ref mutation");
+        const checked = requireStoredCheckoutRow(updated);
+        if (checked.id !== this.#checkoutId || checked.repoId !== this.#repoId) {
+          throw new CorruptError("HEAD update crossed a checkout boundary");
+        }
       }
       for (const page of jsonPages(events, "reflog entry")) {
         this.#db.run(
@@ -3315,7 +4020,28 @@ export class RepoStore {
           page,
         );
       }
-      const finalOrdinal = nextOrdinal + events.length;
+      for (const page of jsonPages(checkoutEvents, "checkout reflog entry")) {
+        this.#db.run(
+          `INSERT INTO git_checkout_reflog_entries
+             (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+              actor_name, actor_email, timestamp, timezone, reason)
+           SELECT json_extract(value, '$.checkoutId'), ?,
+                  json_extract(value, '$.ordinal'),
+                  json_extract(value, '$.oldRaw'),
+                  json_extract(value, '$.newRaw'),
+                  json_extract(value, '$.oldOid'),
+                  json_extract(value, '$.newOid'),
+                  json_extract(value, '$.actorName'),
+                  json_extract(value, '$.actorEmail'),
+                  json_extract(value, '$.timestamp'),
+                  json_extract(value, '$.timezoneOffset'),
+                  json_extract(value, '$.reason')
+             FROM json_each(?)`,
+          this.#repoId,
+          page,
+        );
+      }
+      const finalOrdinal = nextOrdinal + eventCount;
       const state = this.#db.one<{ next_ordinal: unknown }>(
         `UPDATE git_reflog_state SET next_ordinal = ?
           WHERE repo_id = ? AND next_ordinal = ?
@@ -3334,8 +4060,13 @@ export class RepoStore {
         this.#repoId,
         cutoff,
       );
-      const touched = events.map((event) => event.refName);
-      for (const page of jsonPages(touched, "reflog retention ref")) {
+      this.#db.run(
+        "DELETE FROM git_checkout_reflog_entries WHERE repo_id = ? AND timestamp < ?",
+        this.#repoId,
+        cutoff,
+      );
+      const touchedRefs = events.map((event) => event.refName);
+      for (const page of jsonPages(touchedRefs, "reflog retention ref")) {
         this.#db.run(
           `DELETE FROM git_reflog_entries AS entry
             WHERE entry.repo_id = ?
@@ -3345,6 +4076,23 @@ export class RepoStore {
                   FROM git_reflog_entries retained INDEXED BY git_reflog_entries_by_ref
                  WHERE retained.repo_id = entry.repo_id
                    AND retained.ref_name = entry.ref_name
+                 ORDER BY retained.ordinal DESC
+                 LIMIT 1 OFFSET ${REFLOG_RETENTION_ROWS - 1}
+              ), 0)`,
+          this.#repoId,
+          page,
+        );
+      }
+      const touchedCheckouts = checkoutEvents.map((event) => event.checkoutId);
+      for (const page of jsonPages(touchedCheckouts, "checkout reflog retention")) {
+        this.#db.run(
+          `DELETE FROM git_checkout_reflog_entries AS entry
+            WHERE entry.repo_id = ?
+              AND entry.checkout_id IN (SELECT value FROM json_each(?))
+              AND entry.ordinal < coalesce((
+                SELECT retained.ordinal
+                  FROM git_checkout_reflog_entries retained
+                 WHERE retained.checkout_id = entry.checkout_id
                  ORDER BY retained.ordinal DESC
                  LIMIT 1 OFFSET ${REFLOG_RETENTION_ROWS - 1}
               ), 0)`,
@@ -3372,10 +4120,18 @@ export class RepoStore {
   }
 
   head(): string {
-    return (
-      this.#db.scalar<string>("SELECT head FROM git_repositories WHERE id = ?", this.#repoId) ??
-      "ref: refs/heads/main"
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+         FROM git_checkouts WHERE id = ? AND repo_id = ?`,
+      this.#checkoutId,
+      this.#repoId,
     );
+    if (row === undefined) throw new CorruptError("checkout HEAD row is missing");
+    const checkout = requireStoredCheckoutRow(row);
+    if (checkout.id !== this.#checkoutId || checkout.repoId !== this.#repoId) {
+      throw new CorruptError("HEAD read crossed a checkout boundary");
+    }
+    return checkout.head;
   }
 
   setHead(value: string): void {
@@ -3400,33 +4156,57 @@ export class RepoStore {
     let headerSeen = false;
     let nextOrdinal = 0;
     let previousOrdinal: number | null = null;
-    for (const row of this.#db.iterate(
-      `SELECT 0 AS kind, repository.id AS repo_id, repository.head,
+    const headerSql = `SELECT 0 AS kind, repository.id AS repo_id, checkout.head,
               state.next_ordinal,
-              (SELECT max(latest.ordinal)
-                 FROM git_reflog_entries latest
-                WHERE latest.repo_id = repository.id
-                  AND typeof(latest.ordinal) = 'integer'
-                  AND latest.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}) AS latest_ordinal,
+              (SELECT max(ordinal) FROM (
+                 SELECT direct.ordinal FROM git_reflog_entries direct
+                  WHERE direct.repo_id = repository.id
+                 UNION ALL
+                 SELECT local.ordinal FROM git_checkout_reflog_entries local
+                  WHERE local.repo_id = repository.id
+               )) AS latest_ordinal,
               NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
               NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
               NULL AS timestamp, NULL AS timezone, NULL AS reason
          FROM git_repositories repository
-         LEFT JOIN git_reflog_state state ON state.repo_id = repository.id
-        WHERE repository.id = ?
-       UNION ALL
-       SELECT 1 AS kind, entry.repo_id, NULL AS head, NULL AS next_ordinal,
+         JOIN git_reflog_state state ON state.repo_id = repository.id
+         JOIN git_checkouts checkout ON checkout.repo_id = repository.id
+        WHERE repository.id = ? AND checkout.id = ?`;
+    const rows =
+      name === "HEAD"
+        ? this.#db.iterate(
+            `${headerSql}
+             UNION ALL
+             SELECT 1 AS kind, entry.repo_id, NULL AS head, NULL AS next_ordinal,
+                    NULL AS latest_ordinal, 'HEAD' AS ref_name, entry.ordinal,
+                    entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+                    entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone, entry.reason
+               FROM git_checkout_reflog_entries entry
+              WHERE entry.repo_id = ? AND entry.checkout_id = ?
+              ORDER BY kind, ordinal DESC
+              LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
+            this.#repoId,
+            this.#checkoutId,
+            this.#repoId,
+            this.#checkoutId,
+          )
+        : this.#db.iterate(
+            `${headerSql}
+             UNION ALL
+             SELECT 1 AS kind, entry.repo_id, NULL AS head, NULL AS next_ordinal,
               NULL AS latest_ordinal, entry.ref_name, entry.ordinal,
               entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
               entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone, entry.reason
-         FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
-        WHERE entry.repo_id = ? AND entry.ref_name = ?
-        ORDER BY kind, ordinal DESC
-        LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
-      this.#repoId,
-      this.#repoId,
-      name,
-    )) {
+               FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
+              WHERE entry.repo_id = ? AND entry.ref_name = ?
+              ORDER BY kind, ordinal DESC
+              LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
+            this.#repoId,
+            this.#checkoutId,
+            this.#repoId,
+            name,
+          );
+    for (const row of rows) {
       if (row.kind === 0) {
         if (headerSeen) throw new CorruptError("reflog query returned duplicate headers");
         headerSeen = true;
@@ -3463,134 +4243,87 @@ export class RepoStore {
       throw new GitError("EINVAL", "reflog clock must return a safe nonnegative epoch time");
     }
     const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-    let headerSeen = false;
-    let budgetSeen = false;
-    let nextOrdinal = 0;
+    const physicalRows = this.#db.scalar<unknown>(
+      `SELECT (SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?)
+            + (SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?)`,
+      this.#repoId,
+      this.#repoId,
+    );
+    validateRefLogRootScanBudget(physicalRows);
+    const header = this.#db.one<Record<string, unknown>>(
+      `SELECT repository.id AS repo_id, checkout.head, state.next_ordinal,
+              (SELECT max(ordinal) FROM (
+                 SELECT direct.ordinal FROM git_reflog_entries direct
+                  WHERE direct.repo_id = repository.id
+                 UNION ALL
+                 SELECT local.ordinal FROM git_checkout_reflog_entries local
+                  WHERE local.repo_id = repository.id
+               )) AS latest_ordinal
+         FROM git_repositories repository
+         JOIN git_reflog_state state ON state.repo_id = repository.id
+         JOIN git_checkouts checkout ON checkout.repo_id = repository.id
+        WHERE repository.id = ? AND checkout.id = ?`,
+      this.#repoId,
+      this.#checkoutId,
+    );
+    if (header === undefined) throw new CorruptError("repository is missing its reflog state");
+    const nextOrdinal = requireRefLogHeader(header, this.#repoId);
     let previousRef: string | null = null;
-    let previousEntryOrdinal: number | null = null;
-    let entriesForRef = 0;
+    let previousDirectOrdinal: number | null = null;
+    let directEntriesForRef = 0;
+    let previousCheckoutId = 0;
+    let previousCheckoutOrdinal: number | null = null;
+    let checkoutEntries = 0;
     let previousOid: string | null = null;
     for (const row of this.#db.iterate(
-      `SELECT 0 AS kind, repository.id AS repo_id, repository.head,
-              state.next_ordinal,
-              (SELECT max(latest.ordinal)
-                 FROM git_reflog_entries latest
-                WHERE latest.repo_id = repository.id
-                  AND typeof(latest.ordinal) = 'integer'
-                  AND latest.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}) AS latest_ordinal,
-              NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
-              NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
-              NULL AS timestamp, NULL AS timezone, NULL AS reason, NULL AS root_oid,
-              NULL AS entry_count
-         FROM git_repositories repository
-         LEFT JOIN git_reflog_state state ON state.repo_id = repository.id
-        WHERE repository.id = ?
-       UNION ALL
-       SELECT 1 AS kind, invalid.repo_id, NULL AS head, NULL AS next_ordinal,
-              NULL AS latest_ordinal, NULL AS ref_name, invalid.ordinal,
-              NULL AS old_raw, NULL AS new_raw, NULL AS old_oid, NULL AS new_oid,
-              NULL AS actor_name, NULL AS actor_email, NULL AS timestamp,
-              NULL AS timezone, NULL AS reason, NULL AS root_oid, NULL AS entry_count
-         FROM (
-           SELECT entry.repo_id, entry.ordinal
-             FROM git_reflog_entries entry
-            WHERE entry.repo_id = ?
-              AND (typeof(entry.ordinal) != 'integer'
-                   OR entry.ordinal < 1 OR entry.ordinal > ${MAX_REFLOG_ORDINAL})
-            LIMIT 1
-         ) invalid
-       UNION ALL
-       SELECT 2 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
-              NULL AS latest_ordinal, NULL AS ref_name, NULL AS ordinal,
-              NULL AS old_raw, NULL AS new_raw, NULL AS old_oid, NULL AS new_oid,
-              NULL AS actor_name, NULL AS actor_email, NULL AS timestamp,
-              NULL AS timezone, NULL AS reason, NULL AS root_oid, budget.entry_count
-         FROM (
-           SELECT count(*) AS entry_count
-             FROM git_reflog_entries entry
-            WHERE entry.repo_id = ?
-         ) budget
-       UNION ALL
-       SELECT 3 AS kind, retained.repo_id, NULL AS head, NULL AS next_ordinal,
-              NULL AS latest_ordinal, retained.ref_name, retained.ordinal,
-              retained.old_raw, retained.new_raw, retained.old_oid, retained.new_oid,
-              retained.actor_name, retained.actor_email, retained.timestamp, retained.timezone,
-              retained.reason, NULL AS root_oid, NULL AS entry_count
-         FROM (
-           SELECT ranked.*
-             FROM (
-               SELECT entry.*,
-                      row_number() OVER (
-                        PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
-                      ) AS retained_rank
-                 FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
-                WHERE entry.repo_id = ?
-                  AND typeof(entry.ordinal) = 'integer'
-                  AND entry.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}
-             ) ranked
-            WHERE ranked.retained_rank <= ${REFLOG_RETENTION_ROWS}
-            ORDER BY ranked.ref_name, ranked.ordinal DESC
-         ) retained
-       UNION ALL
-       SELECT 4 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
-              NULL AS latest_ordinal, NULL AS ref_name, NULL AS ordinal,
-              NULL AS old_raw, NULL AS new_raw, NULL AS old_oid, NULL AS new_oid,
-              NULL AS actor_name, NULL AS actor_email, NULL AS timestamp,
-              NULL AS timezone, NULL AS reason, roots.oid AS root_oid, NULL AS entry_count
-         FROM (
-           SELECT endpoint.oid
-             FROM (
-               WITH ranked AS (
-                 SELECT entry.old_oid, entry.new_oid, entry.timestamp,
-                        row_number() OVER (
-                          PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
-                        ) AS retained_rank
-                   FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
-                  WHERE entry.repo_id = ?
-                    AND typeof(entry.ordinal) = 'integer'
-                    AND entry.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}
-               )
-               SELECT ranked.old_oid AS oid
-                 FROM ranked
-                WHERE ranked.retained_rank <= ${REFLOG_RETENTION_ROWS}
-                  AND ranked.timestamp >= ?
+      `WITH direct_ranked AS (
+         SELECT entry.*, NULL AS checkout_id, NULL AS owner_repo_id,
+                row_number() OVER (
+                  PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
+                ) AS retained_rank
+           FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
+          WHERE entry.repo_id = ?
+       ), checkout_ranked AS (
+         SELECT entry.*, 'HEAD' AS ref_name, checkout.repo_id AS owner_repo_id,
+                row_number() OVER (
+                  PARTITION BY entry.checkout_id ORDER BY entry.ordinal DESC
+                ) AS retained_rank
+           FROM git_checkout_reflog_entries entry
+           LEFT JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
+          WHERE entry.repo_id = ?
+       ), retained AS (
+         SELECT 0 AS kind, repo_id, checkout_id, owner_repo_id, ref_name, ordinal,
+                old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
+                timestamp, timezone, reason
+           FROM direct_ranked WHERE retained_rank <= ${REFLOG_RETENTION_ROWS}
+         UNION ALL
+         SELECT 1 AS kind, repo_id, checkout_id, owner_repo_id, ref_name, ordinal,
+                old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
+                timestamp, timezone, reason
+           FROM checkout_ranked WHERE retained_rank <= ${REFLOG_RETENTION_ROWS}
+       ), output AS (
+         SELECT retained.*, NULL AS root_oid FROM retained
+         UNION ALL
+         SELECT 2 AS kind, NULL AS repo_id, NULL AS checkout_id, NULL AS owner_repo_id,
+                NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
+                NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
+                NULL AS timestamp, NULL AS timezone, NULL AS reason, endpoint.oid AS root_oid
+           FROM (
+             SELECT oid FROM (
+               SELECT old_oid AS oid FROM retained WHERE timestamp >= ?
                UNION ALL
-               SELECT ranked.new_oid AS oid
-                 FROM ranked
-                WHERE ranked.retained_rank <= ${REFLOG_RETENTION_ROWS}
-                  AND ranked.timestamp >= ?
-             ) endpoint
-            WHERE endpoint.oid IS NOT NULL
-            GROUP BY endpoint.oid
-            ORDER BY endpoint.oid
-         ) roots
-       `,
-      this.#repoId,
-      this.#repoId,
-      this.#repoId,
+               SELECT new_oid AS oid FROM retained WHERE timestamp >= ?
+             ) WHERE oid IS NOT NULL GROUP BY oid
+           ) endpoint
+       )
+       SELECT * FROM output
+       ORDER BY kind, ref_name COLLATE BINARY, checkout_id, ordinal DESC, root_oid COLLATE BINARY`,
       this.#repoId,
       this.#repoId,
       cutoff,
       cutoff,
     )) {
       if (row.kind === 0) {
-        if (headerSeen) throw new CorruptError("reflog root query returned duplicate headers");
-        headerSeen = true;
-        nextOrdinal = requireRefLogHeader(row, this.#repoId);
-        continue;
-      }
-      if (!headerSeen) throw new CorruptError("reflog root query omitted its header");
-      if (row.kind === 1) {
-        throw new CorruptError("reflog root query found an invalid ordinal");
-      }
-      if (row.kind === 2) {
-        if (budgetSeen) throw new CorruptError("reflog root query returned duplicate budgets");
-        validateRefLogRootScanBudget(row.entry_count);
-        budgetSeen = true;
-        continue;
-      }
-      if (!budgetSeen) throw new CorruptError("reflog root query omitted its budget");
-      if (row.kind === 3) {
         const entry = requireStoredRefLogEntry(row, this.#repoId);
         if (entry.ordinal > nextOrdinal) {
           throw new CorruptError("reflog entry exceeds the repository allocation state");
@@ -3600,20 +4333,47 @@ export class RepoStore {
             throw new CorruptError("reflog entries are not in strict ref byte order");
           }
           previousRef = entry.refName;
-          previousEntryOrdinal = null;
-          entriesForRef = 0;
+          previousDirectOrdinal = null;
+          directEntriesForRef = 0;
         }
-        if (previousEntryOrdinal !== null && previousEntryOrdinal <= entry.ordinal) {
+        if (previousDirectOrdinal !== null && previousDirectOrdinal <= entry.ordinal) {
           throw new CorruptError("reflog entries are not in strict descending ordinal order");
         }
-        previousEntryOrdinal = entry.ordinal;
-        entriesForRef++;
-        if (entriesForRef > REFLOG_RETENTION_ROWS) {
+        previousDirectOrdinal = entry.ordinal;
+        directEntriesForRef++;
+        if (directEntriesForRef > REFLOG_RETENTION_ROWS) {
           throw new CorruptError("reflog root query exceeded its retained row bound");
         }
         continue;
       }
-      if (row.kind !== 4 || typeof row.root_oid !== "string" || !isOid(row.root_oid)) {
+      if (row.kind === 1) {
+        const checkoutId = requireSafeId(row.checkout_id, "checkout reflog owner id");
+        if (row.owner_repo_id !== this.#repoId) {
+          throw new CorruptError("checkout reflog owner belongs to another repository");
+        }
+        const entry = requireStoredRefLogEntry(row, this.#repoId);
+        if (entry.refName !== "HEAD" || entry.ordinal > nextOrdinal) {
+          throw new CorruptError("checkout reflog entry is invalid");
+        }
+        if (checkoutId !== previousCheckoutId) {
+          if (checkoutId <= previousCheckoutId) {
+            throw new CorruptError("checkout reflog owners are not in strict order");
+          }
+          previousCheckoutId = checkoutId;
+          previousCheckoutOrdinal = null;
+          checkoutEntries = 0;
+        }
+        if (previousCheckoutOrdinal !== null && previousCheckoutOrdinal <= entry.ordinal) {
+          throw new CorruptError("checkout reflog entries are not in descending ordinal order");
+        }
+        previousCheckoutOrdinal = entry.ordinal;
+        checkoutEntries++;
+        if (checkoutEntries > REFLOG_RETENTION_ROWS) {
+          throw new CorruptError("checkout reflog query exceeded its retained row bound");
+        }
+        continue;
+      }
+      if (row.kind !== 2 || typeof row.root_oid !== "string" || !isOid(row.root_oid)) {
         throw new CorruptError("reflog root query returned an invalid object id");
       }
       if (previousOid !== null && comparePaths(previousOid, row.root_oid) >= 0) {
@@ -3622,8 +4382,6 @@ export class RepoStore {
       previousOid = row.root_oid;
       yield row.root_oid;
     }
-    if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
-    if (!budgetSeen) throw new CorruptError("repository is missing its reflog root budget");
   }
 
   // -- config ---------------------------------------------------------
@@ -3808,19 +4566,19 @@ export class RepoStore {
               CASE WHEN typeof(integrity_oid) = 'text'
                          AND length(CAST(integrity_oid AS BLOB)) = 40
                    THEN integrity_oid END AS integrity_oid
-         FROM git_operation_state WHERE repo_id = ?`,
-      this.#repoId,
+         FROM git_operation_state WHERE checkout_id = ?`,
+      this.#checkoutId,
     );
     if (row === undefined) {
       const orphaned = requireBooleanProbe(
         this.#db.scalar<unknown>(
           `SELECT EXISTS(
-             SELECT 1 FROM git_operation_steps WHERE repo_id = ?
+             SELECT 1 FROM git_operation_steps WHERE checkout_id = ?
              UNION ALL
-             SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1
+             SELECT 1 FROM git_operation_touched WHERE checkout_id = ? LIMIT 1
            )`,
-          this.#repoId,
-          this.#repoId,
+          this.#checkoutId,
+          this.#checkoutId,
         ),
         "operation child-row orphan probe",
       );
@@ -3861,8 +4619,8 @@ export class RepoStore {
               CASE WHEN result_oid IS NULL THEN NULL
                    WHEN typeof(result_oid) = 'text' AND length(CAST(result_oid AS BLOB)) = 40
                    THEN result_oid ELSE 0 END AS result_oid
-         FROM git_operation_steps WHERE repo_id = ? ORDER BY ordinal`,
-      this.#repoId,
+         FROM git_operation_steps WHERE checkout_id = ? ORDER BY ordinal`,
+      this.#checkoutId,
     )) {
       const stepRow: OperationStepRow = {
         ordinal: raw.ordinal,
@@ -3912,8 +4670,8 @@ export class RepoStore {
                          AND length(CAST(worktree_oid AS BLOB)) = 40
                    THEN worktree_oid ELSE 0 END AS worktree_oid,
               worktree_revision
-         FROM git_operation_touched WHERE repo_id = ? ORDER BY ordinal`,
-      this.#repoId,
+         FROM git_operation_touched WHERE checkout_id = ? ORDER BY ordinal`,
+      this.#checkoutId,
     )) {
       const touchedRow: OperationTouchedRow = {
         ordinal: raw.ordinal,
@@ -4006,13 +4764,13 @@ export class RepoStore {
   ): void {
     this.#db.run(
       `INSERT INTO git_operation_state
-         (repo_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
+         (checkout_id, kind, original_head_ref, original_head_oid, phase, empty_reason,
           current_parent_oid, incoming_parent_oid, upstream_oid, base_oid, mode, merge_origin,
           current_step, step_count, current_label, incoming_label, message,
           author_name, author_email, committer_name, committer_email,
           touched_count, retained_bytes, integrity_oid)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      this.#repoId,
+      this.#checkoutId,
       state.kind,
       state.originalHeadRef,
       state.originalHeadOid,
@@ -4050,7 +4808,7 @@ export class RepoStore {
     for (const page of jsonPages(rows(), "operation step")) {
       this.#db.run(
         `INSERT INTO git_operation_steps
-           (repo_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
+           (checkout_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
          SELECT ?,
                 json_extract(value, '$.ordinal'),
                 json_extract(value, '$.sourceOid'),
@@ -4059,7 +4817,7 @@ export class RepoStore {
                 json_extract(value, '$.outcome'),
                 json_extract(value, '$.resultOid')
            FROM json_each(?) ORDER BY CAST(json_extract(value, '$.ordinal') AS INTEGER)`,
-        this.#repoId,
+        this.#checkoutId,
         page,
       );
     }
@@ -4076,7 +4834,7 @@ export class RepoStore {
     for (const page of jsonPages(rows(), "operation touched path")) {
       this.#db.run(
         `INSERT INTO git_operation_touched
-           (repo_id, ordinal, path, logical_path, purpose,
+           (checkout_id, ordinal, path, logical_path, purpose,
             index_stage, index_mode, index_oid, index_size, index_mtime,
             index_ino, index_rev, worktree_kind, worktree_mode,
             worktree_oid, worktree_revision)
@@ -4097,7 +4855,7 @@ export class RepoStore {
                 json_extract(value, '$.worktreeOid'),
                 json_extract(value, '$.worktreeRevision')
            FROM json_each(?) ORDER BY CAST(json_extract(value, '$.ordinal') AS INTEGER)`,
-        this.#repoId,
+        this.#checkoutId,
         page,
       );
     }
@@ -4351,7 +5109,7 @@ export class RepoStore {
                 mode = ?, merge_origin = ?, current_step = ?, current_label = ?, incoming_label = ?,
                 message = ?, author_name = ?, author_email = ?, committer_name = ?,
                 committer_email = ?, retained_bytes = ?, integrity_oid = ?
-          WHERE repo_id = ? AND integrity_oid = ?`,
+          WHERE checkout_id = ? AND integrity_oid = ?`,
         state.originalHeadRef,
         state.originalHeadOid,
         state.phase,
@@ -4372,7 +5130,7 @@ export class RepoStore {
         state.committer?.email ?? null,
         retainedBytes,
         integrityOid,
-        this.#repoId,
+        this.#checkoutId,
         expectedIntegrityOid,
       );
     });
@@ -4410,11 +5168,11 @@ export class RepoStore {
       }
       const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
       this.#validateOperationObjects(journal);
-      this.#db.run("DELETE FROM git_operation_touched WHERE repo_id = ?", this.#repoId);
-      this.#db.run("DELETE FROM git_operation_steps WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
+      this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
       this.#db.run(
-        "DELETE FROM git_operation_state WHERE repo_id = ? AND integrity_oid = ?",
-        this.#repoId,
+        "DELETE FROM git_operation_state WHERE checkout_id = ? AND integrity_oid = ?",
+        this.#checkoutId,
         expectedIntegrityOid,
       );
       this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
@@ -4429,21 +5187,21 @@ export class RepoStore {
       const existed = requireBooleanProbe(
         this.#db.scalar<unknown>(
           `SELECT EXISTS(
-             SELECT 1 FROM git_operation_state WHERE repo_id = ?
+             SELECT 1 FROM git_operation_state WHERE checkout_id = ?
              UNION ALL
-             SELECT 1 FROM git_operation_steps WHERE repo_id = ?
+             SELECT 1 FROM git_operation_steps WHERE checkout_id = ?
              UNION ALL
-             SELECT 1 FROM git_operation_touched WHERE repo_id = ? LIMIT 1
+             SELECT 1 FROM git_operation_touched WHERE checkout_id = ? LIMIT 1
            )`,
-          this.#repoId,
-          this.#repoId,
-          this.#repoId,
+          this.#checkoutId,
+          this.#checkoutId,
+          this.#checkoutId,
         ),
         "operation state clear probe",
       );
-      this.#db.run("DELETE FROM git_operation_touched WHERE repo_id = ?", this.#repoId);
-      this.#db.run("DELETE FROM git_operation_steps WHERE repo_id = ?", this.#repoId);
-      this.#db.run("DELETE FROM git_operation_state WHERE repo_id = ?", this.#repoId);
+      this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
+      this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
+      this.#db.run("DELETE FROM git_operation_state WHERE checkout_id = ?", this.#checkoutId);
       return existed;
     });
   }
@@ -4501,8 +5259,8 @@ export class RepoStore {
   tryCreateInitialState<T>(body: (session: InitialStateSession) => T): InitialStateResult<T> {
     return this.#db.transactionSync(() => {
       const exists = this.#db.scalar<number>(
-        "SELECT EXISTS(SELECT 1 FROM git_index WHERE repo_id = ? LIMIT 1)",
-        this.#repoId,
+        "SELECT EXISTS(SELECT 1 FROM git_index WHERE checkout_id = ? LIMIT 1)",
+        this.#checkoutId,
       );
       if (exists !== 0 && exists !== 1) {
         throw new CorruptError("initial index availability probe returned an invalid value");
@@ -4608,16 +5366,16 @@ export class RepoStore {
 
   indexEntries(): IndexEntry[] {
     return this.#db.all<IndexEntry>(
-      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE repo_id = ? ORDER BY path, stage",
-      this.#repoId,
+      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id = ? ORDER BY path, stage",
+      this.#checkoutId,
     );
   }
 
   indexGet(path: string, stage = 0): IndexEntry | null {
     return (
       this.#db.one<IndexEntry>(
-        "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE repo_id = ? AND path = ? AND stage = ?",
-        this.#repoId,
+        "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id = ? AND path = ? AND stage = ?",
+        this.#checkoutId,
         path,
         stage,
       ) ?? null
@@ -4626,12 +5384,12 @@ export class RepoStore {
 
   indexPut(entry: IndexEntry): void {
     this.#db.run(
-      `INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev)
+      `INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(repo_id, path, stage) DO UPDATE SET
+       ON CONFLICT(checkout_id, path, stage) DO UPDATE SET
          mode = excluded.mode, oid = excluded.oid, size = excluded.size,
          mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
-      this.#repoId,
+      this.#checkoutId,
       entry.path,
       entry.stage,
       entry.mode,
@@ -4645,11 +5403,15 @@ export class RepoStore {
 
   /** Remove every stage of `path`. */
   indexRemove(path: string): void {
-    this.#db.run("DELETE FROM git_index WHERE repo_id = ? AND path = ?", this.#repoId, path);
+    this.#db.run(
+      "DELETE FROM git_index WHERE checkout_id = ? AND path = ?",
+      this.#checkoutId,
+      path,
+    );
   }
 
   indexClear(): void {
-    this.#db.run("DELETE FROM git_index WHERE repo_id = ?", this.#repoId);
+    this.#db.run("DELETE FROM git_index WHERE checkout_id = ?", this.#checkoutId);
   }
 
   #applyIndexMutations(pending: readonly BufferedIndexMutation[]): void {
@@ -4660,12 +5422,12 @@ export class RepoStore {
     if (hasRemoves) {
       this.#db.run(
         `DELETE FROM git_index
-          WHERE repo_id = ?
+          WHERE checkout_id = ?
             AND path IN (
               SELECT json_extract(value, '$.p') FROM json_each(?)
                WHERE json_extract(value, '$.k') = 'r'
             )`,
-        this.#repoId,
+        this.#checkoutId,
         mutations,
       );
     }
@@ -4691,7 +5453,7 @@ export class RepoStore {
                   OVER (PARTITION BY path, stage) AS last_put
            FROM mutation
        )
-       INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev)
+       INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
        SELECT ?, current.path, current.stage, current.mode, current.oid,
               current.size, current.mtime, current.ino, current.rev
          FROM ranked current
@@ -4699,11 +5461,11 @@ export class RepoStore {
           AND current.q = current.last_put
           AND current.q > current.last_remove
         ORDER BY current.q
-       ON CONFLICT(repo_id, path, stage) DO UPDATE SET
+       ON CONFLICT(checkout_id, path, stage) DO UPDATE SET
          mode = excluded.mode, oid = excluded.oid, size = excluded.size,
          mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
       mutations,
-      this.#repoId,
+      this.#checkoutId,
     );
   }
 
@@ -4749,9 +5511,9 @@ export class RepoStore {
         prefix === undefined || prefix === ""
           ? this.#db.all<IndexEntry>(
               `SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index
-               WHERE repo_id = ? AND (path > ? OR (path = ? AND stage > ?))
+               WHERE checkout_id = ? AND (path > ? OR (path = ? AND stage > ?))
                ORDER BY path, stage LIMIT ?`,
-              this.#repoId,
+              this.#checkoutId,
               path,
               path,
               stage,
@@ -4759,10 +5521,10 @@ export class RepoStore {
             )
           : this.#db.all<IndexEntry>(
               `SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index
-               WHERE repo_id = ? AND (path > ? OR (path = ? AND stage > ?))
+               WHERE checkout_id = ? AND (path > ? OR (path = ? AND stage > ?))
                  AND (path = ? OR (path >= ? AND path < ?))
                ORDER BY path, stage LIMIT ?`,
-              this.#repoId,
+              this.#checkoutId,
               path,
               path,
               stage,
@@ -4806,8 +5568,8 @@ export class RepoStore {
   hasConflicts(): boolean {
     return (
       (this.#db.scalar<number>(
-        "SELECT COUNT(*) FROM (SELECT 1 FROM git_index WHERE repo_id = ? AND stage > 0 LIMIT 1)",
-        this.#repoId,
+        "SELECT COUNT(*) FROM (SELECT 1 FROM git_index WHERE checkout_id = ? AND stage > 0 LIMIT 1)",
+        this.#checkoutId,
       ) ?? 0) > 0
     );
   }
@@ -4818,9 +5580,9 @@ export class RepoStore {
       (this.#db.scalar<number>(
         `SELECT COUNT(*) FROM (
            SELECT 1 FROM git_index
-            WHERE repo_id = ? AND (stage > 0 OR (stage = 0 AND mode = 57344)) LIMIT 1
+            WHERE checkout_id = ? AND (stage > 0 OR (stage = 0 AND mode = 57344)) LIMIT 1
          )`,
-        this.#repoId,
+        this.#checkoutId,
       ) ?? 0) > 0
     );
   }
@@ -4901,45 +5663,82 @@ export class RepoStore {
 
   // -- lifecycle ------------------------------------------------------
 
-  /** Drop every row belonging to this repository. */
+  /** Drop the shared store and every checkout through foreign-key cascades. */
   destroy(): void {
+    if (this.#onDestroy !== undefined) {
+      this.#db.transactionSync(this.#onDestroy);
+      return;
+    }
     this.#db.transactionSync(() => {
-      for (const table of [
-        "git_index_dirty",
-        "git_index_state",
-        "git_operation_touched",
-        "git_operation_steps",
-        "git_operation_state",
-        "git_reflog_entries",
-        "git_refs",
-        "git_blob_ids",
-        "git_blob_id_state",
-        "git_config",
-        "git_index",
-        "git_shallow",
-        "git_commits",
-        "git_tree_effective",
-        "git_tree_sources",
-        "git_objects",
-        "git_object_chunks",
-        "git_pack_meta",
-        "git_pack_data",
-        "git_pack_objects",
-        "git_pack_pending",
-        "git_reflog_state",
-      ]) {
-        this.#db.run(`DELETE FROM ${table} WHERE repo_id = ?`, this.#repoId);
-      }
       this.#db.run("DELETE FROM git_repositories WHERE id = ?", this.#repoId);
     });
-    this.#cacheGeneration++;
-    this.#packs.clearCaches();
-    this.#hasLoose = false;
-    this.#onDestroy?.();
+    this.shared.clearCaches();
   }
 
   #objectCacheKey(oid: string): string {
-    return `${this.#cacheNamespace}:${this.#cacheGeneration}:loose:${oid}`;
+    return this.shared.objectCacheKey(oid);
+  }
+}
+
+/** Temporary one-checkout compatibility adapter used by core until WU3. */
+export class RepoStore extends CheckoutStore {
+  constructor(
+    shared: SharedRepoStore,
+    checkout: CheckoutRow,
+    options?: StoreOptions,
+    onDestroy?: () => void,
+  );
+  constructor(
+    db: SqlDatabase,
+    repository: RepositoryRow,
+    storeGeneration: number,
+    objects: ByteLru<string, RawObject>,
+    packRows: ByteLru<string, Uint8Array>,
+    memory: MemoryCoordinator,
+  );
+  constructor(
+    sharedOrDb: SharedRepoStore | SqlDatabase,
+    checkoutOrRepository: CheckoutRow | RepositoryRow,
+    optionsOrGeneration: StoreOptions | number = {},
+    onDestroyOrObjects?: (() => void) | ByteLru<string, RawObject>,
+    packRows?: ByteLru<string, Uint8Array>,
+    memory?: MemoryCoordinator,
+  ) {
+    if (sharedOrDb instanceof SharedRepoStore) {
+      if (
+        !("repoId" in checkoutOrRepository) ||
+        typeof optionsOrGeneration === "number" ||
+        (onDestroyOrObjects !== undefined && typeof onDestroyOrObjects !== "function")
+      ) {
+        throw new CorruptError("checkout facade arguments are invalid");
+      }
+      super(sharedOrDb, checkoutOrRepository, optionsOrGeneration, onDestroyOrObjects);
+      return;
+    }
+    if (
+      "repoId" in checkoutOrRepository ||
+      typeof optionsOrGeneration !== "number" ||
+      !(onDestroyOrObjects instanceof ByteLru) ||
+      !(packRows instanceof ByteLru) ||
+      !(memory instanceof MemoryCoordinator)
+    ) {
+      throw new CorruptError("legacy repository facade arguments are invalid");
+    }
+    const shared = new SharedRepoStore(
+      sharedOrDb,
+      checkoutOrRepository.id,
+      optionsOrGeneration,
+      onDestroyOrObjects,
+      packRows,
+      memory,
+    );
+    super(shared, {
+      id: checkoutOrRepository.checkoutId,
+      repoId: checkoutOrRepository.id,
+      root: checkoutOrRepository.root,
+      head: checkoutOrRepository.head,
+      isPrimary: checkoutOrRepository.isPrimary,
+    });
   }
 }
 

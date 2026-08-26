@@ -1,5 +1,7 @@
 export const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_state (
-  repo_id INTEGER PRIMARY KEY,
+  checkout_id INTEGER PRIMARY KEY CHECK (
+    typeof(checkout_id) = 'integer' AND checkout_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+  ),
   kind TEXT NOT NULL CHECK (kind IN ('merge', 'cherry-pick', 'revert', 'rebase')),
   original_head_ref TEXT NOT NULL,
   original_head_oid TEXT NOT NULL,
@@ -47,5 +49,6 @@ export const OPERATION_STATE_TABLE = `CREATE TABLE IF NOT EXISTS git_operation_s
        AND (phase != 'conflicted' OR current_step < step_count))
   ),
   CHECK ((author_name IS NULL) = (author_email IS NULL)),
-  CHECK ((committer_name IS NULL) = (committer_email IS NULL))
+  CHECK ((committer_name IS NULL) = (committer_email IS NULL)),
+  FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
 )`;

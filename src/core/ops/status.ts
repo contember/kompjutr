@@ -244,7 +244,7 @@ export function eagerStatus(
     return status(repo, worktree, options);
   }
 
-  const state = source.readState(repo.store.repoId);
+  const state = source.readState(repo.store.checkoutId);
   if (!state.available) {
     const baselineTreeOid = repo.headTree();
     const seed = new FullStatusTrackerSeed();
@@ -256,7 +256,7 @@ export function eagerStatus(
       ),
     ].sort((left, right) => comparePaths(left.path, right.path));
     if (seed.resealable) {
-      tracker.reseal(repo.store.repoId, baselineTreeOid, seed.entries());
+      tracker.reseal(repo.store.checkoutId, baselineTreeOid, seed.entries());
     }
     return rows;
   }

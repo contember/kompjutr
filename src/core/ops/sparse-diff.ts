@@ -55,11 +55,11 @@ export function sparseWorkingCandidates(
   options: DiffOptions,
 ): WorkingCandidate[] | null {
   try {
-    const state = source.readState(repo.store.repoId);
+    const state = source.readState(repo.store.checkoutId);
     if (!state.available) return null;
     const paths = sparseWorkingPaths(
       repo,
-      source.dirtyPaths(repo.store.repoId),
+      source.dirtyPaths(repo.store.checkoutId),
       state.baselineTreeOid,
       currentTreeOid,
       options.paths,
@@ -69,6 +69,7 @@ export function sparseWorkingCandidates(
 
     const hydrated = source.hydrate({
       repoId: repo.store.repoId,
+      checkoutId: repo.store.checkoutId,
       root: repo.root,
       baselineTreeOid: state.baselineTreeOid,
       currentTreeOid,

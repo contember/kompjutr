@@ -483,8 +483,13 @@ describe("local ref operations", () => {
     });
     expect(
       workspace.repo.store.db.all<{ ref_name: string; reason: string }>(
-        `SELECT ref_name, reason FROM git_reflog_entries
-          WHERE repo_id = ? AND ordinal > ? ORDER BY ordinal`,
+        `SELECT ref_name, reason FROM (
+           SELECT ref_name, reason, ordinal FROM git_reflog_entries WHERE repo_id = ?
+           UNION ALL
+           SELECT 'HEAD' AS ref_name, reason, ordinal
+             FROM git_checkout_reflog_entries WHERE repo_id = ?
+         ) WHERE ordinal > ? ORDER BY ordinal`,
+        workspace.repo.store.repoId,
         workspace.repo.store.repoId,
         beforeOrdinal,
       ),
@@ -531,6 +536,10 @@ describe("local ref operations", () => {
       index: workspace.repo.store.indexGet("tracked.txt"),
       content: utf8Decoder.decode(workspace.worktree.readFile("/tracked.txt")),
       entries: workspace.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_checkout_reflog_entries WHERE checkout_id = ?",
+        workspace.repo.store.checkoutId,
+      ),
+      directEntries: workspace.repo.store.db.scalar<number>(
         "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
         workspace.repo.store.repoId,
       ),
@@ -540,8 +549,7 @@ describe("local ref operations", () => {
       ),
     };
     workspace.repo.store.db.run(`CREATE TRIGGER fail_checkout_reflog
-      BEFORE INSERT ON git_reflog_entries
-      WHEN NEW.ref_name = 'HEAD'
+      BEFORE INSERT ON git_checkout_reflog_entries
       BEGIN SELECT RAISE(ABORT, 'injected checkout reflog failure'); END`);
 
     expect(() =>
@@ -553,10 +561,16 @@ describe("local ref operations", () => {
     expect(utf8Decoder.decode(workspace.worktree.readFile("/tracked.txt"))).toBe(before.content);
     expect(
       workspace.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_checkout_reflog_entries WHERE checkout_id = ?",
+        workspace.repo.store.checkoutId,
+      ),
+    ).toBe(before.entries);
+    expect(
+      workspace.repo.store.db.scalar<number>(
         "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
         workspace.repo.store.repoId,
       ),
-    ).toBe(before.entries);
+    ).toBe(before.directEntries);
     expect(
       workspace.repo.store.db.scalar<number>(
         "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",

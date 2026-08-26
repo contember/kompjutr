@@ -334,3 +334,8 @@ schema/mutation review before the next dependent phase. Do not overlap writers i
 - 2026-08-26 — Sequencing deviation: WU1 froze the ownership matrix in ADR-0009;
   its executable schema witness moves to WU2 because the checkout tables do not
   exist before the baseline split.
+- 2026-08-26 — WU2 split schema v1 directly into shared-store and checkout state,
+  added shared/checkout facades with unequal-id witnesses, and made causal ref and
+  `HEAD` reflogs atomic with the 9,727/9,728 bound and stable `EBRANCHINUSE`.
+  All 189 focused tests, typecheck, and check passed; independent review approved.
+  The full suite waits for WU3 to migrate legacy raw-SQL fixtures.

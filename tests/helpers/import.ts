@@ -21,6 +21,7 @@ export async function importFixture(fixture: GitFixture, store: RepoStore): Prom
       { actor: null, timestamp: 0, timezoneOffset: 0, reason: "update-ref" },
     );
     store.db.run("DELETE FROM git_reflog_entries WHERE repo_id = ?", store.repoId);
+    store.db.run("DELETE FROM git_checkout_reflog_entries WHERE repo_id = ?", store.repoId);
     store.db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", store.repoId);
   });
 }

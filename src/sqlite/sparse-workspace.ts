@@ -170,6 +170,9 @@ function validateRequest(request: SparseWorkspaceRequest, retainedLimit: number)
   if (!Number.isSafeInteger(request.repoId) || request.repoId <= 0) {
     throw inputError("sparse workspace repository id is invalid");
   }
+  if (!Number.isSafeInteger(request.checkoutId) || request.checkoutId <= 0) {
+    throw inputError("sparse workspace checkout id is invalid");
+  }
   validateRoot(request.root);
   if (
     (request.baselineTreeOid !== null && !isOid(request.baselineTreeOid)) ||
@@ -738,11 +741,11 @@ const INDEX_SQL = `WITH wanted(ordinal, path) AS MATERIALIZED (
   SELECT wanted.*,
          (SELECT count(*) FROM (
             SELECT 1 FROM git_index candidate
-             WHERE candidate.repo_id = ? AND candidate.path = wanted.path
+             WHERE candidate.checkout_id = ? AND candidate.path = wanted.path
              ORDER BY candidate.stage LIMIT 5
           )) AS bounded_count,
          (SELECT count(*) FROM git_index candidate
-           WHERE candidate.repo_id = ? AND candidate.path = wanted.path
+           WHERE candidate.checkout_id = ? AND candidate.path = wanted.path
              AND candidate.stage IN (0, 1, 2, 3)) AS valid_count
     FROM wanted
 )
@@ -760,7 +763,7 @@ SELECT preflight.ordinal,
        typeof(entry.ino) AS ino_type, typeof(entry.rev) AS rev_type
        , 0 AS malformed
   FROM preflight
-  JOIN git_index entry ON entry.repo_id = ? AND entry.path = preflight.path
+  JOIN git_index entry ON entry.checkout_id = ? AND entry.path = preflight.path
    AND entry.stage IN (0, 1, 2, 3)
 UNION ALL
 SELECT ordinal, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
@@ -770,7 +773,7 @@ ORDER BY ordinal, stage`;
 
 function readIndex(
   db: SqlDatabase,
-  repoId: number,
+  checkoutId: number,
   pathsJson: string,
   count: number,
   retainedLimit: number,
@@ -778,7 +781,7 @@ function readIndex(
   const result: IndexEntry[][] = Array.from({ length: count }, () => []);
   let available = true;
   let retainedBytes = 0;
-  for (const row of db.iterate(INDEX_SQL, pathsJson, repoId, repoId, repoId)) {
+  for (const row of db.iterate(INDEX_SQL, pathsJson, checkoutId, checkoutId, checkoutId)) {
     if (row.malformed === 1) {
       throw new CorruptError("sparse index lookup returned malformed stages");
     }
@@ -1014,15 +1017,13 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
   if (validated.retainedBytes < 0 || validated.retainedBytes > retainedLimit) {
     return { available: false };
   }
-  if (request.paths.length === 0) return { available: true, rows: [], retainedBytes: 0 };
-
-  const repository = db.one<Record<string, unknown>>(
+  const checkout = db.one<Record<string, unknown>>(
     `SELECT typeof(root) AS root_type, length(CAST(root AS BLOB)) AS root_bytes,
-            root = ? AS matches,
+            root = ? AS matches, repo_id,
             EXISTS (
               SELECT 1 FROM fs_paths path
               JOIN fs_nodes node ON node.inode = path.inode
-               WHERE path.path = git_repositories.root
+               WHERE path.path = git_checkouts.root
                  AND typeof(path.inode) = 'integer'
                  AND typeof(node.inode) = 'integer'
                  AND node.type = 'dir'
@@ -1033,18 +1034,25 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
                  AND typeof(node.nlink) = 'integer' AND node.nlink > 0
                  AND node.link_target IS NULL AND node.content_id IS NULL
             ) AS root_valid
-       FROM git_repositories WHERE id = ?`,
+       FROM git_checkouts WHERE id = ? AND repo_id = ?`,
     request.root,
+    request.checkoutId,
     request.repoId,
   );
-  if (repository === undefined) throw inputError("sparse workspace repository does not exist");
-  if (repository.root_type !== "text" || numberField(repository.root_bytes) === null) {
-    throw new CorruptError("sparse workspace repository root is malformed");
+  if (checkout === undefined) {
+    throw inputError("sparse workspace checkout does not belong to the repository");
   }
-  if (repository.matches !== 1) throw inputError("sparse workspace root does not match repository");
-  if (repository.root_valid !== 1) {
-    throw new CorruptError("sparse workspace repository root is malformed");
+  if (
+    checkout.repo_id !== request.repoId ||
+    checkout.root_type !== "text" ||
+    numberField(checkout.root_bytes) === null
+  ) {
+    throw new CorruptError("sparse workspace checkout row is malformed");
   }
+  if (checkout.matches !== 1) throw inputError("sparse workspace root does not match checkout");
+  if (checkout.root_valid !== 1)
+    throw new CorruptError("sparse workspace checkout root is malformed");
+  if (request.paths.length === 0) return { available: true, rows: [], retainedBytes: 0 };
 
   const trees = resolveTrees(
     db,
@@ -1056,7 +1064,7 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
   if (!trees.available) return { available: false };
   const index = readIndex(
     db,
-    request.repoId,
+    request.checkoutId,
     validated.json,
     request.paths.length,
     retainedLimit - validated.retainedBytes,
@@ -1103,8 +1111,8 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
 
 export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorkspaceSource {
   return {
-    readState: (repoId) => readIndexTrackerState(db, repoId),
-    dirtyPaths: (repoId) => iterateIndexTrackerDirty(db, repoId),
+    readState: (checkoutId) => readIndexTrackerState(db, checkoutId),
+    dirtyPaths: (checkoutId) => iterateIndexTrackerDirty(db, checkoutId),
     hydrate: (request) => hydrate(db, request),
   };
 }

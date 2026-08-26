@@ -45,21 +45,33 @@ function addFile(db: TestDatabase, path: string, inode: number): void {
   db.run("INSERT INTO fs_paths (path, parent, inode) VALUES (?, ?, ?)", path, parent, inode);
 }
 
-function addRepository(db: TestDatabase, id: number, root: string, inode = id + 10): void {
+function sharedId(checkoutId: number): number {
+  return checkoutId + 100;
+}
+
+function addRepository(
+  db: TestDatabase,
+  checkoutId: number,
+  root: string,
+  inode = checkoutId + 10,
+): void {
   if (root !== "/") addDirectory(db, root, inode);
+  db.run("INSERT INTO git_repositories (id) VALUES (?)", sharedId(checkoutId));
   db.run(
-    "INSERT INTO git_repositories (id, root, head) VALUES (?, ?, 'ref: refs/heads/main')",
-    id,
+    `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+     VALUES (?, ?, ?, 'ref: refs/heads/main', 1)`,
+    checkoutId,
+    sharedId(checkoutId),
     root,
   );
 }
 
-function dirty(db: TestDatabase, repoId: number): Array<{ path: string; flags: number }> {
-  return [...iterateIndexTrackerDirty(db, repoId, 2)];
+function dirty(db: TestDatabase, checkoutId: number): Array<{ path: string; flags: number }> {
+  return [...iterateIndexTrackerDirty(db, checkoutId, 2)];
 }
 
-function seal(db: TestDatabase, repoId: number): void {
-  expect(resealIndexTracker(db, repoId, TREE, [])).toBe(true);
+function seal(db: TestDatabase, checkoutId: number): void {
+  expect(resealIndexTracker(db, checkoutId, TREE, [])).toBe(true);
 }
 
 describe("index tracker", () => {
@@ -76,7 +88,7 @@ describe("index tracker", () => {
       db.scalar<number>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'index_tracker_%'",
       ),
-    ).toBe(16);
+    ).toBe(15);
   });
 
   it("replaces stale owned triggers transactionally and preserves current installs", () => {
@@ -143,7 +155,7 @@ describe("index tracker", () => {
     expect(dirty(db, 1)).toEqual([{ path: "kept", flags: INDEX_DIRTY }]);
   });
 
-  it("leaves invalid, missing, and non-directory roots incomplete without clearing dirties", () => {
+  it("leaves missing roots incomplete and fails closed on corrupt checkout roots", () => {
     const db = setup();
     addRepository(db, 1, "/repo");
     expect(resealIndexTracker(db, 1, TREE, [{ path: "kept", flags: INDEX_DIRTY }])).toBe(true);
@@ -153,8 +165,13 @@ describe("index tracker", () => {
     expect(dirty(db, 1)).toEqual([{ path: "kept", flags: INDEX_DIRTY }]);
     expect(resealIndexTracker(db, 999, TREE, [])).toBe(false);
 
-    db.run("UPDATE git_repositories SET root = 'relative' WHERE id = 1");
-    expect(resealIndexTracker(db, 1, TREE, [])).toBe(false);
+    db.run("DROP TRIGGER git_checkouts_identity_immutable");
+    db.run("PRAGMA ignore_check_constraints = ON");
+    db.run("UPDATE git_checkouts SET root = 'relative' WHERE id = 1");
+    db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() => resealIndexTracker(db, 1, TREE, [])).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
     expect(dirty(db, 1)).toEqual([{ path: "kept", flags: INDEX_DIRTY }]);
   });
 
@@ -162,25 +179,27 @@ describe("index tracker", () => {
     const db = setup();
     addRepository(db, 1, "/repo");
     seal(db, 1);
-    db.run("UPDATE git_index_state SET baseline_tree_oid = 'bad' WHERE repo_id = 1");
+    db.run("UPDATE git_index_state SET baseline_tree_oid = 'bad' WHERE checkout_id = 1");
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
-    db.run("INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, '/bad', 1)");
+    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, '/bad', 1)");
     expect(() => dirty(db, 1)).toThrowError(/invalid path/);
     expect(() => iterateIndexTrackerDirty(db, 1, 1001)).toThrowError(/page size/);
 
-    db.run("DELETE FROM git_index_dirty WHERE repo_id = 1");
-    db.run("INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, '', 1)");
+    db.run("DELETE FROM git_index_dirty WHERE checkout_id = 1");
+    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, '', 1)");
     expect(() => dirty(db, 1)).toThrowError(/invalid path/);
 
-    db.run("DELETE FROM git_index_dirty WHERE repo_id = 1");
+    db.run("DELETE FROM git_index_dirty WHERE checkout_id = 1");
     db.run("PRAGMA ignore_check_constraints = ON");
     db.run(
-      "INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, 'bad-flags', zeroblob(4096))",
+      "INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, 'bad-flags', zeroblob(4096))",
     );
     db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
 
-    db.run("UPDATE git_index_state SET baseline_tree_oid = zeroblob(1048576) WHERE repo_id = 1");
+    db.run(
+      "UPDATE git_index_state SET baseline_tree_oid = zeroblob(1048576) WHERE checkout_id = 1",
+    );
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
   });
 
@@ -199,7 +218,7 @@ describe("index tracker", () => {
     expect(dirty(db, 1)).toEqual([{ path: exact, flags: INDEX_DIRTY }]);
 
     seal(db, 1);
-    db.run("INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, ?, 1)", oversized);
+    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, ?, 1)", oversized);
     expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
   });
 
@@ -221,11 +240,11 @@ describe("index tracker", () => {
       /too many dirty rows/,
     );
     expect(readIndexTrackerState(db, 1)).toEqual({ available: true, baselineTreeOid: TREE });
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_dirty WHERE repo_id = 1")).toBe(
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_dirty WHERE checkout_id = 1")).toBe(
       32_000,
     );
 
-    db.run("INSERT INTO git_index_dirty (repo_id, path, flags) VALUES (1, 'z', 1)");
+    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, 'z', 1)");
     expect(() => [...iterateIndexTrackerDirty(db, 1)]).toThrowError(/too many dirty rows/);
     expect(() => [...iterateIndexTrackerDirty(db, 1, 1)]).toThrowError(/page limit/);
   });
@@ -235,24 +254,24 @@ describe("index tracker", () => {
     addRepository(db, 1, "/repo");
     seal(db, 1);
     db.run(
-      `INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev)
+      `INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
        VALUES (1, 'a', 0, 33188, ?, 1, 1, 1, 1)`,
       TREE,
     );
     expect(dirty(db, 1)).toEqual([{ path: "a", flags: 3 }]);
 
     seal(db, 1);
-    db.run("UPDATE git_index SET mtime = 2 WHERE repo_id = 1 AND path = 'a' AND stage = 0");
+    db.run("UPDATE git_index SET mtime = 2 WHERE checkout_id = 1 AND path = 'a' AND stage = 0");
     expect(dirty(db, 1)).toEqual([{ path: "a", flags: WORKTREE_DIRTY }]);
 
     seal(db, 1);
-    db.run("UPDATE git_index SET path = 'b' WHERE repo_id = 1 AND path = 'a' AND stage = 0");
+    db.run("UPDATE git_index SET path = 'b' WHERE checkout_id = 1 AND path = 'a' AND stage = 0");
     expect(dirty(db, 1)).toEqual([
       { path: "a", flags: 3 },
       { path: "b", flags: 3 },
     ]);
     seal(db, 1);
-    db.run("DELETE FROM git_index WHERE repo_id = 1 AND path = 'b'");
+    db.run("DELETE FROM git_index WHERE checkout_id = 1 AND path = 'b'");
     expect(dirty(db, 1)).toEqual([{ path: "b", flags: 3 }]);
   });
 
@@ -261,29 +280,29 @@ describe("index tracker", () => {
     addRepository(db, 1, "/repo");
     seal(db, 1);
     db.run(
-      "INSERT INTO git_index (repo_id, path, stage, mode, oid) VALUES (1, '', 0, 33188, ?)",
+      "INSERT INTO git_index (checkout_id, path, stage, mode, oid) VALUES (1, '', 0, 33188, ?)",
       TREE,
     );
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
     expect(dirty(db, 1)).toEqual([]);
 
     seal(db, 1);
-    db.run("DELETE FROM git_index WHERE repo_id = 1 AND path = ''");
+    db.run("DELETE FROM git_index WHERE checkout_id = 1 AND path = ''");
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
 
     db.run(
-      "INSERT INTO git_index (repo_id, path, stage, mode, oid) VALUES (1, 'valid', 0, 33188, ?)",
+      "INSERT INTO git_index (checkout_id, path, stage, mode, oid) VALUES (1, 'valid', 0, 33188, ?)",
       TREE,
     );
     seal(db, 1);
-    db.run("UPDATE git_index SET path = '' WHERE repo_id = 1 AND path = 'valid'");
+    db.run("UPDATE git_index SET path = '' WHERE checkout_id = 1 AND path = 'valid'");
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
     expect(dirty(db, 1)).toEqual([{ path: "valid", flags: 3 }]);
 
-    db.run("DELETE FROM git_index WHERE repo_id = 1 AND path = ''");
+    db.run("DELETE FROM git_index WHERE checkout_id = 1 AND path = ''");
     seal(db, 1);
     db.run(
-      "INSERT INTO git_index (repo_id, path, stage, mode, oid) VALUES (1, ?, 0, 33188, ?)",
+      "INSERT INTO git_index (checkout_id, path, stage, mode, oid) VALUES (1, ?, 0, 33188, ?)",
       "a".repeat(2_201),
       TREE,
     );
@@ -377,16 +396,18 @@ describe("index tracker", () => {
 
     seal(db, 1);
     seal(db, 2);
-    db.run("DELETE FROM git_repositories WHERE id = 2");
+    db.run("DELETE FROM git_repositories WHERE id = ?", sharedId(2));
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_state WHERE repo_id = 2")).toBe(0);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_state WHERE checkout_id = 2")).toBe(0);
 
     addRepository(db, 3, "/other", 30);
     seal(db, 1);
     seal(db, 3);
-    db.run("UPDATE git_repositories SET root = '/outer/moved' WHERE id = 3");
-    expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
-    expect(readIndexTrackerState(db, 3)).toEqual({ available: false });
+    expect(() => db.run("UPDATE git_checkouts SET root = '/outer/moved' WHERE id = 3")).toThrow(
+      /immutable/,
+    );
+    expect(readIndexTrackerState(db, 1)).toEqual({ available: true, baselineTreeOid: TREE });
+    expect(readIndexTrackerState(db, 3)).toEqual({ available: true, baselineTreeOid: TREE });
   });
 
   it("does not accumulate journal rows during clone-like writes while incomplete", () => {
@@ -397,7 +418,7 @@ describe("index tracker", () => {
       addFile(db, path, 100 + index);
       db.run("INSERT INTO fs_chunks (inode, idx, bytes) VALUES (?, 0, x'01')", 100 + index);
       db.run(
-        `INSERT INTO git_index (repo_id, path, stage, mode, oid)
+        `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
          VALUES (1, ?, 0, 33188, ?)`,
         `file-${index}`,
         TREE,

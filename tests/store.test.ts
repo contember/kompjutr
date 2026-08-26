@@ -3,7 +3,8 @@ import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
-import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
+import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
+import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
 import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
@@ -16,6 +17,7 @@ import {
   MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
   MAX_REF_MUTATION_RETAINED_BYTES,
   REF_MUTATION_FIXED_RETAINED_BYTES,
+  refMutationCheckoutRetainedBytes,
   refMutationCreateRetainedBytes,
   SqliteGitDatabase,
   type StoreOptions,
@@ -81,6 +83,8 @@ describe("repository registry", () => {
     expect(tables.map((t) => t.name)).toEqual([
       "git_blob_id_state",
       "git_blob_ids",
+      "git_checkout_reflog_entries",
+      "git_checkouts",
       "git_commits",
       "git_config",
       "git_index",
@@ -114,6 +118,91 @@ describe("repository registry", () => {
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'index_tracker_%'",
       ),
     ).toBe(0);
+  });
+
+  it("creates one primary checkout atomically in six statements", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    db.storage.resetCounters();
+
+    const repository = database.createRepository("/repo/../canonical", "ref: refs/heads/main");
+
+    expect(repository).toEqual({
+      id: 1,
+      checkoutId: 1,
+      root: "/canonical",
+      head: "ref: refs/heads/main",
+      isPrimary: true,
+    });
+    expect(db.storage.statementCount).toBe(6);
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+    expect(db.one("SELECT repo_id, is_primary FROM git_checkouts")).toEqual({
+      repo_id: 1,
+      is_primary: 1,
+    });
+    expect(db.one("SELECT complete FROM git_index_state WHERE checkout_id = 1")).toEqual({
+      complete: 0,
+    });
+
+    expect(() => database.createRepository("/canonical", "ref: refs/heads/other")).toThrow();
+    expect(db.scalar<number>("SELECT count(*) FROM git_repositories")).toBe(1);
+    expect(db.scalar<number>("SELECT count(*) FROM git_checkouts")).toBe(1);
+  });
+
+  it("caps checkout listing per store and keeps branch attachment unique", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.createRepository("/primary", "ref: refs/heads/main");
+    expect(() =>
+      db.run(
+        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+         VALUES (2, ?, '/duplicate-branch', 'ref: refs/heads/main', 0)`,
+        repository.id,
+      ),
+    ).toThrow(/UNIQUE/);
+    db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (2) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1024
+       )
+       INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       SELECT id, ?, '/checkout-' || printf('%04d', id), ?, 0 FROM sequence`,
+      repository.id,
+      "1".repeat(40),
+    );
+    expect(database.listCheckouts(repository.id)).toHaveLength(1_024);
+
+    db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (1025, ?, '/checkout-1025', ?, 0)`,
+      repository.id,
+      "1".repeat(40),
+    );
+    expect(() => database.listCheckouts(repository.id)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+  });
+
+  it("does not apply the per-store checkout cap to global routing", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1025
+       )
+       INSERT INTO git_repositories (id) SELECT id FROM sequence`,
+    );
+    db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1025
+       )
+       INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       SELECT id + 2000, id, '/repo-' || printf('%04d', id), ?, 1 FROM sequence`,
+      "1".repeat(40),
+    );
+
+    const checkouts = database.list();
+    expect(checkouts).toHaveLength(1_025);
+    expect(checkouts.every((checkout) => checkout.checkoutId !== checkout.id)).toBe(true);
   });
 
   it("shares one 8 MiB object cache across repositories", () => {
@@ -178,6 +267,190 @@ describe("repository registry", () => {
     expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_reflog_state")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_repositories")).toBe(0);
+  });
+
+  it("composes shared state with isolated checkout state and evicts the whole store", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const repository = database.create("/primary", "ref: refs/heads/main");
+    const primary = database.open(repository);
+    const secondaryId = 101;
+    db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (?, ?, '/secondary', 'ref: refs/heads/secondary', 0)`,
+      secondaryId,
+      repository.id,
+    );
+    const secondaryRow = database.checkoutAt("/secondary");
+    if (secondaryRow === null) throw new Error("secondary checkout is missing");
+    expect(secondaryRow.id).toBe(secondaryId);
+    expect(secondaryRow.repoId).toBe(repository.id);
+    expect(secondaryRow.id).not.toBe(secondaryRow.repoId);
+    expect(() =>
+      database.openCheckout({ ...secondaryRow, repoId: repository.id + 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    const secondary = database.openCheckout(secondaryRow);
+    expect(() =>
+      database.openCheckout({ ...secondaryRow, repoId: repository.id + 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    expect(primary.shared).toBe(secondary.shared);
+    expect(primary.shared).toBe(database.openShared(repository.id));
+    expect(primary.packs).toBe(secondary.packs);
+    const firstBlob = primary.write("blob", utf8.encode("primary\n"));
+    const secondBlob = secondary.write("blob", utf8.encode("secondary\n"));
+    expect(secondary.read(firstBlob)?.data).toEqual(utf8.encode("primary\n"));
+    primary.setRef("refs/tags/shared", firstBlob);
+    expect(secondary.getRef("refs/tags/shared")).toBe(firstBlob);
+    primary.shared.setRef("refs/heads/main", firstBlob);
+    expect(primary.reflog("HEAD")).toEqual([
+      expect.objectContaining({ oldOid: null, newOid: firstBlob, reason: "ref update" }),
+    ]);
+    expect(secondary.reflog("HEAD")).toEqual([]);
+    secondary.configSet("shared.value", "yes");
+    expect(primary.configGet("shared.value")).toBe("yes");
+    expect(() => primary.shared.getRef("HEAD")).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+
+    secondary.setHead(secondBlob);
+    expect(primary.head()).toBe("ref: refs/heads/main");
+    expect(secondary.head()).toBe(secondBlob);
+    expect(secondary.reflog("HEAD")).toEqual([
+      expect.objectContaining({ oldRaw: "ref: refs/heads/secondary", newRaw: secondBlob }),
+    ]);
+    const branchConflictBefore = {
+      head: secondary.head(),
+      ordinal: db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        repository.id,
+      ),
+      directEntries: db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        repository.id,
+      ),
+      headEntries: db.scalar<number>(
+        "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
+        repository.id,
+      ),
+    };
+    expect(() => secondary.setHead("ref: refs/heads/main")).toThrowError(
+      expect.objectContaining({ code: "EBRANCHINUSE" }),
+    );
+    expect(() =>
+      secondary.mutateRefs(
+        {
+          head: "ref: refs/heads/main",
+          puts: [{ name: "refs/tags/must-roll-back", target: secondBlob }],
+        },
+        { actor: null, reason: "branch conflict", timestamp: 0, timezoneOffset: 0 },
+      ),
+    ).toThrowError(expect.objectContaining({ code: "EBRANCHINUSE" }));
+    expect(secondary.head()).toBe(branchConflictBefore.head);
+    expect(secondary.getRef("refs/tags/must-roll-back")).toBeNull();
+    expect(
+      db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        repository.id,
+      ),
+    ).toBe(branchConflictBefore.ordinal);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?", repository.id),
+    ).toBe(branchConflictBefore.directEntries);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
+        repository.id,
+      ),
+    ).toBe(branchConflictBefore.headEntries);
+    expect(
+      db
+        .all<{ ordinal: number }>(
+          `SELECT ordinal FROM git_reflog_entries WHERE repo_id = ?
+         UNION ALL
+         SELECT ordinal FROM git_checkout_reflog_entries WHERE repo_id = ?
+         ORDER BY ordinal`,
+          repository.id,
+          repository.id,
+        )
+        .map((row) => row.ordinal),
+    ).toEqual([1, 2, 3, 4]);
+    expect(
+      db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        repository.id,
+      ),
+    ).toBe(4);
+    primary.indexPut({
+      path: "tracked",
+      stage: 0,
+      mode: 0o100644,
+      oid: firstBlob,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    secondary.indexPut({
+      path: "tracked",
+      stage: 0,
+      mode: 0o100644,
+      oid: secondBlob,
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    expect(primary.indexGet("tracked")?.oid).toBe(firstBlob);
+    expect(secondary.indexGet("tracked")?.oid).toBe(secondBlob);
+
+    const person = {
+      name: "Fixture",
+      email: "fixture@example.com",
+      timestamp: 1_700_000_000,
+      timezoneOffset: 0,
+    };
+    const tree = primary.write("tree", serializeTree([]));
+    const original = primary.write(
+      "commit",
+      serializeCommit({ tree, parent: [], author: person, committer: person, message: "base\n" }),
+    );
+    const source = primary.write(
+      "commit",
+      serializeCommit({
+        tree,
+        parent: [original],
+        author: person,
+        committer: person,
+        message: "source\n",
+      }),
+    );
+    const operation: ReplayStateMetadata = {
+      kind: "cherry-pick",
+      originalHeadRef: "refs/heads/secondary",
+      originalHeadOid: original,
+      phase: "empty",
+      emptyReason: "result",
+      sourceOid: source,
+      selectedParentOid: original,
+      mainline: null,
+      currentLabel: "HEAD",
+      incomingLabel: source.slice(0, 7),
+      message: "source\n",
+      author: null,
+      committer: null,
+    };
+    secondary.writeOperationState(operation, []);
+    expect(primary.readOperationState()).toBeNull();
+    expect(secondary.requireOperationState("cherry-pick").state).toEqual(operation);
+
+    const oldShared = primary.shared;
+    primary.destroy();
+    expect(db.scalar<number>("SELECT count(*) FROM git_repositories")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_checkouts")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_index")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_operation_state")).toBe(0);
+    const replacement = database.open(database.create("/replacement", "ref: refs/heads/main"));
+    expect(replacement.shared).not.toBe(oldShared);
+    expect(replacement.read(firstBlob)).toBeNull();
   });
 });
 
@@ -811,7 +1084,7 @@ describe("bulk existence", () => {
 });
 
 describe("refs, config and index", () => {
-  it("stores refs relationally with HEAD on the repository row", () => {
+  it("stores shared refs relationally with HEAD on the checkout row", () => {
     const { store } = open();
     store.setRef("refs/heads/main", "a".repeat(40));
     store.setRef("refs/remotes/origin/main", "b".repeat(40));
@@ -852,7 +1125,7 @@ describe("refs, config and index", () => {
       refs.slice(0, 1_000),
       refs.slice(-1_000).map((ref) => ref.name),
     );
-    expect(db.storage.statementCount).toBeLessThanOrEqual(8);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(9);
     expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
       10_329,
     );
@@ -1192,7 +1465,12 @@ describe("refs, config and index", () => {
       name: `${prefix}${index.toString(36).padStart(suffixBytes, "0")}${"x".repeat(nameBytes - baseNameBytes)}`,
       target,
     });
-    const remaining = MAX_REF_MUTATION_RETAINED_BYTES - REF_MUTATION_FIXED_RETAINED_BYTES;
+    const checkoutRetained = refMutationCheckoutRetainedBytes({
+      root: "/repo",
+      head: "ref: refs/heads/main",
+    });
+    const remaining =
+      MAX_REF_MUTATION_RETAINED_BYTES - REF_MUTATION_FIXED_RETAINED_BYTES - checkoutRetained;
     const minimum = refMutationCreateRetainedBytes(row(0, baseNameBytes));
     const maximum = refMutationCreateRetainedBytes(row(0, 1_024));
     const count = Math.ceil(remaining / maximum);
@@ -1204,7 +1482,7 @@ describe("refs, config and index", () => {
       extra -= added;
     }
     expect(extra).toBe(0);
-    let retained = REF_MUTATION_FIXED_RETAINED_BYTES;
+    let retained = REF_MUTATION_FIXED_RETAINED_BYTES + checkoutRetained;
     let index = 0;
     for (const length of lengths) retained += refMutationCreateRetainedBytes(row(index++, length));
     expect(retained).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
@@ -1227,7 +1505,7 @@ describe("refs, config and index", () => {
     expect(() => over.store.updateRefs(puts(true))).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(over.db.storage.statementCount).toBe(2);
+    expect(over.db.storage.statementCount).toBe(3);
     expect(over.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
     expect(over.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
     assertMemoryCoordinatorIdle(over.store);
@@ -1240,7 +1518,7 @@ describe("refs, config and index", () => {
       expect(() => coordinated.store.updateRefs(puts(false))).toThrowError(
         expect.objectContaining({ code: "E2BIG" }),
       );
-      expect(coordinated.db.storage.statementCount).toBe(2);
+      expect(coordinated.db.storage.statementCount).toBe(3);
       expect(coordinated.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
       expect(coordinated.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
       expect(blocker.currentBytes).toBe(1);

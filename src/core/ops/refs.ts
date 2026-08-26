@@ -174,7 +174,7 @@ export function checkout(
     const tracker = context.indexTracker;
     if (tracker !== undefined && trySparseCleanCheckout(context, repo, worktree, tree)) {
       moveHead(context, repo, options.ref, commit);
-      tracker.reseal(repo.store.repoId, tree, []);
+      tracker.reseal(repo.store.checkoutId, tree, []);
       return;
     }
 
