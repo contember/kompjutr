@@ -6,6 +6,7 @@ import { utf8 } from "../src/core/bytes.js";
 import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
 import { operationRefLogMetadata } from "../src/core/ops/ref-log.js";
+import { branchDelete } from "../src/core/ops/refs.js";
 import {
   worktreeAdd,
   worktreeList,
@@ -115,6 +116,23 @@ function realGitWorktreeRoots(fixture: GitFixture): string[] {
 }
 
 describe("worktree add", () => {
+  it("prevents deleting a branch attached to another checkout even with force", () => {
+    const workspace = makeRepo("/");
+    const base = seedMain(workspace);
+    workspace.repo.store.setRef("refs/heads/feature", base.oid);
+    worktreeAdd(workspace.context, workspace.repo, {
+      root: "/feature",
+      target: { kind: "existing-branch", name: "feature" },
+    });
+
+    for (const force of [false, true]) {
+      expect(() =>
+        branchDelete(workspace.context, workspace.repo, { name: "feature", force }),
+      ).toThrowError(expect.objectContaining({ code: "EBRANCHFAIL" }));
+      expect(workspace.repo.store.getRef("refs/heads/feature")).toBe(base.oid);
+    }
+  });
+
   it("creates new, detached, explicit-start, and existing-branch checkouts", async () => {
     const now = 1_700_000_000_000;
     const workspace = makeRepo("/", { startTime: now, now: () => now });

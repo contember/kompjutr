@@ -1058,8 +1058,11 @@ function normalizeRefMutation(
           );
     budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + 2 * (nameBytes + targetBytes));
     expected = { name, target };
-    if (!puts.has(name)) {
-      throw new GitError("EINVAL", "conditional ref update must include its destination put");
+    if (puts.has(name) === deletes.has(name)) {
+      throw new GitError(
+        "EINVAL",
+        "conditional ref update must include exactly one destination put or delete",
+      );
     }
   }
   return { puts, deletes, head, expected, budget };

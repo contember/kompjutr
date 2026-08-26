@@ -3,13 +3,16 @@
 // repository row, so nothing here writes a file.
 
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
+import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
-import { GitError } from "../errors.js";
+import { CorruptError, GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
+import { resolveBranchUpstream } from "./branch-upstream.js";
 import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
+import { selectMergeBases } from "./merge-base.js";
 import { treeOf } from "./reads.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import { trySparseCleanCheckout } from "./sparse-checkout.js";
@@ -64,6 +67,8 @@ export function branch(context: GitContext, repo: Repository, options: BranchOpt
 
 export interface BranchDeleteOptions {
   name: string;
+  /** Delete even when the branch is not fully merged. */
+  force?: boolean;
 }
 
 export function branchDelete(
@@ -72,13 +77,51 @@ export function branchDelete(
   options: BranchDeleteOptions,
 ): void {
   const full = branchRef(options.name);
-  if (repo.store.getRef(full) === null) {
-    throw new GitError("EBRANCHFAIL", `branch '${options.name}' not found`);
-  }
-  if (repo.head().ref === full) {
-    throw new GitError("EBRANCHFAIL", `cannot delete branch '${options.name}': it is checked out`);
-  }
-  repo.mutateRefs({ deletes: [full] }, operationRefLogMetadata(context, repo, "branch: delete"));
+  repo.store.db.transactionSync(() => {
+    const tip = repo.store.getRef(full);
+    if (tip === null) {
+      throw new GitError("EBRANCHFAIL", `branch '${options.name}' not found`);
+    }
+    if (!isOid(tip)) {
+      throw new CorruptError(`branch '${options.name}' does not point to a commit`);
+    }
+    repo.readCommit(tip);
+    const owner = context.database
+      .listCheckouts(repo.store.repoId)
+      .find((checkout) => checkout.head === `ref: ${full}`);
+    if (owner !== undefined) {
+      throw new GitError(
+        "EBRANCHFAIL",
+        `cannot delete branch '${options.name}': it is checked out at ${owner.root}`,
+      );
+    }
+
+    if (options.force !== true) {
+      const upstream = resolveBranchUpstream(repo, full);
+      const comparison = upstream?.oid ?? repo.head().oid;
+      if (comparison === null) {
+        throw new GitError(
+          "EBRANCHFAIL",
+          `cannot delete branch '${options.name}': no comparison commit is available`,
+        );
+      }
+      const selection = selectMergeBases(repo, { currentOid: comparison, incomingOid: tip });
+      if (selection.kind === "shallow") {
+        throw new GitError(
+          "ESHALLOW",
+          `cannot prove branch '${options.name}' is fully merged across a shallow boundary`,
+        );
+      }
+      if (selection.kind !== "already-merged") {
+        throw new GitError("EBRANCHFAIL", `branch '${options.name}' is not fully merged`);
+      }
+    }
+
+    repo.mutateRefs(
+      { deletes: [full], expected: { name: full, target: tip } },
+      operationRefLogMetadata(context, repo, "branch: delete"),
+    );
+  });
 }
 
 export function branchList(repo: Repository): string[] {

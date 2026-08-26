@@ -1391,6 +1391,53 @@ describe("refs, config and index", () => {
     );
   });
 
+  it("conditionally deletes one ref and rejects stale or ambiguous destinations atomically", () => {
+    const { db, store } = open({ now: () => 1_800_000_000_000 });
+    const name = "refs/tags/x";
+    const current = "1".repeat(40);
+    const metadata = {
+      actor: null,
+      reason: "conditional delete",
+      timestamp: 1_800_000_000,
+      timezoneOffset: 0,
+    };
+    store.setRef(name, current);
+
+    store.mutateRefs({ deletes: [name], expected: { name, target: current } }, metadata);
+    expect(store.getRef(name)).toBeNull();
+    expect(store.reflog(name)[0]).toMatchObject({ oldRaw: current, newRaw: null });
+
+    store.setRef(name, current);
+    const count = db.scalar<number>("SELECT count(*) FROM git_reflog_entries");
+    const ordinal = db.scalar<number>(
+      "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1",
+    );
+    expect(() =>
+      store.mutateRefs({ deletes: [name], expected: { name, target: "2".repeat(40) } }, metadata),
+    ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
+    expect(() =>
+      store.mutateRefs(
+        {
+          puts: [{ name, target: "3".repeat(40) }],
+          deletes: [name],
+          expected: { name, target: current },
+        },
+        metadata,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      store.mutateRefs(
+        { deletes: ["refs/tags/other"], expected: { name, target: current } },
+        metadata,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(store.getRef(name)).toBe(current);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      ordinal,
+    );
+  });
+
   it("rejects corrupt old/new endpoints, identity, and ordinal shapes on reads", () => {
     const corruptions = [
       "old_oid = NULL",

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { fromHex, utf8, utf8Decoder } from "../src/core/bytes.js";
+import { serializeCommit } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import {
   configGet,
@@ -36,8 +37,9 @@ import {
 } from "../src/core/ops/refs.js";
 import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import { joinPath } from "../src/core/paths.js";
+import { Repository } from "../src/core/repository.js";
 import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+import { type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import {
@@ -198,6 +200,227 @@ describe("branch", () => {
 
     expect(() => branchDelete(ws.context, ws.repo, { name: "nope" })).toThrow(/not found/);
     expect(runGit("branch", "-d", "nope").ok).toBe(false);
+  });
+
+  it("refuses an unmerged branch unless forced", () => {
+    const side = fixture.git("rev-parse", "side");
+
+    expect(() => branchDelete(ws.context, ws.repo, { name: "side" })).toThrowError(
+      expect.objectContaining({ code: "EBRANCHFAIL" }),
+    );
+    expect(runGit("branch", "-d", "side").ok).toBe(false);
+    expect(ws.repo.store.getRef("refs/heads/side")).toBe(side);
+
+    branchDelete(ws.context, ws.repo, { name: "side", force: true });
+    fixture.git("branch", "-D", "side");
+    expect(ws.repo.store.getRef("refs/heads/side")).toBeNull();
+    expect(gitRawRefTarget("refs/heads/side")).toEqual({ kind: "absent" });
+  });
+
+  it("rolls back a branch-level stale delete interleaving", () => {
+    branch(ws.context, ws.repo, { name: "raced", startPoint: "side" });
+    const name = "refs/heads/raced";
+    const tip = ws.repo.store.getRef(name);
+    const replacement = ws.repo.store.getRef("refs/heads/main");
+    if (tip === null || replacement === null) throw new Error("branch fixture is incomplete");
+    let raced = false;
+    const context = {
+      ...ws.context,
+      now: (): number => {
+        if (!raced) {
+          raced = true;
+          ws.repo.store.setRef(name, replacement);
+        }
+        return ws.context.now();
+      },
+    };
+
+    expect(() => branchDelete(context, ws.repo, { name: "raced", force: true })).toThrowError(
+      expect.objectContaining({ code: "ESTALEHEAD" }),
+    );
+    expect(raced).toBe(true);
+    expect(ws.repo.store.getRef(name)).toBe(tip);
+  });
+
+  it("uses a resolvable upstream instead of HEAD in both directions", () => {
+    branch(ws.context, ws.repo, { name: "side-upstream", startPoint: "side" });
+    fixture.git("branch", "side-upstream", "side");
+    ws.repo.store.configSet("branch.side.remote", ".");
+    ws.repo.store.configSet("branch.side.merge", "refs/heads/side-upstream");
+    fixture.git("config", "branch.side.remote", ".");
+    fixture.git("config", "branch.side.merge", "refs/heads/side-upstream");
+
+    branchDelete(ws.context, ws.repo, { name: "side" });
+    fixture.git("branch", "-d", "side");
+    expect(ws.repo.store.getRef("refs/heads/side")).toBeNull();
+
+    branch(ws.context, ws.repo, { name: "candidate", startPoint: "main" });
+    branch(ws.context, ws.repo, { name: "unmerged-upstream", startPoint: "side-upstream" });
+    fixture.git("branch", "candidate", "main");
+    fixture.git("branch", "unmerged-upstream", "side-upstream");
+    ws.repo.store.configSet("branch.candidate.remote", ".");
+    ws.repo.store.configSet("branch.candidate.merge", "refs/heads/unmerged-upstream");
+    fixture.git("config", "branch.candidate.remote", ".");
+    fixture.git("config", "branch.candidate.merge", "refs/heads/unmerged-upstream");
+
+    expect(() => branchDelete(ws.context, ws.repo, { name: "candidate" })).toThrowError(
+      expect.objectContaining({ code: "EBRANCHFAIL" }),
+    );
+    expect(runGit("branch", "-d", "candidate").ok).toBe(false);
+    expect(ws.repo.store.getRef("refs/heads/candidate")).toBe(
+      fixture.git("rev-parse", "candidate"),
+    );
+  });
+
+  it("falls back to attached or detached HEAD when the upstream target is missing", () => {
+    branch(ws.context, ws.repo, { name: "ancestor", startPoint: "main~1" });
+    fixture.git("branch", "ancestor", "main~1");
+    ws.repo.store.configSet("branch.ancestor.remote", ".");
+    ws.repo.store.configSet("branch.ancestor.merge", "refs/heads/missing");
+    fixture.git("config", "branch.ancestor.remote", ".");
+    fixture.git("config", "branch.ancestor.merge", "refs/heads/missing");
+
+    branchDelete(ws.context, ws.repo, { name: "ancestor" });
+    fixture.git("branch", "-d", "ancestor");
+    expect(ws.repo.store.getRef("refs/heads/ancestor")).toBeNull();
+
+    const main = fixture.git("rev-parse", "main");
+    ws.repo.checkout.setHead(main);
+    fixture.git("checkout", "-q", "--detach", main);
+    branch(ws.context, ws.repo, { name: "detached-merged", startPoint: main });
+    fixture.git("branch", "detached-merged", main);
+    branchDelete(ws.context, ws.repo, { name: "detached-merged" });
+    fixture.git("branch", "-d", "detached-merged");
+
+    expect(() => branchDelete(ws.context, ws.repo, { name: "side" })).toThrowError(
+      expect.objectContaining({ code: "EBRANCHFAIL" }),
+    );
+    expect(runGit("branch", "-d", "side").ok).toBe(false);
+    expect(ws.repo.store.getRef("refs/heads/side")).not.toBeNull();
+  });
+
+  it("refuses safe deletion without a comparison commit and across a shallow boundary", () => {
+    ws.repo.checkout.setHead("ref: refs/heads/unborn");
+    expect(() => branchDelete(ws.context, ws.repo, { name: "side" })).toThrowError(
+      expect.objectContaining({ code: "EBRANCHFAIL" }),
+    );
+    expect(ws.repo.store.getRef("refs/heads/side")).not.toBeNull();
+
+    ws.repo.checkout.setHead("ref: refs/heads/main");
+    ws.repo.store.setShallow([fixture.git("rev-parse", "main")]);
+    expect(() => branchDelete(ws.context, ws.repo, { name: "side" })).toThrowError(
+      expect.objectContaining({ code: "ESHALLOW" }),
+    );
+    expect(ws.repo.store.getRef("refs/heads/side")).not.toBeNull();
+  });
+
+  it("propagates a bounded merge-base graph failure without deleting the branch", () => {
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("main is missing");
+    const tree = ws.repo.readCommit(main).tree;
+    const person = {
+      name: "Fixture",
+      email: "fixture@example.com",
+      timestamp: 1_577_836_800,
+      timezoneOffset: 0,
+    };
+    const tip = ws.repo.store.writeObjects((batch) => {
+      let parent = main;
+      for (let index = 0; index < 20; index++) {
+        parent = batch.write(
+          "commit",
+          serializeCommit({
+            tree,
+            parent: [parent],
+            author: person,
+            committer: person,
+            message: `${index}\n${"x".repeat(850_000)}`,
+          }),
+        );
+      }
+      return parent;
+    });
+    ws.repo.store.setRef("refs/heads/oversized-graph", tip);
+
+    expect(() => branchDelete(ws.context, ws.repo, { name: "oversized-graph" })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(ws.repo.store.getRef("refs/heads/oversized-graph")).toBe(tip);
+  });
+
+  it("propagates invalid bounded config and validates the tip even with force", () => {
+    branch(ws.context, ws.repo, { name: "candidate" });
+    ws.repo.store.configSet("branch.candidate.remote", ".");
+    ws.repo.store.configSet("branch.candidate.merge", "x".repeat(1_025));
+    expect(() => branchDelete(ws.context, ws.repo, { name: "candidate" })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(ws.repo.store.getRef("refs/heads/candidate")).not.toBeNull();
+
+    const blob = ws.repo.store.write("blob", utf8.encode("not a commit\n"));
+    ws.repo.store.setRef("refs/heads/not-a-commit", blob);
+    expect(() =>
+      branchDelete(ws.context, ws.repo, { name: "not-a-commit", force: true }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(ws.repo.store.getRef("refs/heads/not-a-commit")).toBe(blob);
+
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("main is missing");
+    const valid = ws.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: ws.repo.readCommit(main).tree,
+        parent: [main],
+        author: {
+          name: "Fixture",
+          email: "fixture@example.com",
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+        },
+        committer: {
+          name: "Fixture",
+          email: "fixture@example.com",
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+        },
+        message: "corrupt me\n",
+      }),
+    );
+    ws.repo.store.setRef("refs/heads/corrupt-commit", valid);
+    ws.repo.store.db.run(
+      "DELETE FROM git_commits WHERE repo_id = ? AND oid = ?",
+      ws.repo.store.repoId,
+      valid,
+    );
+    ws.repo.store.db.run(
+      "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
+      ws.repo.store.repoId,
+      valid,
+    );
+    ws.repo.store.db.run(
+      `UPDATE git_object_chunks SET data = zeroblob((
+         SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
+       )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
+      ws.repo.store.repoId,
+      valid,
+      ws.repo.store.repoId,
+      valid,
+    );
+    ws.repo.store.db.run(
+      "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq > 0",
+      ws.repo.store.repoId,
+      valid,
+    );
+    const coldDatabase = new SqliteGitDatabase(ws.repo.store.db);
+    const checkout = coldDatabase.findCheckout("/");
+    if (checkout === null) throw new Error("primary checkout is missing");
+    const coldRepo = new Repository(coldDatabase.openCheckout(checkout));
+    const coldContext = { ...ws.context, database: coldDatabase };
+
+    expect(() =>
+      branchDelete(coldContext, coldRepo, { name: "corrupt-commit", force: true }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(coldRepo.store.getRef("refs/heads/corrupt-commit")).toBe(valid);
   });
 
   it("overwrites an existing branch only with force", () => {
