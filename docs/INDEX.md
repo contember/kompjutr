@@ -15,15 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-26-git-boundary-correctness.md`](sprints/sprint-2026-08-26-git-boundary-correctness.md)
+  — safe Git-facing boundaries for refs, status, conflicts, and network defaults.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Multi-checkout consumer admission is shipped. The next production evidence is
-  the Durable Object regression probe and concurrent/restart conformance; safe
-  merged-branch deletion and garbage collection remain separate follow-up work.
+- Git boundary correctness is active: safe branch deletion, status truth and
+  framing, materializable distinct-type conflicts, and default network coverage.
 
 ## Key reference
 
@@ -45,6 +45,7 @@ None.
 - [`decisions/0007-key-parsed-trees-by-source-surrogate.md`](decisions/0007-key-parsed-trees-by-source-surrogate.md)
 - [`decisions/0008-retain-deleted-ref-history.md`](decisions/0008-retain-deleted-ref-history.md)
 - [`decisions/0009-split-shared-store-from-checkouts.md`](decisions/0009-split-shared-store-from-checkouts.md)
+- [`decisions/0010-require-valid-utf8-git-paths.md`](decisions/0010-require-valid-utf8-git-paths.md)
 
 ## Historical records
 

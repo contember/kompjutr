@@ -151,3 +151,5 @@ focused sprint.
 - [55 — Keep status sparse across untracked files under normal collapsing](55-sparse-status-across-untracked-files.md)
 - [56 — Move the index tracker baseline on commit](56-reseal-index-tracker-on-commit.md)
 - [57 — Stream HEAD and the index once in the full status prepass](57-single-prepass-in-full-status.md)
+- [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
+- [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
