@@ -30,6 +30,15 @@ function open(options: StoreOptions = {}) {
   return { db, database, store: database.open(repository) };
 }
 
+function assertMemoryCoordinatorIdle(store: ReturnType<typeof open>["store"]): void {
+  const probe = store.reserveMemory();
+  try {
+    probe.set("other", MAX_REF_MUTATION_RETAINED_BYTES);
+  } finally {
+    probe.dispose();
+  }
+}
+
 function insertRawBlob(db: TestDatabase, repoId: number, data: Uint8Array): string {
   const oid = hashObject("blob", data);
   db.run(
@@ -1211,6 +1220,7 @@ describe("refs, config and index", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
     expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
+    assertMemoryCoordinatorIdle(store);
 
     const over = open({ now: () => 1_800_000_000_000 });
     over.db.storage.resetCounters();
@@ -1220,6 +1230,24 @@ describe("refs, config and index", () => {
     expect(over.db.storage.statementCount).toBe(2);
     expect(over.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
     expect(over.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+    assertMemoryCoordinatorIdle(over.store);
+
+    const coordinated = open({ now: () => 1_800_000_000_000 });
+    const blocker = coordinated.store.reserveMemory();
+    blocker.set("other", 1);
+    coordinated.db.storage.resetCounters();
+    try {
+      expect(() => coordinated.store.updateRefs(puts(false))).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(coordinated.db.storage.statementCount).toBe(2);
+      expect(coordinated.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
+      expect(coordinated.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+      expect(blocker.currentBytes).toBe(1);
+    } finally {
+      blocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(coordinated.store);
   });
 
   it("retains only the newest 1,024 entries per ref", () => {

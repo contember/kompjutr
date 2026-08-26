@@ -154,9 +154,17 @@ const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const REFLOG_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 const REFLOG_RETENTION_ROWS = 1_024;
-/** Two conservative SQL slots per row bound validation, grouping, and ordering together. */
-export const MAX_REFLOG_ROOT_SCAN_BYTES = 96 * 1024 * 1024;
+export const MAX_REFLOG_ROOT_RETAINED_BYTES = 100 * 1024 * 1024 - 1;
+export const REFLOG_ROOT_OBJECT_CACHE_BYTES = DEFAULT_OBJECT_CACHE_BYTES;
+export const REFLOG_ROOT_PACK_ROW_CACHE_BYTES = MAX_PACK_ROW_CACHE_BYTES;
+export const REFLOG_ROOT_JS_HEADROOM_BYTES = 4 * 1024 * 1024;
+export const MAX_REFLOG_ROOT_SCAN_BYTES =
+  MAX_REFLOG_ROOT_RETAINED_BYTES -
+  REFLOG_ROOT_OBJECT_CACHE_BYTES -
+  REFLOG_ROOT_PACK_ROW_CACHE_BYTES -
+  REFLOG_ROOT_JS_HEADROOM_BYTES;
 export const REFLOG_ROOT_SCAN_FIXED_BYTES = 8 * 1024 * 1024;
+/** Two conservative SQL slots per row bound validation, grouping, and ordering together. */
 export const REFLOG_ROOT_ENDPOINT_BYTES = 4_096;
 export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
   (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / (2 * REFLOG_ROOT_ENDPOINT_BYTES),
@@ -859,7 +867,7 @@ function validateRefLogRootScanBudget(value: unknown): void {
     throw new CorruptError("reflog root budget query returned an invalid row count");
   }
   if (value > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
-    throw new GitError("E2BIG", "active reflog root scan exceeds its 96 MiB SQL-state bound");
+    throw new GitError("E2BIG", "active reflog root scan exceeds its bounded SQL state");
   }
 }
 
@@ -917,7 +925,13 @@ function validateRefLogMetadata(metadata: RefLogMetadata): RefLogMetadata {
 }
 
 class RefMutationBudget {
-  #retained = REF_MUTATION_FIXED_RETAINED_BYTES;
+  readonly #reservation: MemoryReservation;
+  #retained = 0;
+
+  constructor(reservation: MemoryReservation) {
+    this.#reservation = reservation;
+    this.charge(REF_MUTATION_FIXED_RETAINED_BYTES);
+  }
 
   charge(bytes: number): void {
     if (
@@ -927,7 +941,9 @@ class RefMutationBudget {
     ) {
       throw new GitError("E2BIG", "ref mutation exceeds its 64 MiB retained-memory bound");
     }
-    this.#retained += bytes;
+    const retained = this.#retained + bytes;
+    this.#reservation.set("other", retained);
+    this.#retained = retained;
   }
 }
 
@@ -948,10 +964,12 @@ export function refMutationCreateRetainedBytes(row: RefRow): number {
   );
 }
 
-function normalizeRefMutation(mutation: RefMutation): NormalizedRefMutation {
+function normalizeRefMutation(
+  mutation: RefMutation,
+  budget: RefMutationBudget,
+): NormalizedRefMutation {
   const puts = new Map<string, string>();
   const deletes = new Set<string>();
-  const budget = new RefMutationBudget();
   let inputs = 0;
   const charge = (nameBytes: number, targetBytes = 0): void => {
     inputs++;
@@ -3081,8 +3099,18 @@ export class RepoStore {
 
   /** Apply current ref state and its bounded history through one atomic seam. */
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
-    const normalized = normalizeRefMutation(mutation);
-    const checkedMetadata = validateRefLogMetadata(metadata);
+    const reservation = this.#memory.reserve();
+    try {
+      const budget = new RefMutationBudget(reservation);
+      const normalized = normalizeRefMutation(mutation, budget);
+      const checkedMetadata = validateRefLogMetadata(metadata);
+      return this.#mutateRefs(normalized, checkedMetadata);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  #mutateRefs(normalized: NormalizedRefMutation, checkedMetadata: RefLogMetadata): boolean {
     return this.#db.transactionSync(() => {
       const header = this.#db.one<{
         head: unknown;

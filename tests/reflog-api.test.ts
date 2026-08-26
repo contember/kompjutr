@@ -4,7 +4,14 @@ import { recoverRef } from "../src/core/ops/ref-log.js";
 import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
+  MAX_REFLOG_ROOT_RETAINED_BYTES,
+  MAX_REFLOG_ROOT_SCAN_BYTES,
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
+  REFLOG_ROOT_ENDPOINT_BYTES,
+  REFLOG_ROOT_JS_HEADROOM_BYTES,
+  REFLOG_ROOT_OBJECT_CACHE_BYTES,
+  REFLOG_ROOT_PACK_ROW_CACHE_BYTES,
+  REFLOG_ROOT_SCAN_FIXED_BYTES,
   type RefLogMetadata,
   SqliteGitDatabase,
 } from "../src/sqlite/store.js";
@@ -482,6 +489,27 @@ describe("reflog recovery", () => {
 });
 
 describe("active reflog roots", () => {
+  it("keeps SQL state, shared caches, and JS headroom strictly below 100 MiB", () => {
+    expect(
+      MAX_REFLOG_ROOT_SCAN_BYTES +
+        REFLOG_ROOT_OBJECT_CACHE_BYTES +
+        REFLOG_ROOT_PACK_ROW_CACHE_BYTES +
+        REFLOG_ROOT_JS_HEADROOM_BYTES,
+    ).toBe(MAX_REFLOG_ROOT_RETAINED_BYTES);
+    expect(MAX_REFLOG_ROOT_RETAINED_BYTES).toBe(100 * 1024 * 1024 - 1);
+    expect(REFLOG_ROOT_OBJECT_CACHE_BYTES).toBe(8 * 1024 * 1024);
+    expect(REFLOG_ROOT_PACK_ROW_CACHE_BYTES).toBe(4 * 1024 * 1024);
+    expect(REFLOG_ROOT_JS_HEADROOM_BYTES).toBe(4 * 1024 * 1024);
+    expect(
+      REFLOG_ROOT_SCAN_FIXED_BYTES + 2 * REFLOG_ROOT_ENDPOINT_BYTES * MAX_REFLOG_ROOT_SCAN_ENTRIES,
+    ).toBeLessThanOrEqual(MAX_REFLOG_ROOT_SCAN_BYTES);
+    expect(
+      REFLOG_ROOT_SCAN_FIXED_BYTES +
+        2 * REFLOG_ROOT_ENDPOINT_BYTES * (MAX_REFLOG_ROOT_SCAN_ENTRIES + 1),
+    ).toBeGreaterThan(MAX_REFLOG_ROOT_SCAN_BYTES);
+    expect(MAX_REFLOG_ROOT_SCAN_ENTRIES).toBe(9_727);
+  });
+
   it("deduplicates active non-null endpoints in SQL and excludes expired roots", () => {
     let now = NOW_MILLISECONDS;
     const workspace = makeRepo("/", { now: () => now });
