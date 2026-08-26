@@ -1,4 +1,6 @@
+import { fromHex, isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
+import { decodeTreeName } from "../core/objects.js";
 import type { SqlDatabase } from "./db.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "./schema.js";
 
@@ -23,6 +25,74 @@ export interface WalkTreeDiffEntry {
 export interface WalkTreeDiffObject {
   oid: string;
   type: "tree" | "blob";
+}
+
+function validateTraversalPath(row: Record<string, unknown>, label: string): void {
+  const rawPathHex = row.raw_path_hex;
+  if (rawPathHex === null) {
+    if (row.error === null) throw new CorruptError(`${label} yielded no raw path`);
+    return;
+  }
+  if (
+    typeof rawPathHex !== "string" ||
+    rawPathHex.length > TREE_WALK_PATH_BYTES * 2 ||
+    rawPathHex.length % 2 !== 0 ||
+    /[^0-9A-F]/.test(rawPathHex)
+  ) {
+    throw new CorruptError(`${label} yielded an invalid raw path`);
+  }
+  const rawPath = fromHex(rawPathHex);
+  const path = decodeTreeName(rawPath);
+  if (typeof row.path !== "string" || row.path !== path) {
+    throw new CorruptError(`${label} path does not match its authoritative bytes`);
+  }
+}
+
+function throwTraversalError(row: Record<string, unknown>, label: string): void {
+  const error = row.error;
+  const errorCode = row.error_code;
+  if (error === null) {
+    if (errorCode !== "ECORRUPT" && errorCode !== "E2BIG") {
+      throw new CorruptError(`${label} yielded an invalid error code`);
+    }
+    return;
+  }
+  if (typeof error !== "string" || (errorCode !== "ECORRUPT" && errorCode !== "E2BIG")) {
+    throw new CorruptError(`${label} yielded invalid error fields`);
+  }
+  if (errorCode === "E2BIG") throw new GitError("E2BIG", error);
+  throw new CorruptError(error);
+}
+
+function isTreeMode(mode: string): boolean {
+  return mode === "40000" || mode === "040000";
+}
+
+function isLeafMode(mode: string): boolean {
+  return mode === "100644" || mode === "100755" || mode === "120000" || mode === "160000";
+}
+
+function validateNullableLeaf(mode: unknown, oid: unknown, label: string): void {
+  if (mode === null && oid === null) return;
+  if (typeof mode !== "string" || !isLeafMode(mode) || typeof oid !== "string" || !isOid(oid)) {
+    throw new CorruptError(`${label} yielded an invalid tree entry`);
+  }
+}
+
+function validateDiffProjection(row: Record<string, unknown>, label: string): void {
+  validateNullableLeaf(row.before_mode, row.before_oid, label);
+  validateNullableLeaf(row.after_mode, row.after_oid, label);
+  const mode = row.object_mode;
+  const oid = row.object_oid;
+  if (mode === null && oid === null) return;
+  if (
+    typeof mode !== "string" ||
+    (!isTreeMode(mode) && !isLeafMode(mode)) ||
+    typeof oid !== "string" ||
+    !isOid(oid)
+  ) {
+    throw new CorruptError(`${label} yielded an invalid object projection`);
+  }
 }
 
 export const WALK_TREE_SQL = `WITH RECURSIVE
@@ -77,13 +147,14 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
          )
        )
   ),
-  walk(path, mode, oid, ancestry, sort_key, error, error_code,
+  walk(path, raw_path, mode, oid, ancestry, sort_key, error, error_code,
        path_bytes, state_bytes, descend, reserved_bytes) AS (
     SELECT CASE
              WHEN length(e.name_bytes) <= p.path_cap
                AND length(CAST(e.name AS BLOB)) <= p.path_cap THEN e.name
              ELSE NULL
            END,
+           CASE WHEN length(e.name_bytes) <= p.path_cap THEN e.name_bytes ELSE NULL END,
            CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
            CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
            '/' || p.root_oid || '/', printf('%08x', e.ordinal),
@@ -166,13 +237,13 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
        AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
        AND e.storage = s.storage AND e.source_id = s.source_id
     UNION ALL
-    SELECT NULL, NULL, NULL, '/', '',
+    SELECT NULL, NULL, NULL, NULL, '/', '',
            'tree traversal queue exceeds 16 MiB', 'E2BIG', 0, 0, 0, 0
       FROM params p CROSS JOIN source_valid s
      WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
        AND s.base_cost + s.entry_count * 50 > p.queue_cap
     UNION ALL
-    SELECT NULL, NULL, NULL, '/', '',
+    SELECT NULL, NULL, NULL, NULL, '/', '',
            CASE WHEN length(p.root_oid) = 40 AND p.root_oid NOT GLOB '*[^0-9a-f]*'
                 THEN 'tree source is invalid; reimport or reclone'
                 ELSE 'tree oid is invalid'
@@ -191,6 +262,9 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
                THEN w.path || '/' || e.name
              ELSE NULL
            END,
+           CASE WHEN w.path_bytes + 1 + length(e.name_bytes) <= p.path_cap
+                  THEN CAST(w.raw_path || x'2f' || e.name_bytes AS BLOB)
+                ELSE NULL END,
            CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
            CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
            w.ancestry || w.oid || '/', w.sort_key || printf('%08x', e.ordinal),
@@ -279,9 +353,10 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
        AND s.repo_id = p.repo_id AND s.tree_oid = w.oid
        AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
        AND e.storage = s.storage AND e.source_id = s.source_id
-     ORDER BY 5
+     ORDER BY 6
   )
-SELECT path, mode, oid,
+SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_path_hex,
+       mode, oid,
        CASE
          WHEN error IS NOT NULL THEN error
          WHEN mode IN ('40000', '040000') AND instr(ancestry, '/' || oid || '/') != 0
@@ -415,9 +490,9 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
      WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
        AND e.storage = s.storage AND e.source_id = s.source_id
   ),
-  walk(path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
+  walk(path, raw_path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
        before_ancestry, after_ancestry, state_bytes, reserved_bytes, error, error_code) AS (
-    SELECT '', 0, CAST('' AS BLOB),
+    SELECT '', CAST('' AS BLOB), 0, CAST('' AS BLOB),
            CASE WHEN p.before_root IS NULL THEN NULL ELSE '40000' END, p.before_root,
            CASE WHEN p.after_root IS NULL THEN NULL ELSE '40000' END, p.after_root,
            CASE WHEN p.before_root IS NULL THEN '/' ELSE '/' || p.before_root || '/' END,
@@ -458,7 +533,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
       FROM params p
      WHERE p.before_root IS NOT p.after_root
     UNION ALL
-    SELECT w.path, w.path_bytes, w.sort_key,
+    SELECT w.path, w.raw_path, w.path_bytes, w.sort_key,
            w.before_mode, w.before_oid, w.after_mode, w.after_oid,
            w.before_ancestry, w.after_ancestry, w.state_bytes, w.reserved_bytes,
            'tree traversal queue exceeds 16 MiB', 'E2BIG'
@@ -487,6 +562,11 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            > p.queue_cap
     UNION ALL
     SELECT CASE WHEN w.path = '' THEN be.name ELSE w.path || '/' || be.name END,
+           CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
+                          + length(be.name_bytes) <= p.path_cap
+                  THEN CASE WHEN w.path = '' THEN be.name_bytes
+                            ELSE CAST(w.raw_path || x'2f' || be.name_bytes AS BLOB) END
+                ELSE NULL END,
            w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END + length(be.name_bytes),
            CAST(CAST(CASE WHEN w.path = '' THEN be.name ELSE w.path || '/' || be.name END AS BLOB)
                 || CASE WHEN be.mode NOT IN ('40000', '040000')
@@ -582,6 +662,11 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            <= p.queue_cap
     UNION ALL
     SELECT CASE WHEN w.path = '' THEN ae.name ELSE w.path || '/' || ae.name END,
+           CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
+                          + length(ae.name_bytes) <= p.path_cap
+                  THEN CASE WHEN w.path = '' THEN ae.name_bytes
+                            ELSE CAST(w.raw_path || x'2f' || ae.name_bytes AS BLOB) END
+                ELSE NULL END,
            w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END + length(ae.name_bytes),
            CAST(CAST(CASE WHEN w.path = '' THEN ae.name ELSE w.path || '/' || ae.name END AS BLOB)
                 || CASE WHEN ae.mode NOT IN ('40000', '040000') THEN x'00' ELSE x'2f' END AS BLOB),
@@ -641,9 +726,9 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
              + COALESCE(bps.base_cost + bps.object_size
                           + bps.entry_count * (w.state_bytes + 51), 0)
            <= p.queue_cap
-     ORDER BY 3
+     ORDER BY 4
   )
-SELECT path,
+SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_path_hex,
        CASE WHEN before_mode IN ('40000', '040000') THEN NULL ELSE before_mode END AS before_mode,
        CASE WHEN before_mode IN ('40000', '040000') THEN NULL ELSE before_oid END AS before_oid,
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_mode END AS after_mode,
@@ -674,15 +759,18 @@ export function* iterateTree(
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
   )) {
-    const error = row.error;
-    if (typeof error === "string") {
-      if (row.error_code === "E2BIG") throw new GitError("E2BIG", error);
-      throw new CorruptError(error);
-    }
+    validateTraversalPath(row, "tree traversal");
+    throwTraversalError(row, "tree traversal");
     const path = row.path;
     const mode = row.mode;
     const oid = row.oid;
-    if (typeof path !== "string" || typeof mode !== "string" || typeof oid !== "string") {
+    if (
+      typeof path !== "string" ||
+      typeof mode !== "string" ||
+      !isLeafMode(mode) ||
+      typeof oid !== "string" ||
+      !isOid(oid)
+    ) {
       throw new CorruptError("tree traversal yielded an invalid row");
     }
     yield { path, mode, oid };
@@ -697,6 +785,7 @@ export function* iterateTreeDiffObjects(
   afterTreeOid: string,
 ): Generator<WalkTreeDiffObject> {
   if (beforeTreeOid === afterTreeOid) return;
+  let pendingRoot: WalkTreeDiffObject | null = null;
   for (const row of db.iterate(
     WALK_TREE_DIFF_SQL,
     repoId,
@@ -708,20 +797,39 @@ export function* iterateTreeDiffObjects(
     TREE_QUEUE_ROW_FIXED_BYTES,
     1,
   )) {
-    const error = row.error;
-    if (typeof error === "string") {
-      if (row.error_code === "E2BIG") throw new GitError("E2BIG", error);
-      throw new CorruptError(error);
-    }
+    validateTraversalPath(row, "tree diff object traversal");
+    throwTraversalError(row, "tree diff object traversal");
+    validateDiffProjection(row, "tree diff object traversal");
+    const path = row.path;
     const mode = row.object_mode;
     const oid = row.object_oid;
     if (mode === null && oid === null) continue;
-    if (typeof mode !== "string" || typeof oid !== "string") {
+    if (
+      typeof path !== "string" ||
+      typeof mode !== "string" ||
+      (!isTreeMode(mode) && !isLeafMode(mode)) ||
+      typeof oid !== "string" ||
+      !isOid(oid)
+    ) {
       throw new CorruptError("tree diff object traversal yielded an invalid row");
     }
     if (mode === "160000") continue;
-    yield { oid, type: mode === "40000" || mode === "040000" ? "tree" : "blob" };
+    const object: WalkTreeDiffObject = { oid, type: isTreeMode(mode) ? "tree" : "blob" };
+    if (path === "") {
+      if (pendingRoot !== null) {
+        throw new CorruptError("tree diff object traversal yielded duplicate roots");
+      }
+      pendingRoot = object;
+      continue;
+    }
+    // Validate the first edge before exposing its containing root object.
+    if (pendingRoot !== null) {
+      yield pendingRoot;
+      pendingRoot = null;
+    }
+    yield object;
   }
+  if (pendingRoot !== null) yield pendingRoot;
 }
 
 /** Stream changed leaves between two trees while pruning equal subtrees. */
@@ -743,11 +851,9 @@ export function* iterateTreeDiff(
     TREE_QUEUE_ROW_FIXED_BYTES,
     0,
   )) {
-    const error = row.error;
-    if (typeof error === "string") {
-      if (row.error_code === "E2BIG") throw new GitError("E2BIG", error);
-      throw new CorruptError(error);
-    }
+    validateTraversalPath(row, "tree diff traversal");
+    throwTraversalError(row, "tree diff traversal");
+    validateDiffProjection(row, "tree diff traversal");
     const path = row.path;
     const beforeMode = row.before_mode;
     const beforeOid = row.before_oid;
@@ -755,10 +861,10 @@ export function* iterateTreeDiff(
     const afterOid = row.after_oid;
     if (
       typeof path !== "string" ||
-      (beforeMode !== null && typeof beforeMode !== "string") ||
-      (beforeOid !== null && typeof beforeOid !== "string") ||
-      (afterMode !== null && typeof afterMode !== "string") ||
-      (afterOid !== null && typeof afterOid !== "string") ||
+      (beforeMode !== null && (typeof beforeMode !== "string" || !isLeafMode(beforeMode))) ||
+      (beforeOid !== null && (typeof beforeOid !== "string" || !isOid(beforeOid))) ||
+      (afterMode !== null && (typeof afterMode !== "string" || !isLeafMode(afterMode))) ||
+      (afterOid !== null && (typeof afterOid !== "string" || !isOid(afterOid))) ||
       (beforeMode === null) !== (beforeOid === null) ||
       (afterMode === null) !== (afterOid === null)
     ) {

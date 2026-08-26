@@ -1835,6 +1835,34 @@ describe("synthetic pack ingest", () => {
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBe(0);
   });
 
+  it("leaves a pack with an invalid UTF-8 tree name incomplete and unreadable", async () => {
+    const store = open();
+    const data = concat([
+      utf8.encode("100644 "),
+      new Uint8Array([0x80, 0]),
+      new Uint8Array(20).fill(0x11),
+    ]);
+    const oid = hashObject("tree", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", data);
+    writer.finish();
+
+    await expect(store.packs.ingest(slices(concat(chunks), 64))).rejects.toMatchObject({
+      code: "EUNSUPPORTED",
+    });
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'complete'"),
+    ).toBe(0);
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta WHERE state = 'pending'"),
+    ).toBe(1);
+    expect(store.typeAndSize(oid)).toBeNull();
+    expect(store.read(oid)).toBeNull();
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+  });
+
   it("streams an entry larger than the buffered limit", async () => {
     const database = new SqliteGitDatabase(new TestDatabase(), {
       maxBufferedEntry: 64 * 1024,

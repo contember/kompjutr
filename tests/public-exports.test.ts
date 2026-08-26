@@ -28,6 +28,7 @@ import type {
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
   GitRevertOptions,
+  StatusFormatOptions as GitStatusFormatOptions,
   GitWorktreeAddOptions,
   WorktreeAddTarget as GitWorktreeAddTarget,
   WorktreeInfo as GitWorktreeInfo,
@@ -36,6 +37,7 @@ import type {
 import {
   divergence as gitDivergence,
   readRef as gitReadRef,
+  statusFormatOptions as gitStatusFormatOptions,
   worktreeAdd as gitWorktreeAdd,
   worktreeList as gitWorktreeList,
   worktreePrune as gitWorktreePrune,
@@ -69,6 +71,7 @@ import type {
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
   GitRevertOptions as RootRevertOptions,
+  StatusFormatOptions as RootStatusFormatOptions,
   GitStatusOptions as RootStatusOptions,
   GitStatusReport as RootStatusReport,
   GitStatusReportOptions as RootStatusReportOptions,
@@ -78,6 +81,7 @@ import type {
 import {
   divergence as rootDivergence,
   readRef as rootReadRef,
+  statusFormatOptions as rootStatusFormatOptions,
   worktreeAdd as rootWorktreeAdd,
   worktreeList as rootWorktreeList,
   worktreePrune as rootWorktreePrune,
@@ -129,6 +133,19 @@ describe("public bounded read exports", () => {
       rootDivergence,
       gitReadRef,
       rootReadRef,
+    ]);
+  });
+});
+
+describe("public status formatting exports", () => {
+  it("exposes matching options and configuration resolvers from both entrypoints", () => {
+    const options: RootStatusFormatOptions = { quotePath: false, zeroTerminate: true };
+    const gitOptions: GitStatusFormatOptions = options;
+
+    expect([gitOptions.quotePath, gitOptions.zeroTerminate, gitStatusFormatOptions]).toEqual([
+      false,
+      true,
+      rootStatusFormatOptions,
     ]);
   });
 });

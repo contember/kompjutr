@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
-import { parseTreeStream, serializeTree, type TreeEntry, TreeParser } from "../src/core/objects.js";
+import {
+  hashObject,
+  parseTree,
+  parseTreeStream,
+  serializeTree,
+  type TreeEntry,
+  TreeParser,
+} from "../src/core/objects.js";
 import { readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import { PackTreeIndex } from "../src/sqlite/pack-ingest-index.js";
 import {
@@ -11,6 +18,7 @@ import {
   TREE_QUEUE_ROW_FIXED_BYTES,
   type TreeSource,
 } from "../src/sqlite/schema.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { indexSeededTreeSource } from "../src/sqlite/tree-index.js";
 import { TestDatabase } from "./helpers/db.js";
 
@@ -28,11 +36,15 @@ it("loads the pack tree index directly without a schema module cycle", () => {
 });
 
 function rawEntry(mode: string, name: string, oid = OID): Uint8Array {
+  return rawEntryBytes(mode, utf8.encode(name), oid);
+}
+
+function rawEntryBytes(mode: string, name: Uint8Array, oid = OID): Uint8Array {
   const oidBytes = new Uint8Array(20);
   for (let at = 0; at < oidBytes.length; at++) {
     oidBytes[at] = Number.parseInt(oid.slice(at * 2, at * 2 + 2), 16);
   }
-  return concat([utf8.encode(`${mode} ${name}\0`), oidBytes]);
+  return concat([utf8.encode(`${mode} `), name, new Uint8Array([0]), oidBytes]);
 }
 
 function source(objectSize: number, sourceId = 0): TreeSource {
@@ -172,6 +184,83 @@ describe("incremental tree parser", () => {
     expect(() => consume(name, utf8.encode(`100644 ${"a".repeat(2_201)}`))).toThrow(
       "tree entry name is too long",
     );
+  });
+
+  it("rejects invalid UTF-8 names in scalar and incremental parsing", () => {
+    const data = rawEntryBytes("100644", new Uint8Array([0x66, 0x80]));
+
+    expect(() => parseTree(data)).toThrowError(expect.objectContaining({ code: "EUNSUPPORTED" }));
+    expect(() => [...parseTreeStream([data.subarray(0, 8), data.subarray(8)])]).toThrowError(
+      expect.objectContaining({ code: "EUNSUPPORTED" }),
+    );
+  });
+
+  it("does not publish a loose tree with an invalid UTF-8 name", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const data = rawEntryBytes("100644", new Uint8Array([0x80]));
+    const oid = hashObject("tree", data);
+
+    expect(() => store.write("tree", data)).toThrowError(
+      expect.objectContaining({ code: "EUNSUPPORTED" }),
+    );
+    expect(store.typeAndSize(oid)).toBeNull();
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+  });
+
+  it("rejects corrupted authoritative tree-name bytes during traversal", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const data = rawEntry("100644", "valid.txt");
+    const oid = store.write("tree", data);
+    db.run(
+      `UPDATE git_tree_entries SET name_bytes = ? WHERE source_key = (
+         SELECT source_key FROM git_tree_sources
+          WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+       ) AND ordinal = 0`,
+      new Uint8Array([0x80]),
+      store.repoId,
+      oid,
+    );
+
+    expect(() => [...store.walkTree(oid)]).toThrowError(
+      expect.objectContaining({ code: "EUNSUPPORTED" }),
+    );
+  });
+
+  it("rejects invalid authoritative names before either tree-diff shape yields", () => {
+    for (const objects of [false, true]) {
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
+      const tree = store.write("tree", rawEntry("100644", "x"));
+      const nameBytes = new Uint8Array([0x80]);
+      db.run(
+        `UPDATE git_tree_entries SET name_bytes = ?, raw_entry = ? WHERE source_key = (
+           SELECT source_key FROM git_tree_sources
+            WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+         ) AND ordinal = 0`,
+        nameBytes,
+        rawEntryBytes("100644", nameBytes),
+        store.repoId,
+        tree,
+      );
+      const rows = objects ? store.walkTreeDiffObjects(null, tree) : store.walkTreeDiff(null, tree);
+      let seen = 0;
+      let failure: unknown;
+      try {
+        for (const _row of rows) seen++;
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toEqual(expect.objectContaining({ code: "EUNSUPPORTED" }));
+      expect(seen).toBe(0);
+    }
   });
 });
 

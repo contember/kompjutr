@@ -56,6 +56,10 @@ export {
   statusStream,
 } from "../core/ops/status.js";
 export {
+  type StatusFormatOptions,
+  statusFormatOptions,
+} from "../core/ops/status-format.js";
+export {
   type WorktreeAddOptions,
   type WorktreeAddTarget,
   type WorktreeInfo,

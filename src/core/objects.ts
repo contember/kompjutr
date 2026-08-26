@@ -90,6 +90,17 @@ export const MODE_SYMLINK = "120000";
 export const MODE_TREE = "40000";
 export const MODE_COMMIT = "160000";
 
+const treeNameDecoder = new TextDecoder("utf-8", { fatal: true });
+
+/** Decode one authoritative tree name or composed tree path without byte loss. */
+export function decodeTreeName(bytes: Uint8Array): string {
+  try {
+    return treeNameDecoder.decode(bytes);
+  } catch {
+    throw new GitError("EUNSUPPORTED", "tree names must be valid UTF-8");
+  }
+}
+
 export function isTreeMode(mode: string): boolean {
   return mode === "40000" || mode === "040000";
 }
@@ -306,7 +317,7 @@ export function parseTree(data: Uint8Array): TreeEntry[] {
     if (nul + 21 > data.length) throw new CorruptError("malformed tree entry");
     entries.push({
       mode,
-      name: utf8Decoder.decode(data.subarray(space + 1, nul)),
+      name: decodeTreeName(data.subarray(space + 1, nul)),
       oid: toHex(data.subarray(nul + 1, nul + 21)),
     });
     pos = nul + 21;
@@ -410,7 +421,7 @@ export class TreeParser {
           yield {
             entry: {
               mode: modeText,
-              name: utf8Decoder.decode(nameBytes),
+              name: decodeTreeName(nameBytes),
               oid: toHex(this.#oid),
             },
             nameBytes,
