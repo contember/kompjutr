@@ -36,8 +36,12 @@ function makeNativeGit(): { git: Git; workspace: TestWorkspace } {
 }
 
 function bindNativeGit(workspace: TestWorkspace): Git {
+  return bindNativeGitDatabase(workspace, workspace.database);
+}
+
+function bindNativeGitDatabase(workspace: TestWorkspace, database: SqliteGitDatabase): Git {
   return createGit()({
-    database: workspace.database,
+    database,
     worktree: workspace.worktree,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
@@ -139,6 +143,108 @@ describe("createSqliteGitClient", () => {
     });
     await expect(git.statusReport({ paths: ["fresh"] })).resolves.toEqual({
       entries: [{ path: "fresh/", index: " ", worktree: "?" }],
+    });
+  });
+
+  it("exposes divergence and raw ref reads for symbolic and detached HEAD", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/reads";
+    await git.init({ dir });
+    const base = await commitFile(git, workspace, dir, "file.txt", "base\n", "base");
+    await git.branch({ dir, name: "base" });
+    const tip = await commitFile(git, workspace, dir, "file.txt", "tip\n", "tip");
+
+    await expect(git.divergence({ dir, current: "HEAD", upstream: "base" })).resolves.toEqual({
+      relationship: "ahead",
+      ahead: 1,
+      behind: 0,
+    });
+    await expect(git.readRef({ dir, ref: "HEAD" })).resolves.toEqual({
+      kind: "symbolic",
+      target: "refs/heads/main",
+    });
+
+    await git.updateRef({
+      dir,
+      ref: "refs/remotes/origin/main",
+      value: tip,
+      force: true,
+    });
+    await git.updateRef({
+      dir,
+      ref: "refs/remotes/origin/alias",
+      value: "refs/remotes/origin/main",
+      symbolic: true,
+      force: true,
+    });
+    await git.updateRef({
+      dir,
+      ref: "refs/remotes/origin/HEAD",
+      value: "refs/remotes/origin/alias",
+      symbolic: true,
+      force: true,
+    });
+    await expect(git.readRef({ dir, ref: "refs/remotes/origin/HEAD" })).resolves.toEqual({
+      kind: "symbolic",
+      target: "refs/remotes/origin/alias",
+    });
+    await expect(git.readRef({ dir, ref: "refs/remotes/missing/HEAD" })).resolves.toEqual({
+      kind: "absent",
+    });
+
+    await git.checkout({ dir, ref: base });
+    await expect(git.readRef({ dir, ref: "HEAD" })).resolves.toEqual({
+      kind: "direct",
+      oid: base,
+    });
+    await expect(git.divergence({ dir, current: "HEAD", upstream: "main" })).resolves.toEqual({
+      relationship: "behind",
+      ahead: 0,
+      behind: 1,
+    });
+  });
+
+  it("selects checkout-local HEAD while sharing refs across an unequal-id cold reopen", async () => {
+    const { git, workspace } = makeNativeGit();
+    await git.init({ dir: "/primary" });
+    const oid = await commitFile(git, workspace, "/primary", "file.txt", "main\n", "main");
+    const primary = workspace.database.checkoutAt("/primary");
+    if (primary === null) throw new Error("primary checkout is missing");
+    const secondaryId = primary.id + 100;
+    workspace.database.db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (?, ?, '/secondary', ?, 0)`,
+      secondaryId,
+      primary.repoId,
+      oid,
+    );
+    expect(secondaryId).not.toBe(primary.id);
+    expect(secondaryId).not.toBe(primary.repoId);
+    await expect(git.readRef({ dir: "/primary", ref: "HEAD" })).resolves.toEqual({
+      kind: "symbolic",
+      target: "refs/heads/main",
+    });
+    await expect(git.readRef({ dir: "/secondary", ref: "HEAD" })).resolves.toEqual({
+      kind: "direct",
+      oid,
+    });
+    await expect(git.readRef({ dir: "/secondary", ref: "refs/heads/main" })).resolves.toEqual({
+      kind: "direct",
+      oid,
+    });
+
+    const cold = bindNativeGitDatabase(workspace, new SqliteGitDatabase(workspace.database.db));
+    await expect(cold.readRef({ dir: "/primary", ref: "HEAD" })).resolves.toEqual({
+      kind: "symbolic",
+      target: "refs/heads/main",
+    });
+    await expect(cold.readRef({ dir: "/secondary", ref: "HEAD" })).resolves.toEqual({
+      kind: "direct",
+      oid,
+    });
+    await expect(cold.readRef({ dir: "/secondary", ref: "refs/heads/main" })).resolves.toEqual({
+      kind: "direct",
+      oid,
     });
   });
 

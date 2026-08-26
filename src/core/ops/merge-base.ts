@@ -58,6 +58,27 @@ export interface AheadBehindResult {
   sqlStatements: number;
 }
 
+export interface DivergenceOptions {
+  current: string;
+  upstream: string;
+}
+
+export type DivergenceRelationship =
+  | "identical"
+  | "ahead"
+  | "behind"
+  | "diverged"
+  | "unrelated"
+  | "shallow";
+
+export interface DivergenceResult {
+  relationship: DivergenceRelationship;
+  /** Commits reachable only from `current`. */
+  ahead: number;
+  /** Commits reachable only from `upstream`. */
+  behind: number;
+}
+
 interface ResolvedLimits {
   maxCommits: number;
   maxRetainedBytes: number;
@@ -264,6 +285,38 @@ export function countAheadBehind(repo: Repository, input: MergeBaseInput): Ahead
     retainedBytes: state.retainedBytes,
     sqlStatements: AHEAD_BEHIND_SQL_STATEMENTS,
   };
+}
+
+/** Compare two caller-selected revisions through one bounded reachable graph. */
+export function divergence(repo: Repository, options: DivergenceOptions): DivergenceResult {
+  const currentOid = repo.peel(repo.revParse(options.current));
+  const upstreamOid = repo.peel(repo.revParse(options.upstream));
+  const state = reachableGraph(
+    repo,
+    { currentOid, incomingOid: upstreamOid },
+    AHEAD_BEHIND_SQL_STATEMENTS,
+  );
+
+  let ahead = 0;
+  let behind = 0;
+  let related = false;
+  for (const node of state.nodes.values()) {
+    if (node.sides === CURRENT) ahead++;
+    else if (node.sides === INCOMING) behind++;
+    else related = true;
+  }
+
+  for (const oid of repo.shallow()) {
+    const node = state.nodes.get(oid);
+    if (node !== undefined && node.sides !== BOTH) {
+      return { relationship: "shallow", ahead, behind };
+    }
+  }
+  if (!related) return { relationship: "unrelated", ahead, behind };
+  if (ahead === 0 && behind === 0) return { relationship: "identical", ahead, behind };
+  if (behind === 0) return { relationship: "ahead", ahead, behind };
+  if (ahead === 0) return { relationship: "behind", ahead, behind };
+  return { relationship: "diverged", ahead, behind };
 }
 
 /** Select ancestry mode and all best common ancestors without mutating repository state. */

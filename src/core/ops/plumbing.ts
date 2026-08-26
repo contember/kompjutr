@@ -41,6 +41,31 @@ export interface UpdateRefOptions {
   symbolic?: boolean;
 }
 
+export interface ReadRefOptions {
+  /** Exact `HEAD` or full `refs/...` name to read without following it. */
+  ref: string;
+}
+
+export type RawRefTarget =
+  | { kind: "symbolic"; target: string }
+  | { kind: "direct"; oid: string }
+  | { kind: "absent" };
+
+/** Read one raw ref target without resolving symrefs or checking object existence. */
+export function readRef(repo: Repository, options: ReadRefOptions): RawRefTarget {
+  const ref = options.ref;
+  if (
+    typeof ref !== "string" ||
+    (ref !== "HEAD" && (!ref.startsWith("refs/") || ref.length === "refs/".length))
+  ) {
+    throw new GitError("EINVAL", "raw ref name must be HEAD or a full refs/... name");
+  }
+  const raw = ref === "HEAD" ? repo.checkout.head() : repo.store.getRef(ref);
+  if (raw === null) return { kind: "absent" };
+  if (raw.startsWith("ref: ")) return { kind: "symbolic", target: raw.slice(5) };
+  return { kind: "direct", oid: raw };
+}
+
 /**
  * `force` gates overwriting an existing ref, which is what
  * isomorphic-git's `writeRef` does and therefore what Computer's callers

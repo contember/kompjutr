@@ -3632,14 +3632,16 @@ export class CheckoutStore {
 
   /** Raw ref value: an oid, or "ref: <name>" for a symbolic ref. */
   getRef(name: string): string | null {
-    if (name === "HEAD") return this.head();
-    return (
-      this.#db.scalar<string>(
-        "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
-        this.#repoId,
-        name,
-      ) ?? null
+    const checkedName = requireRefName(name, "ref name", "input", true);
+    if (checkedName === "HEAD") return this.head();
+    const target = this.#db.scalar<unknown>(
+      "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
+      this.#repoId,
+      checkedName,
     );
+    return target === undefined
+      ? null
+      : requireRawRefTarget(target, `stored target of ${checkedName}`, "stored");
   }
 
   setRef(name: string, target: string): void {

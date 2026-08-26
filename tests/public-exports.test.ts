@@ -2,11 +2,18 @@ import { describe, expect, it } from "vitest";
 import type {
   GitCherryPickContinueOptions,
   GitCherryPickOptions,
+  DivergenceOptions as GitCoreDivergenceOptions,
+  ReadRefOptions as GitCoreReadRefOptions,
   StatusReport as GitCoreStatusReport,
+  GitDivergenceOptions,
+  DivergenceRelationship as GitDivergenceRelationship,
+  DivergenceResult as GitDivergenceResult,
   Git as GitEntrypointGit,
   GitStatusOptions as GitEntrypointStatusOptions,
   GitStatusReport as GitEntrypointStatusReport,
   GitStatusReportOptions as GitEntrypointStatusReportOptions,
+  RawRefTarget as GitRawRefTarget,
+  GitReadRefOptions,
   GitRebaseContinueOptions,
   GitRebaseOptions,
   RebaseResult as GitRebaseResult,
@@ -20,11 +27,19 @@ import type {
   GitRevertContinueOptions,
   GitRevertOptions,
 } from "../src/git/index.js";
+import { divergence as gitDivergence, readRef as gitReadRef } from "../src/git/index.js";
 import type {
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
   GitCherryPickOptions as RootCherryPickOptions,
+  DivergenceOptions as RootCoreDivergenceOptions,
+  ReadRefOptions as RootCoreReadRefOptions,
   StatusReport as RootCoreStatusReport,
+  DivergenceRelationship as RootDivergenceRelationship,
+  DivergenceResult as RootDivergenceResult,
   Git as RootGit,
+  GitDivergenceOptions as RootGitDivergenceOptions,
+  GitReadRefOptions as RootGitReadRefOptions,
+  RawRefTarget as RootRawRefTarget,
   GitRebaseContinueOptions as RootRebaseContinueOptions,
   GitRebaseOptions as RootRebaseOptions,
   RebaseResult as RootRebaseResult,
@@ -41,6 +56,56 @@ import type {
   GitStatusReport as RootStatusReport,
   GitStatusReportOptions as RootStatusReportOptions,
 } from "../src/index.js";
+import { divergence as rootDivergence, readRef as rootReadRef } from "../src/index.js";
+
+describe("public bounded read exports", () => {
+  it("exposes matching divergence and raw-ref operations from both entrypoints", () => {
+    const coreDivergence: RootCoreDivergenceOptions = { current: "HEAD", upstream: "main" };
+    const gitCoreDivergence: GitCoreDivergenceOptions = coreDivergence;
+    const options: RootGitDivergenceOptions = { ...coreDivergence, dir: "/repo" };
+    const gitOptions: GitDivergenceOptions = options;
+    const relationship: RootDivergenceRelationship = "diverged";
+    const gitRelationship: GitDivergenceRelationship = relationship;
+    const result: RootDivergenceResult = { relationship, ahead: 3, behind: 2 };
+    const gitResult: GitDivergenceResult = result;
+
+    const coreRead: RootCoreReadRefOptions = { ref: "refs/remotes/origin/HEAD" };
+    const gitCoreRead: GitCoreReadRefOptions = coreRead;
+    const read: RootGitReadRefOptions = { ...coreRead, dir: "/repo" };
+    const gitRead: GitReadRefOptions = read;
+    const target: RootRawRefTarget = {
+      kind: "symbolic",
+      target: "refs/remotes/origin/main",
+    };
+    const gitTarget: GitRawRefTarget = target;
+
+    expect([
+      gitCoreDivergence.current,
+      gitOptions.dir,
+      gitRelationship,
+      gitResult.ahead,
+      gitCoreRead.ref,
+      gitRead.dir,
+      gitTarget.kind,
+      gitDivergence,
+      rootDivergence,
+      gitReadRef,
+      rootReadRef,
+    ]).toEqual([
+      "HEAD",
+      "/repo",
+      "diverged",
+      3,
+      "refs/remotes/origin/HEAD",
+      "/repo",
+      "symbolic",
+      gitDivergence,
+      rootDivergence,
+      gitReadRef,
+      rootReadRef,
+    ]);
+  });
+});
 
 describe("public reflog exports", () => {
   it("exposes matching listing and recovery types from both entrypoints", () => {

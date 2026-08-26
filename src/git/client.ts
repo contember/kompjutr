@@ -51,6 +51,11 @@ import {
   merge as mergeOp,
 } from "../core/ops/merge.js";
 import {
+  type DivergenceOptions,
+  type DivergenceResult,
+  divergence as divergenceOp,
+} from "../core/ops/merge-base.js";
+import {
   type CloneOptions,
   clone as cloneOp,
   type FetchOptions,
@@ -62,6 +67,9 @@ import {
   catFile as catFileOp,
   type HashObjectOptions,
   hashObject as hashObjectOp,
+  type RawRefTarget,
+  type ReadRefOptions,
+  readRef as readRefOp,
   repoRoot as repoRootOp,
   type UpdateRefOptions,
   updateRef as updateRefOp,
@@ -177,6 +185,8 @@ export type GitRemoteRemoveOptions = RemoteRemoveOptions & GitDirOptions;
 export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
 export type GitCatFileOptions = CatFileOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
+export type GitDivergenceOptions = DivergenceOptions & GitDirOptions;
+export type GitReadRefOptions = ReadRefOptions & GitDirOptions;
 export type GitRefLogOptions = RefLogReadOptions & GitDirOptions;
 export type GitRecoverRefOptions = RecoverRefOptions & GitDirOptions;
 export type GitPushOptions = PushOptions & GitDirOptions;
@@ -208,6 +218,8 @@ export interface Git {
   log(input?: GitDirOptions & { ref?: string; depth?: number }): Promise<CommitView[]>;
   show(input: GitDirOptions & { ref: string }): Promise<CommitView>;
   revParse(input: GitDirOptions & { ref: string }): Promise<string>;
+  divergence(input: GitDivergenceOptions): Promise<DivergenceResult>;
+  readRef(input: GitReadRefOptions): Promise<RawRefTarget>;
   reflog(input?: GitRefLogOptions): Promise<RefLogEntry[]>;
   recoverRef(input: GitRecoverRefOptions): Promise<void>;
   repoRoot(input?: GitDirOptions): Promise<string>;
@@ -384,6 +396,12 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async revParse(input) {
       return at(input.dir).revParse(input.ref);
+    },
+    async divergence(input) {
+      return divergenceOp(at(input.dir), input);
+    },
+    async readRef(input) {
+      return readRefOp(at(input.dir), input);
     },
     async reflog(input = {}) {
       return reflogOp(at(input.dir), input);

@@ -28,6 +28,13 @@ export type {
   StatusEntry,
   StatusRow,
 } from "./core/ops/kinds.js";
+export {
+  type DivergenceOptions,
+  type DivergenceRelationship,
+  type DivergenceResult,
+  divergence,
+} from "./core/ops/merge-base.js";
+export { type RawRefTarget, type ReadRefOptions, readRef } from "./core/ops/plumbing.js";
 export type { CommitView, TreeEntryView } from "./core/ops/reads.js";
 export {
   type RecoverRefOptions,
@@ -80,10 +87,12 @@ export {
   type Git,
   type GitCherryPickContinueOptions,
   type GitCherryPickOptions,
+  type GitDivergenceOptions,
   type GitFactory,
   type GitMergeContinueOptions,
   type GitMergeOptions,
   type GitPullOptions,
+  type GitReadRefOptions,
   type GitRebaseContinueOptions,
   type GitRebaseOptions,
   type GitRecoverRefOptions,

@@ -14,7 +14,15 @@ import {
 } from "../src/core/ops/config.js";
 import { initRepository } from "../src/core/ops/init.js";
 import type { RemoteView } from "../src/core/ops/kinds.js";
-import { catFile, hashObject, repoRoot, symbolicRef, updateRef } from "../src/core/ops/plumbing.js";
+import {
+  catFile,
+  hashObject,
+  type RawRefTarget,
+  readRef,
+  repoRoot,
+  symbolicRef,
+  updateRef,
+} from "../src/core/ops/plumbing.js";
 import {
   branch,
   branchDelete,
@@ -139,6 +147,13 @@ function stderrOf(error: unknown): string {
     if (typeof stderr === "string") return stderr;
   }
   return String(error);
+}
+
+function gitRawRefTarget(ref: string): RawRefTarget {
+  const symbolic = runGit("symbolic-ref", "--no-recurse", "-q", ref);
+  if (symbolic.ok) return { kind: "symbolic", target: symbolic.output };
+  const oid = fixture.git("for-each-ref", "--format=%(objectname)", ref);
+  return oid === "" ? { kind: "absent" } : { kind: "direct", oid };
 }
 
 function parseRemotes(output: string): RemoteView[] {
@@ -1026,6 +1041,118 @@ describe("plumbing", () => {
     });
     fixture.git("symbolic-ref", "HEAD", "refs/heads/side");
     expect(symbolicRef(ws.repo)).toBe(fixture.git("symbolic-ref", "HEAD"));
+  });
+
+  it("reads direct, absent, dangling, and chained refs like real Git without following", () => {
+    const mainOid = fixture.git("rev-parse", "main");
+    fixture.git("update-ref", "refs/remotes/origin/main", mainOid);
+    fixture.git("symbolic-ref", "refs/remotes/origin/alias", "refs/remotes/origin/main");
+    fixture.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/alias");
+    fixture.git("symbolic-ref", "refs/remotes/missing/HEAD", "refs/remotes/missing/main");
+
+    ws.repo.store.setRef("refs/remotes/origin/main", mainOid);
+    ws.repo.store.setRef("refs/remotes/origin/alias", "ref: refs/remotes/origin/main");
+    ws.repo.store.setRef("refs/remotes/origin/HEAD", "ref: refs/remotes/origin/alias");
+    ws.repo.store.setRef("refs/remotes/missing/HEAD", "ref: refs/remotes/missing/main");
+
+    for (const ref of [
+      "refs/remotes/origin/main",
+      "refs/remotes/origin/alias",
+      "refs/remotes/origin/HEAD",
+      "refs/remotes/absent/HEAD",
+    ]) {
+      expect(readRef(ws.repo, { ref })).toEqual(gitRawRefTarget(ref));
+    }
+    expect(fixture.git("for-each-ref", "--format=%(symref)", "refs/remotes/origin/HEAD")).toBe(
+      "refs/remotes/origin/main",
+    );
+    expect(readRef(ws.repo, { ref: "refs/remotes/origin/HEAD" })).toEqual({
+      kind: "symbolic",
+      target: "refs/remotes/origin/alias",
+    });
+    expect(readRef(ws.repo, { ref: "refs/remotes/missing/HEAD" })).toEqual({
+      kind: "symbolic",
+      target: fixture.git("symbolic-ref", "--no-recurse", "refs/remotes/missing/HEAD"),
+    });
+
+    const missingOid = "f".repeat(40);
+    expect(ws.repo.has(missingOid)).toBe(false);
+    ws.repo.store.setRef("refs/remotes/origin/missing-object", missingOid);
+    expect(readRef(ws.repo, { ref: "refs/remotes/origin/missing-object" })).toEqual({
+      kind: "direct",
+      oid: missingOid,
+    });
+  });
+
+  it("reads symbolic, detached, unborn, and chained HEAD without resolving it", () => {
+    expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({
+      kind: "symbolic",
+      target: fixture.git("symbolic-ref", "--no-recurse", "HEAD"),
+    });
+
+    const mainOid = fixture.git("rev-parse", "main");
+    fixture.git("checkout", "-q", "--detach", mainOid);
+    ws.repo.checkout.setHead(mainOid);
+    expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({
+      kind: "direct",
+      oid: fixture.git("rev-parse", "HEAD"),
+    });
+
+    fixture.git("symbolic-ref", "HEAD", "refs/heads/unborn");
+    ws.repo.checkout.setHead("ref: refs/heads/unborn");
+    expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({
+      kind: "symbolic",
+      target: fixture.git("symbolic-ref", "--no-recurse", "HEAD"),
+    });
+
+    fixture.git("symbolic-ref", "refs/heads/alias", "refs/heads/main");
+    fixture.git("symbolic-ref", "HEAD", "refs/heads/alias");
+    ws.repo.store.setRef("refs/heads/alias", "ref: refs/heads/main");
+    ws.repo.checkout.setHead("ref: refs/heads/alias");
+    expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({
+      kind: "symbolic",
+      target: fixture.git("symbolic-ref", "--no-recurse", "HEAD"),
+    });
+  });
+
+  it("bounds raw ref inputs and fails closed on malformed stored targets", () => {
+    const exactBound = `refs/${"a".repeat(1_019)}`;
+    expect(readRef(ws.repo, { ref: exactBound })).toEqual({ kind: "absent" });
+    expect(() => readRef(ws.repo, { ref: `${exactBound}a` })).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    for (const ref of ["main", "refs/", "HEAD^", "refs/heads/main\nother"]) {
+      expect(() => readRef(ws.repo, { ref })).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    }
+
+    const corruptRef = "refs/remotes/origin/corrupt";
+    ws.repo.store.setRef(corruptRef, fixture.git("rev-parse", "main"));
+    ws.database.db.run(
+      "UPDATE git_refs SET target = 'malformed' WHERE repo_id = ? AND name = ?",
+      ws.repo.store.repoId,
+      corruptRef,
+    );
+    expect(() => readRef(ws.repo, { ref: corruptRef })).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(() => ws.repo.resolveRef(corruptRef)).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+
+    ws.database.db.run("PRAGMA ignore_check_constraints = ON");
+    try {
+      ws.database.db.run(
+        "UPDATE git_checkouts SET head = 'malformed' WHERE id = ?",
+        ws.repo.checkout.checkoutId,
+      );
+    } finally {
+      ws.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    }
+    expect(ws.database.db.scalar<unknown>("PRAGMA ignore_check_constraints")).toBe(0);
+    expect(() => readRef(ws.repo, { ref: "HEAD" })).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(() => ws.repo.head()).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("finds the repository root and refuses outside one", () => {

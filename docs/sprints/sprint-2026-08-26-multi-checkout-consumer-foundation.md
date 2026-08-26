@@ -344,3 +344,8 @@ schema/mutation review before the next dependent phase. Do not overlap writers i
   cross-view shallow coherence. A blocked real-Git rebase exposed the fixture's
   missing deterministic editors; pinning both editors closed that harness gap.
   All 106 test files passed (1,879 pass, 5 skip); typecheck and check passed.
+- 2026-08-26 — WU6 exposed one bounded divergence traversal and an exact raw-ref
+  read that preserves immediate symbolic targets without object lookup. Real-Git
+  parity covered multiple merge bases, shallow counts, chained and dangling refs,
+  detached and unborn `HEAD`, and cold checkout selection. The focused 76 tests,
+  the executable 50,001-commit rejection, typecheck, and check passed.
