@@ -60,7 +60,37 @@ not effort: a wrong answer outranks a missing one.
   now [40](40-linked-worktrees.md), [44](44-patch-interchange.md) and
   [42](42-remote-ref-discovery-and-refspec-fetch.md).
 
-## Recommended implementation order
+## Shell correctness and query shape
+
+`kompjutr/shell` deliberately supports a bounded Bash-shaped subset. General
+Bash features remain out of scope without a concrete workload; the items below
+cover inputs the current surface already accepts or query shapes it already
+claims to bound.
+
+- **Silent correctness divergences:**
+  [54](54-shell-and-or-lists.md),
+  [55](55-stage-local-shell-redirections.md),
+  [56](56-fail-closed-shell-path-expansion.md), and
+  [60](60-truthful-shell-command-surface.md). These return a plausible wrong
+  result or let an expected command error escape `RunResult`, so take them
+  before adding commands or flags.
+- **Missing set-based filesystem shapes:**
+  [49](49-set-based-copy.md),
+  [58](58-metadata-only-bulk-touch.md), and
+  [59](59-set-based-shell-listing.md). They replace whole-tree retention,
+  content rewrites, or per-row queries in existing commands.
+- **Whole-pipeline safety boundary:**
+  [57](57-bound-shell-retained-memory.md), after 49 and 56 remove their known
+  materialization paths.
+
+Recommended shell order: land 54 first because it is small and independent;
+design 55's stage stream contract; close 56 before expanding path-oriented
+commands; take 49, 58, and 59 independently; then finish 57 across every
+remaining materializing stage. Execute 60 as small command-scoped corrections
+behind one differential parity harness, not as one cross-module rewrite. Split
+57 into retained-memory work units before scheduling it.
+
+## Recommended Git implementation order
 
 This is the default priority at the current HEAD, not scheduling state. Items in
 the same phase may run in parallel, but a blocked item must not move ahead of its
@@ -91,9 +121,9 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
    [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
    [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
-   [47](47-divergence-against-arbitrary-ref.md),
-   [48](48-read-symbolic-ref-target.md) and [49](49-set-based-copy.md) are small
-   and independent; take them here whenever a consumer needs them. Land 47 before
+   [47](47-divergence-against-arbitrary-ref.md) and
+   [48](48-read-symbolic-ref-target.md) are small and independent; take them here
+   whenever a consumer needs them. Land 47 before
    [39](39-plumbing-read-surface.md), which may later subsume it.
 5. **Broaden management and diagnostic surfaces:**
    [18](18-branch-and-remote-management.md),
@@ -156,3 +186,10 @@ focused sprint.
 - [51 — Relocate every distinct-type merge conflict, not only file/directory](51-relocate-distinct-type-conflicts.md)
 - [52 — Match Git's default ref coverage on fetch and pull](52-default-ref-coverage-on-fetch-and-pull.md)
 - [53 — Record the narrowings the Git support reference does not state](53-record-undocumented-narrowings.md)
+- [54 — Execute shell AND-OR lists correctly](54-shell-and-or-lists.md)
+- [55 — Make shell redirections stage-local](55-stage-local-shell-redirections.md)
+- [56 — Fail closed on shell path-expansion limits](56-fail-closed-shell-path-expansion.md)
+- [57 — Bound retained memory across shell pipelines](57-bound-shell-retained-memory.md)
+- [58 — Add metadata-only bulk timestamp updates](58-metadata-only-bulk-touch.md)
+- [59 — Make long and recursive shell listings set-based](59-set-based-shell-listing.md)
+- [60 — Eliminate silently accepted shell command divergences](60-truthful-shell-command-surface.md)
