@@ -15,14 +15,16 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-26-multi-checkout-consumer-foundation.md`](sprints/sprint-2026-08-26-multi-checkout-consumer-foundation.md)
+  — one shared SQLite Git store, isolated session checkouts, and bounded
+  divergence/raw-ref reads required by Roj.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Reflog recovery is shipped. Merged-branch deletion checks and bounded garbage
-  collection are now unblocked follow-ups.
+- Multi-checkout consumer admission is active: split store/checkout identity,
+  add linked-worktree lifecycle, and prove the Roj-facing read contract.
 
 ## Key reference
 
