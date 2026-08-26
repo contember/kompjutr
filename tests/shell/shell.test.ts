@@ -4,8 +4,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
-import { createShell, type Command, type Shell } from "../../src/shell/index.js";
 import { encode } from "../../src/shell/exec/bytes.js";
+import { type Command, createShell, type Shell } from "../../src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 
@@ -47,6 +47,17 @@ describe("reading", () => {
 
   it("counts", () => {
     expect(shell.run("wc -l docs/guide.md").stdout).toBe("5\n");
+    fs.writeFiles([file("/repo/unicode.txt", "é x\n")]);
+    expect(shell.run("wc -m unicode.txt").stdout.trim()).toBe("4");
+    expect(shell.run("wc -cm unicode.txt").stdout.trim().split(/\s+/)).toEqual(["4", "5"]);
+  });
+
+  it("heads each file independently and controls headings", () => {
+    expect(shell.run("head -1 README.md docs/guide.md").stdout).toBe(
+      "==> README.md <==\n# Project\n\n==> docs/guide.md <==\nline1\n",
+    );
+    expect(shell.run("head -q -1 README.md docs/guide.md").stdout).toBe("# Project\nline1\n");
+    expect(shell.run("head -v -1 README.md").stdout).toBe("==> README.md <==\n# Project\n");
   });
 
   it("reports a missing file without crashing", () => {
@@ -130,6 +141,11 @@ describe("grep", () => {
     expect(shell.run("grep -cE 'line1|line2' docs/guide.md").stdout).toBe("2\n");
   });
 
+  it("ORs repeated grep patterns in files and stdin", () => {
+    expect(shell.run("grep -e line1 -e line3 docs/guide.md").stdout).toBe("line1\nline3\n");
+    expect(shell.run("cat docs/guide.md | grep -e line2 -e line4").stdout).toBe("line2\nline4\n");
+  });
+
   it("names a pattern construct it will not fake", () => {
     const run = shell.run("grep -E '(?=x)' README.md");
     expect(run.exitCode).toBe(2);
@@ -167,6 +183,11 @@ describe("rg is its own surface", () => {
     expect(shell.run("rg -c 'line1|line2' docs/guide.md").stdout).toBe("2\n");
   });
 
+  it("ORs repeated rg patterns in files and stdin", () => {
+    expect(shell.run("rg -e line1 -e line3 docs/guide.md").stdout).toBe("line1\nline3\n");
+    expect(shell.run("cat docs/guide.md | rg -e line2 -e line4").stdout).toBe("line2\nline4\n");
+  });
+
   it("searches the working directory when given no path", () => {
     expect(shell.run("rg -l TODO").exitCode).toBe(0);
   });
@@ -193,6 +214,11 @@ describe("pipelines", () => {
 
   it("sorts and uniques", () => {
     expect(shell.run("ls src | sort -r").stdout.split("\n")[0]).toBe("nested");
+  });
+
+  it("sorts text by UTF-8 bytes instead of UTF-16 code units", () => {
+    fs.writeFiles([file("/repo/order.txt", "𐀀\n\n")]);
+    expect(shell.run("sort order.txt").stdout).toBe("\n𐀀\n");
   });
 });
 
@@ -332,5 +358,41 @@ describe("rejections", () => {
     const run = shell.run("bun run build");
     expect(run.exitCode).toBe(127);
     expect(run.stderr).toContain("command not found");
+  });
+
+  it.each([
+    "ls -h",
+    "ls -t",
+    "ls -r",
+    "ls -S",
+    "cp -p README.md copy.md",
+    "cp -v README.md copy.md",
+    "rm -v README.md",
+    "mkdir -v made",
+    "mkdir -m 700 made",
+    "xargs -t echo",
+  ])("rejects a previously ignored flag: %s", (source) => {
+    expect(shell.run(source)).toMatchObject({ exitCode: 2, stdout: "" });
+  });
+
+  it.each(["wc --unknown", "sort --unknown", "uniq --unknown"])(
+    "returns usage errors instead of throwing: %s",
+    (source) => {
+      expect(shell.run(source)).toMatchObject({ exitCode: 2, stdout: "" });
+    },
+  );
+
+  it("returns expected lazy filesystem failures", () => {
+    const run = shell.run("uniq src");
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("EISDIR");
+  });
+
+  it("does not hide arbitrary injected-command exceptions", () => {
+    const broken: Command = () => {
+      throw new Error("injected defect");
+    };
+    const injected = createShell({ fs, cwd: "/repo", commands: new Map([["broken", broken]]) });
+    expect(() => injected.run("broken")).toThrow("injected defect");
   });
 });

@@ -162,6 +162,10 @@ describe.skipIf(!REAL_RG)("rg matches ripgrep", () => {
     it("-e", () => {
       agree(compare("-e", "NEEDLE", "{root}/a.ts"));
     });
+
+    it("ORs repeated -e patterns", () => {
+      agree(compare("-e", "NEEDLE", "-e", "plain", "{root}/a.ts"));
+    });
   });
 
   describe("context lines", () => {

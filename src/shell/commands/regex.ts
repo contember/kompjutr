@@ -68,6 +68,15 @@ export function compilePattern(pattern: string, options: PatternOptions): RegExp
   }
 }
 
+/** Compile repeated `-e` occurrences as one OR expression. */
+export function compilePatternSet(patterns: readonly string[], options: PatternOptions): RegExp {
+  const compiled = patterns.map((pattern) => compilePattern(pattern, options));
+  const first = compiled[0];
+  if (first === undefined) throw new PatternError("pattern", "at least one pattern is required");
+  if (compiled.length === 1) return first;
+  return new RegExp(compiled.map((pattern) => `(?:${pattern.source})`).join("|"), first.flags);
+}
+
 function escapeLiteral(value: string): string {
   return value.replace(/[\\^$.|?*+()[\]{}]/g, (match) => `\\${match}`);
 }

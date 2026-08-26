@@ -5,7 +5,7 @@
 // a script parser here is how a shell turns into a bash port, so anything
 // else is a named error pointing at the container. See §2 of the plan.
 
-import { normalize } from "../../fs/path.js";
+import { comparePaths, normalize } from "../../fs/path.js";
 import { type ByteStream, decode, encode, lines, terminated } from "../exec/bytes.js";
 import { type Command, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
@@ -91,7 +91,7 @@ export const sort: Command = (context) => {
     }
     const a = fold ? left.toLowerCase() : left;
     const b = fold ? right.toLowerCase() : right;
-    return a < b ? -1 : a > b ? 1 : 0;
+    return comparePaths(a, b);
   });
   if (reverse) collected.reverse();
 

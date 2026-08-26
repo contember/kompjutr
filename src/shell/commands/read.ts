@@ -62,6 +62,7 @@ export const head: Command = (context) => {
     });
     let wanted = shorthand ?? 10;
     let unit: "lines" | "bytes" = "lines";
+    let headings: "auto" | "always" | "never" = "auto";
     for (const flag of parsed.flags) {
       if (flag.name === "-n" || flag.name === "--lines") {
         wanted = count(flag.value ?? "", "-n");
@@ -69,28 +70,67 @@ export const head: Command = (context) => {
       } else if (flag.name === "-c" || flag.name === "--bytes") {
         wanted = count(flag.value ?? "", "-c");
         unit = "bytes";
+      } else if (flag.name === "-q") {
+        headings = "never";
+      } else if (flag.name === "-v") {
+        headings = "always";
       }
     }
     const operands = parsed.operands;
 
-    // One file, bounded by lines: read a probe from the front and extend
-    // only if it held too few newlines. Reading a 40 MB file to keep its
-    // first twenty lines is the thing this shell exists not to do.
-    if (operands.length === 1 && unit === "lines") {
-      const path = resolve(context.cwd, operands[0] ?? "");
-      const stat = context.fs.stat(path);
-      if (stat === null) return fail(context, `${path}: No such file or directory`);
-      return result(headOfFile(context, path, stat.size, wanted));
+    if (operands.length > 0) {
+      let status = 0;
+      const stdout = headFiles(context, operands, wanted, unit, headings, () => {
+        status = 1;
+      });
+      return { stdout, status: () => status };
     }
 
-    const source = operands.length === 0 ? context.stdin : fileStream(context, operands);
+    const source = context.stdin;
     if (source === null) return result(empty());
-    return result(unit === "bytes" ? takeBytes(source, wanted) : takeLines(source, wanted));
+    const selected = unit === "bytes" ? takeBytes(source, wanted) : takeLines(source, wanted);
+    return result(headings === "always" ? headed("standard input", selected) : selected);
   } catch (error) {
     if (error instanceof UsageError) return fail(context, error.message, 2);
     throw error;
   }
 };
+
+function* headFiles(
+  context: CommandContext,
+  operands: readonly string[],
+  wanted: number,
+  unit: "lines" | "bytes",
+  headings: "auto" | "always" | "never",
+  failed: () => void,
+): ByteStream {
+  const showHeadings = headings === "always" || (headings === "auto" && operands.length > 1);
+  let emittedSection = false;
+  for (const operand of operands) {
+    const path = resolve(context.cwd, operand);
+    const stat = context.fs.stat(path);
+    if (stat === null) {
+      context.warn(`${operand}: No such file or directory`);
+      failed();
+      continue;
+    }
+    if (showHeadings) {
+      if (emittedSection) yield encode("\n");
+      yield encode(`==> ${operand} <==\n`);
+      emittedSection = true;
+    }
+    if (unit === "lines") {
+      yield* headOfFile(context, path, stat.size, wanted);
+    } else if (wanted > 0) {
+      yield context.fs.readRange(path, 0, Math.min(stat.size, wanted));
+    }
+  }
+}
+
+function* headed(name: string, source: ByteStream): ByteStream {
+  yield encode(`==> ${name} <==\n`);
+  yield* source;
+}
 
 export const tail: Command = (context) => {
   try {
@@ -137,11 +177,10 @@ export const tail: Command = (context) => {
 
 export const wc: Command = (context) => {
   const parsed = parseFlags(context.argv, {
-    boolean: new Set(["-l", "-c", "-w", "-m", "--lines", "--bytes", "--words"]),
+    boolean: new Set(["-l", "-c", "-w", "-m", "--lines", "--bytes", "--words", "--chars"]),
     valued: new Set(),
   });
   const wants = new Set(parsed.flags.map((flag) => flag.name));
-  const only = wants.size === 1 ? [...wants][0] : null;
 
   const source =
     parsed.operands.length === 0 ? context.stdin : fileStream(context, parsed.operands);
@@ -150,9 +189,12 @@ export const wc: Command = (context) => {
   let lineCount = 0;
   let wordCount = 0;
   let byteCount = 0;
+  let characterCount = 0;
   let inWord = false;
+  const decoder = new TextDecoder();
   for (const chunk of source) {
     byteCount += chunk.length;
+    for (const _character of decoder.decode(chunk, { stream: true })) characterCount++;
     for (let index = 0; index < chunk.length; index++) {
       const byte = chunk[index];
       if (byte === NEWLINE) lineCount++;
@@ -166,11 +208,15 @@ export const wc: Command = (context) => {
       }
     }
   }
+  for (const _character of decoder.decode()) characterCount++;
 
-  if (only === "-l" || only === "--lines") return result(one(encode(`${lineCount}\n`)));
-  if (only === "-c" || only === "--bytes") return result(one(encode(`${byteCount}\n`)));
-  if (only === "-w" || only === "--words") return result(one(encode(`${wordCount}\n`)));
-  return result(one(encode(`${lineCount} ${wordCount} ${byteCount}\n`)));
+  const requested = parsed.flags.length > 0;
+  const counts: number[] = [];
+  if (!requested || wants.has("-l") || wants.has("--lines")) counts.push(lineCount);
+  if (!requested || wants.has("-w") || wants.has("--words")) counts.push(wordCount);
+  if (wants.has("-m") || wants.has("--chars")) counts.push(characterCount);
+  if (!requested || wants.has("-c") || wants.has("--bytes")) counts.push(byteCount);
+  return result(one(encode(`${counts.join(" ")}\n`)));
 };
 
 /** Pull `-N` out of an argv, leaving the rest for the flag parser. */

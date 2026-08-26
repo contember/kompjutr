@@ -17,7 +17,7 @@ import { encode } from "../exec/bytes.js";
 import { type Command, fail } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, parseFlags, UsageError } from "./flags.js";
-import { compilePattern, literalNeedle, PatternError } from "./regex.js";
+import { compilePatternSet, literalNeedle, PatternError } from "./regex.js";
 import { type SearchRequest, search } from "./search.js";
 import { searchStream } from "./search-stream.js";
 
@@ -88,7 +88,7 @@ export const rg: Command = (context) => {
     let after = 0;
     const include: string[] = [];
     const exclude: string[] = [];
-    let pattern: string | null = null;
+    const patterns: string[] = [];
 
     for (const flag of parsed.flags) {
       switch (flag.name) {
@@ -162,7 +162,7 @@ export const rg: Command = (context) => {
         }
         case "-e":
         case "--regexp":
-          pattern = flag.value;
+          if (flag.value !== null) patterns.push(flag.value);
           break;
         case "-g":
         case "--glob": {
@@ -185,18 +185,19 @@ export const rg: Command = (context) => {
     }
 
     let operands = parsed.operands;
-    if (pattern === null) {
+    if (patterns.length === 0) {
       const [first, ...rest] = operands;
       if (first === undefined) throw new UsageError("usage: rg [OPTIONS] PATTERN [PATH...]");
-      pattern = first;
+      patterns.push(first);
       operands = rest;
     }
 
     // Smart case: insensitive unless the pattern carries an uppercase letter.
     const ignoreCase =
-      caseMode === "insensitive" || (caseMode === "smart" && !/[A-Z]/.test(pattern));
+      caseMode === "insensitive" ||
+      (caseMode === "smart" && !patterns.some((pattern) => /[A-Z]/.test(pattern)));
 
-    const compiled = compilePattern(pattern, {
+    const compiled = compilePatternSet(patterns, {
       dialect: fixed ? "fixed" : "ere",
       ignoreCase,
       wholeWord,
@@ -205,7 +206,11 @@ export const rg: Command = (context) => {
     // The SQL content predicate only answers a case-sensitive, positive
     // substring search: `instr` has no case folding and cannot prove the
     // absence an inverted search asks about.
-    const needle = ignoreCase || invert ? null : literalNeedle(pattern, fixed ? "fixed" : "ere");
+    const onlyPattern = patterns.length === 1 ? patterns[0] : undefined;
+    const needle =
+      ignoreCase || invert || onlyPattern === undefined
+        ? null
+        : literalNeedle(onlyPattern, fixed ? "fixed" : "ere");
     const literal = needle === null ? null : new TextEncoder().encode(needle);
     const shared = { invert, mode, lineNumbers, before, after };
 

@@ -18,7 +18,7 @@ function* nothing(): ByteStream {
 export const cp: Command = (context) => {
   try {
     const parsed = parseFlags(context.argv, {
-      boolean: new Set(["-r", "-R", "-f", "-p", "--recursive", "-v"]),
+      boolean: new Set(["-r", "-R", "--recursive"]),
       valued: new Set(),
     });
     const recursive = parsed.flags.some(
@@ -136,7 +136,7 @@ export const mv: Command = (context) => {
 export const rm: Command = (context) => {
   try {
     const parsed = parseFlags(context.argv, {
-      boolean: new Set(["-r", "-R", "-f", "-v", "--recursive", "--force"]),
+      boolean: new Set(["-r", "-R", "-f", "--recursive", "--force"]),
       valued: new Set(),
     });
     const flags = new Set(parsed.flags.map((flag) => flag.name));
@@ -173,8 +173,8 @@ export const rm: Command = (context) => {
 export const mkdir: Command = (context) => {
   try {
     const parsed = parseFlags(context.argv, {
-      boolean: new Set(["-p", "-v", "--parents"]),
-      valued: new Set(["-m", "--mode"]),
+      boolean: new Set(["-p", "--parents"]),
+      valued: new Set(),
     });
     const parents = parsed.flags.some((flag) => flag.name === "-p" || flag.name === "--parents");
     if (parsed.operands.length === 0) return fail(context, "missing operand", 2);

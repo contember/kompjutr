@@ -161,6 +161,10 @@ describe.skipIf(!REAL_GREP)("grep matches GNU grep", () => {
     it("-e", () => {
       agree(compare("-e", "NEEDLE", "{root}/a.ts"));
     });
+
+    it("ORs repeated -e patterns", () => {
+      agree(compare("-e", "NEEDLE", "-e", "plain", "{root}/a.ts"));
+    });
   });
 
   describe("context lines", () => {

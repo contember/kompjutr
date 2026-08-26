@@ -14,7 +14,7 @@ import { count, parseFlags, UsageError } from "./flags.js";
 export const ls: Command = (context) => {
   try {
     const parsed = parseFlags(context.argv, {
-      boolean: new Set(["-l", "-a", "-A", "-1", "-R", "-d", "-h", "-t", "-r", "-S"]),
+      boolean: new Set(["-l", "-a", "-A", "-1", "-R", "-d"]),
       valued: new Set(),
     });
     const flags = new Set(parsed.flags.map((flag) => flag.name));

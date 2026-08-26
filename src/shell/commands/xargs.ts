@@ -55,9 +55,6 @@ export const xargs: Command = (context) => {
         case "--no-run-if-empty":
           skipWhenEmpty = true;
           break;
-        case "-t":
-        case "--verbose":
-          break; // Nothing to echo the command to that is not stdout.
         default:
           throw new UsageError(`unrecognized option '${flag.name}'`);
       }
@@ -129,7 +126,7 @@ function runGroups(
 }
 
 const VALUED = new Set(["-n", "-I", "-d", "--max-args", "--replace", "--delimiter"]);
-const BOOLEAN = new Set(["-0", "-r", "-t", "--null", "--no-run-if-empty", "--verbose"]);
+const BOOLEAN = new Set(["-0", "-r", "--null", "--no-run-if-empty"]);
 
 /** xargs's own flags, up to the command name. Everything after is the command's. */
 function leadingFlags(argv: readonly string[]): {
