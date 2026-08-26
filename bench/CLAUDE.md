@@ -7,12 +7,14 @@ inside a cgroup with a hard memory limit, and writes to `bench/results/`.
 npm run bench          # every scenario
 npm run bench:macro    # macro-packed, macro-loose
 npm run bench:nextjs   # the Next.js workflow
+npm run bench:clone-storage  # SQLite bytes a clone costs, and where they go
 npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
 ```
 
 Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
 reference experiment against real repositories; `shell` measures the command
-surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push.
+surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push;
+`clone-storage.ts` sizes the database a clone leaves behind, against real git.
 Fixtures are `express`, `tailwind`, `vue`, `eslint`, `prettier`, `nextjs`
 (218 → 24,252 files). `bench/results/` and `bench/.fixtures/` are gitignored.
 
@@ -44,6 +46,9 @@ legacy comparisons are under `docs/archive/benchmarks/`.
    signal, not proof that the production 128 MB isolate limit is satisfied.
 8. The Next.js push phase must create a fresh remote branch. Setup and teardown
    delete `bench-work`, so a no-op push cannot masquerade as a measurement.
+9. The Smart HTTP origin is an `http` server in the benchmark process. A child
+   spawned with `execFileSync` — real `git`, for a baseline — blocks the event
+   loop and deadlocks against it. Spawn asynchronously and await the exit.
 
 Benchmark numbers taken on a loaded machine are noise. Reserve CPU before a run
 and say in the write-up how it was reserved.
