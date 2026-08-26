@@ -10,7 +10,11 @@ import { openRepository } from "../src/core/context.js";
 import { GitError } from "../src/core/errors.js";
 import { clone, fetchInto, remoteUrlFor } from "../src/core/ops/network.js";
 import { log, lsTree } from "../src/core/ops/reads.js";
-import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
+import {
+  fetchHttpClient,
+  type GitHttpClient,
+  type GitHttpRequest,
+} from "../src/core/protocol/transport.js";
 import type { Repository } from "../src/core/repository.js";
 import { gitModeFor, type Worktree } from "../src/core/worktree.js";
 import { GitFixture } from "./helpers/git.js";
@@ -24,6 +28,8 @@ interface Entry {
 
 const REFLOG_ACTOR = { name: "Network Actor", email: "network@example.com" };
 const REFLOG_TIME = 1_700_000_000_000;
+const packetDecoder = new TextDecoder();
+const packetEncoder = new TextEncoder();
 
 /** Every file under a real directory, keyed by relative path, `.git` aside. */
 function nativeTree(root: string, prefix = ""): Map<string, Entry> {
@@ -129,6 +135,100 @@ function createRemoteBranches(fixture: GitFixture, from: number, to: number, oid
     encoding: "utf8",
   });
   if (result.status !== 0) throw new Error(result.stderr || "git update-ref failed");
+}
+
+function rewriteFirstUploadLine(
+  request: GitHttpRequest,
+  rewrite: (line: string) => string,
+): GitHttpRequest {
+  if (request.method !== "POST" || !(request.body instanceof Uint8Array)) return request;
+  const frameLength = Number.parseInt(packetDecoder.decode(request.body.subarray(0, 4)), 16);
+  if (!Number.isSafeInteger(frameLength) || frameLength < 4 || frameLength > request.body.length) {
+    throw new Error("invalid upload-pack request frame");
+  }
+  const line = packetDecoder.decode(request.body.subarray(4, frameLength));
+  const rewritten = rewrite(line);
+  if (rewritten === line) return request;
+  const payload = packetEncoder.encode(rewritten);
+  const header = packetEncoder.encode((payload.length + 4).toString(16).padStart(4, "0"));
+  const body = new Uint8Array(header.length + payload.length + request.body.length - frameLength);
+  body.set(header);
+  body.set(payload, header.length);
+  body.set(request.body.subarray(frameLength), header.length + payload.length);
+  return { ...request, body };
+}
+
+function withoutIncludeTag(request: GitHttpRequest): GitHttpRequest {
+  return rewriteFirstUploadLine(request, (line) => line.replace(" include-tag", ""));
+}
+
+async function* replaceResponseText(
+  body: AsyncIterable<Uint8Array>,
+  search: string,
+  replacement: string,
+): AsyncGenerator<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  for await (const chunk of body) {
+    chunks.push(chunk);
+    bytes += chunk.length;
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  const text = packetDecoder.decode(joined);
+  if (!text.includes(search)) throw new Error("advertised tag target was not found");
+  yield packetEncoder.encode(text.replace(search, replacement));
+}
+
+async function* removeResponsePacket(
+  body: AsyncIterable<Uint8Array>,
+  marker: string,
+): AsyncGenerator<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  for await (const chunk of body) {
+    chunks.push(chunk);
+    bytes += chunk.length;
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  const text = packetDecoder.decode(joined);
+  const markerOffset = text.indexOf(marker);
+  if (markerOffset < 4) throw new Error("advertised tag packet was not found");
+  const frameOffset = markerOffset - 4;
+  const frameLength = Number.parseInt(text.slice(frameOffset, markerOffset), 16);
+  if (!Number.isSafeInteger(frameLength) || frameLength < 4) {
+    throw new Error("advertised tag packet was malformed");
+  }
+  yield packetEncoder.encode(text.slice(0, frameOffset) + text.slice(frameOffset + frameLength));
+}
+
+function createRemoteAnnotatedTags(fixture: GitFixture, count: number, oid: string): void {
+  let input = "";
+  for (let index = 0; index < count; index++) {
+    const name = `bulk-${String(index).padStart(5, "0")}`;
+    input += `tag ${name}\nfrom ${oid}\ntagger Fixture <fixture@example.com> 1 +0000\ndata ${name.length}\n${name}\n`;
+  }
+  const result = spawnSync("git", ["fast-import", "--quiet"], {
+    cwd: fixture.dir,
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      LC_ALL: "C",
+    },
+    input,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error(result.stderr || "git fast-import failed");
 }
 
 function tableRows<Row extends object>(workspace: TestWorkspace, query: string): Row[] {
@@ -706,6 +806,285 @@ describe("fetch", () => {
     }
   });
 
+  it("auto-follows reachable tags and reserves tags: true for complete coverage", async () => {
+    const { fixture } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.write("release.txt", "release\n");
+      const release = fixture.commit("release");
+      fixture.git("tag", "v1-light");
+      fixture.git("tag", "-a", "v1-annotated", "-m", "release");
+      const detached = fixture.git(
+        "commit-tree",
+        fixture.git("rev-parse", "HEAD^{tree}"),
+        "-m",
+        "detached",
+      );
+      fixture.git("tag", "detached", detached);
+
+      const fetched = await fetchInto(workspace.context, repo, {});
+
+      expect(fetched.fetchHead).toBe(release);
+      expect(repo.store.getRef("refs/tags/v1-light")).toBe(release);
+      const annotated = repo.store.getRef("refs/tags/v1-annotated");
+      if (annotated === null) throw new Error("annotated tag was not fetched");
+      expect(repo.peel(annotated)).toBe(release);
+      expect(repo.store.getRef("refs/tags/detached")).toBeNull();
+
+      await fetchInto(workspace.context, repo, { tags: true });
+      expect(repo.store.getRef("refs/tags/detached")).toBe(detached);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("completes an annotated auto-tag when the server omits include-tag", async () => {
+    const { fixture } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let posts = 0;
+    const http: GitHttpClient = (request) => {
+      if (request.method === "POST") posts++;
+      return fetchHttpClient(withoutIncludeTag(request));
+    };
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.write("release.txt", "release\n");
+      const release = fixture.commit("release");
+      fixture.git("tag", "-a", "v2", "-m", "release");
+      posts = 0;
+
+      await fetchInto({ ...workspace.context, http }, repo, {});
+
+      const tag = repo.store.getRef("refs/tags/v2");
+      if (tag === null) throw new Error("annotated tag was not fetched");
+      expect(repo.peel(tag)).toBe(release);
+      expect(posts).toBe(2);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("does not publish refs when the annotated-tag fallback stays incomplete", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let posts = 0;
+    let tagOid = "";
+    let release = "";
+    const http: GitHttpClient = (request) => {
+      if (request.method !== "POST") return fetchHttpClient(request);
+      posts++;
+      const withoutTag = withoutIncludeTag(request);
+      const forwarded =
+        posts === 2
+          ? rewriteFirstUploadLine(withoutTag, (line) =>
+              line.replace(`want ${tagOid}`, `want ${release}`),
+            )
+          : withoutTag;
+      return fetchHttpClient(forwarded);
+    };
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.write("release.txt", "release\n");
+      release = fixture.commit("release");
+      fixture.git("tag", "-a", "v2", "-m", "release");
+      tagOid = fixture.git("rev-parse", "refs/tags/v2");
+      posts = 0;
+
+      await expect(fetchInto({ ...workspace.context, http }, repo, {})).rejects.toMatchObject({
+        code: "EFETCHFAIL",
+      });
+
+      expect(posts).toBe(2);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(repo.store.getRef("refs/tags/v2")).toBeNull();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects an annotated tag whose chain disagrees with its advertised peeled target", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let release = "";
+    const http: GitHttpClient = async (request) => {
+      const response = await fetchHttpClient(request);
+      if (request.method !== "GET") return response;
+      return {
+        ...response,
+        body: replaceResponseText(
+          response.body,
+          `${release} refs/tags/v2^{}`,
+          `${head} refs/tags/v2^{}`,
+        ),
+      };
+    };
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.write("release.txt", "release\n");
+      release = fixture.commit("release");
+      fixture.git("tag", "-a", "v2", "-m", "release");
+
+      await expect(fetchInto({ ...workspace.context, http }, repo, {})).rejects.toMatchObject({
+        code: "ECORRUPT",
+      });
+
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(repo.store.getRef("refs/tags/v2")).toBeNull();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects an annotated tag without an advertised peeled target", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let release = "";
+    const http: GitHttpClient = async (request) => {
+      const response = await fetchHttpClient(request);
+      if (request.method !== "GET") return response;
+      return {
+        ...response,
+        body: removeResponsePacket(response.body, `${release} refs/tags/broken^{}\n`),
+      };
+    };
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.write("release.txt", "release\n");
+      release = fixture.commit("release");
+      fixture.git("tag", "-a", "broken", "-m", "release");
+
+      await expect(
+        fetchInto({ ...workspace.context, http }, repo, { tags: true }),
+      ).rejects.toMatchObject({ code: "ECORRUPT" });
+
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(repo.store.getRef("refs/tags/broken")).toBeNull();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("rechecks required tag conflicts after the network round trip", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    let enterPost = (): void => {};
+    let releasePost = (): void => {};
+    const entered = new Promise<void>((resolve) => {
+      enterPost = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    const http: GitHttpClient = async (request) => {
+      const response = await fetchHttpClient(request);
+      if (request.method === "POST") {
+        enterPost();
+        await released;
+      }
+      return response;
+    };
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.write("release.txt", "release\n");
+      fixture.commit("release");
+      fixture.git("tag", "release");
+      const fetching = fetchInto({ ...workspace.context, http }, repo, { tags: true });
+      await entered;
+      repo.store.setRef("refs/tags/release", head);
+      releasePost();
+
+      await expect(fetching).rejects.toMatchObject({ code: "ETAGFAIL" });
+      expect(repo.store.getRef("refs/tags/release")).toBe(head);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+    } finally {
+      releasePost();
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps explicit selectors tagless and honors tags: false", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      fixture.git("checkout", "-q", "-b", "topic");
+      fixture.write("topic.txt", "topic\n");
+      const topic = fixture.commit("topic");
+      fixture.git("tag", "topic-tag");
+      fixture.git("checkout", "-q", "main");
+      fixture.write("main.txt", "main\n");
+      const main = fixture.commit("main");
+      fixture.git("tag", "main-tag");
+
+      const explicit = await fetchInto(workspace.context, repo, { remoteRef: "topic" });
+      expect(explicit.fetchHead).toBe(topic);
+      expect(repo.store.getRef("refs/remotes/origin/topic")).toBe(topic);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(repo.tags()).toEqual([]);
+
+      const withoutTags = await fetchInto(workspace.context, repo, {
+        singleBranch: true,
+        tags: false,
+      });
+      expect(withoutTags.fetchHead).toBe(main);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(main);
+      expect(repo.tags()).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("preserves auto-followed local tags and rejects tags: true clobbers", async () => {
+    const { fixture, head } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      repo.store.setRef("refs/tags/release", head);
+      fixture.write("release.txt", "release\n");
+      const release = fixture.commit("release");
+      fixture.git("tag", "release");
+
+      await fetchInto(workspace.context, repo, {});
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(release);
+      expect(repo.store.getRef("refs/tags/release")).toBe(head);
+
+      await expect(
+        fetchInto(workspace.context, repo, { remoteRef: "refs/tags/release" }),
+      ).rejects.toMatchObject({ code: "ETAGFAIL" });
+      await expect(fetchInto(workspace.context, repo, { tags: true })).rejects.toMatchObject({
+        code: "ETAGFAIL",
+      });
+      expect(repo.store.getRef("refs/tags/release")).toBe(head);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("prunes tracking refs the remote has dropped", async () => {
     const { fixture } = makeFixture();
     fixture.git("branch", "topic");
@@ -818,6 +1197,50 @@ describe("fetch", () => {
         { refs: 1_000, fetch: 31, prune: 15 },
         { refs: 9_329, fetch: 43, prune: 27 },
       ]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("authenticates many annotated tags in bounded pages", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "bulk tags\n");
+    const oid = fixture.commit("bulk tags");
+    createRemoteAnnotatedTags(fixture, 4_100, oid);
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    workspace.repo.store.configSet("remote.origin.url", server.url);
+    try {
+      workspace.storage.resetCounters();
+      await fetchInto(workspace.context, workspace.repo, { tags: true });
+
+      expect(workspace.repo.tags()).toHaveLength(4_100);
+      expect(workspace.repo.store.getRef("refs/tags/bulk-00000")).not.toBeNull();
+      expect(workspace.repo.store.getRef("refs/tags/bulk-04099")).not.toBeNull();
+      expect(workspace.storage.statementCount).toBeLessThan(1_000);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  }, 180_000);
+
+  it("rejects an over-limit advertisement before publishing any ref", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "bounded\n");
+    const oid = fixture.commit("bounded advertisement");
+    createRemoteBranches(fixture, 1, 16_385, oid);
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    workspace.repo.store.configSet("remote.origin.url", server.url);
+    workspace.repo.store.setRef("refs/remotes/origin/retained", oid);
+    const before = workspace.repo.store.listRefs();
+    try {
+      await expect(fetchInto(workspace.context, workspace.repo, {})).rejects.toMatchObject({
+        code: "E2BIG",
+      });
+      expect(workspace.repo.store.listRefs()).toEqual(before);
+      expect(tableRows(workspace, "SELECT pack_id FROM git_pack_meta")).toEqual([]);
     } finally {
       await server.close();
       fixture.dispose();

@@ -16,6 +16,7 @@ const HEADS = "refs/heads/";
 const MAX_PULL_REF_BYTES = 1_024;
 const MAX_PULL_REMOTE_BYTES = 255;
 const MAX_PULL_URL_BYTES = 8_192;
+const MAX_PULL_FETCH_REFSPEC_BYTES = 2_048;
 const FALSE_CONFIG_VALUES = new Set(["", "0", "false", "no", "off"]);
 const TRUE_CONFIG_VALUES = new Set(["1", "true", "yes", "on"]);
 
@@ -47,6 +48,9 @@ export interface PullPlan {
   displayUrl: string;
   remoteRef: string;
   remoteBranch: string;
+  fetchRefspec: string;
+  fetchSingleBranch: boolean;
+  fetchAutoTags: boolean;
   fastForward?: boolean;
   fastForwardOnly?: boolean;
 }
@@ -161,6 +165,34 @@ function requireMergeStrategy(repo: Repository): void {
   throw new GitError("EINVAL", `config pull.rebase has invalid value ${rebase}`);
 }
 
+function pullFetchShape(
+  repo: Repository,
+  remote: string,
+  remoteRef: string,
+  options: PullOptions,
+): Pick<PullPlan, "fetchRefspec" | "fetchSingleBranch" | "fetchAutoTags"> {
+  const explicitRemoteRef = options.remoteRef !== undefined;
+  const fetchSingleBranch = options.singleBranch ?? explicitRemoteRef;
+  if (fetchSingleBranch) {
+    return {
+      fetchRefspec: remoteRef,
+      fetchSingleBranch: true,
+      fetchAutoTags: !explicitRemoteRef,
+    };
+  }
+
+  const canonical = `+refs/heads/*:refs/remotes/${remote}/*`;
+  const configuredFetch = configured(repo, `remote.${remote}.fetch`, MAX_PULL_FETCH_REFSPEC_BYTES);
+  if (configuredFetch !== undefined && configuredFetch !== canonical) {
+    throw new UnsupportedOperationError("custom pull fetch refspec");
+  }
+  return {
+    fetchRefspec: canonical,
+    fetchSingleBranch: false,
+    fetchAutoTags: true,
+  };
+}
+
 /** Resolve and validate everything pull needs before it starts network work. */
 export function resolvePull(repo: Repository, options: PullOptions = {}): PullPlan {
   repo.checkout.requireNoMergeState();
@@ -204,6 +236,7 @@ export function resolvePull(repo: Repository, options: PullOptions = {}): PullPl
   const urlValue = options.url ?? configuredUrl;
   if (urlValue === undefined) throw new GitError("ENOREMOTE", `no such remote: ${remote}`);
   const resolvedUrl = pullUrl(urlValue);
+  const fetchShape = pullFetchShape(repo, remote, remoteRef, options);
 
   requireMergeStrategy(repo);
   return {
@@ -214,6 +247,7 @@ export function resolvePull(repo: Repository, options: PullOptions = {}): PullPl
     ...resolvedUrl,
     remoteRef,
     remoteBranch,
+    ...fetchShape,
     ...fastForwardOptions(repo, options),
   };
 }
@@ -223,6 +257,9 @@ function sameTarget(left: PullPlan, right: PullPlan): boolean {
     left.remote === right.remote &&
     left.url === right.url &&
     left.remoteRef === right.remoteRef &&
+    left.fetchRefspec === right.fetchRefspec &&
+    left.fetchSingleBranch === right.fetchSingleBranch &&
+    left.fetchAutoTags === right.fetchAutoTags &&
     left.fastForward === right.fastForward &&
     left.fastForwardOnly === right.fastForwardOnly
   );
@@ -241,16 +278,24 @@ export async function pull(
   behavior: MergeBehavior = {},
 ): Promise<MergeResult> {
   const plan = resolvePull(repo, options);
-  const fetched = await fetchInto(context, repo, {
-    remote: plan.remote,
-    url: plan.url,
-    remoteRef: plan.remoteRef,
-    singleBranch: options.singleBranch ?? true,
-    ...(options.headers === undefined ? {} : { headers: options.headers }),
-    ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
-    ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
-    ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
-  });
+  const fetched = await fetchInto(
+    context,
+    repo,
+    {
+      remote: plan.remote,
+      url: plan.url,
+      ...(options.headers === undefined ? {} : { headers: options.headers }),
+      ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
+      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+      ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+    },
+    "fetch",
+    {
+      ...(plan.fetchSingleBranch ? { coverageRef: plan.remoteRef } : {}),
+      resultRef: plan.remoteRef,
+      autoTags: plan.fetchAutoTags,
+    },
+  );
   if (fetched.fetchHead === null) {
     throw new GitError("EFETCHFAIL", `remote ${plan.remote} advertised no usable upstream ref`);
   }
@@ -259,7 +304,15 @@ export async function pull(
   if (afterFetchHead.ref !== plan.headRef || afterFetchHead.oid !== plan.headOid) {
     throw new GitError("ESTALEHEAD", "HEAD changed while pull was fetching its upstream");
   }
-  const current = resolvePull(repo, options);
+  repo.checkout.requireNoMergeState();
+  let current: PullPlan;
+  try {
+    current = resolvePull(repo, options);
+  } catch (error) {
+    throw new GitError("ESTALEUPSTREAM", "upstream configuration changed while pull was fetching", {
+      cause: error,
+    });
+  }
   if (!sameTarget(current, plan)) {
     throw new GitError("ESTALEUPSTREAM", "upstream configuration changed while pull was fetching");
   }

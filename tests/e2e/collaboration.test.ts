@@ -273,7 +273,7 @@ describe("collaboration over a Smart HTTP origin", () => {
           peer.git("push", "-q", "origin", "main", "v1.0", "v1.0-signed-off");
         },
       },
-      { op: "fetch", tags: true },
+      { op: "fetch" },
       // kompjutr never creates an annotated tag, but it stores one that
       // arrived from a remote — and a start point peels it, which the
       // compared branch ref proves against git.

@@ -127,6 +127,9 @@ describe("pull", () => {
       displayUrl: "https://example.com/repo.git",
       remoteRef: "refs/heads/main",
       remoteBranch: "main",
+      fetchRefspec: "+refs/heads/*:refs/remotes/origin/*",
+      fetchSingleBranch: false,
+      fetchAutoTags: true,
     });
   });
 
@@ -151,9 +154,48 @@ describe("pull", () => {
       url: "https://example.com/repo.git",
       remoteRef: "refs/heads/topic",
       remoteBranch: "topic",
+      fetchRefspec: "refs/heads/topic",
+      fetchSingleBranch: true,
+      fetchAutoTags: false,
       fastForward: false,
       fastForwardOnly: false,
     });
+  });
+
+  it("lets singleBranch explicitly choose exact or canonical pull coverage", () => {
+    const workspace = committedRepo();
+    configureUpstream(workspace);
+
+    expect(resolvePull(workspace.repo, { singleBranch: true })).toMatchObject({
+      fetchRefspec: "refs/heads/main",
+      fetchSingleBranch: true,
+      fetchAutoTags: true,
+    });
+    expect(
+      resolvePull(workspace.repo, {
+        remoteRef: "topic",
+        singleBranch: false,
+      }),
+    ).toMatchObject({
+      remoteRef: "refs/heads/topic",
+      fetchRefspec: "+refs/heads/*:refs/remotes/origin/*",
+      fetchSingleBranch: false,
+      fetchAutoTags: true,
+    });
+  });
+
+  it("rejects a configured fetch refspec outside the canonical pull coverage", () => {
+    const workspace = committedRepo();
+    configureUpstream(workspace);
+    workspace.repo.store.configSet(
+      "remote.origin.fetch",
+      "+refs/heads/main:refs/remotes/origin/main",
+    );
+
+    expect(() => resolvePull(workspace.repo)).toThrowError(
+      expect.objectContaining({ code: "EUNSUPPORTED" }),
+    );
+    expect(() => resolvePull(workspace.repo, { singleBranch: true })).not.toThrow();
   });
 
   it("uses the configured tracking namespace when an explicit URL overrides transport", () => {
@@ -286,6 +328,72 @@ describe("pull", () => {
         });
         expect(await workspace.workspace.fs.readFile("/work/remote.txt", "utf8")).toBe("remote\n");
         expect(workspace.storage.statementCount).toBeLessThan(1_000);
+      } finally {
+        await server.close();
+        fixture.dispose();
+      }
+    });
+
+    it("updates canonical side refs and tags while integrating only its upstream", async () => {
+      const { fixture, base } = remoteFixture();
+      const server = await startGitServer(fixture.dir);
+      const workspace = makeWorkspace();
+      try {
+        const git = gitFor(workspace);
+        await git.clone({ url: server.url, dir: "/work", depth: 0 });
+        const repo = openRepository(workspace.context, "/work");
+
+        fixture.git("checkout", "-q", "-b", "topic", base);
+        fixture.write("topic.txt", "topic\n");
+        const topic = fixture.commit("topic");
+        fixture.git("tag", "topic-light");
+        fixture.git("tag", "-a", "topic-annotated", "-m", "topic");
+        fixture.git("checkout", "-q", "main");
+        fixture.write("main.txt", "main\n");
+        const remoteMain = fixture.commit("main");
+        fixture.git("branch", "side");
+        repo.store.configSet("branch.main.merge", "refs/heads/topic");
+
+        await expect(git.pull({ dir: "/work" })).resolves.toEqual({
+          oid: topic,
+          fastForward: true,
+        });
+
+        expect(repo.head().oid).toBe(topic);
+        expect(repo.store.getRef("refs/remotes/origin/main")).toBe(remoteMain);
+        expect(repo.store.getRef("refs/remotes/origin/side")).toBe(remoteMain);
+        expect(repo.store.getRef("refs/remotes/origin/topic")).toBe(topic);
+        expect(repo.store.getRef("refs/tags/topic-light")).toBe(topic);
+        const annotated = repo.store.getRef("refs/tags/topic-annotated");
+        if (annotated === null) throw new Error("pull omitted the annotated tag");
+        expect(repo.peel(annotated)).toBe(topic);
+        expect(await workspace.workspace.fs.readFile("/work/topic.txt", "utf8")).toBe("topic\n");
+        expect(workspace.worktree.stat("/work/main.txt")).toBeNull();
+      } finally {
+        await server.close();
+        fixture.dispose();
+      }
+    });
+
+    it("keeps configured single-branch pull coverage bounded to its upstream", async () => {
+      const { fixture } = remoteFixture();
+      const server = await startGitServer(fixture.dir);
+      const workspace = makeWorkspace();
+      try {
+        const git = gitFor(workspace);
+        await git.clone({ url: server.url, dir: "/work", depth: 0 });
+        const repo = openRepository(workspace.context, "/work");
+        fixture.git("branch", "side");
+        fixture.write("main.txt", "main\n");
+        const incoming = fixture.commit("main");
+        fixture.git("tag", "main-tag");
+
+        await git.pull({ dir: "/work", singleBranch: true });
+
+        expect(repo.head().oid).toBe(incoming);
+        expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
+        expect(repo.store.getRef("refs/remotes/origin/side")).toBeNull();
+        expect(repo.store.getRef("refs/tags/main-tag")).toBe(incoming);
       } finally {
         await server.close();
         fixture.dispose();
@@ -652,6 +760,12 @@ describe("pull", () => {
         name: "remote URL",
         mutate(repo, serverUrl) {
           repo.store.configSet("remote.origin.url", `${serverUrl}/changed`);
+        },
+      },
+      {
+        name: "remote fetch refspec",
+        mutate(repo) {
+          repo.store.configSet("remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main");
         },
       },
       {
