@@ -50,6 +50,7 @@ function insertTreeSource(
 
 function expectEnforcedBehavior(db: ForeignKeyDatabase): void {
   expectForeignKeysEnabled(db);
+  db.run("INSERT OR IGNORE INTO git_repositories (id) VALUES (91)");
 
   expect(() => insertTreeEntry(db, 999)).toThrow(/FOREIGN KEY constraint failed/);
 
@@ -136,6 +137,7 @@ describe("foreign-key contract", () => {
     const first = new TestDatabase(storage);
     first.run("PRAGMA foreign_keys = OFF");
     new SqliteGitDatabase(first);
+    first.run("INSERT INTO git_repositories (id) VALUES (91)");
 
     insertTreeSource(first, "loose", 0, "a".repeat(40));
     const looseKey = first.scalar<number>(

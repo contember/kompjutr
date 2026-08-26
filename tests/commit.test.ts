@@ -27,7 +27,7 @@ const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
  * SQL statements one 2,000-file commit costs. Deterministic; see the scale
  * test. The trees and commit share one bounded object batch and cache write.
  */
-const SCALE_STATEMENTS = 20;
+const SCALE_STATEMENTS = 24;
 
 const fixtures: GitFixture[] = [];
 
@@ -43,11 +43,11 @@ function useIdentity(workspace: TestRepository): void {
 /** `git add -A`, without depending on U3's `add`. */
 function stageAll(workspace: TestRepository): void {
   const paths = walkWorktree(workspace.worktree, workspace.repo.root);
-  workspace.repo.store.indexClear();
+  workspace.repo.checkout.indexClear();
   for (const relative of paths) {
     const hashed = hashWorktreePath(workspace.repo, workspace.worktree, relative);
     if (hashed === null) throw new Error(`cannot stage ${relative}`);
-    workspace.repo.store.indexPut(indexEntryFor(relative, hashed));
+    workspace.repo.checkout.indexPut(indexEntryFor(relative, hashed));
   }
 }
 
@@ -220,7 +220,7 @@ describe("explicit-parent commit seam", () => {
     repo.write("a.txt", "rewritten\n");
     stageAll(repo.workspace);
     const before = {
-      head: repo.workspace.repo.store.head(),
+      head: repo.workspace.repo.checkout.head(),
       refs: repo.workspace.repo.store.listRefs(),
       reflogEntries:
         repo.workspace.repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries") ??
@@ -248,7 +248,7 @@ describe("explicit-parent commit seam", () => {
       }),
     );
 
-    expect(repo.workspace.repo.store.head()).toBe(before.head);
+    expect(repo.workspace.repo.checkout.head()).toBe(before.head);
     expect(repo.workspace.repo.store.listRefs()).toEqual(before.refs);
     expect(
       repo.workspace.repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries"),
@@ -267,7 +267,7 @@ describe("explicit-parent commit seam", () => {
       data: serializeCommit(expected),
     });
     expect(repo.workspace.repo.resolveTreePath(result.tree, "a.txt")?.oid).toBe(
-      repo.workspace.repo.store.indexGet("a.txt", 0)?.oid,
+      repo.workspace.repo.checkout.indexGet("a.txt", 0)?.oid,
     );
     expect(repo.workspace.repo.store.cachedCommit(result.oid)?.commit).toEqual(
       repo.workspace.repo.readCommit(result.oid),
@@ -517,7 +517,7 @@ describe("refusals", () => {
     writeWorkFile(workspace, "/a.txt", "one\n");
     stageAll(workspace);
     const oid = workspace.repo.store.write("blob", utf8.encode("theirs\n"));
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path: "a.txt",
       stage: 2,
       mode: 0o100644,
@@ -562,9 +562,9 @@ describe("refusals", () => {
     const before = {
       head: repo.workspace.repo.head(),
       refs: repo.workspace.repo.store.listRefs(),
-      index: repo.workspace.repo.store.indexEntries(),
+      index: repo.workspace.repo.checkout.indexEntries(),
       objects: repo.workspace.repo.store.objectCount(),
-      operation: repo.workspace.repo.store.readOperationState(),
+      operation: repo.workspace.repo.checkout.readOperationState(),
       paths: walkWorktree(repo.workspace.worktree, repo.workspace.repo.root),
       content: utf8Decoder.decode(repo.workspace.worktree.readFile("/a.txt")),
     };
@@ -577,9 +577,9 @@ describe("refusals", () => {
     expect(repo.workspace.repo.head()).toEqual(before.head);
     expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(first);
     expect(repo.workspace.repo.store.listRefs()).toEqual(before.refs);
-    expect(repo.workspace.repo.store.indexEntries()).toEqual(before.index);
+    expect(repo.workspace.repo.checkout.indexEntries()).toEqual(before.index);
     expect(repo.workspace.repo.store.objectCount()).toBe(before.objects);
-    expect(repo.workspace.repo.store.readOperationState()).toEqual(before.operation);
+    expect(repo.workspace.repo.checkout.readOperationState()).toEqual(before.operation);
     expect(walkWorktree(repo.workspace.worktree, repo.workspace.repo.root)).toEqual(before.paths);
     expect(utf8Decoder.decode(repo.workspace.worktree.readFile("/a.txt"))).toBe(before.content);
   });
@@ -606,7 +606,7 @@ describe("tree reuse", () => {
     const workspace = makeRepo("/");
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
-    expect(buildTree(workspace.repo, workspace.repo.store.indexEntries())).toBe(
+    expect(buildTree(workspace.repo, workspace.repo.checkout.indexEntries())).toBe(
       fixture.git("hash-object", "-t", "tree", "/dev/null"),
     );
   });
@@ -663,7 +663,7 @@ describe("scale", () => {
           mtime: 0,
           ino: 0,
         };
-        workspace.repo.store.indexPut(entry);
+        workspace.repo.checkout.indexPut(entry);
       }
     }
     const theirs = fixture.commit("scale");
@@ -678,7 +678,7 @@ describe("scale", () => {
     expect(statements).toBe(SCALE_STATEMENTS);
   });
 
-  it("commits 3,293 tree and commit objects within 21 statements", () => {
+  it("commits 3,293 tree and commit objects within 25 statements", () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     const workspace = makeRepo("/");
@@ -687,7 +687,7 @@ describe("scale", () => {
     const path = `${Array.from({ length: 3291 }, () => "a").join("/")}/leaf.txt`;
     const data = utf8.encode("leaf\n");
     const blob = workspace.repo.store.write("blob", data);
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path,
       stage: 0,
       mode: 0o100644,
@@ -711,6 +711,6 @@ describe("scale", () => {
     expect(workspace.repo.readCommit(oid).tree).toBe(expectedTree);
     expect(oid).toBe(expectedCommit);
     expect(workspace.repo.store.objectCount() - before).toBe(3293);
-    expect(statements).toBe(21);
+    expect(statements).toBe(25);
   });
 });

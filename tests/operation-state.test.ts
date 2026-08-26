@@ -166,8 +166,8 @@ function rebaseSteps(): readonly OperationStepMetadata[] {
 function open() {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
-  const repository = database.create("/repo", "ref: refs/heads/main");
-  const store = database.open(repository);
+  const repository = database.createRepository("/repo", "ref: refs/heads/main");
+  const store = database.openCheckout(repository);
   store.write("tree", TREE_BYTES);
   store.write("commit", ORIGINAL_BYTES);
   store.write("commit", SOURCE_BYTES);
@@ -190,7 +190,7 @@ describe("durable operation journal", () => {
       const steps = operationStepsForState(state);
       store.writeOperationState(state, []);
 
-      const cold = new SqliteGitDatabase(db).open(repository).requireOperationState(kind);
+      const cold = new SqliteGitDatabase(db).openCheckout(repository).requireOperationState(kind);
 
       expect(cold).toEqual({
         kind,
@@ -273,7 +273,7 @@ describe("durable operation journal", () => {
     const completedState = rebase({ currentStep: 2, currentParentOid: RESULT_ONE });
     store.replaceOperationJournal(applied.integrityOid, completedState, completedSteps, []);
 
-    const cold = new SqliteGitDatabase(db).open(repository).requireOperationState("rebase");
+    const cold = new SqliteGitDatabase(db).openCheckout(repository).requireOperationState("rebase");
     expect(cold.state).toEqual(completedState);
     expect(cold.steps).toEqual(completedSteps);
     expect(cold.touched).toEqual([]);
@@ -448,7 +448,7 @@ describe("durable operation journal", () => {
         db.run(
           `UPDATE git_operation_steps
               SET source_oid = ?, selected_parent_oid = ?, mainline = ?
-            WHERE repo_id = 1 AND ordinal = ?`,
+            WHERE checkout_id = 1 AND ordinal = ?`,
           step.sourceOid,
           step.selectedParentOid,
           step.mainline,
@@ -456,7 +456,7 @@ describe("durable operation journal", () => {
         );
       }
       db.run(
-        "UPDATE git_operation_state SET retained_bytes = ?, integrity_oid = ? WHERE repo_id = 1",
+        "UPDATE git_operation_state SET retained_bytes = ?, integrity_oid = ? WHERE checkout_id = 1",
         operationJournalRetainedBytes(state, [], steps),
         operationJournalIntegrityOid(state, [], steps),
       );
@@ -476,13 +476,13 @@ describe("durable operation journal", () => {
       db.run(
         `UPDATE git_operation_steps
             SET outcome = 'applied', result_oid = ?
-          WHERE repo_id = 1 AND ordinal = 0`,
+          WHERE checkout_id = 1 AND ordinal = 0`,
         WRONG_RESULT,
       );
       db.run(
         `UPDATE git_operation_state
             SET current_step = 1, current_parent_oid = ?, retained_bytes = ?, integrity_oid = ?
-          WHERE repo_id = 1`,
+          WHERE checkout_id = 1`,
         WRONG_RESULT,
         operationJournalRetainedBytes(state, [], steps),
         operationJournalIntegrityOid(state, [], steps),
@@ -625,7 +625,9 @@ describe("durable operation journal", () => {
       replay("revert", { phase: "conflicted", emptyReason: null }),
       touched(),
     );
-    db.run("DELETE FROM git_operation_state WHERE repo_id = 1");
+    db.run("PRAGMA foreign_keys = OFF");
+    db.run("DELETE FROM git_operation_state WHERE checkout_id = 1");
+    db.run("PRAGMA foreign_keys = ON");
     expect(() => store.readOperationState()).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
@@ -639,30 +641,33 @@ describe("durable operation journal", () => {
     const corruptions: readonly ((db: TestDatabase) => void)[] = [
       (db) => {
         db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_state SET kind = 'pick' WHERE repo_id = 1");
+        db.run("UPDATE git_operation_state SET kind = 'pick' WHERE checkout_id = 1");
         db.run("PRAGMA ignore_check_constraints = OFF");
       },
-      (db) => db.run("UPDATE git_operation_state SET touched_count = 1 WHERE repo_id = 1"),
-      (db) => db.run("UPDATE git_operation_state SET integrity_oid = ? WHERE repo_id = 1", FILE),
-      (db) => db.run("UPDATE git_operation_steps SET source_oid = ? WHERE repo_id = 1", FILE),
+      (db) => db.run("UPDATE git_operation_state SET touched_count = 1 WHERE checkout_id = 1"),
+      (db) =>
+        db.run("UPDATE git_operation_state SET integrity_oid = ? WHERE checkout_id = 1", FILE),
+      (db) => db.run("UPDATE git_operation_steps SET source_oid = ? WHERE checkout_id = 1", FILE),
       (db) => {
         db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_state SET current_step = zeroblob(4096) WHERE repo_id = 1");
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_state SET step_count = zeroblob(4096) WHERE repo_id = 1");
-        db.run("PRAGMA ignore_check_constraints = OFF");
-      },
-      (db) => {
-        db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_steps SET ordinal = zeroblob(4096) WHERE repo_id = 1");
+        db.run(
+          "UPDATE git_operation_state SET current_step = zeroblob(4096) WHERE checkout_id = 1",
+        );
         db.run("PRAGMA ignore_check_constraints = OFF");
       },
       (db) => {
         db.run("PRAGMA ignore_check_constraints = ON");
-        db.run("UPDATE git_operation_steps SET mainline = zeroblob(4096) WHERE repo_id = 1");
+        db.run("UPDATE git_operation_state SET step_count = zeroblob(4096) WHERE checkout_id = 1");
+        db.run("PRAGMA ignore_check_constraints = OFF");
+      },
+      (db) => {
+        db.run("PRAGMA ignore_check_constraints = ON");
+        db.run("UPDATE git_operation_steps SET ordinal = zeroblob(4096) WHERE checkout_id = 1");
+        db.run("PRAGMA ignore_check_constraints = OFF");
+      },
+      (db) => {
+        db.run("PRAGMA ignore_check_constraints = ON");
+        db.run("UPDATE git_operation_steps SET mainline = zeroblob(4096) WHERE checkout_id = 1");
         db.run("PRAGMA ignore_check_constraints = OFF");
       },
     ];
@@ -753,13 +758,13 @@ describe("durable operation journal", () => {
       db.run(
         `UPDATE git_operation_steps
             SET source_oid = ?, selected_parent_oid = ?, mainline = ?
-          WHERE repo_id = 1 AND ordinal = 0`,
+          WHERE checkout_id = 1 AND ordinal = 0`,
         step.sourceOid,
         step.selectedParentOid,
         step.mainline,
       );
       db.run(
-        `UPDATE git_operation_state SET retained_bytes = ?, integrity_oid = ? WHERE repo_id = 1`,
+        `UPDATE git_operation_state SET retained_bytes = ?, integrity_oid = ? WHERE checkout_id = 1`,
         retainedBytes,
         integrityOid,
       );

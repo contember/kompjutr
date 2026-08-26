@@ -51,7 +51,7 @@ export interface IndexTrackerSeedEntry {
 /** Optional sparse-state writer. Core supplies bounded, complete snapshots only. */
 export interface IndexTrackerWriter {
   reseal(
-    repoId: number,
+    checkoutId: number,
     baselineTreeOid: string | null,
     entries: Iterable<IndexTrackerSeedEntry>,
   ): boolean;
@@ -74,14 +74,14 @@ export interface GitContext {
 }
 
 export function openRepository(context: GitContext, dir = "/"): Repository {
-  const row = context.database.find(normalizePath(dir));
+  const row = context.database.findCheckout(normalizePath(dir));
   if (row === null) throw new NotARepositoryError(normalizePath(dir));
-  return new Repository(context.database.open(row), row.root);
+  return new Repository(context.database.openCheckout(row));
 }
 
 export function findRepository(context: GitContext, dir = "/"): Repository | null {
-  const row = context.database.find(normalizePath(dir));
-  return row === null ? null : new Repository(context.database.open(row), row.root);
+  const row = context.database.findCheckout(normalizePath(dir));
+  return row === null ? null : new Repository(context.database.openCheckout(row));
 }
 
 /**
@@ -93,7 +93,7 @@ export function nestedRoots(context: GitContext, root: string): string[] {
   const base = normalizePath(root);
   const prefix = base === "/" ? "/" : `${base}/`;
   return context.database
-    .list()
+    .listRoutingCheckouts()
     .map((row) => row.root)
     .filter((candidate) => candidate !== base && candidate.startsWith(prefix));
 }

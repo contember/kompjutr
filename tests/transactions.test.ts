@@ -45,8 +45,8 @@ class RefWriteFailureDatabase implements SqlDatabase {
 function open() {
   const db = new RefWriteFailureDatabase(new TestDatabase());
   const database = new SqliteGitDatabase(db);
-  const row = database.create("/repo", "ref: refs/heads/main");
-  return { db, repo: new Repository(database.open(row), row.root) };
+  const row = database.createRepository("/repo", "ref: refs/heads/main");
+  return { db, repo: new Repository(database.openCheckout(row)) };
 }
 
 describe("commit transactions", () => {
@@ -54,7 +54,7 @@ describe("commit transactions", () => {
     const { db, repo } = open();
     const data = utf8.encode("staged\n");
     const blob = repo.store.write("blob", data);
-    repo.store.indexPut({
+    repo.checkout.indexPut({
       path: "staged.txt",
       stage: 0,
       mode: 0o100644,
@@ -65,7 +65,7 @@ describe("commit transactions", () => {
     });
     const expectedHead = repo.head();
     const before = {
-      head: repo.store.head(),
+      head: repo.checkout.head(),
       refs: repo.store.listRefs(),
       objects: repo.store.objectCount(),
     };
@@ -96,7 +96,7 @@ describe("commit transactions", () => {
     ).toThrow("injected ref publication failure");
 
     expect(db.objectPayloadWrites).toBeGreaterThan(0);
-    expect(repo.store.head()).toBe(before.head);
+    expect(repo.checkout.head()).toBe(before.head);
     expect(repo.store.listRefs()).toEqual(before.refs);
     expect(repo.store.objectCount()).toBe(before.objects);
     expect(repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);

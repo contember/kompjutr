@@ -107,9 +107,9 @@ beforeAll(async () => {
   fixture.git("tag", "v1");
 
   const database = new SqliteGitDatabase(new TestDatabase());
-  const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+  const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
   await importFixture(fixture, store);
-  repo = new Repository(store, "/repo");
+  repo = new Repository(store);
 });
 
 afterAll(() => fixture.dispose());
@@ -192,7 +192,7 @@ describe("log", () => {
 describe("bounded commit graph reads", () => {
   it("preserves unborn HEAD and explicit missing-ref semantics", () => {
     const db = new TestDatabase();
-    const repo = new Repository(openScale(db), "/repo");
+    const repo = new Repository(openScale(db));
 
     expect(log(repo)).toEqual([]);
     expect(() => log(repo, { ref: "missing" })).toThrow(/unknown revision/);
@@ -446,15 +446,15 @@ class BindingDatabase implements SqlDatabase {
 
 function openScale(db: SqlDatabase) {
   const database = new SqliteGitDatabase(db);
-  const row = database.create("/repo", "ref: refs/heads/main");
-  return database.open(row);
+  const row = database.createRepository("/repo", "ref: refs/heads/main");
+  return database.openCheckout(row);
 }
 
 function reopenScale(db: SqlDatabase): Repository {
   const database = new SqliteGitDatabase(db);
-  const row = database.find("/repo");
+  const row = database.findCheckout("/repo");
   if (row === null) throw new Error("scale repository is missing");
-  return new Repository(database.open(row), "/repo");
+  return new Repository(database.openCheckout(row));
 }
 
 function logFixture(count: number): {
@@ -492,7 +492,7 @@ function logFixture(count: number): {
   const head = oids[oids.length - 1];
   if (head === undefined) throw new Error("log fixture needs at least one commit");
   store.setRef("refs/heads/main", head);
-  return { db, repo: new Repository(store, "/repo"), oids };
+  return { db, repo: new Repository(store), oids };
 }
 
 function* legacyWalk(

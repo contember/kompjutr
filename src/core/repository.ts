@@ -10,10 +10,13 @@ import {
 } from "../sqlite/commits.js";
 import type {
   BlobReadBatch,
+  CheckoutStore,
   ObjectReadBatch,
   RefLogEntry,
+  RefLogMetadata,
   RefLogReadOptions,
-  RepoStore,
+  RefMutation,
+  SharedRepoStore,
   WalkTreeDiffEntry,
   WalkTreeDiffObject,
 } from "../sqlite/store.js";
@@ -122,7 +125,7 @@ class CommitFillBuffer {
   readonly #pending: CommitCacheEntry[] = [];
   #bytes = 0;
 
-  constructor(private readonly store: RepoStore) {}
+  constructor(private readonly store: SharedRepoStore) {}
 
   add(entry: CommitCacheEntry): void {
     if (this.#pending.length > 0 && this.#bytes + entry.cacheBytes > MAX_COMMIT_CACHE_BYTES) {
@@ -142,21 +145,23 @@ class CommitFillBuffer {
 }
 
 export class Repository {
-  #shallow: Set<string> | null = null;
+  readonly store: SharedRepoStore;
 
-  constructor(
-    readonly store: RepoStore,
-    readonly root: string,
-  ) {}
+  constructor(readonly checkout: CheckoutStore) {
+    this.store = checkout.shared;
+  }
+
+  get root(): string {
+    return this.checkout.root;
+  }
 
   /** Commits whose parents this repository deliberately does not have. */
   shallow(): Set<string> {
-    if (this.#shallow === null) this.#shallow = this.store.shallow();
-    return this.#shallow;
+    return this.store.shallow();
   }
 
   invalidateShallow(): void {
-    this.#shallow = null;
+    this.store.invalidateShallow();
   }
 
   // -- objects --------------------------------------------------------
@@ -259,7 +264,7 @@ export class Repository {
     for (let hops = 0; hops < 8; hops++) {
       const full = this.expandRef(current);
       if (full === null) return null;
-      const value = this.store.getRef(full);
+      const value = full === "HEAD" ? this.checkout.head() : this.store.getRef(full);
       if (value === null) return null;
       if (value.startsWith("ref: ")) {
         current = value.slice(5).trim();
@@ -271,7 +276,7 @@ export class Repository {
   }
 
   head(): ResolvedHead {
-    const raw = this.store.head();
+    const raw = this.checkout.head();
     if (raw.startsWith("ref: ")) {
       const ref = raw.slice(5).trim();
       const value = this.store.getRef(ref);
@@ -289,7 +294,11 @@ export class Repository {
   }
 
   reflog(ref = "HEAD", options: RefLogReadOptions = {}): RefLogEntry[] {
-    return this.store.reflog(ref, options);
+    return ref === "HEAD" ? this.checkout.reflog(ref, options) : this.store.reflog(ref, options);
+  }
+
+  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
+    return this.checkout.mutateRefs(mutation, metadata);
   }
 
   activeRefLogOids(): Generator<string> {
@@ -367,7 +376,7 @@ export class Repository {
       const digits = base.slice(6, -1);
       const index = boundedDecimal(digits, MAX_HEAD_REFLOG_INDEX);
       if (index === null) throw new RefNotFoundError(expression);
-      const entry = this.store.reflog("HEAD")[index];
+      const entry = this.checkout.reflog("HEAD")[index];
       if (entry?.newOid === undefined || entry.newOid === null) {
         throw new RefNotFoundError(expression);
       }

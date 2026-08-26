@@ -1,8 +1,8 @@
-import type { RefRow, RepoStore } from "../../src/sqlite/store.js";
+import type { CheckoutStore, RefRow } from "../../src/sqlite/store.js";
 import { type GitFixture, slices } from "./git.js";
 
 /** Load a fixture repository's pack and refs into a store, with no checkout. */
-export async function importFixture(fixture: GitFixture, store: RepoStore): Promise<void> {
+export async function importFixture(fixture: GitFixture, store: CheckoutStore): Promise<void> {
   await store.packs.ingest(slices(fixture.packAll(), 64 * 1024));
   const refs = fixture.git("show-ref");
   const puts: RefRow[] = [];

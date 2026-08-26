@@ -174,7 +174,7 @@ describe("commit publication history", () => {
         reason: "commit (initial)",
       }),
     ]);
-    expect(workspace.repo.store.reflog("HEAD").map((entry) => entry.reason)).toEqual([
+    expect(workspace.repo.checkout.reflog("HEAD").map((entry) => entry.reason)).toEqual([
       "commit (amend)",
       "commit",
       "commit (initial)",
@@ -191,7 +191,7 @@ describe("local ref operations", () => {
     branch(workspace.context, workspace.repo, { name: "feature", checkout: true });
 
     const named = workspace.repo.store.reflog("refs/heads/feature")[0];
-    const head = workspace.repo.store.reflog("HEAD")[0];
+    const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(named).toMatchObject({
       oldRaw: null,
       newRaw: oid,
@@ -226,7 +226,7 @@ describe("local ref operations", () => {
 
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "twin" });
 
-    expect(workspace.repo.store.reflog("HEAD")[0]).toMatchObject({
+    expect(workspace.repo.checkout.reflog("HEAD")[0]).toMatchObject({
       oldRaw: "ref: refs/heads/main",
       newRaw: "ref: refs/heads/twin",
       oldOid: oid,
@@ -264,9 +264,9 @@ describe("local ref operations", () => {
     tagDelete(workspace.context, workspace.repo, { name: "release" });
 
     tag(workspace.context, workspace.repo, { name: "same", object: second });
-    const beforeCheckout = workspace.repo.store.reflog("HEAD").length;
+    const beforeCheckout = workspace.repo.checkout.reflog("HEAD").length;
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "same" });
-    const checkoutEntry = workspace.repo.store.reflog("HEAD")[0];
+    const checkoutEntry = workspace.repo.checkout.reflog("HEAD")[0];
     expect(checkoutEntry).toMatchObject({
       oldRaw: "ref: refs/heads/main",
       newRaw: second,
@@ -274,7 +274,7 @@ describe("local ref operations", () => {
       newOid: second,
       reason: "checkout",
     });
-    expect(workspace.repo.store.reflog("HEAD")).toHaveLength(beforeCheckout + 1);
+    expect(workspace.repo.checkout.reflog("HEAD")).toHaveLength(beforeCheckout + 1);
 
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
     reset(workspace.context, workspace.repo, workspace.worktree, { hard: true, ref: first });
@@ -283,7 +283,7 @@ describe("local ref operations", () => {
       newOid: first,
       reason: "reset: hard",
     });
-    expect(workspace.repo.store.reflog("HEAD")[0]?.reason).toBe("reset: hard");
+    expect(workspace.repo.checkout.reflog("HEAD")[0]?.reason).toBe("reset: hard");
 
     updateRef(workspace.context, workspace.repo, { ref: "refs/heads/recovered", value: second });
     expect(workspace.repo.store.reflog("refs/heads/recovered")[0]).toMatchObject({
@@ -327,7 +327,7 @@ describe("local ref operations", () => {
     stage(workspace, "one\n");
     const oid = commit(workspace.context, workspace.repo, { message: "first" }).oid;
     tag(workspace.context, workspace.repo, { name: "same", object: oid });
-    const before = workspace.repo.store.reflog("HEAD").length;
+    const before = workspace.repo.checkout.reflog("HEAD").length;
 
     checkout(workspace.context, workspace.repo, workspace.worktree, {
       ref: "HEAD",
@@ -340,7 +340,7 @@ describe("local ref operations", () => {
       /already exists/,
     );
 
-    expect(workspace.repo.store.reflog("HEAD")).toHaveLength(before);
+    expect(workspace.repo.checkout.reflog("HEAD")).toHaveLength(before);
     expect(workspace.repo.store.reflog("refs/tags/same")).toHaveLength(1);
   });
 
@@ -365,7 +365,7 @@ describe("local ref operations", () => {
     reset(workspace.context, workspace.repo, workspace.worktree, { hard: true, ref: second });
     fixture.git("reset", "--hard", "-q", fixtureSecond);
 
-    expect(workspace.repo.store.head()).toBe(second);
+    expect(workspace.repo.checkout.head()).toBe(second);
     expect({
       detached: workspace.repo.head().ref === null,
       atRequestedCommit: workspace.repo.head().oid === second,
@@ -373,7 +373,7 @@ describe("local ref operations", () => {
       detached: fixture.git("rev-parse", "--abbrev-ref", "HEAD") === "HEAD",
       atRequestedCommit: fixture.git("rev-parse", "HEAD") === fixtureSecond,
     });
-    expect(workspace.repo.store.reflog("HEAD")[0]).toMatchObject({
+    expect(workspace.repo.checkout.reflog("HEAD")[0]).toMatchObject({
       oldRaw: first,
       newRaw: second,
       oldOid: first,
@@ -385,17 +385,17 @@ describe("local ref operations", () => {
     });
     expect(workspace.repo.store.reflog("refs/heads/main")).toHaveLength(namedEntries);
 
-    const headEntries = workspace.repo.store.reflog("HEAD").length;
+    const headEntries = workspace.repo.checkout.reflog("HEAD").length;
     reset(workspace.context, workspace.repo, workspace.worktree, { hard: true, ref: second });
-    expect(workspace.repo.store.reflog("HEAD")).toHaveLength(headEntries);
+    expect(workspace.repo.checkout.reflog("HEAD")).toHaveLength(headEntries);
     expect(() =>
       reset(workspace.context, workspace.repo, workspace.worktree, {
         hard: true,
         ref: "refs/heads/missing",
       }),
     ).toThrow(expect.objectContaining({ code: "ENOTFOUND" }));
-    expect(workspace.repo.store.head()).toBe(second);
-    expect(workspace.repo.store.reflog("HEAD")).toHaveLength(headEntries);
+    expect(workspace.repo.checkout.head()).toBe(second);
+    expect(workspace.repo.checkout.reflog("HEAD")).toHaveLength(headEntries);
   });
 
   it("logs direct, symbolic, raw HEAD, and causal update-ref movements", () => {
@@ -460,7 +460,7 @@ describe("local ref operations", () => {
         reason: "update-ref",
       }),
     ]);
-    const headEntries = workspace.repo.store.reflog("HEAD");
+    const headEntries = workspace.repo.checkout.reflog("HEAD");
     expect(headEntries[0]).toMatchObject({
       oldRaw: "ref: refs/heads/recovered",
       newRaw: "ref: refs/heads/recovered",
@@ -532,12 +532,12 @@ describe("local ref operations", () => {
     stage(workspace, "main\n");
     commit(workspace.context, workspace.repo, { message: "main" });
     const before = {
-      head: workspace.repo.store.head(),
-      index: workspace.repo.store.indexGet("tracked.txt"),
+      head: workspace.repo.checkout.head(),
+      index: workspace.repo.checkout.indexGet("tracked.txt"),
       content: utf8Decoder.decode(workspace.worktree.readFile("/tracked.txt")),
       entries: workspace.repo.store.db.scalar<number>(
         "SELECT count(*) FROM git_checkout_reflog_entries WHERE checkout_id = ?",
-        workspace.repo.store.checkoutId,
+        workspace.repo.checkout.checkoutId,
       ),
       directEntries: workspace.repo.store.db.scalar<number>(
         "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
@@ -556,13 +556,13 @@ describe("local ref operations", () => {
       checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "side" }),
     ).toThrow(/injected checkout reflog failure/);
 
-    expect(workspace.repo.store.head()).toBe(before.head);
-    expect(workspace.repo.store.indexGet("tracked.txt")).toEqual(before.index);
+    expect(workspace.repo.checkout.head()).toBe(before.head);
+    expect(workspace.repo.checkout.indexGet("tracked.txt")).toEqual(before.index);
     expect(utf8Decoder.decode(workspace.worktree.readFile("/tracked.txt"))).toBe(before.content);
     expect(
       workspace.repo.store.db.scalar<number>(
         "SELECT count(*) FROM git_checkout_reflog_entries WHERE checkout_id = ?",
-        workspace.repo.store.checkoutId,
+        workspace.repo.checkout.checkoutId,
       ),
     ).toBe(before.entries);
     expect(
@@ -587,7 +587,7 @@ describe("local ref operations", () => {
     stage(workspace, "main\n");
     commit(workspace.context, workspace.repo, { message: "main" });
     writeWorkFile(workspace, "/tracked.txt", "dirty\n");
-    const beforeHead = workspace.repo.store.reflog("HEAD").length;
+    const beforeHead = workspace.repo.checkout.reflog("HEAD").length;
 
     expect(() =>
       switchBranch(workspace.context, workspace.repo, workspace.worktree, {
@@ -599,7 +599,7 @@ describe("local ref operations", () => {
 
     expect(workspace.repo.store.getRef("refs/heads/topic")).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/topic")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toHaveLength(beforeHead);
+    expect(workspace.repo.checkout.reflog("HEAD")).toHaveLength(beforeHead);
   });
 });
 
@@ -613,9 +613,9 @@ describe("fixture import", () => {
     fixture.git("tag", "v1");
     const workspace = repository();
 
-    await importFixture(fixture, workspace.repo.store);
+    await importFixture(fixture, workspace.repo.checkout);
 
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
     expect(workspace.repo.store.reflog("refs/heads/side")).toEqual([]);
     expect(workspace.repo.store.reflog("refs/tags/v1")).toEqual([]);

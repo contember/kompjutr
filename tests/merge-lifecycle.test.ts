@@ -108,7 +108,7 @@ function crissCrossDivergence(): CrissCrossHistory {
 
 async function clonedFrom(fixture: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
-  await importFixture(fixture, workspace.repo.store);
+  await importFixture(fixture, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", IDENTITY.name);
   workspace.repo.store.configSet("user.email", IDENTITY.email);
@@ -121,7 +121,7 @@ function textAt(workspace: TestRepository, path: string): string | null {
 }
 
 function indexLines(repo: Repository): string[] {
-  return repo.store
+  return repo.checkout
     .indexEntries()
     .map(
       (entry) =>
@@ -138,11 +138,11 @@ function reopen(workspace: TestRepository): { context: GitContext; repo: Reposit
   const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
     now: workspace.context.now,
   });
-  const row = database.find("/");
+  const row = database.findCheckout("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
     context: { ...workspace.context, database },
-    repo: new Repository(database.open(row), "/"),
+    repo: new Repository(database.openCheckout(row)),
   };
 }
 
@@ -158,7 +158,7 @@ function nativeGit(workspace: TestRepository): Git {
 
 function snapshot(workspace: TestRepository): {
   refs: ReturnType<TestRepository["repo"]["store"]["listRefs"]>;
-  index: ReturnType<TestRepository["repo"]["store"]["indexEntries"]>;
+  index: ReturnType<TestRepository["repo"]["checkout"]["indexEntries"]>;
   objects: number;
   conflict: string | null;
   sentinel: string | null;
@@ -167,7 +167,7 @@ function snapshot(workspace: TestRepository): {
 } {
   return {
     refs: workspace.repo.store.listRefs(),
-    index: workspace.repo.store.indexEntries(),
+    index: workspace.repo.checkout.indexEntries(),
     objects: workspace.repo.store.objectCount(),
     conflict: textAt(workspace, "conflict.txt"),
     sentinel: textAt(workspace, "sentinel.txt"),
@@ -205,7 +205,7 @@ describe("merge lifecycle", () => {
     ).toEqual({ oid: current, alreadyMerged: true });
 
     expect(snapshot(workspace)).toEqual(before);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     expect(
       [...(workspace.storage.histogram?.keys() ?? [])].filter((query) =>
         /^(?:INSERT|UPDATE|DELETE|REPLACE)/.test(query),
@@ -226,7 +226,7 @@ describe("merge lifecycle", () => {
     writeWorkFile(workspace, "/sentinel.txt", "dirty sentinel\n");
     writeWorkFile(workspace, "/staged.txt", "staged\n");
     add(workspace.repo, workspace.worktree, { paths: ["staged.txt"] });
-    const staged = workspace.repo.store.indexGet("staged.txt");
+    const staged = workspace.repo.checkout.indexGet("staged.txt");
     writeWorkFile(workspace, "/untracked.txt", "untracked\n");
 
     await expect(nativeGit(workspace).merge({ theirs: "topic", commit: false })).resolves.toEqual({
@@ -239,10 +239,10 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "sentinel.txt")).toBe("dirty sentinel\n");
     expect(textAt(workspace, "staged.txt")).toBe("staged\n");
     expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
-    expect(workspace.repo.store.indexGet("staged.txt")).toEqual(staged);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.indexGet("staged.txt")).toEqual(staged);
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     const named = workspace.repo.store.reflog("refs/heads/main")[0];
-    const head = workspace.repo.store.reflog("HEAD")[0];
+    const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(named).toMatchObject({
       oldOid: base,
       newOid: incoming,
@@ -310,11 +310,11 @@ describe("merge lifecycle", () => {
     fixture.commit("topic");
     fixture.git("checkout", "-q", "main");
     const workspace = await clonedFrom(fixture);
-    const sentinel = workspace.repo.store.indexGet("sentinel.txt");
+    const sentinel = workspace.repo.checkout.indexGet("sentinel.txt");
     if (sentinel === null) throw new Error("missing sentinel index entry");
-    workspace.repo.store.indexRemove("sentinel.txt");
-    workspace.repo.store.indexPut({ ...sentinel, stage: 1 });
-    workspace.repo.store.indexPut({ ...sentinel, stage: 2 });
+    workspace.repo.checkout.indexRemove("sentinel.txt");
+    workspace.repo.checkout.indexPut({ ...sentinel, stage: 1 });
+    workspace.repo.checkout.indexPut({ ...sentinel, stage: 2 });
     const before = snapshot(workspace);
 
     expect(() =>
@@ -323,9 +323,9 @@ describe("merge lifecycle", () => {
 
     expect(snapshot(workspace)).toEqual(before);
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("rejects large dirty-file hashing before the merge SQL limit", async () => {
@@ -348,7 +348,7 @@ describe("merge lifecycle", () => {
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(workspace.repo.head().oid).toBe(base);
     expect(textAt(workspace, "guard.txt")).toBe(dirty);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("creates the same clean divergent merge commit with current then incoming parents", async () => {
@@ -368,7 +368,7 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "main.txt")).toBe("main\n");
     expect(textAt(workspace, "topic.txt")).toBe("topic\n");
     const named = workspace.repo.store.reflog("refs/heads/main")[0];
-    const head = workspace.repo.store.reflog("HEAD")[0];
+    const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(named).toMatchObject({
       oldOid: history.current,
       newOid: expected,
@@ -391,8 +391,8 @@ describe("merge lifecycle", () => {
     const history = cleanDivergence();
     const workspace = await clonedFrom(history.fixture);
     const before = snapshot(workspace);
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       originalUpdate(mutation, metadata);
       throw new Error("late merge publication fault");
     };
@@ -403,7 +403,7 @@ describe("merge lifecycle", () => {
 
     expect(snapshot(workspace)).toEqual(before);
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("bounds configured reflog identity reads and skips them for an explicit actor", () => {
@@ -453,17 +453,17 @@ describe("merge lifecycle", () => {
       ),
     ).toEqual({ pendingCommit: true });
     expect(workspace.repo.head().oid).toBe(history.current);
-    expect(workspace.repo.store.requireMergeState().state.phase).toBe("ready");
+    expect(workspace.repo.checkout.requireMergeState().state.phase).toBe("ready");
     expect(textAt(workspace, "topic.txt")).toBe("topic\n");
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
 
     const cold = reopen(workspace);
     const result = mergeContinue(cold.context, cold.repo);
 
     if (result.oid === undefined) throw new Error("merge continuation returned no oid");
     expect(cold.repo.readCommit(result.oid).parent).toEqual([history.current, history.incoming]);
-    expect(cold.repo.store.readMergeState()).toBeNull();
+    expect(cold.repo.checkout.readMergeState()).toBeNull();
     expect(cold.repo.store.reflog("refs/heads/main")).toEqual([
       expect.objectContaining({
         oldOid: history.current,
@@ -517,7 +517,7 @@ describe("merge lifecycle", () => {
     );
     workspace.repo.store.setRef("refs/heads/main", current);
     workspace.repo.store.setRef("refs/heads/topic", incoming);
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       entries.map((entry) => ({
         path: entry.name,
         stage: 0,
@@ -538,8 +538,8 @@ describe("merge lifecycle", () => {
       }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
-    expect(workspace.repo.store.indexGet("z-added")).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.indexGet("z-added")).toBeNull();
   });
 
   it("lets ordinary public commit finalize a pending merge exactly once", async () => {
@@ -556,7 +556,7 @@ describe("merge lifecycle", () => {
       history.current,
       history.incoming,
     ]);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     await expect(git.mergeContinue()).rejects.toMatchObject({ code: "ENOMERGE" });
     await expect(git.mergeAbort()).rejects.toMatchObject({ code: "ENOMERGE" });
   });
@@ -588,7 +588,7 @@ describe("merge lifecycle", () => {
         message: "x".repeat(1024 * 1024 + 1),
       }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(workspace.repo.store.readMergeState()).not.toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).not.toBeNull();
 
     mergeAbort(workspace.repo, workspace.worktree);
     expect(() =>
@@ -632,7 +632,7 @@ describe("merge lifecycle", () => {
     if (result.oid === undefined) throw new Error("forced merge returned no oid");
     expect(forced.repo.readCommit(result.oid).parent).toEqual([base, incoming]);
     expect(forced.repo.head().oid).toBe(result.oid);
-    expect(forced.repo.store.readMergeState()).toBeNull();
+    expect(forced.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("matches Git conflict markers and stages, then continues after add", async () => {
@@ -648,9 +648,9 @@ describe("merge lifecycle", () => {
     expect(result).toEqual({ conflicted: true, pendingCommit: true });
     expect(textAt(workspace, "conflict.txt")).toBe(gitMarkers);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(history.fixture));
-    expect(workspace.repo.store.requireMergeState().state.phase).toBe("conflicted");
+    expect(workspace.repo.checkout.requireMergeState().state.phase).toBe("conflicted");
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
 
     writeWorkFile(workspace, "/conflict.txt", "resolved\n");
     add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
@@ -666,7 +666,7 @@ describe("merge lifecycle", () => {
     expect(commit.tree).toBe(history.fixture.git("rev-parse", `${expected}^{tree}`));
     expect(commit.message).toBe(`${history.fixture.git("log", "-1", "--format=%B", expected)}\n`);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(history.fixture));
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([
       expect.objectContaining({
         oldOid: history.current,
@@ -684,7 +684,7 @@ describe("merge lifecycle", () => {
     const workspace = await clonedFrom(history.fixture);
     writeWorkFile(workspace, "/sentinel.txt", "dirty sentinel\n");
     writeWorkFile(workspace, "/untracked.txt", "untracked sentinel\n");
-    const beforeIndex = workspace.repo.store.indexEntries();
+    const beforeIndex = workspace.repo.checkout.indexEntries();
 
     expect(
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
@@ -694,23 +694,23 @@ describe("merge lifecycle", () => {
     mergeAbort(workspace.repo, workspace.worktree);
 
     expect(workspace.repo.head().oid).toBe(history.current);
-    expect(workspace.repo.store.indexEntries()).toEqual(beforeIndex);
+    expect(workspace.repo.checkout.indexEntries()).toEqual(beforeIndex);
     expect(textAt(workspace, "conflict.txt")).toBe("current\n");
     expect(textAt(workspace, "sentinel.txt")).toBe("dirty sentinel\n");
     expect(textAt(workspace, "untracked.txt")).toBe("untracked sentinel\n");
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("restores an originally missing tracked conflict path on abort", async () => {
     const history = conflictingDivergence();
     const workspace = await clonedFrom(history.fixture);
     workspace.worktree.unlink("/conflict.txt");
-    const originalIndex = workspace.repo.store.indexGet("conflict.txt");
+    const originalIndex = workspace.repo.checkout.indexGet("conflict.txt");
 
     expect(
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
     ).toEqual({ conflicted: true, pendingCommit: true });
-    expect(workspace.repo.store.requireMergeState().touched).toEqual(
+    expect(workspace.repo.checkout.requireMergeState().touched).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: "conflict.txt", worktree: { kind: "absent" } }),
       ]),
@@ -719,8 +719,8 @@ describe("merge lifecycle", () => {
     mergeAbort(workspace.repo, workspace.worktree);
 
     expect(textAt(workspace, "conflict.txt")).toBeNull();
-    expect(workspace.repo.store.indexGet("conflict.txt")).toEqual(originalIndex);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.indexGet("conflict.txt")).toEqual(originalIndex);
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("rejects a journal path retarget before abort can delete unrelated content", async () => {
@@ -734,7 +734,7 @@ describe("merge lifecycle", () => {
     workspace.database.db.run(
       `UPDATE git_operation_touched
           SET path = 'sentinel.txt', logical_path = 'sentinel.txt'
-        WHERE repo_id = ? AND path = 'conflict.txt'`,
+        WHERE checkout_id = ? AND path = 'conflict.txt'`,
       workspace.repo.store.repoId,
     );
 
@@ -744,7 +744,7 @@ describe("merge lifecycle", () => {
     expect(textAt(workspace, "sentinel.txt")).toBe("unrelated\n");
     expect(
       workspace.database.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_operation_state WHERE repo_id = ?",
+        "SELECT COUNT(*) FROM git_operation_state WHERE checkout_id = ?",
         workspace.repo.store.repoId,
       ),
     ).toBe(1);
@@ -757,12 +757,12 @@ describe("merge lifecycle", () => {
     expect(
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
     ).toEqual({ conflicted: true, pendingCommit: true });
-    const incoming = workspace.repo.store.indexGet("conflict.txt", 3);
+    const incoming = workspace.repo.checkout.indexGet("conflict.txt", 3);
     if (incoming === null) throw new Error("expected incoming conflict stage");
     workspace.database.db.run(
       `UPDATE git_operation_touched
           SET worktree_oid = ?
-        WHERE repo_id = ? AND path = 'conflict.txt'`,
+        WHERE checkout_id = ? AND path = 'conflict.txt'`,
       incoming.oid,
       workspace.repo.store.repoId,
     );
@@ -772,7 +772,7 @@ describe("merge lifecycle", () => {
     );
     expect(
       workspace.database.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_operation_state WHERE repo_id = ?",
+        "SELECT COUNT(*) FROM git_operation_state WHERE checkout_id = ?",
         workspace.repo.store.repoId,
       ),
     ).toBe(1);
@@ -799,7 +799,7 @@ describe("merge lifecycle", () => {
     writeWorkFile(workspace, "/conflict.txt", "resolved\n");
     add(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
     workspace.database.db.run(
-      "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE repo_id = ?",
+      "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE checkout_id = ?",
       alternate,
       workspace.repo.store.repoId,
     );
@@ -809,7 +809,7 @@ describe("merge lifecycle", () => {
     );
     expect(workspace.repo.head().oid).toBe(current);
     const persisted = workspace.database.db.scalar<string>(
-      "SELECT incoming_parent_oid FROM git_operation_state WHERE repo_id = ?",
+      "SELECT incoming_parent_oid FROM git_operation_state WHERE checkout_id = ?",
       workspace.repo.store.repoId,
     );
     expect(persisted).toBe(alternate);
@@ -832,7 +832,7 @@ describe("merge lifecycle", () => {
     ).toThrowError(expect.objectContaining({ code: "EMERGEFAIL" }));
 
     expect(snapshot(workspace)).toEqual(before);
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("enforces public interlocks and lets hard reset clear an active merge", async () => {
@@ -858,10 +858,10 @@ describe("merge lifecycle", () => {
 
     await git.reset({ hard: true });
 
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     expect(workspace.repo.head().oid).toBe(history.current);
     expect(textAt(workspace, "conflict.txt")).toBe("current\n");
-    expect(workspace.repo.store.hasConflicts()).toBe(false);
+    expect(workspace.repo.checkout.hasConflicts()).toBe(false);
   });
 
   it("matches Git when multiple best bases require a synthetic virtual ancestor", async () => {
@@ -883,7 +883,7 @@ describe("merge lifecycle", () => {
 
     expect(indexLines(workspace.repo)).toEqual(expectedIndex);
     expect(textAt(workspace, "conflict.txt")).toBe(expectedWorktree);
-    const stageOne = workspace.repo.store.indexGet("conflict.txt", 1);
+    const stageOne = workspace.repo.checkout.indexGet("conflict.txt", 1);
     if (stageOne === null) throw new Error("virtual merge produced no stage-one base");
     const synthetic = workspace.repo.read(stageOne.oid);
     expect(synthetic.type).toBe("blob");

@@ -493,14 +493,14 @@ describe("git schema", () => {
   it("enforces current reflog lifecycle foreign keys", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/repo", "ref: refs/heads/main");
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
     db.run(
       `INSERT INTO git_reflog_entries
          (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
           actor_name, actor_email, timestamp, timezone, reason)
        VALUES (?, 'refs/tags/x', 1, NULL, ?, NULL, ?,
                NULL, NULL, 0, 0, 'init')`,
-      repository.id,
+      repository.repoId,
       "1".repeat(40),
       "1".repeat(40),
     );
@@ -510,11 +510,11 @@ describe("git schema", () => {
           actor_name, actor_email, timestamp, timezone, reason)
        VALUES (?, ?, 2, NULL, 'ref: refs/heads/main', NULL, NULL,
                NULL, NULL, 0, 0, 'init')`,
-      repository.checkoutId,
       repository.id,
+      repository.repoId,
     );
 
-    db.run("DELETE FROM git_repositories WHERE id = ?", repository.id);
+    db.run("DELETE FROM git_repositories WHERE id = ?", repository.repoId);
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_reflog_state")).toBe(0);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries")).toBe(0);

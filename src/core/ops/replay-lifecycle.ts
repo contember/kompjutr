@@ -104,8 +104,8 @@ function requireReplayJournal(
   kind: ReplayKind,
 ): CherryPickJournal | RevertJournal {
   return kind === "cherry-pick"
-    ? repo.store.requireOperationState("cherry-pick")
-    : repo.store.requireOperationState("revert");
+    ? repo.checkout.requireOperationState("cherry-pick")
+    : repo.checkout.requireOperationState("revert");
 }
 
 function savedIdentity(identity: GitIdentity | undefined): GitIdentity | null {
@@ -312,7 +312,7 @@ export function startReplay(
   policy: ReplayPolicy,
 ): ReplayResult {
   return repo.store.db.transactionSync(() => {
-    repo.store.requireNoOperationState();
+    repo.checkout.requireNoOperationState();
     const head = requireReplayHead(repo, policy.kind);
     const currentTree = repo.readCommit(head.oid).tree;
     requireBoundedIntegrationIndex(repo);
@@ -332,7 +332,7 @@ export function startReplay(
         requireSql(prior);
         const reason = emptyReason(plan);
         if (policy.suspendEmpty) {
-          repo.store.writeOperationState(
+          repo.checkout.writeOperationState(
             replayState(policy, plan, head, "empty", reason, message, input),
             [],
           );
@@ -412,7 +412,7 @@ export function continueReplay(
         if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
         return { outcome: "empty", reason };
       }
-      if (repo.store.hasConflicts()) {
+      if (repo.checkout.hasConflicts()) {
         throw new GitError(
           "EUNMERGED",
           `cannot continue ${policy.kind}: the index has unmerged paths`,
@@ -428,13 +428,13 @@ export function continueReplay(
         );
         const reason: ReplayEmptyReason = "result";
         if (policy.suspendEmpty) {
-          repo.store.replaceOperationState(journal.integrityOid, {
+          repo.checkout.replaceOperationState(journal.integrityOid, {
             ...journal.state,
             phase: "empty",
             emptyReason: reason,
           });
         } else {
-          repo.store.clearOperationState();
+          repo.checkout.clearOperationState();
         }
         return { outcome: "empty", reason };
       }
@@ -459,7 +459,7 @@ export function continueReplay(
         expectedHead: head,
         refLogReason: policy.kind,
       });
-      repo.store.clearOperationState();
+      repo.checkout.clearOperationState();
       return { outcome: "committed", oid: result.oid };
     } finally {
       verified.reservation.dispose();
@@ -488,7 +488,7 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
           ),
         );
       }
-      repo.store.clearOperationState();
+      repo.checkout.clearOperationState();
     } finally {
       verified.reservation.dispose();
     }

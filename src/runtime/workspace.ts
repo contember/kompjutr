@@ -51,8 +51,8 @@ export class Workspace {
       initializeIndexTracker(this.db);
       const now = this.#options.now ?? Date.now;
       const indexTracker: IndexTrackerWriter = {
-        reseal: (repoId, baselineTreeOid, entries) =>
-          resealIndexTracker(this.db, repoId, baselineTreeOid, entries),
+        reseal: (checkoutId, baselineTreeOid, entries) =>
+          resealIndexTracker(this.db, checkoutId, baselineTreeOid, entries),
       };
       const binding = {
         database: this.#gitDatabase,

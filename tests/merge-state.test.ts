@@ -104,8 +104,8 @@ function touched(): readonly MergeTouchedPath[] {
 function open() {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
-  const repository = database.create("/repo", "ref: refs/heads/main");
-  const store = database.open(repository);
+  const repository = database.createRepository("/repo", "ref: refs/heads/main");
+  const store = database.openCheckout(repository);
   store.write("tree", TREE_BYTES);
   store.write("commit", ORIGINAL_BYTES);
   store.write("commit", INCOMING_BYTES);
@@ -125,7 +125,7 @@ describe("durable merge journal", () => {
 
     expect(db.storage.statementCount).toBeLessThan(10);
     const coldDatabase = new SqliteGitDatabase(db);
-    const cold = coldDatabase.open(repository);
+    const cold = coldDatabase.openCheckout(repository);
     db.storage.resetCounters();
     expect(cold.requireMergeState()).toEqual({
       state,
@@ -139,12 +139,12 @@ describe("durable merge journal", () => {
     const ddl = open();
     ddl.store.writeMergeState(metadata(), touched());
     expect(() =>
-      ddl.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE repo_id = 1"),
+      ddl.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE checkout_id = 1"),
     ).toThrow();
 
     const tampered = open();
     tampered.store.writeMergeState(metadata(), touched());
-    tampered.db.run("UPDATE git_operation_state SET merge_origin = 'pull' WHERE repo_id = 1");
+    tampered.db.run("UPDATE git_operation_state SET merge_origin = 'pull' WHERE checkout_id = 1");
     expect(() => tampered.store.readMergeState()).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
@@ -152,7 +152,7 @@ describe("durable merge journal", () => {
     const invalid = open();
     invalid.store.writeMergeState(metadata(), touched());
     invalid.db.run("PRAGMA ignore_check_constraints = ON");
-    invalid.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE repo_id = 1");
+    invalid.db.run("UPDATE git_operation_state SET merge_origin = 'fetch' WHERE checkout_id = 1");
     invalid.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => invalid.store.readMergeState()).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
@@ -203,7 +203,9 @@ describe("durable merge journal", () => {
     expect(store.clearMergeState()).toBe(false);
 
     store.writeMergeState(metadata(), touched());
-    db.run("DELETE FROM git_operation_state WHERE repo_id = 1");
+    db.run("PRAGMA foreign_keys = OFF");
+    db.run("DELETE FROM git_operation_state WHERE checkout_id = 1");
+    db.run("PRAGMA foreign_keys = ON");
     expect(() => store.readMergeState()).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
@@ -263,7 +265,7 @@ describe("durable merge journal", () => {
         name: "phase",
         corrupt: (db) => {
           db.run("PRAGMA ignore_check_constraints = ON");
-          db.run("UPDATE git_operation_state SET phase = 'applying' WHERE repo_id = 1");
+          db.run("UPDATE git_operation_state SET phase = 'applying' WHERE checkout_id = 1");
           db.run("PRAGMA ignore_check_constraints = OFF");
         },
         code: "ECORRUPT",
@@ -283,7 +285,7 @@ describe("durable merge journal", () => {
         name: "count",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_operation_state SET touched_count = ? WHERE repo_id = 1",
+            "UPDATE git_operation_state SET touched_count = ? WHERE checkout_id = 1",
             MAX_MERGE_TOUCHED_PATHS + 1,
           ),
         code: "E2BIG",
@@ -292,7 +294,7 @@ describe("durable merge journal", () => {
         name: "retained bytes",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_operation_state SET retained_bytes = retained_bytes + 1 WHERE repo_id = 1",
+            "UPDATE git_operation_state SET retained_bytes = retained_bytes + 1 WHERE checkout_id = 1",
           ),
         code: "ECORRUPT",
       },
@@ -331,7 +333,7 @@ describe("durable merge journal", () => {
       store.writeMergeState(metadata(), touched());
       db.run("PRAGMA ignore_check_constraints = ON");
       db.run(
-        `UPDATE git_operation_state SET ${column} = zeroblob(?) WHERE repo_id = 1`,
+        `UPDATE git_operation_state SET ${column} = zeroblob(?) WHERE checkout_id = 1`,
         MAX_MERGE_MESSAGE_BYTES + 1,
       );
       db.run("PRAGMA ignore_check_constraints = OFF");
@@ -366,14 +368,17 @@ describe("durable merge journal", () => {
         name: "missing parent",
         corrupt: (db) =>
           db.run(
-            "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE repo_id = 1",
+            "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE checkout_id = 1",
             "f".repeat(40),
           ),
       },
       {
         name: "parent is a blob",
         corrupt: (db) =>
-          db.run("UPDATE git_operation_state SET incoming_parent_oid = ? WHERE repo_id = 1", FILE),
+          db.run(
+            "UPDATE git_operation_state SET incoming_parent_oid = ? WHERE checkout_id = 1",
+            FILE,
+          ),
       },
       {
         name: "index file is a commit",

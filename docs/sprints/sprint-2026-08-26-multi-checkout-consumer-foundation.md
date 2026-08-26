@@ -339,3 +339,8 @@ schema/mutation review before the next dependent phase. Do not overlap writers i
   `HEAD` reflogs atomic with the 9,727/9,728 bound and stable `EBRANCHINUSE`.
   All 189 focused tests, typecheck, and check passed; independent review approved.
   The full suite waits for WU3 to migrate legacy raw-SQL fixtures.
+- 2026-08-26 — WU3 bound each `Repository` to one checkout over shared routing,
+  removed the temporary compatibility aliases, and proved one-lookup opens and
+  cross-view shallow coherence. A blocked real-Git rebase exposed the fixture's
+  missing deterministic editors; pinning both editors closed that harness gap.
+  All 106 test files passed (1,879 pass, 5 skip); typecheck and check passed.

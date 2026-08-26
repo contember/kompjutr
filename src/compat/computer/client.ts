@@ -111,7 +111,7 @@ export function createSqliteGitClient(
       },
       async fetch(input = {}) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         return fetchInto(ctx(), repo, input);
       },
       async init(input = {}) {
@@ -173,7 +173,7 @@ export function createSqliteGitClient(
       },
       async clean(input = {}) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         return cleanOp(repo, ctx().worktree, { ...input, excludeRoots: excludeRoots(repo) });
       },
 
@@ -194,16 +194,16 @@ export function createSqliteGitClient(
         if (input.hard === true) {
           repo.store.db.transactionSync(() => {
             resetOp(ctx(), repo, ctx().worktree, input);
-            repo.store.clearOperationState();
+            repo.checkout.clearOperationState();
           });
           return;
         }
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         resetOp(ctx(), repo, ctx().worktree, input);
       },
       async commit(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         return commitOp(ctx(), repo, input);
       },
 
@@ -232,12 +232,12 @@ export function createSqliteGitClient(
 
       async branch(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         branchOp(ctx(), repo, input);
       },
       async branchDelete(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         branchDeleteOp(ctx(), repo, input);
       },
       async branchList(input = {}) {
@@ -245,12 +245,12 @@ export function createSqliteGitClient(
       },
       async tag(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         tagOp(ctx(), repo, input);
       },
       async tagDelete(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         tagDeleteOp(ctx(), repo, input);
       },
       async tagList(input = {}) {
@@ -258,7 +258,7 @@ export function createSqliteGitClient(
       },
       async checkout(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         checkoutOp(ctx(), repo, ctx().worktree, input);
       },
 
@@ -291,7 +291,7 @@ export function createSqliteGitClient(
       },
       async updateRef(input) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         updateRefOp(ctx(), repo, input);
       },
 
@@ -299,12 +299,12 @@ export function createSqliteGitClient(
       // can bind it today and find out precisely what is missing.
       async push(input = {}) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         return pushOp(ctx(), repo, input);
       },
       async pull(input = {}) {
         const repo = at(input.dir);
-        repo.store.requireNoOperationState();
+        repo.checkout.requireNoOperationState();
         await pullOp(ctx(), repo, ctx().worktree, input, { persistConflicts: false });
       },
       async merge(input) {

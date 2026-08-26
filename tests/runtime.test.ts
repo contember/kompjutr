@@ -77,7 +77,7 @@ describe("Workspace", () => {
       workspace.db.scalar<number>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'index_tracker_%'",
       ),
-    ).toBe(16);
+    ).toBe(15);
   });
 
   it("keeps filesystem-only workspaces free of Git schema", async () => {

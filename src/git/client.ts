@@ -302,7 +302,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async fetch(input = {}) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       return fetchInto(context, repo, input);
     },
     async init(input = {}) {
@@ -337,7 +337,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async clean(input = {}) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       return cleanOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
     },
     async add(input) {
@@ -353,16 +353,16 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       if (input.hard === true) {
         repo.store.db.transactionSync(() => {
           resetOp(context, repo, context.worktree, input);
-          repo.store.clearOperationState();
+          repo.checkout.clearOperationState();
         });
         return;
       }
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       resetOp(context, repo, context.worktree, input);
     },
     async commit(input) {
       const repo = at(input.dir);
-      const operation = repo.store.readOperationState();
+      const operation = repo.checkout.readOperationState();
       if (operation?.kind === "merge") {
         if (input.amend === true) {
           throw new GitError("EINVAL", "cannot amend while continuing a merge");
@@ -373,7 +373,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
         }
         return { oid: result.oid };
       }
-      if (operation !== null) repo.store.requireNoOperationState();
+      if (operation !== null) repo.checkout.requireNoOperationState();
       return commitOp(context, repo, input);
     },
     async log(input = {}) {
@@ -390,7 +390,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async recoverRef(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       recoverRefOp(context, repo, input);
     },
     async repoRoot(input = {}) {
@@ -408,12 +408,12 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async branch(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       branchOp(context, repo, input);
     },
     async branchDelete(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       branchDeleteOp(context, repo, input);
     },
     async branchList(input = {}) {
@@ -421,12 +421,12 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async tag(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       tagOp(context, repo, input);
     },
     async tagDelete(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       tagDeleteOp(context, repo, input);
     },
     async tagList(input = {}) {
@@ -434,7 +434,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async checkout(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       checkoutOp(context, repo, context.worktree, input);
     },
     async remoteAdd(input) {
@@ -465,17 +465,17 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async updateRef(input) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       updateRefOp(context, repo, input);
     },
     async push(input = {}) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       return pushOp(context, repo, input);
     },
     async pull(input = {}) {
       const repo = at(input.dir);
-      repo.store.requireNoOperationState();
+      repo.checkout.requireNoOperationState();
       return pullOp(context, repo, context.worktree, input);
     },
     async merge(input) {

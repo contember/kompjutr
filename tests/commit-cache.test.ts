@@ -86,8 +86,8 @@ class MeasuredDatabase implements SqlDatabase {
 
 function open(db: SqlDatabase = new TestDatabase()) {
   const database = new SqliteGitDatabase(db);
-  const repository = database.create("/repo", "ref: refs/heads/main");
-  return database.open(repository);
+  const repository = database.createRepository("/repo", "ref: refs/heads/main");
+  return database.openCheckout(repository);
 }
 
 function fixture(message = "subject\n\nbody\n"): Commit {
@@ -276,7 +276,7 @@ describe("parsed commit cache", () => {
     expect(store.cachedCommit(oid)).toBeNull();
   });
 
-  it("batch-inserts prepared point misses through the RepoStore seam", () => {
+  it("batch-inserts prepared point misses through the shared-store seam", () => {
     const store = open();
     const sources = [fixture("first\n"), fixture("second\n")].map((commit) => {
       const data = serializeCommit(commit);
@@ -637,8 +637,12 @@ describe("parsed commit cache", () => {
   it("isolates identical commit graphs and shallow boundaries by repository", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const first = database.open(database.create("/first", "ref: refs/heads/main"));
-    const second = database.open(database.create("/second", "ref: refs/heads/main"));
+    const first = database.openCheckout(
+      database.createRepository("/first", "ref: refs/heads/main"),
+    );
+    const second = database.openCheckout(
+      database.createRepository("/second", "ref: refs/heads/main"),
+    );
     const firstOids = commitChain(first, 2);
     const secondOids = commitChain(second, 2);
     expect(firstOids).toEqual(secondOids);

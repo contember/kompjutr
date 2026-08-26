@@ -196,9 +196,9 @@ function makeChangedFiles(
       rev: stat.rev,
     };
   });
-  workspace.repo.store.indexReplace(original);
+  workspace.repo.checkout.indexReplace(original);
   const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
-  workspace.repo.store.indexReplace(
+  workspace.repo.checkout.indexReplace(
     original.map((entry, index) =>
       index < changedFiles ? { ...entry, oid: afterOid, size: after.length } : entry,
     ),
@@ -215,8 +215,8 @@ function makeChangedFiles(
       contentId: fromHex(beforeOid),
     })),
   );
-  workspace.repo.store.indexReplace(original);
-  workspace.repo.store.setHead(base);
+  workspace.repo.checkout.indexReplace(original);
+  workspace.repo.checkout.setHead(base);
   sealIndexTracker(workspace);
   return { workspace, base, target, paths };
 }
@@ -226,7 +226,7 @@ describe("sparse checkout", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a", "a\n");
     stageWorktreePaths(workspace, ["a"]);
-    const entry = workspace.repo.store.indexGet("a");
+    const entry = workspace.repo.checkout.indexGet("a");
     if (entry === null) throw new Error("missing plan boundary index entry");
     const change: SparseCheckoutChange = {
       path: "a",
@@ -242,13 +242,13 @@ describe("sparse checkout", () => {
     ).toBe(false);
     expect(workspace.storage.statementCount).toBe(0);
     expect(workspace.worktree.stat("/a")?.type).toBe("file");
-    expect(workspace.repo.store.indexGet("a")).not.toBeNull();
+    expect(workspace.repo.checkout.indexGet("a")).not.toBeNull();
 
     expect(
       checkoutSparseChanges(workspace.repo, workspace.worktree, [change], exactPlanBytes),
     ).toBe(true);
     expect(workspace.worktree.stat("/a")).toBeNull();
-    expect(workspace.repo.store.indexGet("a")).toBeNull();
+    expect(workspace.repo.checkout.indexGet("a")).toBeNull();
   });
 
   it("charges a large symlink target before raw egress and checkout mutation", () => {
@@ -257,7 +257,7 @@ describe("sparse checkout", () => {
     const largeTarget = "t".repeat(512 * 1024);
     workspace.worktree.symlink(largeTarget, "/link");
     stageWorktreePaths(workspace, ["link"]);
-    const baseEntry = workspace.repo.store.indexGet("link");
+    const baseEntry = workspace.repo.checkout.indexGet("link");
     if (baseEntry === null) throw new Error("missing large symlink index entry");
     const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
 
@@ -268,8 +268,8 @@ describe("sparse checkout", () => {
     workspace.worktree.writeFiles([
       { path: "/link", target: largeTarget, contentId: fromHex(baseEntry.oid) },
     ]);
-    workspace.repo.store.indexReplace([baseEntry]);
-    workspace.repo.store.setHead(base);
+    workspace.repo.checkout.indexReplace([baseEntry]);
+    workspace.repo.checkout.setHead(base);
     sealIndexTracker(workspace);
 
     const probe = new WorktreePayloadProbe(workspace.database.db);
@@ -278,7 +278,7 @@ describe("sparse checkout", () => {
     const exactRetainedBytes = 1_420 + largeTarget.length * 2 + 20;
     const exact = source.hydrate({
       repoId: workspace.repo.store.repoId,
-      checkoutId: workspace.repo.store.checkoutId,
+      checkoutId: workspace.repo.checkout.checkoutId,
       root: "/",
       baselineTreeOid: null,
       currentTreeOid: null,
@@ -334,13 +334,13 @@ describe("sparse checkout", () => {
     expect(worktree.writes).toEqual(sparse.paths.slice(0, 2).map((path) => `/${path}`));
     expect(sparse.workspace.repo.headTree()).toBe(legacy.workspace.repo.headTree());
     expect(
-      [...sparse.workspace.repo.store.indexScan()].map(({ path, mode, oid }) => ({
+      [...sparse.workspace.repo.checkout.indexScan()].map(({ path, mode, oid }) => ({
         path,
         mode,
         oid,
       })),
     ).toEqual(
-      [...legacy.workspace.repo.store.indexScan()].map(({ path, mode, oid }) => ({
+      [...legacy.workspace.repo.checkout.indexScan()].map(({ path, mode, oid }) => ({
         path,
         mode,
         oid,
@@ -358,7 +358,7 @@ describe("sparse checkout", () => {
   it("keeps a clean forced same target free of filesystem and index writes", () => {
     const { workspace, base } = makeChangedFiles(2, 0);
     const worktree = new NoScanWorktree(workspace.worktree);
-    const before = [...workspace.repo.store.indexScan()];
+    const before = [...workspace.repo.checkout.indexScan()];
     workspace.storage.histogram = new Map();
 
     workspace.storage.resetCounters();
@@ -369,7 +369,7 @@ describe("sparse checkout", () => {
 
     expect(worktree.writes).toEqual([]);
     expect(worktree.removals).toEqual([]);
-    expect([...workspace.repo.store.indexScan()]).toEqual(before);
+    expect([...workspace.repo.checkout.indexScan()]).toEqual(before);
     expect(
       [...workspace.storage.histogram.keys()].filter(
         (query) =>
@@ -400,8 +400,8 @@ describe("sparse checkout", () => {
     expect(workspace.repo.head().oid).toBe(target);
     for (const path of paths) {
       const hashed = hashWorktreePath(workspace.repo, workspace.worktree, path, { write: false });
-      expect(workspace.repo.store.indexGet(path)?.oid).toBe(hashed?.oid);
-      expect(workspace.repo.store.indexGet(path)?.mode.toString(8)).toBe(hashed?.mode);
+      expect(workspace.repo.checkout.indexGet(path)?.oid).toBe(hashed?.oid);
+      expect(workspace.repo.checkout.indexGet(path)?.mode.toString(8)).toBe(hashed?.mode);
     }
   });
 
@@ -420,12 +420,14 @@ describe("sparse checkout", () => {
     expect(workspace.storage.statementCount).toBe(61);
     expect(workspace.storage.rowCount).toBeLessThan(10_000);
     expect(workspace.repo.head().oid).toBe(target);
-    expect(workspace.context.sparseWorkspace?.readState(workspace.repo.store.checkoutId)).toEqual({
+    expect(
+      workspace.context.sparseWorkspace?.readState(workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: true,
       baselineTreeOid: workspace.repo.headTree(),
     });
     expect([
-      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.checkoutId),
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
     ]).toEqual([]);
   });
 
@@ -441,11 +443,11 @@ describe("sparse checkout", () => {
     workspace.repo.store.setRef("refs/heads/base", base);
 
     workspace.worktree.unlink("/node");
-    workspace.repo.store.indexRemove("node");
+    workspace.repo.checkout.indexRemove("node");
     writeWorkFile(workspace, "/node/child.txt", "nested\n");
     workspace.worktree.unlink("/deleted/old.txt");
     workspace.worktree.rmdir("/deleted");
-    workspace.repo.store.indexRemove("deleted/old.txt");
+    workspace.repo.checkout.indexRemove("deleted/old.txt");
     writeWorkFile(workspace, "/added/new.txt", "new\n");
     workspace.worktree.chmod("/mode.txt", 0o755);
     workspace.worktree.unlink("/link");
@@ -527,7 +529,7 @@ describe("sparse checkout", () => {
 
     const conflicted = makeChangedFiles(2, 1);
     const oid = conflicted.workspace.repo.store.write("blob", utf8.encode("stage\n"));
-    conflicted.workspace.repo.store.indexPut({
+    conflicted.workspace.repo.checkout.indexPut({
       path: "conflict.txt",
       stage: 2,
       mode: 0o100644,
@@ -549,7 +551,7 @@ describe("sparse checkout", () => {
     expect(conflictWorktree.writes).toEqual([]);
 
     const gitlinked = makeChangedFiles(2, 1);
-    gitlinked.workspace.repo.store.indexPut({
+    gitlinked.workspace.repo.checkout.indexPut({
       path: "module",
       stage: 0,
       mode: 0o160000,
@@ -647,12 +649,12 @@ describe("sparse checkout", () => {
         rev: stat.rev,
       };
     });
-    workspace.repo.store.indexReplace(original);
+    workspace.repo.checkout.indexReplace(original);
     const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
-    workspace.repo.store.indexReplace(original.slice(1));
+    workspace.repo.checkout.indexReplace(original.slice(1));
     const target = commit(workspace.context, workspace.repo, { message: "delete one" }).oid;
-    workspace.repo.store.indexReplace(original);
-    workspace.repo.store.setHead(base);
+    workspace.repo.checkout.indexReplace(original);
+    workspace.repo.checkout.setHead(base);
     sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree, () => workspace.storage.statementCount);
 
@@ -684,7 +686,7 @@ describe("sparse checkout", () => {
     const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
     workspace.repo.store.setRef("refs/heads/base", base);
     workspace.worktree.removeFiles(paths.map((path) => `/${path}`));
-    workspace.repo.store.indexClear();
+    workspace.repo.checkout.indexClear();
     const target = commit(workspace.context, workspace.repo, { message: "delete" }).oid;
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
     sealIndexTracker(workspace);
@@ -727,8 +729,8 @@ describe("sparse checkout", () => {
     const path = paths[0];
     if (path === undefined) throw new Error("sparse rollback path missing");
     const before = {
-      head: workspace.repo.store.head(),
-      index: workspace.repo.store.indexGet(path),
+      head: workspace.repo.checkout.head(),
+      index: workspace.repo.checkout.indexGet(path),
       content: utf8Decoder.decode(workspace.worktree.readFile(`/${path}`)),
       entries: workspace.database.db.scalar<number>(
         "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
@@ -755,8 +757,8 @@ describe("sparse checkout", () => {
     );
 
     expect(base).not.toBe(target);
-    expect(workspace.repo.store.head()).toBe(before.head);
-    expect(workspace.repo.store.indexGet(path)).toEqual(before.index);
+    expect(workspace.repo.checkout.head()).toBe(before.head);
+    expect(workspace.repo.checkout.indexGet(path)).toEqual(before.index);
     expect(utf8Decoder.decode(workspace.worktree.readFile(`/${path}`))).toBe(before.content);
     expect(
       workspace.database.db.scalar<number>(

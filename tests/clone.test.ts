@@ -178,7 +178,7 @@ describe("clone", () => {
     try {
       await clone(workspace.context, { url: server.url, dir: "/work" });
 
-      expect(tableRows(workspace, "SELECT root, head FROM git_repositories")).toEqual([
+      expect(tableRows(workspace, "SELECT root, head FROM git_checkouts")).toEqual([
         { root: "/work", head: "ref: refs/heads/main" },
       ]);
       expect(tableRows(workspace, "SELECT name, target FROM git_refs ORDER BY name")).toEqual([
@@ -240,8 +240,10 @@ describe("clone", () => {
       }>(
         workspace,
         `SELECT ref_name, ordinal, old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
-                timestamp, timezone, reason
-           FROM git_reflog_entries
+                timestamp, timezone, reason FROM git_reflog_entries
+          UNION ALL
+         SELECT 'HEAD', ordinal, old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
+                timestamp, timezone, reason FROM git_checkout_reflog_entries
           ORDER BY ordinal`,
       );
       expect(ordered).toEqual([
@@ -324,7 +326,7 @@ describe("clone", () => {
           reason: "clone: checkout",
         },
       ]);
-      expect(repo.store.reflog("HEAD")[0]).toMatchObject({ oldOid: null, newOid: head });
+      expect(repo.checkout.reflog("HEAD")[0]).toMatchObject({ oldOid: null, newOid: head });
     } finally {
       await server.close();
       fixture.dispose();
@@ -495,7 +497,7 @@ describe("clone", () => {
       await expect(
         clone(workspace.context, { url: server.url, dir: "/work", ref: "no-such-branch" }),
       ).rejects.toMatchObject({ code: "EREFNOTFOUND" });
-      expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
       expect(tableRows(workspace, "SELECT pack_id FROM git_pack_meta")).toEqual([]);
     } finally {
       await server.close();
@@ -513,7 +515,7 @@ describe("clone", () => {
         (error: unknown) => error,
       );
       expect(failure).toBeInstanceOf(Error);
-      expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
       expect(tableRows(workspace, "SELECT pack_id, state FROM git_pack_meta")).toEqual([]);
       expect(tableRows(workspace, "SELECT oid FROM git_pack_objects")).toEqual([]);
       expect(tableRows(workspace, "SELECT offset FROM git_pack_pending")).toEqual([]);
@@ -540,11 +542,16 @@ describe("clone", () => {
         provisionalEntries =
           tableRows<{ count: number }>(
             workspace,
-            "SELECT count(*) AS count FROM git_reflog_entries",
+            `SELECT count(*) AS count FROM (
+               SELECT ordinal FROM git_reflog_entries
+               UNION ALL SELECT ordinal FROM git_checkout_reflog_entries
+             )`,
           )[0]?.count ?? 0;
         provisionalReasons = tableRows<{ reason: string }>(
           workspace,
-          "SELECT reason FROM git_reflog_entries ORDER BY ordinal",
+          `SELECT reason, ordinal FROM git_reflog_entries
+           UNION ALL SELECT reason, ordinal FROM git_checkout_reflog_entries
+           ORDER BY ordinal`,
         ).map((row) => row.reason);
         provisionalNextOrdinal =
           tableRows<{ next_ordinal: number }>(
@@ -569,7 +576,7 @@ describe("clone", () => {
       expect(provisionalNextOrdinal).toBe(4);
       expect(tableRows(workspace, "SELECT ref_name FROM git_reflog_entries")).toEqual([]);
       expect(tableRows(workspace, "SELECT repo_id FROM git_reflog_state")).toEqual([]);
-      expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
     } finally {
       await server.close();
       fixture.dispose();
@@ -584,7 +591,7 @@ describe("clone", () => {
       await expect(
         clone(workspace.context, { url: `${server.url}-absent`, dir: "/work" }),
       ).rejects.toMatchObject({ code: "EHTTP", status: 404 });
-      expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
     } finally {
       await server.close();
       fixture.dispose();
@@ -621,7 +628,7 @@ describe("clone", () => {
       await expect(
         clone(workspace.context, { url: server.url, dir: "/work" }),
       ).rejects.toMatchObject({ code: "ECORRUPT" });
-      expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
+      expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
     } finally {
       await server.close();
     }
@@ -632,7 +639,7 @@ describe("clone", () => {
     await expect(
       clone(workspace.context, { url: "ssh://git@example.com/x.git", dir: "/work" }),
     ).rejects.toMatchObject({ code: "EURLSCHEME" });
-    expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
+    expect(tableRows(workspace, "SELECT root FROM git_checkouts")).toEqual([]);
   });
 });
 
@@ -807,9 +814,9 @@ describe("fetch", () => {
       }
 
       expect(statements).toEqual([
-        { refs: 1, fetch: 29, prune: 13 },
-        { refs: 1_000, fetch: 29, prune: 13 },
-        { refs: 9_329, fetch: 41, prune: 25 },
+        { refs: 1, fetch: 31, prune: 15 },
+        { refs: 1_000, fetch: 31, prune: 15 },
+        { refs: 9_329, fetch: 43, prune: 27 },
       ]);
     } finally {
       await server.close();

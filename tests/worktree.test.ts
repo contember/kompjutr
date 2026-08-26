@@ -620,7 +620,7 @@ describe("batched worktree hashing", () => {
 describe("dirtyPaths content identity", () => {
   it("does no filesystem SQL for an index with no eligible entry", () => {
     const workspace = makeRepo("/");
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path: "conflict.txt",
       stage: 1,
       mode: 0o100644,
@@ -634,7 +634,7 @@ describe("dirtyPaths content identity", () => {
     expect(dirtyPaths(workspace.repo, workspace.worktree)).toEqual([]);
     expect(filesystemStatements(workspace.storage.histogram)).toBe(0);
 
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path: "tracked.txt",
       stage: 0,
       mode: 0o100644,
@@ -656,7 +656,7 @@ describe("dirtyPaths content identity", () => {
     const bytes = new TextEncoder().encode("unchanged\n");
     const oid = hashObject("blob", bytes);
     workspace.worktree.writeFiles([{ path: "/real/file.txt", bytes, contentId: fromHex(oid) }]);
-    repo.store.indexPut({
+    repo.checkout.indexPut({
       path: "file.txt",
       stage: 0,
       mode: 0o100644,
@@ -679,7 +679,7 @@ describe("dirtyPaths content identity", () => {
       const path = `f${index.toString().padStart(4, "0")}.txt`;
       const bytes = encoder.encode(`contents ${index}\n`);
       workspace.worktree.writeFile(`/${path}`, bytes);
-      workspace.repo.store.indexPut({
+      workspace.repo.checkout.indexPut({
         path,
         stage: 0,
         mode: 0o100644,
@@ -706,7 +706,7 @@ describe("dirtyPaths content identity", () => {
     workspace.worktree.writeFiles(
       paths.map((path) => ({ path: `/${path}`, bytes, contentId: fromHex(oid) })),
     );
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       paths.map((path) => ({
         path,
         stage: 0,
@@ -738,7 +738,7 @@ describe("dirtyPaths content identity", () => {
     workspace.worktree.writeFiles([{ path: "/clean.txt", bytes, contentId: fromHex(oid) }]);
     const stat = workspace.worktree.stat("/clean.txt");
     if (stat === null) throw new Error("clean.txt was not written");
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path: "clean.txt",
       stage: 0,
       mode: 0o100644,
@@ -764,7 +764,7 @@ describe("dirtyPaths content identity", () => {
   it("does not trust a symlink target after the path disappears", () => {
     const workspace = makeRepo("/");
     workspace.worktree.symlink("target.txt", "/link.txt");
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path: "link.txt",
       stage: 0,
       mode: 0o120000,
@@ -786,7 +786,7 @@ describe("dirtyPaths content identity", () => {
       const original = pattern(CHUNK + 1, 17);
       const oid = hashObject("blob", original);
       workspace.worktree.writeFile("/large.bin", original);
-      workspace.repo.store.indexPut({
+      workspace.repo.checkout.indexPut({
         path: "large.bin",
         stage: 0,
         mode: 0o100644,

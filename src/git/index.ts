@@ -53,9 +53,10 @@ export type { Worktree, WorktreeDirent, WorktreeStat } from "../core/worktree.js
 export type { SqlDatabase } from "../sqlite/db.js";
 export { initializeGitSchema, SCHEMA_VERSION } from "../sqlite/schema.js";
 export {
+  type CheckoutRow,
+  CheckoutStore,
   type IndexEntry,
-  RepoStore,
-  type RepositoryRow,
+  SharedRepoStore,
   SqliteGitDatabase,
   type StoreOptions,
 } from "../sqlite/store.js";

@@ -230,7 +230,7 @@ export function preflightTreeBuild(
  * Write every tree the stage-0 index describes and return the root's oid.
  *
  * `entries` must be in git's byte order over the full path, which is what
- * `RepoStore.indexScan()` yields: SQLite orders TEXT by UTF-8 bytes,
+ * `CheckoutStore.indexScan()` yields: SQLite orders TEXT by UTF-8 bytes,
  * and a byte-ordered path list visits each directory contiguously and in
  * exactly the order git's tree rule ("a subtree sorts as `name/`") puts
  * its entries in. Re-sorting here would cost a second full-index pass for

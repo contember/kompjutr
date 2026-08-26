@@ -551,7 +551,7 @@ export function* dirtyPathStream(
     }
   };
 
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     if (limits !== undefined) {
       if (limits.indexRows >= limits.maxIndexRows) {
         throw new GitError("E2BIG", `dirty-path scan exceeds ${limits.maxIndexRows} index rows`);

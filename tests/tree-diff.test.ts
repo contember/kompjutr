@@ -23,9 +23,9 @@ const oid = (digit: number): string => digit.toString(16).padStart(40, "0");
 function open() {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
-  const row = database.create("/repo", "ref: refs/heads/main");
-  const store = database.open(row);
-  return { db, store, repo: new Repository(store, row.root) };
+  const row = database.createRepository("/repo", "ref: refs/heads/main");
+  const store = database.openCheckout(row);
+  return { db, store, repo: new Repository(store) };
 }
 
 describe("tree diff", () => {

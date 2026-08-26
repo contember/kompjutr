@@ -85,7 +85,7 @@ function updateTracking(
   deleting: boolean,
 ): void {
   const tracking = trackingRef(remote, remoteRef);
-  repo.store.mutateRefs(
+  repo.mutateRefs(
     {
       puts: deleting ? [] : [{ name: tracking, target: newOid }],
       deletes: deleting ? [tracking] : [],

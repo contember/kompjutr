@@ -84,7 +84,7 @@ class WidestDatabase implements SqlDatabase {
 
 function open(db: SqlDatabase = new TestDatabase()) {
   const database = new SqliteGitDatabase(db);
-  return database.open(database.create("/repo", "ref: refs/heads/main"));
+  return database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
 }
 
 function entry(path: string, stage = 0, oid = "0".repeat(40)): IndexEntry {
@@ -479,6 +479,7 @@ describe("tryCreateInitialState", () => {
     const db = new WidestDatabase(inner);
     const store = open(db);
     inner.storage.resetCounters();
+    db.widestBindings = 0;
     let maxRetainedBytes = 0;
 
     const result = store.tryCreateInitialState((session) => {
@@ -500,7 +501,10 @@ describe("tryCreateInitialState", () => {
     expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
     expect(maxRetainedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
     expect(
-      store.db.scalar<number>("SELECT COUNT(*) FROM git_index WHERE repo_id = ?", store.repoId),
+      store.db.scalar<number>(
+        "SELECT COUNT(*) FROM git_index WHERE checkout_id = ?",
+        store.checkoutId,
+      ),
     ).toBe(24_252);
     expect(
       store.db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = ?", store.repoId),

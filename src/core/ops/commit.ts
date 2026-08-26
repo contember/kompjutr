@@ -88,7 +88,7 @@ export function commit(
 ): CommitResult {
   if (options.message.trim() === "") throw new GitError("EMSG", "commit message is required");
   return repo.store.db.transactionSync(() => {
-    if (repo.store.hasConflicts()) {
+    if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot commit: the index has unmerged paths");
     }
 
@@ -153,7 +153,7 @@ function writeCommitObjects(
 ): UnpublishedCommitResult {
   // A paged scan, so the index never exists as one array alongside the build.
   return repo.store.writeObjects((batch) => {
-    const tree = buildTreeInBatch(batch, repo.store.indexScan({ pageSize: 2048 }));
+    const tree = buildTreeInBatch(batch, repo.checkout.indexScan({ pageSize: 2048 }));
     const oid = batch.write(
       "commit",
       serializeCommit({
@@ -186,8 +186,8 @@ function publishCommitResult(
   metadata: ReturnType<typeof committerRefLogMetadata>,
 ): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
-  if (expectedHead.ref === null) repo.store.mutateRefs({ head: result.oid }, metadata);
-  else repo.store.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata);
+  if (expectedHead.ref === null) repo.mutateRefs({ head: result.oid }, metadata);
+  else repo.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata);
   return { oid: result.oid };
 }
 

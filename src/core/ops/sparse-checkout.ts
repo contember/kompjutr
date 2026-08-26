@@ -66,15 +66,15 @@ export function trySparseCleanCheckout(
   if (source === undefined || tracker === undefined) return false;
 
   const baselineTreeOid = repo.headTree();
-  const state = source.readState(repo.store.checkoutId);
+  const state = source.readState(repo.checkout.checkoutId);
   if (!state.available || state.baselineTreeOid !== baselineTreeOid) return false;
   try {
-    for (const _entry of source.dirtyPaths(repo.store.checkoutId)) return false;
+    for (const _entry of source.dirtyPaths(repo.checkout.checkoutId)) return false;
   } catch (error) {
     if (hasErrorCode(error, "E2BIG")) return false;
     throw error;
   }
-  if (repo.store.hasCheckoutBlockingIndexEntries()) return false;
+  if (repo.checkout.hasCheckoutBlockingIndexEntries()) return false;
 
   const budget = new SparseCheckoutRetainedBudget();
   if (!budget.retain(256)) return false;
@@ -89,7 +89,7 @@ export function trySparseCleanCheckout(
   try {
     hydrated = source.hydrate({
       repoId: repo.store.repoId,
-      checkoutId: repo.store.checkoutId,
+      checkoutId: repo.checkout.checkoutId,
       root: repo.root,
       baselineTreeOid,
       currentTreeOid: targetTreeOid,
@@ -272,7 +272,7 @@ export function checkoutSparseChanges(
   const plan = prepareSparseCheckout(changes, maxRetainedBytes);
   if (plan === null) return false;
 
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     if (plan.structuralRoots.length > 0) {
       worktree.removeFiles(
         plan.structuralRoots.map((path) => joinPath(repo.root, path)),
@@ -286,7 +286,7 @@ export function checkoutSparseChanges(
     sink.flush();
   });
   pruneSparseDirectories(repo, worktree, plan.pruneGroups);
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     const written = [...plan.writes];
     flushCheckoutWrites(repo, worktree, written, sink);
   });

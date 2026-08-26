@@ -881,7 +881,7 @@ async function snapshotKompjutr(
   const git = workspace.git;
   const context = probeContext(workspace, storage);
   const repo = openRepository(context, WORK);
-  const head = repo.store.getRef("HEAD") === null ? null : safeOid(repo);
+  const head = safeOid(repo);
 
   const report = statusReport(repo, context.worktree, { untrackedFiles: "normal" });
   const branch: StatusBranch | undefined = undefined;
@@ -901,7 +901,7 @@ async function snapshotKompjutr(
     status: formatPorcelainV2(report.entries, branch).trimEnd(),
     worktree: await kompjutrWorktree(workspace),
     log: await kompjutrLog(git, head),
-    operation: repo.store.readOperationState()?.kind ?? null,
+    operation: repo.checkout.readOperationState()?.kind ?? null,
   };
 }
 

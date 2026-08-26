@@ -160,7 +160,7 @@ async function open(setup: (fixture: GitFixture) => void): Promise<Pair> {
   setup(fixture);
 
   const workspace = makeRepo("/");
-  await importFixture(fixture, workspace.repo.store);
+  await importFixture(fixture, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.tick(60_000);
   return { fixture, workspace };
@@ -186,7 +186,7 @@ function chmodBoth(pair: Pair, path: string, mode: number): void {
 function stageWorkspace(pair: Pair, path: string): void {
   const hashed = hashWorktreePath(pair.workspace.repo, pair.workspace.worktree, path);
   if (hashed === null) throw new Error(`nothing to stage at ${path}`);
-  pair.workspace.repo.store.indexPut(indexEntryFor(path, hashed));
+  pair.workspace.repo.checkout.indexPut(indexEntryFor(path, hashed));
 }
 
 /** git's own bytes, untrimmed. */
@@ -280,7 +280,7 @@ function buildDiffScale(
       ino: options.mappedContentIds === true ? null : stat.ino,
     };
   });
-  workspace.repo.store.indexReplace(entries);
+  workspace.repo.checkout.indexReplace(entries);
   if (options.mappedContentIds === true) {
     workspace.repo.store.upsertBlobIds(contentIds.map((contentId) => ({ contentId, oid })));
   }
@@ -300,7 +300,7 @@ function commitScaleMove(workspace: TestRepository, entries: readonly IndexEntry
       .scan("/new", { filesOnly: true, limit: paths.length + 1 })
       .map((entry) => [entry.path.slice(1), entry]),
   );
-  workspace.repo.store.indexReplace(
+  workspace.repo.checkout.indexReplace(
     paths.map((path): IndexEntry => {
       const stat = stats.get(path);
       if (stat === undefined) throw new Error(`moved scale path was not written: ${path}`);
@@ -383,7 +383,7 @@ describe("diff", () => {
     const oid = pair.workspace.repo.store.write("blob", utf8.encode("staged\n"));
     const stat = pair.workspace.worktree.stat("/staged.txt");
     if (stat === null) throw new Error("staged.txt vanished");
-    pair.workspace.repo.store.indexPut({
+    pair.workspace.repo.checkout.indexPut({
       path: "staged.txt",
       stage: 0,
       mode: 0o100644,
@@ -411,7 +411,7 @@ describe("diff", () => {
       fixture.commit("first");
     });
     removeBoth(pair, "plain.txt");
-    pair.workspace.repo.store.indexRemove("plain.txt");
+    pair.workspace.repo.checkout.indexRemove("plain.txt");
     writeBoth(pair, "moved/executable.txt", "same\n", 0o755);
     stageWorkspace(pair, "moved/executable.txt");
     pair.fixture.git("add", "-A");
@@ -438,7 +438,7 @@ describe("diff", () => {
       fixture.commit("first");
     });
     removeBoth(pair, "old.txt");
-    pair.workspace.repo.store.indexRemove("old.txt");
+    pair.workspace.repo.checkout.indexRemove("old.txt");
     writeBoth(pair, "new.txt", "after\n");
     stageWorkspace(pair, "new.txt");
     pair.fixture.git("add", "-A");

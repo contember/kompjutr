@@ -20,7 +20,7 @@ import { MAX_INDEXED_COMMIT_BYTES, prepareCommitCache } from "../src/sqlite/comm
 import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
 import { MAX_DELTA_DEPTH, MAX_PACK_DELTA_WORKING_BYTES, PACK_CHUNK } from "../src/sqlite/packs.js";
-import { RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { CheckoutStore, SharedRepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 
@@ -99,7 +99,7 @@ class RecordingDatabase implements SqlDatabase {
 
 function open() {
   const database = new SqliteGitDatabase(new TestDatabase(), { objectCacheBytes: 1024 * 1024 });
-  return database.open(database.create("/repo", "ref: refs/heads/main"));
+  return database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
 }
 
 function syntheticTree(count: number): Uint8Array {
@@ -247,12 +247,18 @@ describe("synthetic pack ingest", () => {
   it("shares and isolates one 4 MiB pack-row cache across repositories", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { chunkBytes: 16 * 1024 * 1024 });
-    const first = database.open(database.create("/one", "ref: refs/heads/main"));
-    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    const first = database.openCheckout(database.createRepository("/one", "ref: refs/heads/main"));
+    const second = database.openCheckout(database.createRepository("/two", "ref: refs/heads/main"));
     for (const { store, prefix } of [
       { store: first, prefix: 0x10 },
       { store: second, prefix: 0x20 },
     ]) {
+      db.run(
+        `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+         VALUES (?, 1, ?, 0, 'complete', 0)`,
+        store.repoId,
+        3 * PACK_CHUNK,
+      );
       for (let seq = 0; seq < 3; seq++) {
         db.run(
           "INSERT INTO git_pack_data (repo_id, pack_id, seq, data) VALUES (?, 1, ?, ?)",
@@ -328,9 +334,9 @@ describe("synthetic pack ingest", () => {
     const db = store.db;
     if (!(db instanceof TestDatabase)) throw new Error("expected test database");
     const coldDatabase = new SqliteGitDatabase(db, { objectCacheBytes: 1024 * 1024 });
-    const repository = coldDatabase.find("/repo");
+    const repository = coldDatabase.findCheckout("/repo");
     if (repository === null) throw new Error("repository missing after pack ingest");
-    const cold = coldDatabase.open(repository);
+    const cold = coldDatabase.openCheckout(repository);
     db.storage.resetCounters();
 
     const started = performance.now();
@@ -395,18 +401,18 @@ describe("synthetic pack ingest", () => {
     const db = store.db;
     if (!(db instanceof TestDatabase)) throw new Error("expected test database");
     const coldDatabase = new SqliteGitDatabase(db);
-    const repository = coldDatabase.find("/repo");
+    const repository = coldDatabase.findCheckout("/repo");
     if (repository === null) throw new Error("repository missing after pack ingest");
-    expect(coldDatabase.open(repository).readBlobs([targetOid]).blobs.get(targetOid)).toEqual(
-      target,
-    );
+    expect(
+      coldDatabase.openCheckout(repository).readBlobs([targetOid]).blobs.get(targetOid),
+    ).toEqual(target);
   });
 
   it("drives the packed base lookup from the requested oids", async () => {
     const inner = new TestDatabase();
     const recorder = new RecordingDatabase(inner);
     const database = new SqliteGitDatabase(recorder);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     // The delta precedes its base, so the entry is deferred and draining it
     // looks the base up through the statement under test.
     const base = utf8.encode("base content\n".repeat(20));
@@ -463,7 +469,9 @@ describe("synthetic pack ingest", () => {
     const measure = async (type: "blob" | "commit") => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db);
-      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
       const chunks: Uint8Array[] = [];
       const writer = new PackWriter((chunk) => chunks.push(chunk));
       writer.header(500);
@@ -517,7 +525,7 @@ describe("synthetic pack ingest", () => {
 
   it("re-inflates a buffered-limit commit and rejects an over-limit commit", async () => {
     const database = new SqliteGitDatabase(new TestDatabase(), { maxBufferedEntry: 64 * 1024 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     let acceptedMessageBytes = 0;
     let rejectedMessageBytes = MAX_INDEXED_COMMIT_BYTES;
     while (acceptedMessageBytes + 1 < rejectedMessageBytes) {
@@ -590,13 +598,16 @@ describe("synthetic pack ingest", () => {
   it("accepts a near-limit commit with 21,843 parents under shared coordinator pressure", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/repo", "ref: refs/heads/main");
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const coordinator = new MemoryCoordinator();
     const blocker = coordinator.reserve();
     blocker.set("other", 1);
     const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
     const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const store = new CheckoutStore(
+      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
+      repository,
+    );
     const data = parentHeavyCommit(21_843);
     expect(data.length).toBe(1_048_511);
     const oid = hashObject("commit", data);
@@ -620,13 +631,16 @@ describe("synthetic pack ingest", () => {
   it("rejects dense ignored headers before allocating the commit parser", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/repo", "ref: refs/heads/main");
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const coordinator = new MemoryCoordinator();
     const blocker = coordinator.reserve();
     blocker.set("other", 1);
     const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
     const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const store = new CheckoutStore(
+      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
+      repository,
+    );
     const data = denseIgnoredHeaderCommit();
     expect(data.length).toBeLessThanOrEqual(MAX_INDEXED_COMMIT_BYTES);
     const chunks: Uint8Array[] = [];
@@ -653,12 +667,15 @@ describe("synthetic pack ingest", () => {
   it("preflights commit serialization again when shared pressure arrives before flush", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/repo", "ref: refs/heads/main");
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const coordinator = new MemoryCoordinator();
     const blocker = coordinator.reserve();
     const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
     const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const store = new CheckoutStore(
+      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
+      repository,
+    );
     const data = parentHeavyCommit(21_843);
     const chunks: Uint8Array[] = [];
     const writer = new PackWriter((chunk) => chunks.push(chunk));
@@ -777,7 +794,9 @@ describe("synthetic pack ingest", () => {
     );
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBeGreaterThan(0);
     expect(store.cachedCommit(firstOid)).toBeNull();
+    store.db.run("PRAGMA foreign_keys = OFF");
     store.db.run("DELETE FROM git_pack_meta WHERE state = 'pending'");
+    store.db.run("PRAGMA foreign_keys = ON");
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBeGreaterThan(0);
     expect(store.packs.reclaimPending()).toBe(1);
     expect(store.cachedCommit(firstOid)).toBeNull();
@@ -812,7 +831,9 @@ describe("synthetic pack ingest", () => {
     const measure = async (count: number) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db);
-      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
       const chunks: Uint8Array[] = [];
       const writer = new PackWriter((chunk) => chunks.push(chunk));
       writer.header(count);
@@ -845,7 +866,7 @@ describe("synthetic pack ingest", () => {
   it("batches 999 deferred deltas that share a later base", async () => {
     const db = new ReorderedRangeDatabase(new TestDatabase());
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = new Uint8Array(513).fill(0x61);
     const baseOid = hashObject("blob", base);
     const targets = Array.from({ length: 999 }, (_, index) => {
@@ -894,7 +915,7 @@ describe("synthetic pack ingest", () => {
   it("reads a deferred range crossing physical rows without full-row rereads", async () => {
     const db = new ReorderedRangeDatabase(new TestDatabase());
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const padding = new Uint8Array(randomBytes(880 * 1024));
     const base = new Uint8Array(randomBytes(300 * 1024));
     const target = new Uint8Array(randomBytes(300 * 1024));
@@ -936,7 +957,7 @@ describe("synthetic pack ingest", () => {
   it("falls back to bounded full-row streaming above the one-MiB page range cap", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = new Uint8Array(randomBytes(300 * 1024));
     const baseOid = hashObject("blob", base);
     const targets = Array.from({ length: 4 }, () => {
@@ -979,12 +1000,15 @@ describe("synthetic pack ingest", () => {
   it("fails one byte before allocating a deferred range batch", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/repo", "ref: refs/heads/main");
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const coordinator = new MemoryCoordinator();
     const blocker = coordinator.reserve();
     const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
     const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const store = new CheckoutStore(
+      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
+      repository,
+    );
     const base = new Uint8Array(513).fill(0x61);
     const baseOid = hashObject("blob", base);
     const chunks: Uint8Array[] = [];
@@ -1043,7 +1067,7 @@ describe("synthetic pack ingest", () => {
       objectCacheBytes: 0,
       maxBufferedEntry: 64 * 1024,
     });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = syntheticTree(2_000);
     const target = syntheticTree(3_000);
     const baseOid = hashObject("tree", base);
@@ -1072,7 +1096,7 @@ describe("synthetic pack ingest", () => {
   it("batches deferred chunked trees instead of flushing one sink per tree", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = serializeTree([{ mode: MODE_FILE, name: "base", oid: "1".repeat(40) }]);
     const baseOid = hashObject("tree", base);
     const targets = Array.from({ length: 80 }, (_, index) =>
@@ -1106,7 +1130,9 @@ describe("synthetic pack ingest", () => {
     const ingest = async (extraNameByte: boolean) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db);
-      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
       const base = new Uint8Array(0);
       const suffix = serializeTree([
         {
@@ -1141,13 +1167,16 @@ describe("synthetic pack ingest", () => {
   it("does not stage an empty commit batch under repeated reservation pressure", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/repo", "ref: refs/heads/main");
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const coordinator = new MemoryCoordinator();
     const blocker = coordinator.reserve();
     blocker.set("other", 1);
     const objects = new ByteLru<string, RawObject>(8 * 1024 * 1024, (object) => object.data.length);
     const rows = new ByteLru<string, Uint8Array>(4 * PACK_CHUNK, (row) => row.length);
-    const store = new RepoStore(db, repository, 1, objects, rows, coordinator);
+    const store = new CheckoutStore(
+      new SharedRepoStore(db, repository.repoId, 1, objects, rows, coordinator),
+      repository,
+    );
     const exactTree = concat([
       syntheticTree(29_088),
       serializeTree([{ mode: MODE_FILE, name: "z".repeat(36), oid: "f".repeat(40) }]),
@@ -1185,7 +1214,7 @@ describe("synthetic pack ingest", () => {
   it("resolves a same-page deferred chain without one pass per delta", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const chunks: Uint8Array[] = [];
     const writer = new PackWriter((chunk) => chunks.push(chunk));
     writer.header(301);
@@ -1211,7 +1240,7 @@ describe("synthetic pack ingest", () => {
   it("resolves 999 child-before-base deltas in bounded statements", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const objects = Array.from({ length: 1_000 }, (_, index) => {
       const data = new Uint8Array(64).fill(index & 0xff);
       data[0] = index & 0xff;
@@ -1239,7 +1268,7 @@ describe("synthetic pack ingest", () => {
   it("checkpoints a reverse delta chain across three pending pages", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const objects = Array.from({ length: 8_194 }, (_, index) => {
       const data = new Uint8Array(8);
       const view = new DataView(data.buffer);
@@ -1268,7 +1297,7 @@ describe("synthetic pack ingest", () => {
   it("resolves thin deltas from every loose object type in one bounded batch", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const treeBase = serializeTree(
       Array.from({ length: 150 }, (_, index) => ({
         mode: MODE_FILE,
@@ -1382,7 +1411,7 @@ describe("synthetic pack ingest", () => {
   it("rejects multiple oversized ingest bases before bulk inflation", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const size = 2 * 1024 * 1024 + 1;
     const bases = [new Uint8Array(size), new Uint8Array(size).fill(1)];
     const chunks: Uint8Array[] = [];
@@ -1405,7 +1434,7 @@ describe("synthetic pack ingest", () => {
   it("rejects mixed packed and loose bases before either source is materialized", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const packedBase = utf8.encode("packed base\n");
     const packedChunks: Uint8Array[] = [];
     const packedWriter = new PackWriter((chunk) => packedChunks.push(chunk));
@@ -1573,7 +1602,9 @@ describe("synthetic pack ingest", () => {
     const ingest = async (data: Uint8Array, maxBufferedEntry?: number) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db, { maxBufferedEntry });
-      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
       const chunks: Uint8Array[] = [];
       const writer = new PackWriter((chunk) => chunks.push(chunk));
       writer.header(1);
@@ -1610,7 +1641,7 @@ describe("synthetic pack ingest", () => {
   it("rejects a corrupt pack region before allocating it", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     db.storage.resetCounters();
     expect(() => store.packs.readRaw(1, 0, 100 * 1024 * 1024)).toThrow(/bounded region/);
     expect(db.storage.statementCount).toBe(0);
@@ -1639,13 +1670,15 @@ describe("synthetic pack ingest", () => {
     const readAt = async (depth: number, limit: number) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db, { maxDeltaDepth: limit });
-      const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
       const fixture = deltaPack(depth);
       await store.packs.ingest(slices(fixture.bytes, 64));
       const coldDatabase = new SqliteGitDatabase(db, { maxDeltaDepth: limit });
-      const row = coldDatabase.find("/repo");
+      const row = coldDatabase.findCheckout("/repo");
       if (row === null) throw new Error("repository missing after pack ingest");
-      return { actual: coldDatabase.open(row).read(fixture.targetOid), fixture };
+      return { actual: coldDatabase.openCheckout(row).read(fixture.targetOid), fixture };
     };
 
     const accepted = await readAt(3, 3);
@@ -1655,7 +1688,7 @@ describe("synthetic pack ingest", () => {
     const openWithLimit = (maxDeltaDepth: number) => {
       const db = new TestDatabase();
       const database = new SqliteGitDatabase(db, { maxDeltaDepth });
-      return database.open(database.create("/repo", "ref: refs/heads/main"));
+      return database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     };
     expect(() => openWithLimit(MAX_DELTA_DEPTH + 1)).not.toThrow();
     for (const invalid of [-1, 1.5, Number.POSITIVE_INFINITY]) {
@@ -1807,7 +1840,7 @@ describe("synthetic pack ingest", () => {
       maxBufferedEntry: 64 * 1024,
       objectCacheBytes: 512 * 1024,
     });
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const big = new Uint8Array(randomBytes(600_000));
     const small = utf8.encode("after the big one\n");
     const chunks: Uint8Array[] = [];

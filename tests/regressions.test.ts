@@ -36,15 +36,15 @@ describe("regressions", () => {
 
   it("does not hand back a destroyed repository's store, even at the same root", () => {
     const ws = makeWorkspace();
-    const first = ws.database.create("/", "ref: refs/heads/main");
-    const storeA = ws.database.open(first);
+    const first = ws.database.createRepository("/", "ref: refs/heads/main");
+    const storeA = ws.database.openCheckout(first);
     storeA.write("blob", new TextEncoder().encode("gone"));
     storeA.destroy();
 
     // A failed clone frees the id; the next create reuses it.
-    const second = ws.database.create("/", "ref: refs/heads/other");
-    expect(second.id).toBe(first.id);
-    const storeB = ws.database.open(second);
+    const second = ws.database.createRepository("/", "ref: refs/heads/other");
+    expect(second.repoId).toBe(first.repoId);
+    const storeB = ws.database.openCheckout(second);
     expect(storeB).not.toBe(storeA);
     expect(storeB.objectCount()).toBe(0);
   });

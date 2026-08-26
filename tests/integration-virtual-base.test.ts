@@ -20,7 +20,7 @@ import { buildTree } from "../src/core/ops/tree-build.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
-import { type IndexEntry, type RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { type CheckoutStore, type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 
@@ -163,13 +163,13 @@ function ordered(entries: ReadonlyMap<string, TreeIdentity>): [string, string, s
     .map(([path, identity]) => [path, identity.mode, identity.oid]);
 }
 
-function repoFixture(): { store: RepoStore; repo: Repository } {
+function repoFixture(): { store: CheckoutStore; repo: Repository } {
   const database = new SqliteGitDatabase(new TestDatabase());
-  const store = database.open(database.create("/repo", "ref: refs/heads/main"));
-  return { store, repo: new Repository(store, "/repo") };
+  const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+  return { store, repo: new Repository(store) };
 }
 
-function assertCoordinatorIdle(store: RepoStore): void {
+function assertCoordinatorIdle(store: CheckoutStore): void {
   const probe = store.reserveMemory();
   try {
     probe.set("other", MAX_OPERATION_MEMORY_BYTES);

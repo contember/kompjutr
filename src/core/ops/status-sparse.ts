@@ -132,7 +132,7 @@ export function sparseStatus(
   try {
     candidates = sparseStatusCandidates(
       repo,
-      source.dirtyPaths(repo.store.checkoutId),
+      source.dirtyPaths(repo.checkout.checkoutId),
       baselineTreeOid,
       currentTreeOid,
     );
@@ -147,7 +147,7 @@ export function sparseStatus(
   try {
     hydrated = source.hydrate({
       repoId: repo.store.repoId,
-      checkoutId: repo.store.checkoutId,
+      checkoutId: repo.checkout.checkoutId,
       root: repo.root,
       baselineTreeOid,
       currentTreeOid,
@@ -221,7 +221,7 @@ export function sparseStatus(
     const flags = retained.get(path);
     if (flags !== undefined) seed.push({ path, flags });
   }
-  tracker.reseal(repo.store.checkoutId, currentTreeOid, seed);
+  tracker.reseal(repo.checkout.checkoutId, currentTreeOid, seed);
   return details;
 }
 

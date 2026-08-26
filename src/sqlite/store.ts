@@ -192,21 +192,12 @@ export interface StoreOptions extends PackCacheOptions {
   now?: () => number;
 }
 
-export interface RepositoryRow {
-  /** Shared store id retained for one-checkout compatibility. */
-  id: number;
-  checkoutId: number;
-  root: string;
-  head: string;
-  isPrimary: boolean;
-}
-
 export interface CheckoutRow {
-  id: number;
-  repoId: number;
-  root: string;
-  head: string;
-  isPrimary: boolean;
+  readonly id: number;
+  readonly repoId: number;
+  readonly root: string;
+  readonly head: string;
+  readonly isPrimary: boolean;
 }
 
 export interface RefRow {
@@ -1749,16 +1740,6 @@ function requireStoredCheckoutRow(row: Record<string, unknown>): CheckoutRow {
   return { id, repoId, root, head, isPrimary: row.is_primary === 1 };
 }
 
-function compatibilityRepositoryRow(checkout: CheckoutRow): RepositoryRow {
-  return {
-    id: checkout.repoId,
-    checkoutId: checkout.id,
-    root: checkout.root,
-    head: checkout.head,
-    isPrimary: checkout.isPrimary,
-  };
-}
-
 /** Every ancestor of `path`, nearest first, ending at "/". */
 export function ancestors(path: string): string[] {
   const normalized = normalizeRoot(path);
@@ -1792,6 +1773,7 @@ export class SharedRepoStore {
   #operations: CheckoutStore | null = null;
   #cacheGeneration = 0;
   #hasLoose: boolean;
+  #shallow: Set<string> | null = null;
 
   constructor(
     db: SqlDatabase,
@@ -1836,7 +1818,10 @@ export class SharedRepoStore {
     return this.#operations;
   }
 
-  get packs(): PackStore | null {
+  get packs(): PackStore {
+    if (this.#packs === null) {
+      throw new CorruptError("shared pack facade is unavailable");
+    }
     return this.#packs;
   }
 
@@ -1856,6 +1841,7 @@ export class SharedRepoStore {
     this.#cacheGeneration++;
     this.#packs?.clearCaches();
     this.#hasLoose = false;
+    this.#shallow = null;
   }
 
   cacheBytes(): { objects: number; chunks: number } {
@@ -2046,11 +2032,17 @@ export class SharedRepoStore {
   }
 
   shallow(): Set<string> {
-    return this.#ops().shallow();
+    if (this.#shallow === null) this.#shallow = this.#ops().shallow();
+    return new Set(this.#shallow);
+  }
+
+  invalidateShallow(): void {
+    this.#shallow = null;
   }
 
   setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
     this.#ops().setShallow(add, remove);
+    this.#shallow = null;
   }
 
   destroy(): void {
@@ -2063,7 +2055,8 @@ export class SqliteGitDatabase {
   readonly #db: SqlDatabase;
   readonly #options: StoreOptions;
   readonly #sharedStores = new Map<number, SharedRepoStore>();
-  readonly #checkoutStores = new Map<number, RepoStore>();
+  readonly #checkoutStores = new Map<number, CheckoutStore>();
+  readonly #validatedCheckoutRows = new WeakSet<CheckoutRow>();
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packRows: ByteLru<string, Uint8Array>;
   readonly #memory = new MemoryCoordinator();
@@ -2100,7 +2093,7 @@ export class SqliteGitDatabase {
       path,
       path,
     );
-    return row === undefined ? null : requireStoredCheckoutRow(row);
+    return row === undefined ? null : this.#rememberCheckout(requireStoredCheckoutRow(row));
   }
 
   checkoutAt(root: string): CheckoutRow | null {
@@ -2109,7 +2102,7 @@ export class SqliteGitDatabase {
          FROM git_checkouts WHERE root = ?`,
       requireCheckoutRoot(root, "input"),
     );
-    return row === undefined ? null : requireStoredCheckoutRow(row);
+    return row === undefined ? null : this.#rememberCheckout(requireStoredCheckoutRow(row));
   }
 
   listCheckouts(repoId: number): CheckoutRow[] {
@@ -2133,7 +2126,7 @@ export class SqliteGitDatabase {
         throw new CorruptError("checkout roots are not in strict byte order");
       }
       previousRoot = row.root;
-      rows.push(row);
+      rows.push(this.#rememberCheckout(row));
       if (row.isPrimary) primaryCount++;
       if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
         throw new GitError("E2BIG", "checkout listing exceeds its retained bound");
@@ -2145,7 +2138,7 @@ export class SqliteGitDatabase {
     return rows;
   }
 
-  #listRoutingCheckouts(): CheckoutRow[] {
+  listRoutingCheckouts(): CheckoutRow[] {
     const rows: CheckoutRow[] = [];
     const primaryCounts = new Map<number, number>();
     const checkoutCounts = new Map<number, number>();
@@ -2159,7 +2152,7 @@ export class SqliteGitDatabase {
         throw new CorruptError("checkout roots are not in strict byte order");
       }
       previousRoot = row.root;
-      rows.push(row);
+      rows.push(this.#rememberCheckout(row));
       primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
       const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
       if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
@@ -2176,7 +2169,7 @@ export class SqliteGitDatabase {
     return rows;
   }
 
-  createRepository(root: string, head: string): RepositoryRow {
+  createRepository(root: string, head: string): CheckoutRow {
     const normalized = requireCheckoutRoot(root, "input");
     const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     return this.#db.transactionSync(() => {
@@ -2204,7 +2197,13 @@ export class SqliteGitDatabase {
            (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
         checkoutId,
       );
-      return { id: repoId, checkoutId, root: normalized, head: checkedHead, isPrimary: true };
+      return this.#rememberCheckout({
+        id: checkoutId,
+        repoId,
+        root: normalized,
+        head: checkedHead,
+        isPrimary: true,
+      });
     });
   }
 
@@ -2264,14 +2263,14 @@ export class SqliteGitDatabase {
     );
     if (primaryRaw === undefined) throw new CorruptError("repository primary checkout is missing");
     const primary = requireStoredCheckoutRow(primaryRaw);
-    const primaryStore = new RepoStore(store, primary, this.#options, () =>
+    const primaryStore = new CheckoutStore(store, primary, this.#options, () =>
       this.destroyRepository(repoId),
     );
     this.#checkoutStores.set(primary.id, primaryStore);
     return store;
   }
 
-  openCheckout(checkout: CheckoutRow | number): RepoStore {
+  openCheckout(checkout: CheckoutRow | number): CheckoutStore {
     const checkoutId =
       typeof checkout === "number" ? checkout : requireSafeId(checkout.id, "checkout id");
     const existing = this.#checkoutStores.get(checkoutId);
@@ -2280,38 +2279,61 @@ export class SqliteGitDatabase {
         typeof checkout !== "number" &&
         (checkout.repoId !== existing.sharedRepoId ||
           checkout.root !== existing.root ||
-          checkout.head !== existing.head() ||
           checkout.isPrimary !== existing.isPrimary)
       ) {
         throw new CorruptError("cached checkout identity does not match its requested row");
       }
       return existing;
     }
+    const stored =
+      typeof checkout === "number"
+        ? this.#checkoutById(checkoutId)
+        : this.#validatedCheckoutRows.has(checkout)
+          ? requireStoredCheckoutRow({
+              checkout_id: checkout.id,
+              repo_id: checkout.repoId,
+              root: checkout.root,
+              head: checkout.head,
+              is_primary: checkout.isPrimary ? 1 : 0,
+            })
+          : this.#verifyCheckoutRow(checkout);
+    const shared = this.openShared(stored.repoId);
+    const installed = this.#checkoutStores.get(checkoutId);
+    if (installed !== undefined) return installed;
+    const store = new CheckoutStore(shared, stored, this.#options, () =>
+      this.destroyRepository(stored.repoId),
+    );
+    this.#checkoutStores.set(checkoutId, store);
+    return store;
+  }
+
+  #checkoutById(checkoutId: number): CheckoutRow {
     const raw = this.#db.one<Record<string, unknown>>(
       `SELECT id AS checkout_id, repo_id, root, head, is_primary
          FROM git_checkouts WHERE id = ?`,
       checkoutId,
     );
     if (raw === undefined) throw new GitError("ENOTFOUND", "checkout does not exist");
-    const stored = requireStoredCheckoutRow(raw);
-    if (typeof checkout !== "number") {
-      if (
-        checkout.repoId !== stored.repoId ||
-        checkout.root !== stored.root ||
-        checkout.head !== stored.head ||
-        checkout.isPrimary !== stored.isPrimary
-      ) {
-        throw new CorruptError("checkout identity changed before it was opened");
-      }
+    return requireStoredCheckoutRow(raw);
+  }
+
+  #verifyCheckoutRow(checkout: CheckoutRow): CheckoutRow {
+    const stored = this.#checkoutById(requireSafeId(checkout.id, "checkout id"));
+    if (
+      checkout.repoId !== stored.repoId ||
+      checkout.root !== stored.root ||
+      checkout.head !== stored.head ||
+      checkout.isPrimary !== stored.isPrimary
+    ) {
+      throw new CorruptError("checkout identity changed before it was opened");
     }
-    const shared = this.openShared(stored.repoId);
-    const installed = this.#checkoutStores.get(checkoutId);
-    if (installed !== undefined) return installed;
-    const store = new RepoStore(shared, stored, this.#options, () =>
-      this.destroyRepository(stored.repoId),
-    );
-    this.#checkoutStores.set(checkoutId, store);
-    return store;
+    return stored;
+  }
+
+  #rememberCheckout(row: CheckoutRow): CheckoutRow {
+    const remembered = Object.freeze(row);
+    this.#validatedCheckoutRows.add(remembered);
+    return remembered;
   }
 
   destroyRepository(repoId: number): void {
@@ -2326,43 +2348,9 @@ export class SqliteGitDatabase {
       if (store.sharedRepoId === repoId) this.#checkoutStores.delete(checkoutId);
     }
   }
-
-  /** Compatibility registry view until Repository becomes explicitly checkout-bound. */
-  find(dir: string): RepositoryRow | null {
-    const checkout = this.findCheckout(dir);
-    return checkout === null ? null : compatibilityRepositoryRow(checkout);
-  }
-
-  at(root: string): RepositoryRow | null {
-    const checkout = this.checkoutAt(root);
-    return checkout === null ? null : compatibilityRepositoryRow(checkout);
-  }
-
-  list(): RepositoryRow[] {
-    return this.#listRoutingCheckouts().map(compatibilityRepositoryRow);
-  }
-
-  create(root: string, head: string): RepositoryRow {
-    return this.createRepository(root, head);
-  }
-
-  open(repository: RepositoryRow): RepoStore {
-    if (requireSafeId(repository.id, "repository id") < 1) {
-      throw new CorruptError("repository id is invalid");
-    }
-    const store = this.openCheckout(repository.checkoutId);
-    if (
-      store.sharedRepoId !== repository.id ||
-      store.root !== repository.root ||
-      store.head() !== repository.head
-    ) {
-      throw new CorruptError("repository compatibility row changed before it was opened");
-    }
-    return store;
-  }
 }
 
-/** Checkout-bound storage view; RepoStore below is its compatibility name. */
+/** Checkout-bound storage view. */
 export class CheckoutStore {
   readonly shared: SharedRepoStore;
   readonly #db: SqlDatabase;
@@ -2400,23 +2388,20 @@ export class CheckoutStore {
     this.#isPrimary = checkout.isPrimary;
     this.#objects = shared.objects;
     this.#memory = shared.memory;
-    const existingPacks = shared.packs;
-    this.#packs =
-      existingPacks ??
-      shared.installPacks(
-        new PackStore(
-          this.#db,
-          this.#repoId,
-          this.#objects,
-          shared.packRows,
-          this.#memory,
-          shared.cacheNamespace,
-          (oid) => this.#readLoose(oid),
-          (oids) => this.#readLooseObjects(oids),
-          (oids) => this.#looseObjectMetadata(oids),
-          options,
-        ),
-      );
+    this.#packs = shared.installPacks(
+      new PackStore(
+        this.#db,
+        this.#repoId,
+        this.#objects,
+        shared.packRows,
+        this.#memory,
+        shared.cacheNamespace,
+        (oid) => this.#readLoose(oid),
+        (oids) => this.#readLooseObjects(oids),
+        (oids) => this.#looseObjectMetadata(oids),
+        options,
+      ),
+    );
     shared.installOperations(this);
   }
 
@@ -5646,6 +5631,7 @@ export class CheckoutStore {
         );
       }
     });
+    this.shared.invalidateShallow();
   }
 
   #nowSeconds(): number {
@@ -5677,68 +5663,6 @@ export class CheckoutStore {
 
   #objectCacheKey(oid: string): string {
     return this.shared.objectCacheKey(oid);
-  }
-}
-
-/** Temporary one-checkout compatibility adapter used by core until WU3. */
-export class RepoStore extends CheckoutStore {
-  constructor(
-    shared: SharedRepoStore,
-    checkout: CheckoutRow,
-    options?: StoreOptions,
-    onDestroy?: () => void,
-  );
-  constructor(
-    db: SqlDatabase,
-    repository: RepositoryRow,
-    storeGeneration: number,
-    objects: ByteLru<string, RawObject>,
-    packRows: ByteLru<string, Uint8Array>,
-    memory: MemoryCoordinator,
-  );
-  constructor(
-    sharedOrDb: SharedRepoStore | SqlDatabase,
-    checkoutOrRepository: CheckoutRow | RepositoryRow,
-    optionsOrGeneration: StoreOptions | number = {},
-    onDestroyOrObjects?: (() => void) | ByteLru<string, RawObject>,
-    packRows?: ByteLru<string, Uint8Array>,
-    memory?: MemoryCoordinator,
-  ) {
-    if (sharedOrDb instanceof SharedRepoStore) {
-      if (
-        !("repoId" in checkoutOrRepository) ||
-        typeof optionsOrGeneration === "number" ||
-        (onDestroyOrObjects !== undefined && typeof onDestroyOrObjects !== "function")
-      ) {
-        throw new CorruptError("checkout facade arguments are invalid");
-      }
-      super(sharedOrDb, checkoutOrRepository, optionsOrGeneration, onDestroyOrObjects);
-      return;
-    }
-    if (
-      "repoId" in checkoutOrRepository ||
-      typeof optionsOrGeneration !== "number" ||
-      !(onDestroyOrObjects instanceof ByteLru) ||
-      !(packRows instanceof ByteLru) ||
-      !(memory instanceof MemoryCoordinator)
-    ) {
-      throw new CorruptError("legacy repository facade arguments are invalid");
-    }
-    const shared = new SharedRepoStore(
-      sharedOrDb,
-      checkoutOrRepository.id,
-      optionsOrGeneration,
-      onDestroyOrObjects,
-      packRows,
-      memory,
-    );
-    super(shared, {
-      id: checkoutOrRepository.checkoutId,
-      repoId: checkoutOrRepository.id,
-      root: checkoutOrRepository.root,
-      head: checkoutOrRepository.head,
-      isPrimary: checkoutOrRepository.isPrimary,
-    });
   }
 }
 

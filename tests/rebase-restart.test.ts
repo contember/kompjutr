@@ -46,7 +46,7 @@ function fixture(): GitFixture {
 
 async function imported(source: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
-  await importFixture(source, workspace.repo.store);
+  await importFixture(source, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", "Fixture");
   workspace.repo.store.configSet("user.email", "fixture@example.com");
@@ -57,11 +57,11 @@ function reopen(workspace: TestRepository): { context: GitContext; repo: Reposit
   const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
     now: workspace.context.now,
   });
-  const row = database.find("/");
+  const row = database.findCheckout("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
     context: { ...workspace.context, database },
-    repo: new Repository(database.open(row), "/"),
+    repo: new Repository(database.openCheckout(row)),
   };
 }
 
@@ -207,9 +207,11 @@ describe("rebase restart recovery", () => {
         }
       });
     };
-    const originalWrite = workspace.repo.store.writeOperationJournal.bind(workspace.repo.store);
+    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
+      workspace.repo.checkout,
+    );
     let reachedJournal = false;
-    workspace.repo.store.writeOperationJournal = (state, steps, touched) => {
+    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
       expect(steps).toHaveLength(MAX_OPERATION_STEPS);
       reachedJournal = true;
       originalWrite(state, steps, touched);
@@ -222,15 +224,17 @@ describe("rebase restart recovery", () => {
     expect(reachedJournal).toBe(true);
     expect(Math.max(...transitionStatements)).toBeLessThan(1_000);
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("rolls the upstream baseline back when initial journal creation fails", async () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalWrite = workspace.repo.store.writeOperationJournal.bind(workspace.repo.store);
-    workspace.repo.store.writeOperationJournal = (state, steps, touched) => {
+    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
+      workspace.repo.checkout,
+    );
+    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
       originalWrite(state, steps, touched);
       throw new Error("initial journal fault");
     };
@@ -239,7 +243,7 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("initial journal fault");
     expect(workspace.repo.head().oid).toBe(original);
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(
       integrationIndexMatchesTree(workspace.repo, workspace.repo.readCommit(original).tree),
     ).toBe(true);
@@ -253,8 +257,8 @@ describe("rebase restart recovery", () => {
     const second = source.commit("two");
     source.git("checkout", "-q", "-b", "behind", first);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       originalUpdate({ puts: [{ name: "refs/heads/behind", target: second }] }, metadata);
       return originalUpdate(mutation, metadata);
     };
@@ -267,17 +271,19 @@ describe("rebase restart recovery", () => {
     expect(integrationIndexMatchesTree(durable.repo, durable.repo.readCommit(first).tree)).toBe(
       true,
     );
-    expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
     expect(durable.repo.store.reflog("refs/heads/behind")).toEqual([]);
-    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
+    expect(durable.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("rolls conflict files and stages back when journal suspension fails", async () => {
     const source = fixture();
     const { original, upstream } = history(source, true);
     const workspace = await imported(source);
-    const originalReplace = workspace.repo.store.replaceOperationJournal.bind(workspace.repo.store);
-    workspace.repo.store.replaceOperationJournal = (integrity, state, steps, touched) => {
+    const originalReplace = workspace.repo.checkout.replaceOperationJournal.bind(
+      workspace.repo.checkout,
+    );
+    workspace.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
       originalReplace(integrity, state, steps, touched);
       if (state.phase === "conflicted") throw new Error("conflict journal fault");
     };
@@ -286,11 +292,11 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("conflict journal fault");
     const durable = reopen(workspace);
-    const journal = durable.repo.store.requireOperationState("rebase");
+    const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state).toMatchObject({ phase: "running", currentStep: 1 });
     expect(journal.touched).toEqual([]);
     expect(durable.repo.head().oid).toBe(original);
-    expect(durable.repo.store.hasConflicts()).toBe(false);
+    expect(durable.repo.checkout.hasConflicts()).toBe(false);
   });
 
   it("rolls a hard skip checkout back when its cursor transition fails", async () => {
@@ -302,9 +308,11 @@ describe("rebase restart recovery", () => {
     ).toBe("conflicted");
     writeWorkFile(workspace, "/one.txt", "conflict-time staged edit\n");
     add(workspace.repo, workspace.worktree, { paths: ["one.txt"] });
-    const before = workspace.repo.store.requireOperationState("rebase");
-    const originalReplace = workspace.repo.store.replaceOperationJournal.bind(workspace.repo.store);
-    workspace.repo.store.replaceOperationJournal = (integrity, state, steps, touched) => {
+    const before = workspace.repo.checkout.requireOperationState("rebase");
+    const originalReplace = workspace.repo.checkout.replaceOperationJournal.bind(
+      workspace.repo.checkout,
+    );
+    workspace.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
       originalReplace(integrity, state, steps, touched);
       if (state.phase === "running") throw new Error("skip cursor fault");
     };
@@ -313,7 +321,7 @@ describe("rebase restart recovery", () => {
       "skip cursor fault",
     );
     const durable = reopen(workspace);
-    const after = durable.repo.store.requireOperationState("rebase");
+    const after = durable.repo.checkout.requireOperationState("rebase");
     expect(after.integrityOid).toBe(before.integrityOid);
     expect(after.state).toMatchObject({
       phase: "conflicted",
@@ -332,16 +340,16 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
     ).toBe("conflicted");
     writeWorkFile(workspace, "/one.txt", "abort-time edit\n");
-    const before = workspace.repo.store.requireOperationState("rebase");
-    const originalClear = workspace.repo.store.clearOperationState.bind(workspace.repo.store);
-    workspace.repo.store.clearOperationState = () => {
+    const before = workspace.repo.checkout.requireOperationState("rebase");
+    const originalClear = workspace.repo.checkout.clearOperationState.bind(workspace.repo.checkout);
+    workspace.repo.checkout.clearOperationState = () => {
       originalClear();
       throw new Error("abort clear fault");
     };
 
     expect(() => rebaseAbort(workspace.repo, workspace.worktree)).toThrow("abort clear fault");
     const durable = reopen(workspace);
-    expect(durable.repo.store.requireOperationState("rebase").integrityOid).toBe(
+    expect(durable.repo.checkout.requireOperationState("rebase").integrityOid).toBe(
       before.integrityOid,
     );
     expect(workspace.worktree.readFile("/one.txt")).toEqual(
@@ -354,8 +362,10 @@ describe("rebase restart recovery", () => {
     const { original, upstream } = history(source);
     const workspace = await imported(source);
     const projectionsBefore = objectProjectionCounts(workspace);
-    const originalReplace = workspace.repo.store.replaceOperationJournal.bind(workspace.repo.store);
-    workspace.repo.store.replaceOperationJournal = (integrity, state, steps, touched) => {
+    const originalReplace = workspace.repo.checkout.replaceOperationJournal.bind(
+      workspace.repo.checkout,
+    );
+    workspace.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
       originalReplace(integrity, state, steps, touched);
       if (state.phase === "running" && state.currentStep === 1) {
         throw new Error("clean cursor fault");
@@ -366,7 +376,7 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("clean cursor fault");
     const durable = reopen(workspace);
-    const journal = durable.repo.store.requireOperationState("rebase");
+    const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state).toMatchObject({
       phase: "running",
       currentStep: 0,
@@ -384,14 +394,16 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalRead = workspace.repo.store.readOperationState.bind(workspace.repo.store);
+    const originalRead = workspace.repo.checkout.readOperationState.bind(workspace.repo.checkout);
     let journalWritten = false;
-    const originalWrite = workspace.repo.store.writeOperationJournal.bind(workspace.repo.store);
-    workspace.repo.store.writeOperationJournal = (state, steps, touched) => {
+    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
+      workspace.repo.checkout,
+    );
+    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
       originalWrite(state, steps, touched);
       journalWritten = true;
     };
-    workspace.repo.store.readOperationState = () => {
+    workspace.repo.checkout.readOperationState = () => {
       if (journalWritten) throw new Error("restart after baseline");
       return originalRead();
     };
@@ -400,7 +412,7 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("restart after baseline");
     const durable = reopen(workspace);
-    const journal = durable.repo.store.requireOperationState("rebase");
+    const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state).toMatchObject({
       phase: "running",
       currentStep: 0,
@@ -414,21 +426,23 @@ describe("rebase restart recovery", () => {
 
     const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
     expect(result.outcome).toBe("completed");
-    expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("aborts a cold running baseline back to original HEAD", async () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalRead = workspace.repo.store.readOperationState.bind(workspace.repo.store);
+    const originalRead = workspace.repo.checkout.readOperationState.bind(workspace.repo.checkout);
     let journalWritten = false;
-    const originalWrite = workspace.repo.store.writeOperationJournal.bind(workspace.repo.store);
-    workspace.repo.store.writeOperationJournal = (state, steps, touched) => {
+    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
+      workspace.repo.checkout,
+    );
+    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
       originalWrite(state, steps, touched);
       journalWritten = true;
     };
-    workspace.repo.store.readOperationState = () => {
+    workspace.repo.checkout.readOperationState = () => {
       if (journalWritten) throw new Error("restart at running baseline");
       return originalRead();
     };
@@ -439,7 +453,7 @@ describe("rebase restart recovery", () => {
     const durable = reopen(workspace);
     rebaseAbort(durable.repo, workspace.worktree);
     expect(durable.repo.head().oid).toBe(original);
-    expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
     expect(integrationIndexMatchesTree(durable.repo, durable.repo.readCommit(original).tree)).toBe(
       true,
     );
@@ -454,7 +468,7 @@ describe("rebase restart recovery", () => {
       upstream: "upstream",
     });
     expect(suspended).toMatchObject({ outcome: "conflicted", replayed: 1 });
-    const journal = workspace.repo.store.requireOperationState("rebase");
+    const journal = workspace.repo.checkout.requireOperationState("rebase");
     expect(journal.state.currentStep).toBe(1);
     workspace.repo.store.setRef("refs/heads/upstream", original);
 
@@ -464,15 +478,15 @@ describe("rebase restart recovery", () => {
     const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
 
     expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
-    expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("retains the completed journal when final publication fails, then publishes after reopen", async () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       originalUpdate(mutation, metadata);
       throw new Error("restart before publication");
     };
@@ -481,7 +495,7 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("restart before publication");
     const durable = reopen(workspace);
-    const journal = durable.repo.store.requireOperationState("rebase");
+    const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state.currentStep).toBe(journal.steps.length);
     expect(journal.state.committer).toEqual({
       name: "Fixture",
@@ -489,7 +503,7 @@ describe("rebase restart recovery", () => {
     });
     expect(durable.repo.head().oid).toBe(original);
     expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
-    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
+    expect(durable.repo.checkout.reflog("HEAD")).toEqual([]);
     durable.repo.store.configSet("user.name", "Changed after restart");
     durable.repo.store.configSet("user.email", "changed@example.com");
     workspace.tick(60_000);
@@ -502,7 +516,7 @@ describe("rebase restart recovery", () => {
     expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
     if (result.outcome !== "completed") throw new Error("rebase did not complete");
     expect(durable.repo.head().oid).toBe(result.oid);
-    expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
     expect(durable.repo.store.reflog("refs/heads/current")).toEqual([
       expect.objectContaining({
         oldOid: original,
@@ -519,8 +533,8 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       workspace.repo.store.db.run(
         "UPDATE git_refs SET target = ? WHERE repo_id = ? AND name = 'refs/heads/current'",
         upstream,
@@ -534,16 +548,16 @@ describe("rebase restart recovery", () => {
     ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
 
     const durable = reopen(workspace);
-    const journal = durable.repo.store.requireOperationState("rebase");
+    const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state.currentStep).toBe(journal.steps.length);
     expect(durable.repo.head().oid).toBe(original);
     expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
-    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
+    expect(durable.repo.checkout.reflog("HEAD")).toEqual([]);
 
     const result = rebaseContinue(durable.context, durable.repo, workspace.worktree);
     expect(result.outcome).toBe("completed");
     const named = durable.repo.store.reflog("refs/heads/current")[0];
-    const head = durable.repo.store.reflog("HEAD")[0];
+    const head = durable.repo.checkout.reflog("HEAD")[0];
     if (named === undefined || head === undefined) throw new Error("rebase reflog is missing");
     expect(named.ordinal).toBe(1);
     expect(head.ordinal).toBe(2);
@@ -553,8 +567,8 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       originalUpdate(mutation, metadata);
       throw new Error("restart before completed abort");
     };
@@ -563,16 +577,16 @@ describe("rebase restart recovery", () => {
     ).toThrow("restart before completed abort");
 
     const durable = reopen(workspace);
-    const journal = durable.repo.store.requireOperationState("rebase");
+    const journal = durable.repo.checkout.requireOperationState("rebase");
     expect(journal.state.currentStep).toBe(journal.steps.length);
     rebaseAbort(durable.repo, workspace.worktree);
     expect(durable.repo.head().oid).toBe(original);
-    expect(durable.repo.store.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
     expect(integrationIndexMatchesTree(durable.repo, durable.repo.readCommit(original).tree)).toBe(
       true,
     );
     expect(durable.repo.store.reflog("refs/heads/current")).toEqual([]);
-    expect(durable.repo.store.reflog("HEAD")).toEqual([]);
+    expect(durable.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("rejects a stale checked-out branch without clearing recovery state", async () => {
@@ -582,13 +596,13 @@ describe("rebase restart recovery", () => {
     expect(
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
     ).toBe("conflicted");
-    const journal = workspace.repo.store.requireOperationState("rebase");
+    const journal = workspace.repo.checkout.requireOperationState("rebase");
     workspace.repo.store.setRef(journal.state.originalHeadRef, upstream);
 
     expect(() =>
       rebaseContinue(workspace.context, workspace.repo, workspace.worktree),
     ).toThrowError("HEAD changed during the rebase operation");
-    expect(workspace.repo.store.requireOperationState("rebase").integrityOid).toBe(
+    expect(workspace.repo.checkout.requireOperationState("rebase").integrityOid).toBe(
       journal.integrityOid,
     );
   });

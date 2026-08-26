@@ -25,6 +25,8 @@ const ENV = {
   GIT_COMMITTER_DATE: "2020-01-01T00:00:00+0000",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_EDITOR: "true",
+  GIT_SEQUENCE_EDITOR: "true",
 };
 
 export class GitFixture {

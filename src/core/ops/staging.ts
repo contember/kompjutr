@@ -95,7 +95,7 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
   // `commit -a` never adds a path HEAD does not already have.
   const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
 
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     const pending: StageCandidate[] = [];
     const flush = (): void => stageCandidates(repo, worktree, pending, sink);
     for (const row of joinSorted3(walked, snapshot.paths, head, {
@@ -132,7 +132,7 @@ function snapshotAddIndex(repo: Repository, specs: string[] | undefined): AddInd
   const conflicted = new Set<string>();
   let retained = 0;
   let current: AddIndexPath | null = null;
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     if (specs !== undefined && !matchesPaths(entry.path, specs)) continue;
     retained +=
       INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid);
@@ -400,7 +400,7 @@ export function rm(repo: Repository, worktree: Worktree, options: RmOptions): vo
       removeRmWorktreePaths(worktree, physicalRmPaths(repo, candidates), false);
       removeRmWorktreePaths(worktree, absoluteRmPaths(repo, pruned), true);
     }
-    repo.store.indexApply((sink) => {
+    repo.checkout.indexApply((sink) => {
       for (const candidate of candidates) sink.remove(candidate.path);
     });
   });
@@ -412,7 +412,7 @@ function* rmIndexPaths(
   excluded: readonly string[],
 ): Generator<RmIndexPath> {
   let current: RmIndexPath | null = null;
-  for (const entry of boundedRmRows(repo.store.indexScan(), "index")) {
+  for (const entry of boundedRmRows(repo.checkout.indexScan(), "index")) {
     if (!matchesRmSpecs(specs, entry.path) || isExcluded(entry.path, excluded)) continue;
     if (current === null || current.path !== entry.path) {
       if (current !== null) yield current;
@@ -739,13 +739,13 @@ export function reset(
   const tree = targetTree(repo, options.ref);
   if (specs.length === 0) {
     // This one genuinely replaces the whole index, so the big hammer fits.
-    repo.store.indexReplace(indexFromTree(repo, tree));
+    repo.checkout.indexReplace(indexFromTree(repo, tree));
     return;
   }
 
   // Tree and index are both path-ordered, so one merge decides each path.
-  repo.store.indexApply((sink) => {
-    for (const row of joinSorted(indexFromTree(repo, tree), repo.store.indexScan(), {
+  repo.checkout.indexApply((sink) => {
+    for (const row of joinSorted(indexFromTree(repo, tree), repo.checkout.indexScan(), {
       left: (entry) => entry.path,
       right: (entry) => entry.path,
     })) {
@@ -766,7 +766,7 @@ export function reset(
 export function lsFiles(repo: Repository): string[] {
   const out: string[] = [];
   let previous: string | null = null;
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     // Conflict stages repeat the path; callers want it once.
     if (entry.path === previous) continue;
     out.push(entry.path);
@@ -786,7 +786,7 @@ function hardReset(context: GitContext, repo: Repository, worktree: Worktree, re
       const metadata = operationRefLogMetadata(context, repo, "reset: hard");
       const mutation =
         head.ref === null ? { head: commit } : { puts: [{ name: head.ref, target: commit }] };
-      repo.store.mutateRefs(mutation, metadata);
+      repo.mutateRefs(mutation, metadata);
     }
     checkoutTree(repo, worktree, tree, {
       discardUnmerged: true,
@@ -834,7 +834,7 @@ function assertPathspecsMatch(repo: Repository, worktree: Worktree, specs: strin
   for (const spec of specs) {
     if (spec === "") continue;
     if (worktree.stat(joinPath(repo.root, spec)) !== null) continue;
-    const tracked = repo.store.indexScan({ prefix: spec, pageSize: 1 }).next();
+    const tracked = repo.checkout.indexScan({ prefix: spec, pageSize: 1 }).next();
     if (tracked.done !== true) continue;
     throw new PathspecNotFoundError(spec);
   }

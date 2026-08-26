@@ -93,12 +93,12 @@ function applyToWorkspace(workspace: TestRepository, step: Step): void {
     case "stage": {
       const hashed = hashWorktreePath(repo, worktree, step.path);
       if (hashed === null) throw new Error(`nothing to stage at ${step.path}`);
-      repo.store.indexPut(indexEntryFor(step.path, hashed));
+      repo.checkout.indexPut(indexEntryFor(step.path, hashed));
       return;
     }
     case "gitRemove":
       worktree.unlink(absolute);
-      repo.store.indexRemove(step.path);
+      repo.checkout.indexRemove(step.path);
       return;
   }
 }
@@ -115,7 +115,7 @@ async function build(scenario: Scenario): Promise<{
   }
 
   const workspace = makeRepo("/");
-  await importFixture(fixture, workspace.repo.store);
+  await importFixture(fixture, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   // Move the clock on, so a later write of the same length still looks
   // newer than the stat data checkout recorded.
@@ -182,7 +182,7 @@ function buildStatusScale(
       ino: stat.ino,
     };
   });
-  workspace.repo.store.indexReplace(entries);
+  workspace.repo.checkout.indexReplace(entries);
   commit(workspace.context, workspace.repo, { message: "scale" });
   return { workspace, entries };
 }
@@ -199,7 +199,7 @@ function stageScaleMove(workspace: TestRepository, entries: readonly IndexEntry[
       .scan("/new", { filesOnly: true, limit: paths.length + 1 })
       .map((entry) => [entry.path.slice(1), entry]),
   );
-  workspace.repo.store.indexReplace(
+  workspace.repo.checkout.indexReplace(
     paths.map((path): IndexEntry => {
       const stat = stats.get(path);
       if (stat === undefined) throw new Error(`moved scale path was not written: ${path}`);
@@ -421,7 +421,7 @@ describe("status", () => {
     fixture.commit("base");
 
     const workspace = makeRepo("/");
-    await importFixture(fixture, workspace.repo.store);
+    await importFixture(fixture, workspace.repo.checkout);
     checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
     const index: IndexEntry[] = [];
     let indexInfo = "";
@@ -470,7 +470,7 @@ describe("status", () => {
       }
     }
     fixture.gitInput(indexInfo, "update-index", "--index-info");
-    workspace.repo.store.indexReplace(index);
+    workspace.repo.checkout.indexReplace(index);
 
     const entries = status(workspace.repo, workspace.worktree);
     expect(entries.map((entry) => `${entry.index}${entry.worktree}`)).toEqual(
@@ -496,7 +496,7 @@ describe("status", () => {
       ino: null,
     });
 
-    workspace.repo.store.indexReplace([entry(0), entry(1)]);
+    workspace.repo.checkout.indexReplace([entry(0), entry(1)]);
     expect(() => status(workspace.repo, workspace.worktree)).toThrow(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
@@ -738,7 +738,7 @@ describe("status", () => {
     fixtures.push(fixture);
     fixture.write("base.txt", "base\n").commit("base");
     const workspace = makeRepo("/");
-    await importFixture(fixture, workspace.repo.store);
+    await importFixture(fixture, workspace.repo.checkout);
     checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
     const attached = statusReport(workspace.repo, workspace.worktree, { branch: true });
     expect(formatPorcelainV2(attached.entries, attached.branch)).toBe(
@@ -756,7 +756,7 @@ describe("status", () => {
     );
     const oid = fixture.git("rev-parse", "HEAD");
     fixture.git("checkout", "-q", "--detach");
-    workspace.repo.store.setHead(oid);
+    workspace.repo.checkout.setHead(oid);
 
     const detached = statusReport(workspace.repo, workspace.worktree, { branch: true });
     expect(formatPorcelainV2(detached.entries, detached.branch)).toBe(
@@ -788,7 +788,7 @@ describe("status", () => {
       fixture.git("config", "branch.main.merge", "refs/heads/upstream");
 
       const workspace = makeRepo("/");
-      await importFixture(fixture, workspace.repo.store);
+      await importFixture(fixture, workspace.repo.checkout);
       checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
       workspace.repo.store.configSet("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
       workspace.repo.store.configSet("branch.main.remote", "origin");
@@ -958,7 +958,7 @@ describe("status cost", () => {
     const bytes = utf8.encode("identity\n");
     const oid = workspace.repo.store.write("blob", bytes);
     workspace.worktree.writeFiles([{ path: "/identity.txt", bytes, contentId: fromHex(oid) }]);
-    workspace.repo.store.indexPut({
+    workspace.repo.checkout.indexPut({
       path: "identity.txt",
       stage: 0,
       mode: 0o100644,
@@ -1017,10 +1017,12 @@ describe("status cost", () => {
     });
     const retainedPerEntry = statusIndexRetainedBytes(entry(0));
     const accepted = Math.floor(STATUS_RETAINED_BYTES / retainedPerEntry);
-    workspace.repo.store.indexReplace(Array.from({ length: accepted }, (_, index) => entry(index)));
+    workspace.repo.checkout.indexReplace(
+      Array.from({ length: accepted }, (_, index) => entry(index)),
+    );
 
     expect(status(workspace.repo, workspace.worktree)).toHaveLength(accepted);
-    workspace.repo.store.indexPut(entry(accepted));
+    workspace.repo.checkout.indexPut(entry(accepted));
     expect(() => status(workspace.repo, workspace.worktree)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );

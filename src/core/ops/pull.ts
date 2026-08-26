@@ -163,7 +163,7 @@ function requireMergeStrategy(repo: Repository): void {
 
 /** Resolve and validate everything pull needs before it starts network work. */
 export function resolvePull(repo: Repository, options: PullOptions = {}): PullPlan {
-  repo.store.requireNoMergeState();
+  repo.checkout.requireNoMergeState();
   const head = repo.head();
   if (head.ref === null) throw new GitError("EDETACHED", "cannot pull with a detached HEAD");
   if (head.oid === null) throw new GitError("ENOCOMMIT", "cannot pull into an unborn branch");

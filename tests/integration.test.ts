@@ -17,7 +17,7 @@ import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
-import { type RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 
@@ -35,7 +35,7 @@ function bytes(value: string | Uint8Array): Uint8Array {
   return typeof value === "string" ? new TextEncoder().encode(value) : value;
 }
 
-function writeTree(store: RepoStore, files: Record<string, FileValue>): WrittenTree {
+function writeTree(store: CheckoutStore, files: Record<string, FileValue>): WrittenTree {
   const identities = new Map<string, { mode: string; oid: string }>();
   const entries = Object.entries(files)
     .sort(([left], [right]) => comparePaths(left, right))
@@ -49,7 +49,7 @@ function writeTree(store: RepoStore, files: Record<string, FileValue>): WrittenT
 }
 
 function writeIdentityTree(
-  store: RepoStore,
+  store: CheckoutStore,
   files: Record<string, { mode: string; oid: string }>,
 ): WrittenTree {
   const entries = Object.entries(files)
@@ -67,7 +67,7 @@ function find(entries: readonly IntegrationEntry[], path: string): IntegrationEn
   return entry;
 }
 
-function assertCoordinatorIdle(store: RepoStore): void {
+function assertCoordinatorIdle(store: CheckoutStore): void {
   const probe = store.reserveMemory();
   try {
     probe.set("other", MAX_OPERATION_MEMORY_BYTES);
@@ -89,7 +89,7 @@ describe("bounded three-way integration plan", () => {
   it("rejects concurrent operation state before opening a tree cursor", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, { file: { content: "base\n" } });
     const current = writeTree(store, { file: { content: "current\n" } });
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
@@ -98,7 +98,7 @@ describe("bounded three-way integration plan", () => {
     db.storage.resetCounters();
     try {
       expect(() =>
-        planIntegration(new Repository(store, "/repo"), {
+        planIntegration(new Repository(store), {
           baseTreeOid: base.tree,
           currentTreeOid: current.tree,
           incomingTreeOid: incoming.tree,
@@ -114,9 +114,9 @@ describe("bounded three-way integration plan", () => {
 
   it("coordinates retained caller state through planning and maximum rebase execution reserve", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const tree = writeTree(store, { file: { content: "same\n" } });
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
     const journal = store.reserveMemory();
     journal.set("other", 4 * 1024 * 1024);
     try {
@@ -142,7 +142,7 @@ describe("bounded three-way integration plan", () => {
   it("merges mixed loose and packed blobs without mutation or leaked reservations", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const packedContents = {
       cleanBase: bytes("one\ncommon\nthree\n"),
       cleanIncoming: bytes("one\ncommon\nTHREE\n"),
@@ -201,16 +201,16 @@ describe("bounded three-way integration plan", () => {
     ).toBe(4);
 
     const coldDatabase = new SqliteGitDatabase(db);
-    const repository = coldDatabase.find("/repo");
+    const repository = coldDatabase.findCheckout("/repo");
     if (repository === null) throw new Error("missing packed integration repository");
-    const coldStore = coldDatabase.open(repository);
+    const coldStore = coldDatabase.openCheckout(repository);
     const before = {
       objects: coldStore.objectCount(),
       refs: coldStore.listRefs(),
       index: coldStore.indexEntries(),
     };
     db.storage.resetCounters();
-    const plan = planIntegration(new Repository(coldStore, "/repo"), {
+    const plan = planIntegration(new Repository(coldStore), {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
       incomingTreeOid: incoming.tree,
@@ -262,7 +262,7 @@ describe("bounded three-way integration plan", () => {
   it("batches content reads and returns clean, text, binary, and structural results", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, {
       "a.txt": { content: "one\ncommon\nthree\n" },
       "binary.bin": { content: new Uint8Array([0, 1]) },
@@ -281,7 +281,7 @@ describe("bounded three-way integration plan", () => {
       "conflict.txt": { content: "incoming\n" },
     });
     store.setRef("refs/heads/main", current.tree);
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
     const before = {
       objects: store.objectCount(),
       refs: store.listRefs(),
@@ -364,11 +364,11 @@ describe("bounded three-way integration plan", () => {
 
   it("fails at the blob-read boundary without leaking its reservation or mutating state", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, { file: { content: "base\n" } });
     const current = writeTree(store, { file: { content: "current\n" } });
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
     const before = {
       objects: store.objectCount(),
       refs: store.listRefs(),
@@ -393,7 +393,7 @@ describe("bounded three-way integration plan", () => {
 
   it("fails closed on missing and wrong-type candidate objects", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const current = writeTree(store, { file: { content: "current\n" } });
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
     const missing = writeIdentityTree(store, {
@@ -403,7 +403,7 @@ describe("bounded three-way integration plan", () => {
     const wrongType = writeIdentityTree(store, {
       file: { mode: MODE_FILE, oid: wrongTypeOid },
     });
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
     const before = {
       objects: store.objectCount(),
       refs: store.listRefs(),
@@ -436,7 +436,7 @@ describe("bounded three-way integration plan", () => {
   it("rejects candidate bytes that do not match their object id", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, { file: { content: "base\n" } });
     const current = writeTree(store, { file: { content: "current\n" } });
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
@@ -450,12 +450,12 @@ describe("bounded three-way integration plan", () => {
       currentIdentity.oid,
     );
     const coldDatabase = new SqliteGitDatabase(db);
-    const repository = coldDatabase.find("/repo");
+    const repository = coldDatabase.findCheckout("/repo");
     if (repository === null) throw new Error("missing corrupt integration repository");
-    const coldStore = coldDatabase.open(repository);
+    const coldStore = coldDatabase.openCheckout(repository);
 
     expect(() =>
-      planIntegration(new Repository(coldStore, "/repo"), {
+      planIntegration(new Repository(coldStore), {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,
@@ -473,8 +473,8 @@ describe("bounded three-way integration plan", () => {
 
   it("rejects limits that try to raise a hard ceiling", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
-    const repo = new Repository(store, "/repo");
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const repo = new Repository(store);
     expect(() =>
       planIntegration(repo, {
         baseTreeOid: null,
@@ -487,11 +487,11 @@ describe("bounded three-way integration plan", () => {
 
   it("uses a stable error code when the retained plan limit is crossed", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, { file: { content: "base\n" } });
     const current = writeTree(store, { file: { content: "current\n" } });
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
 
     try {
       planIntegration(repo, {
@@ -509,7 +509,7 @@ describe("bounded three-way integration plan", () => {
 
   it("caps text output before merge allocation and binary content before retention", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, {
       binary: { content: new Uint8Array([0, 1]) },
       text: { content: "base\n" },
@@ -522,7 +522,7 @@ describe("bounded three-way integration plan", () => {
       binary: { content: new Uint8Array([0, 3]) },
       text: { content: "incoming contents\n" },
     });
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
 
     expect(() =>
       planIntegration(repo, {
@@ -550,13 +550,13 @@ describe("bounded three-way integration plan", () => {
 
   it("does not hide a text output limit above the xmerge hard ceiling", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, { file: { content: "base\n" } });
     const current = writeTree(store, { file: { content: "current\n" } });
     const incoming = writeTree(store, { file: { content: "incoming\n" } });
 
     expect(() =>
-      planIntegration(new Repository(store, "/repo"), {
+      planIntegration(new Repository(store), {
         baseTreeOid: base.tree,
         currentTreeOid: current.tree,
         incomingTreeOid: incoming.tree,

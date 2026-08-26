@@ -193,7 +193,7 @@ describe("pull", () => {
     const detached = committedRepo();
     const oid = detached.repo.head().oid;
     if (oid === null) throw new Error("fixture did not create HEAD");
-    detached.repo.store.setHead(oid);
+    detached.repo.checkout.setHead(oid);
     expect(() => resolvePull(detached.repo)).toThrowError(
       expect.objectContaining({ code: "EDETACHED" }),
     );
@@ -221,7 +221,7 @@ describe("pull", () => {
       });
       expect(requests).toBe(0);
       expect(workspace.repo.head()).toEqual(originalHead);
-      expect(workspace.repo.store.readMergeState()).toBeNull();
+      expect(workspace.repo.checkout.readMergeState()).toBeNull();
     });
 
     it("rejects a malformed URL before making an HTTP request", async () => {
@@ -279,7 +279,7 @@ describe("pull", () => {
           timezoneOffset: 0,
           reason: "pull: fast-forward",
         });
-        expect(repo.store.reflog("HEAD")[0]).toMatchObject({
+        expect(repo.checkout.reflog("HEAD")[0]).toMatchObject({
           oldOid: base,
           newOid: incoming,
           reason: "pull: fast-forward",
@@ -389,7 +389,7 @@ describe("pull", () => {
           timezoneOffset: 0,
           reason: "pull: merge",
         });
-        expect(repo.store.reflog("HEAD")[0]).toMatchObject({
+        expect(repo.checkout.reflog("HEAD")[0]).toMatchObject({
           oldOid: local.oid,
           newOid: result.oid,
           reason: "pull: merge",
@@ -497,7 +497,7 @@ describe("pull", () => {
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
         const repo = openRepository(workspace.context, "/work");
         const branchEntries = repo.store.reflog("refs/heads/main").length;
-        const headEntries = repo.store.reflog("HEAD").length;
+        const headEntries = repo.checkout.reflog("HEAD").length;
         await workspace.workspace.fs.writeFile("/work/base.txt", "dirty\n");
         fixture.write("base.txt", "incoming\n");
         const incoming = fixture.commit("remote");
@@ -514,7 +514,7 @@ describe("pull", () => {
           reason: "fetch",
         });
         expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries);
-        expect(repo.store.reflog("HEAD")).toHaveLength(headEntries);
+        expect(repo.checkout.reflog("HEAD")).toHaveLength(headEntries);
       } finally {
         await server.close();
         fixture.dispose();
@@ -533,7 +533,7 @@ describe("pull", () => {
         const local = await git.commit({ dir: "/work", message: "local" });
         const repo = openRepository(workspace.context, "/work");
         const branchEntries = repo.store.reflog("refs/heads/main").length;
-        const headEntries = repo.store.reflog("HEAD").length;
+        const headEntries = repo.checkout.reflog("HEAD").length;
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
 
@@ -543,14 +543,14 @@ describe("pull", () => {
 
         expect(repo.head().oid).toBe(local.oid);
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-        expect(repo.store.readMergeState()).toBeNull();
+        expect(repo.checkout.readMergeState()).toBeNull();
         expect(await workspace.workspace.fs.readFile("/work/local.txt", "utf8")).toBe("local\n");
         expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
           newOid: incoming,
           reason: "fetch",
         });
         expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries);
-        expect(repo.store.reflog("HEAD")).toHaveLength(headEntries);
+        expect(repo.checkout.reflog("HEAD")).toHaveLength(headEntries);
       } finally {
         await server.close();
         fixture.dispose();
@@ -574,13 +574,13 @@ describe("pull", () => {
         const pulling = git.pull({ dir: "/work" });
         await barrier.entered;
         repo.store.setRef("refs/heads/topic", base);
-        repo.store.setHead("ref: refs/heads/topic");
+        repo.checkout.setHead("ref: refs/heads/topic");
         barrier.release();
 
         await expect(pulling).rejects.toMatchObject({ code: "ESTALEHEAD" });
         expect(repo.head()).toEqual({ ref: "refs/heads/topic", oid: base });
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-        expect(repo.store.readMergeState()).toBeNull();
+        expect(repo.checkout.readMergeState()).toBeNull();
         expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
           newOid: incoming,
           reason: "fetch",
@@ -618,7 +618,7 @@ describe("pull", () => {
         await expect(pulling).rejects.toMatchObject({ code: "ESTALEHEAD" });
         expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: base });
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-        expect(repo.store.readMergeState()).toBeNull();
+        expect(repo.checkout.readMergeState()).toBeNull();
         expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
           newOid: incoming,
           reason: "fetch",
@@ -686,7 +686,7 @@ describe("pull", () => {
           await expect(pulling).rejects.toMatchObject({ code: "ESTALEUPSTREAM" });
           expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: base });
           expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-          expect(repo.store.readMergeState()).toBeNull();
+          expect(repo.checkout.readMergeState()).toBeNull();
           expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
             newOid: incoming,
             reason: "fetch",
@@ -733,13 +733,13 @@ describe("pull", () => {
           author: null,
           committer: null,
         };
-        repo.store.writeMergeState(state, []);
+        repo.checkout.writeMergeState(state, []);
         barrier.release();
 
         await expect(pulling).rejects.toMatchObject({ code: "EMERGEACTIVE" });
         expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: local.oid });
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-        expect(repo.store.requireMergeState().state).toEqual(state);
+        expect(repo.checkout.requireMergeState().state).toEqual(state);
         expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
           newOid: incoming,
           reason: "fetch",
@@ -787,7 +787,7 @@ describe("pull", () => {
       const branchEntries = repo.store.reflog("refs/heads/main").length;
       expect(repo.head().oid).toBe(local.oid);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-      expect(repo.store.requireMergeState().state.phase).toBe("conflicted");
+      expect(repo.checkout.requireMergeState().state.phase).toBe("conflicted");
       expect(await workspace.workspace.fs.readFile("/work/conflict.txt", "utf8")).toContain(
         `>>>>>>> ${incoming}`,
       );
@@ -809,7 +809,7 @@ describe("pull", () => {
       await cold.add({ dir: "/work", paths: ["conflict.txt"] });
       const continued = await cold.commit({ dir: "/work", message: "resolved pull" });
       expect(repo.readCommit(continued.oid).parent).toEqual([local.oid, incoming]);
-      expect(repo.store.readMergeState()).toBeNull();
+      expect(repo.checkout.readMergeState()).toBeNull();
       expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries + 1);
       expect(repo.store.reflog("refs/heads/main")[0]).toEqual({
         refName: "refs/heads/main",
@@ -823,7 +823,7 @@ describe("pull", () => {
         timezoneOffset: 0,
         reason: "pull: merge",
       });
-      expect(repo.store.reflog("HEAD")[0]).toEqual({
+      expect(repo.checkout.reflog("HEAD")[0]).toEqual({
         refName: "HEAD",
         ordinal: priorOrdinal + 2,
         oldRaw: "ref: refs/heads/main",
@@ -860,13 +860,13 @@ describe("pull", () => {
 
       const repo = openRepository(workspace.context, "/work");
       expect(repo.head().oid).toBe(local.oid);
-      expect(repo.store.requireMergeState().state.phase).toBe("ready");
+      expect(repo.checkout.requireMergeState().state.phase).toBe("ready");
       expect(await workspace.workspace.fs.readFile("/work/remote.txt", "utf8")).toBe("remote\n");
 
       await reopenedGit(workspace).mergeAbort({ dir: "/work" });
       expect(repo.head().oid).toBe(local.oid);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-      expect(repo.store.readMergeState()).toBeNull();
+      expect(repo.checkout.readMergeState()).toBeNull();
       expect(() => workspace.workspace.fs.readFile("/work/remote.txt")).toThrowError(
         expect.objectContaining({ code: "ENOENT" }),
       );

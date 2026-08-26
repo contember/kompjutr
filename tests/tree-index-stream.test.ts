@@ -18,6 +18,11 @@ const OID = "11".repeat(20);
 const TREE_OID = "22".repeat(20);
 const ONE_MIB = 1024 * 1024;
 
+function initializeTreeSchema(db: SqlDatabase): void {
+  initializeGitSchema(db);
+  db.run("INSERT INTO git_repositories (id) VALUES (1)");
+}
+
 it("loads the pack tree index directly without a schema module cycle", () => {
   expect(typeof PackTreeIndex).toBe("function");
 });
@@ -173,7 +178,7 @@ describe("incremental tree parser", () => {
 describe("incremental tree index sink", () => {
   it("indexes a >16 MiB tree from tiny chunks within the exact state and SQL bounds", () => {
     const inner = new TestDatabase();
-    initializeGitSchema(inner);
+    initializeTreeSchema(inner);
     inner.storage.resetCounters();
     const db = new ObservedDatabase(inner);
     const nameLength = 2_180;
@@ -248,7 +253,7 @@ describe("incremental tree index sink", () => {
 
   it("keeps marker formulas and legacy adapters byte-exact", () => {
     const db = new TestDatabase();
-    initializeGitSchema(db);
+    initializeTreeSchema(db);
     const entries: TreeEntry[] = [
       { mode: "100644", name: "a", oid: OID },
       { mode: "100755", name: "b", oid: "33".repeat(20) },
@@ -279,7 +284,7 @@ describe("incremental tree index sink", () => {
 
   it("fails closed when a seeded loose source is missing", () => {
     const db = new TestDatabase();
-    initializeGitSchema(db);
+    initializeTreeSchema(db);
     const data = rawEntry("100644", "file");
 
     expect(() =>
@@ -295,14 +300,14 @@ describe("incremental tree index sink", () => {
       rawEntry("100644", "a/b"),
     ]) {
       const db = new TestDatabase();
-      initializeGitSchema(db);
+      initializeTreeSchema(db);
       const sink = createTreeIndexSink(db, source(raw.length));
       expect(() => sink.push(raw)).toThrow(/invalid tree/);
       expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
     }
 
     const db = new TestDatabase();
-    initializeGitSchema(db);
+    initializeTreeSchema(db);
     const valid = rawEntry("100644", "file");
     const sink = createTreeIndexSink(db, source(valid.length + 1));
     sink.push(valid);
@@ -316,7 +321,7 @@ describe("incremental tree index sink", () => {
     for (let at = 0; at < many.length; at += entry.length) many.set(entry, at);
 
     const directInner = new TestDatabase();
-    initializeGitSchema(directInner);
+    initializeTreeSchema(directInner);
     const direct = new ObservedDatabase(directInner);
     const sink = createTreeIndexSink(direct, source(entry.length));
     expect(() => sink.push(many)).toThrow("exceeds its declared size");
@@ -324,7 +329,7 @@ describe("incremental tree index sink", () => {
     expect(direct.markerInserts).toBe(0);
 
     const legacyInner = new TestDatabase();
-    initializeGitSchema(legacyInner);
+    initializeTreeSchema(legacyInner);
     const legacy = new ObservedDatabase(legacyInner);
     expect(() => indexTreeSources(legacy, [{ ...source(entry.length), chunks: [many] }])).toThrow(
       "exceeds its declared size",
@@ -335,7 +340,7 @@ describe("incremental tree index sink", () => {
 
   it("flushes mixed entries and markers at the combined 2,048-row boundary", () => {
     const inner = new TestDatabase();
-    initializeGitSchema(inner);
+    initializeTreeSchema(inner);
     inner.storage.resetCounters();
     const db = new ObservedDatabase(inner);
     const entry = rawEntry("100644", "file");
@@ -360,7 +365,7 @@ describe("incremental tree index sink", () => {
 
   it("rolls back entries and never writes a marker after an injected SQL failure", () => {
     const inner = new TestDatabase();
-    initializeGitSchema(inner);
+    initializeTreeSchema(inner);
     const db = new ObservedDatabase(inner);
     db.failEntryInsert = 2;
     const entry = rawEntry("100644", "file");

@@ -27,7 +27,7 @@ function fixture(): GitFixture {
 
 async function imported(source: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
-  await importFixture(source, workspace.repo.store);
+  await importFixture(source, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", "Fixture");
   workspace.repo.store.configSet("user.email", "fixture@example.com");
@@ -43,9 +43,9 @@ function reopenRepo(workspace: TestRepository): Repository {
   const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
     now: workspace.context.now,
   });
-  const row = database.find("/");
+  const row = database.findCheckout("/");
   if (row === null) throw new Error("reopened repository is missing");
-  return new Repository(database.open(row), "/");
+  return new Repository(database.openCheckout(row));
 }
 
 function expectCode(action: () => unknown, code: string): void {
@@ -89,9 +89,9 @@ describe("rebase lifecycle", () => {
     const workspace = await imported(source);
     source.git("rebase", "upstream");
     const expected = source.git("rev-parse", "HEAD");
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
     let publications = 0;
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       publications++;
       return originalUpdate(mutation, metadata);
     };
@@ -116,11 +116,11 @@ describe("rebase lifecycle", () => {
     expect(workspace.repo.readCommit(rewrittenFirst).author).toEqual(
       workspace.repo.readCommit(originalFirst).author,
     );
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(publications).toBe(1);
     expect(original).not.toBe(expected);
     const named = workspace.repo.store.reflog("refs/heads/current")[0];
-    const head = workspace.repo.store.reflog("HEAD")[0];
+    const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(named).toMatchObject({
       oldOid: original,
       newOid: expected,
@@ -160,9 +160,9 @@ describe("rebase lifecycle", () => {
       skipped: 0,
       fastForward: true,
     });
-    expect(behind.repo.store.readOperationState()).toBeNull();
+    expect(behind.repo.checkout.readOperationState()).toBeNull();
     const named = behind.repo.store.reflog("refs/heads/behind")[0];
-    const head = behind.repo.store.reflog("HEAD")[0];
+    const head = behind.repo.checkout.reflog("HEAD")[0];
     expect(named).toMatchObject({
       oldOid: first,
       newOid: second,
@@ -187,9 +187,9 @@ describe("rebase lifecycle", () => {
       outcome: "up-to-date",
       oid: second,
     });
-    expect(current.repo.store.readOperationState()).toBeNull();
+    expect(current.repo.checkout.readOperationState()).toBeNull();
     expect(current.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(current.repo.store.reflog("HEAD")).toEqual([]);
+    expect(current.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("retains a source-empty commit with its exact message and drops a result-empty commit", async () => {
@@ -263,7 +263,7 @@ describe("rebase lifecycle", () => {
     const suspended = rebase(workspace.context, workspace.repo, workspace.worktree, { upstream });
     expect(suspended.outcome).toBe("conflicted");
     expect(workspace.repo.head().oid).not.toBe(upstream);
-    expect(workspace.repo.store.requireOperationState("rebase").state.phase).toBe("conflicted");
+    expect(workspace.repo.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
 
     writeWorkFile(workspace, "/shared.txt", "resolved\n");
     add(workspace.repo, workspace.worktree, { paths: ["shared.txt"] });
@@ -271,7 +271,7 @@ describe("rebase lifecycle", () => {
 
     expect(completed.outcome).toBe("completed");
     expect(textAt(workspace, "shared.txt")).toBe("resolved\n");
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("resumes the remaining queue after a conflict in the first step", async () => {
@@ -291,7 +291,7 @@ describe("rebase lifecycle", () => {
     expect(
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toMatchObject({ outcome: "conflicted", replayed: 0 });
-    expect(workspace.repo.store.requireOperationState("rebase").state.currentStep).toBe(0);
+    expect(workspace.repo.checkout.requireOperationState("rebase").state.currentStep).toBe(0);
     writeWorkFile(workspace, "/shared.txt", "resolved first\n");
     add(workspace.repo, workspace.worktree, { paths: ["shared.txt"] });
 
@@ -372,18 +372,18 @@ describe("rebase lifecycle", () => {
     expect(
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
     ).toBe("conflicted");
-    expect(workspace.repo.store.hasConflicts()).toBe(true);
+    expect(workspace.repo.checkout.hasConflicts()).toBe(true);
     expect(textAt(workspace, "deleted.txt")).toBe("upstream\n");
 
     rebaseAbort(workspace.repo, workspace.worktree);
 
     expect(workspace.repo.head().oid).toBe(original);
-    expect(workspace.repo.store.hasConflicts()).toBe(false);
+    expect(workspace.repo.checkout.hasConflicts()).toBe(false);
     expect(textAt(workspace, "deleted.txt")).toBeNull();
     expect(
       integrationIndexMatchesTree(workspace.repo, workspace.repo.readCommit(original).tree),
     ).toBe(true);
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("restores the current replay parent on skip and original HEAD on abort", async () => {
@@ -409,7 +409,7 @@ describe("rebase lifecycle", () => {
     expect(aborted.repo.head().oid).toBe(original);
     expect(textAt(aborted, "shared.txt")).toBe("current\n");
     expect(textAt(aborted, "keep.txt")).toBe("untracked\n");
-    expect(aborted.repo.store.readOperationState()).toBeNull();
+    expect(aborted.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("discards all tracked conflict-time edits on skip and abort but preserves untracked files", async () => {
@@ -464,7 +464,7 @@ describe("rebase lifecycle", () => {
     }
     expect(textAt(aborted.workspace, "staged-add.txt")).toBeNull();
     expect(textAt(aborted.workspace, "untracked.txt")).toBe("keep me\n");
-    expect(aborted.workspace.repo.store.readOperationState()).toBeNull();
+    expect(aborted.workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("refuses dirty starts before mutation", async () => {
@@ -478,7 +478,7 @@ describe("rebase lifecycle", () => {
       "ECHECKOUTFAIL",
     );
     expect(workspace.repo.head().oid).toBe(original);
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("rejects unsupported source message bytes and encoding headers before mutation", async () => {
@@ -510,7 +510,7 @@ describe("rebase lifecycle", () => {
         "EUNSUPPORTED",
       );
       expect(workspace.repo.head()).toEqual({ ref: "refs/heads/current", oid: unsupported });
-      expect(workspace.repo.store.readOperationState()).toBeNull();
+      expect(workspace.repo.checkout.readOperationState()).toBeNull();
       expect(textAt(workspace, "current.txt")).toBe("current\n");
       expect(textAt(workspace, "upstream.txt")).toBeNull();
     }
@@ -534,7 +534,7 @@ describe("rebase lifecycle", () => {
       "ECHECKOUTFAIL",
     );
     expect(textAt(workspace, "x~HEAD")).toBe("pre-existing untracked\n");
-    expect(workspace.repo.store.requireOperationState("rebase").state).toMatchObject({
+    expect(workspace.repo.checkout.requireOperationState("rebase").state).toMatchObject({
       phase: "running",
       currentStep: 0,
       currentParentOid: upstream,
@@ -546,7 +546,7 @@ describe("rebase lifecycle", () => {
     expect(cold.head().oid).toBe(original);
     expect(textAt(workspace, "x/y.txt")).toBe("current child\n");
     expect(textAt(workspace, "x~HEAD")).toBe("pre-existing untracked\n");
-    expect(cold.store.readOperationState()).toBeNull();
+    expect(cold.checkout.readOperationState()).toBeNull();
   });
 
   it("authenticates only absent or directory snapshots for baseline-absent relocations", async () => {
@@ -564,9 +564,9 @@ describe("rebase lifecycle", () => {
     const upstreamTree = absent.repo.readCommit(upstream).tree;
     const upstreamFile = absent.repo.readTree(upstreamTree).find((entry) => entry.name === "x");
     if (upstreamFile === undefined) throw new Error("upstream file is missing");
-    const originalReplace = absent.repo.store.replaceOperationJournal.bind(absent.repo.store);
+    const originalReplace = absent.repo.checkout.replaceOperationJournal.bind(absent.repo.checkout);
     let sawAbsent = false;
-    absent.repo.store.replaceOperationJournal = (integrity, state, steps, touched) => {
+    absent.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
       const relocation = touched.find((entry) => entry.path === "x~HEAD");
       if (state.phase !== "conflicted" || relocation === undefined) {
         originalReplace(integrity, state, steps, touched);
@@ -604,7 +604,7 @@ describe("rebase lifecycle", () => {
       rebase(directory.context, directory.repo, directory.worktree, { upstream }).outcome,
     ).toBe("conflicted");
     expect(
-      directory.repo.store
+      directory.repo.checkout
         .requireOperationState("rebase")
         .touched.find((entry) => entry.path === "x~HEAD"),
     ).toMatchObject({ index: null, worktree: { kind: "directory" } });

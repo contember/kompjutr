@@ -538,11 +538,11 @@ function mergeInTransaction(
   const theirs = requireMergeRevision(options.theirs, "incoming");
   const ours =
     options.ours === undefined ? undefined : requireMergeRevision(options.ours, "current");
-  repo.store.requireNoMergeState();
+  repo.checkout.requireNoMergeState();
   const rawHead = requireCurrentHead(repo, ours);
   if (rawHead.ref === null || rawHead.oid === null) throw new GitError("ECORRUPT", "invalid HEAD");
   const head = { ref: rawHead.ref, oid: rawHead.oid };
-  if (repo.store.hasConflicts()) {
+  if (repo.checkout.hasConflicts()) {
     throw new GitError("EUNMERGED", "cannot merge with unmerged index entries");
   }
   const incomingOid = repo.peel(repo.revParse(theirs));
@@ -643,7 +643,7 @@ function mergeInTransaction(
       priorSqlStatements: budget.sqlStatements,
     });
     if (isFastForward) {
-      repo.store.mutateRefs(
+      repo.mutateRefs(
         {
           expected: { name: head.ref, target: head.oid },
           puts: [{ name: head.ref, target: incomingOid }],
@@ -699,7 +699,7 @@ export function mergeContinue(
   options: MergeContinueOptions = {},
 ): MergeResult {
   return repo.store.db.transactionSync(() => {
-    const journal = repo.store.requireMergeState();
+    const journal = repo.checkout.requireMergeState();
     const head = requireOriginalHead(repo, journal.state);
     requireJournalOwnership(
       repo,
@@ -707,7 +707,7 @@ export function mergeContinue(
       journal,
       MAX_INTEGRATION_COMMIT_SQL_STATEMENTS + INTEGRATION_INDEX_SQL_STATEMENTS,
     );
-    if (repo.store.hasConflicts()) {
+    if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue: the index has unmerged paths");
     }
     requireBoundedIntegrationIndex(repo);
@@ -727,7 +727,7 @@ export function mergeContinue(
         expectedHead: head,
         refLogReason: mergeReason(journal.state.mergeOrigin, "commit"),
       });
-      repo.store.clearMergeState();
+      repo.checkout.clearMergeState();
       return result;
     } finally {
       reservation.dispose();
@@ -738,7 +738,7 @@ export function mergeContinue(
 /** Restore only paths owned by the active merge and clear its durable state. */
 export function mergeAbort(repo: Repository, worktree: Worktree): void {
   repo.store.db.transactionSync(() => {
-    const journal = repo.store.requireMergeState();
+    const journal = repo.checkout.requireMergeState();
     requireOriginalHead(repo, journal.state);
     requireJournalOwnership(repo, worktree, journal, 350);
     const reservation = reserveIntegrationExecution(repo);

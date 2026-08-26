@@ -21,10 +21,10 @@ export interface InitOptions {
 
 export function initRepository(context: GitContext, options: InitOptions = {}): Repository {
   const root = normalizePath(options.dir ?? "/");
-  if (context.database.at(root) !== null) throw new AlreadyInitializedError(root);
+  if (context.database.checkoutAt(root) !== null) throw new AlreadyInitializedError(root);
   const branch = options.defaultBranch ?? "main";
-  const row = context.database.create(root, `ref: refs/heads/${branch}`);
-  const repo = new Repository(context.database.open(row), row.root);
+  const row = context.database.createRepository(root, `ref: refs/heads/${branch}`);
+  const repo = new Repository(context.database.openCheckout(row));
   if (options.bare === true) repo.store.configSet("core.bare", "true");
   return repo;
 }

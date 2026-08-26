@@ -15,7 +15,7 @@ export function stageWorktreePaths(workspace: TestRepository, paths: readonly st
   for (const path of paths) {
     const hashed = hashWorktreePath(workspace.repo, workspace.worktree, path);
     if (hashed === null) throw new Error(`missing fixture path: ${path}`);
-    workspace.repo.store.indexPut(indexEntryFor(path, hashed));
+    workspace.repo.checkout.indexPut(indexEntryFor(path, hashed));
   }
 }
 
@@ -33,8 +33,8 @@ export function sparseTrackerContext(
     ...workspace.context,
     sparseWorkspace: source,
     indexTracker: {
-      reseal(repoId, baselineTreeOid, entries) {
-        return resealIndexTracker(workspace.database.db, repoId, baselineTreeOid, entries);
+      reseal(checkoutId, baselineTreeOid, entries) {
+        return resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries);
       },
     },
   };
@@ -52,7 +52,7 @@ export function sealIndexTracker(
   expect(
     resealIndexTracker(
       workspace.database.db,
-      workspace.repo.store.repoId,
+      workspace.repo.checkout.checkoutId,
       options.baselineTreeOid === undefined ? workspace.repo.headTree() : options.baselineTreeOid,
       options.entries ?? [],
     ),

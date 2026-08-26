@@ -34,7 +34,7 @@ function fixture(): GitFixture {
 
 async function imported(source: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
-  await importFixture(source, workspace.repo.store);
+  await importFixture(source, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", IDENTITY.name);
   workspace.repo.store.configSet("user.email", IDENTITY.email);
@@ -45,11 +45,11 @@ function reopen(workspace: TestRepository): { context: GitContext; repo: Reposit
   const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
     now: workspace.context.now,
   });
-  const row = database.find("/");
+  const row = database.findCheckout("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
     context: { ...workspace.context, database },
-    repo: new Repository(database.open(row), "/"),
+    repo: new Repository(database.openCheckout(row)),
   };
 }
 
@@ -61,8 +61,8 @@ function textAt(workspace: TestRepository, path: string): string | null {
 function durableSnapshot(workspace: TestRepository): {
   head: ReturnType<Repository["head"]>;
   objects: number;
-  state: ReturnType<Repository["store"]["readOperationState"]>;
-  index: ReturnType<Repository["store"]["indexGet"]>[];
+  state: ReturnType<Repository["checkout"]["readOperationState"]>;
+  index: ReturnType<Repository["checkout"]["indexGet"]>[];
   conflict: string | null;
   reflogEntries: number;
   reflogOrdinal: number;
@@ -74,12 +74,12 @@ function durableSnapshot(workspace: TestRepository): {
   return {
     head: workspace.repo.head(),
     objects: row.count,
-    state: workspace.repo.store.readOperationState(),
+    state: workspace.repo.checkout.readOperationState(),
     index: [
-      workspace.repo.store.indexGet("conflict.txt", 0),
-      workspace.repo.store.indexGet("conflict.txt", 1),
-      workspace.repo.store.indexGet("conflict.txt", 2),
-      workspace.repo.store.indexGet("conflict.txt", 3),
+      workspace.repo.checkout.indexGet("conflict.txt", 0),
+      workspace.repo.checkout.indexGet("conflict.txt", 1),
+      workspace.repo.checkout.indexGet("conflict.txt", 2),
+      workspace.repo.checkout.indexGet("conflict.txt", 3),
     ],
     conflict: textAt(workspace, "conflict.txt"),
     reflogEntries:
@@ -139,15 +139,15 @@ describe("cherry-pick lifecycle", () => {
         };
       }
       if (fault === "index") {
-        const original = workspace.repo.store.indexApply.bind(workspace.repo.store);
-        workspace.repo.store.indexApply = (body, options) => {
+        const original = workspace.repo.checkout.indexApply.bind(workspace.repo.checkout);
+        workspace.repo.checkout.indexApply = (body, options) => {
           original(body, options);
           throw new Error("fault index");
         };
       }
       if (fault === "journal") {
-        const original = workspace.repo.store.writeOperationState.bind(workspace.repo.store);
-        workspace.repo.store.writeOperationState = (state, touched) => {
+        const original = workspace.repo.checkout.writeOperationState.bind(workspace.repo.checkout);
+        workspace.repo.checkout.writeOperationState = (state, touched) => {
           original(state, touched);
           throw new Error("fault journal");
         };
@@ -182,8 +182,8 @@ describe("cherry-pick lifecycle", () => {
           return result;
         };
       } else {
-        const original = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-        workspace.repo.store.mutateRefs = (mutation, metadata) => {
+        const original = workspace.repo.mutateRefs.bind(workspace.repo);
+        workspace.repo.mutateRefs = (mutation, metadata) => {
           original(mutation, metadata);
           throw new Error("fault ref");
         };
@@ -220,7 +220,7 @@ describe("cherry-pick lifecycle", () => {
     expect(commit.committer.timestamp).toBe(original.committer.timestamp + 60);
     expect(commit.message).toBe(original.message);
     expect(textAt(workspace, "picked.txt")).toBe("picked\n");
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([
       expect.objectContaining({
         oldOid: base,
@@ -232,7 +232,7 @@ describe("cherry-pick lifecycle", () => {
       }),
     ]);
     const named = workspace.repo.store.reflog("refs/heads/main")[0];
-    const head = workspace.repo.store.reflog("HEAD")[0];
+    const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(head).toMatchObject({ oldOid: base, newOid: result.oid, reason: "cherry-pick" });
     if (named === undefined || head === undefined) throw new Error("cherry-pick reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
@@ -289,7 +289,7 @@ describe("cherry-pick lifecycle", () => {
       });
       expect(workspace.repo.head().oid).not.toBeNull();
       const cold = reopen(workspace);
-      expect(cold.repo.store.requireOperationState("cherry-pick").state).toMatchObject({
+      expect(cold.repo.checkout.requireOperationState("cherry-pick").state).toMatchObject({
         phase: "empty",
         emptyReason: kind,
         sourceOid: picked,
@@ -299,10 +299,10 @@ describe("cherry-pick lifecycle", () => {
         reason: kind,
       });
       cherryPickSkip(cold.repo, workspace.worktree);
-      expect(cold.repo.store.readOperationState()).toBeNull();
+      expect(cold.repo.checkout.readOperationState()).toBeNull();
       expect(cold.repo.has(base)).toBe(true);
       expect(cold.repo.store.reflog("refs/heads/main")).toEqual([]);
-      expect(cold.repo.store.reflog("HEAD")).toEqual([]);
+      expect(cold.repo.checkout.reflog("HEAD")).toEqual([]);
     }
   });
 
@@ -324,14 +324,14 @@ describe("cherry-pick lifecycle", () => {
       outcome: "conflicted",
     });
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.indexGet("conflict.txt", 1)?.oid).toBeDefined();
-    expect(workspace.repo.store.indexGet("conflict.txt", 2)?.oid).toBeDefined();
-    expect(workspace.repo.store.indexGet("conflict.txt", 3)?.oid).toBeDefined();
+    expect(workspace.repo.checkout.indexGet("conflict.txt", 1)?.oid).toBeDefined();
+    expect(workspace.repo.checkout.indexGet("conflict.txt", 2)?.oid).toBeDefined();
+    expect(workspace.repo.checkout.indexGet("conflict.txt", 3)?.oid).toBeDefined();
     expect(textAt(workspace, "conflict.txt")).toContain(
       `>>>>>>> ${picked.slice(0, 7)} (topic subject)`,
     );
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
 
     workspace.tick(60_000);
     const cold = reopen(workspace);
@@ -351,7 +351,7 @@ describe("cherry-pick lifecycle", () => {
       timestamp: original.committer.timestamp + 60,
       timezoneOffset: workspace.context.timezoneOffset(),
     });
-    expect(cold.repo.store.readOperationState()).toBeNull();
+    expect(cold.repo.checkout.readOperationState()).toBeNull();
     expect(cold.repo.store.reflog("refs/heads/main")).toEqual([
       expect.objectContaining({
         oldOid: current,
@@ -363,7 +363,7 @@ describe("cherry-pick lifecycle", () => {
       }),
     ]);
     const named = cold.repo.store.reflog("refs/heads/main")[0];
-    const head = cold.repo.store.reflog("HEAD")[0];
+    const head = cold.repo.checkout.reflog("HEAD")[0];
     expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "cherry-pick" });
     if (named === undefined || head === undefined) throw new Error("cherry-pick reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
@@ -415,11 +415,11 @@ describe("cherry-pick lifecycle", () => {
       reason: "result",
     });
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.requireOperationState("cherry-pick").state.phase).toBe("empty");
+    expect(workspace.repo.checkout.requireOperationState("cherry-pick").state.phase).toBe("empty");
     cherryPickAbort(workspace.repo, workspace.worktree);
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("restores owned paths on abort after partial resolution and preserves unrelated paths", async () => {
@@ -441,7 +441,7 @@ describe("cherry-pick lifecycle", () => {
     writeWorkFile(workspace, "/untracked.txt", "untracked\n");
 
     const beforeRejectedRestore = durableSnapshot(workspace);
-    const journal = workspace.repo.store.requireOperationState("cherry-pick");
+    const journal = workspace.repo.checkout.requireOperationState("cherry-pick");
     expect(() =>
       workspace.repo.store.db.transactionSync(() =>
         restoreProjectedOperation(workspace.repo, workspace.worktree, journal, {
@@ -458,7 +458,7 @@ describe("cherry-pick lifecycle", () => {
     expect(textAt(workspace, "conflict.txt")).toBe("current\n");
     expect(textAt(workspace, "sentinel.txt")).toBe("local sentinel\n");
     expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("restores owned paths on skip after partial resolution and a cold reopen", async () => {
@@ -486,9 +486,9 @@ describe("cherry-pick lifecycle", () => {
     expect(textAt(workspace, "conflict.txt")).toBe("current\n");
     expect(textAt(workspace, "sentinel.txt")).toBe("local sentinel\n");
     expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
-    expect(cold.repo.store.indexGet("conflict.txt", 0)?.oid).toBeDefined();
-    expect(cold.repo.store.hasConflicts()).toBe(false);
-    expect(cold.repo.store.readOperationState()).toBeNull();
+    expect(cold.repo.checkout.indexGet("conflict.txt", 0)?.oid).toBeDefined();
+    expect(cold.repo.checkout.hasConflicts()).toBe(false);
+    expect(cold.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("rejects staged and touched dirty state while preserving unrelated work", async () => {
@@ -545,16 +545,16 @@ describe("cherry-pick lifecycle", () => {
       const workspace = await imported(source);
       const oid = workspace.repo.head().oid;
       if (oid === null) throw new Error("fixture HEAD is missing");
-      if (kind === "detached") workspace.repo.store.setHead(oid);
-      if (kind === "unborn") workspace.repo.store.setHead("ref: refs/heads/unborn");
+      if (kind === "detached") workspace.repo.checkout.setHead(oid);
+      if (kind === "unborn") workspace.repo.checkout.setHead("ref: refs/heads/unborn");
       if (kind === "tag") {
         workspace.repo.store.setRef("refs/tags/current", oid);
-        workspace.repo.store.setHead("ref: refs/tags/current");
+        workspace.repo.checkout.setHead("ref: refs/tags/current");
       }
       const before = {
         head: workspace.repo.head(),
-        index: [...workspace.repo.store.indexScan()],
-        state: workspace.repo.store.readOperationState(),
+        index: [...workspace.repo.checkout.indexScan()],
+        state: workspace.repo.checkout.readOperationState(),
         base: textAt(workspace, "base.txt"),
         picked: textAt(workspace, "picked.txt"),
       };
@@ -568,8 +568,8 @@ describe("cherry-pick lifecycle", () => {
       );
       expect({
         head: workspace.repo.head(),
-        index: [...workspace.repo.store.indexScan()],
-        state: workspace.repo.store.readOperationState(),
+        index: [...workspace.repo.checkout.indexScan()],
+        state: workspace.repo.checkout.readOperationState(),
         base: textAt(workspace, "base.txt"),
         picked: textAt(workspace, "picked.txt"),
       }).toEqual(before);

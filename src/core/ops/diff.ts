@@ -321,7 +321,7 @@ function* pendingChanges(
   const candidates: WorkingCandidate[] = [];
   for (const row of joinSorted3(
     from,
-    stageZero(repo.store.indexScan()),
+    stageZero(repo.checkout.indexScan()),
     walkWorktreeEntriesStream(
       worktree,
       repo.root,

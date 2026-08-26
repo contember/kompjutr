@@ -14,7 +14,7 @@ import {
   planReplay,
 } from "../src/core/ops/replay.js";
 import { Repository } from "../src/core/repository.js";
-import { type RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const PERSON: Person = {
@@ -26,7 +26,7 @@ const PERSON: Person = {
 
 interface Harness {
   db: TestDatabase;
-  store: RepoStore;
+  store: CheckoutStore;
   repo: Repository;
 }
 
@@ -38,11 +38,11 @@ interface TreeFixture {
 function harness(): Harness {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
-  const store = database.open(database.create("/repo", "ref: refs/heads/main"));
-  return { db, store, repo: new Repository(store, "/repo") };
+  const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+  return { db, store, repo: new Repository(store) };
 }
 
-function tree(store: RepoStore, content?: string): TreeFixture {
+function tree(store: CheckoutStore, content?: string): TreeFixture {
   if (content === undefined) {
     return { tree: store.write("tree", serializeTree([])), blob: null };
   }
@@ -54,7 +54,7 @@ function tree(store: RepoStore, content?: string): TreeFixture {
 }
 
 function commit(
-  store: RepoStore,
+  store: CheckoutStore,
   treeOid: string,
   parent: readonly string[],
   message: string,
@@ -560,9 +560,9 @@ describe("one-commit replay planner", () => {
       corruptParent,
     );
     const coldDatabase = new SqliteGitDatabase(corrupt.db);
-    const row = coldDatabase.find("/repo");
+    const row = coldDatabase.findCheckout("/repo");
     if (row === null) throw new Error("missing corrupt replay repository");
-    const coldRepo = new Repository(coldDatabase.open(row), "/repo");
+    const coldRepo = new Repository(coldDatabase.openCheckout(row));
     expectCode(
       () =>
         planReplay(coldRepo, {

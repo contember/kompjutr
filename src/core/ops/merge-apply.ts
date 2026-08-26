@@ -521,7 +521,7 @@ function indexSnapshots(repo: Repository, specs: readonly TouchedSpec[]): IndexS
   const last = specs[specs.length - 1];
   if (last === undefined) return { entries: found, rows: 0 };
   let rows = 0;
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     rows++;
     if (rows > MAX_MERGE_APPLY_SCAN_ROWS) {
       throw new GitError("E2BIG", `merge index scan exceeds ${MAX_MERGE_APPLY_SCAN_ROWS} rows`);
@@ -843,7 +843,7 @@ function applyIndex(
   specs: readonly TouchedSpec[],
 ): void {
   const projected = new Set(entries.map((entry) => entry.path));
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     for (const spec of specs) {
       if (!projected.has(spec.path)) sink.remove(spec.path);
     }
@@ -905,12 +905,12 @@ function applyProjectedOperationInternal(
 ): OperationApplyResult {
   validateEntries(entries);
   if (activeRebase === null) {
-    repo.store.requireNoOperationState();
+    repo.checkout.requireNoOperationState();
   } else {
     if (options.suspendedState !== null) {
       throw new CorruptError("rebase apply supplied two journal transitions");
     }
-    const current = repo.store.requireOperationState("rebase");
+    const current = repo.checkout.requireOperationState("rebase");
     if (current.integrityOid !== activeRebase.expectedIntegrityOid) {
       throw new GitError("EOPMISMATCH", "rebase operation changed before apply");
     }
@@ -1016,9 +1016,9 @@ function applyProjectedOperationInternal(
   if (touched !== null) {
     if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
     if (activeRebase === null) {
-      repo.store.writeOperationState(suspendedState, touched);
+      repo.checkout.writeOperationState(suspendedState, touched);
     } else {
-      repo.store.replaceOperationJournal(
+      repo.checkout.replaceOperationJournal(
         activeRebase.expectedIntegrityOid,
         suspendedState,
         activeRebase.steps,
@@ -1165,7 +1165,7 @@ function abortDestructiveRoots(touched: readonly MergeTouchedPath[]): string[] {
 }
 
 function restoreIndex(repo: Repository, touched: readonly MergeTouchedPath[]): void {
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     for (const entry of touched) {
       sink.remove(entry.path);
       if (entry.index !== null) {
@@ -1334,7 +1334,7 @@ export function abortProjectedMerge(
   );
   restoreWorktree(repo, worktree, journal.touched, current.entries, calls);
   restoreIndex(repo, journal.touched);
-  repo.store.clearMergeState();
+  repo.checkout.clearMergeState();
 }
 
 /** Restore one authenticated operation snapshot; the caller owns state clearing. */

@@ -8,24 +8,24 @@ import {
   selectMergeBases,
 } from "../src/core/ops/merge-base.js";
 import { Repository } from "../src/core/repository.js";
-import { type RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 
 interface Harness {
   db: TestDatabase;
-  store: RepoStore;
+  store: CheckoutStore;
   repo: Repository;
 }
 
 function harness(): Harness {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
-  const store = database.open(database.create("/repo", "ref: refs/heads/main"));
-  return { db, store, repo: new Repository(store, "/repo") };
+  const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+  return { db, store, repo: new Repository(store) };
 }
 
-function importCommits(store: RepoStore, fixture: GitFixture, oids: readonly string[]): void {
+function importCommits(store: CheckoutStore, fixture: GitFixture, oids: readonly string[]): void {
   const seen = new Set<string>();
   for (const oid of oids) {
     if (seen.has(oid)) continue;
@@ -34,7 +34,7 @@ function importCommits(store: RepoStore, fixture: GitFixture, oids: readonly str
   }
 }
 
-function importReachable(store: RepoStore, fixture: GitFixture, tips: readonly string[]): void {
+function importReachable(store: CheckoutStore, fixture: GitFixture, tips: readonly string[]): void {
   const output = fixture.git("rev-list", ...tips);
   importCommits(store, fixture, output === "" ? [] : output.split("\n"));
 }
@@ -103,7 +103,7 @@ describe("bounded merge-base selection", () => {
 
       expect(fixture.git("merge-base", "--is-ancestor", second, third)).toBe("");
       expect(
-        selectMergeBases(new Repository(store, "/repo"), {
+        selectMergeBases(new Repository(store), {
           currentOid: third,
           incomingOid: second,
         }),
@@ -142,7 +142,7 @@ describe("bounded merge-base selection", () => {
       });
       expect(db.storage.statementCount).toBe(AHEAD_BEHIND_SQL_STATEMENTS);
       expect(() =>
-        countAheadBehind(new Repository(store, "/repo"), {
+        countAheadBehind(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxCommits: 2 },
@@ -150,7 +150,7 @@ describe("bounded merge-base selection", () => {
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
       const blob = store.write("blob", new Uint8Array([1]));
       expect(() =>
-        countAheadBehind(new Repository(store, "/repo"), {
+        countAheadBehind(new Repository(store), {
           currentOid: current,
           incomingOid: blob,
         }),
@@ -247,7 +247,7 @@ describe("bounded merge-base selection", () => {
       expect(expected).toEqual([left, right].sort(compareOids));
       expect(selection).toMatchObject({ kind: "divergent", bases: expected, commits: 5 });
       expect(() =>
-        selectMergeBases(new Repository(store, "/repo"), {
+        selectMergeBases(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxBases: 1 },
@@ -267,21 +267,21 @@ describe("bounded merge-base selection", () => {
       const before = store.objectCount();
 
       expect(
-        selectMergeBases(new Repository(store, "/repo"), {
+        selectMergeBases(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxCommits: measured.commits, maxRetainedBytes: measured.retainedBytes },
         }),
       ).toMatchObject({ commits: measured.commits, retainedBytes: measured.retainedBytes });
       expect(() =>
-        selectMergeBases(new Repository(store, "/repo"), {
+        selectMergeBases(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxCommits: measured.commits - 1 },
         }),
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
       expect(() =>
-        selectMergeBases(new Repository(store, "/repo"), {
+        selectMergeBases(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxRetainedBytes: measured.retainedBytes - 1 },
@@ -291,7 +291,7 @@ describe("bounded merge-base selection", () => {
 
       db.storage.resetCounters();
       expect(() =>
-        selectMergeBases(new Repository(store, "/repo"), {
+        selectMergeBases(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxSqlStatements: MERGE_BASE_SQL_STATEMENTS - 1 },

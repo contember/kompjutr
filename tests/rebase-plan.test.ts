@@ -12,7 +12,7 @@ import { planRebase } from "../src/core/ops/rebase-plan.js";
 import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/core/ops/replay.js";
 import { Repository } from "../src/core/repository.js";
 import { commitCacheBytes } from "../src/sqlite/commits.js";
-import { type RepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 
@@ -25,18 +25,18 @@ const PERSON = {
 
 interface Harness {
   db: TestDatabase;
-  store: RepoStore;
+  store: CheckoutStore;
   repo: Repository;
 }
 
 function harness(): Harness {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
-  const store = database.open(database.create("/repo", "ref: refs/heads/main"));
-  return { db, store, repo: new Repository(store, "/repo") };
+  const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+  return { db, store, repo: new Repository(store) };
 }
 
-function importCommits(store: RepoStore, fixture: GitFixture, tips: readonly string[]): void {
+function importCommits(store: CheckoutStore, fixture: GitFixture, tips: readonly string[]): void {
   const output = fixture.git("rev-list", ...tips);
   for (const oid of output === "" ? [] : output.split("\n")) {
     expect(store.write("commit", fixture.catFile(oid))).toBe(oid);
@@ -53,7 +53,7 @@ function expectCode(action: () => unknown, code: string): void {
   throw new Error(`expected ${code}`);
 }
 
-function snapshot(store: RepoStore): unknown {
+function snapshot(store: CheckoutStore): unknown {
   return {
     objects: store.objectCount(),
     refs: store.listRefs(),

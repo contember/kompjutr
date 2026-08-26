@@ -85,7 +85,7 @@ describe("sparse diff", () => {
     workspace.worktree.symlink("after", "/link");
     writeWorkFile(workspace, "/staged.txt", "after\n");
     stageWorktreePaths(workspace, ["staged.txt"]);
-    workspace.repo.store.indexRemove("conflict.txt");
+    workspace.repo.checkout.indexRemove("conflict.txt");
     const conflictOid = workspace.repo.store.write("blob", utf8.encode("conflict\n"));
     for (const stage of [1, 2, 3]) {
       const entry: IndexEntry = {
@@ -97,7 +97,7 @@ describe("sparse diff", () => {
         mtime: null,
         ino: null,
       };
-      workspace.repo.store.indexPut(entry);
+      workspace.repo.checkout.indexPut(entry);
     }
 
     const expectedPatch = diff(workspace.repo, workspace.worktree);
@@ -118,7 +118,7 @@ describe("sparse diff", () => {
     sealIndexTracker(workspace);
 
     workspace.worktree.unlink("/old.txt");
-    workspace.repo.store.indexRemove("old.txt");
+    workspace.repo.checkout.indexRemove("old.txt");
     writeWorkFile(workspace, "/new.txt", "same\n");
     stageWorktreePaths(workspace, ["new.txt"]);
 

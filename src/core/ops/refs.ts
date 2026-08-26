@@ -55,7 +55,7 @@ export function branch(context: GitContext, repo: Repository, options: BranchOpt
       options.checkout === true
         ? { puts: [{ name: full, target: oid }], head: `ref: ${full}` }
         : { puts: [{ name: full, target: oid }] };
-    repo.store.mutateRefs(
+    repo.mutateRefs(
       mutation,
       operationRefLogMetadata(context, repo, current === null ? "branch: create" : "branch: reset"),
     );
@@ -78,10 +78,7 @@ export function branchDelete(
   if (repo.head().ref === full) {
     throw new GitError("EBRANCHFAIL", `cannot delete branch '${options.name}': it is checked out`);
   }
-  repo.store.mutateRefs(
-    { deletes: [full] },
-    operationRefLogMetadata(context, repo, "branch: delete"),
-  );
+  repo.mutateRefs({ deletes: [full] }, operationRefLogMetadata(context, repo, "branch: delete"));
 }
 
 export function branchList(repo: Repository): string[] {
@@ -122,7 +119,7 @@ export function tag(context: GitContext, repo: Repository, options: TagOptions):
   if (options.force !== true && current !== null) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' already exists`);
   }
-  repo.store.mutateRefs(
+  repo.mutateRefs(
     { puts: [{ name: full, target: repo.revParse(options.object ?? "HEAD") }] },
     operationRefLogMetadata(context, repo, current === null ? "tag: create" : "tag: update"),
   );
@@ -137,7 +134,7 @@ export function tagDelete(context: GitContext, repo: Repository, options: TagDel
   if (repo.store.getRef(full) === null) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' not found`);
   }
-  repo.store.mutateRefs({ deletes: [full] }, operationRefLogMetadata(context, repo, "tag: delete"));
+  repo.mutateRefs({ deletes: [full] }, operationRefLogMetadata(context, repo, "tag: delete"));
 }
 
 export function tagList(repo: Repository): string[] {
@@ -174,7 +171,7 @@ export function checkout(
     const tracker = context.indexTracker;
     if (tracker !== undefined && trySparseCleanCheckout(context, repo, worktree, tree)) {
       moveHead(context, repo, options.ref, commit);
-      tracker.reseal(repo.store.checkoutId, tree, []);
+      tracker.reseal(repo.checkout.checkoutId, tree, []);
       return;
     }
 
@@ -251,7 +248,7 @@ function tagRef(name: string): string {
 function moveHead(context: GitContext, repo: Repository, ref: string, commit: string): void {
   const expanded = repo.expandRef(ref);
   const full = expanded === "HEAD" ? repo.head().ref : expanded;
-  repo.store.mutateRefs(
+  repo.mutateRefs(
     { head: full?.startsWith(HEADS) ? `ref: ${full}` : commit },
     operationRefLogMetadata(context, repo, "checkout"),
   );
@@ -486,7 +483,7 @@ function* checkoutGuardRows(
     right: (entry) => entry.path,
   });
   const current = joinSorted(
-    stageZero(repo.store.indexScan()),
+    stageZero(repo.checkout.indexScan()),
     walkWorktreeEntriesStream(worktree, repo.root),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   );

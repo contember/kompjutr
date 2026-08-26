@@ -423,7 +423,7 @@ function advance(
   committer?: GitIdentity,
 ): void {
   const steps = nextSteps(journal, outcome, resultOid);
-  repo.store.replaceOperationJournal(
+  repo.checkout.replaceOperationJournal(
     journal.integrityOid,
     {
       ...journal.state,
@@ -540,7 +540,7 @@ function applyOneStep(
   options: RebaseContinueOptions,
 ): "advanced" | "conflicted" {
   return repo.store.db.transactionSync(() => {
-    const journal = repo.store.requireOperationState("rebase");
+    const journal = repo.checkout.requireOperationState("rebase");
     if (journal.integrityOid !== expectedIntegrityOid) {
       throw new GitError("EOPMISMATCH", "rebase operation changed before replay");
     }
@@ -740,7 +740,7 @@ function publishCompleted(
   worktree: Worktree,
 ): RebaseLifecycleResult {
   return repo.store.db.transactionSync(() => {
-    const journal = repo.store.requireOperationState("rebase");
+    const journal = repo.checkout.requireOperationState("rebase");
     requireOriginalHead(repo, journal.state);
     if (journal.state.phase !== "running" || journal.state.currentStep !== journal.steps.length) {
       throw new CorruptError("rebase publication started before replay completion");
@@ -750,7 +750,7 @@ function publishCompleted(
       throw new CorruptError("completed rebase baseline changed before publication");
     }
     requireTransitionBudget(journal, REBASE_FINAL_PUBLICATION_SQL_STATEMENTS);
-    repo.store.mutateRefs(
+    repo.mutateRefs(
       {
         expected: {
           name: journal.state.originalHeadRef,
@@ -765,7 +765,7 @@ function publishCompleted(
       },
       persistedRefLogMetadata(context, journal.state.committer, "rebase: replay"),
     );
-    repo.store.clearOperationState();
+    repo.checkout.clearOperationState();
     return {
       outcome: "completed",
       oid: journal.state.currentParentOid,
@@ -785,7 +785,7 @@ interface RebaseDriveState {
 }
 
 function readRebaseDriveState(repo: Repository): RebaseDriveState {
-  const journal = repo.store.requireOperationState("rebase");
+  const journal = repo.checkout.requireOperationState("rebase");
   requireOriginalHead(repo, journal.state);
   return {
     integrityOid: journal.integrityOid,
@@ -821,7 +821,7 @@ export function startRebase(
   options: RebaseStartOptions,
 ): RebaseLifecycleResult {
   const started = repo.store.db.transactionSync(() => {
-    repo.store.requireNoOperationState();
+    repo.checkout.requireNoOperationState();
     const head = requireHead(repo);
     const originalTree = repo.readCommit(head.oid).tree;
     requireRebaseIndex(repo);
@@ -863,7 +863,7 @@ export function startRebase(
         throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
       }
       if (plan.relation === "fast-forward") {
-        repo.store.mutateRefs(
+        repo.mutateRefs(
           {
             expected: { name: head.ref, target: head.oid },
             puts: [{ name: head.ref, target: plan.upstreamOid }],
@@ -879,7 +879,7 @@ export function startRebase(
         identity: options.committer,
         env: options.env,
       }).actor;
-      repo.store.writeOperationJournal(
+      repo.checkout.writeOperationJournal(
         initialState(head, plan.upstreamOid, plan.baseOid, actor),
         plan.steps,
         [],
@@ -905,7 +905,7 @@ export function startRebase(
 type PreparedContinuation = { phase: "running" } | { phase: "conflicted"; integrityOid: string };
 
 function prepareContinuation(repo: Repository, worktree: Worktree): PreparedContinuation {
-  const journal = repo.store.requireOperationState("rebase");
+  const journal = repo.checkout.requireOperationState("rebase");
   requireOriginalHead(repo, journal.state);
   requireResumedTopology(repo, journal);
   if (journal.state.phase === "running") {
@@ -925,12 +925,12 @@ export function continueRebase(
   const prepared = prepareContinuation(repo, worktree);
   if (prepared.phase === "running") return driveRebase(context, repo, worktree, options);
   repo.store.db.transactionSync(() => {
-    const current = repo.store.requireOperationState("rebase");
+    const current = repo.checkout.requireOperationState("rebase");
     if (current.integrityOid !== prepared.integrityOid) {
       throw new GitError("EOPMISMATCH", "rebase conflict changed before continuation");
     }
     requireOriginalHead(repo, current.state);
-    if (repo.store.hasConflicts()) {
+    if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
     }
     const treeStats = requireRebaseIndex(repo);
@@ -987,7 +987,7 @@ interface PreparedSkip {
 }
 
 function prepareSkip(repo: Repository, worktree: Worktree): PreparedSkip {
-  const journal = repo.store.requireOperationState("rebase");
+  const journal = repo.checkout.requireOperationState("rebase");
   requireOriginalHead(repo, journal.state);
   requireResumedTopology(repo, journal);
   if (journal.state.phase !== "conflicted") {
@@ -1010,7 +1010,7 @@ export function skipRebase(
 ): RebaseLifecycleResult {
   const prepared = prepareSkip(repo, worktree);
   repo.store.db.transactionSync(() => {
-    const current = repo.store.requireOperationState("rebase");
+    const current = repo.checkout.requireOperationState("rebase");
     if (current.integrityOid !== prepared.integrityOid) {
       throw new GitError("EOPMISMATCH", "rebase conflict changed before skip");
     }
@@ -1029,7 +1029,7 @@ interface PreparedAbort {
 }
 
 function prepareAbort(repo: Repository, worktree: Worktree): PreparedAbort {
-  const journal = repo.store.requireOperationState("rebase");
+  const journal = repo.checkout.requireOperationState("rebase");
   requireOriginalHead(repo, journal.state);
   requireResumedTopology(repo, journal);
   if (journal.state.phase === "conflicted") requireConflictOwnership(repo, worktree, journal);
@@ -1044,13 +1044,13 @@ function prepareAbort(repo: Repository, worktree: Worktree): PreparedAbort {
 export function abortRebase(repo: Repository, worktree: Worktree): void {
   const prepared = prepareAbort(repo, worktree);
   repo.store.db.transactionSync(() => {
-    const current = repo.store.requireOperationState("rebase");
+    const current = repo.checkout.requireOperationState("rebase");
     if (current.integrityOid !== prepared.integrityOid) {
       throw new GitError("EOPMISMATCH", "rebase operation changed before abort");
     }
     requireOriginalHead(repo, current.state);
     requireTransitionBudget(current, 192 + prepared.baseline.sqlStatements);
     hardMaterializeTree(repo, worktree, prepared.baselineTree, prepared.baseline);
-    repo.store.clearOperationState();
+    repo.checkout.clearOperationState();
   });
 }

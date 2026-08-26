@@ -82,9 +82,9 @@ export function checkoutTree(
 
   // Remove obsolete paths before writing replacements. This also handles a
   // directory-to-file transition without retaining the whole target tree.
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     let retainedBytes = 0;
-    for (const row of joinSorted(treeStream(repo, treeOid), stageZero(repo.store.indexScan()), {
+    for (const row of joinSorted(treeStream(repo, treeOid), stageZero(repo.checkout.indexScan()), {
       left: (entry) => entry.path,
       right: (entry) => entry.path,
     })) {
@@ -115,10 +115,10 @@ export function checkoutTree(
 
   const written: TargetEntry[] = [];
   const candidates: CheckoutCandidate[] = [];
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     for (const row of joinSorted3(
       treeStream(repo, treeOid),
-      stageZero(repo.store.indexScan()),
+      stageZero(repo.checkout.indexScan()),
       boundedCheckoutWorktreeEntries(
         walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
         options.maxWorktreeRowsPerPass,
@@ -154,7 +154,7 @@ function discardUnmergedPaths(
   const paths: string[] = [];
   let previousUnmerged: string | null = null;
   let retainedBytes = 0;
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     if (entry.stage === 0 || entry.path === previousUnmerged) continue;
     previousUnmerged = entry.path;
     if (paths.length >= CHECKOUT_UNMERGED_PATHS) {
@@ -192,7 +192,7 @@ function discardUnmergedPaths(
         .map((path) => joinPath(repo.root, path)),
     );
   }
-  repo.store.indexApply((sink) => {
+  repo.checkout.indexApply((sink) => {
     for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
       for (const path of paths.slice(offset, offset + CHECKOUT_WINDOW_ROWS)) sink.remove(path);
       sink.flush();
@@ -218,7 +218,7 @@ function restoreStructuralConflicts(
   const activeLeaves: Array<{ path: string; upper: string; bytes: number }> = [];
   for (const row of joinSorted3(
     treeStream(repo, treeOid),
-    stageZero(repo.store.indexScan()),
+    stageZero(repo.checkout.indexScan()),
     walkStructuralPaths(worktree, repo.root, options.maxWorktreeRowsPerPass),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {

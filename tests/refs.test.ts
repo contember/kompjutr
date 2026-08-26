@@ -71,7 +71,7 @@ let ws: TestRepository;
 beforeEach(async () => {
   fixture = buildFixture();
   ws = makeRepo("/");
-  await importFixture(fixture, ws.repo.store);
+  await importFixture(fixture, ws.repo.checkout);
 });
 
 afterEach(() => fixture.dispose());
@@ -112,7 +112,7 @@ function expectSameTree(): void {
 }
 
 function indexPaths(): string[] {
-  return ws.repo.store.indexEntries().map((entry) => entry.path);
+  return ws.repo.checkout.indexEntries().map((entry) => entry.path);
 }
 
 function lines(output: string): string[] {
@@ -276,7 +276,7 @@ describe("checkout", () => {
     try {
       largeFixture.write("large.bin", bytes);
       largeFixture.commit("large");
-      await importFixture(largeFixture, workspace.repo.store);
+      await importFixture(largeFixture, workspace.repo.checkout);
 
       checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
@@ -300,7 +300,7 @@ describe("checkout", () => {
     expect(ws.repo.head().ref).toBe("refs/heads/side");
     expect(currentBranch(ws.repo)).toBe(fixture.git("branch", "--show-current"));
     expect(indexPaths()).toEqual(lines(fixture.git("ls-files")));
-    expect(ws.repo.store.indexGet("modified.txt")?.oid).toBe(
+    expect(ws.repo.checkout.indexGet("modified.txt")?.oid).toBe(
       fixture.git("rev-parse", "main:modified.txt"),
     );
   });
@@ -369,7 +369,7 @@ describe("checkout", () => {
           transition.write("branch.txt", "side\n");
           transition.commit("side");
           transition.git("checkout", "-q", "main");
-          await importFixture(transition, workspace.repo.store);
+          await importFixture(transition, workspace.repo.checkout);
           checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
           transition.remove("node");
@@ -474,7 +474,7 @@ describe("checkout", () => {
       transition.write("node", "flat\n");
       transition.commit("file");
       transition.git("checkout", "-q", "main");
-      await importFixture(transition, workspace.repo.store);
+      await importFixture(transition, workspace.repo.checkout);
 
       checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
       checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "flat" });
@@ -507,7 +507,7 @@ describe("checkout", () => {
         transition.write("node/child.txt", "nested\n");
         transition.commit("nested");
         transition.git("checkout", "-q", "main");
-        await importFixture(transition, workspace.repo.store);
+        await importFixture(transition, workspace.repo.checkout);
         checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
         if (kind === "file") {
@@ -539,7 +539,7 @@ describe("checkout", () => {
       transition.write("node/child.txt", "changed\n");
       transition.commit("changed");
       transition.git("checkout", "-q", "main");
-      await importFixture(transition, workspace.repo.store);
+      await importFixture(transition, workspace.repo.checkout);
       checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
       workspace.worktree.unlink("/node/child.txt");
@@ -576,7 +576,7 @@ describe("checkout", () => {
         else transition.write("node/child.txt", "nested\n");
         transition.commit(entry.target);
         transition.git("checkout", "-q", "main");
-        await importFixture(transition, workspace.repo.store);
+        await importFixture(transition, workspace.repo.checkout);
         checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
         const dirtyPath = entry.start === "file" ? "/node" : "/node/child.txt";
@@ -607,7 +607,7 @@ describe("checkout", () => {
         if (target === "directory") transition.write("node/target.txt", "target\n");
         transition.commit(target);
         transition.git("checkout", "-q", "main");
-        await importFixture(transition, workspace.repo.store);
+        await importFixture(transition, workspace.repo.checkout);
         checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
         workspace.worktree.unlink("/node");
@@ -639,7 +639,7 @@ describe("checkout", () => {
         transition.remove("node");
         transition.commit("delete node");
         transition.git("checkout", "-q", "main");
-        await importFixture(transition, workspace.repo.store);
+        await importFixture(transition, workspace.repo.checkout);
         checkout(workspace.context, workspace.repo, workspace.worktree, { ref: "main" });
 
         transition.remove("node");
@@ -669,7 +669,7 @@ describe("checkout", () => {
 
         expect(worktree.removals).toEqual([]);
         expect(workspace.repo.head().ref).toBe("refs/heads/target");
-        expect(workspace.repo.store.indexEntries().map((entry) => entry.path)).toEqual([
+        expect(workspace.repo.checkout.indexEntries().map((entry) => entry.path)).toEqual([
           "anchor.txt",
         ]);
         expect(sorted(workspaceTree(workspace))).toEqual(sorted(diskTree(transition.dir)));
@@ -724,17 +724,17 @@ describe("checkout", () => {
         ino: stat.ino,
       };
     });
-    workspace.repo.store.indexReplace(originalIndex);
+    workspace.repo.checkout.indexReplace(originalIndex);
     const base = commit(workspace.context, workspace.repo, { message: "base" });
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       originalIndex.map((entry, index) =>
         index < 1_000 ? { ...entry, oid: changedOid, size: changed.length } : entry,
       ),
     );
     const changedCommit = commit(workspace.context, workspace.repo, { message: "changed" });
     workspace.repo.store.setRef("refs/heads/changed", changedCommit.oid);
-    workspace.repo.store.setHead(base.oid);
-    workspace.repo.store.indexReplace(originalIndex);
+    workspace.repo.checkout.setHead(base.oid);
+    workspace.repo.checkout.indexReplace(originalIndex);
 
     class BulkCheckoutWorktree extends CountingWorktree {
       writes: string[] = [];
@@ -767,7 +767,7 @@ describe("checkout", () => {
       new Set(paths.slice(0, 1_000).map((path) => `/${path}`)),
     );
     expect(
-      workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
+      workspace.repo.checkout.indexEntries().filter((entry) => entry.oid === changedOid),
     ).toHaveLength(1_000);
   });
 
@@ -809,17 +809,17 @@ describe("checkout", () => {
         ino: stat.ino,
       };
     });
-    workspace.repo.store.indexReplace(originalIndex);
+    workspace.repo.checkout.indexReplace(originalIndex);
     const base = commit(workspace.context, workspace.repo, { message: "base" });
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       originalIndex.map((entry, index) =>
         index < changedFiles ? { ...entry, oid: changedOid, size: changed.length } : entry,
       ),
     );
     const changedCommit = commit(workspace.context, workspace.repo, { message: "changed" });
     workspace.repo.store.setRef("refs/heads/changed", changedCommit.oid);
-    workspace.repo.store.setHead(base.oid);
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.setHead(base.oid);
+    workspace.repo.checkout.indexReplace(
       originalIndex.map((entry) => ({ ...entry, mtime: null, ino: null, rev: null })),
     );
 
@@ -855,7 +855,7 @@ describe("checkout", () => {
     expect(worktree.rangeReads).toBe(0);
     expect(worktree.bulkReadPaths).toEqual([]);
     expect(
-      workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
+      workspace.repo.checkout.indexEntries().filter((entry) => entry.oid === changedOid),
     ).toHaveLength(changedFiles);
 
     worktree.writes.length = 0;
@@ -872,7 +872,7 @@ describe("checkout", () => {
     expect(worktree.rangeReads).toBe(0);
     expect(worktree.bulkReadPaths).toEqual([]);
     expect(
-      workspace.repo.store.indexEntries().filter((entry) => entry.oid === changedOid),
+      workspace.repo.checkout.indexEntries().filter((entry) => entry.oid === changedOid),
     ).toHaveLength(0);
   });
 });

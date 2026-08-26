@@ -127,7 +127,7 @@ export function statusReport(
 
 /** Read and validate HEAD, its configured upstream, and bounded graph counts. */
 export function statusBranch(repo: Repository): StatusBranch {
-  const rawHead: unknown = repo.store.head();
+  const rawHead: unknown = repo.checkout.head();
   if (typeof rawHead !== "string") throw new CorruptError("repository HEAD is not text");
 
   let oid: string | null;
@@ -244,7 +244,7 @@ export function eagerStatus(
     return status(repo, worktree, options);
   }
 
-  const state = source.readState(repo.store.checkoutId);
+  const state = source.readState(repo.checkout.checkoutId);
   if (!state.available) {
     const baselineTreeOid = repo.headTree();
     const seed = new FullStatusTrackerSeed();
@@ -256,7 +256,7 @@ export function eagerStatus(
       ),
     ].sort((left, right) => comparePaths(left.path, right.path));
     if (seed.resealable) {
-      tracker.reseal(repo.store.checkoutId, baselineTreeOid, seed.entries());
+      tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries());
     }
     return rows;
   }
@@ -299,7 +299,7 @@ function classifyStatusRenames(
   const classifier = new ExactRenameClassifier();
   for (const row of joinSorted(
     treeStream(repo, headTreeOid),
-    statusIndexGroups(repo.store.indexScan()),
+    statusIndexGroups(repo.checkout.indexScan()),
     {
       left: (entry) => entry.path,
       right: (entry) => entry.path,
@@ -372,7 +372,7 @@ function* statusStreamInternal(
 
   for (const row of joinSorted3(
     treeStream(repo, headTreeOid),
-    statusIndexGroups(repo.store.indexScan()),
+    statusIndexGroups(repo.checkout.indexScan()),
     worktreeEntries(repo, worktree, options, ignores, prunable),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
@@ -528,7 +528,7 @@ function snapshotStatusIndex(
   if (!includeDirectories && !includeTrackedPaths) {
     return { trackedDirs, trackedPaths, budget, retainsTrackedPaths: false };
   }
-  for (const group of statusIndexGroups(repo.store.indexScan())) {
+  for (const group of statusIndexGroups(repo.checkout.indexScan())) {
     const path = group.path;
     if (includeTrackedPaths) {
       budget.add(trackedPathRetainedBytes(path));
@@ -597,7 +597,7 @@ function stripSlash(path: string): string {
 /** O(tracked). Only `statusMatrix`, which is not on the client surface, still needs it. */
 function stagedIndex(repo: Repository): Map<string, IndexEntry> {
   const index = new Map<string, IndexEntry>();
-  for (const group of statusIndexGroups(repo.store.indexScan())) {
+  for (const group of statusIndexGroups(repo.checkout.indexScan())) {
     if (group.kind === "unmerged") {
       throw new GitError("EUNMERGED", `status matrix cannot represent conflict at ${group.path}`);
     }

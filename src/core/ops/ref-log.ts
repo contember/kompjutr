@@ -97,7 +97,7 @@ export function recoverRef(
   }
 
   repo.store.db.transactionSync(() => {
-    repo.store.requireNoOperationState();
+    repo.checkout.requireNoOperationState();
     const entry = repo
       .reflog(options.source.ref)
       .find((candidate) => candidate.ordinal === options.source.ordinal);
@@ -109,7 +109,7 @@ export function recoverRef(
       throw new RefNotFoundError(`${options.source.ref}@{${options.source.ordinal}}`);
     }
     if (!repo.has(oid)) throw new ObjectNotFoundError(oid);
-    const changed = repo.store.mutateRefs(
+    const changed = repo.mutateRefs(
       {
         puts: [{ name: options.ref, target: oid }],
         expected: { name: options.ref, target: options.expectedCurrent },

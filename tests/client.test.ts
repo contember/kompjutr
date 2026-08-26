@@ -471,9 +471,9 @@ describe("createSqliteGitClient", () => {
     await workspace.git.add({ paths: ["file.txt"] });
     const original = await workspace.git.commit({ message: "base" });
     const database = new SqliteGitDatabase(new TestDatabase(storage));
-    const repository = database.find("/");
+    const repository = database.findCheckout("/");
     if (repository === null) throw new Error("repository is missing");
-    const store = database.open(repository);
+    const store = database.openCheckout(repository);
     store.writeOperationState(
       {
         kind: "cherry-pick",
@@ -682,16 +682,16 @@ describe("createSqliteGitClient", () => {
     await git.reset({ dir, hard: true });
 
     await expect(git.revParse({ dir, ref: "HEAD" })).resolves.toBe(original);
-    const repository = workspace.database.find(dir);
+    const repository = workspace.database.findCheckout(dir);
     if (repository === null) throw new Error("rebase repository is missing");
-    expect(workspace.database.open(repository).readOperationState()).toBeNull();
+    expect(workspace.database.openCheckout(repository).readOperationState()).toBeNull();
   });
 
   it("hard reset removes modify-delete conflict content before clearing rebase recovery", async () => {
     const { git, workspace, dir, original } = await modifyDeleteRebase();
-    const repository = workspace.database.find(dir);
+    const repository = workspace.database.findCheckout(dir);
     if (repository === null) throw new Error("modify-delete repository is missing");
-    const store = workspace.database.open(repository);
+    const store = workspace.database.openCheckout(repository);
     expect(store.hasConflicts()).toBe(true);
     expect(workspace.worktree.stat(`${dir}/deleted.txt`)).not.toBeNull();
 

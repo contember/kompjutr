@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-
 import type { GitContext, IndexTrackerSeedEntry } from "../src/core/context.js";
+import { openRepository } from "../src/core/context.js";
 import { CorruptError, GitError } from "../src/core/errors.js";
 import { commit } from "../src/core/ops/commit.js";
 import { eagerStatus, status, statusStream } from "../src/core/ops/status.js";
@@ -38,15 +38,15 @@ function commitFiles(workspace: TestRepository, paths: readonly string[]): void 
 
 function recordingContext(workspace: TestRepository) {
   const reseals: Array<{
-    repoId: number;
+    checkoutId: number;
     baselineTreeOid: string | null;
     entries: IndexTrackerSeedEntry[];
   }> = [];
   const context: Pick<GitContext, "sparseWorkspace" | "indexTracker"> = {
     sparseWorkspace: workspace.context.sparseWorkspace,
     indexTracker: {
-      reseal(repoId, baselineTreeOid, entries) {
-        reseals.push({ repoId, baselineTreeOid, entries: [...entries] });
+      reseal(checkoutId, baselineTreeOid, entries) {
+        reseals.push({ checkoutId, baselineTreeOid, entries: [...entries] });
         return true;
       },
     },
@@ -71,7 +71,9 @@ describe("sparse eager status", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "a\n");
     commitFiles(workspace, ["a.txt"]);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: false,
     });
 
@@ -79,13 +81,15 @@ describe("sparse eager status", () => {
     expect(
       eagerStatus(workspace.repo, workspace.worktree, {}, sparseTrackerContext(workspace)),
     ).toEqual(expected);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: true,
       baselineTreeOid: workspace.repo.headTree(),
     });
-    expect([...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId)]).toEqual(
-      [],
-    );
+    expect([
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
+    ]).toEqual([]);
     expect(
       eagerStatus(
         workspace.repo,
@@ -94,6 +98,43 @@ describe("sparse eager status", () => {
         sparseTrackerContext(workspace),
       ),
     ).toEqual([]);
+  });
+
+  it("routes consumer status state through an unequal checkout id", () => {
+    const workspace = makeRepo("/");
+    const primaryCheckoutId = workspace.repo.checkout.checkoutId;
+    const checkoutId = primaryCheckoutId + 100;
+    workspace.worktree.mkdir("/linked");
+    workspace.database.db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (?, ?, '/linked', 'ref: refs/heads/linked', 0)`,
+      checkoutId,
+      workspace.repo.store.repoId,
+    );
+    const repo = openRepository(workspace.context, "/linked");
+    const linked: TestRepository = { ...workspace, repo };
+    expect(repo.store.repoId).not.toBe(repo.checkout.checkoutId);
+
+    writeWorkFile(linked, "/linked/a.txt", "before\n");
+    commitFiles(linked, ["a.txt"]);
+    sealIndexTracker(linked);
+    expect(readIndexTrackerState(workspace.database.db, checkoutId)).toEqual({
+      available: true,
+      baselineTreeOid: repo.headTree(),
+    });
+    expect(readIndexTrackerState(workspace.database.db, primaryCheckoutId)).toEqual({
+      available: false,
+    });
+
+    linked.tick(60_000);
+    writeWorkFile(linked, "/linked/a.txt", "after\n");
+    expect([...requireSparseWorkspace(linked).dirtyPaths(checkoutId)]).toEqual([
+      { path: "a.txt", flags: WORKTREE_DIRTY },
+    ]);
+    expect([...requireSparseWorkspace(linked).dirtyPaths(primaryCheckoutId)]).toEqual([]);
+    expect(
+      eagerStatus(repo, new NoScanWorktree(linked.worktree), {}, sparseTrackerContext(linked)),
+    ).toEqual([expect.objectContaining({ path: "a.txt", index: " ", worktree: "M" })]);
   });
 
   it("reseals exact conservative dirty leaves hidden by status presentation", () => {
@@ -120,25 +161,25 @@ describe("sparse eager status", () => {
       "staged.txt",
       "unstaged.txt",
     ]);
-    workspace.repo.store.indexPut(bareIndexEntry("module", 0o160000));
+    workspace.repo.checkout.indexPut(bareIndexEntry("module", 0o160000));
     commit(workspace.context, workspace.repo, { message: "gitlink fixture" });
     workspace.tick(60_000);
 
     writeWorkFile(workspace, "/staged.txt", "staged after\n");
     const staged = hashWorktreePath(workspace.repo, workspace.worktree, "staged.txt");
     if (staged === null) throw new Error("missing staged fixture");
-    workspace.repo.store.indexPut(indexEntryFor("staged.txt", staged));
+    workspace.repo.checkout.indexPut(indexEntryFor("staged.txt", staged));
     writeWorkFile(workspace, "/unstaged.txt", "unstaged after\n");
     writeWorkFile(workspace, "/stable.txt", "stable.txt\n");
-    workspace.repo.store.indexRemove("retained.txt");
-    workspace.repo.store.indexRemove("removed.txt");
+    workspace.repo.checkout.indexRemove("retained.txt");
+    workspace.repo.checkout.indexRemove("removed.txt");
     workspace.worktree.unlink("/removed.txt");
     workspace.worktree.unlink("/link");
     workspace.worktree.symlink("after", "/link");
-    workspace.repo.store.indexRemove("conflict.txt");
+    workspace.repo.checkout.indexRemove("conflict.txt");
     const conflictOid = workspace.repo.store.write("blob", new TextEncoder().encode("conflict\n"));
     for (const stage of [1, 2, 3]) {
-      workspace.repo.store.indexPut({
+      workspace.repo.checkout.indexPut({
         path: "conflict.txt",
         stage,
         mode: 0o100644,
@@ -156,20 +197,20 @@ describe("sparse eager status", () => {
     expect(
       eagerStatus(workspace.repo, workspace.worktree, {}, sparseTrackerContext(workspace)),
     ).toEqual(expected);
-    expect([...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId)]).toEqual(
-      [
-        { path: "cache/noisy.log", flags: WORKTREE_DIRTY },
-        { path: "conflict.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY },
-        { path: "fresh/a.txt", flags: WORKTREE_DIRTY },
-        { path: "fresh/deeper/b.txt", flags: WORKTREE_DIRTY },
-        { path: "link", flags: WORKTREE_DIRTY },
-        { path: "module", flags: INDEX_DIRTY },
-        { path: "removed.txt", flags: INDEX_DIRTY },
-        { path: "retained.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY },
-        { path: "staged.txt", flags: INDEX_DIRTY },
-        { path: "unstaged.txt", flags: WORKTREE_DIRTY },
-      ],
-    );
+    expect([
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
+    ]).toEqual([
+      { path: "cache/noisy.log", flags: WORKTREE_DIRTY },
+      { path: "conflict.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY },
+      { path: "fresh/a.txt", flags: WORKTREE_DIRTY },
+      { path: "fresh/deeper/b.txt", flags: WORKTREE_DIRTY },
+      { path: "link", flags: WORKTREE_DIRTY },
+      { path: "module", flags: INDEX_DIRTY },
+      { path: "removed.txt", flags: INDEX_DIRTY },
+      { path: "retained.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY },
+      { path: "staged.txt", flags: INDEX_DIRTY },
+      { path: "unstaged.txt", flags: WORKTREE_DIRTY },
+    ]);
   });
 
   it("returns a clean sealed status without scanning the tree or worktree", () => {
@@ -211,9 +252,9 @@ describe("sparse eager status", () => {
     expect(worktree.bulkReadPaths).toHaveLength(100);
     expect(workspace.storage.statementCount).toBeLessThan(50);
     expect(workspace.storage.rowCount).toBeLessThan(10_000);
-    expect([...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId)]).toEqual(
-      paths.map((path) => ({ path, flags: WORKTREE_DIRTY })),
-    );
+    expect([
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
+    ]).toEqual(paths.map((path) => ({ path, flags: WORKTREE_DIRTY })));
   });
 
   it("matches full status for staged, unstaged, mode, symlink, and conflict rows", () => {
@@ -231,12 +272,12 @@ describe("sparse eager status", () => {
     writeWorkFile(workspace, "/staged.txt", "staged\n");
     const staged = hashWorktreePath(workspace.repo, workspace.worktree, "staged.txt");
     if (staged === null) throw new Error("missing staged fixture");
-    workspace.repo.store.indexPut(indexEntryFor("staged.txt", staged));
+    workspace.repo.checkout.indexPut(indexEntryFor("staged.txt", staged));
     writeWorkFile(workspace, "/unstaged.txt", "unstaged\n");
     workspace.worktree.chmod("/mode.txt", 0o755);
     workspace.worktree.unlink("/link");
     workspace.worktree.symlink("after", "/link");
-    workspace.repo.store.indexRemove("conflict.txt");
+    workspace.repo.checkout.indexRemove("conflict.txt");
     const oid = workspace.repo.store.write("blob", new TextEncoder().encode("conflict\n"));
     for (const stage of [1, 2, 3]) {
       const entry: IndexEntry = {
@@ -248,7 +289,7 @@ describe("sparse eager status", () => {
         mtime: null,
         ino: null,
       };
-      workspace.repo.store.indexPut(entry);
+      workspace.repo.checkout.indexPut(entry);
     }
 
     const expected = status(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
@@ -263,7 +304,7 @@ describe("sparse eager status", () => {
       expect.objectContaining({ path: "conflict.txt", index: "U", worktree: "U" }),
     );
     expect([
-      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId),
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
     ]).toContainEqual({ path: "conflict.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY });
   });
 
@@ -274,7 +315,7 @@ describe("sparse eager status", () => {
     sealIndexTracker(workspace);
 
     workspace.worktree.unlink("/old.txt");
-    workspace.repo.store.indexRemove("old.txt");
+    workspace.repo.checkout.indexRemove("old.txt");
     writeWorkFile(workspace, "/new.txt", "same\n");
     stageWorktreePaths(workspace, ["new.txt"]);
 
@@ -363,7 +404,7 @@ describe("sparse eager status", () => {
     writeWorkFile(workspace, "/kept.txt", "kept\n");
     commitFiles(workspace, ["kept.txt"]);
     sealIndexTracker(workspace);
-    workspace.repo.store.indexRemove("kept.txt");
+    workspace.repo.checkout.indexRemove("kept.txt");
 
     expect(
       eagerStatus(
@@ -373,9 +414,9 @@ describe("sparse eager status", () => {
         sparseTrackerContext(workspace),
       ),
     ).toEqual([expect.objectContaining({ path: "kept.txt", index: "D", worktree: " " })]);
-    expect([...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.store.repoId)]).toEqual(
-      [{ path: "kept.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY }],
-    );
+    expect([
+      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
+    ]).toEqual([{ path: "kept.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY }]);
   });
 
   it("falls back when capabilities or tracker state are unavailable", () => {
@@ -426,7 +467,9 @@ describe("sparse eager status", () => {
       ),
     ).toHaveLength(1);
     expect(recorded.reseals).toEqual([]);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: false,
     });
   });
@@ -448,7 +491,9 @@ describe("sparse eager status", () => {
       ),
     ).toThrowError(/injected hash failure/);
     expect(recorded.reseals).toEqual([]);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: false,
     });
   });
@@ -460,14 +505,16 @@ describe("sparse eager status", () => {
 
     expect(stream.next().value).toEqual(expect.objectContaining({ path: "a.txt" }));
     stream.return(undefined);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: false,
     });
   });
 
   it("returns normal status and skips reseal above the dirty-row cap", () => {
     const workspace = makeRepo("/");
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       Array.from({ length: 32_001 }, (_, index) =>
         bareIndexEntry(`f${index.toString().padStart(5, "0")}.txt`),
       ),
@@ -483,7 +530,7 @@ describe("sparse eager status", () => {
   it("returns normal status and skips reseal above the retained-memory cap", () => {
     const workspace = makeRepo("/");
     const suffix = "x".repeat(2_000);
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       Array.from({ length: 4_000 }, (_, index) =>
         bareIndexEntry(`${index.toString().padStart(4, "0")}/${suffix}`),
       ),
@@ -516,7 +563,7 @@ describe("sparse eager status", () => {
     writeWorkFile(workspace, "/a.txt", "two\n");
     const hashed = hashWorktreePath(workspace.repo, workspace.worktree, "a.txt");
     if (hashed === null) throw new Error("missing updated fixture");
-    workspace.repo.store.indexPut(indexEntryFor("a.txt", hashed));
+    workspace.repo.checkout.indexPut(indexEntryFor("a.txt", hashed));
     commit(workspace.context, workspace.repo, { message: "second" });
     sealIndexTracker(workspace, { baselineTreeOid: oldTree });
 
@@ -528,7 +575,9 @@ describe("sparse eager status", () => {
         sparseTrackerContext(workspace),
       ),
     ).toEqual([]);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.repoId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: true,
       baselineTreeOid: workspace.repo.headTree(),
     });
@@ -539,8 +588,8 @@ describe("sparse eager status", () => {
     sealIndexTracker(workspace, { entries: [{ path: "broken.txt", flags: INDEX_DIRTY }] });
     const source = requireSparseWorkspace(workspace);
     const broken: SparseWorkspaceSource = {
-      readState: (repoId) => source.readState(repoId),
-      dirtyPaths: (repoId) => source.dirtyPaths(repoId),
+      readState: (checkoutId) => source.readState(checkoutId),
+      dirtyPaths: (checkoutId) => source.dirtyPaths(checkoutId),
       hydrate: () => {
         throw new CorruptError("injected sparse corruption");
       },

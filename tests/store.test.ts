@@ -28,8 +28,8 @@ import { slices } from "./helpers/git.js";
 function open(options: StoreOptions = {}) {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db, options);
-  const repository = database.create("/repo", "ref: refs/heads/main");
-  return { db, database, store: database.open(repository) };
+  const repository = database.createRepository("/repo", "ref: refs/heads/main");
+  return { db, database, store: database.openCheckout(repository) };
 }
 
 function assertMemoryCoordinatorIdle(store: ReturnType<typeof open>["store"]): void {
@@ -68,11 +68,11 @@ describe("path helpers", () => {
 describe("repository registry", () => {
   it("resolves the nearest registered ancestor", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    database.create("/", "ref: refs/heads/main");
-    database.create("/projects/app", "ref: refs/heads/main");
-    expect(database.find("/projects/app/src/index.ts")?.root).toBe("/projects/app");
-    expect(database.find("/projects/other")?.root).toBe("/");
-    expect(database.find("/projects/appliance")?.root).toBe("/");
+    database.createRepository("/", "ref: refs/heads/main");
+    database.createRepository("/projects/app", "ref: refs/heads/main");
+    expect(database.findCheckout("/projects/app/src/index.ts")?.root).toBe("/projects/app");
+    expect(database.findCheckout("/projects/other")?.root).toBe("/");
+    expect(database.findCheckout("/projects/appliance")?.root).toBe("/");
   });
 
   it("creates no .git rows of any kind", () => {
@@ -129,7 +129,7 @@ describe("repository registry", () => {
 
     expect(repository).toEqual({
       id: 1,
-      checkoutId: 1,
+      repoId: 1,
       root: "/canonical",
       head: "ref: refs/heads/main",
       isPrimary: true,
@@ -157,7 +157,7 @@ describe("repository registry", () => {
       db.run(
         `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
          VALUES (2, ?, '/duplicate-branch', 'ref: refs/heads/main', 0)`,
-        repository.id,
+        repository.repoId,
       ),
     ).toThrow(/UNIQUE/);
     db.run(
@@ -166,18 +166,18 @@ describe("repository registry", () => {
        )
        INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
        SELECT id, ?, '/checkout-' || printf('%04d', id), ?, 0 FROM sequence`,
-      repository.id,
+      repository.repoId,
       "1".repeat(40),
     );
-    expect(database.listCheckouts(repository.id)).toHaveLength(1_024);
+    expect(database.listCheckouts(repository.repoId)).toHaveLength(1_024);
 
     db.run(
       `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
        VALUES (1025, ?, '/checkout-1025', ?, 0)`,
-      repository.id,
+      repository.repoId,
       "1".repeat(40),
     );
-    expect(() => database.listCheckouts(repository.id)).toThrowError(
+    expect(() => database.listCheckouts(repository.repoId)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
   });
@@ -200,15 +200,15 @@ describe("repository registry", () => {
       "1".repeat(40),
     );
 
-    const checkouts = database.list();
+    const checkouts = database.listRoutingCheckouts();
     expect(checkouts).toHaveLength(1_025);
-    expect(checkouts.every((checkout) => checkout.checkoutId !== checkout.id)).toBe(true);
+    expect(checkouts.every((checkout) => checkout.id !== checkout.repoId)).toBe(true);
   });
 
   it("shares one 8 MiB object cache across repositories", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const first = database.open(database.create("/one", "ref: refs/heads/main"));
-    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    const first = database.openCheckout(database.createRepository("/one", "ref: refs/heads/main"));
+    const second = database.openCheckout(database.createRepository("/two", "ref: refs/heads/main"));
     for (let index = 0; index < 10; index++) {
       const data = new Uint8Array(1024 * 1024).fill(index);
       (index < 5 ? first : second).write("blob", data);
@@ -220,13 +220,13 @@ describe("repository registry", () => {
   it("isolates equal oids by repository and store generation", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const firstRow = database.create("/one", "ref: refs/heads/main");
-    const secondRow = database.create("/two", "ref: refs/heads/main");
-    const first = database.open(firstRow);
+    const firstRow = database.createRepository("/one", "ref: refs/heads/main");
+    const secondRow = database.createRepository("/two", "ref: refs/heads/main");
+    const first = database.openCheckout(firstRow);
     const data = utf8.encode("same object, isolated cache\n");
     const oid = first.write("blob", data);
-    expect(insertRawBlob(db, secondRow.id, data)).toBe(oid);
-    const second = database.open(secondRow);
+    expect(insertRawBlob(db, secondRow.repoId, data)).toBe(oid);
+    const second = database.openCheckout(secondRow);
 
     db.storage.resetCounters();
     expect(second.read(oid)?.data).toEqual(data);
@@ -237,10 +237,10 @@ describe("repository registry", () => {
 
     first.destroy();
     second.destroy();
-    const recreated = database.create("/recreated", "ref: refs/heads/main");
-    expect(recreated.id).toBe(firstRow.id);
-    expect(insertRawBlob(db, recreated.id, data)).toBe(oid);
-    const replacement = database.open(recreated);
+    const recreated = database.createRepository("/recreated", "ref: refs/heads/main");
+    expect(recreated.repoId).toBe(firstRow.repoId);
+    expect(insertRawBlob(db, recreated.repoId, data)).toBe(oid);
+    const replacement = database.openCheckout(recreated);
     db.storage.resetCounters();
     expect(replacement.read(oid)?.data).toEqual(data);
     expect(db.storage.statementCount).toBeGreaterThan(0);
@@ -272,30 +272,45 @@ describe("repository registry", () => {
   it("composes shared state with isolated checkout state and evicts the whole store", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const repository = database.create("/primary", "ref: refs/heads/main");
-    const primary = database.open(repository);
+    const repository = database.createRepository("/primary", "ref: refs/heads/main");
+    const primary = database.openCheckout(repository);
     const secondaryId = 101;
     db.run(
       `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
        VALUES (?, ?, '/secondary', 'ref: refs/heads/secondary', 0)`,
       secondaryId,
-      repository.id,
+      repository.repoId,
     );
     const secondaryRow = database.checkoutAt("/secondary");
     if (secondaryRow === null) throw new Error("secondary checkout is missing");
+    expect(Object.isFrozen(secondaryRow)).toBe(true);
+    expect(Reflect.set(secondaryRow, "repoId", repository.repoId + 1)).toBe(false);
+    expect(Reflect.set(secondaryRow, "root", "/forged")).toBe(false);
+    expect(Reflect.set(secondaryRow, "head", "1".repeat(40))).toBe(false);
+    expect(Reflect.set(secondaryRow, "isPrimary", true)).toBe(false);
     expect(secondaryRow.id).toBe(secondaryId);
-    expect(secondaryRow.repoId).toBe(repository.id);
+    expect(secondaryRow.repoId).toBe(repository.repoId);
+    expect(secondaryRow.root).toBe("/secondary");
+    expect(secondaryRow.head).toBe("ref: refs/heads/secondary");
+    expect(secondaryRow.isPrimary).toBe(false);
     expect(secondaryRow.id).not.toBe(secondaryRow.repoId);
-    expect(() =>
-      database.openCheckout({ ...secondaryRow, repoId: repository.id + 1 }),
-    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    for (const forged of [
+      { ...secondaryRow, repoId: repository.repoId + 1 },
+      { ...secondaryRow, root: "/forged" },
+      { ...secondaryRow, head: "1".repeat(40) },
+      { ...secondaryRow, isPrimary: true },
+    ]) {
+      expect(() => database.openCheckout(forged)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+    }
     const secondary = database.openCheckout(secondaryRow);
     expect(() =>
-      database.openCheckout({ ...secondaryRow, repoId: repository.id + 1 }),
+      database.openCheckout({ ...secondaryRow, repoId: repository.repoId + 1 }),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
 
     expect(primary.shared).toBe(secondary.shared);
-    expect(primary.shared).toBe(database.openShared(repository.id));
+    expect(primary.shared).toBe(database.openShared(repository.repoId));
     expect(primary.packs).toBe(secondary.packs);
     const firstBlob = primary.write("blob", utf8.encode("primary\n"));
     const secondBlob = secondary.write("blob", utf8.encode("secondary\n"));
@@ -323,15 +338,15 @@ describe("repository registry", () => {
       head: secondary.head(),
       ordinal: db.scalar<number>(
         "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
-        repository.id,
+        repository.repoId,
       ),
       directEntries: db.scalar<number>(
         "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
-        repository.id,
+        repository.repoId,
       ),
       headEntries: db.scalar<number>(
         "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
-        repository.id,
+        repository.repoId,
       ),
     };
     expect(() => secondary.setHead("ref: refs/heads/main")).toThrowError(
@@ -351,16 +366,19 @@ describe("repository registry", () => {
     expect(
       db.scalar<number>(
         "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
-        repository.id,
+        repository.repoId,
       ),
     ).toBe(branchConflictBefore.ordinal);
     expect(
-      db.scalar<number>("SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?", repository.id),
+      db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        repository.repoId,
+      ),
     ).toBe(branchConflictBefore.directEntries);
     expect(
       db.scalar<number>(
         "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
-        repository.id,
+        repository.repoId,
       ),
     ).toBe(branchConflictBefore.headEntries);
     expect(
@@ -370,15 +388,15 @@ describe("repository registry", () => {
          UNION ALL
          SELECT ordinal FROM git_checkout_reflog_entries WHERE repo_id = ?
          ORDER BY ordinal`,
-          repository.id,
-          repository.id,
+          repository.repoId,
+          repository.repoId,
         )
         .map((row) => row.ordinal),
     ).toEqual([1, 2, 3, 4]);
     expect(
       db.scalar<number>(
         "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
-        repository.id,
+        repository.repoId,
       ),
     ).toBe(4);
     primary.indexPut({
@@ -448,7 +466,9 @@ describe("repository registry", () => {
     expect(db.scalar<number>("SELECT count(*) FROM git_checkouts")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_index")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_operation_state")).toBe(0);
-    const replacement = database.open(database.create("/replacement", "ref: refs/heads/main"));
+    const replacement = database.openCheckout(
+      database.createRepository("/replacement", "ref: refs/heads/main"),
+    );
     expect(replacement.shared).not.toBe(oldShared);
     expect(replacement.read(firstBlob)).toBeNull();
   });
@@ -571,8 +591,8 @@ describe("blob id batches", () => {
   it("isolates mappings and removes them with their repository", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const first = database.open(database.create("/one", "ref: refs/heads/main"));
-    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    const first = database.openCheckout(database.createRepository("/one", "ref: refs/heads/main"));
+    const second = database.openCheckout(database.createRepository("/two", "ref: refs/heads/main"));
     const contentId = new Uint8Array([0, 255, 0]);
     first.upsertBlobIds([{ contentId, oid: "1".repeat(40) }]);
     second.upsertBlobIds([{ contentId, oid: "2".repeat(40) }]);
@@ -827,8 +847,8 @@ describe("effective tree sources", () => {
   it("isolates identical tree ids between repositories", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
-    const first = database.open(database.create("/one", "ref: refs/heads/main"));
-    const second = database.open(database.create("/two", "ref: refs/heads/main"));
+    const first = database.openCheckout(database.createRepository("/one", "ref: refs/heads/main"));
+    const second = database.openCheckout(database.createRepository("/two", "ref: refs/heads/main"));
     const data = serializeTree([{ mode: MODE_FILE, name: "same", oid: "1".repeat(40) }]);
     const oid = first.write("tree", data);
     expect(second.write("tree", data)).toBe(oid);

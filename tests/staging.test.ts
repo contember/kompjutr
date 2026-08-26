@@ -20,7 +20,7 @@ import { CountingWorktree } from "./helpers/worktree.js";
  * short mode.
  */
 function indexLines(repo: Repository): string[] {
-  return repo.store
+  return repo.checkout
     .indexEntries()
     .map(
       (entry) =>
@@ -48,7 +48,7 @@ afterEach(() => {
 /** A workspace whose objects, refs, working tree and index match a fixture's HEAD. */
 async function clonedFrom(fixture: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/");
-  await importFixture(fixture, workspace.repo.store);
+  await importFixture(fixture, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   // The fixture clock is frozen, so a later same-size edit would land on the
   // checkout's own mtime and read as clean — git's racily-clean window.
@@ -108,7 +108,7 @@ describe("add", () => {
 
     add(workspace.repo, workspace.worktree, { paths: ["tracked.txt"] });
 
-    expect(workspace.repo.store.indexGet("tracked.txt")?.oid).toBe(
+    expect(workspace.repo.checkout.indexGet("tracked.txt")?.oid).toBe(
       hashObject("blob", utf8.encode("two\n")),
     );
     writeWorkFile(workspace, "/new.txt", "new\n");
@@ -223,7 +223,7 @@ describe("add", () => {
     writeWorkFile(workspace, "/present.txt", "resolved\n");
     for (const path of ["present.txt", "deleted.txt"]) {
       for (const stage of [1, 2, 3]) {
-        workspace.repo.store.indexPut({
+        workspace.repo.checkout.indexPut({
           path,
           stage,
           mode: 0o100644,
@@ -237,7 +237,7 @@ describe("add", () => {
 
     add(workspace.repo, workspace.worktree, { paths: [], all: true });
 
-    expect(workspace.repo.store.indexEntries()).toEqual([
+    expect(workspace.repo.checkout.indexEntries()).toEqual([
       expect.objectContaining({
         path: "present.txt",
         stage: 0,
@@ -457,7 +457,7 @@ describe("rm", () => {
     fixture.write("file.txt", "head\n");
     fixture.commit("base");
     const workspace = await clonedFrom(fixture);
-    const entry = workspace.repo.store.indexGet("file.txt");
+    const entry = workspace.repo.checkout.indexGet("file.txt");
     if (entry === null) throw new Error("fixture index entry is missing");
     const forgedContentId = utf8.encode("forged-content-id");
     workspace.worktree.writeFiles([
@@ -496,7 +496,7 @@ describe("rm", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/conflict.txt", "conflict\n");
     for (const stage of [1, 2, 3]) {
-      workspace.repo.store.indexPut({
+      workspace.repo.checkout.indexPut({
         path: "conflict.txt",
         stage,
         mode: 0o100644,
@@ -509,7 +509,7 @@ describe("rm", () => {
 
     rm(workspace.repo, workspace.worktree, { paths: ["conflict.txt"] });
 
-    expect(workspace.repo.store.indexEntries()).toEqual([]);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
     expect(workspace.worktree.stat("/conflict.txt")).toBeNull();
   });
 
@@ -688,7 +688,7 @@ describe("cost", () => {
     workspace.storage.resetCounters();
     add(workspace.repo, worktree, { paths: [], all: true });
     const first = workspace.storage.statementCount;
-    expect(workspace.repo.store.indexEntries()).toHaveLength(paths.length);
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
     expect(first).toBeLessThanOrEqual(230);
     expect(worktree.bulkReadPaths).toHaveLength(paths.length);
 
@@ -707,7 +707,7 @@ describe("cost", () => {
     expect(worktree.bulkReadPaths).toHaveLength(changed.length);
     expect(new Set(worktree.bulkReadPaths)).toEqual(new Set(changed));
     const changedOid = hashObject("blob", utf8.encode("changed\n"));
-    const stagedChanged = workspace.repo.store
+    const stagedChanged = workspace.repo.checkout
       .indexEntries()
       .filter((entry) => entry.oid === changedOid)
       .map((entry) => `/${entry.path}`);
@@ -717,7 +717,7 @@ describe("cost", () => {
     workspace.storage.resetCounters();
     rm(workspace.repo, worktree, { paths: ["."], force: true, recursive: true });
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    expect(workspace.repo.store.indexEntries()).toEqual([]);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
     expect(workspace.worktree.scan("/", { filesOnly: true, limit: 1 })).toEqual([]);
   });
 
@@ -730,7 +730,7 @@ describe("cost", () => {
       { length: 24_252 },
       (_, index) => `f${index.toString().padStart(5, "0")}.txt`,
     );
-    workspace.repo.store.indexReplace(
+    workspace.repo.checkout.indexReplace(
       paths.map((path) => ({
         path,
         stage: 0,
@@ -749,10 +749,10 @@ describe("cost", () => {
 
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(400);
     const changedOid = hashObject("blob", changed);
-    expect(selected.every((path) => workspace.repo.store.indexGet(path)?.oid === changedOid)).toBe(
-      true,
-    );
-    expect(workspace.repo.store.indexGet(paths[100] ?? "")?.oid).toBe(originalOid);
+    expect(
+      selected.every((path) => workspace.repo.checkout.indexGet(path)?.oid === changedOid),
+    ).toBe(true);
+    expect(workspace.repo.checkout.indexGet(paths[100] ?? "")?.oid).toBe(originalOid);
   });
 
   it("fails rm before mutation when retained state exceeds 16 MiB", () => {
@@ -768,7 +768,7 @@ describe("cost", () => {
       mtime: null,
       ino: null,
     }));
-    workspace.repo.store.indexReplace(entries);
+    workspace.repo.checkout.indexReplace(entries);
 
     expect(() =>
       rm(workspace.repo, workspace.worktree, {
@@ -779,6 +779,6 @@ describe("cost", () => {
       }),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
 
-    expect(workspace.repo.store.indexEntries()).toHaveLength(entries.length);
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(entries.length);
   });
 });

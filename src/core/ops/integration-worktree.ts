@@ -96,7 +96,7 @@ export function* prospectiveIntegrationIndexEntries(
   projected: readonly ProjectedMergeEntry[],
 ): Generator<IndexEntry> {
   const owned = new Set(projectedTouchedShape(projected).map((entry) => entry.path));
-  for (const row of joinSorted(repo.store.indexScan(), projected, {
+  for (const row of joinSorted(repo.checkout.indexScan(), projected, {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
   })) {
@@ -111,7 +111,7 @@ export function* prospectiveIntegrationIndexEntries(
 
 function* continuationIndexEntries(repo: Repository): Generator<IndexEntry> {
   let previous: string | null = null;
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     if (entry.path === previous) continue;
     previous = entry.path;
     yield entry.stage === 0 ? entry : { ...entry, stage: 0 };
@@ -148,10 +148,10 @@ export function requireCleanIntegrationIndex(
   headTree: string,
   operation: IntegrationOperation,
 ): void {
-  if (repo.store.hasConflicts()) {
+  if (repo.checkout.hasConflicts()) {
     throw new GitError("EUNMERGED", `cannot ${operation} with unmerged index entries`);
   }
-  for (const row of joinSorted(treeStream(repo, headTree), repo.store.indexScan(), {
+  for (const row of joinSorted(treeStream(repo, headTree), repo.checkout.indexScan(), {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
   })) {
@@ -170,8 +170,8 @@ export function requireCleanIntegrationIndex(
 }
 
 export function integrationIndexMatchesTree(repo: Repository, treeOid: string): boolean {
-  if (repo.store.hasConflicts()) return false;
-  for (const row of joinSorted(treeStream(repo, treeOid), repo.store.indexScan(), {
+  if (repo.checkout.hasConflicts()) return false;
+  for (const row of joinSorted(treeStream(repo, treeOid), repo.checkout.indexScan(), {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
   })) {
@@ -294,7 +294,7 @@ function relocationCollisions(
   if (bases.length === 0) return { tracked: new Set(), untracked: new Set() };
   const tracked = new Set<string>();
   let indexRows = 0;
-  for (const entry of repo.store.indexScan()) {
+  for (const entry of repo.checkout.indexScan()) {
     if (indexRows >= MAX_REPOSITORY_ROWS) {
       throw new GitError(
         "E2BIG",
@@ -313,7 +313,7 @@ function relocationCollisions(
   const untracked = new Set<string>();
   let worktreeRows = 0;
   for (const row of joinSorted(
-    repo.store.indexScan(),
+    repo.checkout.indexScan(),
     walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   )) {

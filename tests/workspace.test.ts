@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { utf8Decoder } from "../src/core/bytes.js";
-import { nestedRoots } from "../src/core/context.js";
+import { nestedRoots, openRepository } from "../src/core/context.js";
 import { initRepository } from "../src/core/ops/init.js";
 import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import {
@@ -13,6 +13,8 @@ import {
 import { makeRepo, makeWorkspace, writeWorkFile } from "./helpers/workspace.js";
 
 const TREE = "1".repeat(40);
+const OTHER_TREE = "2".repeat(40);
+const CALLER_TREE = "3".repeat(40);
 
 describe("workspace fixture", () => {
   it("puts the git state in SQL and the working tree in DOFS", async () => {
@@ -21,11 +23,13 @@ describe("workspace fixture", () => {
 
     expect(await workspace.workspace.fs.readFile("/README.md", "utf8")).toBe("hello\n");
     expect(utf8Decoder.decode(workspace.worktree.readFile("/README.md"))).toBe("hello\n");
-    expect(workspace.repo.store.head()).toBe("ref: refs/heads/main");
+    expect(workspace.repo.checkout.head()).toBe("ref: refs/heads/main");
     expect(
       workspace.storage.sql.exec<{ root: string }>("SELECT root FROM git_checkouts").toArray(),
     ).toEqual([{ root: "/" }]);
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.checkoutId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: false,
     });
   });
@@ -58,9 +62,56 @@ describe("workspace fixture", () => {
     expect(workspace.storage.statementCount).toBe(1);
   });
 
+  it("opens one checkout-bound view from one routing lookup", () => {
+    const workspace = makeRepo("/");
+    const repoId = workspace.repo.store.repoId;
+    const checkoutId = workspace.repo.checkout.checkoutId + 100;
+    workspace.worktree.mkdir("/linked");
+    workspace.database.db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (?, ?, '/linked', ?, 0)`,
+      checkoutId,
+      repoId,
+      TREE,
+    );
+    workspace.database.db.run(
+      `INSERT OR IGNORE INTO git_index_state
+         (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
+      checkoutId,
+    );
+
+    workspace.storage.resetCounters();
+    const linked = openRepository(workspace.context, "/linked/src/file.ts");
+
+    expect(workspace.storage.statementCount).toBe(1);
+    expect(linked.store).toBe(workspace.repo.store);
+    expect(linked.checkout.checkoutId).toBe(checkoutId);
+    expect(linked.checkout.checkoutId).not.toBe(linked.store.repoId);
+    expect(linked.root).toBe("/linked");
+
+    linked.checkout.setHead("ref: refs/heads/linked");
+    expect(linked.checkout.head()).toBe("ref: refs/heads/linked");
+    expect(workspace.repo.checkout.head()).toBe("ref: refs/heads/main");
+
+    workspace.repo.store.setShallow([TREE]);
+    expect(workspace.repo.shallow()).toEqual(new Set([TREE]));
+    linked.checkout.setShallow([OTHER_TREE], [TREE]);
+    expect(workspace.repo.shallow()).toEqual(new Set([OTHER_TREE]));
+    const callerCopy = linked.store.shallow();
+    callerCopy.clear();
+    callerCopy.add(CALLER_TREE);
+    expect(linked.store.shallow()).toEqual(new Set([OTHER_TREE]));
+    workspace.repo.store.clearCaches();
+    expect(workspace.repo.shallow()).toEqual(new Set([OTHER_TREE]));
+
+    workspace.storage.resetCounters();
+    expect(nestedRoots(workspace.context, "/")).toEqual(["/linked"]);
+    expect(workspace.storage.statementCount).toBe(1);
+  });
+
   it("removes tracker state before destroying a sealed repository", () => {
     const workspace = makeRepo("/");
-    const checkoutId = workspace.repo.store.checkoutId;
+    const checkoutId = workspace.repo.checkout.checkoutId;
     expect(
       resealIndexTracker(workspace.database.db, checkoutId, TREE, [
         { path: "old.txt", flags: INDEX_DIRTY },
@@ -88,13 +139,17 @@ describe("workspace fixture", () => {
     workspace.worktree.mkdir("/nested");
     const nested = initRepository(workspace.context, { dir: "/nested" });
     expect(
-      resealIndexTracker(workspace.database.db, workspace.repo.store.checkoutId, TREE, []),
+      resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, TREE, []),
     ).toBe(true);
-    expect(resealIndexTracker(workspace.database.db, nested.store.checkoutId, TREE, [])).toBe(true);
+    expect(resealIndexTracker(workspace.database.db, nested.checkout.checkoutId, TREE, [])).toBe(
+      true,
+    );
 
     nested.store.destroy();
 
-    expect(readIndexTrackerState(workspace.database.db, workspace.repo.store.checkoutId)).toEqual({
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({
       available: false,
     });
   });
@@ -102,7 +157,7 @@ describe("workspace fixture", () => {
   it("starts a reused repository id with clean incomplete tracker state", () => {
     const workspace = makeRepo("/");
     const repoId = workspace.repo.store.repoId;
-    const checkoutId = workspace.repo.store.checkoutId;
+    const checkoutId = workspace.repo.checkout.checkoutId;
     expect(
       resealIndexTracker(workspace.database.db, checkoutId, TREE, [
         { path: "old.txt", flags: INDEX_DIRTY },
@@ -112,7 +167,7 @@ describe("workspace fixture", () => {
 
     const replacement = initRepository(workspace.context, { dir: "/replacement" });
     expect(replacement.store.repoId).toBe(repoId);
-    expect(replacement.store.checkoutId).toBe(checkoutId);
+    expect(replacement.checkout.checkoutId).toBe(checkoutId);
     expect(readIndexTrackerState(workspace.database.db, checkoutId)).toEqual({ available: false });
     expect([...iterateIndexTrackerDirty(workspace.database.db, checkoutId)]).toEqual([]);
   });

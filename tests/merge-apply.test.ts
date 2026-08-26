@@ -52,7 +52,7 @@ function seedFile(workspace: TestRepository, path: string, text: string): string
   ]);
   const stat = workspace.worktree.stat(`/${path}`);
   if (stat === null) throw new Error(`failed to seed ${path}`);
-  workspace.repo.store.indexPut({
+  workspace.repo.checkout.indexPut({
     path,
     stage: 0,
     mode: 0o100644,
@@ -174,8 +174,8 @@ describe("projected merge apply", () => {
       ),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     expect(textAt(workspace, "guarded.txt")).toBe("old\n");
-    expect(workspace.repo.store.indexGet("guarded.txt")).toBeNull();
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.indexGet("guarded.txt")).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("bounds structural ancestors while they are retained", () => {
@@ -201,7 +201,7 @@ describe("projected merge apply", () => {
         metadata(workspace.repo, "no-commit"),
       ),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("applies clean text, add, and delete entries and durably restores them", () => {
@@ -254,21 +254,21 @@ describe("projected merge apply", () => {
     expect(textAt(workspace, "a.txt")).toBe("merged\n");
     expect(textAt(workspace, "added.txt")).toBe("added\n");
     expect(textAt(workspace, "deleted.txt")).toBeNull();
-    expect(workspace.repo.store.indexGet("a.txt")?.oid).toBe(newA.oid);
-    expect(workspace.repo.store.indexGet("added.txt")?.oid).toBe(added.oid);
-    expect(workspace.repo.store.indexGet("deleted.txt")).toBeNull();
+    expect(workspace.repo.checkout.indexGet("a.txt")?.oid).toBe(newA.oid);
+    expect(workspace.repo.checkout.indexGet("added.txt")?.oid).toBe(added.oid);
+    expect(workspace.repo.checkout.indexGet("deleted.txt")).toBeNull();
 
-    const journal = workspace.repo.store.requireMergeState();
+    const journal = workspace.repo.checkout.requireMergeState();
     workspace.repo.store.db.transactionSync(() =>
       abortProjectedMerge(workspace.repo, workspace.worktree, journal),
     );
 
-    expect(workspace.repo.store.readMergeState()).toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
     expect(textAt(workspace, "a.txt")).toBe("old\n");
     expect(textAt(workspace, "added.txt")).toBeNull();
     expect(textAt(workspace, "deleted.txt")).toBe("keep me\n");
-    expect(workspace.repo.store.indexGet("a.txt")?.oid).toBe(oldA);
-    expect(workspace.repo.store.indexGet("deleted.txt")?.oid).toBe(oldDeleted);
+    expect(workspace.repo.checkout.indexGet("a.txt")?.oid).toBe(oldA);
+    expect(workspace.repo.checkout.indexGet("deleted.txt")?.oid).toBe(oldDeleted);
   });
 
   it("writes binary conflict content and replaces stage zero with stages 1, 2, and 3", () => {
@@ -294,12 +294,12 @@ describe("projected merge apply", () => {
     );
 
     expect(result.outcome).toBe("conflicted");
-    expect(workspace.repo.store.indexGet("binary.dat", 0)).toBeNull();
-    expect(workspace.repo.store.indexGet("binary.dat", 1)?.oid).toBe(base.oid);
-    expect(workspace.repo.store.indexGet("binary.dat", 2)?.oid).toBe(current.oid);
-    expect(workspace.repo.store.indexGet("binary.dat", 3)?.oid).toBe(incoming.oid);
+    expect(workspace.repo.checkout.indexGet("binary.dat", 0)).toBeNull();
+    expect(workspace.repo.checkout.indexGet("binary.dat", 1)?.oid).toBe(base.oid);
+    expect(workspace.repo.checkout.indexGet("binary.dat", 2)?.oid).toBe(current.oid);
+    expect(workspace.repo.checkout.indexGet("binary.dat", 3)?.oid).toBe(incoming.oid);
     expect(textAt(workspace, "binary.dat")).toBe("current\0bytes");
-    expect(workspace.repo.store.requireMergeState().state.phase).toBe("conflicted");
+    expect(workspace.repo.checkout.requireMergeState().state.phase).toBe("conflicted");
   });
 
   it("applies and aborts a current-file/incoming-directory projection", () => {
@@ -335,23 +335,23 @@ describe("projected merge apply", () => {
     expect(workspace.worktree.stat("/x")?.type).toBe("dir");
     expect(textAt(workspace, "x/y")).toBe("incoming child\n");
     expect(textAt(workspace, "x~HEAD")).toBe("current file\n");
-    expect(workspace.repo.store.indexGet("x")).toBeNull();
-    expect(workspace.repo.store.indexGet("x/y")?.oid).toBe(incoming.oid);
-    expect(workspace.repo.store.indexGet("x~HEAD", 2)?.oid).toBe(current.oid);
-    expect(workspace.repo.store.requireMergeState().touched.map((entry) => entry.path)).toEqual([
+    expect(workspace.repo.checkout.indexGet("x")).toBeNull();
+    expect(workspace.repo.checkout.indexGet("x/y")?.oid).toBe(incoming.oid);
+    expect(workspace.repo.checkout.indexGet("x~HEAD", 2)?.oid).toBe(current.oid);
+    expect(workspace.repo.checkout.requireMergeState().touched.map((entry) => entry.path)).toEqual([
       "x",
       "x/y",
       "x~HEAD",
     ]);
 
-    const journal = workspace.repo.store.requireMergeState();
+    const journal = workspace.repo.checkout.requireMergeState();
     workspace.repo.store.db.transactionSync(() =>
       abortProjectedMerge(workspace.repo, workspace.worktree, journal),
     );
     expect(textAt(workspace, "x")).toBe("current file\n");
     expect(workspace.worktree.stat("/x/y")).toBeNull();
     expect(workspace.worktree.stat("/x~HEAD")).toBeNull();
-    expect(workspace.repo.store.indexGet("x")?.oid).toBe(current.oid);
+    expect(workspace.repo.checkout.indexGet("x")?.oid).toBe(current.oid);
   });
 
   it("refuses abort when restoring a file would remove an outside path", () => {
@@ -383,7 +383,7 @@ describe("projected merge apply", () => {
       applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
     );
     workspace.worktree.writeFiles([{ path: "/x/outside.txt", bytes: utf8.encode("outside\n") }]);
-    const journal = workspace.repo.store.requireMergeState();
+    const journal = workspace.repo.checkout.requireMergeState();
 
     expect(() =>
       workspace.repo.store.db.transactionSync(() =>
@@ -391,7 +391,7 @@ describe("projected merge apply", () => {
       ),
     ).toThrow(expect.objectContaining({ code: "ECHECKOUTFAIL" }));
     expect(textAt(workspace, "x/outside.txt")).toBe("outside\n");
-    expect(workspace.repo.store.readMergeState()).not.toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).not.toBeNull();
   });
 
   it("validates snapshot objects before abort mutates a journal-owned path", () => {
@@ -417,7 +417,7 @@ describe("projected merge apply", () => {
         metadata(workspace.repo, "no-commit"),
       ),
     );
-    const journal = workspace.repo.store.requireMergeState();
+    const journal = workspace.repo.checkout.requireMergeState();
     const touched = journal.touched.map(
       (entry): MergeTouchedPath =>
         entry.path === "a.txt"
@@ -440,7 +440,7 @@ describe("projected merge apply", () => {
       ),
     ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
     expect(textAt(workspace, "a.txt")).toBe("next\n");
-    expect(workspace.repo.store.readMergeState()).not.toBeNull();
+    expect(workspace.repo.checkout.readMergeState()).not.toBeNull();
   });
 
   it("removes a merge-created parent but preserves a pre-existing empty parent on abort", () => {
@@ -467,7 +467,7 @@ describe("projected merge apply", () => {
           metadata(workspace.repo, "no-commit"),
         ),
       );
-      const journal = workspace.repo.store.requireMergeState();
+      const journal = workspace.repo.checkout.requireMergeState();
       expect(journal.touched.map((entry) => entry.path)).toEqual(["d", "d/f.txt"]);
 
       workspace.repo.store.db.transactionSync(() =>

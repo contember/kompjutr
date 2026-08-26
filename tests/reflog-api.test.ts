@@ -344,7 +344,7 @@ describe("HEAD reflog selectors", () => {
     await git.commit({ message: "second" });
     expect(await git.revParse({ ref: "HEAD@{0}^" })).toBe(first);
 
-    workspace.repo.store.mutateRefs({ head: "ref: refs/heads/unborn" }, metadata("unborn"));
+    workspace.repo.mutateRefs({ head: "ref: refs/heads/unborn" }, metadata("unborn"));
     await expect(git.revParse({ ref: "HEAD@{0}" })).rejects.toMatchObject({ code: "ENOTFOUND" });
 
     now += (RETENTION_SECONDS + 1) * 1_000;
@@ -362,11 +362,11 @@ describe("reflog recovery", () => {
     const git = bindGit(workspace);
     const oldOid = workspace.repo.store.write("blob", new TextEncoder().encode("old"));
     const newOid = workspace.repo.store.write("blob", new TextEncoder().encode("new"));
-    workspace.repo.store.mutateRefs(
+    workspace.repo.mutateRefs(
       { puts: [{ name: "refs/heads/main", target: oldOid }] },
       metadata("old"),
     );
-    workspace.repo.store.mutateRefs(
+    workspace.repo.mutateRefs(
       { puts: [{ name: "refs/heads/main", target: newOid }] },
       metadata("new"),
     );
@@ -391,7 +391,7 @@ describe("reflog recovery", () => {
       reason: "recover-ref",
     });
 
-    workspace.repo.store.mutateRefs({ deletes: ["refs/heads/main"] }, metadata("delete"));
+    workspace.repo.mutateRefs({ deletes: ["refs/heads/main"] }, metadata("delete"));
     const deletion = (await git.reflog({ ref: "refs/heads/main", limit: 1 }))[0];
     if (deletion === undefined) throw new Error("missing deletion entry");
     await git.recoverRef({
@@ -416,13 +416,13 @@ describe("reflog recovery", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     const git = bindGit(workspace);
     const oid = workspace.repo.store.write("blob", new TextEncoder().encode("recover"));
-    workspace.repo.store.mutateRefs(
+    workspace.repo.mutateRefs(
       { puts: [{ name: "refs/tags/source", target: oid }] },
       metadata("source"),
     );
     const source = workspace.repo.reflog("refs/tags/source")[0];
     if (source === undefined) throw new Error("missing source entry");
-    workspace.repo.store.mutateRefs(
+    workspace.repo.mutateRefs(
       { puts: [{ name: "refs/heads/destination", target: "ref: refs/tags/source" }] },
       metadata("symbolic"),
     );
@@ -475,7 +475,7 @@ describe("reflog recovery", () => {
     const workspace = makeRepo("/", { startTime: now, now: () => now });
     const git = bindGit(workspace);
     const oid = workspace.repo.store.write("blob", new TextEncoder().encode("retained object"));
-    workspace.repo.store.mutateRefs(
+    workspace.repo.mutateRefs(
       { puts: [{ name: "refs/tags/source", target: oid }] },
       metadata("source"),
     );
@@ -502,7 +502,7 @@ describe("reflog recovery", () => {
     const oid = (await git.commit({ message: "committed" })).oid;
     const source = workspace.repo.reflog("refs/heads/main")[0];
     if (source === undefined) throw new Error("missing source entry");
-    workspace.repo.store.writeOperationState(
+    workspace.repo.checkout.writeOperationState(
       {
         kind: "cherry-pick",
         originalHeadRef: "refs/heads/main",
@@ -612,7 +612,7 @@ describe("active reflog roots", () => {
     let now = NOW_MILLISECONDS;
     const workspace = makeRepo("/", { now: () => now });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 10);
-    workspace.repo.store.mutateRefs(
+    workspace.repo.mutateRefs(
       { puts: [{ name: "refs/tags/created", target: THIRD }] },
       metadata("null-old-endpoint"),
     );
@@ -648,8 +648,8 @@ describe("active reflog roots", () => {
   it("is lazy, uses one iterate query, never calls all, and closes early", () => {
     const db = new GuardedDatabase();
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
-    const repository = database.create("/repo", "ref: refs/heads/main");
-    const store = database.open(repository);
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(repository);
     seedRefLog(db, store.repoId, "HEAD", 10);
     db.iterateCalls = 0;
     db.closedIterators = 0;
@@ -683,8 +683,8 @@ describe("active reflog roots", () => {
   it("accepts the exact SQL-state budget and rejects one physical row over before grouping", () => {
     const db = new GuardedDatabase();
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
-    const repository = database.create("/repo", "ref: refs/heads/main");
-    const store = database.open(repository);
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(repository);
     seedDistinctActiveRefLogs(db, store.repoId, MAX_REFLOG_ROOT_SCAN_ENTRIES);
     db.forbidAll = true;
     db.iterateCalls = 0;
@@ -723,30 +723,30 @@ describe("active reflog roots", () => {
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
     const first = database.createRepository("/first", "ref: refs/heads/main");
     const second = database.createRepository("/second", "ref: refs/heads/main");
-    const secondStore = database.open(second);
+    const secondStore = database.openCheckout(second);
     db.run(
       `INSERT INTO git_checkout_reflog_entries
          (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
           actor_name, actor_email, timestamp, timezone, reason)
        VALUES (?, ?, 1, ?, ?, ?, ?, NULL, NULL, ?, 0, 'cross-owner')`,
-      first.checkoutId,
       first.id,
+      first.repoId,
       FIRST,
       SECOND,
       FIRST,
       SECOND,
       NOW_SECONDS,
     );
-    db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", first.id);
+    db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", first.repoId);
     db.run("PRAGMA foreign_keys = OFF");
     try {
       db.run(
         "UPDATE git_checkout_reflog_entries SET repo_id = ? WHERE checkout_id = ?",
-        second.id,
-        first.checkoutId,
+        second.repoId,
+        first.id,
       );
-      db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", first.id);
-      db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", second.id);
+      db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", first.repoId);
+      db.run("UPDATE git_reflog_state SET next_ordinal = 1 WHERE repo_id = ?", second.repoId);
     } finally {
       db.run("PRAGMA foreign_keys = ON");
     }
@@ -798,15 +798,15 @@ describe("active reflog roots", () => {
 describe("mutation publication result", () => {
   it("returns false only for no event and true after publication", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
-    expect(workspace.repo.store.mutateRefs({}, metadata("none"))).toBe(false);
+    expect(workspace.repo.mutateRefs({}, metadata("none"))).toBe(false);
     expect(
-      workspace.repo.store.mutateRefs(
+      workspace.repo.mutateRefs(
         { puts: [{ name: "refs/tags/published", target: FIRST }] },
         metadata("publish"),
       ),
     ).toBe(true);
     expect(
-      workspace.repo.store.mutateRefs(
+      workspace.repo.mutateRefs(
         { puts: [{ name: "refs/tags/published", target: FIRST }] },
         metadata("same"),
       ),
@@ -819,7 +819,7 @@ describe("mutation publication result", () => {
       BEFORE INSERT ON git_reflog_entries
       BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END`);
     expect(() =>
-      workspace.repo.store.mutateRefs(
+      workspace.repo.mutateRefs(
         { puts: [{ name: "refs/tags/fail", target: FIRST }] },
         metadata("fail"),
       ),

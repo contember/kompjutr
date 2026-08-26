@@ -230,10 +230,7 @@ export async function fetchInto(
       updates.push({ name: `${trackingPrefix}HEAD`, target: `ref: ${tracking}` });
     }
   }
-  repo.store.mutateRefs(
-    { puts: updates, deletes },
-    operationRefLogMetadata(context, repo, refLogReason),
-  );
+  repo.mutateRefs({ puts: updates, deletes }, operationRefLogMetadata(context, repo, refLogReason));
 
   const first = wantedRefs[0];
   return {
@@ -352,12 +349,12 @@ function tryInitialClone(context: GitContext, repo: Repository, treeOid: string)
     const worktree = writer.tryRun(
       repo.root,
       (worktreeSession) =>
-        repo.store.tryCreateInitialState((indexSession) =>
+        repo.checkout.tryCreateInitialState((indexSession) =>
           writeInitialClone(repo, treeOid, worktreeSession, indexSession),
         ),
       (state) => {
         if (state.available && state.value !== null && context.indexTracker !== undefined) {
-          context.indexTracker.reseal(repo.store.checkoutId, treeOid, state.value);
+          context.indexTracker.reseal(repo.checkout.checkoutId, treeOid, state.value);
         }
       },
     );
@@ -370,12 +367,12 @@ function tryInitialClone(context: GitContext, repo: Repository, treeOid: string)
 
 export async function clone(context: GitContext, options: CloneOptions): Promise<void> {
   const root = normalizePath(options.dir ?? "/");
-  if (context.database.at(root) !== null) throw new AlreadyInitializedError(root);
+  if (context.database.checkoutAt(root) !== null) throw new AlreadyInitializedError(root);
   const url = normalizeRemoteUrl(options.url);
   const remote = options.remote ?? "origin";
 
-  const row = context.database.create(root, "ref: refs/heads/main");
-  const repo = new Repository(context.database.open(row), row.root);
+  const row = context.database.createRepository(root, "ref: refs/heads/main");
+  const repo = new Repository(context.database.openCheckout(row));
   try {
     repo.store.configSet(`remote.${remote}.url`, url);
     repo.store.configSet(`remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
@@ -404,7 +401,7 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     if (tip === null) throw new GitError("EFETCHFAIL", "remote advertised no usable ref");
 
     repo.store.db.transactionSync(() => {
-      repo.store.mutateRefs(
+      repo.mutateRefs(
         {
           puts: [{ name: `refs/heads/${branch}`, target: tip }],
           head: `ref: refs/heads/${branch}`,

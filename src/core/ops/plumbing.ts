@@ -54,7 +54,7 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
   const target = options.symbolic === true ? `ref: ${options.value}` : repo.revParse(options.value);
   const mutation =
     options.ref === "HEAD" ? { head: target } : { puts: [{ name: options.ref, target }] };
-  repo.store.mutateRefs(mutation, operationRefLogMetadata(context, repo, "update-ref"));
+  repo.mutateRefs(mutation, operationRefLogMetadata(context, repo, "update-ref"));
 }
 
 export interface RepoRootOptions {

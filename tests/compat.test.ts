@@ -43,9 +43,9 @@ describe("Computer client operation interlocks", () => {
     await workspace.git.add({ paths: ["file.txt"] });
     const original = await workspace.git.commit({ message: "base" });
     const database = new SqliteGitDatabase(new TestDatabase(storage));
-    const repository = database.find("/");
+    const repository = database.findCheckout("/");
     if (repository === null) throw new Error("repository is missing");
-    const store = database.open(repository);
+    const store = database.openCheckout(repository);
     store.writeOperationState(
       {
         kind: "revert",
@@ -106,9 +106,9 @@ describe("Computer client operation interlocks", () => {
     await expect(native.rebase({ upstream: "upstream" })).resolves.toMatchObject({
       outcome: "conflicted",
     });
-    const repository = database.find("/");
+    const repository = database.findCheckout("/");
     if (repository === null) throw new Error("repository is missing");
-    const store = database.open(repository);
+    const store = database.openCheckout(repository);
     expect(store.hasConflicts()).toBe(true);
     expect(worktree.stat("/deleted.txt")).not.toBeNull();
 

@@ -28,7 +28,7 @@ function fixture(): GitFixture {
 
 async function imported(source: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/", { now: () => 1_577_836_800_000 });
-  await importFixture(source, workspace.repo.store);
+  await importFixture(source, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   workspace.repo.store.configSet("user.name", REVERTER.name);
   workspace.repo.store.configSet("user.email", REVERTER.email);
@@ -39,11 +39,11 @@ function reopen(workspace: TestRepository): { context: GitContext; repo: Reposit
   const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
     now: workspace.context.now,
   });
-  const row = database.find("/");
+  const row = database.findCheckout("/");
   if (row === null) throw new Error("reopened repository is missing");
   return {
     context: { ...workspace.context, database },
-    repo: new Repository(database.open(row), "/"),
+    repo: new Repository(database.openCheckout(row)),
   };
 }
 
@@ -95,7 +95,7 @@ describe("revert lifecycle", () => {
     expect(commit.committer).toEqual(commit.author);
     expect(textAt(workspace, "tracked.txt")).toBe("base\n");
     expect(textAt(workspace, "later.txt")).toBe("later\n");
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([
       expect.objectContaining({
         oldOid: current,
@@ -107,7 +107,7 @@ describe("revert lifecycle", () => {
       }),
     ]);
     const named = workspace.repo.store.reflog("refs/heads/main")[0];
-    const head = workspace.repo.store.reflog("HEAD")[0];
+    const head = workspace.repo.checkout.reflog("HEAD")[0];
     expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "revert" });
     if (named === undefined || head === undefined) throw new Error("revert reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
@@ -123,8 +123,8 @@ describe("revert lifecycle", () => {
     const current = source.commit("later");
     const workspace = await imported(source);
     const beforeObjects = workspace.repo.store.objectCount();
-    const originalUpdate = workspace.repo.store.mutateRefs.bind(workspace.repo.store);
-    workspace.repo.store.mutateRefs = (mutation, metadata) => {
+    const originalUpdate = workspace.repo.mutateRefs.bind(workspace.repo);
+    workspace.repo.mutateRefs = (mutation, metadata) => {
       originalUpdate(mutation, metadata);
       throw new Error("late revert publication fault");
     };
@@ -137,9 +137,9 @@ describe("revert lifecycle", () => {
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
     expect(textAt(workspace, "tracked.txt")).toBe("changed\n");
     expect(textAt(workspace, "later.txt")).toBe("later\n");
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
   it("reverts a root commit relative to the empty tree", async () => {
@@ -184,9 +184,9 @@ describe("revert lifecycle", () => {
         }),
       ).toThrow(expect.objectContaining({ code: "EINVAL" }));
       expect(rejected.repo.head()).toEqual(before);
-      expect(rejected.repo.store.readOperationState()).toBeNull();
+      expect(rejected.repo.checkout.readOperationState()).toBeNull();
       expect(rejected.repo.store.reflog("refs/heads/main")).toEqual([]);
-      expect(rejected.repo.store.reflog("HEAD")).toEqual([]);
+      expect(rejected.repo.checkout.reflog("HEAD")).toEqual([]);
     }
 
     const workspace = await imported(source);
@@ -230,9 +230,9 @@ describe("revert lifecycle", () => {
         revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
       ).toEqual({ outcome: "empty", reason: kind });
       expect(workspace.repo.head()).toEqual(before);
-      expect(workspace.repo.store.readOperationState()).toBeNull();
+      expect(workspace.repo.checkout.readOperationState()).toBeNull();
       expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-      expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+      expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
       expect(() => revertContinue(workspace.context, workspace.repo)).toThrow(
         expect.objectContaining({ code: "ENOREVERT" }),
       );
@@ -258,14 +258,14 @@ describe("revert lifecycle", () => {
       revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
     ).toEqual({ outcome: "conflicted" });
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.indexGet("conflict.txt", 1)?.oid).toBe(expectedStage1);
-    expect(workspace.repo.store.indexGet("conflict.txt", 2)?.oid).toBe(expectedStage2);
-    expect(workspace.repo.store.indexGet("conflict.txt", 3)?.oid).toBe(expectedStage3);
+    expect(workspace.repo.checkout.indexGet("conflict.txt", 1)?.oid).toBe(expectedStage1);
+    expect(workspace.repo.checkout.indexGet("conflict.txt", 2)?.oid).toBe(expectedStage2);
+    expect(workspace.repo.checkout.indexGet("conflict.txt", 3)?.oid).toBe(expectedStage3);
     expect(textAt(workspace, "conflict.txt")).toContain(
       `>>>>>>> parent of ${reverted.slice(0, 7)} (source subject)`,
     );
     expect(workspace.repo.store.reflog("refs/heads/main")).toEqual([]);
-    expect(workspace.repo.store.reflog("HEAD")).toEqual([]);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
 
     workspace.tick(60_000);
     const cold = reopen(workspace);
@@ -278,7 +278,7 @@ describe("revert lifecycle", () => {
     expect(commit.parent).toEqual([current]);
     expect(commit.author).toMatchObject({ ...REVERTER, timestamp: 1_577_836_860 });
     expect(commit.committer).toEqual(commit.author);
-    expect(cold.repo.store.readOperationState()).toBeNull();
+    expect(cold.repo.checkout.readOperationState()).toBeNull();
     expect(cold.repo.store.reflog("refs/heads/main")).toEqual([
       expect.objectContaining({
         oldOid: current,
@@ -290,7 +290,7 @@ describe("revert lifecycle", () => {
       }),
     ]);
     const named = cold.repo.store.reflog("refs/heads/main")[0];
-    const head = cold.repo.store.reflog("HEAD")[0];
+    const head = cold.repo.checkout.reflog("HEAD")[0];
     expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "revert" });
     if (named === undefined || head === undefined) throw new Error("revert reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
@@ -311,9 +311,9 @@ describe("revert lifecycle", () => {
     expect(
       revert(workspace.context, workspace.repo, workspace.worktree, { source: reverted }),
     ).toEqual({ outcome: "conflicted" });
-    expect(workspace.repo.store.indexGet("added.txt", 1)?.oid).toBeDefined();
-    expect(workspace.repo.store.indexGet("added.txt", 2)?.oid).toBeDefined();
-    expect(workspace.repo.store.indexGet("added.txt", 3)).toBeNull();
+    expect(workspace.repo.checkout.indexGet("added.txt", 1)?.oid).toBeDefined();
+    expect(workspace.repo.checkout.indexGet("added.txt", 2)?.oid).toBeDefined();
+    expect(workspace.repo.checkout.indexGet("added.txt", 3)).toBeNull();
     rm(workspace.repo, workspace.worktree, { paths: ["added.txt"] });
     const result = revertContinue(workspace.context, workspace.repo);
     expect(result.outcome).toBe("committed");
@@ -346,7 +346,7 @@ describe("revert lifecycle", () => {
       reason: "result",
     });
     expect(workspace.repo.head().oid).toBe(current);
-    expect(workspace.repo.store.readOperationState()).toBeNull();
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(() => revertContinue(workspace.context, workspace.repo)).toThrow(
       expect.objectContaining({ code: "ENOREVERT" }),
     );
@@ -375,10 +375,10 @@ describe("revert lifecycle", () => {
       if (action === "skip") {
         const cold = reopen(workspace);
         revertSkip(cold.repo, workspace.worktree);
-        expect(cold.repo.store.readOperationState()).toBeNull();
+        expect(cold.repo.checkout.readOperationState()).toBeNull();
       } else {
         revertAbort(workspace.repo, workspace.worktree);
-        expect(workspace.repo.store.readOperationState()).toBeNull();
+        expect(workspace.repo.checkout.readOperationState()).toBeNull();
       }
       expect(workspace.repo.head().oid).toBe(current);
       expect(textAt(workspace, "conflict.txt")).toBe("current\n");
@@ -414,7 +414,7 @@ describe("revert lifecycle", () => {
       () => revertAbort(workspace.repo, workspace.worktree),
     ]) {
       expect(invoke).toThrow(expect.objectContaining({ code: "EOPMISMATCH" }));
-      expect(workspace.repo.store.readOperationState()?.kind).toBe("cherry-pick");
+      expect(workspace.repo.checkout.readOperationState()?.kind).toBe("cherry-pick");
     }
   });
 

@@ -364,7 +364,7 @@ describe("ordering, bounds, and trust", () => {
 
   it("prunes equal roots only after validating the authoritative object", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const written = store.writeObjects((batch) => {
       const blob = batch.write("blob", new TextEncoder().encode("content\n"));
       const tree = batch.write(
@@ -373,7 +373,7 @@ describe("ordering, bounds, and trust", () => {
       );
       return { blob, tree };
     });
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
 
     expect(
       classifyIntegrationStructure(repo, {
@@ -400,10 +400,10 @@ describe("ordering, bounds, and trust", () => {
 
   it("rejects corrupt authoritative metadata on the equal-root fast path", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
-    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const blob = store.write("blob", new TextEncoder().encode("content\n"));
     const tree = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "file", oid: blob }]));
-    const repo = new Repository(store, "/repo");
+    const repo = new Repository(store);
     const classifyEqual = (oid: string): ReturnType<typeof classifyIntegrationStructure> =>
       classifyIntegrationStructure(repo, {
         baseTreeOid: oid,
