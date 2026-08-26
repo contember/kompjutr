@@ -47,3 +47,45 @@ The harness writes detailed generated output to `bench/results/`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run. Historical
 pre-standalone comparisons remain in
 [`../archive/benchmarks/`](../archive/benchmarks/README.md).
+
+## Tree-schema storage
+
+Measured 2026-08-26 at benchmark commit `6890f53` with Node v24.4.0 and
+SQLite 3.50.2 on Linux 6.17.0-41-generic x64 and an AMD Ryzen 7 PRO 8840HS:
+
+```bash
+npm run bench:tree-schema
+```
+
+The harness re-executes measurement through `cpu-lease run -n 2 --no-smt` and
+verified `Cpus_allowed_list=10`, one logical CPU. A correctness-only run uses
+`npm run bench:tree-schema -- --check` without a lease. Both layouts contain the
+same parsed data from Next.js v15.5.2 at revision
+`381a9c8089ed7a244dcfa374fbb27d37032e208a`: 24,252 tracked paths, 11,070 tree
+sources, 34,996 immediate entries, and 11,070 effective sources.
+
+| Structure | v11 pages | v11 bytes | v12 pages | v12 bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Sources | 163 | 667,648 | 173 | 708,608 |
+| Entries | 1,536 | 6,291,456 | 1,001 | 4,100,096 |
+| Name index | 585 | 2,396,160 | 195 | 798,720 |
+| Effective sources | 144 | 589,824 | 135 | 552,960 |
+| Automatic source indexes | 0 | 0 | 296 | 1,212,416 |
+| **Combined** | **2,428** | **9,945,088** | **1,800** | **7,372,800** |
+
+The source-surrogate layout saves 628 pages and 2,572,288 bytes, or 25.8649%.
+Combined storage falls from 284.17785 to 210.67551 bytes per immediate entry, a
+73.50234-byte reduction. The total includes the two v12 source-key indexes, so
+the result does not hide the surrogate's added indexing cost.
+
+Logical validation produced the same row counts and layout checksum
+`86c7c1c52823ea97e6b1163abaa06c2f16402e2c796fa2b729c9acf1c6c349b5`.
+Both layouts completed the traversal profile in 11,070 statements over 34,996
+rows with checksum
+`86cafc000db99382db9972c47129ee5827266564f8bdb1633197cd13f947f309`.
+The exact-name profile found all 2,048 sampled entries in 2,048 statements with
+checksum `312271501c79dd9cb5d888ea75be8b4c9fc13b3b2f2f756bf11f9a1c2b886619`.
+
+This measurement isolates SQLite layout size and logical query profiles. It is
+`node:sqlite`, not Durable Object SQL, and makes no wall-time or production
+runtime claim.

@@ -253,12 +253,9 @@ sprint.
 ## Out of scope (explicit)
 
 - The schema-wide OID migration. A BLOB decision becomes a narrowed follow-up to
-  run with [21](../backlog/21-narrow-parsed-tree-keys.md), so keyed tree tables
-  are rebuilt once.
+  run with backlog 21, so keyed tree tables are rebuilt once.
 - Parsed-tree key narrowing, `git_blob_ids` lifecycle, and write-time CHECKs —
-  backlogs [20](../backlog/20-blob-id-mapping-role-and-growth.md),
-  [21](../backlog/21-narrow-parsed-tree-keys.md), and
-  [23](../backlog/23-write-time-checks-on-derived-tables.md).
+  backlogs 20, 21, and 23.
 - Full production Durable Object release probing and the concurrent/restart
   matrix — backlogs [11](../backlog/11-production-do-regression-probe.md) and
   [16](../backlog/16-concurrent-and-restart-conformance.md). WU2 owns only the

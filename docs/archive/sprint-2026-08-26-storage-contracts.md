@@ -1,10 +1,14 @@
-<!--
-On close, prepend an OUTCOME block here, then `git mv` this file to ../archive/:
-
-> **OUTCOME — shipped YYYY-MM-DD.** <one-paragraph result.> Commit map: WU1 → <sha>,
-> WU2 → <sha>, … Verification: <the gate command + numbers>. Backlog closed:
-> <ids deleted/rescoped>. Deferred: <honest notes>.
--->
+> **OUTCOME — shipped 2026-08-26.** Schema v12 keeps filesystem content
+> identities opaque while bounding their Git blob cache, keys parsed trees by a
+> source surrogate, reconstructs derived projections from authoritative loose
+> objects and complete packs, and rejects malformed projection writes. Commit
+> map: WU1–WU4 → `f327434`; WU5 benchmark → `6890f53`. Verification: leased full
+> suite — 96 files and 1,719 tests passed, 5 skipped; leased `npm run build`;
+> leased `npm run typecheck`; `npm run check`; docs lint; tree-schema
+> correctness and leased measurement. The representative layout shrank by
+> 2,572,288 bytes, or 25.8649%. Backlog closed: 20, 21, and 23. Deferred:
+> production Durable Object evidence remains backlog 11; no production
+> wall-time or memory claim was made.
 
 # Sprint — Storage contracts and derived-table hardening (2026-08-26)
 
@@ -19,9 +23,7 @@ expensive. Success means existing repositories rebuild derived projections from
 authoritative loose objects and complete packs, hot reads retain their statement
 and ordering properties, and every new retained structure has an explicit bound.
 
-Consumes backlog items [20](../backlog/20-blob-id-mapping-role-and-growth.md),
-[21](../backlog/21-narrow-parsed-tree-keys.md), and
-[23](../backlog/23-write-time-checks-on-derived-tables.md).
+Consumes backlog items 20, 21, and 23. All three closed with this sprint.
 
 ## Refs re-verified at HEAD (2026-08-26, `0499ada`)
 
@@ -209,3 +211,11 @@ source rule, or operation-budget exception stops the sprint for an owner decisio
   was re-verified by three independent read-only specifications. Removal of
   `git_blob_ids` was rejected because it would couple the Git-agnostic filesystem
   contract to Git object identity; bounded eviction preserves the existing layer.
+- 2026-08-26 — WU1–WU4 shipped in `f327434`. Independent migration, tree, and
+  cache reviews found and verified fixes for migration bounds, source identity,
+  newest-generation retention, invalid control rows, and statement-count
+  regressions. → ADR-0006 and ADR-0007.
+- 2026-08-26 — WU5 shipped in `6890f53`. The leased Next.js layout measurement
+  proved equal logical rows and query profiles while reducing combined parsed-
+  tree storage by 25.8649%. The full suite, build, typecheck, check, docs lint,
+  and diff checks passed.

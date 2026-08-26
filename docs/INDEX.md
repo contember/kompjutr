@@ -15,15 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-26-storage-contracts.md`](sprints/sprint-2026-08-26-storage-contracts.md)
-  — bounded content-identity cache, narrow tree projections, and guarded writes.
+None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Storage-contract work is active: schema v12 settles blob-identity lifecycle,
-  parsed-tree storage, authoritative migration, and derived-row write guards.
+- Recovery is next: reflogs and ref recovery precede merged-branch deletion and
+  destructive repository maintenance.
 
 ## Key reference
 
@@ -41,9 +40,14 @@ decisions → reference → archive.
 - [`decisions/0003-port-xdiff-text-merge.md`](decisions/0003-port-xdiff-text-merge.md)
 - [`decisions/0004-foreign-key-enforcement.md`](decisions/0004-foreign-key-enforcement.md)
 - [`decisions/0005-keep-oid-columns-as-text.md`](decisions/0005-keep-oid-columns-as-text.md)
+- [`decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md`](decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md)
+- [`decisions/0007-key-parsed-trees-by-source-surrogate.md`](decisions/0007-key-parsed-trees-by-source-surrogate.md)
 
 ## Historical records
 
+- [`archive/sprint-2026-08-26-storage-contracts.md`](archive/sprint-2026-08-26-storage-contracts.md)
+  — bounded opaque content identities, source-surrogate tree projections,
+  authoritative migration, and derived-row write guards.
 - [`archive/sprint-2026-08-25-status-and-rename-correctness.md`](archive/sprint-2026-08-25-status-and-rename-correctness.md)
   — unmerged status truth, native status reports, and bounded exact renames.
 - [`archive/sprint-2026-08-25-release-correctness-baseline.md`](archive/sprint-2026-08-25-release-correctness-baseline.md)

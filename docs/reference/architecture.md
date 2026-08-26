@@ -62,12 +62,25 @@ Repository state is relational rather than a fake `.git` tree:
 - `git_index` stores one row per path and stage.
 - `git_objects` and `git_object_chunks` store locally created objects.
 - `git_pack_*` stores received pack bytes and their index.
-- `git_tree_*` stores source-qualified parsed tree edges.
+- `git_blob_ids` caches opaque filesystem content identities to blob OIDs.
+- `git_tree_*` stores source-qualified parsed tree edges through narrow source
+  surrogates.
 - `git_commits` stores validated parsed commit projections.
 - `git_operation_state`, `git_operation_steps`, and `git_operation_touched`
   store one authenticated bounded recovery journal per repository.
 
 No operation depends on a `.git` directory.
+
+The blob-identity mapping is a disposable optimization, not an identity
+contract. Filesystem writers may mint arbitrary content identities; Git never
+interprets their bytes as object IDs. Each repository retains at most 65,536
+cache rows. An identity longer than 256 bytes is not cached, so stored identity
+payload is at most 16 MiB. Lookup and update callers have separate 16 MiB
+retained-state limits that include row accounting. Writers publish each bounded
+page as one generation and evict older generations transactionally. A miss or
+eviction only makes the caller hash the authoritative file bytes again; it
+cannot change the Git result. When a write contains more mappings than the cache
+can retain, the newest pages survive and older mappings become misses.
 
 ## Objects and packs
 
@@ -101,6 +114,14 @@ Tree objects are parsed when they become visible. The index records exact raw
 entry bytes, source identity, ordinal order, and cumulative queue accounting.
 A single recursive SQLite cursor performs a depth-first traversal through
 primary-key lookups. It does not read object BLOBs and has no outer sort.
+
+Schema v12 gives each loose or packed tree source one integer `source_key`.
+Entries use `(source_key, ordinal)` as their primary key, and the effective
+`(repo_id, tree_oid)` row points to that exact source through a matching
+composite foreign key. An explicit incomplete source marker preserves
+fail-closed loose-over-pack shadowing before parsing succeeds. `name_bytes` is
+the canonical BINARY lookup and ordering value; bounded readers derive the TEXT
+name. `raw_entry` remains an independent cross-field corruption witness.
 
 The cursor accounts for every live queued row. Completed sibling state is
 reclaimed. A directory is expanded only when the exact conservative suffix plus
@@ -386,6 +407,16 @@ SQL cursors must be truly iterable; traversal never falls back to materializing
 Every SQL row is untrusted. Numeric, text, BLOB, source, size, revision, ordinal,
 and cumulative fields are validated before use. Derived tree and commit rows are
 validated against an authoritative loose object or complete packed source.
+Cheap affinity, shape, range, and enum checks also reject malformed projection
+writes, but they do not replace read-time source authentication.
+
+Schema v12 migration rebuilds commit and tree projections from authoritative
+loose objects and complete packs; it never copies legacy derived rows. Missing
+or malformed authoritative storage fails with `ECORRUPT`, and a migration that
+cannot complete within 999 executed statements fails with `E2BIG`. The rebuild
+runs in one `transactionSync()` and records v12 only after every source has
+validated, so failure leaves the v11 shape and data intact. Retained migration
+state also remains below the operation-wide 100 MiB ceiling.
 
 ## Resource limits and open performance work
 

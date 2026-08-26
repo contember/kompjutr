@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Storage contracts and derived-table hardening](sprint-2026-08-26-storage-contracts.md)
+  — bounded opaque content identities, narrow source-surrogate tree storage,
+  guarded derived writes, and authoritative schema-v12 reconstruction.
 - [Status and rename correctness](sprint-2026-08-25-status-and-rename-correctness.md)
   — truthful unmerged status, native status options and branch metadata, and
   bounded exact rename detection.

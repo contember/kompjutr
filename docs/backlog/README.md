@@ -51,31 +51,27 @@ This is the default priority at the current HEAD, not scheduling state. Items in
 the same phase may run in parallel, but a blocked item must not move ahead of its
 blocker. Re-evaluate the order after each phase as production evidence arrives.
 
-1. **Settle storage contracts before data volume grows:**
-   [20](20-blob-id-mapping-role-and-growth.md),
-   [21](21-narrow-parsed-tree-keys.md), and
-   [23](23-write-time-checks-on-derived-tables.md).
-2. **Build recovery before destructive maintenance:**
+1. **Build recovery before destructive maintenance:**
    [12](12-reflogs-and-ref-recovery.md), then
    [33](33-branch-delete-merged-check.md) and
    [04](04-repack-and-garbage-collection.md). Reflogs are the retention and
    recovery prerequisite for both follow-ups.
-3. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
+2. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
    [11](11-production-do-regression-probe.md), and
    [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
    work unit; the production probe is now unblocked by the verified CI/release
    seam.
-4. **Add the highest-return daily workflows:**
+3. **Add the highest-return daily workflows:**
    [38](38-clone-depth-and-deepening.md), [28](28-pull-rebase.md),
    [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
    [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
    [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
-5. **Broaden management and diagnostic surfaces:**
+4. **Broaden management and diagnostic surfaces:**
    [18](18-branch-and-remote-management.md),
    [08](08-extend-push-refspecs.md), [25](25-rebase-targets-and-roots.md),
    [39](39-plumbing-read-surface.md), and
    [17](17-integrity-audit-and-snapshots.md).
-6. **Defer until a concrete workload justifies them:**
+5. **Defer until a concrete workload justifies them:**
    [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
    [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md). Item 29 also
    remains blocked by 12.
@@ -98,9 +94,6 @@ focused sprint.
 - [16 — Verify concurrent and interrupted operations](16-concurrent-and-restart-conformance.md)
 - [17 — Add repository integrity audit and snapshots](17-integrity-audit-and-snapshots.md)
 - [18 — Complete branch and remote management](18-branch-and-remote-management.md)
-- [20 — Settle the role of `git_blob_ids` and bound its growth](20-blob-id-mapping-role-and-growth.md)
-- [21 — Narrow the parsed-tree table keys and remove the duplicated entry name](21-narrow-parsed-tree-keys.md)
-- [23 — Add write-time CHECK constraints to the derived commit and tree tables](23-write-time-checks-on-derived-tables.md)
 - [25 — Add explicit rebase targets and roots](25-rebase-targets-and-roots.md)
 - [26 — Add programmable interactive rebase](26-interactive-rebase.md)
 - [27 — Replay merge topology during rebase](27-rebase-merges.md)

@@ -19,3 +19,5 @@ a commit message suffices.
 - [0003 — Port xdiff for text merge](0003-port-xdiff-text-merge.md) — accepted (2026-08-24)
 - [0004 — Enforce SQLite foreign keys at the Git store boundary](0004-foreign-key-enforcement.md) — accepted (2026-08-25)
 - [0005 — Keep persisted OIDs as hexadecimal text](0005-keep-oid-columns-as-text.md) — accepted (2026-08-25)
+- [0006 — Keep content identities opaque and bound the Git blob cache](0006-keep-content-identities-opaque-and-bound-the-cache.md) — accepted (2026-08-26)
+- [0007 — Key parsed trees by source surrogate](0007-key-parsed-trees-by-source-surrogate.md) — accepted (2026-08-26)
