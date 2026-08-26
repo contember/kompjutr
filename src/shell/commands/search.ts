@@ -110,7 +110,15 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
         try {
           const bytes = fs.readFile(root);
           // Named on the command line: searched whatever it holds.
-          yield* emit(root, bytes, request, request.withFilename ?? several, noteMatch, "report");
+          yield* emit(
+            root,
+            bytes,
+            request,
+            request.withFilename ?? several,
+            noteMatch,
+            "report",
+            fs.retained,
+          );
         } finally {
           release();
         }
@@ -140,6 +148,7 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
           request.withFilename ?? true,
           noteMatch,
           request.walkedBinaries,
+          fs.retained,
         );
       }
     }
@@ -348,6 +357,7 @@ function* emit(
   withFilename: boolean,
   noteMatch: () => void,
   binary: "report" | "skip",
+  retained: BoundedFs["retained"],
 ): Generator<Uint8Array, void, undefined> {
   // Only the line-printing mode substitutes a notice for the content. Both
   // real greps count and list a binary file exactly as they would a text
@@ -357,7 +367,7 @@ function* emit(
     const nul = firstNul(bytes);
     if (nul >= 0) {
       if (binary === "skip") return;
-      if (!matchesAnywhere(bytes, request)) return;
+      if (!matchesAnywhere(bytes, request, retained)) return;
       noteMatch();
       const notice = request.reportBinary(path, nul, withFilename);
       if (notice !== null) yield notice;
@@ -366,7 +376,7 @@ function* emit(
   }
 
   if (request.mode === "files" || request.mode === "files-without-match") {
-    const hit = matchesAnywhere(bytes, request);
+    const hit = matchesAnywhere(bytes, request, retained);
     // `-L` still exits 0 when the pattern was found: it changes which files
     // are named, not what counts as a match.
     if (hit) noteMatch();
@@ -378,7 +388,7 @@ function* emit(
   const hits = new Set<number>();
   for (let index = 0; index < all.length; index++) {
     const text = all[index];
-    if (text !== undefined && test(text, request)) hits.add(index);
+    if (text !== undefined && test(text, request, retained)) hits.add(index);
   }
 
   if (hits.size > 0) noteMatch();
@@ -432,17 +442,26 @@ function render(
   return out;
 }
 
-function matchesAnywhere(bytes: Uint8Array, request: SearchRequest): boolean {
+function matchesAnywhere(
+  bytes: Uint8Array,
+  request: SearchRequest,
+  retained: BoundedFs["retained"],
+): boolean {
   for (const text of lines(chunk(bytes))) {
-    if (test(text, request)) return true;
+    if (test(text, request, retained)) return true;
   }
   return false;
 }
 
-function test(text: Uint8Array, request: SearchRequest): boolean {
-  request.pattern.lastIndex = 0;
-  const hit = request.pattern.test(decode(text));
-  return request.invert ? !hit : hit;
+function test(text: Uint8Array, request: SearchRequest, retained: BoundedFs["retained"]): boolean {
+  const release = retained.retain(text.length * 2, "search decoded line");
+  try {
+    request.pattern.lastIndex = 0;
+    const hit = request.pattern.test(decode(text));
+    return request.invert ? !hit : hit;
+  } finally {
+    release();
+  }
 }
 
 function* chunk(bytes: Uint8Array): ByteStream {

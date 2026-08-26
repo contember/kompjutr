@@ -33,13 +33,16 @@ plan and performed by the executor.
   `maxOperations` (default 10,000). Do not hand a command the raw `Filesystem` —
   the set of things a command can do to the database stays visible in one file.
 - **Bounds are the executor's job, not the caller's discipline.** An agent that
-  forgets `| head` must still get a bounded result. Defaults: 1 MB stdout,
-  10,000 operations, 1.5 MB read budget per statement.
+  forgets `| head` must still get a bounded result. Defaults: 1 MB each for
+  stdout and stderr, 10,000 operations, 1.5 MB per read statement, and 16 MiB
+  of live shell-owned intermediate bytes. Reserve before retaining and release
+  when ownership ends; semantic input fails rather than truncates.
 - **`operations` in `RunResult` is the metric that matters.** A change that
   makes output prettier and raises the operation count is a regression.
-- **A trailing `head -N` is a demand hint, not a stage.** Sources seed at
-  `2 * limitHint`; a fixed page costs a second round trip once match density
-  drops below 2/3. Do not change the seeding factor without re-measuring.
+- **A trailing `head -N` publishes a demand hint and remains a stage.** Paged
+  listings size their first page from it; searches use fixed full pages after
+  measurement showed that sparse matches make small discovery pages costlier.
+  Do not change either policy without re-measuring.
 - **`grep` and `rg` are the real flags and the real output.** Their behaviour is
   not a matter of opinion — it is pinned by differential tests against the
   installed binaries. See `tests/CLAUDE.md`.

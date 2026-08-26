@@ -40,9 +40,11 @@ export interface ExecResult {
   readonly exitCode: number;
   /** The working directory after the run — `cd` is a builtin. */
   readonly cwd: string;
-  /** True when `maxOutputBytes` stopped the output early. */
+  /** True when `maxOutputBytes` stopped stdout or stderr early. */
   readonly truncated: boolean;
   readonly operations: number;
+  /** Peak shell-owned intermediate bytes, excluding public stdout and stderr. */
+  readonly peakRetainedBytes: number;
 }
 
 export function execute(plan: Plan, options: ExecOptions): ExecResult {
@@ -90,6 +92,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
     cwd,
     truncated: out.truncated || errors.truncated,
     operations: fs.operations,
+    peakRetainedBytes: fs.retained.peak,
   };
 }
 

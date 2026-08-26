@@ -49,8 +49,14 @@ export function searchStream(
     try {
       for (const text of lines(stdin, retained)) {
         number++;
-        options.pattern.lastIndex = 0;
-        const hit = options.pattern.test(decode(text)) !== options.invert;
+        const releaseDecoded = retained.retain(text.length * 2, "search decoded line");
+        let hit: boolean;
+        try {
+          options.pattern.lastIndex = 0;
+          hit = options.pattern.test(decode(text)) !== options.invert;
+        } finally {
+          releaseDecoded();
+        }
 
         if (hit) {
           matched = true;

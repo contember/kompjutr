@@ -262,10 +262,15 @@ function* applySubstitution(
     : substitution.pattern.flags.replace("g", "");
   const pattern = new RegExp(substitution.pattern.source, flags);
   for (const text of lines(source, retained)) {
-    const value = decode(text);
-    const replaced = value.replace(pattern, substitution.replacement);
-    if (quiet && replaced === value) continue;
-    yield encode(`${replaced}\n`);
+    const release = retained.retain(text.length * 2, "sed decoded line");
+    try {
+      const value = decode(text);
+      const replaced = value.replace(pattern, substitution.replacement);
+      if (quiet && replaced === value) continue;
+      yield encode(`${replaced}\n`);
+    } finally {
+      release();
+    }
   }
 }
 
@@ -280,10 +285,16 @@ function* printRange(
   for (const text of lines(source, retained)) {
     number++;
     const inRange = number >= from && number <= to;
-    // Without `-n`, sed prints every line and duplicates the range.
-    if (!quiet) yield encode(`${decode(text)}\n`);
-    if (inRange && quiet) yield encode(`${decode(text)}\n`);
-    if (number > to && quiet) return;
+    const release = retained.retain(text.length * 2, "sed decoded line");
+    try {
+      const output = encode(`${decode(text)}\n`);
+      // Without `-n`, sed prints every line and duplicates the selected range.
+      if (!quiet) yield output;
+      if (inRange) yield output;
+      if (number > to && quiet) return;
+    } finally {
+      release();
+    }
   }
 }
 

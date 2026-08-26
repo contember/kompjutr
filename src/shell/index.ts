@@ -33,10 +33,12 @@ export interface RunResult {
   readonly stderr: string;
   readonly exitCode: number;
   readonly cwd: string;
-  /** True when the output ceiling stopped the result early. */
+  /** True when the stdout or stderr ceiling stopped the result early. */
   readonly truncated: boolean;
   /** Filesystem operations the run cost. The metric that matters. */
   readonly operations: number;
+  /** Peak shell-owned intermediate bytes, excluding public stdout and stderr. */
+  readonly peakRetainedBytes: number;
 }
 
 export interface Shell {
@@ -74,6 +76,7 @@ export function createShell(options: ShellOptions): Shell {
           cwd: before,
           truncated: stderr.length < message.length,
           operations: 0,
+          peakRetainedBytes: 0,
         };
       }
       throw error;
@@ -100,6 +103,7 @@ export function createShell(options: ShellOptions): Shell {
         cwd: outcome.cwd,
         truncated: outcome.truncated,
         operations: outcome.operations,
+        peakRetainedBytes: outcome.peakRetainedBytes,
       };
     },
     cwd: () => session.cwd(),

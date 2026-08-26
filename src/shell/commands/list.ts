@@ -1,7 +1,5 @@
-// `ls`, `find`, `stat`.
-//
-// `find -name` is `fs.glob` — one indexed statement — and `ls` is one
-// `readdir`. Neither walks anything in JS.
+// `ls`, `find`, `stat`. Long/recursive listings and indexed find stream
+// keyset pages; bare `ls` keeps the cheaper direct-directory shape.
 
 import { basename, normalize } from "../../fs/path.js";
 import type { ListCursor, Stat } from "../../fs/types.js";

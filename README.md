@@ -120,21 +120,24 @@ options, SSH, and outbound Git deltas are not implemented yet.
 ## Shell
 
 `kompjutr/shell` is a bash-shaped command surface over `Filesystem`, in which a
-command compiles to a bounded query rather than a tree walk: `find -name` is one
-`glob`, `grep -rl` on a literal is one indexed content search, `ls` is one
-`readdir`. It is a separate entry point, not part of `Workspace`.
+command compiles to bounded, keyset-paged queries rather than per-path tree
+walks. Literal recursive search uses indexed content discovery; long and
+recursive listings, path expansion, copy, and touch use set-based filesystem
+operations. It is a separate entry point, not part of `Workspace`.
 
 ```ts
 import { createShell } from "kompjutr/shell";
 
 const shell = createShell({ fs: workspace.filesystem });
-const { stdout, operations } = shell.run("grep -rl createShell /src");
+const { stdout, operations, peakRetainedBytes } = shell.run("grep -rl createShell /src");
 ```
 
-Output bytes and filesystem operations are bounded by the executor, so a command
-without `| head` still returns a bounded result. `git` is not a built-in; a
-consumer injects it through `commands`. See [the shell reference](docs/reference/shell.md) for
-the command set and the deliberate divergences from bash.
+Stdout, stderr, filesystem operations, and live intermediate bytes are bounded
+by the executor, so a command without `| head` still returns a bounded result.
+File redirects stream atomically and roll back on an upstream failure. `git` is
+not a built-in; a consumer injects it through `commands`. See
+[the shell reference](docs/reference/shell.md) for the exact command set,
+limits, and deliberate divergences from Bash.
 
 ## Compatibility
 

@@ -332,7 +332,7 @@ describe("retained-memory bounds", () => {
         maxOutputBytes: 100,
         maxOperations: 100,
         readBudget: 16,
-        maxRetainedBytes: 13,
+        maxRetainedBytes: 25,
       },
     });
 

@@ -16,11 +16,13 @@ import.ts       bulk import of an external tree
 ## The bulk API is the product
 
 Single-path calls exist for compatibility. The reason this layer was written is
-`scan`, `glob`, `discoverFiles`, `discoverFilesContaining`, `readFileHandles`,
-and `writeFiles` — each **one indexed range scan on the `fs_paths` primary key
-per page**, no recursion, no CTE, no traversal. A checkout of 9,329 files costs
-~420,000 statements through a per-path API and a constant handful through this
-one.
+`scan`, `globPage`, `listEntries`, `discoverFiles`,
+`discoverFilesContaining`, `readFileHandles`, `readFiles`, `writeFiles`,
+`copyFiles`, and `touchFiles`. Reads and discovery use indexed, bounded pages;
+copy keeps content inside SQLite; touch changes metadata without reading file
+bodies. `writeFileStream` is the atomic bounded sink for a chunk producer. A
+checkout of 9,329 files costs ~420,000 statements through a per-path API and a
+constant handful through this one.
 
 When you add a capability, add it as a bulk, paged, budgeted operation. A
 convenience wrapper that loops over a single-path call is a regression, however

@@ -390,6 +390,9 @@ describe("sed ships two forms", () => {
 
   it("prints a line range", () => {
     expect(shell.run("sed -n 2,3p docs/guide.md").stdout).toBe("line2\nline3\n");
+    expect(shell.run("sed 2p docs/guide.md").stdout).toBe(
+      "line1\nline2\nline2\nline3\nline4\nline5\n",
+    );
   });
 
   it("points at the container for anything else", () => {

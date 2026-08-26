@@ -70,6 +70,7 @@ export class ShellLimitError extends Error {
 /** Tracks live intermediate bytes. Callers release reservations as buffers leave scope. */
 export class RetainedBudget {
   #held = 0;
+  #peak = 0;
 
   constructor(readonly max: number) {
     if (!Number.isSafeInteger(max) || max < 1) {
@@ -79,6 +80,10 @@ export class RetainedBudget {
 
   get available(): number {
     return this.max - this.#held;
+  }
+
+  get peak(): number {
+    return this.#peak;
   }
 
   retain(bytes: number, label: string): () => void {
@@ -92,6 +97,7 @@ export class RetainedBudget {
       );
     }
     this.#held += bytes;
+    this.#peak = Math.max(this.#peak, this.#held);
     let released = false;
     return () => {
       if (released) return;
