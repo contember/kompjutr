@@ -82,6 +82,33 @@ export interface GlobPage {
   next: string | null;
 }
 
+export interface ListCursor {
+  directory: string;
+  /** Null is the synthetic row for an empty directory. */
+  path: string | null;
+}
+
+export interface ListOptions {
+  after?: ListCursor;
+  /** Defaults to 1,000 and cannot exceed 1,000. */
+  limit?: number;
+  /** Include every descendant directory group. Default false. */
+  recursive?: boolean;
+}
+
+export interface ListItem {
+  /** The directory whose output group this row belongs to. */
+  directory: string;
+  /** Null proves the directory exists but has no children. */
+  entry: ScanEntry | null;
+}
+
+export interface ListPage {
+  items: ListItem[];
+  /** Re-call with this cursor. `null` proves this was the final page. */
+  next: ListCursor | null;
+}
+
 /** A regular file proven to have contiguous content at discovery time. */
 export interface RegularFileHandle {
   /** Absolute, canonical, real path. */
@@ -264,6 +291,9 @@ export interface Filesystem {
 
   /** A completeness-bearing, keyset-paged glob for bounded consumers. */
   globPage(root: string, pattern: string, options?: GlobOptions): GlobPage;
+
+  /** Metadata-bearing directory groups for long and recursive listings. */
+  listEntries(root: string, options?: ListOptions): ListPage;
 
   // -- bulk writes ---------------------------------------------------
 

@@ -10,6 +10,7 @@ import {
   discoverFiles,
   glob as scanGlob,
   globPage as scanGlobPage,
+  listEntries as scanListEntries,
   scan as scanPage,
 } from "./store/scan.js";
 import { discoverFilesContaining } from "./store/search.js";
@@ -24,6 +25,8 @@ import type {
   FilesystemOptions,
   GlobOptions,
   GlobPage,
+  ListOptions,
+  ListPage,
   ReadBatch,
   RemoveOptions,
   ScanEntry,
@@ -41,9 +44,11 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
   const ops = createFilesystemOps(db, { now });
   const scanRoots = new Map<string, ReturnType<typeof realpath>>();
   const globRoots = new Map<string, ReturnType<typeof realpath>>();
+  const listRoots = new Map<string, ReturnType<typeof realpath>>();
   const mutated = (): void => {
     scanRoots.clear();
     globRoots.clear();
+    listRoots.clear();
   };
 
   const readFiles = (paths: readonly string[], readOptions?: { budget?: number }): ReadBatch => {
@@ -121,6 +126,14 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
       const page = scanGlobPage(db, resolved, pattern, globOptions);
       if (page.next === null) globRoots.delete(root);
       else globRoots.set(root, resolved);
+      return page;
+    },
+    listEntries(root: string, listOptions: ListOptions = {}): ListPage {
+      let resolved = listRoots.get(root);
+      if (resolved === undefined || listOptions.after === undefined) resolved = realpath(db, root);
+      const page = scanListEntries(db, resolved, listOptions);
+      if (page.next === null) listRoots.delete(root);
+      else listRoots.set(root, resolved);
       return page;
     },
     writeFiles(entries: readonly WriteEntry[], writeOptions?: WriteOptions): void {

@@ -16,6 +16,8 @@ import type {
   GlobOptions,
   GlobPage,
   HandleReadBatch,
+  ListOptions,
+  ListPage,
   ReadBatch,
   RealPath,
   RegularFileHandle,
@@ -162,6 +164,11 @@ export class BoundedFs {
   globPage(root: string, pattern: string, options?: GlobOptions): GlobPage {
     this.#charge();
     return this.fs.globPage(root, pattern, options);
+  }
+
+  listEntries(root: string, options?: ListOptions): ListPage {
+    this.#charge();
+    return this.fs.listEntries(root, options);
   }
 
   writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {

@@ -13,10 +13,12 @@ import { comparePaths, subtreeSuccessor } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
 import { realpath } from "../../src/fs/store/resolve.js";
-import { discoverFiles, glob, globPage, scan } from "../../src/fs/store/scan.js";
+import { discoverFiles, glob, globPage, listEntries, scan } from "../../src/fs/store/scan.js";
 import { writeFiles } from "../../src/fs/store/write.js";
 import {
   type EntryType,
+  type ListCursor,
+  type ListItem,
   type RealPath,
   S_IFDIR,
   S_IFLNK,
@@ -627,6 +629,48 @@ describe("glob", () => {
     expect(() => glob(BIG.db, BIG.root, "a".repeat(51))).toThrow(/51 bytes/);
     // 17 characters, 51 bytes — the cap counts bytes.
     expect(() => glob(BIG.db, BIG.root, "日".repeat(17))).toThrow(/51 bytes/);
+  });
+});
+
+describe("listEntries", () => {
+  it("groups recursive metadata and represents empty directories", () => {
+    const db = open();
+    writeFiles(db, [
+      { path: "/repo/a/one.txt", bytes: new Uint8Array([1]), mode: 0o600 },
+      { path: "/repo/b/two.txt", bytes: new Uint8Array([2]), mode: 0o640 },
+      { path: "/repo/empty" },
+    ]);
+    const root = realpath(db, "/repo");
+    const items: ListItem[] = [];
+    let after: ListCursor | undefined;
+    for (;;) {
+      const page = listEntries(
+        db,
+        root,
+        after === undefined ? { recursive: true, limit: 2 } : { recursive: true, after, limit: 2 },
+      );
+      items.push(...page.items);
+      if (page.next === null) break;
+      after = page.next;
+    }
+
+    expect(items.map((item) => [item.directory, item.entry?.path ?? null])).toEqual([
+      ["/repo", "/repo/a"],
+      ["/repo", "/repo/b"],
+      ["/repo", "/repo/empty"],
+      ["/repo/a", "/repo/a/one.txt"],
+      ["/repo/b", "/repo/b/two.txt"],
+      ["/repo/empty", null],
+    ]);
+    expect(items[3]?.entry).toMatchObject({ type: "file", mode: S_IFREG | 0o600, size: 1 });
+  });
+
+  it("returns one bounded statement per page", () => {
+    BIG.db.storage.resetCounters();
+    const page = listEntries(BIG.db, BIG.root, { recursive: true, limit: 10 });
+    expect(page.items).toHaveLength(10);
+    expect(page.next).not.toBeNull();
+    expect(BIG.db.storage.statementCount).toBe(1);
   });
 });
 

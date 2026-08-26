@@ -91,6 +91,28 @@ describe("listing", () => {
       "/repo/src/nested/delta.ts",
     ]);
   });
+
+  it("renders long listings from bulk metadata", () => {
+    const run = shell.run("ls -l src");
+    expect(run.stdout).toContain("alpha.ts");
+    expect(run.stdout).toContain("nested");
+    expect(run.operations).toBeLessThanOrEqual(2);
+  });
+
+  it("renders recursive groups including an empty directory", () => {
+    fs.mkdir("/repo/src/empty");
+    expect(shell.run("ls -R src").stdout).toBe(
+      "/repo/src:\nalpha.ts\nbeta.ts\nempty\ngamma.js\nnested\n\n" +
+        "/repo/src/empty:\n\n/repo/src/nested:\ndelta.ts\n",
+    );
+  });
+
+  it("prunes hidden recursive groups unless requested", () => {
+    const hidden = shell.run("ls -R /repo").stdout;
+    expect(hidden).not.toContain(".hidden");
+    expect(hidden).not.toContain("secret.ts");
+    expect(shell.run("ls -Ra /repo").stdout).toContain("/repo/.hidden:\nsecret.ts\n");
+  });
 });
 
 describe("grep", () => {

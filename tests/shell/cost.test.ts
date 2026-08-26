@@ -192,8 +192,29 @@ describe("paged find", () => {
     const bounded = fixture.shell.run("find /repo/src -name '*.ts' | head -5");
     const unbounded = fixture.shell.run("find /repo/src -name '*.ts'");
 
-    expect(bounded.stdout.split("\n").filter(Boolean)).toHaveLength(5);
+    expect(bounded.stdout.split("\n").slice(0, -1)).toHaveLength(5);
     expect(unbounded.stdout.split("\n").filter(Boolean)).toHaveLength(2_000);
+    expect(bounded.operations).toBeLessThan(unbounded.operations);
+  });
+});
+
+describe("set-based listing", () => {
+  it("scales long listing by pages rather than paths", () => {
+    const small = tree(200).shell.run("ls -l /repo/src");
+    const large = tree(2_000).shell.run("ls -l /repo/src");
+
+    expect(small.stdout.split("\n").filter(Boolean)).toHaveLength(200);
+    expect(large.stdout.split("\n").filter(Boolean)).toHaveLength(2_000);
+    expect(small.operations).toBe(2);
+    expect(large.operations).toBe(3);
+  });
+
+  it("lets head stop recursive listing pages", () => {
+    const fixture = tree(2_000);
+    const bounded = fixture.shell.run("ls -R /repo | head -5");
+    const unbounded = fixture.shell.run("ls -R /repo");
+
+    expect(bounded.stdout.split("\n").slice(0, -1)).toHaveLength(5);
     expect(bounded.operations).toBeLessThan(unbounded.operations);
   });
 });

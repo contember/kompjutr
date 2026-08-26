@@ -8,7 +8,7 @@
 // nothing.
 
 import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
-import { comparePaths, subtreeSuccessor } from "../path.js";
+import { comparePaths, dirname, normalize, subtreeSuccessor } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import {
   type DiscoverFilesOptions,
@@ -16,6 +16,9 @@ import {
   type EntryType,
   type GlobOptions,
   type GlobPage,
+  type ListItem,
+  type ListOptions,
+  type ListPage,
   type RealPath,
   type RegularFileHandle,
   S_IFDIR,
@@ -84,6 +87,41 @@ const GLOB_SQL = `SELECT fs_paths.path AS path
  ORDER BY fs_paths.path
  LIMIT ?`;
 
+const LIST_SELECT = `SELECT groups.directory AS directory,
+       fs_paths.path AS path,
+       fs_paths.inode AS inode,
+       fs_nodes.type AS type,
+       fs_nodes.mode AS mode,
+       fs_nodes.mtime AS mtime,
+       fs_nodes.size AS size,
+       fs_nodes.rev AS rev,
+       fs_nodes.nlink AS nlink,
+       fs_nodes.link_target AS link_target,
+       fs_nodes.content_id AS content_id
+  FROM groups
+  LEFT JOIN fs_paths ON fs_paths.parent = groups.directory
+  LEFT JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode`;
+
+const LIST_AFTER = ` WHERE (groups.directory > ?
+          OR (groups.directory = ? AND coalesce(fs_paths.path, '') > ?))
+ ORDER BY groups.directory, fs_paths.path
+ LIMIT ?`;
+
+const LIST_DIRECTORY_SQL = `WITH groups(directory) AS (VALUES (?))
+${LIST_SELECT}
+${LIST_AFTER}`;
+
+const LIST_RECURSIVE_SQL = `WITH groups(directory) AS (
+       SELECT ?
+       UNION ALL
+       SELECT fs_paths.path
+         FROM fs_paths
+         JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode
+        WHERE fs_paths.path > ? AND fs_paths.path < ? AND fs_nodes.type = 'dir'
+     )
+${LIST_SELECT}
+${LIST_AFTER}`;
+
 const DISCOVER_FILES_SQL = `WITH candidates AS MATERIALIZED (
        SELECT fs_paths.path AS path,
               fs_paths.inode AS inode,
@@ -151,6 +189,20 @@ interface FileHandleRow {
   invalid_chunk_sizes: number;
 }
 
+interface ListRow {
+  directory: unknown;
+  path: unknown;
+  inode: unknown;
+  type: unknown;
+  mode: unknown;
+  mtime: unknown;
+  size: unknown;
+  rev: unknown;
+  nlink: unknown;
+  link_target: unknown;
+  content_id: unknown;
+}
+
 /** The CHECK constraint guarantees this; the throw keeps the type honest. */
 function entryType(value: string): EntryType {
   if (value === "file" || value === "dir" || value === "symlink") return value;
@@ -171,6 +223,68 @@ function toEntry(row: ScanRow): ScanEntry {
     rev: row.rev,
     target: row.link_target,
     contentId: row.content_id === null ? null : readBlob(row.content_id),
+  };
+}
+
+function safeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+function toListItem(row: ListRow): ListItem {
+  if (typeof row.directory !== "string" || normalize(row.directory) !== row.directory) {
+    throw new Error("listEntries: directory is not an absolute canonical path");
+  }
+  if (row.path === null) {
+    if (
+      row.inode !== null ||
+      row.type !== null ||
+      row.mode !== null ||
+      row.mtime !== null ||
+      row.size !== null ||
+      row.rev !== null ||
+      row.nlink !== null ||
+      row.link_target !== null ||
+      row.content_id !== null
+    ) {
+      throw new Error("listEntries: empty directory row carries entry metadata");
+    }
+    return { directory: row.directory, entry: null };
+  }
+  if (
+    typeof row.path !== "string" ||
+    normalize(row.path) !== row.path ||
+    dirname(row.path) !== row.directory ||
+    !safeInteger(row.inode) ||
+    row.inode < 1 ||
+    typeof row.type !== "string" ||
+    !safeInteger(row.mode) ||
+    row.mode < 0 ||
+    !safeInteger(row.mtime) ||
+    !safeInteger(row.size) ||
+    row.size < 0 ||
+    !safeInteger(row.rev) ||
+    row.rev < 0 ||
+    !safeInteger(row.nlink) ||
+    row.nlink < 1 ||
+    (row.link_target !== null && typeof row.link_target !== "string")
+  ) {
+    throw new Error("listEntries: row contains invalid metadata");
+  }
+  const type = entryType(row.type);
+  return {
+    directory: row.directory,
+    entry: {
+      path: row.path,
+      ino: row.inode,
+      type,
+      mode: TYPE_BITS[type] | (row.mode & PERMISSION_BITS),
+      size: row.size,
+      mtime: row.mtime,
+      nlink: row.nlink,
+      rev: row.rev,
+      target: row.link_target,
+      contentId: row.content_id === null ? null : readBlob(row.content_id),
+    },
   };
 }
 
@@ -346,5 +460,50 @@ export function globPage(
   return {
     paths,
     next: found.length > limit ? (paths[paths.length - 1] ?? null) : null,
+  };
+}
+
+/** Page directory groups with metadata, including one null row for an empty group. */
+export function listEntries(db: SqlDatabase, root: RealPath, options: ListOptions = {}): ListPage {
+  const limit = options.limit ?? DISCOVERY_PAGE_MAX;
+  if (!Number.isInteger(limit) || limit < 1 || limit > DISCOVERY_PAGE_MAX) {
+    throw new Error(
+      `listEntries: limit must be an integer from 1 to ${DISCOVERY_PAGE_MAX}, got ${limit}`,
+    );
+  }
+  const afterDirectory = options.after?.directory ?? "";
+  const afterPath = options.after?.path ?? "";
+  const rows =
+    options.recursive === true
+      ? (() => {
+          const { lower, upper } = subtreeBounds(root);
+          return db.all<ListRow>(
+            LIST_RECURSIVE_SQL,
+            root,
+            lower,
+            upper,
+            afterDirectory,
+            afterDirectory,
+            afterPath,
+            limit + 1,
+          );
+        })()
+      : db.all<ListRow>(
+          LIST_DIRECTORY_SQL,
+          root,
+          afterDirectory,
+          afterDirectory,
+          afterPath,
+          limit + 1,
+        );
+  const found = rows.map(toListItem);
+  const items = found.slice(0, limit);
+  const last = items[items.length - 1];
+  return {
+    items,
+    next:
+      found.length > limit && last !== undefined
+        ? { directory: last.directory, path: last.entry?.path ?? null }
+        : null,
   };
 }

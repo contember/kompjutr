@@ -4,7 +4,7 @@
 // `readdir`. Neither walks anything in JS.
 
 import { basename, normalize } from "../../fs/path.js";
-import type { Stat } from "../../fs/types.js";
+import type { ListCursor, Stat } from "../../fs/types.js";
 import { type ByteStream, encode } from "../exec/bytes.js";
 import { type Command, type CommandContext, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
@@ -39,12 +39,19 @@ export const ls: Command = (context) => {
           yield row(basename(path), stat, long);
           continue;
         }
-        if (many || recursive) {
+        if (recursive) {
+          if (!first) yield encode("\n");
+          yield* listRecursive(context, path, { long, all });
+          first = false;
+          continue;
+        }
+        if (many) {
           if (!first) yield encode("\n");
           yield encode(`${path}:\n`);
         }
         first = false;
-        yield* listDirectory(context, path, { long, all, recursive });
+        if (long) yield* listLongDirectory(context, path, all);
+        else yield* listBareDirectory(context, path, all);
       }
     })();
 
@@ -55,28 +62,69 @@ export const ls: Command = (context) => {
   }
 };
 
-function* listDirectory(
-  context: CommandContext,
-  path: string,
-  options: { long: boolean; all: boolean; recursive: boolean },
-): ByteStream {
+function* listBareDirectory(context: CommandContext, path: string, all: boolean): ByteStream {
   const entries = context.fs.readdir(path);
-  const visible = options.all ? entries : entries.filter((entry) => !entry.name.startsWith("."));
-
-  for (const entry of visible) {
-    const child = `${path === "/" ? "" : path}/${entry.name}`;
-    // `-l` needs the metadata; a bare listing must not pay for it.
-    const stat = options.long ? context.fs.stat(child) : null;
-    yield row(entry.name, stat, options.long);
+  for (const entry of entries) {
+    if (!all && entry.name.startsWith(".")) continue;
+    yield row(entry.name, null, false);
   }
+}
 
-  if (!options.recursive) return;
-  for (const entry of visible) {
-    if (entry.type !== "dir") continue;
-    const child = `${path === "/" ? "" : path}/${entry.name}`;
-    yield encode(`\n${child}:\n`);
-    yield* listDirectory(context, child, options);
+function* listLongDirectory(context: CommandContext, path: string, all: boolean): ByteStream {
+  let after: ListCursor | undefined;
+  const limit = listingPageSize(context);
+  for (;;) {
+    const page = context.fs.listEntries(path, after === undefined ? { limit } : { after, limit });
+    for (const item of page.items) {
+      const entry = item.entry;
+      if (entry === null) continue;
+      const name = basename(entry.path);
+      if (!all && name.startsWith(".")) continue;
+      yield row(name, entry, true);
+    }
+    if (page.next === null) return;
+    after = page.next;
   }
+}
+
+function* listRecursive(
+  context: CommandContext,
+  root: string,
+  options: { long: boolean; all: boolean },
+): ByteStream {
+  let after: ListCursor | undefined;
+  let current: string | null = null;
+  const limit = listingPageSize(context);
+  for (;;) {
+    const page = context.fs.listEntries(
+      root,
+      after === undefined ? { recursive: true, limit } : { recursive: true, after, limit },
+    );
+    for (const item of page.items) {
+      if (!options.all && hiddenBelow(root, item.directory)) continue;
+      if (item.directory !== current) {
+        if (current !== null) yield encode("\n");
+        yield encode(`${item.directory}:\n`);
+        current = item.directory;
+      }
+      const entry = item.entry;
+      if (entry === null) continue;
+      const name = basename(entry.path);
+      if (!options.all && name.startsWith(".")) continue;
+      yield row(name, entry, options.long);
+    }
+    if (page.next === null) return;
+    after = page.next;
+  }
+}
+
+function listingPageSize(context: CommandContext): number {
+  return Math.min(1_000, Math.max(1, (context.limitHint ?? 500) * 2));
+}
+
+function hiddenBelow(root: string, directory: string): boolean {
+  const relative = directory.slice(root === "/" ? 1 : root.length + 1);
+  return relative.split("/").some((segment) => segment.startsWith("."));
 }
 
 function row(name: string, stat: Stat | null, long: boolean): Uint8Array {
