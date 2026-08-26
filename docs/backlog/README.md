@@ -20,7 +20,8 @@ not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
-  [33](33-branch-delete-merged-check.md)
+  [33](33-branch-delete-merged-check.md) ·
+  [45](45-framing-safe-porcelain-output.md)
 - **A — blocks a common workflow, loudly.** The call fails or the capability is
   absent; no data is at risk.
   [35](35-staged-diff.md) ·
@@ -28,6 +29,11 @@ not effort: a wrong answer outranks a missing one.
   [37](37-history-reads-patch-and-paths.md) ·
   [38](38-clone-depth-and-deepening.md) ·
   [39](39-plumbing-read-surface.md) ·
+  [40](40-linked-worktrees.md) ·
+  [41](41-partial-clone.md) ·
+  [42](42-remote-ref-discovery-and-refspec-fetch.md) ·
+  [43](43-index-and-object-write-plumbing.md) ·
+  [44](44-patch-interchange.md) ·
   [06](06-stash-operations.md) ·
   [18](18-branch-and-remote-management.md) ·
   [28](28-pull-rebase.md)
@@ -38,12 +44,17 @@ not effort: a wrong answer outranks a missing one.
   [25](25-rebase-targets-and-roots.md) ·
   [26](26-interactive-rebase.md) ·
   [27](27-rebase-merges.md) ·
-  [29](29-rebase-update-refs.md)
+  [29](29-rebase-update-refs.md) ·
+  [46](46-rev-parse-revision-syntax.md)
 - **C — deliberately out of scope.** Not filed: `bisect`, `blame`, `describe`,
-  `shortlog`, `grep`, `archive`, `bundle`, `am`/`apply`/`format-patch`,
-  submodules, worktrees, notes, hooks, signing, credential helpers, LFS,
-  `.gitattributes` filters, config scopes, `clean -x`, SSH transport. Reopen a
-  case for one only with a concrete workload behind it.
+  `shortlog`, `grep`, `archive`, `bundle`, `am`/`format-patch`, submodules,
+  notes, hooks, signing, credential helpers, LFS, `.gitattributes` filters,
+  config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
+  concrete workload behind it. Worktrees, `apply` and `ls-remote` left this tier
+  that way — see [reference workload
+  coverage](../reference/git-support.md#reference-workload-coverage) — and are
+  now [40](40-linked-worktrees.md), [44](44-patch-interchange.md) and
+  [42](42-remote-ref-discovery-and-refspec-fetch.md).
 
 ## Recommended implementation order
 
@@ -61,23 +72,34 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
    work unit; the production probe is now unblocked by the verified CI/release
    seam.
-3. **Add the highest-return daily workflows:**
-   [38](38-clone-depth-and-deepening.md), [28](28-pull-rebase.md),
+3. **Close the reference-workload gaps.** These come from the only production
+   workload documented end to end
+   ([coverage](../reference/git-support.md#reference-workload-coverage)), so they
+   are evidence rather than guesswork: [45](45-framing-safe-porcelain-output.md)
+   first (it is tier S), then [43](43-index-and-object-write-plumbing.md) and
+   [44](44-patch-interchange.md), then
+   [42](42-remote-ref-discovery-and-refspec-fetch.md) with
+   [08](08-extend-push-refspecs.md) (shared refspec type),
+   [41](41-partial-clone.md) alongside [38](38-clone-depth-and-deepening.md)
+   (both touch the clone contract), and [40](40-linked-worktrees.md) last — it
+   splits the repository row and wants the schema quiet around it.
+4. **Add the highest-return daily workflows:**
+   [28](28-pull-rebase.md),
    [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
    [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
    [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
-4. **Broaden management and diagnostic surfaces:**
+5. **Broaden management and diagnostic surfaces:**
    [18](18-branch-and-remote-management.md),
-   [08](08-extend-push-refspecs.md), [25](25-rebase-targets-and-roots.md),
-   [39](39-plumbing-read-surface.md), and
+   [25](25-rebase-targets-and-roots.md),
+   [39](39-plumbing-read-surface.md), [46](46-rev-parse-revision-syntax.md), and
    [17](17-integrity-audit-and-snapshots.md).
-5. **Defer until a concrete workload justifies them:**
+6. **Defer until a concrete workload justifies them:**
    [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
    [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md). Item 29 also
    remains blocked by 12.
 
-Before scheduling them, split 04, 16, 17, and 39 into smaller work units with
-independent witnesses. Their current acceptance scopes are larger than one
+Before scheduling them, split 04, 16, 17, 39, and 40 into smaller work units
+with independent witnesses. Their current acceptance scopes are larger than one
 focused sprint.
 
 ## Items
@@ -105,3 +127,10 @@ focused sprint.
 - [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)
 - [38 — Align clone depth with Git and allow deepening](38-clone-depth-and-deepening.md)
 - [39 — Complete the plumbing read surface](39-plumbing-read-surface.md)
+- [40 — Support linked worktrees over one repository](40-linked-worktrees.md)
+- [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
+- [42 — Add remote ref discovery and refspec fetch](42-remote-ref-discovery-and-refspec-fetch.md)
+- [43 — Add index and object write plumbing](43-index-and-object-write-plumbing.md)
+- [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
+- [45 — Make porcelain output framing-safe](45-framing-safe-porcelain-output.md)
+- [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
