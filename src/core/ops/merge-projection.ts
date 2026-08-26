@@ -1,6 +1,7 @@
 // Project logical integration conflicts into the physical index/worktree paths Git uses.
 
 import { GitError } from "../errors.js";
+import { MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
 import { comparePaths } from "../streams.js";
 import type { IntegrationEntry, IntegrationPlan } from "./integration.js";
 import type { IntegrationIdentity, IntegrationStages } from "./integration-structure.js";
@@ -123,6 +124,79 @@ function sideStages(
   };
 }
 
+type MaterializableModeClass = "regular" | "symlink";
+
+function materializableModeClass(
+  identity: IntegrationIdentity | null,
+): MaterializableModeClass | null {
+  if (identity === null) return null;
+  if (identity.mode === MODE_FILE || identity.mode === MODE_EXECUTABLE) return "regular";
+  return identity.mode === MODE_SYMLINK ? "symlink" : null;
+}
+
+function stagesForModeClass(
+  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+  modeClass: MaterializableModeClass,
+): IntegrationStages {
+  return {
+    base: materializableModeClass(entry.stages.base) === modeClass ? entry.stages.base : null,
+    current:
+      materializableModeClass(entry.stages.current) === modeClass ? entry.stages.current : null,
+    incoming:
+      materializableModeClass(entry.stages.incoming) === modeClass ? entry.stages.incoming : null,
+  };
+}
+
+function distinctMaterializableSides(
+  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+): { regular: "current" | "incoming"; symlink: "current" | "incoming" } | null {
+  if (entry.conflict !== "add/add" && entry.conflict !== "symlink") return null;
+  const currentClass = materializableModeClass(entry.stages.current);
+  const incomingClass = materializableModeClass(entry.stages.incoming);
+  if (currentClass === "regular" && incomingClass === "symlink") {
+    return { regular: "current", symlink: "incoming" };
+  }
+  if (currentClass === "symlink" && incomingClass === "regular") {
+    return { regular: "incoming", symlink: "current" };
+  }
+  return null;
+}
+
+function projectDistinctMaterializableConflict(
+  entry: Extract<IntegrationEntry, { kind: "conflict" }>,
+  sides: { regular: "current" | "incoming"; symlink: "current" | "incoming" },
+  options: MergeProjectionOptions,
+  reserved: Set<string>,
+  untracked: ReadonlySet<string>,
+): ProjectedMergeEntry[] {
+  const regular = entry.stages[sides.regular];
+  const symlink = entry.stages[sides.symlink];
+  if (regular === null || symlink === null) {
+    throw new GitError("ECORRUPT", `distinct-type conflict ${entry.path} lost one side`);
+  }
+  const label = sides.regular === "current" ? options.currentLabel : options.incomingLabel;
+  return [
+    {
+      path: entry.path,
+      logicalPath: entry.path,
+      purpose: "primary",
+      stageZero: null,
+      stages: stagesForModeClass(entry, "symlink"),
+      worktree: symlink,
+      content: null,
+    },
+    {
+      path: uniqueRelocation(entry.path, label, reserved, untracked),
+      logicalPath: entry.path,
+      purpose: sides.regular === "current" ? "current-relocation" : "incoming-relocation",
+      stageZero: null,
+      stages: stagesForModeClass(entry, "regular"),
+      worktree: regular,
+      content: null,
+    },
+  ];
+}
+
 function descendant(
   entry: Extract<IntegrationEntry, { kind: "conflict" }>,
   directorySide: "current" | "incoming",
@@ -143,7 +217,7 @@ function descendant(
   return ordinary(entry);
 }
 
-/** Relocate each file side of a file/directory conflict and preserve Git's stages. */
+/** Project structural conflicts to Git's collision-safe physical paths. */
 export function projectMergePlan(
   plan: IntegrationPlan,
   options: MergeProjectionOptions,
@@ -155,6 +229,22 @@ export function projectMergePlan(
   let index = 0;
   while (index < plan.entries.length) {
     const entry = plan.entries[index]!;
+    if (entry.kind === "conflict") {
+      const distinctSides = distinctMaterializableSides(entry);
+      if (distinctSides !== null) {
+        projected.push(
+          ...projectDistinctMaterializableConflict(
+            entry,
+            distinctSides,
+            options,
+            reserved,
+            untracked,
+          ),
+        );
+        index++;
+        continue;
+      }
+    }
     if (entry.kind !== "conflict" || entry.conflict !== "file/directory") {
       projected.push(ordinary(entry));
       index++;

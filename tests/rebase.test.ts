@@ -274,6 +274,52 @@ describe("rebase lifecycle", () => {
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
+  it("keeps a cold distinct-type rebase journal until structural abort blockers clear", async () => {
+    const source = fixture();
+    source.write("target.txt", "target\n");
+    const base = source.commit("base");
+    source.git("checkout", "-q", "-b", "upstream", base);
+    source.write("lnk", "upstream file\n");
+    const upstream = source.commit("upstream file");
+    source.git("checkout", "-q", "-b", "current", base);
+    source.symlink("target.txt", "lnk");
+    const original = source.commit("current symlink");
+    const workspace = await imported(source);
+
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+    ).toMatchObject({ outcome: "conflicted", replayed: 0 });
+    expect(workspace.worktree.readlink("/lnk")).toBe("target.txt");
+    expect(textAt(workspace, "lnk~HEAD")).toBe("upstream file\n");
+
+    const cold = reopenRepo(workspace);
+    expect(cold.checkout.requireOperationState("rebase").touched).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "lnk", logicalPath: "lnk", purpose: "primary" }),
+        expect.objectContaining({
+          path: "lnk~HEAD",
+          logicalPath: "lnk",
+          purpose: "current-relocation",
+        }),
+      ]),
+    );
+    workspace.worktree.removeFiles(["/lnk~HEAD"]);
+    writeWorkFile(workspace, "/lnk~HEAD/outside.txt", "outside\n");
+
+    expectCode(() => rebaseAbort(cold, workspace.worktree), "ECHECKOUTFAIL");
+    expect(textAt(workspace, "lnk~HEAD/outside.txt")).toBe("outside\n");
+    expect(cold.checkout.readOperationState()).not.toBeNull();
+    expect(cold.head().oid).toBe(original);
+
+    workspace.worktree.removeFiles(["/lnk~HEAD/outside.txt"]);
+    workspace.worktree.rmdir("/lnk~HEAD");
+    rebaseAbort(cold, workspace.worktree);
+    expect(cold.head().oid).toBe(original);
+    expect(workspace.worktree.readlink("/lnk")).toBe("target.txt");
+    expect(workspace.worktree.stat("/lnk~HEAD")).toBeNull();
+    expect(cold.checkout.readOperationState()).toBeNull();
+  });
+
   it("resumes the remaining queue after a conflict in the first step", async () => {
     const source = fixture();
     source.write("shared.txt", "base\n");

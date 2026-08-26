@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -29,6 +29,54 @@ interface History {
   current: string;
   incoming: string;
 }
+
+type DistinctPathKind = "absent" | "regular" | "symlink";
+
+interface DistinctTypeScenario {
+  name: string;
+  base: DistinctPathKind;
+  current: "regular" | "symlink";
+  incoming: "regular" | "symlink";
+  relocation: string;
+  relocationPurpose: "current-relocation" | "incoming-relocation";
+}
+
+const DEFAULT_DISTINCT_TYPE_SCENARIO: DistinctTypeScenario = {
+  name: "base absent, current regular, incoming symlink",
+  base: "absent",
+  current: "regular",
+  incoming: "symlink",
+  relocation: "lnk~HEAD",
+  relocationPurpose: "current-relocation",
+};
+
+const DISTINCT_TYPE_SCENARIOS: readonly DistinctTypeScenario[] = [
+  DEFAULT_DISTINCT_TYPE_SCENARIO,
+  {
+    name: "base absent, current symlink, incoming regular",
+    base: "absent",
+    current: "symlink",
+    incoming: "regular",
+    relocation: "lnk~topic",
+    relocationPurpose: "incoming-relocation",
+  },
+  {
+    name: "regular base, current regular, incoming symlink",
+    base: "regular",
+    current: "regular",
+    incoming: "symlink",
+    relocation: "lnk~HEAD",
+    relocationPurpose: "current-relocation",
+  },
+  {
+    name: "symlink base, current symlink, incoming regular",
+    base: "symlink",
+    current: "symlink",
+    incoming: "regular",
+    relocation: "lnk~topic",
+    relocationPurpose: "incoming-relocation",
+  },
+];
 
 interface CrissCrossHistory extends History {
   bestBases: readonly [string, string];
@@ -69,6 +117,30 @@ function conflictingDivergence(): History {
   fixture.git("checkout", "-q", "main");
   fixture.write("conflict.txt", "current\n");
   const current = fixture.commit("main");
+  return { fixture, base, current, incoming };
+}
+
+function writeDistinctPath(fixture: GitFixture, kind: DistinctPathKind, version: string): void {
+  fixture.remove("lnk");
+  if (kind === "regular") fixture.write("lnk", `${version} file\n`);
+  if (kind === "symlink") fixture.symlink(`${version}-target.txt`, "lnk");
+}
+
+function distinctTypeDivergence(
+  scenario: DistinctTypeScenario = DEFAULT_DISTINCT_TYPE_SCENARIO,
+): History {
+  const fixture = newFixture();
+  fixture.write("base-target.txt", "base target\n");
+  fixture.write("current-target.txt", "current target\n");
+  fixture.write("incoming-target.txt", "incoming target\n");
+  writeDistinctPath(fixture, scenario.base, "base");
+  const base = fixture.commit("base");
+  fixture.git("checkout", "-q", "-b", "topic");
+  writeDistinctPath(fixture, scenario.incoming, "incoming");
+  const incoming = fixture.commit(`topic ${scenario.incoming}`);
+  fixture.git("checkout", "-q", "main");
+  writeDistinctPath(fixture, scenario.current, "current");
+  const current = fixture.commit(`main ${scenario.current}`);
   return { fixture, base, current, incoming };
 }
 
@@ -677,6 +749,95 @@ describe("merge lifecycle", () => {
         reason: "merge: commit",
       }),
     ]);
+  });
+
+  it.each(DISTINCT_TYPE_SCENARIOS)(
+    "matches Git's $name distinct-type stages and aborts cold",
+    async (scenario) => {
+      const history = distinctTypeDivergence(scenario);
+      const workspace = await clonedFrom(history.fixture);
+      const beforeIndex = workspace.repo.checkout.indexEntries();
+
+      expect(() => history.fixture.git("merge", "topic")).toThrow();
+      expect(
+        merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+      ).toEqual({ conflicted: true, pendingCommit: true });
+      expect(indexLines(workspace.repo)).toEqual(gitIndexLines(history.fixture));
+      expect(workspace.worktree.readlink("/lnk")).toBe(
+        readlinkSync(join(history.fixture.dir, "lnk")),
+      );
+      expect(textAt(workspace, scenario.relocation)).toBe(
+        readFileSync(join(history.fixture.dir, scenario.relocation), "utf8"),
+      );
+      expect(workspace.repo.checkout.requireMergeState().touched).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: "lnk", logicalPath: "lnk", purpose: "primary" }),
+          expect.objectContaining({
+            path: scenario.relocation,
+            logicalPath: "lnk",
+            purpose: scenario.relocationPurpose,
+            worktree: { kind: "absent" },
+          }),
+        ]),
+      );
+
+      const cold = reopen(workspace);
+      mergeAbort(cold.repo, workspace.worktree);
+
+      expect(cold.repo.head().oid).toBe(history.current);
+      expect(cold.repo.checkout.indexEntries()).toEqual(beforeIndex);
+      if (scenario.current === "regular") {
+        expect(textAt(workspace, "lnk")).toBe("current file\n");
+      } else {
+        expect(workspace.worktree.readlink("/lnk")).toBe("current-target.txt");
+      }
+      expect(workspace.worktree.stat(`/${scenario.relocation}`)).toBeNull();
+      expect(cold.repo.checkout.readMergeState()).toBeNull();
+    },
+  );
+
+  it("preserves a distinct-type merge when abort would remove an outside descendant", async () => {
+    const history = distinctTypeDivergence();
+    const workspace = await clonedFrom(history.fixture);
+
+    expect(
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+    ).toEqual({ conflicted: true, pendingCommit: true });
+    workspace.worktree.removeFiles(["/lnk~HEAD"]);
+    writeWorkFile(workspace, "/lnk~HEAD/outside.txt", "outside\n");
+    const cold = reopen(workspace);
+
+    expect(() => mergeAbort(cold.repo, workspace.worktree)).toThrow(
+      expect.objectContaining({ code: "ECHECKOUTFAIL" }),
+    );
+    expect(textAt(workspace, "lnk~HEAD/outside.txt")).toBe("outside\n");
+    expect(cold.repo.checkout.readMergeState()).not.toBeNull();
+    expect(cold.repo.head().oid).toBe(history.current);
+  });
+
+  it("refuses a gitlink distinct-type conflict atomically", async () => {
+    const fixture = newFixture();
+    fixture.write("base.txt", "base\n");
+    const base = fixture.commit("base");
+    fixture.git("checkout", "-q", "-b", "topic");
+    fixture.git("update-index", "--add", "--cacheinfo", `160000,${base},lnk`);
+    fixture.git("commit", "-q", "-m", "topic gitlink");
+    fixture.git("checkout", "-q", "main");
+    fixture.remove("lnk");
+    fixture.write("lnk", "current file\n");
+    fixture.commit("main file");
+    const workspace = await clonedFrom(fixture);
+    const before = snapshot(workspace);
+    const beforeIndex = workspace.repo.checkout.indexEntries();
+
+    expect(() =>
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
+    ).toThrow(expect.objectContaining({ code: "EUNSUPPORTED" }));
+
+    expect(snapshot(workspace)).toEqual(before);
+    expect(workspace.repo.checkout.indexEntries()).toEqual(beforeIndex);
+    expect(textAt(workspace, "lnk")).toBe("current file\n");
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 
   it("aborts with exact index and owned-path restoration while preserving sentinels", async () => {

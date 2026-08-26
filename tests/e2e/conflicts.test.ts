@@ -179,14 +179,7 @@ describe("merge conflicts", () => {
     );
   });
 
-  // KNOWN DIVERGENCE — kompjutr disagrees with git on a "distinct types"
-  // conflict. Git splits the path in two (symlink at `lnk` stage 3, regular
-  // file relocated to `lnk~HEAD` stage 2); kompjutr keeps one unmerged entry at
-  // `lnk` carrying both modes, because `projectMergePlan` relocates only
-  // `file/directory` conflicts (`src/core/ops/merge-projection.ts`). Nothing is
-  // relaxed here: the step below still demands full agreement, so this turns
-  // red — and the `.fails` comes off — the day kompjutr relocates too.
-  it.fails("conflicts on a symlink versus a regular file at the same path", async () => {
+  it("conflicts on a symlink versus a regular file at the same path", async () => {
     world = await createWorld({ seed: { "target.txt": "pointed at\n" } });
     await world.run(
       { op: "branch", name: "feature", checkout: true },
@@ -203,7 +196,9 @@ describe("merge conflicts", () => {
         message: "merge feature",
         expect: { outcome: "conflicted" },
       },
-      // Keep the symlink; drop the relocated regular file.
+      // Keep the regular file; replace the symlink before staging the resolution.
+      { op: "rm", paths: ["lnk"], force: true },
+      { op: "write", path: "lnk", content: "not a link\n" },
       { op: "add", paths: ["lnk"] },
       { op: "rm", paths: ["lnk~HEAD"], force: true },
       { op: "mergeContinue", message: "merge feature" },

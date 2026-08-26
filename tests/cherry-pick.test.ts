@@ -369,6 +369,49 @@ describe("cherry-pick lifecycle", () => {
     expect(head.ordinal).toBe(named.ordinal + 1);
   });
 
+  it("continues a distinct regular-symlink conflict from its cold journal", async () => {
+    const source = fixture();
+    source.write("target.txt", "target\n");
+    source.commit("base");
+    source.git("checkout", "-q", "-b", "topic");
+    source.symlink("target.txt", "lnk");
+    const picked = source.commit("topic symlink");
+    source.git("checkout", "-q", "main");
+    source.write("lnk", "current file\n");
+    const current = source.commit("main file");
+    const workspace = await imported(source);
+
+    expect(
+      cherryPick(workspace.context, workspace.repo, workspace.worktree, { source: picked }),
+    ).toEqual({ outcome: "conflicted" });
+    expect(workspace.worktree.readlink("/lnk")).toBe("target.txt");
+    expect(textAt(workspace, "lnk~HEAD")).toBe("current file\n");
+
+    const cold = reopen(workspace);
+    expect(cold.repo.checkout.requireOperationState("cherry-pick").touched).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "lnk", logicalPath: "lnk", purpose: "primary" }),
+        expect.objectContaining({
+          path: "lnk~HEAD",
+          logicalPath: "lnk",
+          purpose: "current-relocation",
+        }),
+      ]),
+    );
+    workspace.worktree.unlink("/lnk");
+    writeWorkFile(workspace, "/lnk", "resolved file\n");
+    add(cold.repo, workspace.worktree, { paths: ["lnk"], excludeRoots: [] });
+    rm(cold.repo, workspace.worktree, { paths: ["lnk~HEAD"], force: true });
+
+    const result = cherryPickContinue(cold.context, cold.repo);
+    expect(result.outcome).toBe("committed");
+    if (result.outcome !== "committed") throw new Error("continuation did not commit");
+    expect(cold.repo.readCommit(result.oid).parent).toEqual([current]);
+    expect(textAt(workspace, "lnk")).toBe("resolved file\n");
+    expect(workspace.worktree.stat("/lnk~HEAD")).toBeNull();
+    expect(cold.repo.checkout.readOperationState()).toBeNull();
+  });
+
   it("continues a modify/delete conflict after native rm resolution", async () => {
     const source = fixture();
     source.write("deleted.txt", "base\n");
