@@ -7,18 +7,18 @@
 // untouched tree therefore reads no file content at all.
 
 import type { IndexEntry } from "../../sqlite/store.js";
-import { isOid, utf8 } from "../bytes.js";
+import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
-import { requireBranchRef } from "../protocol/receive-pack.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import type { Worktree } from "../worktree.js";
+import { boundedBranchRef, directRefOid, resolveBranchUpstream } from "./branch-upstream.js";
 import { matchesPaths, treeEntries } from "./checkout.js";
-import type { StatusEntry, StatusRow } from "./kinds.js";
+import type { StatusRow } from "./kinds.js";
 import { countAheadBehind } from "./merge-base.js";
 import {
   type ExactRenameClassification,
@@ -49,12 +49,10 @@ import {
   walkWorktreeStream,
 } from "./worktree-io.js";
 
+export { formatPorcelainV1, formatPorcelainV2, formatShort } from "./status-format.js";
 export type { StatusDetail, StatusOptions } from "./status-rows.js";
 
 const HEADS = "refs/heads/";
-const STATUS_BRANCH_REF_BYTES = 1_024;
-const STATUS_REMOTE_BYTES = 255;
-const STATUS_FETCH_BYTES = 2_048;
 
 export interface StatusBranch {
   /** Full commit OID, or null for an unborn branch. */
@@ -148,7 +146,7 @@ export function statusBranch(repo: Repository): StatusBranch {
 
   const base: StatusBranch = { oid, head };
   if (headRef === undefined) return base;
-  const upstream = statusUpstream(repo, headRef);
+  const upstream = resolveBranchUpstream(repo, headRef);
   if (upstream === undefined) return base;
   if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
   const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
@@ -158,72 +156,6 @@ export function statusBranch(repo: Repository): StatusBranch {
     ahead: counts.ahead,
     behind: counts.behind,
   };
-}
-
-interface ResolvedStatusUpstream {
-  name: string;
-  oid: string | null;
-}
-
-function statusUpstream(repo: Repository, headRef: string): ResolvedStatusUpstream | undefined {
-  const branch = headRef.slice(HEADS.length);
-  const remote = repo.store.configGetBounded(`branch.${branch}.remote`, STATUS_REMOTE_BYTES);
-  const configuredMerge = repo.store.configGetBounded(
-    `branch.${branch}.merge`,
-    STATUS_BRANCH_REF_BYTES,
-  );
-  if (remote === undefined || configuredMerge === undefined) return undefined;
-  const mergeRef = boundedBranchRef(configuredMerge, "status upstream ref");
-  const upstreamBranch = mergeRef.slice(HEADS.length);
-
-  if (remote === ".") {
-    return { name: upstreamBranch, oid: directRefOid(repo, mergeRef) };
-  }
-  requireStatusRemote(remote);
-  const fetch = repo.store.configGetBounded(`remote.${remote}.fetch`, STATUS_FETCH_BYTES);
-  const expected = `refs/heads/*:refs/remotes/${remote}/*`;
-  if (fetch !== expected && fetch !== `+${expected}`) return undefined;
-  const trackingRef = `refs/remotes/${remote}/${upstreamBranch}`;
-  return {
-    name: `${remote}/${upstreamBranch}`,
-    oid: directRefOid(repo, trackingRef),
-  };
-}
-
-function boundedBranchRef(value: string, label: string): string {
-  if (utf8.encode(value).length > STATUS_BRANCH_REF_BYTES) {
-    throw new GitError("E2BIG", `${label} exceeds ${STATUS_BRANCH_REF_BYTES} bytes`);
-  }
-  return requireBranchRef(value.startsWith("refs/") ? value : `${HEADS}${value}`);
-}
-
-function requireStatusRemote(remote: string): void {
-  if (
-    remote.length === 0 ||
-    remote.startsWith("/") ||
-    remote.endsWith("/") ||
-    remote.includes("//") ||
-    remote.includes("..") ||
-    remote.includes("@{") ||
-    remote.includes("\\")
-  ) {
-    throw new GitError("EINVAL", `invalid status remote ${remote}`);
-  }
-  for (const character of remote) {
-    const code = character.charCodeAt(0);
-    if (code <= 0x20 || code === 0x7f || "~^:?*[".includes(character)) {
-      throw new GitError("EINVAL", `invalid status remote ${remote}`);
-    }
-  }
-}
-
-function directRefOid(repo: Repository, ref: string): string | null {
-  const target: unknown = repo.store.getRef(ref);
-  if (target === null) return null;
-  if (typeof target !== "string" || !isOid(target)) {
-    throw new CorruptError(`status ref ${ref} does not contain a full object id`);
-  }
-  return target;
 }
 
 /** Eager status with an optional same-database sparse fast path. */
@@ -652,93 +584,6 @@ function worktreeOid(
     if (stat !== null && indexMatchesStat(entry, stat)) return entry.oid;
   }
   return hashWorktreePath(repo, worktree, path, { write: false })?.oid ?? null;
-}
-
-// -- formatters --------------------------------------------------------
-
-/** `git status --porcelain=v2`, with optional `--branch` headers. */
-export function formatPorcelainV2(entries: StatusDetail[], branch?: StatusBranch): string {
-  const lines = branch === undefined ? [] : formatStatusBranch(branch);
-  for (const entry of entries) {
-    if (entry.ignored === true || entry.worktree === "?") continue;
-    if (entry.unmerged === true) {
-      lines.push(
-        `u ${entry.index}${entry.worktree} N... ` +
-          `${entry.baseMode} ${entry.currentMode} ${entry.incomingMode} ${entry.worktreeMode} ` +
-          `${entry.baseOid} ${entry.currentOid} ${entry.incomingOid} ${entry.path}`,
-      );
-      continue;
-    }
-    if (entry.renamed === true) {
-      lines.push(
-        `2 ${entry.index}${v2Code(entry.worktree)} N... ` +
-          `${entry.headMode} ${entry.indexMode} ${entry.worktreeMode} ` +
-          `${entry.headOid} ${entry.indexOid} R${entry.similarity} ` +
-          `${entry.path}\t${entry.originalPath}`,
-      );
-      continue;
-    }
-    lines.push(
-      `1 ${v2Code(entry.index)}${v2Code(entry.worktree)} N... ` +
-        `${entry.headMode} ${entry.indexMode} ${entry.worktreeMode} ` +
-        `${entry.headOid} ${entry.indexOid} ${entry.path}`,
-    );
-  }
-  for (const entry of entries) if (entry.worktree === "?") lines.push(`? ${entry.path}`);
-  for (const entry of entries) if (entry.ignored === true) lines.push(`! ${entry.path}`);
-  return join(lines);
-}
-
-function formatStatusBranch(branch: StatusBranch): string[] {
-  const lines = [
-    `# branch.oid ${branch.oid ?? "(initial)"}`,
-    `# branch.head ${branch.head ?? "(detached)"}`,
-  ];
-  if (branch.upstream !== undefined) lines.push(`# branch.upstream ${branch.upstream}`);
-  if (branch.ahead !== undefined || branch.behind !== undefined) {
-    if (
-      branch.upstream === undefined ||
-      branch.ahead === undefined ||
-      branch.behind === undefined
-    ) {
-      throw new GitError("EINVAL", "status branch counts require an upstream and both counts");
-    }
-    lines.push(`# branch.ab +${branch.ahead} -${branch.behind}`);
-  }
-  return lines;
-}
-
-/** `git status --porcelain=v1`. */
-export function formatPorcelainV1(entries: StatusEntry[]): string {
-  const lines: string[] = [];
-  for (const entry of entries) {
-    if (entry.worktree === "?" || entry.worktree === "!") continue;
-    if (entry.originalPath !== undefined) {
-      lines.push(`${entry.index}${entry.worktree} ${entry.originalPath} -> ${entry.path}`);
-      continue;
-    }
-    lines.push(`${entry.index}${entry.worktree} ${entry.path}`);
-  }
-  for (const entry of entries) if (entry.worktree === "?") lines.push(`?? ${entry.path}`);
-  for (const entry of entries) if (entry.worktree === "!") lines.push(`!! ${entry.path}`);
-  return join(lines);
-}
-
-/**
- * `git status --short`. Identical to porcelain v1 over the states this
- * package models — the two differ only on colour and path quoting.
- */
-export function formatShort(entries: StatusEntry[]): string {
-  return formatPorcelainV1(entries);
-}
-
-/** Porcelain v2 spells "unmodified" as a dot where v1 uses a space. */
-function v2Code(code: string): string {
-  return code === " " ? "." : code;
-}
-
-function join(lines: string[]): string {
-  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
 }
 
 // -- clean -------------------------------------------------------------
