@@ -37,6 +37,7 @@ not effort: a wrong answer outranks a missing one.
   [42](42-remote-ref-discovery-and-refspec-fetch.md) ·
   [43](43-index-and-object-write-plumbing.md) ·
   [44](44-patch-interchange.md) ·
+  [47](47-divergence-against-arbitrary-ref.md) ·
   [06](06-stash-operations.md) ·
   [18](18-branch-and-remote-management.md) ·
   [28](28-pull-rebase.md)
@@ -47,7 +48,8 @@ not effort: a wrong answer outranks a missing one.
   [26](26-interactive-rebase.md) ·
   [27](27-rebase-merges.md) ·
   [29](29-rebase-update-refs.md) ·
-  [46](46-rev-parse-revision-syntax.md)
+  [46](46-rev-parse-revision-syntax.md) ·
+  [48](48-read-symbolic-ref-target.md)
 - **C — deliberately out of scope.** Not filed: `bisect`, `blame`, `describe`,
   `shortlog`, `grep`, `archive`, `bundle`, `am`/`format-patch`, submodules,
   notes, hooks, signing, credential helpers, LFS, `.gitattributes` filters,
@@ -89,6 +91,10 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
    [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
    [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
+   [47](47-divergence-against-arbitrary-ref.md),
+   [48](48-read-symbolic-ref-target.md) and [49](49-set-based-copy.md) are small
+   and independent; take them here whenever a consumer needs them. Land 47 before
+   [39](39-plumbing-read-surface.md), which may later subsume it.
 5. **Broaden management and diagnostic surfaces:**
    [18](18-branch-and-remote-management.md),
    [25](25-rebase-targets-and-roots.md),
@@ -143,6 +149,9 @@ focused sprint.
 - [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
 - [45 — Make porcelain output framing-safe](45-framing-safe-porcelain-output.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
+- [47 — Count divergence against an arbitrary ref](47-divergence-against-arbitrary-ref.md)
+- [48 — Read a symbolic ref's target](48-read-symbolic-ref-target.md)
+- [49 — Copy a set of paths as one operation](49-set-based-copy.md)
 - [50 — Report the untracked file a cached removal leaves behind](50-untracked-row-after-cached-removal.md)
 - [51 — Relocate every distinct-type merge conflict, not only file/directory](51-relocate-distinct-type-conflicts.md)
 - [52 — Match Git's default ref coverage on fetch and pull](52-default-ref-coverage-on-fetch-and-pull.md)
