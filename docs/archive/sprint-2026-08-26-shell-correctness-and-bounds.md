@@ -4,9 +4,9 @@
 > SQLite-internal copy, and metadata-only touch. One 16 MiB default
 > retained-memory budget now covers argv, line state, blocking stages, search, xargs,
 > merged diagnostics, and redirect inputs; stdout and stderr keep independent
-> public caps, and redirects stream atomically. Commit map: plan → `2d7b185`;
-> WU1 → `f9161f8`; WU2 → `333d2c3`; WU3 → `9454a94`; WU4 → `aef7bea`;
-> WU5 → `880a530`; WU6 → `fcef49c`; WU7 → `a0130e0`; WU8 → `59ce213`.
+> public caps, and redirects stream atomically. Commit map: plan → `ca02f0f`;
+> WU1 → `27eab29`; WU2 → `5c04899`; WU3 → `8b81498`; WU4 → `2c398d5`;
+> WU5 → `e6a6c58`; WU6 → `737a53c`; WU7 → `1d6bf2c`; WU8 → `f7aac7e`.
 > Verification: typecheck and Biome check; CPU-leased build; CPU-leased full
 > suite — 110 files, 1,936 passed, 5 skipped; clean 574-file package smoke;
 > docs lint. Backlog closed: 49 and 54–60. Deferred: general Bash constructs,
