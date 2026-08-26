@@ -252,10 +252,11 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | full 40-char oid | ★ ✔ |
 | abbreviated oid | ✔ resolved by unique prefix |
 | `<rev>~<n>`, `<rev>^<n>`, `<rev>^0` | ★ ✔ chained suffixes allowed |
+| `HEAD@{0}` … `HEAD@{1023}` | ✔ active new-OID reflog endpoints; composes with `^` and `~` |
 | `--verify`, `--quiet` (existence probe) | ★ ~ an unresolvable rev throws; there is no quiet non-zero-exit mode |
 | `FETCH_HEAD` | ★ ✘ `fetch()` returns the tip as `fetchHead`; no `FETCH_HEAD` ref is written |
 | `<rev>^{commit}`, `<rev>^{tree}` (peel to type) | ★ ✘ |
-| `@`, `@{upstream}`, `@{n}`, `:/text`, `<a>..<b>`, `<rev>:<path>` | ★ ✘ (`<oid>:<path>` works in `catFile` only) |
+| `@`, `@{upstream}`, arbitrary `<ref>@{n}`, dates, `:/text`, `<a>..<b>`, `<rev>:<path>` | ★ ✘ (`<oid>:<path>` works in `catFile` only) |
 
 ### Plumbing
 
@@ -278,7 +279,7 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 |---|---|---|
 | `git branch <name> [<start>]` | `name`, `startPoint` | ★ ✔ start point peels annotated tags |
 | `-f`, `--force` | `force` | ✔ |
-| `-d` / `-D` | `branchDelete({ name })` | ★ ~ one spelling; refuses the checked-out branch (`EBRANCHFAIL`), and does **not** check whether the branch is merged |
+| `-d` / `-D` | `branchDelete({ name })` | ★ ~ one spelling; refuses the checked-out branch (`EBRANCHFAIL`), does **not** check whether the branch is merged, and retains bounded recovery history after deletion |
 | `--list` | `branchList()` | ✔ names only |
 | `--show-current` | `currentBranch()` | ★ ✔ `undefined` on a detached HEAD |
 | `-m` (rename), `--set-upstream-to`, `--contains`, `-v` | — | ★ ✘ set upstream through `configSet("branch.<n>.remote"/"…merge")`; rename is create-plus-delete |
@@ -292,6 +293,21 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | `-d` | `tagDelete()` | ✔ |
 | `--list` | `tagList()` | ✔ |
 | `-a`, `-m`, `-s`, `-u` | — | ✘ kompjutr never *creates* an annotated tag. Annotated tags fetched from a remote are stored, read and peeled correctly |
+
+### Reflog and ref recovery — `reflog()`, `recoverRef()`
+
+| Git | kompjutr | |
+|---|---|---|
+| `git reflog [<ref>]` | `reflog({ ref, limit, before })` | ~ returns typed rows newest-first; default 100, maximum 1,000, ordinal cursor |
+| `git reflog expire` | — | ~ fixed policy: both at most 90 days old and among newest 1,024 rows per ref |
+| recover a prior direct ref | `recoverRef({ ref, source, expectedCurrent })` | ✔ selects an active old/new endpoint, verifies the object, and uses CAS |
+| branch log after deletion | retained active entry | ~ unlike Git's per-branch log deletion, retained for bounded recovery and future GC roots |
+| formatted output, date selectors, arbitrary `<ref>@{n}` | — | ✘ typed reads and `HEAD@{n}` only |
+
+Every successful direct-ref or raw `HEAD` movement records bounded raw and
+resolved endpoints, optional actor, timestamp/timezone, and an internal reason in
+the same transaction as the mutation. Failed, stale, no-op, unpublished, and
+rolled-back movements record nothing.
 
 ## Remotes and network
 
@@ -479,7 +495,7 @@ workload also sets `core.quotePath`, `safe.directory`, `init.defaultBranch` and
 These have no method and no equivalent. `stash` and the argv entry point throw
 `UnsupportedOperationError`; the rest simply do not exist on the surface.
 
-- **State:** `stash` (push/list/pop throw), `reflog`, `rerere`, `notes`
+- **State:** `stash` (push/list/pop throw), `rerere`, `notes`
 - **Layout:** `worktree` ★, `submodule` (gitlinks are preserved in trees but never
   followed), `sparse-checkout` as a command — sparse hydration is an internal
   optimisation, not a user-facing mode
@@ -502,6 +518,7 @@ tag, checkout, remote, config, hashObject, catFile, updateRef, push, pull and
 merge — with these differences:
 
 - ✘ no `cherryPick`, `revert` or `rebase`;
+- ✘ no `reflog` or `recoverRef` surface;
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
@@ -519,7 +536,10 @@ worktree scan rows, path length, journal steps) are listed in
 [`architecture.md`](architecture.md).
 
 Two limits bite most often in ordinary use: the 2,200-byte cap on an emitted
-Git path, and the 4,096-step cap on a rebase or replay journal.
+Git path, and the 4,096-step cap on a rebase or replay journal. Revision input is
+limited to 1,024 code units and 32 total `^`/`~` traversals. An active reflog-root
+scan fails closed above 9,727 physical rows; its SQL state, shared caches, and JS
+headroom total at most 100 MiB minus one byte.
 
 ## Path and ordering rules
 

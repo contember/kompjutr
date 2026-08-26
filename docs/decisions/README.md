@@ -21,3 +21,4 @@ a commit message suffices.
 - [0005 — Keep persisted OIDs as hexadecimal text](0005-keep-oid-columns-as-text.md) — accepted (2026-08-25)
 - [0006 — Keep content identities opaque and bound the Git blob cache](0006-keep-content-identities-opaque-and-bound-the-cache.md) — accepted (2026-08-26)
 - [0007 — Key parsed trees by source surrogate](0007-key-parsed-trees-by-source-surrogate.md) — accepted (2026-08-26)
+- [0008 — Retain bounded deleted-ref history](0008-retain-deleted-ref-history.md) — accepted (2026-08-26)

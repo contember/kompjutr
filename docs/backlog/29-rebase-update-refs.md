@@ -1,7 +1,7 @@
 ---
 id: 29
 title: Update dependent refs after rebase
-blocked-by: [./12-reflogs-and-ref-recovery.md]
+blocked-by: []
 ---
 
 # 29 — Update dependent refs after rebase

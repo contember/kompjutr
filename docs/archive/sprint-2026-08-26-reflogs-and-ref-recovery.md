@@ -1,3 +1,17 @@
+> **OUTCOME — shipped 2026-08-26.** Every Git-visible direct-ref and raw
+> `HEAD` movement now records bounded, transactional history with typed reasons,
+> optional actors, stable ordinals, public paging, `HEAD@{n}`, CAS recovery, and
+> a lazy active-root stream. The undeployed Git migration chain was collapsed
+> into one exact version-1 initializer. Commit map: WU1 → `2a95c4e`; WU2 local
+> operations → `a991971`, integration lifecycle and schema cleanup →
+> `21fc1ea`, network operations → `62105b3`; WU3 → `c52257a`; WU4 memory
+> correction → `962332c`. Verification: leased full suite — 105 files, 1,864
+> passed, 5 skipped; leased typecheck; leased build; clean 570-file package
+> smoke; Biome check; docs lint. Backlog closed: 12. Backlogs 04, 29, and 33 are
+> unblocked. Deferred: merged-branch deletion safety, garbage collection,
+> integrity audit, configurable expiry, arbitrary-ref/date selectors, reflog
+> formatting and CLI, Computer facade expansion, deployment, and publication.
+
 # Sprint — Bounded reflogs and ref recovery (2026-08-26)
 
 **Goal.** Make every Git-visible ref movement recoverable through bounded,
@@ -231,9 +245,10 @@ matrix and recovery witnesses pass.
 
 ## Decisions
 
-- Use one schema-v13 additive migration. A repository-wide monotonic ordinal
-  gives stable ordering and pagination even when timestamps collide or move
-  backward; a per-ref index serves bounded listing and retention.
+- Keep the complete undeployed Git schema as one version-1 initializer with no
+  upgrade chain. A repository-wide monotonic ordinal gives stable ordering and
+  pagination even when timestamps collide or move backward; a per-ref index
+  serves bounded listing and retention.
 - The store owns old/new capture, log insertion, ordinal allocation, pruning,
   and ref mutation in one synchronous transaction. Core operations own the
   bounded reason and best available actor metadata.
@@ -256,6 +271,8 @@ matrix and recovery witnesses pass.
   caller intended.
 - No ADR is created at sprint opening. WU4 graduates the shipped retention and
   deletion semantics after implementation evidence confirms them.
+- The shipped retention and deletion semantics are recorded in
+  [ADR-0008](../decisions/0008-retain-deleted-ref-history.md).
 
 **Planning alternative rejected.** Instrumenting each core operation directly
 without a store-level mutation seam would make reasons easy to add, but it could
@@ -359,3 +376,11 @@ counts are recorded in the archived outcome.
   pushes write none. The 1/1,000/9,329-ref fetch/prune witnesses use 29/13,
   29/13, and 41/25 statements. Network verification passed 65/65 tests, and the
   combined post-cleanup regression set passed 274/274 tests.
+- 2026-08-26 — Final WU4 audit found that the 64 MiB ref-mutation model did not
+  compose with live integration reservations, and that the 96 MiB root SQL-state
+  model omitted 12 MiB of shared caches. `962332c` routes every mutation charge
+  through the shared coordinator before allocation and disposes it on every
+  path. The root model now reserves 8 MiB object cache, 4 MiB pack-row cache,
+  and 4 MiB JS headroom inside a strict `100 MiB - 1 B` total. Exactly 9,727
+  physical rows are accepted and 9,728 fail; the 9,329-ref witness remains
+  supported. Independent re-review approved the fixes after 75/75 focused tests.

@@ -54,10 +54,9 @@ with and without a start point, `worktree remove --force`, `worktree prune`,
 
 ## Touch points
 
-`src/sqlite/schema.ts`, `src/sqlite/store.ts`, a new
-`src/sqlite/schema-migration-vNN.ts`, `src/core/repository.ts`,
+`src/sqlite/schema.ts`, `src/sqlite/store.ts`, `src/core/repository.ts`,
 `src/core/context.ts`, `src/core/ops/init.ts`, `src/core/ops/operation-state.ts`,
-`src/git/client.ts`, `tests/workspace.test.ts`, `tests/schema-migration.test.ts`,
+`src/git/client.ts`, `tests/workspace.test.ts`, `tests/schema.test.ts`,
 `docs/decisions/`, `docs/reference/git-support.md`
 
 <!-- Origin: docs/reference/git-support.md#reference-workload-coverage -->

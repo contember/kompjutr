@@ -245,7 +245,7 @@ compatibility and public-export tests, `docs/reference/git-support.md`.
   backlogs [18](../backlog/18-branch-and-remote-management.md) and
   [28](../backlog/28-pull-rebase.md). WU2 only reads existing branch config.
 - Reflogs, branch-delete ancestry enforcement, and repository maintenance —
-  backlogs [12](../backlog/12-reflogs-and-ref-recovery.md),
+  backlogs [12](sprint-2026-08-26-reflogs-and-ref-recovery.md),
   [33](../backlog/33-branch-delete-merged-check.md), and
   [04](../backlog/04-repack-and-garbage-collection.md).
 - Publishing a release. The tag workflow is checked in, but configuring the

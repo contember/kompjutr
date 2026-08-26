@@ -42,7 +42,6 @@ not effort: a wrong answer outranks a missing one.
   [28](28-pull-rebase.md)
 - **B — real gap, narrower audience or a workaround exists.**
   [08](08-extend-push-refspecs.md) ·
-  [12](12-reflogs-and-ref-recovery.md) ·
   [13](13-force-with-lease.md) ·
   [25](25-rebase-targets-and-roots.md) ·
   [26](26-interactive-rebase.md) ·
@@ -65,11 +64,10 @@ This is the default priority at the current HEAD, not scheduling state. Items in
 the same phase may run in parallel, but a blocked item must not move ahead of its
 blocker. Re-evaluate the order after each phase as production evidence arrives.
 
-1. **Build recovery before destructive maintenance:**
-   [12](12-reflogs-and-ref-recovery.md), then
-   [33](33-branch-delete-merged-check.md) and
-   [04](04-repack-and-garbage-collection.md). Reflogs are the retention and
-   recovery prerequisite for both follow-ups.
+1. **Harden destructive maintenance:**
+   [33](33-branch-delete-merged-check.md), then
+   [04](04-repack-and-garbage-collection.md). Both now consume the bounded
+   recovery and active-root contracts.
 2. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
    [11](11-production-do-regression-probe.md), and
    [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
@@ -98,8 +96,7 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [17](17-integrity-audit-and-snapshots.md).
 6. **Defer until a concrete workload justifies them:**
    [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
-   [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md). Item 29 also
-   remains blocked by 12.
+   [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md).
 
 Outside the phases: [50](50-untracked-row-after-cached-removal.md),
 [51](51-relocate-distinct-type-conflicts.md),
@@ -123,7 +120,6 @@ focused sprint.
 - [09 — Add outbound delta compression](09-outbound-delta-compression.md)
 - [10 — Close worktree wall-time gaps](10-worktree-wall-time.md)
 - [11 — Add a production Durable Object regression probe](11-production-do-regression-probe.md)
-- [12 — Add reflogs and ref recovery](12-reflogs-and-ref-recovery.md)
 - [13 — Add force-with-lease push](13-force-with-lease.md)
 - [15 — Make network operations abortable](15-abortable-network-operations.md)
 - [16 — Verify concurrent and interrupted operations](16-concurrent-and-restart-conformance.md)

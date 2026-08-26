@@ -15,15 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md`](sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md)
-  — transactional ref history, bounded recovery APIs, and future GC roots.
+None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Recovery is active: reflogs and ref recovery precede merged-branch deletion
-  and destructive repository maintenance.
+- Reflog recovery is shipped. Merged-branch deletion checks and bounded garbage
+  collection are now unblocked follow-ups.
 
 ## Key reference
 
@@ -43,9 +42,13 @@ decisions → reference → archive.
 - [`decisions/0005-keep-oid-columns-as-text.md`](decisions/0005-keep-oid-columns-as-text.md)
 - [`decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md`](decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md)
 - [`decisions/0007-key-parsed-trees-by-source-surrogate.md`](decisions/0007-key-parsed-trees-by-source-surrogate.md)
+- [`decisions/0008-retain-deleted-ref-history.md`](decisions/0008-retain-deleted-ref-history.md)
 
 ## Historical records
 
+- [`archive/sprint-2026-08-26-reflogs-and-ref-recovery.md`](archive/sprint-2026-08-26-reflogs-and-ref-recovery.md)
+  — transactional bounded ref history, public CAS recovery, fixed retention
+  roots, and one undeployed Git schema baseline.
 - [`archive/sprint-2026-08-26-e2e-journeys.md`](archive/sprint-2026-08-26-e2e-journeys.md)
   — a differential journey harness and six workflow files, plus the six
   divergences from Git they pinned.

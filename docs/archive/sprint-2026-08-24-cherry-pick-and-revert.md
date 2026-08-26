@@ -276,7 +276,7 @@ implementing a sequencer here.
   interface does not declare. The generic `git.cli()` dispatcher also remains
   unsupported.
 - Reflogs and post-success ref recovery remain in
-  [backlog item 12](../backlog/12-reflogs-and-ref-recovery.md). This sprint makes
+  [backlog item 12](sprint-2026-08-26-reflogs-and-ref-recovery.md). This sprint makes
   suspended operations abortable but does not add historical ref retention.
 - Repack/GC, benchmark claims, and production deployment are unrelated to this
   functional sprint.

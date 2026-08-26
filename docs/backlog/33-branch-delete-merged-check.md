@@ -1,7 +1,7 @@
 ---
 id: 33
 title: Enforce the merged check on branch deletion
-blocked-by: [./12-reflogs-and-ref-recovery.md]
+blocked-by: []
 ---
 
 # 33 — Enforce the merged check on branch deletion
@@ -16,10 +16,10 @@ and is not checked out, then calls `deleteRef`. Git's `-d` refuses to delete a
 branch whose tip is not reachable from HEAD or from its configured upstream, and
 requires the explicit `-D` to override.
 
-kompjutr has no reflog (see [12](12-reflogs-and-ref-recovery.md)) and no
-`git fsck`-style recovery, so the deleted tip is unreachable and the commits are
-lost at the next repack. The safe spelling is the one callers reach for, and it
-does the dangerous thing.
+kompjutr retains the deleted tip in bounded reflog history, but has no
+`git fsck`-style repair surface. The safe spelling is still the one callers reach
+for, and it still does the dangerous thing. Recovery now depends on acting inside
+the fixed retention window.
 
 ## Approach / acceptance
 

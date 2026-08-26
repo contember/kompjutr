@@ -231,7 +231,7 @@ Consumed backlog items 01 and 03, which were deleted on ship.
   [backlog item 16](../backlog/16-concurrent-and-restart-conformance.md). This
   sprint covers the pull-specific await boundary and stale-HEAD/upstream races.
 - Reflogs, ref recovery, and garbage-collection roots remain in
-  [backlog item 12](../backlog/12-reflogs-and-ref-recovery.md) and
+  [backlog item 12](sprint-2026-08-26-reflogs-and-ref-recovery.md) and
   [backlog item 04](../backlog/04-repack-and-garbage-collection.md).
 - Arbitrary fetch refspec expansion, multi-upstream integration, octopus merge,
   unrelated-history opt-in, SSH, signing, hooks, submodule checkout, and custom

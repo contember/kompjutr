@@ -59,6 +59,7 @@ Repository state is relational rather than a fake `.git` tree:
 
 - `git_repositories` stores the root and HEAD.
 - `git_refs`, `git_config`, and `git_shallow` store repository metadata.
+- `git_reflog_state` and `git_reflog_entries` store bounded ref history.
 - `git_index` stores one row per path and stage.
 - `git_objects` and `git_object_chunks` store locally created objects.
 - `git_pack_*` stores received pack bytes and their index.
@@ -70,6 +71,24 @@ Repository state is relational rather than a fake `.git` tree:
   store one authenticated bounded recovery journal per repository.
 
 No operation depends on a `.git` directory.
+
+Every Git-visible direct-ref or raw `HEAD` movement passes through one store
+mutation seam. The seam captures raw and resolved old/new endpoints, applies the
+ref change, assigns repository-wide ordinals, appends the reflog rows, and prunes
+retention in the same synchronous transaction. A checked-out direct-ref movement
+records the direct ref before its causal `HEAD` entry. Failed, stale, no-op, and
+rolled-back mutations record nothing.
+
+Reflog reads are newest-first and page strictly before a repository-wide ordinal.
+An entry is active only while it is both at most 90 days old and among the newest
+1,024 entries for its ref. `HEAD@{0}` through `HEAD@{1023}` select active new-OID
+endpoints. `recoverRef()` selects an active old or new endpoint, verifies the
+object, and moves one direct `refs/*` destination with expected-current CAS. Ref
+deletion keeps its history for the active window. The internal active-root cursor
+validates retained rows, streams distinct old/new OIDs in byte order through one
+`db.iterate()` traversal, and accepts at most 9,727 physical rows. Its SQL state,
+8 MiB object cache, 4 MiB pack-row cache, and 4 MiB JS headroom total at most
+100 MiB minus one byte.
 
 The blob-identity mapping is a disposable optimization, not an identity
 contract. Filesystem writers may mint arbitrary content identities; Git never
@@ -115,7 +134,7 @@ entry bytes, source identity, ordinal order, and cumulative queue accounting.
 A single recursive SQLite cursor performs a depth-first traversal through
 primary-key lookups. It does not read object BLOBs and has no outer sort.
 
-Schema v12 gives each loose or packed tree source one integer `source_key`.
+Each loose or packed tree source has one integer `source_key`.
 Entries use `(source_key, ordinal)` as their primary key, and the effective
 `(repo_id, tree_oid)` row points to that exact source through a matching
 composite foreign key. An explicit incomplete source marker preserves
@@ -212,11 +231,12 @@ or 30 large-file range reads. The retained integration plan stays reserved with
 24 MiB of execution headroom through projection, application, and commit.
 
 Clean divergent merges create a commit with ordered current/incoming parents.
-`commit: false` and conflicts persist schema-v9 merge metadata plus bounded
+`commit: false` and conflicts persist authenticated merge metadata plus bounded
 snapshots for only merge-owned paths. A deterministic integrity identity binds
-every saved parent, option, and snapshot row; unauthenticated v8 pending state is
-cleared during migration. Native `mergeContinue()` and ordinary `commit()`
-finalize the saved parents after all stages are resolved.
+every saved parent, option, origin, and snapshot row. Native `mergeContinue()`
+and ordinary `commit()` finalize the saved parents after all stages are resolved.
+The saved origin determines whether continuation records `merge: commit` or
+`pull: merge`; the caller cannot choose it after restart.
 `mergeAbort()` first reconstructs ownership from the authoritative parents, then
 restores those index/worktree paths and their structural ancestors. Unrelated
 worktree content is preserved, and a structural blocker makes abort fail closed.
@@ -238,8 +258,8 @@ a new committer identity. Revert creates new author and committer identities and
 uses Git-compatible default messages. A caller can override the supported
 message and identity fields through the native `Git` methods.
 
-Conflicts and cherry-pick empty results persist one schema-v11 operation step
-plus bounded snapshots for only replay-owned paths. Continue validates the
+Conflicts and cherry-pick empty results persist one operation-step row plus
+bounded snapshots for only replay-owned paths. Continue validates the
 authoritative source, selected parent, original HEAD, labels, step row, and saved
 path ownership before committing. Skip and abort restore the original index and
 worktree state for those paths and preserve unrelated content. Each recovery
@@ -313,7 +333,8 @@ refusal, dirty-worktree refusal, stale-state error, or integration conflict, whi
 the local branch, index, worktree, and merge state retain merge's atomicity.
 
 Native pull returns `MergeResult`. Conflicts and `commit: false` use the same
-schema-v9 journal as local merge and can be continued or aborted after a restart.
+authenticated journal as local merge and can be continued or aborted after a
+restart.
 The Computer compatibility contract returns `void` and exposes no recovery
 methods, so compatibility pull uses single-shot merge: conflicts roll back local
 integration and report `EMERGEFAIL`, but do not discard fetched objects or the
@@ -321,9 +342,9 @@ tracking ref.
 
 ## Sparse workspace tracking
 
-Schema v7 adds a source-qualified index over raw tree-entry name bytes. Sparse
-hydration can therefore resolve selected paths in loose or complete packed
-trees without scanning either full tree. The lookup still validates each parsed
+A source-qualified index over raw tree-entry name bytes lets sparse hydration
+resolve selected paths in loose or complete packed trees without scanning either
+full tree. The lookup still validates each parsed
 source against its authoritative object and preserves loose-source precedence.
 
 `git_index_state` and `git_index_dirty` form a conservative change journal. An
@@ -410,13 +431,13 @@ validated against an authoritative loose object or complete packed source.
 Cheap affinity, shape, range, and enum checks also reject malformed projection
 writes, but they do not replace read-time source authentication.
 
-Schema v12 migration rebuilds commit and tree projections from authoritative
-loose objects and complete packs; it never copies legacy derived rows. Missing
-or malformed authoritative storage fails with `ECORRUPT`, and a migration that
-cannot complete within 999 executed statements fails with `E2BIG`. The rebuild
-runs in one `transactionSync()` and records v12 only after every source has
-validated, so failure leaves the v11 shape and data intact. Retained migration
-state also remains below the operation-wide 100 MiB ceiling.
+The undeployed Git schema has one version-1 baseline and no upgrade chain.
+Initialization creates the complete current shape in one `transactionSync()`.
+Reopen accepts only version 1 and validates the exact name, type, and SQL of every
+Git schema object before returning. Partial, aliased, oversized, unexpected, or
+unsupported schemas fail closed before creation can mask them. Fresh
+initialization uses 45 statements; exact reopen uses two. Untrusted schema
+metadata is projected through byte bounds and retains less than 100 MiB.
 
 ## Resource limits and open performance work
 

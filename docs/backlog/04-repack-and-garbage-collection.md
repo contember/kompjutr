@@ -1,7 +1,7 @@
 ---
 id: 04
 title: Add incremental repack and garbage collection
-blocked-by: [./12-reflogs-and-ref-recovery.md]
+blocked-by: []
 ---
 
 # 04 — Add incremental repack and garbage collection

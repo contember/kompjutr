@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Bounded reflogs and ref recovery](sprint-2026-08-26-reflogs-and-ref-recovery.md)
+  — transactional ref history, CAS recovery, fixed retention roots, and one
+  undeployed Git schema baseline.
 - [End-to-end journeys](sprint-2026-08-26-e2e-journeys.md)
   — a differential journey harness and six workflow files, plus the six
   divergences from Git they pinned.

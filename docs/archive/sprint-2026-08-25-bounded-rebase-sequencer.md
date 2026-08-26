@@ -243,7 +243,7 @@ not a parallel follow-up.
 - Rebase-based pull. `pull.rebase` remains rejected by
   `src/core/ops/pull.ts`; enabling it needs its own network/config parity scope.
 - Reflogs and recovery of a branch after a completed rebase — backlog
-  [12](../backlog/12-reflogs-and-ref-recovery.md).
+  [12](sprint-2026-08-26-reflogs-and-ref-recovery.md).
 - A repository-wide async operation epoch and full concurrent/restart matrix —
   backlog [16](../backlog/16-concurrent-and-restart-conformance.md). This sprint
   still owns stale-ref checks and restart safety for its journal transitions.
