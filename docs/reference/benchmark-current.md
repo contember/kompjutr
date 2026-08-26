@@ -89,3 +89,83 @@ checksum `312271501c79dd9cb5d888ea75be8b4c9fc13b3b2f2f756bf11f9a1c2b886619`.
 This measurement isolates SQLite layout size and logical query profiles. It is
 `node:sqlite`, not Durable Object SQL, and makes no wall-time or production
 runtime claim.
+
+
+## Clone storage
+
+Measured 2026-08-26 at commit `4f64cf9` with a clean `src` tree, Node v24.4.0
+and SQLite 3.50.2 on Linux 6.17.0-41-generic x64 and an AMD Ryzen 7 PRO 8840HS:
+
+```bash
+npm run bench:clone-storage
+```
+
+The harness re-executes measurement through `cpu-lease run -n 4 --no-smt` and
+verified `Cpus_allowed_list=8,10`, two logical CPUs — one for the client, one
+for the Smart HTTP origin that runs in the same process. A correctness-only run
+uses `npm run bench:clone-storage -- --check` without a lease. Sizes are
+`page_count * page_size`, the quantity `SqlStorage.databaseSize` reports on the
+platform; the baseline is a real `git clone --depth 1` from the same origin,
+counted as apparent bytes per entry. Every run proves its own end state: HEAD,
+index entries and worktree files must match the fixture before a size is
+reported.
+
+| Fixture | Files | SQLite | `.git` | Worktree | git total | SQLite / git | `git.clone` | `git clone` | SQL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `express` | 218 | 1.42 MiB | 229.1 KiB | 688.1 KiB | 917.2 KiB | 1.59× | 175 ms | 86 ms | 74 |
+| `tailwind` | 541 | 7.44 MiB | 1.12 MiB | 5.30 MiB | 6.41 MiB | 1.16× | 260 ms | 146 ms | 86 |
+| `vue` | 1,075 | 14.15 MiB | 2.51 MiB | 9.75 MiB | 12.25 MiB | 1.15× | 484 ms | 244 ms | 103 |
+| `eslint` | 2,358 | 32.70 MiB | 6.61 MiB | 22.47 MiB | 29.08 MiB | 1.12× | 1,130 ms | 506 ms | 150 |
+| `prettier` | 9,329 | 43.91 MiB | 7.99 MiB | 22.93 MiB | 30.92 MiB | 1.42× | 2,554 ms | 912 ms | 262 |
+| `nextjs` | 24,252 | 218.04 MiB | 45.81 MiB | 134.08 MiB | 179.89 MiB | 1.21× | 10,998 ms | 2,906 ms | 813 |
+
+Sizes and statement counts are byte-identical across repeated runs. Wall time is
+not: three leased runs of the same ladder put `nextjs` at 9,715, 10,745 and
+10,998 ms and `eslint` at 1,117, 1,876 and 1,130 ms while every size stayed the
+same. Read the times as a regression signal, not a constant — and never read a
+sub-second improvement out of this column.
+
+Next.js is the row that carries. Its 218.04 MiB is 1.21× what git writes for the
+same shallow clone, and the shape of that overhead is the whole story:
+
+| Group | Allocated | Payload | Overhead | Share |
+| --- | ---: | ---: | ---: | ---: |
+| Working tree (`fs_*`) | 153.55 MiB | 146.79 MiB | 4.4% | 70.4% |
+| Pack (`git_pack_*`) | 45.85 MiB | 45.19 MiB | 1.4% | 21.0% |
+| Tree projection (`git_tree_*`) | 11.45 MiB | 6.50 MiB | 43.2% | 5.3% |
+| Index (`git_index`, `git_blob_ids`) | 7.01 MiB | 6.14 MiB | 12.4% | 3.2% |
+| Repository and schema | 160.0 KiB | 70.5 KiB | 55.9% | 0.1% |
+| **Total** | **218.04 MiB** | **204.69 MiB** | **6.1%** | 100.0% |
+
+The working tree holds the checkout uncompressed, so `fs_chunks` carries
+134.25 MiB of payload against the 134.08 MiB git writes to disk — a filesystem
+is a filesystem either way. The pack is retained verbatim next to it, which is
+why the total is above git's: nothing yet drops the pack after checkout, and
+[repack and garbage collection](../backlog/04-repack-and-garbage-collection.md)
+is where that would change. Derived rows — tree projections, the index and the
+blob-id cache — cost 18.46 MiB, 8.5% of the database, and are the only part a
+plain `.git` does not have an equivalent for. B-tree overhead over the whole
+database is 6.1%; `VACUUM` would reclaim a further 2.9%, and Durable Object SQL
+exposes no `VACUUM`, so treat that as a diagnostic rather than a plan.
+
+Decomposing the same work — `init`, `fetch`, `updateRef`, `checkout`, each into
+its own database — attributes bytes and statements to the two halves:
+
+| Phase | SQL | Rows | DB after | Added |
+| --- | ---: | ---: | ---: | ---: |
+| `git.init` + `remoteAdd` | 11 | 3 | 300.0 KiB | 300.0 KiB |
+| `git.fetch` | 206 | 1,201 | 57.54 MiB | 57.24 MiB |
+| `git.updateRef` | 19 | 7 | 57.54 MiB | 0.0 KiB |
+| `git.checkout` | 1,117 | 155,446 | 218.07 MiB | 160.53 MiB |
+
+This is a decomposition, not the clone path: `clone` takes an initial-checkout
+fast path only a fresh repository can take, which is why it needs 813 statements
+where the decomposed sequence needs 1,353. The decomposed total lands within
+28 KiB of the clone's, so the attribution holds. **A standalone `git.checkout`
+that materialises 24,252 files uses 1,117 statements and exceeds the
+1,000-statement operation budget.** `clone` does not hit it and neither does a
+branch switch in an already-materialised tree — the nextjs workflow's
+`git.checkout main` costs 51 — but a checkout into an empty worktree does.
+
+Generated output goes to `bench/results/clone-storage.{json,md}`, which is
+gitignored. Update this curated snapshot only from a CPU-leased run.
