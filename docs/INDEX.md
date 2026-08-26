@@ -15,14 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md`](sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md)
+  — transactional ref history, bounded recovery APIs, and future GC roots.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Recovery is next: reflogs and ref recovery precede merged-branch deletion and
-  destructive repository maintenance.
+- Recovery is active: reflogs and ref recovery precede merged-branch deletion
+  and destructive repository maintenance.
 
 ## Key reference
 

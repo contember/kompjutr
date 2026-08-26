@@ -19,4 +19,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [Bounded reflogs and ref recovery](sprint-2026-08-26-reflogs-and-ref-recovery.md)
+  — transactional ref history, bounded recovery APIs, and future GC roots.
