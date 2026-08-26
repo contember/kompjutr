@@ -46,6 +46,7 @@ import {
 } from "./blob-id-cache.js";
 import type { SqlDatabase } from "./db.js";
 import { migrateV12 } from "./schema-migration-v12.js";
+import { migrateV13, REFLOG_SCHEMA_STATEMENTS } from "./schema-migration-v13.js";
 
 export {
   createTreeIndexSink,
@@ -58,7 +59,7 @@ export {
   type TreeStorage,
 } from "./tree-index.js";
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 export { MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 
 const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
@@ -169,6 +170,8 @@ const STATEMENTS = [
      target TEXT NOT NULL,
      PRIMARY KEY (repo_id, name)
    )`,
+
+  ...REFLOG_SCHEMA_STATEMENTS,
 
   // Dotted config path ("user.email", "remote.origin.url"). `seq` keeps
   // multi-valued keys ordered the way a config file would.
@@ -1110,9 +1113,17 @@ const V12_REQUIRED_TABLES = [
   "git_tree_effective",
 ];
 
+const V13_REQUIRED_TABLES = [...V12_REQUIRED_TABLES, "git_reflog_state", "git_reflog_entries"];
+
 function requireExistingSchema(db: SqlDatabase, version: number): void {
   const required =
-    version === 12 ? V12_REQUIRED_TABLES : version === 11 ? V11_REQUIRED_TABLES : ["git_objects"];
+    version === 13
+      ? V13_REQUIRED_TABLES
+      : version === 12
+        ? V12_REQUIRED_TABLES
+        : version === 11
+          ? V11_REQUIRED_TABLES
+          : ["git_objects"];
   const found = new Set<string>();
   for (const row of db.iterate(
     "SELECT name FROM sqlite_schema WHERE type = 'table' AND name GLOB 'git_*'",
@@ -1185,6 +1196,7 @@ function migrate(db: SqlDatabase, from: number): void {
   }
   if (from === 10) migrateV10OperationJournal(db);
   if (from < 12) migrateV12(db, STATEMENTS);
+  if (from < 13) migrateV13(db);
 }
 
 export function initializeGitSchema(db: SqlDatabase): void {
@@ -1230,6 +1242,7 @@ export function initializeGitSchema(db: SqlDatabase): void {
     if (previous !== undefined) requireExistingSchema(bounded, previous);
 
     const hasLegacyV11Shape = previous !== undefined && previous < 12;
+    const hasLegacyV12Shape = previous !== undefined && previous < 13;
     for (const statement of STATEMENTS) {
       if (
         hasLegacyV11Shape &&
@@ -1237,6 +1250,7 @@ export function initializeGitSchema(db: SqlDatabase): void {
       ) {
         continue;
       }
+      if (hasLegacyV12Shape && REFLOG_SCHEMA_STATEMENTS.includes(statement)) continue;
       bounded.run(statement);
     }
 

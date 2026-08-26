@@ -77,6 +77,16 @@ export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_CACHED_CONTENT_ID_BYTES } from "./blob-id-cache.js";
 import { initializeGitSchema } from "./schema.js";
+import {
+  MAX_REFLOG_IDENTITY_BYTES,
+  MAX_REFLOG_ORDINAL,
+  MAX_REFLOG_RAW_TARGET_BYTES,
+  MAX_REFLOG_REASON_BYTES,
+  MAX_REFLOG_REF_BYTES,
+  MAX_REFLOG_STATE_BYTES,
+  MAX_REFLOG_STATE_ROWS,
+  MAX_REFLOG_TIMEZONE_MINUTES,
+} from "./schema-migration-v13.js";
 import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
 import {
   iterateTree,
@@ -141,10 +151,21 @@ const INITIAL_BLOB_ROW_JSON_BYTES = 96;
 const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 
 const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
+const REFLOG_RETENTION_SECONDS = 90 * 24 * 60 * 60;
+const REFLOG_RETENTION_ROWS = 1_024;
+const MAX_REF_MUTATION_INPUTS = 100_000;
+const REF_ROW_RETAINED_BYTES = 256;
+const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
+const REF_MUTATION_EVENT_RETAINED_BYTES = 2_048;
+const REF_MUTATION_SQL_HEADROOM_BYTES = 8 * 1024 * 1024;
+export const MAX_REF_MUTATION_RETAINED_BYTES = 64 * 1024 * 1024;
+export const REF_MUTATION_FIXED_RETAINED_BYTES =
+  REF_MUTATION_SQL_HEADROOM_BYTES + REF_ROW_RETAINED_BYTES + 2 * MAX_REFLOG_RAW_TARGET_BYTES;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
   objectCacheBytes?: number;
+  /** Clock in milliseconds since the Unix epoch. */
   now?: () => number;
 }
 
@@ -157,6 +178,65 @@ export interface RepositoryRow {
 export interface RefRow {
   name: string;
   target: string;
+}
+
+export interface RefLogActor {
+  name: string;
+  email: string;
+}
+
+export interface RefLogMetadata {
+  actor: RefLogActor | null;
+  reason: string;
+  timestamp: number;
+  timezoneOffset: number;
+}
+
+interface RefMutationExpected {
+  name: string;
+  target: string | null;
+}
+
+export interface RefMutation {
+  puts?: Iterable<RefRow>;
+  deletes?: Iterable<string>;
+  head?: string;
+  expected?: RefMutationExpected;
+}
+
+interface StoredRefLogEntry {
+  refName: string;
+  ordinal: number;
+  oldRaw: string | null;
+  newRaw: string | null;
+  oldOid: string | null;
+  newOid: string | null;
+  actor: RefLogActor | null;
+  timestamp: number;
+  timezoneOffset: number;
+  reason: string;
+}
+
+interface RefLogEvent {
+  refName: string;
+  ordinal: number;
+  oldRaw: string | null;
+  newRaw: string | null;
+  oldOid: string | null;
+  newOid: string | null;
+  actorName: string | null;
+  actorEmail: string | null;
+  timestamp: number;
+  timezoneOffset: number;
+  reason: string;
+}
+
+interface NormalizedRefMutation {
+  puts: Map<string, string>;
+  deletes: Set<string>;
+  head: string | undefined;
+  expected: RefMutationExpected | undefined;
+  budget: RefMutationBudget;
 }
 
 export interface IndexEntry {
@@ -549,6 +629,342 @@ function* jsonPages<T>(items: Iterable<T>, label: string): Generator<string> {
     rows.push(row);
   }
   if (rows.length > 0) yield `[${rows.join(",")}]`;
+}
+
+function invalidRefValue(source: "input" | "stored", message: string): never {
+  if (source === "stored") throw new CorruptError(message);
+  throw new GitError("EINVAL", message);
+}
+
+function boundedRefText(
+  value: string,
+  label: string,
+  limit: number,
+  source: "input" | "stored",
+): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit === 0 || unit === 0x0a || unit === 0x0d) {
+      invalidRefValue(source, `${label} contains an invalid character`);
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) {
+        invalidRefValue(source, `${label} is not canonical UTF-16`);
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      invalidRefValue(source, `${label} is not canonical UTF-16`);
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+    if (bytes > limit) {
+      if (source === "stored") throw new CorruptError(`${label} exceeds its stored byte bound`);
+      throw new GitError("E2BIG", `${label} exceeds ${limit} UTF-8 bytes`);
+    }
+  }
+  return bytes;
+}
+
+function requireRefName(
+  value: unknown,
+  label: string,
+  source: "input" | "stored",
+  allowHead = false,
+): string {
+  if (typeof value !== "string" || value === "" || (!allowHead && value === "HEAD")) {
+    invalidRefValue(source, `${label} is invalid`);
+  }
+  boundedRefText(value, label, MAX_REFLOG_REF_BYTES, source);
+  return value;
+}
+
+function rawSymbolicTarget(value: string): string | null {
+  if (!value.startsWith("ref: ")) return null;
+  const target = value.slice(5);
+  if (target === "" || target === "HEAD" || target.startsWith("ref: ")) return null;
+  return target;
+}
+
+function requireRawRefTarget(value: unknown, label: string, source: "input" | "stored"): string {
+  if (typeof value !== "string" || value === "") {
+    invalidRefValue(source, `${label} is invalid`);
+  }
+  boundedRefText(value, label, MAX_REFLOG_RAW_TARGET_BYTES, source);
+  if (isOid(value)) return value;
+  const symbolic = rawSymbolicTarget(value);
+  if (symbolic === null) invalidRefValue(source, `${label} is not an OID or symbolic ref`);
+  requireRefName(symbolic, `${label} symbolic ref`, source);
+  return value;
+}
+
+function requireNullableRawRefTarget(value: unknown, label: string): string | null {
+  return value === null ? null : requireRawRefTarget(value, label, "stored");
+}
+
+function requireNullableRefLogOid(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== "string" || !isOid(value)) {
+    throw new CorruptError(`${label} is not a valid object id`);
+  }
+  return value;
+}
+
+function requireStoredRefLogEndpoint(
+  rawValue: unknown,
+  oidValue: unknown,
+  label: string,
+): { raw: string | null; oid: string | null } {
+  const raw = requireNullableRawRefTarget(rawValue, `reflog ${label} raw target`);
+  const oid = requireNullableRefLogOid(oidValue, `reflog ${label} OID`);
+  if (raw === null) {
+    if (oid !== null) throw new CorruptError(`reflog ${label} absent endpoint has an OID`);
+    return { raw, oid };
+  }
+  if (isOid(raw)) {
+    if (oid !== raw) throw new CorruptError(`reflog ${label} direct endpoint OID does not match`);
+    return { raw, oid };
+  }
+  if (rawSymbolicTarget(raw) === null) {
+    throw new CorruptError(`reflog ${label} symbolic endpoint is invalid`);
+  }
+  return { raw, oid };
+}
+
+function requireSafeRefLogInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw new CorruptError(`${label} is not a bounded safe integer`);
+  }
+  return value;
+}
+
+function requireRefLogIdentityText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new CorruptError(`${label} is invalid`);
+  }
+  boundedRefText(value, label, MAX_REFLOG_IDENTITY_BYTES, "stored");
+  return value;
+}
+
+function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number): StoredRefLogEntry {
+  if (row.repo_id !== repoId) throw new CorruptError("reflog row belongs to another repository");
+  const refName = requireRefName(row.ref_name, "reflog ref name", "stored", true);
+  const ordinal = requireSafeRefLogInteger(row.ordinal, "reflog ordinal", 1, MAX_REFLOG_ORDINAL);
+  const oldEndpoint = requireStoredRefLogEndpoint(row.old_raw, row.old_oid, "old");
+  const newEndpoint = requireStoredRefLogEndpoint(row.new_raw, row.new_oid, "new");
+  if (
+    refName !== "HEAD" &&
+    oldEndpoint.raw === newEndpoint.raw &&
+    oldEndpoint.oid === newEndpoint.oid
+  ) {
+    throw new CorruptError("reflog row does not change either endpoint");
+  }
+  let actor: RefLogActor | null;
+  if (row.actor_name === null && row.actor_email === null) {
+    actor = null;
+  } else if (row.actor_name !== null && row.actor_email !== null) {
+    actor = {
+      name: requireRefLogIdentityText(row.actor_name, "reflog actor name"),
+      email: requireRefLogIdentityText(row.actor_email, "reflog actor email"),
+    };
+  } else {
+    throw new CorruptError("reflog actor is incomplete");
+  }
+  const timestamp = requireSafeRefLogInteger(
+    row.timestamp,
+    "reflog timestamp",
+    0,
+    MAX_REFLOG_ORDINAL,
+  );
+  const timezoneOffset = requireSafeRefLogInteger(
+    row.timezone,
+    "reflog timezone",
+    -MAX_REFLOG_TIMEZONE_MINUTES,
+    MAX_REFLOG_TIMEZONE_MINUTES,
+  );
+  if (typeof row.reason !== "string" || row.reason === "") {
+    throw new CorruptError("reflog reason is invalid");
+  }
+  boundedRefText(row.reason, "reflog reason", MAX_REFLOG_REASON_BYTES, "stored");
+  return {
+    refName,
+    ordinal,
+    oldRaw: oldEndpoint.raw,
+    newRaw: newEndpoint.raw,
+    oldOid: oldEndpoint.oid,
+    newOid: newEndpoint.oid,
+    actor,
+    timestamp,
+    timezoneOffset,
+    reason: row.reason,
+  };
+}
+
+function validateRefLogMetadata(metadata: RefLogMetadata): RefLogMetadata {
+  if (
+    !Number.isSafeInteger(metadata.timestamp) ||
+    metadata.timestamp < 0 ||
+    metadata.timestamp > MAX_REFLOG_ORDINAL
+  ) {
+    throw new GitError("EINVAL", "reflog timestamp must be a safe nonnegative epoch second");
+  }
+  if (
+    !Number.isSafeInteger(metadata.timezoneOffset) ||
+    metadata.timezoneOffset < -MAX_REFLOG_TIMEZONE_MINUTES ||
+    metadata.timezoneOffset > MAX_REFLOG_TIMEZONE_MINUTES
+  ) {
+    throw new GitError("EINVAL", "reflog timezone offset is outside its bounded range");
+  }
+  if (typeof metadata.reason !== "string" || metadata.reason === "") {
+    throw new GitError("EINVAL", "reflog reason is required");
+  }
+  boundedRefText(metadata.reason, "reflog reason", MAX_REFLOG_REASON_BYTES, "input");
+  if (metadata.actor !== null) {
+    if (metadata.actor.name === "" || metadata.actor.email === "") {
+      throw new GitError("EINVAL", "reflog actor name and email are required together");
+    }
+    boundedRefText(metadata.actor.name, "reflog actor name", MAX_REFLOG_IDENTITY_BYTES, "input");
+    boundedRefText(metadata.actor.email, "reflog actor email", MAX_REFLOG_IDENTITY_BYTES, "input");
+  }
+  return metadata;
+}
+
+class RefMutationBudget {
+  #retained = REF_MUTATION_FIXED_RETAINED_BYTES;
+
+  charge(bytes: number): void {
+    if (
+      !Number.isSafeInteger(bytes) ||
+      bytes < 0 ||
+      bytes > MAX_REF_MUTATION_RETAINED_BYTES - this.#retained
+    ) {
+      throw new GitError("E2BIG", "ref mutation exceeds its 64 MiB retained-memory bound");
+    }
+    this.#retained += bytes;
+  }
+}
+
+export function refMutationCreateRetainedBytes(row: RefRow): number {
+  const name = requireRefName(row.name, "updated ref name", "input");
+  const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
+  const nameBytes = boundedRefText(name, "updated ref name", MAX_REFLOG_REF_BYTES, "input");
+  const targetBytes = boundedRefText(
+    target,
+    `target of ${name}`,
+    MAX_REFLOG_RAW_TARGET_BYTES,
+    "input",
+  );
+  return (
+    REF_MUTATION_ITEM_RETAINED_BYTES +
+    REF_MUTATION_EVENT_RETAINED_BYTES +
+    4 * (nameBytes + targetBytes)
+  );
+}
+
+function normalizeRefMutation(mutation: RefMutation): NormalizedRefMutation {
+  const puts = new Map<string, string>();
+  const deletes = new Set<string>();
+  const budget = new RefMutationBudget();
+  let inputs = 0;
+  const charge = (nameBytes: number, targetBytes = 0): void => {
+    inputs++;
+    if (inputs > MAX_REF_MUTATION_INPUTS) {
+      throw new GitError("E2BIG", "ref mutation exceeds its retained input count bound");
+    }
+    budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + nameBytes * 2 + targetBytes * 2);
+  };
+  for (const value of mutation.deletes ?? []) {
+    const name = requireRefName(value, "deleted ref name", "input");
+    charge(boundedRefText(name, "deleted ref name", MAX_REFLOG_REF_BYTES, "input"));
+    deletes.add(name);
+  }
+  for (const row of mutation.puts ?? []) {
+    if (typeof row !== "object" || row === null) {
+      throw new GitError("EINVAL", "ref update row is invalid");
+    }
+    const name = requireRefName(row.name, "updated ref name", "input");
+    const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
+    charge(
+      boundedRefText(name, "updated ref name", MAX_REFLOG_REF_BYTES, "input"),
+      boundedRefText(target, `target of ${name}`, MAX_REFLOG_RAW_TARGET_BYTES, "input"),
+    );
+    puts.set(name, target);
+  }
+  const head =
+    mutation.head === undefined
+      ? undefined
+      : requireRawRefTarget(mutation.head, "HEAD target", "input");
+  if (head !== undefined) {
+    charge(4, boundedRefText(head, "HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "input"));
+  }
+  let expected: RefMutationExpected | undefined;
+  if (mutation.expected !== undefined) {
+    const name = requireRefName(mutation.expected.name, "conditional ref name", "input");
+    const nameBytes = boundedRefText(name, "conditional ref name", MAX_REFLOG_REF_BYTES, "input");
+    const target =
+      mutation.expected.target === null
+        ? null
+        : requireRawRefTarget(mutation.expected.target, `expected target of ${name}`, "input");
+    const targetBytes =
+      target === null
+        ? 0
+        : boundedRefText(
+            target,
+            `expected target of ${name}`,
+            MAX_REFLOG_RAW_TARGET_BYTES,
+            "input",
+          );
+    budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + 2 * (nameBytes + targetBytes));
+    expected = { name, target };
+    if (!puts.has(name)) {
+      throw new GitError("EINVAL", "conditional ref update must include its destination put");
+    }
+  }
+  return { puts, deletes, head, expected, budget };
+}
+
+function resolveRawRef(raw: string | null, lookup: (name: string) => string | null): string | null {
+  let value = raw;
+  const seen = new Set<string>();
+  for (let hops = 0; hops < 8; hops++) {
+    if (value === null) return null;
+    if (isOid(value)) return value;
+    const target = rawSymbolicTarget(value);
+    if (target === null) throw new CorruptError("stored ref target has an invalid shape");
+    if (seen.has(target)) return null;
+    seen.add(target);
+    value = lookup(target);
+  }
+  return null;
+}
+
+function refLogEventRetainedBytes(
+  refName: string,
+  oldRaw: string | null,
+  newRaw: string | null,
+): number {
+  const refBytes = boundedRefText(refName, "reflog ref name", MAX_REFLOG_REF_BYTES, "input");
+  const oldBytes =
+    oldRaw === null
+      ? 0
+      : boundedRefText(oldRaw, "reflog old raw target", MAX_REFLOG_RAW_TARGET_BYTES, "input");
+  const newBytes =
+    newRaw === null
+      ? 0
+      : boundedRefText(newRaw, "reflog new raw target", MAX_REFLOG_RAW_TARGET_BYTES, "input");
+  return REF_MUTATION_EVENT_RETAINED_BYTES + 2 * (refBytes + oldBytes + newBytes);
 }
 
 function serializeIndexMutation(
@@ -1235,6 +1651,7 @@ export class SqliteGitDatabase {
 
   create(root: string, head: string): RepositoryRow {
     const normalized = normalizeRoot(root);
+    const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     return this.#db.transactionSync(() => {
       const nextId =
         (this.#db.scalar<number | null>("SELECT MAX(id) FROM git_repositories") ?? 0) + 1;
@@ -1242,9 +1659,10 @@ export class SqliteGitDatabase {
         "INSERT INTO git_repositories (id, root, head) VALUES (?, ?, ?)",
         nextId,
         normalized,
-        head,
+        checkedHead,
       );
-      return { id: nextId, root: normalized, head };
+      this.#db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)", nextId);
+      return { id: nextId, root: normalized, head: checkedHead };
     });
   }
 
@@ -1284,6 +1702,7 @@ export class RepoStore {
   #cacheGeneration = 0;
   #hasLoose: boolean;
   readonly #onDestroy: (() => void) | undefined;
+  readonly #now: () => number;
 
   constructor(
     db: SqlDatabase,
@@ -1296,6 +1715,7 @@ export class RepoStore {
     onDestroy?: () => void,
   ) {
     this.#onDestroy = onDestroy;
+    this.#now = options.now ?? Date.now;
     this.#db = db;
     this.#repoId = repository.id;
     this.#root = repository.root;
@@ -2551,12 +2971,7 @@ export class RepoStore {
       this.setHead(target);
       return;
     }
-    this.#db.run(
-      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, ?, ?) ON CONFLICT(repo_id, name) DO UPDATE SET target = excluded.target",
-      this.#repoId,
-      name,
-      target,
-    );
+    this.mutateRefs({ puts: [{ name, target }] }, this.#genericRefLogMetadata("ref update"));
   }
 
   /** Move one direct ref only if it still contains the caller's observed OID. */
@@ -2564,40 +2979,189 @@ export class RepoStore {
     if (name === "HEAD" || !isOid(expectedOid) || !isOid(targetOid)) {
       throw new GitError("EINVAL", "conditional ref update requires a direct ref and full OIDs");
     }
-    const row = this.#db.one<{ name: unknown; target: unknown }>(
-      `UPDATE git_refs SET target = ?
-        WHERE repo_id = ? AND name = ? AND target = ?
-        RETURNING name, target`,
-      targetOid,
-      this.#repoId,
-      name,
-      expectedOid,
+    this.mutateRefs(
+      {
+        puts: [{ name, target: targetOid }],
+        expected: { name, target: expectedOid },
+      },
+      this.#genericRefLogMetadata("conditional ref update"),
     );
-    if (row === undefined) {
-      throw new GitError("ESTALEHEAD", `ref ${name} changed before conditional update`);
-    }
-    if (typeof row.name !== "string" || typeof row.target !== "string") {
-      throw new CorruptError("conditional ref update returned invalid SQL fields");
-    }
-    if (row.name !== name || row.target !== targetOid) {
-      throw new CorruptError("conditional ref update returned an unexpected row");
-    }
   }
 
   deleteRef(name: string): void {
-    this.#db.run("DELETE FROM git_refs WHERE repo_id = ? AND name = ?", this.#repoId, name);
+    this.mutateRefs({ deletes: [name] }, this.#genericRefLogMetadata("ref delete"));
   }
 
   /** Apply bounded ref deletions and updates atomically. */
   updateRefs(puts: Iterable<RefRow>, deletes: Iterable<string> = []): void {
-    const checkedPuts = function* (): Generator<RefRow> {
-      for (const row of puts) {
-        if (row.name === "HEAD") throw new GitError("EINVAL", "HEAD is not a git_refs row");
-        yield row;
-      }
-    };
+    this.mutateRefs({ puts, deletes }, this.#genericRefLogMetadata("ref batch update"));
+  }
+
+  /** Apply current ref state and its bounded history through one atomic seam. */
+  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): void {
+    const normalized = normalizeRefMutation(mutation);
+    const checkedMetadata = validateRefLogMetadata(metadata);
     this.#db.transactionSync(() => {
-      for (const page of jsonPages(deletes, "ref deletion")) {
+      const header = this.#db.one<{
+        head: unknown;
+        next_ordinal: unknown;
+        latest_ordinal: unknown;
+      }>(
+        `SELECT repository.head, state.next_ordinal,
+                (SELECT max(entry.ordinal) FROM git_reflog_entries entry
+                  WHERE entry.repo_id = repository.id) AS latest_ordinal
+           FROM git_repositories repository
+           JOIN git_reflog_state state ON state.repo_id = repository.id
+          WHERE repository.id = ?`,
+        this.#repoId,
+      );
+      if (header === undefined) {
+        throw new CorruptError("repository is missing its reflog state");
+      }
+      const oldHead = requireRawRefTarget(header.head, "stored HEAD target", "stored");
+      const nextOrdinal = requireSafeRefLogInteger(
+        header.next_ordinal,
+        "reflog next ordinal",
+        0,
+        MAX_REFLOG_ORDINAL,
+      );
+      if (
+        (nextOrdinal === 0 && header.latest_ordinal !== null) ||
+        (nextOrdinal !== 0 && header.latest_ordinal !== nextOrdinal)
+      ) {
+        throw new CorruptError("reflog state does not match its newest entry");
+      }
+
+      const before = new Map<string, string>();
+      let rows = 0;
+      let retainedBytes = REF_ROW_RETAINED_BYTES + oldHead.length * 2;
+      let previousName: string | null = null;
+      for (const row of this.#db.iterate(
+        "SELECT repo_id, name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
+        this.#repoId,
+      )) {
+        if (row.repo_id !== this.#repoId) {
+          throw new CorruptError("ref state query crossed repository boundaries");
+        }
+        const name = requireRefName(row.name, "stored ref name", "stored");
+        const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
+        if (previousName !== null && comparePaths(previousName, name) >= 0) {
+          throw new CorruptError("stored refs are not in strict Git byte order");
+        }
+        previousName = name;
+        rows++;
+        retainedBytes += REF_ROW_RETAINED_BYTES + name.length * 2 + target.length * 2;
+        if (rows > MAX_REFLOG_STATE_ROWS || retainedBytes > MAX_REFLOG_STATE_BYTES) {
+          throw new GitError("E2BIG", "repository ref state exceeds its retained bound");
+        }
+        normalized.budget.charge(
+          REF_ROW_RETAINED_BYTES +
+            2 *
+              (boundedRefText(name, "stored ref name", MAX_REFLOG_REF_BYTES, "stored") +
+                boundedRefText(
+                  target,
+                  `stored target of ${name}`,
+                  MAX_REFLOG_RAW_TARGET_BYTES,
+                  "stored",
+                )),
+        );
+        before.set(name, target);
+      }
+
+      const beforeTarget = (name: string): string | null => before.get(name) ?? null;
+      if (
+        normalized.expected !== undefined &&
+        beforeTarget(normalized.expected.name) !== normalized.expected.target
+      ) {
+        throw new GitError(
+          "ESTALEHEAD",
+          `ref ${normalized.expected.name} changed before conditional update`,
+        );
+      }
+
+      const afterTarget = (name: string): string | null => {
+        const put = normalized.puts.get(name);
+        if (put !== undefined) return put;
+        if (normalized.deletes.has(name)) return null;
+        return beforeTarget(name);
+      };
+      const newHead = normalized.head ?? oldHead;
+
+      const changedNames = new Set<string>();
+      for (const name of normalized.deletes) {
+        const oldRaw = beforeTarget(name);
+        const newRaw = afterTarget(name);
+        if (oldRaw !== newRaw && !changedNames.has(name)) {
+          normalized.budget.charge(refLogEventRetainedBytes(name, oldRaw, newRaw));
+          changedNames.add(name);
+        }
+      }
+      for (const name of normalized.puts.keys()) {
+        const oldRaw = beforeTarget(name);
+        const newRaw = afterTarget(name);
+        if (oldRaw !== newRaw && !changedNames.has(name)) {
+          normalized.budget.charge(refLogEventRetainedBytes(name, oldRaw, newRaw));
+          changedNames.add(name);
+        }
+      }
+      const orderedNames = [...changedNames].sort(comparePaths);
+      const pending: Omit<RefLogEvent, "ordinal">[] = [];
+      for (const name of orderedNames) {
+        const oldRaw = beforeTarget(name);
+        const newRaw = afterTarget(name);
+        const oldOid = resolveRawRef(oldRaw, beforeTarget);
+        const newOid = resolveRawRef(newRaw, afterTarget);
+        pending.push({
+          refName: name,
+          oldRaw,
+          newRaw,
+          oldOid,
+          newOid,
+          actorName: checkedMetadata.actor?.name ?? null,
+          actorEmail: checkedMetadata.actor?.email ?? null,
+          timestamp: checkedMetadata.timestamp,
+          timezoneOffset: checkedMetadata.timezoneOffset,
+          reason: checkedMetadata.reason,
+        });
+      }
+      const oldHeadOid = resolveRawRef(oldHead, beforeTarget);
+      const newHeadOid = resolveRawRef(newHead, afterTarget);
+      const checkedOutRef = rawSymbolicTarget(oldHead);
+      const causalHeadChange = checkedOutRef !== null && changedNames.has(checkedOutRef);
+      if (oldHead !== newHead || oldHeadOid !== newHeadOid || causalHeadChange) {
+        normalized.budget.charge(refLogEventRetainedBytes("HEAD", oldHead, newHead));
+        pending.push({
+          refName: "HEAD",
+          oldRaw: oldHead,
+          newRaw: newHead,
+          oldOid: oldHeadOid,
+          newOid: newHeadOid,
+          actorName: checkedMetadata.actor?.name ?? null,
+          actorEmail: checkedMetadata.actor?.email ?? null,
+          timestamp: checkedMetadata.timestamp,
+          timezoneOffset: checkedMetadata.timezoneOffset,
+          reason: checkedMetadata.reason,
+        });
+      }
+      if (pending.length === 0) return;
+      if (pending.length > MAX_REFLOG_ORDINAL - nextOrdinal) {
+        throw new GitError("E2BIG", "repository reflog ordinal is exhausted");
+      }
+
+      const events: RefLogEvent[] = pending.map((event, index) => ({
+        ...event,
+        ordinal: nextOrdinal + index + 1,
+      }));
+      const deleted = events
+        .filter((event) => event.refName !== "HEAD" && event.newRaw === null)
+        .map((event) => event.refName);
+      const put: RefRow[] = [];
+      for (const event of events) {
+        if (event.refName !== "HEAD" && event.newRaw !== null) {
+          put.push({ name: event.refName, target: event.newRaw });
+        }
+      }
+      for (const page of jsonPages(deleted, "ref deletion")) {
         this.#db.run(
           `DELETE FROM git_refs
             WHERE repo_id = ? AND name IN (SELECT value FROM json_each(?))`,
@@ -2605,13 +3169,75 @@ export class RepoStore {
           page,
         );
       }
-      for (const page of jsonPages(checkedPuts(), "ref update")) {
+      for (const page of jsonPages(put, "ref update")) {
         this.#db.run(
           `INSERT INTO git_refs (repo_id, name, target)
            SELECT ?, json_extract(value, '$.name'), json_extract(value, '$.target')
              FROM json_each(?)
             WHERE true
            ON CONFLICT(repo_id, name) DO UPDATE SET target = excluded.target`,
+          this.#repoId,
+          page,
+        );
+      }
+      if (newHead !== oldHead) {
+        this.#db.run("UPDATE git_repositories SET head = ? WHERE id = ?", newHead, this.#repoId);
+      }
+      for (const page of jsonPages(events, "reflog entry")) {
+        this.#db.run(
+          `INSERT INTO git_reflog_entries
+             (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+              actor_name, actor_email, timestamp, timezone, reason)
+           SELECT ?,
+                  json_extract(value, '$.refName'),
+                  json_extract(value, '$.ordinal'),
+                  json_extract(value, '$.oldRaw'),
+                  json_extract(value, '$.newRaw'),
+                  json_extract(value, '$.oldOid'),
+                  json_extract(value, '$.newOid'),
+                  json_extract(value, '$.actorName'),
+                  json_extract(value, '$.actorEmail'),
+                  json_extract(value, '$.timestamp'),
+                  json_extract(value, '$.timezoneOffset'),
+                  json_extract(value, '$.reason')
+             FROM json_each(?)`,
+          this.#repoId,
+          page,
+        );
+      }
+      const finalOrdinal = nextOrdinal + events.length;
+      const state = this.#db.one<{ next_ordinal: unknown }>(
+        `UPDATE git_reflog_state SET next_ordinal = ?
+          WHERE repo_id = ? AND next_ordinal = ?
+          RETURNING next_ordinal`,
+        finalOrdinal,
+        this.#repoId,
+        nextOrdinal,
+      );
+      if (state === undefined || state.next_ordinal !== finalOrdinal) {
+        throw new CorruptError("reflog state changed during atomic ref mutation");
+      }
+
+      const cutoff = Math.max(0, checkedMetadata.timestamp - REFLOG_RETENTION_SECONDS);
+      this.#db.run(
+        "DELETE FROM git_reflog_entries WHERE repo_id = ? AND timestamp < ?",
+        this.#repoId,
+        cutoff,
+      );
+      const touched = events.map((event) => event.refName);
+      for (const page of jsonPages(touched, "reflog retention ref")) {
+        this.#db.run(
+          `DELETE FROM git_reflog_entries AS entry
+            WHERE entry.repo_id = ?
+              AND entry.ref_name IN (SELECT value FROM json_each(?))
+              AND entry.ordinal < coalesce((
+                SELECT retained.ordinal
+                  FROM git_reflog_entries retained INDEXED BY git_reflog_entries_by_ref
+                 WHERE retained.repo_id = entry.repo_id
+                   AND retained.ref_name = entry.ref_name
+                 ORDER BY retained.ordinal DESC
+                 LIMIT 1 OFFSET ${REFLOG_RETENTION_ROWS - 1}
+              ), 0)`,
           this.#repoId,
           page,
         );
@@ -2642,7 +3268,43 @@ export class RepoStore {
   }
 
   setHead(value: string): void {
-    this.#db.run("UPDATE git_repositories SET head = ? WHERE id = ?", value, this.#repoId);
+    this.mutateRefs({ head: value }, this.#genericRefLogMetadata("HEAD update"));
+  }
+
+  /** Active stored entries for one ref, newest first. */
+  reflog(refName: string): StoredRefLogEntry[] {
+    const name = requireRefName(refName, "reflog ref name", "input", true);
+    const now = this.#nowSeconds();
+    if (!Number.isSafeInteger(now) || now < 0 || now > MAX_REFLOG_ORDINAL) {
+      throw new GitError("EINVAL", "reflog clock must return a safe nonnegative epoch time");
+    }
+    const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
+    const entries: StoredRefLogEntry[] = [];
+    let scanned = 0;
+    let previousOrdinal: number | null = null;
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+              actor_name, actor_email, timestamp, timezone, reason
+         FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
+        WHERE repo_id = ? AND ref_name = ?
+        ORDER BY ordinal DESC
+        LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
+      this.#repoId,
+      name,
+    )) {
+      const entry = requireStoredRefLogEntry(row, this.#repoId);
+      if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
+      if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
+        throw new CorruptError("reflog entries are not in strict descending ordinal order");
+      }
+      previousOrdinal = entry.ordinal;
+      scanned++;
+      if (scanned > REFLOG_RETENTION_ROWS) {
+        throw new CorruptError("reflog physical count retention is not enforced");
+      }
+      if (entry.timestamp >= cutoff) entries.push(entry);
+    }
+    return entries;
   }
 
   // -- config ---------------------------------------------------------
@@ -3900,6 +4562,19 @@ export class RepoStore {
     });
   }
 
+  #nowSeconds(): number {
+    return Math.floor(this.#now() / 1_000);
+  }
+
+  #genericRefLogMetadata(reason: string): RefLogMetadata {
+    return {
+      actor: null,
+      reason,
+      timestamp: this.#nowSeconds(),
+      timezoneOffset: 0,
+    };
+  }
+
   // -- lifecycle ------------------------------------------------------
 
   /** Drop every row belonging to this repository. */
@@ -3911,6 +4586,7 @@ export class RepoStore {
         "git_operation_touched",
         "git_operation_steps",
         "git_operation_state",
+        "git_reflog_entries",
         "git_refs",
         "git_blob_ids",
         "git_blob_id_state",
@@ -3926,6 +4602,7 @@ export class RepoStore {
         "git_pack_data",
         "git_pack_objects",
         "git_pack_pending",
+        "git_reflog_state",
       ]) {
         this.#db.run(`DELETE FROM ${table} WHERE repo_id = ?`, this.#repoId);
       }

@@ -25,6 +25,7 @@ import { initializeGitSchema, SCHEMA_VERSION } from "../src/sqlite/schema.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { createFrozenV11Schema } from "./helpers/schema-v11.js";
+import { createFrozenV12Schema } from "./helpers/schema-v12.js";
 
 /** The v1 schema, as it shipped: no git_blob_ids, no git_commits, no `stored`. */
 function createV1(db: TestDatabase): void {
@@ -146,11 +147,19 @@ function createV10OperationStateTable(db: TestDatabase): void {
   )`);
 }
 
+function setHistoricalGitVersion(db: TestDatabase, version: number): void {
+  db.run("DROP INDEX IF EXISTS git_reflog_entries_by_timestamp");
+  db.run("DROP INDEX IF EXISTS git_reflog_entries_by_ref");
+  db.run("DROP TABLE IF EXISTS git_reflog_entries");
+  db.run("DROP TABLE IF EXISTS git_reflog_state");
+  db.run("UPDATE git_meta SET value = ? WHERE key = 'schema_version'", String(version));
+}
+
 function finishV10Downgrade(db: TestDatabase): void {
   db.run("DROP TABLE git_operation_steps");
   db.run("DROP TABLE git_operation_state");
   db.run("ALTER TABLE git_operation_state_v10 RENAME TO git_operation_state");
-  db.run("UPDATE git_meta SET value = '10' WHERE key = 'schema_version'");
+  setHistoricalGitVersion(db, 10);
 }
 
 function downgradeReplayJournalToV10(
@@ -411,6 +420,45 @@ describe("git schema", () => {
       "complete",
     ]);
     expect(columnsOf(db, "git_index_dirty")).toEqual(["repo_id", "path", "flags"]);
+    expect(columnsOf(db, "git_reflog_state")).toEqual(["repo_id", "next_ordinal"]);
+    expect(columnsOf(db, "git_reflog_entries")).toEqual([
+      "repo_id",
+      "ref_name",
+      "ordinal",
+      "old_raw",
+      "new_raw",
+      "old_oid",
+      "new_oid",
+      "actor_name",
+      "actor_email",
+      "timestamp",
+      "timezone",
+      "reason",
+    ]);
+    expect(
+      db
+        .all<{ table: string; from: string; to: string; on_delete: string }>(
+          "PRAGMA foreign_key_list(git_reflog_state)",
+        )
+        .map((row) => ({
+          table: row.table,
+          from: row.from,
+          to: row.to,
+          onDelete: row.on_delete,
+        })),
+    ).toEqual([{ table: "git_repositories", from: "repo_id", to: "id", onDelete: "CASCADE" }]);
+    expect(
+      db
+        .all<{ table: string; from: string; to: string; on_delete: string }>(
+          "PRAGMA foreign_key_list(git_reflog_entries)",
+        )
+        .map((row) => ({
+          table: row.table,
+          from: row.from,
+          to: row.to,
+          onDelete: row.on_delete,
+        })),
+    ).toEqual([{ table: "git_reflog_state", from: "repo_id", to: "repo_id", onDelete: "CASCADE" }]);
     expect(columnsOf(db, "git_operation_state")).toEqual([
       "repo_id",
       "kind",
@@ -550,6 +598,118 @@ describe("git schema", () => {
     ).toContain("WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200");
   });
 
+  it("migrates genuine v12 refs with zero state and empty history", () => {
+    const db = new TestDatabase();
+    createFrozenV12Schema(db);
+    db.run(
+      "INSERT INTO git_repositories (id, root, head) VALUES (1, '/one', 'ref: refs/heads/main')",
+    );
+    db.run("INSERT INTO git_repositories (id, root, head) VALUES (2, '/two', ?)", "a".repeat(40));
+    db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (1, 'refs/heads/main', ?)",
+      "1".repeat(40),
+    );
+    db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (1, 'refs/heads/alias', 'ref: refs/heads/main')",
+    );
+
+    initializeGitSchema(db);
+
+    expect(db.all("SELECT id, root, head FROM git_repositories ORDER BY id")).toEqual([
+      { id: 1, root: "/one", head: "ref: refs/heads/main" },
+      { id: 2, root: "/two", head: "a".repeat(40) },
+    ]);
+    expect(db.all("SELECT repo_id, name, target FROM git_refs ORDER BY repo_id, name")).toEqual([
+      { repo_id: 1, name: "refs/heads/alias", target: "ref: refs/heads/main" },
+      { repo_id: 1, name: "refs/heads/main", target: "1".repeat(40) },
+    ]);
+    expect(db.all("SELECT repo_id, next_ordinal FROM git_reflog_state ORDER BY repo_id")).toEqual([
+      { repo_id: 1, next_ordinal: 0 },
+      { repo_id: 2, next_ordinal: 0 },
+    ]);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("13");
+  });
+
+  it("rolls malformed v12 refs back before recording v13", () => {
+    const db = new TestDatabase();
+    createFrozenV12Schema(db);
+    db.run("INSERT INTO git_repositories (id, root, head) VALUES (1, '/repo', zeroblob(4))");
+
+    expect(() => initializeGitSchema(db)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("12");
+    expect(columnsOf(db, "git_reflog_state")).toEqual([]);
+    expect(columnsOf(db, "git_reflog_entries")).toEqual([]);
+  });
+
+  it("rejects an over-bound v12 ref without leaving v13 objects", () => {
+    const db = new TestDatabase();
+    createFrozenV12Schema(db);
+    db.run(
+      "INSERT INTO git_repositories (id, root, head) VALUES (1, '/repo', 'ref: refs/heads/main')",
+    );
+    db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)",
+      `refs/tags/${"x".repeat(1_024)}`,
+      "1".repeat(40),
+    );
+
+    expect(() => initializeGitSchema(db)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("12");
+    expect(columnsOf(db, "git_reflog_state")).toEqual([]);
+    expect(columnsOf(db, "git_reflog_entries")).toEqual([]);
+  });
+
+  it("rolls a late v13 migration failure back to the exact v12 state", () => {
+    const db = new TestDatabase();
+    createFrozenV12Schema(db);
+    db.run(
+      "INSERT INTO git_repositories (id, root, head) VALUES (1, '/repo', 'ref: refs/heads/main')",
+    );
+    db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (1, 'refs/heads/main', ?)",
+      "1".repeat(40),
+    );
+    db.run(`CREATE TRIGGER fail_v13_version
+      BEFORE INSERT ON git_meta
+      WHEN NEW.key = 'schema_version' AND NEW.value = '13'
+      BEGIN SELECT RAISE(ABORT, 'injected late v13 failure'); END`);
+
+    expect(() => initializeGitSchema(db)).toThrow(/injected late v13 failure/);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("12");
+    expect(db.one("SELECT id, root, head FROM git_repositories")).toEqual({
+      id: 1,
+      root: "/repo",
+      head: "ref: refs/heads/main",
+    });
+    expect(db.one("SELECT repo_id, name, target FROM git_refs")).toEqual({
+      repo_id: 1,
+      name: "refs/heads/main",
+      target: "1".repeat(40),
+    });
+    expect(columnsOf(db, "git_reflog_state")).toEqual([]);
+    expect(columnsOf(db, "git_reflog_entries")).toEqual([]);
+  });
+
+  it("rejects pre-existing v13 objects in a v12 database", () => {
+    const db = new TestDatabase();
+    createFrozenV12Schema(db);
+    db.run("CREATE TABLE git_reflog_state (repo_id TEXT, next_ordinal BLOB)");
+    db.run("INSERT INTO git_reflog_state VALUES ('sentinel', X'0102')");
+
+    expect(() => initializeGitSchema(db)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("12");
+    expect(columnsOf(db, "git_reflog_state")).toEqual(["repo_id", "next_ordinal"]);
+    expect(
+      db.one("SELECT repo_id, hex(next_ordinal) AS next_ordinal FROM git_reflog_state"),
+    ).toEqual({ repo_id: "sentinel", next_ordinal: "0102" });
+    expect(columnsOf(db, "git_reflog_entries")).toEqual([]);
+  });
+
   it("fails before current CREATE statements can mask a missing v11 authoritative table", () => {
     const db = new TestDatabase();
     createFrozenV11Schema(db);
@@ -626,7 +786,7 @@ describe("git schema", () => {
     db.run("DROP TABLE git_tree_entries");
     db.run("DROP TABLE git_tree_sources");
     db.run("DROP TABLE git_tree_effective");
-    db.run("UPDATE git_meta SET value = '2' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 2);
 
     initializeGitSchema(db);
 
@@ -650,7 +810,7 @@ describe("git schema", () => {
       "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, ?, 'blob', 7, 'raw')",
       "b".repeat(40),
     );
-    db.run("UPDATE git_meta SET value = '3' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 3);
 
     initializeGitSchema(db);
 
@@ -681,7 +841,7 @@ describe("git schema", () => {
     );
     db.run("DROP TABLE git_index_v5");
     db.run("INSERT INTO git_index VALUES (1, 'a.txt', 0, 33188, 'abc', 1, 2, 3)");
-    db.run("UPDATE git_meta SET value = '4' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 4);
 
     initializeGitSchema(db);
 
@@ -705,7 +865,7 @@ describe("git schema", () => {
     db.run(
       "INSERT INTO git_index (repo_id, path, stage, mode, oid, size, mtime, ino, rev) VALUES (1, 'a.txt', 0, 33188, 'abc', 1, 2, 3, 4)",
     );
-    db.run("UPDATE git_meta SET value = '5' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 5);
 
     initializeGitSchema(db);
 
@@ -735,7 +895,7 @@ describe("git schema", () => {
       ]),
     );
     db.run("UPDATE git_tree_entries SET raw_entry = X'00'");
-    db.run("UPDATE git_meta SET value = '6' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 6);
 
     initializeGitSchema(db);
 
@@ -969,7 +1129,7 @@ describe("git schema", () => {
     db.run("DROP TABLE git_operation_touched");
     db.run("DROP TABLE git_operation_steps");
     db.run("DROP TABLE git_operation_state");
-    db.run("UPDATE git_meta SET value = '7' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 7);
 
     initializeGitSchema(db);
 
@@ -1014,7 +1174,7 @@ describe("git schema", () => {
       "1".repeat(40),
       "2".repeat(40),
     );
-    db.run("UPDATE git_meta SET value = '8' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 8);
 
     initializeGitSchema(db);
 
@@ -1100,7 +1260,7 @@ describe("git schema", () => {
     db.run("DROP TABLE git_operation_touched");
     db.run("DROP TABLE git_operation_steps");
     db.run("DROP TABLE git_operation_state");
-    db.run("UPDATE git_meta SET value = '9' WHERE key = 'schema_version'");
+    setHistoricalGitVersion(db, 9);
 
     initializeGitSchema(db);
 

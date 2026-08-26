@@ -14,14 +14,18 @@ import {
   blobIdMismatchRetainedBytes,
   contentIdKey,
   MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
+  MAX_REF_MUTATION_RETAINED_BYTES,
+  REF_MUTATION_FIXED_RETAINED_BYTES,
+  refMutationCreateRetainedBytes,
   SqliteGitDatabase,
+  type StoreOptions,
 } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 
-function open() {
+function open(options: StoreOptions = {}) {
   const db = new TestDatabase();
-  const database = new SqliteGitDatabase(db);
+  const database = new SqliteGitDatabase(db, options);
   const repository = database.create("/repo", "ref: refs/heads/main");
   return { db, database, store: database.open(repository) };
 }
@@ -83,6 +87,8 @@ describe("repository registry", () => {
       "git_pack_meta",
       "git_pack_objects",
       "git_pack_pending",
+      "git_reflog_entries",
+      "git_reflog_state",
       "git_refs",
       "git_repositories",
       "git_shallow",
@@ -140,6 +146,29 @@ describe("repository registry", () => {
     db.storage.resetCounters();
     expect(replacement.read(oid)?.data).toEqual(data);
     expect(db.storage.statementCount).toBeGreaterThan(0);
+  });
+
+  it("owns reflog rows through repository lifecycle foreign keys", () => {
+    const { db, store } = open();
+    store.setRef("refs/tags/x", "1".repeat(40));
+    expect(() =>
+      db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (999, 0)"),
+    ).toThrow();
+    expect(() =>
+      db.run(
+        `INSERT INTO git_reflog_entries
+           (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         VALUES (999, 'refs/tags/x', 1, NULL, ?, NULL, ?, NULL, NULL, 0, 0, 'orphan')`,
+        "1".repeat(40),
+        "1".repeat(40),
+      ),
+    ).toThrow();
+
+    store.destroy();
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_state")).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_repositories")).toBe(0);
   });
 });
 
@@ -796,7 +825,17 @@ describe("refs, config and index", () => {
 
     db.storage.resetCounters();
     store.updateRefs(refs);
-    expect(db.storage.statementCount).toBeLessThanOrEqual(5);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(24);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(9_329);
+    expect(
+      db.all<{ ref_name: string; ordinal: number }>(
+        `SELECT ref_name, ordinal FROM git_reflog_entries
+          WHERE ordinal IN (1, 9329) ORDER BY ordinal`,
+      ),
+    ).toEqual([
+      { ref_name: "refs/remotes/origin/branch-0000", ordinal: 1 },
+      { ref_name: "refs/remotes/origin/branch-9328", ordinal: 9_329 },
+    ]);
     expect(store.listRefs("refs/remotes/origin/")).toHaveLength(refs.length);
 
     db.storage.resetCounters();
@@ -804,7 +843,19 @@ describe("refs, config and index", () => {
       refs.slice(0, 1_000),
       refs.slice(-1_000).map((ref) => ref.name),
     );
-    expect(db.storage.statementCount).toBeLessThanOrEqual(2);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(8);
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      10_329,
+    );
+    expect(
+      db.all<{ ref_name: string; ordinal: number }>(
+        `SELECT ref_name, ordinal FROM git_reflog_entries
+          WHERE ordinal IN (9330, 10329) ORDER BY ordinal`,
+      ),
+    ).toEqual([
+      { ref_name: "refs/remotes/origin/branch-8329", ordinal: 9_330 },
+      { ref_name: "refs/remotes/origin/branch-9328", ordinal: 10_329 },
+    ]);
     expect(store.listRefs("refs/remotes/origin/")).toHaveLength(refs.length - 1_000);
 
     db.storage.resetCounters();
@@ -816,6 +867,406 @@ describe("refs, config and index", () => {
     store.setShallow([], oids.slice(0, 1_000));
     expect(db.storage.statementCount).toBeLessThanOrEqual(1);
     expect(store.shallow().size).toBe(oids.length - 1_000);
+  });
+
+  it("records exact direct create, no-op, delete, and checked-out HEAD transitions", () => {
+    const now = 1_800_000_000;
+    const { db, store } = open({ now: () => now * 1_000 });
+    const oid = "a".repeat(40);
+
+    store.setRef("refs/heads/main", oid);
+    store.setRef("refs/heads/main", oid);
+    expect(store.reflog("refs/heads/main")).toEqual([
+      {
+        refName: "refs/heads/main",
+        ordinal: 1,
+        oldRaw: null,
+        newRaw: oid,
+        oldOid: null,
+        newOid: oid,
+        actor: null,
+        timestamp: now,
+        timezoneOffset: 0,
+        reason: "ref update",
+      },
+    ]);
+    expect(store.reflog("HEAD")).toEqual([
+      {
+        refName: "HEAD",
+        ordinal: 2,
+        oldRaw: "ref: refs/heads/main",
+        newRaw: "ref: refs/heads/main",
+        oldOid: null,
+        newOid: oid,
+        actor: null,
+        timestamp: now,
+        timezoneOffset: 0,
+        reason: "ref update",
+      },
+    ]);
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      2,
+    );
+
+    store.deleteRef("refs/heads/main");
+    expect(store.reflog("refs/heads/main")[0]).toMatchObject({
+      ordinal: 3,
+      oldRaw: oid,
+      newRaw: null,
+      oldOid: oid,
+      newOid: null,
+      reason: "ref delete",
+    });
+    expect(store.reflog("HEAD")[0]).toMatchObject({
+      ordinal: 4,
+      oldRaw: "ref: refs/heads/main",
+      newRaw: "ref: refs/heads/main",
+      oldOid: oid,
+      newOid: null,
+      reason: "ref delete",
+    });
+  });
+
+  it("keeps raw identity for same-OID retargets and symbolic unresolved endpoints", () => {
+    const { store } = open({ now: () => 1_800_000_000_000 });
+    const oid = "a".repeat(40);
+    store.setRef("refs/heads/main", oid);
+    store.setRef("refs/heads/alias", oid);
+    store.setRef("refs/heads/main", "ref: refs/heads/alias");
+
+    expect(store.reflog("refs/heads/main")[0]).toMatchObject({
+      oldRaw: oid,
+      newRaw: "ref: refs/heads/alias",
+      oldOid: oid,
+      newOid: oid,
+    });
+    expect(store.reflog("HEAD")[0]).toMatchObject({
+      ordinal: 5,
+      oldRaw: "ref: refs/heads/main",
+      newRaw: "ref: refs/heads/main",
+      oldOid: oid,
+      newOid: oid,
+      reason: "ref update",
+    });
+    store.setHead("ref: refs/heads/alias");
+    expect(store.reflog("HEAD")[0]).toMatchObject({
+      ordinal: 6,
+      oldRaw: "ref: refs/heads/main",
+      newRaw: "ref: refs/heads/alias",
+      oldOid: oid,
+      newOid: oid,
+    });
+
+    store.setRef("refs/heads/dangling", "ref: refs/heads/missing");
+    store.setRef("refs/heads/cycle-b", "ref: refs/heads/dangling");
+    store.setRef("refs/heads/dangling", "ref: refs/heads/cycle-b");
+    expect(store.reflog("refs/heads/dangling")[0]).toMatchObject({
+      oldRaw: "ref: refs/heads/missing",
+      newRaw: "ref: refs/heads/cycle-b",
+      oldOid: null,
+      newOid: null,
+    });
+  });
+
+  it("normalizes duplicate and overlapping batches to one ordered final-state event", () => {
+    const { store } = open({ now: () => 1_800_000_000_000 });
+    const first = "1".repeat(40);
+    const second = "2".repeat(40);
+    const third = "3".repeat(40);
+    store.setRef("refs/tags/x", first);
+
+    store.updateRefs(
+      [
+        { name: "refs/tags/y", target: first },
+        { name: "refs/tags/x", target: second },
+        { name: "refs/tags/x", target: third },
+      ],
+      ["refs/tags/x", "refs/tags/y", "refs/tags/missing"],
+    );
+
+    expect(store.getRef("refs/tags/x")).toBe(third);
+    expect(store.getRef("refs/tags/y")).toBe(first);
+    expect(store.reflog("refs/tags/x")[0]).toMatchObject({
+      oldRaw: first,
+      newRaw: third,
+      reason: "ref batch update",
+    });
+    expect(store.reflog("refs/tags/y")).toHaveLength(1);
+  });
+
+  it("orders mixed batch history by Git bytes and records only pre-to-final rows", () => {
+    const { db, store } = open({ now: () => 1_800_000_000_000 });
+    const ascii = "refs/tags/a";
+    const bmp = "refs/tags/\ue000";
+    const astral = "refs/tags/\u{10000}";
+    store.updateRefs(
+      [
+        { name: astral, target: "1".repeat(40) },
+        { name: bmp, target: "2".repeat(40) },
+        { name: astral, target: "3".repeat(40) },
+        { name: ascii, target: "4".repeat(40) },
+      ],
+      [astral, bmp, "refs/tags/missing"],
+    );
+
+    expect(
+      db.all<{ ref_name: string; ordinal: number; old_raw: null; new_raw: string }>(
+        `SELECT ref_name, ordinal, old_raw, new_raw
+           FROM git_reflog_entries ORDER BY ordinal`,
+      ),
+    ).toEqual([
+      { ref_name: ascii, ordinal: 1, old_raw: null, new_raw: "4".repeat(40) },
+      { ref_name: bmp, ordinal: 2, old_raw: null, new_raw: "2".repeat(40) },
+      { ref_name: astral, ordinal: 3, old_raw: null, new_raw: "3".repeat(40) },
+    ]);
+  });
+
+  it("rolls back refs, history, and ordinal after a late SQL failure", () => {
+    const { db, store } = open({ now: () => 1_800_000_000_000 });
+    const name = "refs/tags/x";
+    const before = "1".repeat(40);
+    store.setRef(name, before);
+    db.run(`CREATE TRIGGER fail_reflog_insert
+      BEFORE INSERT ON git_reflog_entries
+      WHEN NEW.ref_name = 'refs/tags/x'
+      BEGIN SELECT RAISE(ABORT, 'injected reflog insert failure'); END`);
+    const entries = db.scalar<number>("SELECT count(*) FROM git_reflog_entries");
+    const ordinal = db.scalar<number>(
+      "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1",
+    );
+
+    expect(() => store.setRef(name, "2".repeat(40))).toThrow(/injected reflog insert failure/);
+    expect(store.getRef(name)).toBe(before);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(entries);
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      ordinal,
+    );
+  });
+
+  it("fails a stale CAS before changing current state, history, or ordinal", () => {
+    const { db, store } = open({ now: () => 1_800_000_000_000 });
+    const current = "1".repeat(40);
+    store.setRef("refs/tags/x", current);
+    const count = db.scalar<number>("SELECT count(*) FROM git_reflog_entries");
+    const ordinal = db.scalar<number>(
+      "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1",
+    );
+
+    expect(() =>
+      store.updateRefExpected("refs/tags/x", "2".repeat(40), "3".repeat(40)),
+    ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
+    expect(store.getRef("refs/tags/x")).toBe(current);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      ordinal,
+    );
+  });
+
+  it("compares conditional mutations against an absent raw ref", () => {
+    const { db, store } = open({ now: () => 1_800_000_000_000 });
+    const name = "refs/tags/new";
+    const first = "1".repeat(40);
+    store.mutateRefs(
+      { puts: [{ name, target: first }], expected: { name, target: null } },
+      { actor: null, reason: "absent CAS", timestamp: 1_800_000_000, timezoneOffset: 0 },
+    );
+    expect(store.getRef(name)).toBe(first);
+    expect(store.reflog(name)).toHaveLength(1);
+    const ordinal = db.scalar<number>(
+      "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1",
+    );
+
+    expect(() =>
+      store.mutateRefs(
+        { puts: [{ name, target: "2".repeat(40) }], expected: { name, target: null } },
+        { actor: null, reason: "stale absent CAS", timestamp: 1_800_000_000, timezoneOffset: 0 },
+      ),
+    ).toThrowError(expect.objectContaining({ code: "ESTALEHEAD" }));
+    expect(store.getRef(name)).toBe(first);
+    expect(store.reflog(name)).toHaveLength(1);
+    expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
+      ordinal,
+    );
+  });
+
+  it("rejects corrupt old/new endpoints, identity, and ordinal shapes on reads", () => {
+    const corruptions = [
+      "old_oid = NULL",
+      `old_oid = '${"3".repeat(40)}'`,
+      `old_oid = '${"A".repeat(40)}'`,
+      "new_oid = NULL",
+      `new_oid = '${"3".repeat(40)}'`,
+      `new_oid = '${"B".repeat(40)}'`,
+      "old_raw = NULL, old_oid = '1111111111111111111111111111111111111111'",
+      "new_raw = NULL, new_oid = '2222222222222222222222222222222222222222'",
+      "actor_name = zeroblob(1), actor_email = 'actor@example.com'",
+      "actor_name = 'Actor', actor_email = NULL",
+      "ordinal = 0",
+      "reason = zeroblob(1)",
+    ];
+    for (const corruption of corruptions) {
+      const { db, store } = open({ now: () => 1_800_000_000_000 });
+      store.setRef("refs/tags/x", "1".repeat(40));
+      store.setRef("refs/tags/x", "2".repeat(40));
+      db.run("PRAGMA ignore_check_constraints = ON");
+      db.run(
+        `UPDATE git_reflog_entries SET ${corruption}
+          WHERE ref_name = 'refs/tags/x' AND ordinal = 2`,
+      );
+      db.run("PRAGMA ignore_check_constraints = OFF");
+
+      expect(() => store.reflog("refs/tags/x"), corruption).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+    }
+  });
+
+  it("rejects malformed symbolic raw shapes at both DDL endpoints", () => {
+    const { db } = open();
+    const direct = "1".repeat(40);
+    const malformed = [
+      "ref: ",
+      "ref: HEAD",
+      "ref: ref: refs/heads/main",
+      "ref: refs/heads/main\0suffix",
+      "ref: refs/heads/main\n",
+      "ref: refs/heads/main\r",
+    ];
+    for (const raw of malformed) {
+      for (const endpoint of ["old", "new"]) {
+        const oldRaw = endpoint === "old" ? raw : direct;
+        const newRaw = endpoint === "new" ? raw : direct;
+        const oldOid = endpoint === "old" ? null : direct;
+        const newOid = endpoint === "new" ? null : direct;
+        expect(
+          () =>
+            db.run(
+              `INSERT INTO git_reflog_entries
+                 (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+                  actor_name, actor_email, timestamp, timezone, reason)
+               VALUES (1, 'refs/tags/x', 1, ?, ?, ?, ?, NULL, NULL, 0, 0, 'constraint')`,
+              oldRaw,
+              newRaw,
+              oldOid,
+              newOid,
+            ),
+          `${endpoint}: ${JSON.stringify(raw)}`,
+        ).toThrow();
+      }
+    }
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+  });
+
+  it("rejects corrupt reflog allocation state before mutating refs", () => {
+    const corruptions = ["next_ordinal = zeroblob(1)", "next_ordinal = -1", "next_ordinal = 0"];
+    for (const corruption of corruptions) {
+      const { db, store } = open({ now: () => 1_800_000_000_000 });
+      store.setRef("refs/tags/x", "1".repeat(40));
+      db.run("PRAGMA ignore_check_constraints = ON");
+      db.run(`UPDATE git_reflog_state SET ${corruption} WHERE repo_id = 1`);
+      db.run("PRAGMA ignore_check_constraints = OFF");
+
+      expect(() => store.setRef("refs/tags/y", "2".repeat(40)), corruption).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(store.getRef("refs/tags/y")).toBeNull();
+      expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(1);
+    }
+  });
+
+  it("accepts exact-budget unique events and rejects one additional changed ref", () => {
+    const target = "1".repeat(40);
+    const prefix = "refs/tags/";
+    const suffixBytes = 6;
+    const baseNameBytes = prefix.length + suffixBytes;
+    const row = (index: number, nameBytes: number) => ({
+      name: `${prefix}${index.toString(36).padStart(suffixBytes, "0")}${"x".repeat(nameBytes - baseNameBytes)}`,
+      target,
+    });
+    const remaining = MAX_REF_MUTATION_RETAINED_BYTES - REF_MUTATION_FIXED_RETAINED_BYTES;
+    const minimum = refMutationCreateRetainedBytes(row(0, baseNameBytes));
+    const maximum = refMutationCreateRetainedBytes(row(0, 1_024));
+    const count = Math.ceil(remaining / maximum);
+    const lengths = new Uint16Array(count).fill(baseNameBytes);
+    let extra = remaining - count * minimum;
+    for (let index = 0; index < lengths.length && extra > 0; index++) {
+      const added = Math.min(maximum - minimum, extra);
+      lengths[index] = (lengths[index] ?? baseNameBytes) + added / 4;
+      extra -= added;
+    }
+    expect(extra).toBe(0);
+    let retained = REF_MUTATION_FIXED_RETAINED_BYTES;
+    let index = 0;
+    for (const length of lengths) retained += refMutationCreateRetainedBytes(row(index++, length));
+    expect(retained).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
+    const puts = function* (oneOver: boolean): Generator<{ name: string; target: string }> {
+      let ordinal = 0;
+      for (const length of lengths) yield row(ordinal++, length);
+      if (oneOver) yield { name: "refs/tags/overflow", target };
+    };
+
+    const { db, store } = open({ now: () => 1_800_000_000_000 });
+    db.storage.resetCounters();
+    store.updateRefs(puts(false));
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+    expect(db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
+
+    const over = open({ now: () => 1_800_000_000_000 });
+    over.db.storage.resetCounters();
+    expect(() => over.store.updateRefs(puts(true))).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(over.db.storage.statementCount).toBe(2);
+    expect(over.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
+    expect(over.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+  });
+
+  it("retains only the newest 1,024 entries per ref", () => {
+    const now = 1_800_000_000;
+    const { db, store } = open({ now: () => now * 1_000 });
+    for (let index = 0; index < 1_025; index++) {
+      store.mutateRefs(
+        { puts: [{ name: "refs/tags/x", target: (index % 2 === 0 ? "1" : "2").repeat(40) }] },
+        { actor: null, reason: "retention witness", timestamp: now, timezoneOffset: 0 },
+      );
+    }
+
+    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(1_024);
+    const entries = store.reflog("refs/tags/x");
+    expect(entries).toHaveLength(1_024);
+    expect(entries.at(-1)?.ordinal).toBe(2);
+  });
+
+  it("keeps the exact 90-day boundary and removes one second older", () => {
+    const now = 2_000_000_000;
+    const cutoff = now - 90 * 24 * 60 * 60;
+    const { db, store } = open({ now: () => now * 1_000 });
+    store.mutateRefs(
+      { puts: [{ name: "refs/tags/x", target: "1".repeat(40) }] },
+      { actor: null, reason: "too old", timestamp: cutoff - 1, timezoneOffset: 0 },
+    );
+    store.mutateRefs(
+      { puts: [{ name: "refs/tags/x", target: "2".repeat(40) }] },
+      { actor: null, reason: "boundary", timestamp: cutoff, timezoneOffset: 0 },
+    );
+    store.mutateRefs(
+      { puts: [{ name: "refs/tags/x", target: "3".repeat(40) }] },
+      { actor: null, reason: "current", timestamp: now, timezoneOffset: 0 },
+    );
+
+    expect(store.reflog("refs/tags/x").map((entry) => entry.reason)).toEqual([
+      "current",
+      "boundary",
+    ]);
+    expect(
+      db.all<{ timestamp: number; reason: string }>(
+        "SELECT timestamp, reason FROM git_reflog_entries ORDER BY ordinal",
+      ),
+    ).toEqual([
+      { timestamp: cutoff, reason: "boundary" },
+      { timestamp: now, reason: "current" },
+    ]);
   });
 
   it("keeps multi-valued config in order", () => {
