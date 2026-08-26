@@ -4,7 +4,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
-import { createShell, type Shell } from "../../src/shell/index.js";
+import { createShell, type Command, type Shell } from "../../src/shell/index.js";
+import { encode } from "../../src/shell/exec/bytes.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 
@@ -205,6 +206,28 @@ describe("connectors and redirection", () => {
     expect(shell.run("grep -r zzz /repo/src || echo fallback").stdout).toBe("fallback\n");
   });
 
+  it("evaluates mixed AND-OR lists left to right", () => {
+    expect(shell.run("false && echo no || echo yes")).toMatchObject({
+      stdout: "yes\n",
+      exitCode: 0,
+    });
+    expect(shell.run("true || echo no && echo yes")).toMatchObject({
+      stdout: "yes\n",
+      exitCode: 0,
+    });
+  });
+
+  it("continues after a skipped pipeline at a semicolon", () => {
+    expect(shell.run("false && echo no; echo final")).toMatchObject({
+      stdout: "final\n",
+      exitCode: 0,
+    });
+    expect(shell.run("true || echo no; echo final")).toMatchObject({
+      stdout: "final\n",
+      exitCode: 0,
+    });
+  });
+
   it("drops stderr on request", () => {
     expect(shell.run("cat nope 2>/dev/null").stderr).toBe("");
     expect(shell.run("cat nope").stderr).not.toBe("");
@@ -214,10 +237,45 @@ describe("connectors and redirection", () => {
     expect(shell.run("cat nope 2>&1").stdout).toContain("No such file");
   });
 
+  it("merges stderr before the downstream stage", () => {
+    const run = shell.run("cat no1 no2 2>&1 | head -1");
+    expect(run.stdout).toContain("no1");
+    expect(run.stdout).not.toContain("no2");
+    expect(run.stderr).toBe("");
+  });
+
+  it("preserves merged stream order from an injected command", () => {
+    const alternating: Command = (context) => ({
+      stdout: (function* () {
+        context.warn("before");
+        yield encode("stdout\n");
+        context.warn("after");
+      })(),
+      status: () => 0,
+    });
+    const injected = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([["alternating", alternating]]),
+    });
+
+    expect(injected.run("alternating 2>&1").stdout).toBe(
+      "alternating: before\nstdout\nalternating: after\n",
+    );
+  });
+
   it("writes and appends to a file", () => {
     shell.run("echo one > /repo/out.txt");
     shell.run("echo two >> /repo/out.txt");
     expect(shell.run("cat /repo/out.txt").stdout).toBe("one\ntwo\n");
+  });
+
+  it("applies stdout redirection to an intermediate stage", () => {
+    expect(shell.run("echo piped > /repo/intermediate.txt | cat").stdout).toBe("");
+    expect(shell.run("cat /repo/intermediate.txt").stdout).toBe("piped\n");
+
+    expect(shell.run("echo appended >> /repo/intermediate.txt | cat").stdout).toBe("");
+    expect(shell.run("cat /repo/intermediate.txt").stdout).toBe("piped\nappended\n");
   });
 });
 

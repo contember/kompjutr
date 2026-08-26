@@ -72,6 +72,15 @@ describe("cwd persists", () => {
     expect(shell.cwd()).toBe("/repo");
   });
 
+  it("changes cwd only when a mixed list selects cd", () => {
+    const shell = createShell({ fs: workspace(), cwd: "/repo" });
+    expect(shell.run("true || cd src; pwd").stdout).toBe("/repo\n");
+    expect(shell.cwd()).toBe("/repo");
+
+    expect(shell.run("false && cd src || cd src; pwd").stdout).toBe("/repo/src\n");
+    expect(shell.cwd()).toBe("/repo/src");
+  });
+
   it("still honours an explicit cd prefix", () => {
     // Agents will keep writing it out of habit; it has to keep working.
     const shell = createShell({ fs: workspace(), cwd: "/" });

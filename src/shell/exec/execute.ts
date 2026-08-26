@@ -47,23 +47,27 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
   const errors: Uint8Array[] = [];
   let cwd = normalize(options.cwd);
   let exitCode = 0;
+  let previousConnector: "&&" | "||" | ";" | null = null;
 
   try {
     for (const step of plan.steps) {
-      const run = runPipeline(step.pipeline, {
-        fs,
-        cwd,
-        commands: options.commands,
-        out,
-        errors,
-        chdir: (path: string) => {
-          cwd = path;
-        },
-      });
-      exitCode = run;
-
-      if (step.connector === "&&" && exitCode !== 0) break;
-      if (step.connector === "||" && exitCode === 0) break;
+      const selected =
+        previousConnector === null ||
+        previousConnector === ";" ||
+        (previousConnector === "&&" ? exitCode === 0 : exitCode !== 0);
+      if (selected) {
+        exitCode = runPipeline(step.pipeline, {
+          fs,
+          cwd,
+          commands: options.commands,
+          out,
+          errors,
+          chdir: (path: string) => {
+            cwd = path;
+          },
+        });
+      }
+      previousConnector = step.connector;
     }
   } catch (error) {
     if (error instanceof ShellLimitError || error instanceof ShellSyntaxError) {
@@ -96,7 +100,6 @@ interface PipelineEnvironment {
 function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): number {
   let stream: ByteStream | null = null;
   const statuses: Array<() => number> = [];
-  let redirected: { path: string; append: boolean } | null = null;
 
   for (let index = 0; index < pipeline.commands.length; index++) {
     const planned = pipeline.commands[index];
@@ -115,27 +118,22 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
       stream = readWholeFile(env.fs, path);
     }
 
-    const isLast = index === pipeline.commands.length - 1;
-    if (isLast && planned.stdout !== null) {
-      redirected = {
-        path: resolve(env.cwd, single(planned.stdout.path, env.fs, env.cwd)),
-        append: planned.stdout.append,
-      };
-    }
-
-    const context = commandContext(planned, argv, stream, pipeline.limitHint, env);
+    const mergedErrors: Uint8Array[] = [];
+    const context = commandContext(planned, argv, stream, pipeline.limitHint, env, mergedErrors);
     const produced = command(context);
-    stream = produced.stdout;
+    const output = stageOutput(produced.stdout, mergedErrors);
+    if (planned.stdout === null) {
+      stream = output;
+    } else {
+      const target = resolve(env.cwd, single(planned.stdout.path, env.fs, env.cwd));
+      writeStream(env.fs, target, planned.stdout.append, output);
+      stream = empty();
+    }
     statuses.push(produced.status);
   }
 
   if (stream === null) return 0;
-
-  if (redirected !== null) {
-    writeStream(env.fs, redirected.path, redirected.append, stream);
-  } else {
-    env.out.write(stream);
-  }
+  env.out.write(stream);
 
   // A pipeline's status is its last stage's, as in bash without pipefail.
   const last = statuses[statuses.length - 1];
@@ -148,6 +146,7 @@ function commandContext(
   stdin: ByteStream | null,
   limitHint: number | null,
   env: PipelineEnvironment,
+  mergedErrors: Uint8Array[],
 ): CommandContext {
   const context: CommandContext = {
     fs: env.fs,
@@ -158,8 +157,8 @@ function commandContext(
     warn: (message: string) => {
       if (planned.stderr === "drop") return;
       const bytes = line(`${planned.name}: ${message}`);
-      // `2>&1` puts the diagnostic in stdout, in order with the output.
-      if (planned.stderr === "merge") env.out.writeBytes(bytes);
+      // `2>&1` joins this stage before any downstream pipe consumes it.
+      if (planned.stderr === "merge") mergedErrors.push(bytes);
       else env.errors.push(bytes);
     },
     chdir: env.chdir,
@@ -172,6 +171,25 @@ function commandContext(
     },
   };
   return context;
+}
+
+/** Interleave diagnostics emitted while pulling a command with its stdout. */
+function* stageOutput(stdout: ByteStream, mergedErrors: Uint8Array[]): ByteStream {
+  let warningIndex = 0;
+  for (;;) {
+    const next = stdout.next();
+    while (warningIndex < mergedErrors.length) {
+      const warning = mergedErrors[warningIndex];
+      warningIndex++;
+      if (warning !== undefined) yield warning;
+    }
+    if (next.done) return;
+    yield next.value;
+  }
+}
+
+function* empty(): ByteStream {
+  // A redirected stage contributes no stdout to the following pipe.
 }
 
 /**
