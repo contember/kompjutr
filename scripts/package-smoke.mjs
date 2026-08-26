@@ -70,15 +70,22 @@ function typecheckConsumer(directory) {
 
 async function assertComputerIsAbsent(directory) {
   const manifest = join(directory, "node_modules", "@cloudflare", "computer", "package.json");
+  await assertPathIsAbsent(
+    manifest,
+    "The standalone consumer unexpectedly installed @cloudflare/computer",
+  );
+}
+
+async function assertPathIsAbsent(path, message) {
   try {
-    await access(manifest, constants.F_OK);
+    await access(path, constants.F_OK);
   } catch (error) {
     if (error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return;
     }
     throw error;
   }
-  throw new Error("The standalone consumer unexpectedly installed @cloudflare/computer");
+  throw new Error(message);
 }
 
 async function main() {
@@ -96,6 +103,10 @@ async function main() {
     }
 
     run(npm, ["run", "build"], root);
+    await assertPathIsAbsent(
+      join(root, "dist", "computer"),
+      "Build retained stale dist/computer output",
+    );
     run(npm, ["pack", "--pack-destination", packDestination], root);
 
     const tarballs = (await readdir(packDestination)).filter((name) => name.endsWith(".tgz"));
@@ -108,13 +119,99 @@ async function main() {
     await writeConsumer(
       standalone,
       [
+        "import type {",
+        "  DivergenceOptions as RootDivergenceOptions,",
+        "  DivergenceRelationship as RootDivergenceRelationship,",
+        "  DivergenceResult as RootDivergenceResult,",
+        "  Git as RootGit,",
+        "  GitDivergenceOptions as RootGitDivergenceOptions,",
+        "  GitReadRefOptions as RootGitReadRefOptions,",
+        "  GitWorktreeAddOptions as RootGitWorktreeAddOptions,",
+        "  GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,",
+        "  RawRefTarget as RootRawRefTarget,",
+        "  ReadRefOptions as RootReadRefOptions,",
+        "  WorktreeAddOptions as RootWorktreeAddOptions,",
+        "  WorktreeAddTarget as RootWorktreeAddTarget,",
+        "  WorktreeInfo as RootWorktreeInfo,",
+        "  WorktreeRemoveOptions as RootWorktreeRemoveOptions,",
+        '} from "kompjutr";',
+        "import {",
+        "  divergence as rootDivergence,",
+        "  readRef as rootReadRef,",
+        "  worktreeAdd as rootWorktreeAdd,",
+        "  worktreeList as rootWorktreeList,",
+        "  worktreePrune as rootWorktreePrune,",
+        "  worktreeRemove as rootWorktreeRemove,",
+        '} from "kompjutr";',
         'import * as rootEntry from "kompjutr";',
         'import * as fsEntry from "kompjutr/fs";',
+        "import type {",
+        "  DivergenceOptions as GitDivergenceOptions,",
+        "  DivergenceRelationship as GitDivergenceRelationship,",
+        "  DivergenceResult as GitDivergenceResult,",
+        "  Git as GitEntrypointGit,",
+        "  GitDivergenceOptions as GitClientDivergenceOptions,",
+        "  GitReadRefOptions as GitClientReadRefOptions,",
+        "  GitWorktreeAddOptions as GitClientWorktreeAddOptions,",
+        "  GitWorktreeRemoveOptions as GitClientWorktreeRemoveOptions,",
+        "  RawRefTarget as GitRawRefTarget,",
+        "  ReadRefOptions as GitReadRefOptions,",
+        "  WorktreeAddOptions as GitWorktreeAddOptions,",
+        "  WorktreeAddTarget as GitWorktreeAddTarget,",
+        "  WorktreeInfo as GitWorktreeInfo,",
+        "  WorktreeRemoveOptions as GitWorktreeRemoveOptions,",
+        '} from "kompjutr/git";',
+        "import {",
+        "  divergence as gitDivergence,",
+        "  readRef as gitReadRef,",
+        "  worktreeAdd as gitWorktreeAdd,",
+        "  worktreeList as gitWorktreeList,",
+        "  worktreePrune as gitWorktreePrune,",
+        "  worktreeRemove as gitWorktreeRemove,",
+        '} from "kompjutr/git";',
         'import * as gitEntry from "kompjutr/git";',
         'import * as shellEntry from "kompjutr/shell";',
         'import * as testingEntry from "kompjutr/testing";',
         "",
-        "void [rootEntry, fsEntry, gitEntry, shellEntry, testingEntry];",
+        'const coreDivergence: RootDivergenceOptions = { current: "HEAD", upstream: "main" };',
+        "const gitCoreDivergence: GitDivergenceOptions = coreDivergence;",
+        'const divergenceOptions: RootGitDivergenceOptions = { ...coreDivergence, dir: "/repo" };',
+        "const gitDivergenceOptions: GitClientDivergenceOptions = divergenceOptions;",
+        'const relationship: RootDivergenceRelationship = "diverged";',
+        "const gitRelationship: GitDivergenceRelationship = relationship;",
+        "const divergenceResult: RootDivergenceResult = { relationship, ahead: 2, behind: 1 };",
+        "const gitDivergenceResult: GitDivergenceResult = divergenceResult;",
+        "",
+        'const readOptions: RootReadRefOptions = { ref: "refs/remotes/origin/HEAD" };',
+        "const gitReadOptions: GitReadRefOptions = readOptions;",
+        'const clientReadOptions: RootGitReadRefOptions = { ...readOptions, dir: "/repo" };',
+        "const gitClientReadOptions: GitClientReadRefOptions = clientReadOptions;",
+        'const rawTarget: RootRawRefTarget = { kind: "symbolic", target: "refs/remotes/origin/main" };',
+        "const gitRawTarget: GitRawRefTarget = rawTarget;",
+        "",
+        'const target: RootWorktreeAddTarget = { kind: "detached" };',
+        "const gitTarget: GitWorktreeAddTarget = target;",
+        'const addOptions: RootWorktreeAddOptions = { root: "/session", target };',
+        "const gitAddOptions: GitWorktreeAddOptions = addOptions;",
+        'const clientAddOptions: RootGitWorktreeAddOptions = { ...addOptions, dir: "/repo" };',
+        "const gitClientAddOptions: GitClientWorktreeAddOptions = clientAddOptions;",
+        'const removeOptions: RootWorktreeRemoveOptions = { root: "/session", force: true };',
+        "const gitCoreRemoveOptions: GitWorktreeRemoveOptions = removeOptions;",
+        'const clientRemoveOptions: RootGitWorktreeRemoveOptions = { ...removeOptions, dir: "/repo" };',
+        "const gitClientRemoveOptions: GitClientWorktreeRemoveOptions = clientRemoveOptions;",
+        'const worktree: RootWorktreeInfo = { checkoutId: 2, root: "/session", head: "0123456789012345678901234567890123456789", isPrimary: false, state: "present" };',
+        "const gitWorktree: GitWorktreeInfo = worktree;",
+        'const rootMethods: readonly (keyof RootGit)[] = ["divergence", "readRef", "worktreeAdd", "worktreeList", "worktreeRemove", "worktreePrune"];',
+        "const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;",
+        "",
+        "void [",
+        "  rootEntry, fsEntry, gitEntry, shellEntry, testingEntry,",
+        "  gitCoreDivergence, gitDivergenceOptions, gitRelationship, gitDivergenceResult,",
+        "  gitReadOptions, gitClientReadOptions, gitRawTarget,",
+        "  gitTarget, gitAddOptions, gitClientAddOptions, gitCoreRemoveOptions, gitClientRemoveOptions, gitWorktree, gitMethods,",
+        "  rootDivergence, rootReadRef, rootWorktreeAdd, rootWorktreeList, rootWorktreeRemove, rootWorktreePrune,",
+        "  gitDivergence, gitReadRef, gitWorktreeAdd, gitWorktreeList, gitWorktreeRemove, gitWorktreePrune,",
+        "];",
         "",
       ].join("\n"),
     );
@@ -126,7 +223,24 @@ async function main() {
       [
         "--input-type=module",
         "--eval",
-        'for (const entry of ["kompjutr", "kompjutr/fs", "kompjutr/git", "kompjutr/shell", "kompjutr/testing"]) await import(entry);',
+        [
+          'for (const entry of ["kompjutr", "kompjutr/fs", "kompjutr/git", "kompjutr/shell", "kompjutr/testing"]) await import(entry);',
+          'const root = await import("kompjutr");',
+          'const fs = await import("kompjutr/fs");',
+          'const git = await import("kompjutr/git");',
+          'for (const [name, entry] of [["kompjutr", root], ["kompjutr/fs", fs], ["kompjutr/git", git]]) {',
+          '  if ("createExactPathStateSource" in entry) throw new Error("Internal exact-path source leaked from " + name);',
+          "}",
+          'for (const name of ["divergence", "readRef", "worktreeAdd", "worktreeList", "worktreeRemove", "worktreePrune"]) {',
+          '  if (typeof root[name] !== "function" || typeof git[name] !== "function") throw new Error("Missing public operation: " + name);',
+          "}",
+          "try {",
+          '  await import("kompjutr/fs/exact-path-states");',
+          '  throw new Error("Internal exact-path implementation is publicly importable");',
+          "} catch (error) {",
+          '  if (error?.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error;',
+          "}",
+        ].join("\n"),
       ],
       standalone,
     );

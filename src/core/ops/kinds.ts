@@ -1,5 +1,5 @@
 // View types shared by the commands. These mirror the shapes Computer's
-// `GitClient` interface returns, so the facade in `src/computer/` is a
+// `GitClient` interface returns, so the facade in `src/compat/computer/` is a
 // direct hand-off with no translation layer.
 //
 // FROZEN SEAM: every command depends on these. Changing one invalidates

@@ -97,7 +97,7 @@ export function createSqliteGitClient(
   }: WorkspaceGitClientOptions): GitClient {
     let context: GitContext | undefined;
     // The provider is stable for the workspace's lifetime, but building the
-    // database runs the schema migration, so it waits for first use.
+    // database initializes and validates the schema, so it waits for first use.
     const ctx = (): GitContext => {
       if (context === undefined) context = buildContext(ws.provider(), options, defaultIdentity);
       return context;
