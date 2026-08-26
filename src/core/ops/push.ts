@@ -16,6 +16,7 @@ import type { Repository } from "../repository.js";
 import type { PushResult, RefUpdateStatus } from "./kinds.js";
 import { type RemoteAuthOptions, remoteUrlFor } from "./network.js";
 import { openPushPack, planPushObjects } from "./push-plan.js";
+import { operationRefLogMetadata } from "./ref-log.js";
 
 export interface PushOptions extends RemoteAuthOptions {
   remote?: string;
@@ -76,6 +77,7 @@ function trackingRef(remote: string, remoteRef: string): string {
 }
 
 function updateTracking(
+  context: GitContext,
   repo: Repository,
   remote: string,
   remoteRef: string,
@@ -83,9 +85,12 @@ function updateTracking(
   deleting: boolean,
 ): void {
   const tracking = trackingRef(remote, remoteRef);
-  repo.store.updateRefs(
-    deleting ? [] : [{ name: tracking, target: newOid }],
-    deleting ? [tracking] : [],
+  repo.store.mutateRefs(
+    {
+      puts: deleting ? [] : [{ name: tracking, target: newOid }],
+      deletes: deleting ? [tracking] : [],
+    },
+    operationRefLogMetadata(context, repo, "push"),
   );
 }
 
@@ -125,7 +130,9 @@ export async function push(
 
   const deleting = options.delete === true;
   if ((!deleting && oldOid === newOid) || (deleting && oldOid === ZERO_OID)) {
-    if (options.url === undefined) updateTracking(repo, remote, remoteRef, newOid, deleting);
+    if (options.url === undefined) {
+      updateTracking(context, repo, remote, remoteRef, newOid, deleting);
+    }
     return resultFor(remoteRef, { ok: true });
   }
 
@@ -174,6 +181,8 @@ export async function push(
   if (!result.ok) {
     throw new GitError("EPUSHREJECTED", result.error ?? `remote rejected ${remoteRef}`);
   }
-  if (options.url === undefined) updateTracking(repo, remote, remoteRef, newOid, deleting);
+  if (options.url === undefined) {
+    updateTracking(context, repo, remote, remoteRef, newOid, deleting);
+  }
   return result;
 }

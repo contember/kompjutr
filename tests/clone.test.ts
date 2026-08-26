@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -14,13 +14,16 @@ import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transp
 import type { Repository } from "../src/core/repository.js";
 import { gitModeFor, type Worktree } from "../src/core/worktree.js";
 import { GitFixture } from "./helpers/git.js";
-import { startGitServer, startStubServer } from "./helpers/http-backend.js";
-import { makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
+import { type GitServerOptions, startGitServer, startStubServer } from "./helpers/http-backend.js";
+import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
 
 interface Entry {
   mode: string;
   content: string;
 }
+
+const REFLOG_ACTOR = { name: "Network Actor", email: "network@example.com" };
+const REFLOG_TIME = 1_700_000_000_000;
 
 /** Every file under a real directory, keyed by relative path, `.git` aside. */
 function nativeTree(root: string, prefix = ""): Map<string, Entry> {
@@ -108,6 +111,26 @@ async function nativeGit(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trimEnd();
 }
 
+function createRemoteBranches(fixture: GitFixture, from: number, to: number, oid: string): void {
+  let input = "";
+  for (let index = from; index < to; index++) {
+    input += `create refs/heads/bulk-${String(index).padStart(5, "0")} ${oid}\n`;
+  }
+  if (input === "") return;
+  const result = spawnSync("git", ["update-ref", "--stdin"], {
+    cwd: fixture.dir,
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      LC_ALL: "C",
+    },
+    input,
+    encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error(result.stderr || "git update-ref failed");
+}
+
 function tableRows<Row extends object>(workspace: TestWorkspace, query: string): Row[] {
   return workspace.storage.sql.exec<Row>(query).toArray();
 }
@@ -175,6 +198,133 @@ describe("clone", () => {
       ).toEqual([...files.keys()].sort());
       expect(allSegments(workspace.worktree, "/work")).not.toContain(".git");
       expect(tableRows(workspace, "SELECT * FROM git_objects")).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("records clone fetch and checkout as exact ordered publications", async () => {
+    const { fixture, head } = makeFixture();
+    fixture.git("branch", "topic");
+    fixture.git("tag", "v1");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace({
+      startTime: REFLOG_TIME,
+      timezoneOffset: -90,
+      now: () => REFLOG_TIME,
+    });
+    workspace.context.defaultIdentity = REFLOG_ACTOR;
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 0,
+        singleBranch: false,
+        noTags: false,
+      });
+      const repo = openRepository(workspace.context, "/work");
+
+      const ordered = tableRows<{
+        ref_name: string;
+        ordinal: number;
+        old_raw: string | null;
+        new_raw: string | null;
+        old_oid: string | null;
+        new_oid: string | null;
+        actor_name: string | null;
+        actor_email: string | null;
+        timestamp: number;
+        timezone: number;
+        reason: string;
+      }>(
+        workspace,
+        `SELECT ref_name, ordinal, old_raw, new_raw, old_oid, new_oid, actor_name, actor_email,
+                timestamp, timezone, reason
+           FROM git_reflog_entries
+          ORDER BY ordinal`,
+      );
+      expect(ordered).toEqual([
+        {
+          ref_name: "refs/remotes/origin/HEAD",
+          ordinal: 1,
+          old_raw: null,
+          new_raw: "ref: refs/remotes/origin/main",
+          old_oid: null,
+          new_oid: head,
+          actor_name: REFLOG_ACTOR.name,
+          actor_email: REFLOG_ACTOR.email,
+          timestamp: REFLOG_TIME / 1_000,
+          timezone: -90,
+          reason: "clone: fetch",
+        },
+        {
+          ref_name: "refs/remotes/origin/main",
+          ordinal: 2,
+          old_raw: null,
+          new_raw: head,
+          old_oid: null,
+          new_oid: head,
+          actor_name: REFLOG_ACTOR.name,
+          actor_email: REFLOG_ACTOR.email,
+          timestamp: REFLOG_TIME / 1_000,
+          timezone: -90,
+          reason: "clone: fetch",
+        },
+        {
+          ref_name: "refs/remotes/origin/topic",
+          ordinal: 3,
+          old_raw: null,
+          new_raw: head,
+          old_oid: null,
+          new_oid: head,
+          actor_name: REFLOG_ACTOR.name,
+          actor_email: REFLOG_ACTOR.email,
+          timestamp: REFLOG_TIME / 1_000,
+          timezone: -90,
+          reason: "clone: fetch",
+        },
+        {
+          ref_name: "refs/tags/v1",
+          ordinal: 4,
+          old_raw: null,
+          new_raw: head,
+          old_oid: null,
+          new_oid: head,
+          actor_name: REFLOG_ACTOR.name,
+          actor_email: REFLOG_ACTOR.email,
+          timestamp: REFLOG_TIME / 1_000,
+          timezone: -90,
+          reason: "clone: fetch",
+        },
+        {
+          ref_name: "refs/heads/main",
+          ordinal: 5,
+          old_raw: null,
+          new_raw: head,
+          old_oid: null,
+          new_oid: head,
+          actor_name: REFLOG_ACTOR.name,
+          actor_email: REFLOG_ACTOR.email,
+          timestamp: REFLOG_TIME / 1_000,
+          timezone: -90,
+          reason: "clone: checkout",
+        },
+        {
+          ref_name: "HEAD",
+          ordinal: 6,
+          old_raw: "ref: refs/heads/main",
+          new_raw: "ref: refs/heads/main",
+          old_oid: null,
+          new_oid: head,
+          actor_name: REFLOG_ACTOR.name,
+          actor_email: REFLOG_ACTOR.email,
+          timestamp: REFLOG_TIME / 1_000,
+          timezone: -90,
+          reason: "clone: checkout",
+        },
+      ]);
+      expect(repo.store.reflog("HEAD")[0]).toMatchObject({ oldOid: null, newOid: head });
     } finally {
       await server.close();
       fixture.dispose();
@@ -368,6 +518,58 @@ describe("clone", () => {
       expect(tableRows(workspace, "SELECT oid FROM git_pack_objects")).toEqual([]);
       expect(tableRows(workspace, "SELECT offset FROM git_pack_pending")).toEqual([]);
       expect(tableRows(workspace, "SELECT seq FROM git_pack_data")).toEqual([]);
+      expect(tableRows(workspace, "SELECT ref_name FROM git_reflog_entries")).toEqual([]);
+      expect(tableRows(workspace, "SELECT repo_id FROM git_reflog_state")).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("removes provisional clone history when checkout fails after ref publication", async () => {
+    const { fixture } = makeFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace({ startTime: REFLOG_TIME, now: () => REFLOG_TIME });
+    const injected = new GitError("EIO", "injected checkout failure");
+    let provisionalEntries = 0;
+    let provisionalReasons: string[] = [];
+    let provisionalNextOrdinal: number | null = null;
+    const worktree: Worktree = {
+      ...workspace.worktree,
+      writeFiles() {
+        provisionalEntries =
+          tableRows<{ count: number }>(
+            workspace,
+            "SELECT count(*) AS count FROM git_reflog_entries",
+          )[0]?.count ?? 0;
+        provisionalReasons = tableRows<{ reason: string }>(
+          workspace,
+          "SELECT reason FROM git_reflog_entries ORDER BY ordinal",
+        ).map((row) => row.reason);
+        provisionalNextOrdinal =
+          tableRows<{ next_ordinal: number }>(
+            workspace,
+            "SELECT next_ordinal FROM git_reflog_state",
+          )[0]?.next_ordinal ?? null;
+        throw injected;
+      },
+    };
+    try {
+      await expect(
+        clone({ ...workspace.context, worktree }, { url: server.url, dir: "/work", depth: 0 }),
+      ).rejects.toBe(injected);
+
+      expect(provisionalEntries).toBe(4);
+      expect(provisionalReasons).toEqual([
+        "clone: fetch",
+        "clone: fetch",
+        "clone: checkout",
+        "clone: checkout",
+      ]);
+      expect(provisionalNextOrdinal).toBe(4);
+      expect(tableRows(workspace, "SELECT ref_name FROM git_reflog_entries")).toEqual([]);
+      expect(tableRows(workspace, "SELECT repo_id FROM git_reflog_state")).toEqual([]);
+      expect(tableRows(workspace, "SELECT root FROM git_repositories")).toEqual([]);
     } finally {
       await server.close();
       fixture.dispose();
@@ -438,7 +640,12 @@ describe("fetch", () => {
   it("transfers only the new objects, then nothing at all", async () => {
     const { fixture, head } = makeFixture();
     const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
+    const workspace = makeWorkspace({
+      startTime: REFLOG_TIME,
+      timezoneOffset: -90,
+      now: () => REFLOG_TIME,
+    });
+    workspace.context.defaultIdentity = REFLOG_ACTOR;
     try {
       await clone(workspace.context, { url: server.url, dir: "/work" });
       const repo: Repository = openRepository(workspace.context, "/work");
@@ -449,6 +656,7 @@ describe("fetch", () => {
 
       fixture.write("third.txt", "third\n");
       const next = fixture.commit("third");
+      workspace.tick(2_000);
       const result = await fetchInto(workspace.context, repo, { depth: 1, singleBranch: true });
 
       expect(result.fetchHead).toBe(next);
@@ -465,6 +673,17 @@ describe("fetch", () => {
       // The new commit, the new root tree and the one new blob — nothing else.
       expect(packs[1]?.count).toBe(3);
       expect(packs[1]?.count ?? 0).toBeLessThan(firstPack[0]?.count ?? 0);
+      expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+        oldRaw: head,
+        newRaw: next,
+        oldOid: head,
+        newOid: next,
+        actor: REFLOG_ACTOR,
+        timestamp: REFLOG_TIME / 1_000 + 2,
+        timezoneOffset: -90,
+        reason: "fetch",
+      });
+      const historyAfterUpdate = repo.store.reflog("refs/remotes/origin/main").length;
 
       const posts = server.requests.filter((request) => request.method === "POST").length;
       const unchanged = await fetchInto(workspace.context, repo, { depth: 1, singleBranch: true });
@@ -473,6 +692,7 @@ describe("fetch", () => {
       expect(
         tableRows<{ pack_id: number }>(workspace, "SELECT pack_id FROM git_pack_meta").length,
       ).toBe(2);
+      expect(repo.store.reflog("refs/remotes/origin/main")).toHaveLength(historyAfterUpdate);
     } finally {
       await server.close();
       fixture.dispose();
@@ -482,18 +702,115 @@ describe("fetch", () => {
   it("prunes tracking refs the remote has dropped", async () => {
     const { fixture } = makeFixture();
     fixture.git("branch", "topic");
+    fixture.git("tag", "v1");
     const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
+    const workspace = makeWorkspace({ startTime: REFLOG_TIME, now: () => REFLOG_TIME });
     try {
       await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
       const repo = openRepository(workspace.context, "/work");
-      await fetchInto(workspace.context, repo, { depth: 0, singleBranch: false });
+      await fetchInto(workspace.context, repo, {
+        depth: 0,
+        singleBranch: false,
+        tags: true,
+      });
       expect(repo.store.getRef("refs/remotes/origin/topic")).not.toBeNull();
+      expect(repo.store.reflog("refs/tags/v1")[0]).toMatchObject({
+        oldRaw: null,
+        newOid: repo.head().oid,
+        reason: "fetch",
+      });
 
       fixture.git("branch", "-D", "topic");
       await fetchInto(workspace.context, repo, { depth: 0, singleBranch: false, prune: true });
       expect(repo.store.getRef("refs/remotes/origin/topic")).toBeNull();
       expect(repo.store.getRef("refs/remotes/origin/main")).not.toBeNull();
+      expect(repo.store.reflog("refs/remotes/origin/topic")[0]).toMatchObject({
+        newRaw: null,
+        newOid: null,
+        reason: "fetch",
+      });
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("does not publish tracking history when fetch pack ingest fails", async () => {
+    const { fixture, head } = makeFixture();
+    const serverOptions: GitServerOptions = {};
+    const server = await startGitServer(fixture.dir, serverOptions);
+    const workspace = makeWorkspace({ startTime: REFLOG_TIME, now: () => REFLOG_TIME });
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      const repo = openRepository(workspace.context, "/work");
+      const entries = repo.store.reflog("refs/remotes/origin/main").length;
+      fixture.write("failed.txt", "failed\n");
+      fixture.commit("failed fetch");
+      serverOptions.truncatePostAfter = 200;
+
+      const failure = await fetchInto(workspace.context, repo, {
+        depth: 0,
+        singleBranch: true,
+      }).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
+      expect(repo.store.reflog("refs/remotes/origin/main")).toHaveLength(entries);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps bulk fetch and prune statement growth flat by page", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "bulk\n");
+    const oid = fixture.commit("bulk refs");
+    const server = await startGitServer(fixture.dir);
+    const counts = [1, 1_000, 9_329];
+    const statements: Array<{ refs: number; fetch: number; prune: number }> = [];
+    let remoteBranches = 1;
+    try {
+      for (const count of counts) {
+        createRemoteBranches(fixture, remoteBranches, count, oid);
+        remoteBranches = count;
+        const workspace = makeRepo("/work", {
+          startTime: REFLOG_TIME,
+          now: () => REFLOG_TIME,
+        });
+        workspace.repo.store.configSet("remote.origin.url", server.url);
+
+        workspace.storage.resetCounters();
+        await fetchInto(workspace.context, workspace.repo, {
+          singleBranch: false,
+        });
+        const fetchStatements = workspace.storage.statementCount;
+        expect(workspace.repo.store.listRefs("refs/remotes/origin/")).toHaveLength(count + 1);
+
+        const stale = Array.from({ length: count }, (_, index) => ({
+          name: `refs/remotes/origin/stale-${String(index).padStart(5, "0")}`,
+          target: oid,
+        }));
+        workspace.repo.store.updateRefs(stale);
+        workspace.storage.resetCounters();
+        await fetchInto(workspace.context, workspace.repo, {
+          singleBranch: false,
+          prune: true,
+        });
+        const pruneStatements = workspace.storage.statementCount;
+        expect(workspace.repo.store.getRef(stale[0]!.name)).toBeNull();
+        expect(workspace.repo.store.getRef(stale[stale.length - 1]!.name)).toBeNull();
+        statements.push({ refs: count, fetch: fetchStatements, prune: pruneStatements });
+      }
+
+      expect(statements).toEqual([
+        { refs: 1, fetch: 29, prune: 13 },
+        { refs: 1_000, fetch: 29, prune: 13 },
+        { refs: 9_329, fetch: 41, prune: 25 },
+      ]);
     } finally {
       await server.close();
       fixture.dispose();
@@ -503,13 +820,23 @@ describe("fetch", () => {
   it("fails with a clear error when the remote is unknown", async () => {
     const { fixture } = makeFixture();
     const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
+    const workspace = makeWorkspace({ now: () => REFLOG_TIME });
     try {
       await clone(workspace.context, { url: server.url, dir: "/work" });
       const repo = openRepository(workspace.context, "/work");
+      const entries = repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        repo.store.repoId,
+      );
       await expect(
         fetchInto(workspace.context, repo, { remote: "upstream" }),
       ).rejects.toBeInstanceOf(GitError);
+      expect(
+        repo.store.db.scalar<number>(
+          "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+          repo.store.repoId,
+        ),
+      ).toBe(entries);
     } finally {
       await server.close();
       fixture.dispose();

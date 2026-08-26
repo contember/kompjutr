@@ -23,6 +23,7 @@ import { type AuthCallback, RemoteAuthSession } from "../protocol/transport.js";
 import { Repository } from "../repository.js";
 import { fileModeFor } from "../worktree.js";
 import { checkoutTree } from "./checkout.js";
+import { operationRefLogMetadata } from "./ref-log.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 
 /** How many commits back from each local tip are offered as `have`s. */
@@ -150,6 +151,7 @@ export async function fetchInto(
   context: GitContext,
   repo: Repository,
   options: FetchOptions,
+  refLogReason: "fetch" | "clone: fetch" = "fetch",
 ): Promise<FetchResult> {
   const remote = options.remote ?? "origin";
   const url = options.url ?? remoteUrlFor(repo, remote);
@@ -228,7 +230,10 @@ export async function fetchInto(
       updates.push({ name: `${trackingPrefix}HEAD`, target: `ref: ${tracking}` });
     }
   }
-  repo.store.updateRefs(updates, deletes);
+  repo.store.mutateRefs(
+    { puts: updates, deletes },
+    operationRefLogMetadata(context, repo, refLogReason),
+  );
 
   const first = wantedRefs[0];
   return {
@@ -376,26 +381,36 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     repo.store.configSet(`remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
 
     const depth = options.depth ?? 1;
-    const result = await fetchInto(context, repo, {
-      remote,
-      url,
-      singleBranch: options.singleBranch ?? true,
-      tags: !(options.noTags ?? true),
-      ...(options.ref === undefined ? {} : { ref: options.ref }),
-      ...(depth > 0 && Number.isFinite(depth) ? { depth } : {}),
-      ...(options.headers === undefined ? {} : { headers: options.headers }),
-      ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
-      ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
-      ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
-    });
+    const result = await fetchInto(
+      context,
+      repo,
+      {
+        remote,
+        url,
+        singleBranch: options.singleBranch ?? true,
+        tags: !(options.noTags ?? true),
+        ...(options.ref === undefined ? {} : { ref: options.ref }),
+        ...(depth > 0 && Number.isFinite(depth) ? { depth } : {}),
+        ...(options.headers === undefined ? {} : { headers: options.headers }),
+        ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
+        ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+        ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
+      },
+      "clone: fetch",
+    );
 
     const branch = branchNameFor(options.ref, result.defaultBranch);
     const tip = result.fetchHead;
     if (tip === null) throw new GitError("EFETCHFAIL", "remote advertised no usable ref");
 
     repo.store.db.transactionSync(() => {
-      repo.store.setRef(`refs/heads/${branch}`, tip);
-      repo.store.setHead(`ref: refs/heads/${branch}`);
+      repo.store.mutateRefs(
+        {
+          puts: [{ name: `refs/heads/${branch}`, target: tip }],
+          head: `ref: refs/heads/${branch}`,
+        },
+        operationRefLogMetadata(context, repo, "clone: checkout"),
+      );
       repo.store.configSet(`branch.${branch}.remote`, remote);
       repo.store.configSet(`branch.${branch}.merge`, `refs/heads/${branch}`);
     });

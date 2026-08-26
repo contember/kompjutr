@@ -20,6 +20,7 @@ import {
 } from "./helpers/workspace.js";
 
 const IDENTITY = { name: "Fixture", email: "fixture@example.com" };
+const REFLOG_TIME = 1_577_836_800_000;
 const compatibilityPullOptions: ComputerPullOptions = {};
 const nativePullOptions: GitPullOptions = compatibilityPullOptions;
 void nativePullOptions;
@@ -41,6 +42,15 @@ function configureUpstream(workspace: TestRepository): void {
   workspace.repo.store.configSet("remote.origin.url", "https://example.com/repo.git");
 }
 
+function pullPublicationCount(repo: Repository): number {
+  return (
+    repo.store.db.scalar<number>(
+      "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ? AND reason LIKE 'pull:%'",
+      repo.store.repoId,
+    ) ?? 0
+  );
+}
+
 function gitFor(workspace: TestWorkspace, http?: GitHttpClient): Git {
   return createGit()({
     database: workspace.database,
@@ -54,7 +64,9 @@ function gitFor(workspace: TestWorkspace, http?: GitHttpClient): Git {
 
 function reopenedGit(workspace: TestWorkspace): Git {
   return createGit()({
-    database: new SqliteGitDatabase(new TestDatabase(workspace.storage)),
+    database: new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+      now: workspace.context.now,
+    }),
     worktree: workspace.worktree,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
@@ -232,10 +244,12 @@ describe("pull", () => {
     it("fetches and fast-forwards the checked-out branch", async () => {
       const { fixture, base } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       try {
         const git = gitFor(workspace);
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
+        const repo = openRepository(workspace.context, "/work");
+        const branchEntries = repo.store.reflog("refs/heads/main").length;
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
         workspace.storage.resetCounters();
@@ -245,10 +259,31 @@ describe("pull", () => {
           fastForward: true,
         });
 
-        const repo = openRepository(workspace.context, "/work");
         expect(base).not.toBe(incoming);
         expect(repo.head().oid).toBe(incoming);
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          oldOid: base,
+          newOid: incoming,
+          actor: IDENTITY,
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+          reason: "fetch",
+        });
+        expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries + 1);
+        expect(repo.store.reflog("refs/heads/main")[0]).toMatchObject({
+          oldOid: base,
+          newOid: incoming,
+          actor: IDENTITY,
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+          reason: "pull: fast-forward",
+        });
+        expect(repo.store.reflog("HEAD")[0]).toMatchObject({
+          oldOid: base,
+          newOid: incoming,
+          reason: "pull: fast-forward",
+        });
         expect(await workspace.workspace.fs.readFile("/work/remote.txt", "utf8")).toBe("remote\n");
         expect(workspace.storage.statementCount).toBeLessThan(1_000);
       } finally {
@@ -317,27 +352,48 @@ describe("pull", () => {
     });
 
     it("creates a two-parent merge for clean divergence", async () => {
-      const { fixture } = remoteFixture();
+      const { fixture, base } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       try {
         const git = gitFor(workspace);
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
         await workspace.workspace.fs.writeFile("/work/local.txt", "local\n");
         await git.add({ dir: "/work", paths: ["local.txt"] });
         const local = await git.commit({ dir: "/work", message: "local" });
+        const repo = openRepository(workspace.context, "/work");
+        const branchEntries = repo.store.reflog("refs/heads/main").length;
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
 
         const result = await git.pull({ dir: "/work" });
         if (result.oid === undefined) throw new Error("pull did not create a merge commit");
 
-        const repo = openRepository(workspace.context, "/work");
         const merged = repo.readCommit(result.oid);
         expect(merged.parent).toEqual([local.oid, incoming]);
         expect(merged.message).toBe(`Merge branch 'main' of ${server.url}\n`);
         expect(repo.head().oid).toBe(result.oid);
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          oldOid: base,
+          newOid: incoming,
+          actor: IDENTITY,
+          reason: "fetch",
+        });
+        expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries + 1);
+        expect(repo.store.reflog("refs/heads/main")[0]).toMatchObject({
+          oldOid: local.oid,
+          newOid: result.oid,
+          actor: IDENTITY,
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+          reason: "pull: merge",
+        });
+        expect(repo.store.reflog("HEAD")[0]).toMatchObject({
+          oldOid: local.oid,
+          newOid: result.oid,
+          reason: "pull: merge",
+        });
         expect(await workspace.workspace.fs.readFile("/work/local.txt", "utf8")).toBe("local\n");
         expect(await workspace.workspace.fs.readFile("/work/remote.txt", "utf8")).toBe("remote\n");
       } finally {
@@ -435,10 +491,13 @@ describe("pull", () => {
     it("retains fetched state when a touched worktree file is dirty", async () => {
       const { fixture, base } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       try {
         const git = gitFor(workspace);
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
+        const repo = openRepository(workspace.context, "/work");
+        const branchEntries = repo.store.reflog("refs/heads/main").length;
+        const headEntries = repo.store.reflog("HEAD").length;
         await workspace.workspace.fs.writeFile("/work/base.txt", "dirty\n");
         fixture.write("base.txt", "incoming\n");
         const incoming = fixture.commit("remote");
@@ -446,10 +505,16 @@ describe("pull", () => {
         await expect(git.pull({ dir: "/work" })).rejects.toMatchObject({
           code: "ECHECKOUTFAIL",
         });
-        const repo = openRepository(workspace.context, "/work");
         expect(repo.head().oid).toBe(base);
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
         expect(await workspace.workspace.fs.readFile("/work/base.txt", "utf8")).toBe("dirty\n");
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          oldOid: base,
+          newOid: incoming,
+          reason: "fetch",
+        });
+        expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries);
+        expect(repo.store.reflog("HEAD")).toHaveLength(headEntries);
       } finally {
         await server.close();
         fixture.dispose();
@@ -459,13 +524,16 @@ describe("pull", () => {
     it("retains fetched state when fast-forward-only rejects divergence", async () => {
       const { fixture } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       try {
         const git = gitFor(workspace);
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
         await workspace.workspace.fs.writeFile("/work/local.txt", "local\n");
         await git.add({ dir: "/work", paths: ["local.txt"] });
         const local = await git.commit({ dir: "/work", message: "local" });
+        const repo = openRepository(workspace.context, "/work");
+        const branchEntries = repo.store.reflog("refs/heads/main").length;
+        const headEntries = repo.store.reflog("HEAD").length;
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
 
@@ -473,11 +541,16 @@ describe("pull", () => {
           code: "ENONFF",
         });
 
-        const repo = openRepository(workspace.context, "/work");
         expect(repo.head().oid).toBe(local.oid);
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
         expect(repo.store.readMergeState()).toBeNull();
         expect(await workspace.workspace.fs.readFile("/work/local.txt", "utf8")).toBe("local\n");
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          newOid: incoming,
+          reason: "fetch",
+        });
+        expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries);
+        expect(repo.store.reflog("HEAD")).toHaveLength(headEntries);
       } finally {
         await server.close();
         fixture.dispose();
@@ -487,18 +560,19 @@ describe("pull", () => {
     it("rejects a HEAD change across fetch while retaining fetched state", async () => {
       const { fixture, base } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       const barrier = discoveryBarrier();
       try {
         const git = gitFor(workspace, barrier.http);
         await git.clone({ url: server.url, dir: "/work", depth: 0 });
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
+        const repo = openRepository(workspace.context, "/work");
+        const pullEntries = pullPublicationCount(repo);
         barrier.block();
 
         const pulling = git.pull({ dir: "/work" });
         await barrier.entered;
-        const repo = openRepository(workspace.context, "/work");
         repo.store.setRef("refs/heads/topic", base);
         repo.store.setHead("ref: refs/heads/topic");
         barrier.release();
@@ -507,6 +581,11 @@ describe("pull", () => {
         expect(repo.head()).toEqual({ ref: "refs/heads/topic", oid: base });
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
         expect(repo.store.readMergeState()).toBeNull();
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          newOid: incoming,
+          reason: "fetch",
+        });
+        expect(pullPublicationCount(repo)).toBe(pullEntries);
       } finally {
         barrier.release();
         await server.close();
@@ -517,7 +596,7 @@ describe("pull", () => {
     it("rejects a same-branch OID change across fetch", async () => {
       const { fixture, base } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       const barrier = discoveryBarrier();
       try {
         const git = gitFor(workspace, barrier.http);
@@ -527,11 +606,12 @@ describe("pull", () => {
         await git.commit({ dir: "/work", message: "local" });
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
+        const repo = openRepository(workspace.context, "/work");
+        const pullEntries = pullPublicationCount(repo);
         barrier.block();
 
         const pulling = git.pull({ dir: "/work" });
         await barrier.entered;
-        const repo = openRepository(workspace.context, "/work");
         repo.store.setRef("refs/heads/main", base);
         barrier.release();
 
@@ -539,6 +619,11 @@ describe("pull", () => {
         expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: base });
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
         expect(repo.store.readMergeState()).toBeNull();
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          newOid: incoming,
+          reason: "fetch",
+        });
+        expect(pullPublicationCount(repo)).toBe(pullEntries);
       } finally {
         barrier.release();
         await server.close();
@@ -582,18 +667,19 @@ describe("pull", () => {
       async ({ mutate }) => {
         const { fixture, base } = remoteFixture();
         const server = await startGitServer(fixture.dir);
-        const workspace = makeWorkspace();
+        const workspace = makeWorkspace({ now: () => REFLOG_TIME });
         const barrier = discoveryBarrier();
         try {
           const git = gitFor(workspace, barrier.http);
           await git.clone({ url: server.url, dir: "/work", depth: 0 });
           fixture.write("remote.txt", "remote\n");
           const incoming = fixture.commit("remote");
+          const repo = openRepository(workspace.context, "/work");
+          const pullEntries = pullPublicationCount(repo);
           barrier.block();
 
           const pulling = git.pull({ dir: "/work" });
           await barrier.entered;
-          const repo = openRepository(workspace.context, "/work");
           mutate(repo, server.url);
           barrier.release();
 
@@ -601,6 +687,11 @@ describe("pull", () => {
           expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: base });
           expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
           expect(repo.store.readMergeState()).toBeNull();
+          expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+            newOid: incoming,
+            reason: "fetch",
+          });
+          expect(pullPublicationCount(repo)).toBe(pullEntries);
         } finally {
           barrier.release();
           await server.close();
@@ -612,7 +703,7 @@ describe("pull", () => {
     it("preserves an active merge created across fetch and rejects it on preflight", async () => {
       const { fixture, base } = remoteFixture();
       const server = await startGitServer(fixture.dir);
-      const workspace = makeWorkspace();
+      const workspace = makeWorkspace({ now: () => REFLOG_TIME });
       const barrier = discoveryBarrier();
       try {
         const git = gitFor(workspace, barrier.http);
@@ -622,11 +713,12 @@ describe("pull", () => {
         const local = await git.commit({ dir: "/work", message: "local" });
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
+        const repo = openRepository(workspace.context, "/work");
+        const pullEntries = pullPublicationCount(repo);
         barrier.block();
 
         const pulling = git.pull({ dir: "/work" });
         await barrier.entered;
-        const repo = openRepository(workspace.context, "/work");
         const state: MergeStateMetadata = {
           originalHeadRef: "refs/heads/main",
           originalHeadOid: local.oid,
@@ -634,6 +726,7 @@ describe("pull", () => {
           incomingParentOid: base,
           phase: "ready",
           mode: "no-commit",
+          mergeOrigin: "merge",
           currentLabel: "HEAD",
           incomingLabel: base,
           message: "pending local merge\n",
@@ -647,6 +740,11 @@ describe("pull", () => {
         expect(repo.head()).toEqual({ ref: "refs/heads/main", oid: local.oid });
         expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
         expect(repo.store.requireMergeState().state).toEqual(state);
+        expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+          newOid: incoming,
+          reason: "fetch",
+        });
+        expect(pullPublicationCount(repo)).toBe(pullEntries);
 
         let requests = 0;
         const noHttp: GitHttpClient = async () => {
@@ -670,7 +768,7 @@ describe("pull", () => {
     fixture.write("conflict.txt", "base\n");
     fixture.commit("base");
     const server = await startGitServer(fixture.dir);
-    const workspace = makeWorkspace();
+    const workspace = makeWorkspace({ now: () => REFLOG_TIME });
     try {
       const git = gitFor(workspace);
       await git.clone({ url: server.url, dir: "/work", depth: 0 });
@@ -686,20 +784,57 @@ describe("pull", () => {
       });
 
       const repo = openRepository(workspace.context, "/work");
+      const branchEntries = repo.store.reflog("refs/heads/main").length;
       expect(repo.head().oid).toBe(local.oid);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
       expect(repo.store.requireMergeState().state.phase).toBe("conflicted");
       expect(await workspace.workspace.fs.readFile("/work/conflict.txt", "utf8")).toContain(
         `>>>>>>> ${incoming}`,
       );
+      expect(repo.store.reflog("refs/remotes/origin/main")[0]).toMatchObject({
+        newOid: incoming,
+        reason: "fetch",
+      });
+      expect(
+        repo.store.reflog("refs/heads/main").filter((entry) => entry.reason.startsWith("pull:")),
+      ).toEqual([]);
+      const priorOrdinal = repo.store.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        repo.store.repoId,
+      );
+      if (priorOrdinal === undefined) throw new Error("reflog state missing before continuation");
 
       const cold = reopenedGit(workspace);
       await workspace.workspace.fs.writeFile("/work/conflict.txt", "resolved\n");
       await cold.add({ dir: "/work", paths: ["conflict.txt"] });
-      const continued = await cold.mergeContinue({ dir: "/work" });
-      if (continued.oid === undefined) throw new Error("continued pull returned no commit");
+      const continued = await cold.commit({ dir: "/work", message: "resolved pull" });
       expect(repo.readCommit(continued.oid).parent).toEqual([local.oid, incoming]);
       expect(repo.store.readMergeState()).toBeNull();
+      expect(repo.store.reflog("refs/heads/main")).toHaveLength(branchEntries + 1);
+      expect(repo.store.reflog("refs/heads/main")[0]).toEqual({
+        refName: "refs/heads/main",
+        ordinal: priorOrdinal + 1,
+        oldRaw: local.oid,
+        newRaw: continued.oid,
+        oldOid: local.oid,
+        newOid: continued.oid,
+        actor: IDENTITY,
+        timestamp: 1_577_836_800,
+        timezoneOffset: 0,
+        reason: "pull: merge",
+      });
+      expect(repo.store.reflog("HEAD")[0]).toEqual({
+        refName: "HEAD",
+        ordinal: priorOrdinal + 2,
+        oldRaw: "ref: refs/heads/main",
+        newRaw: "ref: refs/heads/main",
+        oldOid: local.oid,
+        newOid: continued.oid,
+        actor: IDENTITY,
+        timestamp: 1_577_836_800,
+        timezoneOffset: 0,
+        reason: "pull: merge",
+      });
     } finally {
       await server.close();
       fixture.dispose();

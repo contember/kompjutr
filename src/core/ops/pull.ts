@@ -284,6 +284,7 @@ export async function pull(
     {
       ...behavior,
       incomingLabel: fetched.fetchHead,
+      origin: "pull",
     },
   );
 }
