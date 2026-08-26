@@ -57,10 +57,18 @@ export interface IndexTrackerWriter {
   ): boolean;
 }
 
+export type ExactRootState = "present" | "missing";
+
+/** Optional bulk path-state capability used by repository checkout lifecycle operations. */
+export interface ExactRootStateSource {
+  states(roots: readonly string[]): readonly ExactRootState[];
+}
+
 /** Everything the commands need that is not the repository itself. */
 export interface GitContext {
   database: SqliteGitDatabase;
   worktree: Worktree;
+  exactRootStates?: ExactRootStateSource;
   initialWorktree?: InitialWorktreeWriter;
   indexTracker?: IndexTrackerWriter;
   sparseWorkspace?: SparseWorkspaceSource;

@@ -2,6 +2,7 @@ import type { GitContext } from "../../src/core/context.js";
 import { initRepository } from "../../src/core/ops/init.js";
 import type { Repository } from "../../src/core/repository.js";
 import { NodeFsCompat } from "../../src/fs/compat/node.js";
+import { createExactPathStateSource } from "../../src/fs/exact-path-states.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
 import { initializeIndexTracker } from "../../src/sqlite/index-tracker.js";
@@ -39,6 +40,7 @@ export function makeWorkspace(options: MakeWorkspaceOptions = {}): TestWorkspace
   const context: GitContext = {
     database,
     worktree,
+    exactRootStates: createExactPathStateSource(db),
     sparseWorkspace: createSqliteSparseWorkspaceSource(db),
     now,
     timezoneOffset: () => options.timezoneOffset ?? 0,

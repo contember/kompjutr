@@ -55,6 +55,16 @@ export {
   statusReport,
   statusStream,
 } from "../core/ops/status.js";
+export {
+  type WorktreeAddOptions,
+  type WorktreeAddTarget,
+  type WorktreeInfo,
+  type WorktreeRemoveOptions,
+  worktreeAdd,
+  worktreeList,
+  worktreePrune,
+  worktreeRemove,
+} from "../core/ops/worktrees.js";
 export { Repository } from "../core/repository.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "../core/worktree.js";
 export type { SqlDatabase } from "../sqlite/db.js";
@@ -113,4 +123,6 @@ export {
   type GitTagOptions,
   type GitUpdateRefOptions,
   type GitWorkspaceBinding,
+  type GitWorktreeAddOptions,
+  type GitWorktreeRemoveOptions,
 } from "./client.js";

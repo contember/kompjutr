@@ -58,6 +58,16 @@ export {
   statusReport,
   statusStream,
 } from "./core/ops/status.js";
+export {
+  type WorktreeAddOptions,
+  type WorktreeAddTarget,
+  type WorktreeInfo,
+  type WorktreeRemoveOptions,
+  worktreeAdd,
+  worktreeList,
+  worktreePrune,
+  worktreeRemove,
+} from "./core/ops/worktrees.js";
 export { Repository } from "./core/repository.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";
 export { NodeFsCompat } from "./fs/compat/node.js";
@@ -102,6 +112,8 @@ export {
   type GitStatusOptions,
   type GitStatusReport,
   type GitStatusReportOptions,
+  type GitWorktreeAddOptions,
+  type GitWorktreeRemoveOptions,
 } from "./git/client.js";
 export {
   type Async,

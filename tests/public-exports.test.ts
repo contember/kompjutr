@@ -5,6 +5,8 @@ import type {
   DivergenceOptions as GitCoreDivergenceOptions,
   ReadRefOptions as GitCoreReadRefOptions,
   StatusReport as GitCoreStatusReport,
+  WorktreeAddOptions as GitCoreWorktreeAddOptions,
+  WorktreeRemoveOptions as GitCoreWorktreeRemoveOptions,
   GitDivergenceOptions,
   DivergenceRelationship as GitDivergenceRelationship,
   DivergenceResult as GitDivergenceResult,
@@ -26,19 +28,34 @@ import type {
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
   GitRevertOptions,
+  GitWorktreeAddOptions,
+  WorktreeAddTarget as GitWorktreeAddTarget,
+  WorktreeInfo as GitWorktreeInfo,
+  GitWorktreeRemoveOptions,
 } from "../src/git/index.js";
-import { divergence as gitDivergence, readRef as gitReadRef } from "../src/git/index.js";
+import {
+  divergence as gitDivergence,
+  readRef as gitReadRef,
+  worktreeAdd as gitWorktreeAdd,
+  worktreeList as gitWorktreeList,
+  worktreePrune as gitWorktreePrune,
+  worktreeRemove as gitWorktreeRemove,
+} from "../src/git/index.js";
 import type {
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
   GitCherryPickOptions as RootCherryPickOptions,
   DivergenceOptions as RootCoreDivergenceOptions,
   ReadRefOptions as RootCoreReadRefOptions,
   StatusReport as RootCoreStatusReport,
+  WorktreeAddOptions as RootCoreWorktreeAddOptions,
+  WorktreeRemoveOptions as RootCoreWorktreeRemoveOptions,
   DivergenceRelationship as RootDivergenceRelationship,
   DivergenceResult as RootDivergenceResult,
   Git as RootGit,
   GitDivergenceOptions as RootGitDivergenceOptions,
   GitReadRefOptions as RootGitReadRefOptions,
+  GitWorktreeAddOptions as RootGitWorktreeAddOptions,
+  GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
   RawRefTarget as RootRawRefTarget,
   GitRebaseContinueOptions as RootRebaseContinueOptions,
   GitRebaseOptions as RootRebaseOptions,
@@ -55,8 +72,17 @@ import type {
   GitStatusOptions as RootStatusOptions,
   GitStatusReport as RootStatusReport,
   GitStatusReportOptions as RootStatusReportOptions,
+  WorktreeAddTarget as RootWorktreeAddTarget,
+  WorktreeInfo as RootWorktreeInfo,
 } from "../src/index.js";
-import { divergence as rootDivergence, readRef as rootReadRef } from "../src/index.js";
+import {
+  divergence as rootDivergence,
+  readRef as rootReadRef,
+  worktreeAdd as rootWorktreeAdd,
+  worktreeList as rootWorktreeList,
+  worktreePrune as rootWorktreePrune,
+  worktreeRemove as rootWorktreeRemove,
+} from "../src/index.js";
 
 describe("public bounded read exports", () => {
   it("exposes matching divergence and raw-ref operations from both entrypoints", () => {
@@ -103,6 +129,74 @@ describe("public bounded read exports", () => {
       rootDivergence,
       gitReadRef,
       rootReadRef,
+    ]);
+  });
+});
+
+describe("public worktree lifecycle exports", () => {
+  it("exposes matching core operations, public options, results, and Git methods", () => {
+    const target: RootWorktreeAddTarget = {
+      kind: "new-branch",
+      name: "session",
+      startPoint: "HEAD",
+    };
+    const gitTarget: GitWorktreeAddTarget = target;
+    const coreAdd: RootCoreWorktreeAddOptions = { root: "/session", target };
+    const gitCoreAdd: GitCoreWorktreeAddOptions = coreAdd;
+    const add: RootGitWorktreeAddOptions = { ...coreAdd, dir: "/primary" };
+    const gitAdd: GitWorktreeAddOptions = add;
+    const coreRemove: RootCoreWorktreeRemoveOptions = { root: "/session", force: true };
+    const gitCoreRemove: GitCoreWorktreeRemoveOptions = coreRemove;
+    const remove: RootGitWorktreeRemoveOptions = { ...coreRemove, dir: "/primary" };
+    const gitRemove: GitWorktreeRemoveOptions = remove;
+    const result: RootWorktreeInfo = {
+      checkoutId: 2,
+      root: "/session",
+      head: "ref: refs/heads/session",
+      isPrimary: false,
+      state: "present",
+    };
+    const gitResult: GitWorktreeInfo = result;
+    const rootMethods: readonly (keyof RootGit)[] = [
+      "worktreeAdd",
+      "worktreeList",
+      "worktreeRemove",
+      "worktreePrune",
+    ];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
+
+    expect([
+      gitTarget.kind,
+      gitCoreAdd.root,
+      gitAdd.dir,
+      gitCoreRemove.force,
+      gitRemove.dir,
+      gitResult.state,
+      gitMethods,
+      gitWorktreeAdd,
+      gitWorktreeList,
+      gitWorktreeRemove,
+      gitWorktreePrune,
+      rootWorktreeAdd,
+      rootWorktreeList,
+      rootWorktreeRemove,
+      rootWorktreePrune,
+    ]).toEqual([
+      "new-branch",
+      "/session",
+      "/primary",
+      true,
+      "/primary",
+      "present",
+      rootMethods,
+      gitWorktreeAdd,
+      gitWorktreeList,
+      gitWorktreeRemove,
+      gitWorktreePrune,
+      rootWorktreeAdd,
+      rootWorktreeList,
+      rootWorktreeRemove,
+      rootWorktreePrune,
     ]);
   });
 });

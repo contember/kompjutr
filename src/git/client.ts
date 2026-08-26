@@ -1,4 +1,5 @@
 import {
+  type ExactRootStateSource,
   type GitContext,
   type GitIdentity,
   type IndexTrackerWriter,
@@ -143,6 +144,15 @@ import {
   type StatusReportOptions,
   statusBranch,
 } from "../core/ops/status.js";
+import {
+  type WorktreeAddOptions,
+  type WorktreeInfo,
+  type WorktreeRemoveOptions,
+  worktreeAdd as worktreeAddOp,
+  worktreeList as worktreeListOp,
+  worktreePrune as worktreePruneOp,
+  worktreeRemove as worktreeRemoveOp,
+} from "../core/ops/worktrees.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import type { Repository } from "../core/repository.js";
 import type { SparseWorkspaceSource } from "../core/sparse-workspace.js";
@@ -189,6 +199,8 @@ export type GitDivergenceOptions = DivergenceOptions & GitDirOptions;
 export type GitReadRefOptions = ReadRefOptions & GitDirOptions;
 export type GitRefLogOptions = RefLogReadOptions & GitDirOptions;
 export type GitRecoverRefOptions = RecoverRefOptions & GitDirOptions;
+export type GitWorktreeAddOptions = WorktreeAddOptions & GitDirOptions;
+export type GitWorktreeRemoveOptions = WorktreeRemoveOptions & GitDirOptions;
 export type GitPushOptions = PushOptions & GitDirOptions;
 export type GitPullOptions = PullOptions & GitDirOptions;
 
@@ -220,6 +232,10 @@ export interface Git {
   revParse(input: GitDirOptions & { ref: string }): Promise<string>;
   divergence(input: GitDivergenceOptions): Promise<DivergenceResult>;
   readRef(input: GitReadRefOptions): Promise<RawRefTarget>;
+  worktreeAdd(input: GitWorktreeAddOptions): Promise<WorktreeInfo>;
+  worktreeList(input?: GitDirOptions): Promise<readonly WorktreeInfo[]>;
+  worktreeRemove(input: GitWorktreeRemoveOptions): Promise<void>;
+  worktreePrune(input?: GitDirOptions): Promise<readonly WorktreeInfo[]>;
   reflog(input?: GitRefLogOptions): Promise<RefLogEntry[]>;
   recoverRef(input: GitRecoverRefOptions): Promise<void>;
   repoRoot(input?: GitDirOptions): Promise<string>;
@@ -267,6 +283,7 @@ export interface Git {
 export interface GitWorkspaceBinding {
   database: SqliteGitDatabase;
   worktree: Worktree;
+  exactRootStates?: ExactRootStateSource;
   initialWorktree?: InitialWorktreeWriter;
   indexTracker?: IndexTrackerWriter;
   sparseWorkspace?: SparseWorkspaceSource;
@@ -298,6 +315,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     timezoneOffset: options.timezoneOffset ?? binding.timezoneOffset,
   };
   if (binding.defaultIdentity !== undefined) context.defaultIdentity = binding.defaultIdentity;
+  if (binding.exactRootStates !== undefined) context.exactRootStates = binding.exactRootStates;
   if (binding.http !== undefined) context.http = binding.http;
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
   if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
@@ -402,6 +420,18 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async readRef(input) {
       return readRefOp(at(input.dir), input);
+    },
+    async worktreeAdd(input) {
+      return worktreeAddOp(context, at(input.dir), input);
+    },
+    async worktreeList(input = {}) {
+      return worktreeListOp(context, at(input.dir));
+    },
+    async worktreeRemove(input) {
+      worktreeRemoveOp(context, at(input.dir), input);
+    },
+    async worktreePrune(input = {}) {
+      return worktreePruneOp(context, at(input.dir));
     },
     async reflog(input = {}) {
       return reflogOp(at(input.dir), input);

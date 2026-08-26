@@ -1,6 +1,7 @@
 import type { GitIdentity, IndexTrackerWriter } from "../core/context.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import { NodeFsCompat } from "../fs/compat/node.js";
+import { createExactPathStateSource } from "../fs/exact-path-states.js";
 import { createFilesystem } from "../fs/filesystem.js";
 import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
@@ -57,6 +58,7 @@ export class Workspace {
       const binding = {
         database: this.#gitDatabase,
         worktree: this.filesystem,
+        exactRootStates: createExactPathStateSource(this.db),
         initialWorktree: createInitialWorktreeWriter(this.db, now),
         indexTracker,
         sparseWorkspace: createSqliteSparseWorkspaceSource(this.db),
