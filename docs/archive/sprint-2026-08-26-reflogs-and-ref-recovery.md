@@ -226,7 +226,7 @@ matrix and recovery witnesses pass.
 ## Out of scope (explicit)
 
 - Merged-branch reachability enforcement and force-delete behavior remain
-  backlog [33](../backlog/33-branch-delete-merged-check.md). It becomes
+  backlog [33](sprint-2026-08-26-git-boundary-correctness.md#wu1--safe-branch-deletion-33-effort-m). It becomes
   schedulable only after this sprint closes.
 - Repack, garbage collection, object deletion, and reflog-aware pruning remain
   backlog [04](../backlog/04-repack-and-garbage-collection.md). This sprint

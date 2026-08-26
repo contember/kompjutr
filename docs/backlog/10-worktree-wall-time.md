@@ -19,10 +19,14 @@ as blockers for a performance-complete release.
 The status half is attributed. Its contributors are filed as separate items
 with independent witnesses — [54](54-prune-ignored-directories-in-status-walk.md)
 (ignored directories are walked, not pruned),
-[55](55-sparse-status-across-untracked-files.md) (one untracked file forces the
-full path), [56](56-reseal-index-tracker-on-commit.md) (the first status after
-commit pays a full tree diff), and [57](57-single-prepass-in-full-status.md)
-(the index is streamed three times). The checkout half is not yet attributed.
+[56](56-reseal-index-tracker-on-commit.md) (the first status after commit pays a
+full tree diff), and [57](57-single-prepass-in-full-status.md) (the index is
+streamed three times). Sparse status now keeps normal untracked collapsing on
+its bounded path; the
+[Git boundary sprint](../archive/sprint-2026-08-26-git-boundary-correctness.md#wu2--framing-safe-and-sparse-truthful-status-45-50-55-effort-l)
+closed that separate contributor.
+
+The checkout half is not yet attributed.
 
 ## Approach / acceptance
 

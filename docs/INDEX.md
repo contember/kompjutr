@@ -15,15 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-26-git-boundary-correctness.md`](sprints/sprint-2026-08-26-git-boundary-correctness.md)
-  — safe Git-facing boundaries for refs, status, conflicts, and network defaults.
+- None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Git boundary correctness is active: safe branch deletion, status truth and
-  framing, materializable distinct-type conflicts, and default network coverage.
+- Production qualification is next: correct the force-checkout benchmark before
+  measuring worktree cost, then run the production and concurrency probes.
 
 ## Key reference
 
@@ -49,6 +48,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-26-git-boundary-correctness.md`](archive/sprint-2026-08-26-git-boundary-correctness.md)
+  — safe branch deletion, framing-safe and sparse-truthful status,
+  file/symlink conflict materialisation, and Git-compatible network defaults.
 - [`archive/sprint-2026-08-26-shell-correctness-and-bounds.md`](archive/sprint-2026-08-26-shell-correctness-and-bounds.md)
   — truthful shell lists and commands, set-based filesystem mutations, paged
   discovery, atomic redirects, and one measured retained-memory boundary.

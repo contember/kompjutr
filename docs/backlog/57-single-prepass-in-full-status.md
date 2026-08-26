@@ -39,8 +39,9 @@ contract.
 - Skip the HEAD side of the prepass when `renameDetectionEnabled` is false, so
   `renames: false` keeps today's cost.
 - Keep the lazy contract of `statusStream` unchanged.
-- Coordinate with [55](55-sparse-status-across-untracked-files.md), which may
-  remove `trackedPaths` retention from the same prepass.
+- Preserve the bounded sparse-status path shipped by the
+  [Git boundary sprint](../archive/sprint-2026-08-26-git-boundary-correctness.md#wu2--framing-safe-and-sparse-truthful-status-45-50-55-effort-l);
+  this item changes only the full-status prepass.
 - **Witness.** `tests/status.test.ts` parity output is unchanged; a recorded
   statement test asserts the full path scans the index twice with renames on
   and off.

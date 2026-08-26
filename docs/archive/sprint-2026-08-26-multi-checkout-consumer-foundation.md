@@ -291,7 +291,7 @@ models overlap.
   [44](../backlog/44-patch-interchange.md). They belong to the broader checkpoint
   workload, not the current consumer admission gate.
 - Safe merged-branch deletion and storage reclamation remain follow-up production
-  safety work in [33](../backlog/33-branch-delete-merged-check.md) and
+  safety work in [33](sprint-2026-08-26-git-boundary-correctness.md#wu1--safe-branch-deletion-33-effort-m) and
   [04](../backlog/04-repack-and-garbage-collection.md).
 - The actual Durable Object release-candidate probe and systematic interleaving
   suite remain [11](../backlog/11-production-do-regression-probe.md) and

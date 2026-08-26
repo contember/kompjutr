@@ -19,12 +19,7 @@ Ranking of the gaps recorded in
 not effort: a wrong answer outranks a missing one.
 
 - **S — silent divergence.** kompjutr returns a plausible result where Git
-  returns a different one or refuses. Nothing warns the caller.
-  [33](33-branch-delete-merged-check.md) ·
-  [45](45-framing-safe-porcelain-output.md) ·
-  [50](50-untracked-row-after-cached-removal.md) ·
-  [51](51-relocate-distinct-type-conflicts.md) ·
-  [52](52-default-ref-coverage-on-fetch-and-pull.md)
+  returns a different one or refuses. Nothing warns the caller. No current item.
 - **A — blocks a common workflow, loudly.** The call fails or the capability is
   absent; no data is at risk.
   [35](35-staged-diff.md) ·
@@ -63,24 +58,21 @@ the same phase may run in parallel, but a blocked item must not move ahead of it
 blocker. Re-evaluate the order after each phase as production evidence arrives.
 
 1. **Harden destructive maintenance:**
-   [33](33-branch-delete-merged-check.md), then
-   [04](04-repack-and-garbage-collection.md). Both now consume the bounded
-   recovery and active-root contracts.
+   [04](04-repack-and-garbage-collection.md), which consumes the bounded recovery
+   and active-root contracts.
 2. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
    [11](11-production-do-regression-probe.md), and
    [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
    work unit; the production probe is now unblocked by the verified CI/release
    seam. The status half of 10 now has attributed causes with their own
    witnesses: [54](54-prune-ignored-directories-in-status-walk.md) and
-   [56](56-reseal-index-tracker-on-commit.md) are small and independent, take
-   them first; then [55](55-sparse-status-across-untracked-files.md); then
-   [57](57-single-prepass-in-full-status.md).
+   [56](56-reseal-index-tracker-on-commit.md) are small and independent; take
+   them first, then [57](57-single-prepass-in-full-status.md).
 3. **Close the reference-workload gaps.** These come from the only production
    workload documented end to end
    ([coverage](../reference/git-support.md#reference-workload-coverage)), so they
-   are evidence rather than guesswork: [45](45-framing-safe-porcelain-output.md)
-   first (it is tier S), then [43](43-index-and-object-write-plumbing.md) and
-   [44](44-patch-interchange.md), then
+   are evidence rather than guesswork: [43](43-index-and-object-write-plumbing.md)
+   and [44](44-patch-interchange.md), then
    [42](42-remote-ref-discovery-and-refspec-fetch.md) with
    [08](08-extend-push-refspecs.md) (shared refspec type),
    [41](41-partial-clone.md) alongside [38](38-clone-depth-and-deepening.md)
@@ -98,16 +90,6 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
 6. **Defer until a concrete workload justifies them:**
    [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
    [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md).
-
-Outside the phases: [50](50-untracked-row-after-cached-removal.md),
-[51](51-relocate-distinct-type-conflicts.md),
-[52](52-default-ref-coverage-on-fetch-and-pull.md) and
-[53](53-record-undocumented-narrowings.md) are corrections rather than
-capabilities — the end-to-end journeys caught them against the git binary. By
-the tier rule above a wrong answer outranks a missing one, so take them early:
-50 and 53 are small and independent, 51 wants the merge projection quiet around
-it, and 52 needs a decision on whether its two narrowings are gaps or contracts
-before it is work at all.
 
 Before scheduling them, split 04, 16, 17, and 39 into smaller work units
 with independent witnesses. Their current acceptance scopes are larger than one
@@ -131,7 +113,6 @@ focused sprint.
 - [27 — Replay merge topology during rebase](27-rebase-merges.md)
 - [28 — Compose pull with native rebase](28-pull-rebase.md)
 - [29 — Update dependent refs after rebase](29-rebase-update-refs.md)
-- [33 — Enforce the merged check on branch deletion](33-branch-delete-merged-check.md)
 - [35 — Add a staged diff mode](35-staged-diff.md)
 - [36 — Support glob pathspecs](36-glob-pathspecs.md)
 - [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)
@@ -141,14 +122,8 @@ focused sprint.
 - [42 — Add remote ref discovery and refspec fetch](42-remote-ref-discovery-and-refspec-fetch.md)
 - [43 — Add index and object write plumbing](43-index-and-object-write-plumbing.md)
 - [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
-- [45 — Make porcelain output framing-safe](45-framing-safe-porcelain-output.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
-- [50 — Report the untracked file a cached removal leaves behind](50-untracked-row-after-cached-removal.md)
-- [51 — Relocate every distinct-type merge conflict, not only file/directory](51-relocate-distinct-type-conflicts.md)
-- [52 — Match Git's default ref coverage on fetch and pull](52-default-ref-coverage-on-fetch-and-pull.md)
-- [53 — Record the narrowings the Git support reference does not state](53-record-undocumented-narrowings.md)
 - [54 — Prune ignored directories from the full status walk](54-prune-ignored-directories-in-status-walk.md)
-- [55 — Keep status sparse across untracked files under normal collapsing](55-sparse-status-across-untracked-files.md)
 - [56 — Move the index tracker baseline on commit](56-reseal-index-tracker-on-commit.md)
 - [57 — Stream HEAD and the index once in the full status prepass](57-single-prepass-in-full-status.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)

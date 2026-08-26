@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Git boundary correctness](sprint-2026-08-26-git-boundary-correctness.md)
+  — safe branch deletion, framing-safe and sparse-truthful status,
+  file/symlink conflict materialisation, and Git-compatible network defaults.
 - [Shell correctness and bounds](sprint-2026-08-26-shell-correctness-and-bounds.md)
   — truthful shell lists and commands, set-based filesystem mutations, paged
   discovery, atomic redirects, and one measured retained-memory boundary.

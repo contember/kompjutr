@@ -19,6 +19,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Git boundary correctness](sprint-2026-08-26-git-boundary-correctness.md) —
-  safe branch deletion, truthful framing-safe status, complete materializable
-  conflicts, and Git-compatible fetch/pull defaults.
+- None.
