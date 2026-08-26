@@ -9,10 +9,11 @@ import { describe, expect, it } from "vitest";
 import { NodeFsCompat } from "../../../src/fs/compat/node.js";
 import { createFilesystemOps } from "../../../src/fs/ops.js";
 import { initializeFsSchema } from "../../../src/fs/schema.js";
+import { copyFiles } from "../../../src/fs/store/copy.js";
 import { currentRev } from "../../../src/fs/store/meta.js";
 import { readFileHandles, readFiles } from "../../../src/fs/store/read.js";
 import { removeFiles } from "../../../src/fs/store/remove.js";
-import { realpath } from "../../../src/fs/store/resolve.js";
+import { realpath, realpathsNoFollow } from "../../../src/fs/store/resolve.js";
 import { discoverFiles, glob, globPage, listEntries, scan } from "../../../src/fs/store/scan.js";
 import { discoverFilesContaining } from "../../../src/fs/store/search.js";
 import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
@@ -39,6 +40,25 @@ function createTestProvider(): NodeFsCompat {
     globPage: (root, pattern, options) => globPage(db, realpath(db, root), pattern, options),
     listEntries: (root, options) => listEntries(db, realpath(db, root), options),
     writeFiles: (entries, options) => writeFiles(db, entries, options),
+    copyFiles: (entries, options) => {
+      const sources = realpathsNoFollow(
+        db,
+        entries.map((entry) => entry.source),
+      );
+      const destinations = realpathsNoFollow(
+        db,
+        entries.map((entry) => entry.destination),
+      );
+      const resolved = [];
+      for (let index = 0; index < sources.length; index++) {
+        const source = sources[index];
+        const destination = destinations[index];
+        if (source === undefined || destination === undefined) throw new Error("incomplete batch");
+        resolved.push({ source, destination });
+      }
+      const copied = copyFiles(db, resolved, options);
+      return { copied, remaining: entries.slice(copied) };
+    },
     makeDirectories: (paths) => makeDirectories(db, paths),
     removeFiles: (paths, options) => removeFiles(db, paths, options),
     withReadScope: (work) => work(),

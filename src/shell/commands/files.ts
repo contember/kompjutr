@@ -5,7 +5,7 @@
 // `rm -rf` on a 5,000-file tree O(1) rather than O(files).
 
 import { basename, join } from "../../fs/path.js";
-import type { WriteEntry } from "../../fs/types.js";
+import type { CopyEntry, WriteEntry } from "../../fs/types.js";
 import { type ByteStream, encode } from "../exec/bytes.js";
 import { type Command, type CommandContext, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
@@ -36,7 +36,6 @@ export const cp: Command = (context) => {
       return fail(context, `target '${destination}' is not a directory`, 2);
     }
 
-    const entries: WriteEntry[] = [];
     for (const source of paths) {
       const stat = context.fs.stat(source);
       if (stat === null) {
@@ -45,21 +44,15 @@ export const cp: Command = (context) => {
       const target = intoDirectory ? join(destination, basename(source)) : destination;
 
       if (stat.type !== "dir") {
-        entries.push({
-          path: target,
-          bytes: context.fs.readFile(source),
-          mode: stat.mode & 0o7777,
-          contentId: stat.contentId ?? undefined,
-        });
+        copyEntries(context, [{ source, destination: target }]);
         continue;
       }
 
       if (!recursive) return fail(context, `-r not specified; omitting directory '${source}'`);
-      collectSubtree(context, source, target, entries);
+      copyEntries(context, [{ source, destination: target }]);
+      copySubtree(context, source, target);
     }
 
-    // One write for the whole copy, however many files it covers.
-    context.fs.writeFiles(entries);
     return result(nothing());
   } catch (error) {
     if (error instanceof UsageError) return fail(context, error.message, 2);
@@ -67,13 +60,16 @@ export const cp: Command = (context) => {
   }
 };
 
-function collectSubtree(
-  context: CommandContext,
-  source: string,
-  target: string,
-  entries: WriteEntry[],
-): void {
-  entries.push({ path: target, mode: 0o755 });
+function copyEntries(context: CommandContext, entries: readonly CopyEntry[]): void {
+  let remaining = entries;
+  while (remaining.length > 0) {
+    const batch = context.fs.copyFiles(remaining, { budget: context.fs.readBudget });
+    if (batch.copied === 0) throw new Error("copyFiles made no progress");
+    remaining = batch.remaining;
+  }
+}
+
+function copySubtree(context: CommandContext, source: string, target: string): void {
   let after: string | undefined;
   for (;;) {
     const page = context.fs.scan(
@@ -82,31 +78,13 @@ function collectSubtree(
     );
     if (page.length === 0) return;
 
-    const files = page.filter((entry) => entry.type === "file");
-    const contents = new Map<string, Uint8Array>();
-    let pending: readonly string[] = files.map((entry) => entry.path);
-    while (pending.length > 0) {
-      const batch = context.fs.readFiles(pending, { budget: context.fs.readBudget });
-      for (const [path, bytes] of batch.files) contents.set(path, bytes);
-      pending = batch.remaining;
-    }
-
-    for (const entry of page) {
-      const relative = entry.path.slice(source.length);
-      const path = `${target}${relative}`;
-      if (entry.type === "dir") {
-        entries.push({ path, mode: entry.mode & 0o7777 });
-        continue;
-      }
-      if (entry.type === "symlink" && entry.target !== null) {
-        entries.push({ path, target: entry.target });
-        continue;
-      }
-      const bytes = contents.get(entry.path);
-      if (bytes !== undefined) {
-        entries.push({ path, bytes, mode: entry.mode & 0o7777 });
-      }
-    }
+    copyEntries(
+      context,
+      page.map((entry) => ({
+        source: entry.path,
+        destination: `${target}${entry.path.slice(source.length)}`,
+      })),
+    );
 
     if (page.length < 1_000) return;
     after = page[page.length - 1]?.path;

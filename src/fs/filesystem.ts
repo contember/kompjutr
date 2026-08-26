@@ -2,6 +2,7 @@ import type { SqlDatabase } from "../sqlite/db.js";
 import { assertComputerImportCurrent } from "./import.js";
 import { createFilesystemOps } from "./ops.js";
 import { initializeFsSchema } from "./schema.js";
+import { COPY_ENTRY_LIMIT, copyFiles as copyStoredFiles } from "./store/copy.js";
 import { currentRev } from "./store/meta.js";
 import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
@@ -21,6 +22,9 @@ import {
 import type {
   ContentSearchOptions,
   ContentSearchPage,
+  CopyBatch,
+  CopyEntry,
+  CopyOptions,
   Filesystem,
   FilesystemOptions,
   GlobOptions,
@@ -139,6 +143,29 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     writeFiles(entries: readonly WriteEntry[], writeOptions?: WriteOptions): void {
       writeStoredFiles(db, entries, writeOptions, now);
       mutated();
+    },
+    copyFiles(entries: readonly CopyEntry[], copyOptions?: CopyOptions): CopyBatch {
+      const page = entries.slice(0, COPY_ENTRY_LIMIT);
+      const sources = realpathsNoFollow(
+        db,
+        page.map((entry) => entry.source),
+      );
+      const destinations = realpathsNoFollow(
+        db,
+        page.map((entry) => entry.destination),
+      );
+      const resolved = [];
+      for (let index = 0; index < page.length; index++) {
+        const source = sources[index];
+        const destination = destinations[index];
+        if (source === undefined || destination === undefined) {
+          throw new Error("copyFiles: path resolution returned an incomplete batch");
+        }
+        resolved.push({ source, destination });
+      }
+      const copied = copyStoredFiles(db, resolved, copyOptions, now);
+      if (copied > 0) mutated();
+      return { copied, remaining: entries.slice(copied) };
     },
     makeDirectories(paths: readonly string[]): void {
       makeStoredDirectories(db, paths, now);

@@ -109,6 +109,22 @@ describe("a tree bigger than one discovery page", () => {
     expect(fs.stat("/repo/copy/zz-link.ts")?.type).toBe("symlink");
   });
 
+  it("cp -r never reads file bodies into the shell", () => {
+    const guarded: Filesystem = {
+      ...fs,
+      readFile: () => {
+        throw new Error("shell retained a file body");
+      },
+      readFiles: () => {
+        throw new Error("shell retained file bodies");
+      },
+    };
+    const guardedShell = createShell({ fs: guarded, cwd: "/repo" });
+
+    expect(guardedShell.run("cp -r /repo/src /repo/copy").exitCode).toBe(0);
+    expect(fs.stat("/repo/copy/f01199.ts")?.type).toBe("file");
+  });
+
   it("rm -r removes it whatever the page size", () => {
     expect(shell.run("rm -r /repo/src").exitCode).toBe(0);
     expect(fs.stat("/repo/src")).toBeNull();

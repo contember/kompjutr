@@ -10,10 +10,11 @@ import { shellQuote, withReadScope } from "../../../src/fs/compat/computer.js";
 import { NodeFsCompat } from "../../../src/fs/compat/node.js";
 import { createFilesystemOps } from "../../../src/fs/ops.js";
 import { initializeFsSchema } from "../../../src/fs/schema.js";
+import { copyFiles } from "../../../src/fs/store/copy.js";
 import { currentRev } from "../../../src/fs/store/meta.js";
 import { readFileHandles, readFiles } from "../../../src/fs/store/read.js";
 import { removeFiles } from "../../../src/fs/store/remove.js";
-import { realpath } from "../../../src/fs/store/resolve.js";
+import { realpath, realpathsNoFollow } from "../../../src/fs/store/resolve.js";
 import { discoverFiles, glob, globPage, listEntries, scan } from "../../../src/fs/store/scan.js";
 import { discoverFilesContaining } from "../../../src/fs/store/search.js";
 import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
@@ -40,6 +41,25 @@ function createTestProvider(): NodeFsCompat {
     globPage: (root, pattern, options) => globPage(db, realpath(db, root), pattern, options),
     listEntries: (root, options) => listEntries(db, realpath(db, root), options),
     writeFiles: (entries, options) => writeFiles(db, entries, options),
+    copyFiles: (entries, options) => {
+      const sources = realpathsNoFollow(
+        db,
+        entries.map((entry) => entry.source),
+      );
+      const destinations = realpathsNoFollow(
+        db,
+        entries.map((entry) => entry.destination),
+      );
+      const resolved = [];
+      for (let index = 0; index < sources.length; index++) {
+        const source = sources[index];
+        const destination = destinations[index];
+        if (source === undefined || destination === undefined) throw new Error("incomplete batch");
+        resolved.push({ source, destination });
+      }
+      const copied = copyFiles(db, resolved, options);
+      return { copied, remaining: entries.slice(copied) };
+    },
     makeDirectories: (paths) => makeDirectories(db, paths),
     removeFiles: (paths, options) => removeFiles(db, paths, options),
     withReadScope: (work) => work(),
@@ -184,6 +204,33 @@ describe("NodeFsCompat — provider shape", () => {
     provider.renameSync("/a", "/b");
     expect(provider.existsSync("/a")).toBe(false);
     expect(provider.readFileSync("/b", "utf8")).toBe("x");
+  });
+
+  it("copyFileSync copies bytes, overwrites, and supports exclusive mode", () => {
+    const provider = createTestProvider();
+    provider.writeFileSync("/source", "new");
+    provider.writeFileSync("/destination", "old");
+
+    provider.copyFileSync("/source", "/destination");
+    expect(provider.readFileSync("/destination", "utf8")).toBe("new");
+    expect(() => provider.copyFileSync("/source", "/destination", 1)).toThrowError(
+      expect.objectContaining({ code: "EEXIST" }),
+    );
+  });
+
+  it("copyFileSync follows a source symlink and rejects a directory target", () => {
+    const provider = createTestProvider();
+    provider.writeFileSync("/file", "content");
+    provider.symlinkSync("/file", "/file-link");
+    provider.mkdirSync("/dir");
+    provider.symlinkSync("/dir", "/dir-link");
+
+    provider.copyFileSync("/file-link", "/copy");
+    expect(provider.readFileSync("/copy", "utf8")).toBe("content");
+    expect(provider.lstatSync("/copy").isFile()).toBe(true);
+    expect(() => provider.copyFileSync("/dir-link", "/nope")).toThrowError(
+      expect.objectContaining({ code: "EISDIR" }),
+    );
   });
 
   it("realpathSync canonicalises and resolves links", () => {

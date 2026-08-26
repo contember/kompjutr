@@ -9,6 +9,9 @@
 import type {
   ContentSearchOptions,
   ContentSearchPage,
+  CopyBatch,
+  CopyEntry,
+  CopyOptions,
   Dirent,
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -174,6 +177,11 @@ export class BoundedFs {
   writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void {
     this.#charge();
     this.fs.writeFiles(entries, options);
+  }
+
+  copyFiles(entries: readonly CopyEntry[], options?: CopyOptions): CopyBatch {
+    this.#charge();
+    return this.fs.copyFiles(entries, options);
   }
 
   makeDirectories(paths: readonly string[]): void {

@@ -356,8 +356,21 @@ export class NodeFsCompat {
     }
   }
 
-  copyFileSync(_source: string, _destination: string, _mode?: number): void {
-    throw filesystemError("ENOSYS", "copyFile", undefined, "operation not implemented");
+  copyFileSync(source: string, destination: string, mode = 0): void {
+    const stat = this.fs.statTarget(source);
+    if (stat === null) throw filesystemError("ENOENT", "copyFile", source, "no such file");
+    if (stat.type !== "file") {
+      throw filesystemError("EISDIR", "copyFile", source, "source is not a regular file");
+    }
+    if ((mode & 1) !== 0 && this.fs.stat(destination) !== null) {
+      throw filesystemError("EEXIST", "copyFile", destination, "destination exists");
+    }
+    const batch = this.fs.copyFiles([{ source: this.fs.realpath(source), destination }], {
+      parents: false,
+    });
+    if (batch.remaining.length > 0) {
+      throw filesystemError("EIO", "copyFile", source, "copy made no progress");
+    }
   }
 
   copyFile(source: string, destination: string, mode?: number): Promise<void> {

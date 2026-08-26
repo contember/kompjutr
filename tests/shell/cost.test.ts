@@ -219,6 +219,26 @@ describe("set-based listing", () => {
   });
 });
 
+describe("set-based copy", () => {
+  it("copies 5,000 files by metadata pages", () => {
+    const storage = new SqliteTestStorage();
+    const fs = createFilesystem(new TestDatabase(storage));
+    fs.writeFiles(
+      Array.from({ length: 5_000 }, (_, index) => ({
+        path: `/repo/source/f${String(index).padStart(5, "0")}`,
+        bytes: new Uint8Array(0),
+      })),
+    );
+    const shell = createShell({ fs, cwd: "/repo" });
+
+    const copied = shell.run("cp -r source copy");
+
+    expect(copied.exitCode).toBe(0);
+    expect(copied.operations).toBeLessThanOrEqual(15);
+    expect(fs.stat("/repo/copy/f04999")?.type).toBe("file");
+  });
+});
+
 describe("bounds hold even when the agent forgets them", () => {
   it("truncates output rather than filling a context window", () => {
     const storage = new SqliteTestStorage();

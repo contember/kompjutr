@@ -201,6 +201,25 @@ export interface WriteOptions {
   payloadBudget?: number;
 }
 
+export interface CopyEntry {
+  source: string;
+  destination: string;
+}
+
+export interface CopyOptions {
+  /** Create missing destination parents. Default true. */
+  parents?: boolean;
+  /** Maximum regular-file bytes selected for this call. Default 1.5 MiB. */
+  budget?: number;
+}
+
+export interface CopyBatch {
+  /** Input entries copied by this call, in input order. */
+  copied: number;
+  /** Re-call with these entries to complete the request. */
+  remaining: CopyEntry[];
+}
+
 export interface RemoveOptions {
   /** Remove directories and everything under them. Default false. */
   recursive?: boolean;
@@ -303,6 +322,9 @@ export interface Filesystem {
    * before its children.
    */
   writeFiles(entries: readonly WriteEntry[], options?: WriteOptions): void;
+
+  /** Copy entries inside SQLite; file BLOBs never enter the isolate. */
+  copyFiles(entries: readonly CopyEntry[], options?: CopyOptions): CopyBatch;
 
   /** Create directories, parents included. Existing ones are left alone. */
   makeDirectories(paths: readonly string[]): void;
