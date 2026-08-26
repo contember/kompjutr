@@ -827,9 +827,14 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
     case "push": {
       const args = ["push", "-q"];
       if (step.force === true) args.push("--force");
-      if (step.delete === true) args.push("--delete");
       args.push("origin");
-      args.push(step.remoteRef === undefined ? currentBranchOf(fixture) : refspecFor(step));
+      if (step.delete === true) {
+        // `--delete` names the remote branch alone; a colon refspec is a
+        // different request and git rejects the combination.
+        args.push("--delete", step.remoteRef ?? step.ref ?? currentBranchOf(fixture));
+      } else {
+        args.push(refspecFor(step, fixture));
+      }
       return integrationOutcome(fixture, args);
     }
 
@@ -845,8 +850,8 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
   }
 }
 
-function refspecFor(step: { ref?: string; remoteRef?: string }): string {
-  const source = step.ref ?? "HEAD";
+function refspecFor(step: { ref?: string; remoteRef?: string }, fixture: GitFixture): string {
+  const source = step.ref ?? currentBranchOf(fixture);
   return step.remoteRef === undefined ? source : `${source}:${step.remoteRef}`;
 }
 
