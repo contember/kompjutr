@@ -175,6 +175,8 @@ export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
 );
 const MAX_REF_MUTATION_INPUTS = 100_000;
 const MAX_GLOBAL_CHECKOUT_LIST = 8_192;
+const CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES = 1_024;
+export const MAX_CHECKOUT_LIST_RETAINED_BYTES = 6 * 1024 * 1024;
 const REF_ROW_RETAINED_BYTES = 256;
 const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
 const REF_MUTATION_EVENT_RETAINED_BYTES = 2_048;
@@ -886,6 +888,12 @@ function isAttachedBranchUniqueConstraint(error: unknown): boolean {
   return (
     error instanceof Error &&
     error.message.includes("UNIQUE constraint failed: git_checkouts.repo_id, git_checkouts.head")
+  );
+}
+
+function isCheckoutRootUniqueConstraint(error: unknown): boolean {
+  return (
+    error instanceof Error && error.message.includes("UNIQUE constraint failed: git_checkouts.root")
   );
 }
 
@@ -1761,6 +1769,20 @@ function enforceForeignKeys(db: SqlDatabase): void {
   }
 }
 
+class CheckoutStoreLifetime {
+  #active = true;
+
+  requireActive(): void {
+    if (!this.#active) {
+      throw new GitError("EWORKTREENOTFOUND", "checkout is no longer active");
+    }
+  }
+
+  revoke(): void {
+    this.#active = false;
+  }
+}
+
 /** Canonical resources shared by every checkout view of one Git store. */
 export class SharedRepoStore {
   readonly db: SqlDatabase;
@@ -1842,6 +1864,22 @@ export class SharedRepoStore {
     this.#packs?.clearCaches();
     this.#hasLoose = false;
     this.#shallow = null;
+  }
+
+  /** Discard transaction-local cache state and re-read committed loose-object availability. */
+  revalidateAfterRollback(): void {
+    this.#cacheGeneration++;
+    this.#packs?.clearCaches();
+    this.#hasLoose = false;
+    this.#shallow = null;
+    const hasLoose = this.db.scalar<unknown>(
+      "SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)",
+      this.repoId,
+    );
+    if (hasLoose !== 0 && hasLoose !== 1) {
+      throw new CorruptError("loose object rollback probe returned an invalid value");
+    }
+    this.#hasLoose = hasLoose === 1;
   }
 
   cacheBytes(): { objects: number; chunks: number } {
@@ -2056,11 +2094,14 @@ export class SqliteGitDatabase {
   readonly #options: StoreOptions;
   readonly #sharedStores = new Map<number, SharedRepoStore>();
   readonly #checkoutStores = new Map<number, CheckoutStore>();
-  readonly #validatedCheckoutRows = new WeakSet<CheckoutRow>();
+  readonly #checkoutLifetimes = new Map<number, CheckoutStoreLifetime>();
+  readonly #validatedCheckoutRows = new WeakMap<CheckoutRow, number>();
+  readonly #checkoutRowGenerations = new Map<number, number>();
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packRows: ByteLru<string, Uint8Array>;
   readonly #memory = new MemoryCoordinator();
   #nextStoreGeneration = 1;
+  #nextCheckoutRowGeneration = 1;
 
   constructor(db: SqlDatabase, options: StoreOptions = {}) {
     this.#db = db;
@@ -2105,13 +2146,14 @@ export class SqliteGitDatabase {
     return row === undefined ? null : this.#rememberCheckout(requireStoredCheckoutRow(row));
   }
 
-  listCheckouts(repoId: number): CheckoutRow[] {
+  listCheckouts(repoId: number): readonly CheckoutRow[] {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
     const rows: CheckoutRow[] = [];
     let primaryCount = 0;
     let previousRoot: string | null = null;
+    let retainedBytes = 0;
     for (const raw of this.#db.iterate(
       `SELECT id AS checkout_id, repo_id, root, head, is_primary
          FROM git_checkouts WHERE repo_id = ?
@@ -2126,6 +2168,13 @@ export class SqliteGitDatabase {
         throw new CorruptError("checkout roots are not in strict byte order");
       }
       previousRoot = row.root;
+      retainedBytes +=
+        CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
+        checkoutTextEncoder.encode(row.root).byteLength +
+        boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
+      if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
+        throw new GitError("E2BIG", "checkout listing exceeds its 6 MiB retained bound");
+      }
       rows.push(this.#rememberCheckout(row));
       if (row.isPrimary) primaryCount++;
       if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
@@ -2135,7 +2184,7 @@ export class SqliteGitDatabase {
     if (rows.length > 0 && primaryCount !== 1) {
       throw new CorruptError("repository must have exactly one primary checkout");
     }
-    return rows;
+    return Object.freeze(rows);
   }
 
   listRoutingCheckouts(): CheckoutRow[] {
@@ -2197,14 +2246,306 @@ export class SqliteGitDatabase {
            (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
         checkoutId,
       );
-      return this.#rememberCheckout({
-        id: checkoutId,
-        repoId,
-        root: normalized,
-        head: checkedHead,
-        isPrimary: true,
-      });
+      return this.#rememberCheckout(
+        {
+          id: checkoutId,
+          repoId,
+          root: normalized,
+          head: checkedHead,
+          isPrimary: true,
+        },
+        true,
+      );
     });
+  }
+
+  /** Create one non-primary checkout and initialize its private state atomically. */
+  createCheckout(
+    repoId: number,
+    root: string,
+    head: string,
+    initialize?: (store: CheckoutStore) => undefined,
+  ): CheckoutRow {
+    if (!Number.isSafeInteger(repoId) || repoId < 1) {
+      throw new GitError("EINVAL", "repository id must be a safe positive integer");
+    }
+    const normalized = requireCheckoutRoot(root, "input");
+    const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
+    const attached = rawSymbolicTarget(checkedHead);
+    const shared = this.openShared(repoId);
+
+    const lifetime = new CheckoutStoreLifetime();
+    let created: {
+      row: CheckoutRow;
+      store: CheckoutStore;
+      lifetime: CheckoutStoreLifetime;
+    };
+    try {
+      created = this.#db.transactionSync(() => {
+        const count = this.#db.scalar<unknown>(
+          "SELECT count(*) FROM git_checkouts WHERE repo_id = ?",
+          repoId,
+        );
+        if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 1) {
+          throw new CorruptError("repository checkout count is invalid");
+        }
+        if (count >= MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError(
+            "EWORKTREELIMIT",
+            `repository already has ${MAX_CHECKOUTS_PER_REPOSITORY} checkouts`,
+          );
+        }
+
+        const rootOwner = this.#db.one<Record<string, unknown>>(
+          `SELECT id AS checkout_id, repo_id, root, head, is_primary
+           FROM git_checkouts WHERE root = ?`,
+          normalized,
+        );
+        if (rootOwner !== undefined) {
+          const owner = requireStoredCheckoutRow(rootOwner);
+          if (owner.root !== normalized) {
+            throw new CorruptError("checkout root lookup returned another root");
+          }
+          throw new GitError(
+            "EWORKTREEEXISTS",
+            `checkout root is already registered: ${normalized}`,
+          );
+        }
+        if (attached?.startsWith("refs/heads/")) {
+          const branchOwner = this.#db.one<Record<string, unknown>>(
+            `SELECT id AS checkout_id, repo_id, root, head, is_primary
+             FROM git_checkouts WHERE repo_id = ? AND head = ?`,
+            repoId,
+            checkedHead,
+          );
+          if (branchOwner !== undefined) {
+            const owner = requireStoredCheckoutRow(branchOwner);
+            if (owner.repoId !== repoId) {
+              throw new CorruptError("attached branch lookup crossed repository boundaries");
+            }
+            if (owner.head !== checkedHead) {
+              throw new CorruptError("attached branch lookup returned another branch");
+            }
+            throw new GitError(
+              "EBRANCHINUSE",
+              `branch ${attached} is already attached to checkout ${owner.root}`,
+            );
+          }
+        }
+
+        const lastCheckoutId = this.#db.scalar<unknown>("SELECT MAX(id) FROM git_checkouts");
+        const checkoutId =
+          lastCheckoutId === null ? 1 : requireSafeId(lastCheckoutId, "latest checkout id") + 1;
+        if (!Number.isSafeInteger(checkoutId)) {
+          throw new GitError("E2BIG", "checkout id space is exhausted");
+        }
+        try {
+          this.#db.run(
+            `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+           VALUES (?, ?, ?, ?, 0)`,
+            checkoutId,
+            repoId,
+            normalized,
+            checkedHead,
+          );
+        } catch (error) {
+          if (isCheckoutRootUniqueConstraint(error)) {
+            throw new GitError(
+              "EWORKTREEEXISTS",
+              `checkout root is already registered: ${normalized}`,
+              { cause: error },
+            );
+          }
+          if (isAttachedBranchUniqueConstraint(error)) {
+            throw new GitError(
+              "EBRANCHINUSE",
+              `branch ${attached ?? checkedHead} is already attached to another checkout`,
+              { cause: error },
+            );
+          }
+          throw error;
+        }
+        this.#db.run(
+          `INSERT OR IGNORE INTO git_index_state
+           (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
+          checkoutId,
+        );
+        const initial: CheckoutRow = {
+          id: checkoutId,
+          repoId,
+          root: normalized,
+          head: checkedHead,
+          isPrimary: false,
+        };
+        const store = new CheckoutStore(
+          shared,
+          initial,
+          this.#options,
+          () => this.destroyRepository(repoId),
+          lifetime,
+        );
+        if (initialize !== undefined) {
+          const result = initialize(store);
+          if (isThenableResult(result)) {
+            void Promise.resolve(result).catch(() => {});
+            throw new GitError("EINVAL", "checkout initialization must be synchronous");
+          }
+        }
+        const stored = this.#db.one<Record<string, unknown>>(
+          `SELECT id AS checkout_id, repo_id, root, head, is_primary
+           FROM git_checkouts WHERE id = ? AND repo_id = ?`,
+          checkoutId,
+          repoId,
+        );
+        if (stored === undefined) throw new CorruptError("initialized checkout row is missing");
+        const row = requireStoredCheckoutRow(stored);
+        if (
+          row.id !== checkoutId ||
+          row.repoId !== repoId ||
+          row.root !== normalized ||
+          row.isPrimary
+        ) {
+          throw new CorruptError("initialized checkout identity changed");
+        }
+        return { row, store, lifetime };
+      });
+    } catch (error) {
+      lifetime.revoke();
+      shared.revalidateAfterRollback();
+      throw error;
+    }
+
+    const remembered = this.#rememberCheckout(created.row, true);
+    this.#checkoutStores.set(remembered.id, created.store);
+    this.#checkoutLifetimes.set(remembered.id, created.lifetime);
+    return remembered;
+  }
+
+  /** Remove one non-primary checkout after the caller deletes its root. */
+  removeCheckout(
+    checkoutId: number,
+    removeRoot: (checkout: CheckoutRow) => undefined,
+  ): CheckoutRow {
+    if (!Number.isSafeInteger(checkoutId) || checkoutId < 1) {
+      throw new GitError("EINVAL", "checkout id must be a safe positive integer");
+    }
+    const removed = this.#db.transactionSync(() => {
+      const raw = this.#db.one<Record<string, unknown>>(
+        `SELECT id AS checkout_id, repo_id, root, head, is_primary
+           FROM git_checkouts WHERE id = ?`,
+        checkoutId,
+      );
+      if (raw === undefined) throw new GitError("EWORKTREENOTFOUND", "checkout does not exist");
+      const row = requireStoredCheckoutRow(raw);
+      if (row.id !== checkoutId) throw new CorruptError("checkout lookup returned another row");
+      if (row.isPrimary) {
+        throw new GitError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
+      }
+      this.#requireCheckoutsIdle(row.repoId, [row.id]);
+      const result = removeRoot(Object.freeze(row));
+      if (isThenableResult(result)) {
+        void Promise.resolve(result).catch(() => {});
+        throw new GitError("EINVAL", "checkout removal must be synchronous");
+      }
+      const deleted = this.#db.one<Record<string, unknown>>(
+        `DELETE FROM git_checkouts
+          WHERE id = ? AND repo_id = ? AND is_primary = 0
+          RETURNING id AS checkout_id`,
+        row.id,
+        row.repoId,
+      );
+      if (
+        deleted === undefined ||
+        requireSafeId(deleted.checkout_id, "deleted checkout id") !== row.id
+      ) {
+        throw new CorruptError("checkout disappeared during removal");
+      }
+      return Object.freeze(row);
+    });
+    this.#evictCheckout(removed.id);
+    return removed;
+  }
+
+  /** Remove a bounded set of non-primary checkouts in one atomic delete. */
+  removeCheckouts(repoId: number, checkoutIds: readonly number[]): readonly CheckoutRow[] {
+    if (!Number.isSafeInteger(repoId) || repoId < 1) {
+      throw new GitError("EINVAL", "repository id must be a safe positive integer");
+    }
+    if (checkoutIds.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+      throw new GitError("E2BIG", "checkout removal exceeds 1,024 inputs");
+    }
+    const uniqueIds: number[] = [];
+    const seen = new Set<number>();
+    for (const checkoutId of checkoutIds) {
+      if (!Number.isSafeInteger(checkoutId) || checkoutId < 1) {
+        throw new GitError("EINVAL", "checkout id must be a safe positive integer");
+      }
+      if (!seen.has(checkoutId)) {
+        seen.add(checkoutId);
+        uniqueIds.push(checkoutId);
+      }
+    }
+    if (uniqueIds.length === 0) return Object.freeze([]);
+    this.openShared(repoId);
+    const idsJson = JSON.stringify(uniqueIds);
+    const removed = this.#db.transactionSync(() => {
+      const rows: CheckoutRow[] = [];
+      const selectedIds = new Set<number>();
+      let previousRoot: string | null = null;
+      for (const raw of this.#db.iterate(
+        `SELECT id AS checkout_id, repo_id, root, head, is_primary
+           FROM git_checkouts
+          WHERE id IN (SELECT value FROM json_each(?))
+          ORDER BY root COLLATE BINARY
+          LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+        idsJson,
+      )) {
+        const row = requireStoredCheckoutRow(raw);
+        if (!seen.has(row.id)) {
+          throw new CorruptError("checkout removal query returned an unrequested checkout");
+        }
+        if (selectedIds.has(row.id)) {
+          throw new CorruptError("checkout removal query returned a duplicate checkout");
+        }
+        selectedIds.add(row.id);
+        if (row.repoId !== repoId) {
+          throw new GitError("EWORKTREENOTFOUND", "checkout belongs to another repository");
+        }
+        if (row.isPrimary) {
+          throw new GitError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
+        }
+        if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+          throw new CorruptError("checkout removal roots are not in strict byte order");
+        }
+        previousRoot = row.root;
+        rows.push(row);
+      }
+      if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+        throw new CorruptError("checkout removal query exceeded its bounded result");
+      }
+      if (rows.length === 0) return Object.freeze(rows);
+      const existingIds = rows.map((row) => row.id);
+      this.#requireCheckoutsIdle(repoId, existingIds);
+      const existingJson = JSON.stringify(existingIds);
+      const deleted = this.#db.all<Record<string, unknown>>(
+        `DELETE FROM git_checkouts
+          WHERE repo_id = ? AND is_primary = 0
+            AND id IN (SELECT value FROM json_each(?))
+          RETURNING id AS checkout_id`,
+        repoId,
+        existingJson,
+      );
+      const deletedIds = new Set<number>();
+      for (const row of deleted) {
+        deletedIds.add(requireSafeId(row.checkout_id, "deleted checkout id"));
+      }
+      if (deletedIds.size !== rows.length || rows.some((row) => !deletedIds.has(row.id))) {
+        throw new CorruptError("bulk checkout removal deleted an unexpected set");
+      }
+      return Object.freeze(rows.map((row) => Object.freeze(row)));
+    });
+    for (const row of removed) this.#evictCheckout(row.id);
+    return removed;
   }
 
   openShared(repoId: number): SharedRepoStore {
@@ -2263,16 +2604,23 @@ export class SqliteGitDatabase {
     );
     if (primaryRaw === undefined) throw new CorruptError("repository primary checkout is missing");
     const primary = requireStoredCheckoutRow(primaryRaw);
-    const primaryStore = new CheckoutStore(store, primary, this.#options, () =>
-      this.destroyRepository(repoId),
+    const lifetime = new CheckoutStoreLifetime();
+    const primaryStore = new CheckoutStore(
+      store,
+      primary,
+      this.#options,
+      () => this.destroyRepository(repoId),
+      lifetime,
     );
     this.#checkoutStores.set(primary.id, primaryStore);
+    this.#checkoutLifetimes.set(primary.id, lifetime);
     return store;
   }
 
   openCheckout(checkout: CheckoutRow | number): CheckoutStore {
     const checkoutId =
       typeof checkout === "number" ? checkout : requireSafeId(checkout.id, "checkout id");
+    if (typeof checkout !== "number") this.#rejectStaleCheckoutRow(checkout, checkoutId);
     const existing = this.#checkoutStores.get(checkoutId);
     if (existing !== undefined) {
       if (
@@ -2288,7 +2636,7 @@ export class SqliteGitDatabase {
     const stored =
       typeof checkout === "number"
         ? this.#checkoutById(checkoutId)
-        : this.#validatedCheckoutRows.has(checkout)
+        : this.#isRememberedCheckout(checkout, checkoutId)
           ? requireStoredCheckoutRow({
               checkout_id: checkout.id,
               repo_id: checkout.repoId,
@@ -2300,10 +2648,16 @@ export class SqliteGitDatabase {
     const shared = this.openShared(stored.repoId);
     const installed = this.#checkoutStores.get(checkoutId);
     if (installed !== undefined) return installed;
-    const store = new CheckoutStore(shared, stored, this.#options, () =>
-      this.destroyRepository(stored.repoId),
+    const lifetime = new CheckoutStoreLifetime();
+    const store = new CheckoutStore(
+      shared,
+      stored,
+      this.#options,
+      () => this.destroyRepository(stored.repoId),
+      lifetime,
     );
     this.#checkoutStores.set(checkoutId, store);
+    this.#checkoutLifetimes.set(checkoutId, lifetime);
     return store;
   }
 
@@ -2330,10 +2684,60 @@ export class SqliteGitDatabase {
     return stored;
   }
 
-  #rememberCheckout(row: CheckoutRow): CheckoutRow {
+  #isRememberedCheckout(checkout: CheckoutRow, checkoutId: number): boolean {
+    const generation = this.#validatedCheckoutRows.get(checkout);
+    return generation !== undefined && generation === this.#checkoutRowGenerations.get(checkoutId);
+  }
+
+  #rejectStaleCheckoutRow(checkout: CheckoutRow, checkoutId: number): void {
+    const rememberedGeneration = this.#validatedCheckoutRows.get(checkout);
+    if (
+      rememberedGeneration !== undefined &&
+      rememberedGeneration !== this.#checkoutRowGenerations.get(checkoutId)
+    ) {
+      throw new GitError("EWORKTREENOTFOUND", "checkout identity is no longer active");
+    }
+  }
+
+  #rememberCheckout(row: CheckoutRow, replaceIdentity = false): CheckoutRow {
+    let generation = replaceIdentity ? undefined : this.#checkoutRowGenerations.get(row.id);
+    if (generation === undefined) {
+      if (!Number.isSafeInteger(this.#nextCheckoutRowGeneration)) {
+        throw new GitError("E2BIG", "checkout row generation is exhausted");
+      }
+      generation = this.#nextCheckoutRowGeneration++;
+      this.#checkoutRowGenerations.set(row.id, generation);
+    }
     const remembered = Object.freeze(row);
-    this.#validatedCheckoutRows.add(remembered);
+    this.#validatedCheckoutRows.set(remembered, generation);
     return remembered;
+  }
+
+  #requireCheckoutsIdle(repoId: number, checkoutIds: readonly number[]): void {
+    if (checkoutIds.length === 0) return;
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT operation.checkout_id
+         FROM git_operation_state operation
+         JOIN git_checkouts checkout ON checkout.id = operation.checkout_id
+        WHERE checkout.repo_id = ?
+          AND operation.checkout_id IN (SELECT value FROM json_each(?))
+        LIMIT 1`,
+      repoId,
+      JSON.stringify(checkoutIds),
+    );
+    if (row === undefined) return;
+    const busyId = requireSafeId(row.checkout_id, "busy checkout id");
+    if (!checkoutIds.includes(busyId)) {
+      throw new CorruptError("checkout operation probe returned another checkout");
+    }
+    throw new GitError("EWORKTREEBUSY", `checkout ${busyId} has a live operation`);
+  }
+
+  #evictCheckout(checkoutId: number): void {
+    this.#checkoutLifetimes.get(checkoutId)?.revoke();
+    this.#checkoutLifetimes.delete(checkoutId);
+    this.#checkoutStores.delete(checkoutId);
+    this.#checkoutRowGenerations.delete(checkoutId);
   }
 
   destroyRepository(repoId: number): void {
@@ -2345,30 +2749,32 @@ export class SqliteGitDatabase {
     shared?.clearCaches();
     this.#sharedStores.delete(repoId);
     for (const [checkoutId, store] of this.#checkoutStores) {
-      if (store.sharedRepoId === repoId) this.#checkoutStores.delete(checkoutId);
+      if (store.sharedRepoId === repoId) this.#evictCheckout(checkoutId);
     }
   }
 }
 
 /** Checkout-bound storage view. */
 export class CheckoutStore {
-  readonly shared: SharedRepoStore;
-  readonly #db: SqlDatabase;
+  readonly #sharedStore: SharedRepoStore;
+  readonly #database: SqlDatabase;
   readonly #repoId: number;
   readonly #checkoutId: number;
   readonly #root: string;
   readonly #isPrimary: boolean;
-  readonly #objects: ByteLru<string, RawObject>;
-  readonly #packs: PackStore;
-  readonly #memory: MemoryCoordinator;
+  readonly #objectCache: ByteLru<string, RawObject>;
+  readonly #packStore: PackStore;
+  readonly #memoryCoordinator: MemoryCoordinator;
   readonly #onDestroy: (() => void) | undefined;
   readonly #now: () => number;
+  readonly #lifetime: CheckoutStoreLifetime;
 
   constructor(
     shared: SharedRepoStore,
     checkout: CheckoutRow,
     options: StoreOptions = {},
     onDestroy?: () => void,
+    lifetime = new CheckoutStoreLifetime(),
   ) {
     if (
       requireSafeId(checkout.id, "checkout id") < 1 ||
@@ -2378,23 +2784,24 @@ export class CheckoutStore {
     ) {
       throw new CorruptError("checkout facade identity is invalid");
     }
-    this.shared = shared;
+    this.#sharedStore = shared;
     this.#onDestroy = onDestroy;
     this.#now = options.now ?? Date.now;
-    this.#db = shared.db;
+    this.#lifetime = lifetime;
+    this.#database = shared.db;
     this.#repoId = shared.repoId;
     this.#checkoutId = checkout.id;
     this.#root = checkout.root;
     this.#isPrimary = checkout.isPrimary;
-    this.#objects = shared.objects;
-    this.#memory = shared.memory;
-    this.#packs = shared.installPacks(
+    this.#objectCache = shared.objects;
+    this.#memoryCoordinator = shared.memory;
+    this.#packStore = shared.installPacks(
       new PackStore(
-        this.#db,
+        this.#database,
         this.#repoId,
-        this.#objects,
+        this.#objectCache,
         shared.packRows,
-        this.#memory,
+        this.#memoryCoordinator,
         shared.cacheNamespace,
         (oid) => this.#readLoose(oid),
         (oids) => this.#readLooseObjects(oids),
@@ -2403,6 +2810,35 @@ export class CheckoutStore {
       ),
     );
     shared.installOperations(this);
+  }
+
+  #requireActive(): void {
+    this.#lifetime.requireActive();
+  }
+
+  get shared(): SharedRepoStore {
+    this.#requireActive();
+    return this.#sharedStore;
+  }
+
+  get #db(): SqlDatabase {
+    this.#requireActive();
+    return this.#database;
+  }
+
+  get #objects(): ByteLru<string, RawObject> {
+    this.#requireActive();
+    return this.#objectCache;
+  }
+
+  get #packs(): PackStore {
+    this.#requireActive();
+    return this.#packStore;
+  }
+
+  get #memory(): MemoryCoordinator {
+    this.#requireActive();
+    return this.#memoryCoordinator;
   }
 
   get db(): SqlDatabase {
@@ -5653,6 +6089,7 @@ export class CheckoutStore {
 
   /** Drop the shared store and every checkout through foreign-key cascades. */
   destroy(): void {
+    this.#requireActive();
     if (this.#onDestroy !== undefined) {
       this.#db.transactionSync(this.#onDestroy);
       return;
