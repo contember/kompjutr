@@ -1,3 +1,15 @@
+> **OUTCOME — shipped 2026-08-26.** A journey layer now sits above the
+> per-operation suite: `tests/helpers/e2e.ts` plays a bounded action DSL against
+> kompjutr and the `git` binary at once and compares the whole public repository
+> state after every step, and six journey files exercise it. Commit map: WU1 →
+> `10a4fd7`, WU2 → `db50ef6` (with harness corrections `696379d` and `b681001`),
+> WU3 → `0aa9f8a`. Verification: `npx vitest run tests/e2e/` → 94 passed across 7
+> files; full suite 1868 passed, the only 2 failures belonging to the concurrent
+> reflog sprint (`pull.test.ts`, `reflog-api.test.ts`); `tsc --noEmit` and
+> `biome check` clean. Backlog closed: none — this sprint consumed no backlog
+> item. Deferred: the six divergences the journeys uncovered are **pinned in the
+> tests but not fixed**, and need triage before any become work (see below).
+
 # Sprint — end-to-end journeys (2026-08-26)
 
 **Goal.** Add a journey layer to the suite: realistic multi-step Git workflows
@@ -115,4 +127,39 @@ since it records what actually shipped.
 
 ## Run log
 
-<!-- Append as you work. -->
+- **The harness had three defects of its own**, all found by running journeys
+  rather than by review, and all fixed in the seam: `--delete` paired with a
+  colon refspec (git rejects the combination), a `ref` without a `remoteRef`
+  silently pushing the checked-out branch instead, and `pull` mirrored as
+  `git merge <ref>` — which labels a conflict hunk with the ref name, where
+  real `git pull` merges the fetched commit and labels it with the OID, as
+  kompjutr does. Transient; the commits hold the record.
+
+- **The mid-rebase relaxation had to widen once.** Masking porcelain v2's two
+  HEAD-derived *fields* was not enough: a whole ordinary row can be
+  HEAD-derived, since a path held by the branch tip but not the new base shows
+  as deleted on one side and is absent on the other. While a rebase is pending
+  only unmerged, untracked and ignored rows are compared now. Worktree bytes,
+  index paths, refs and the pending operation stayed under full comparison, so
+  no coverage was lost — only rows that cannot be compared between the two
+  designs. → recorded in `../../tests/CLAUDE.md`.
+
+- **Six divergences from Git surfaced. None is fixed; each is pinned by a test
+  that turns red when kompjutr changes.** They need triage — two look like
+  defects, three like undocumented deliberate narrowings, one like reference
+  drift:
+
+  | # | Finding | Reads as |
+  |---|---|---|
+  | 1 | `status` drops the untracked row left by `rm --cached`: git reports the path twice (`1 D.` and `? path`), kompjutr once. `status.ts` ("a tracked path is never also untracked") and `status-rows.ts` ("the file, if any, shows up as untracked instead") contradict each other. | defect |
+  | 2 | A symlink-versus-file conflict is not relocated. Git splits the path (`lnk` stage 3, `lnk~HEAD` stage 2); `projectMergePlan` relocates only `file/directory`. | unimplemented case |
+  | 3 | `fetch` never auto-follows tags reachable from fetched refs; `tags: true` is required. | narrowing, undocumented |
+  | 4 | `pull` updates only its own upstream tracking ref — `singleBranch ?? true` plus an exact `remoteRef`, where `git pull` runs the full `+refs/heads/*` refspec. | narrowing, undocumented |
+  | 5 | `add` of an explicitly named ignored path succeeds silently; git exits 1. Intent is stated in `staging.ts`, not in the reference. | narrowing, undocumented |
+  | 6 | The `revParse` row claims annotated tags peel to their commit. They do not — and not peeling is what matches `git rev-parse`. | reference drift |
+
+  Findings 3–6 are documentation work on
+  [`../reference/git-support.md`](../reference/git-support.md); 1 and 2 are
+  candidate backlog items. Left un-filed deliberately: whether a narrowing is a
+  gap or a decision is not the test suite's call to make.
+

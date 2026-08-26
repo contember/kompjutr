@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [End-to-end journeys](sprint-2026-08-26-e2e-journeys.md)
+  — a differential journey harness and six workflow files, plus the six
+  divergences from Git they pinned.
 - [Storage contracts and derived-table hardening](sprint-2026-08-26-storage-contracts.md)
   — bounded opaque content identities, narrow source-surrogate tree storage,
   guarded derived writes, and authoritative schema-v12 reconstruction.

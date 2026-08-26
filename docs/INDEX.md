@@ -17,8 +17,6 @@ decisions → reference → archive.
 
 - [`sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md`](sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md)
   — transactional ref history, bounded recovery APIs, and future GC roots.
-- [`sprints/sprint-2026-08-26-e2e-journeys.md`](sprints/sprint-2026-08-26-e2e-journeys.md)
-  — whole-workflow tests played against the git binary, step by step.
 
 ## What's hot
 
@@ -48,6 +46,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-26-e2e-journeys.md`](archive/sprint-2026-08-26-e2e-journeys.md)
+  — a differential journey harness and six workflow files, plus the six
+  divergences from Git they pinned.
 - [`archive/sprint-2026-08-26-storage-contracts.md`](archive/sprint-2026-08-26-storage-contracts.md)
   — bounded opaque content identities, source-surrogate tree projections,
   authoritative migration, and derived-row write guards.
