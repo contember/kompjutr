@@ -56,7 +56,7 @@ describe("checkout refuses what git refuses", () => {
     writeWorkFile(ws, "/a.txt", "one\n");
     stage(ws, "a.txt");
     commit(ws, "first");
-    branch(ws.repo, { name: "topic" });
+    branch(ws.context, ws.repo, { name: "topic" });
     writeWorkFile(ws, "/a.txt", "two\n");
     writeWorkFile(ws, "/new.txt", "added on main\n");
     stage(ws, "a.txt");

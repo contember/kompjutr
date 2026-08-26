@@ -193,13 +193,13 @@ export function createSqliteGitClient(
         const repo = at(input.dir);
         if (input.hard === true) {
           repo.store.db.transactionSync(() => {
-            resetOp(repo, ctx().worktree, input);
+            resetOp(ctx(), repo, ctx().worktree, input);
             repo.store.clearOperationState();
           });
           return;
         }
         repo.store.requireNoOperationState();
-        resetOp(repo, ctx().worktree, input);
+        resetOp(ctx(), repo, ctx().worktree, input);
       },
       async commit(input) {
         const repo = at(input.dir);
@@ -233,12 +233,12 @@ export function createSqliteGitClient(
       async branch(input) {
         const repo = at(input.dir);
         repo.store.requireNoOperationState();
-        branchOp(repo, input);
+        branchOp(ctx(), repo, input);
       },
       async branchDelete(input) {
         const repo = at(input.dir);
         repo.store.requireNoOperationState();
-        branchDeleteOp(repo, input);
+        branchDeleteOp(ctx(), repo, input);
       },
       async branchList(input = {}) {
         return branchListOp(at(input.dir));
@@ -246,12 +246,12 @@ export function createSqliteGitClient(
       async tag(input) {
         const repo = at(input.dir);
         repo.store.requireNoOperationState();
-        tagOp(repo, input);
+        tagOp(ctx(), repo, input);
       },
       async tagDelete(input) {
         const repo = at(input.dir);
         repo.store.requireNoOperationState();
-        tagDeleteOp(repo, input);
+        tagDeleteOp(ctx(), repo, input);
       },
       async tagList(input = {}) {
         return tagListOp(at(input.dir));
@@ -292,7 +292,7 @@ export function createSqliteGitClient(
       async updateRef(input) {
         const repo = at(input.dir);
         repo.store.requireNoOperationState();
-        updateRefOp(repo, input);
+        updateRefOp(ctx(), repo, input);
       },
 
       // Phase 5 and beyond. The object satisfies the interface so a caller

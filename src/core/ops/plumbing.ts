@@ -7,6 +7,7 @@ import { GitError } from "../errors.js";
 import { hashObject as hashRaw } from "../objects.js";
 import type { Repository } from "../repository.js";
 import { type CatFileResult, catFile as readObject } from "./reads.js";
+import { operationRefLogMetadata } from "./ref-log.js";
 
 export interface HashObjectOptions {
   content: Uint8Array | string;
@@ -46,15 +47,14 @@ export interface UpdateRefOptions {
  * see today — its doc comment describes a fast-forward check it never
  * performs.
  */
-export function updateRef(repo: Repository, options: UpdateRefOptions): void {
+export function updateRef(context: GitContext, repo: Repository, options: UpdateRefOptions): void {
   if (options.force !== true && repo.store.getRef(options.ref) !== null) {
     throw new GitError("EUPDATEREFFAIL", `ref ${options.ref} already exists`);
   }
-  if (options.symbolic === true) {
-    repo.store.setRef(options.ref, `ref: ${options.value}`);
-    return;
-  }
-  repo.store.setRef(options.ref, repo.revParse(options.value));
+  const target = options.symbolic === true ? `ref: ${options.value}` : repo.revParse(options.value);
+  const mutation =
+    options.ref === "HEAD" ? { head: target } : { puts: [{ name: options.ref, target }] };
+  repo.store.mutateRefs(mutation, operationRefLogMetadata(context, repo, "update-ref"));
 }
 
 export interface RepoRootOptions {

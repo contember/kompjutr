@@ -153,8 +153,8 @@ function parseRemotes(output: string): RemoteView[] {
 
 describe("branch", () => {
   it("creates a branch at HEAD and at a start point", () => {
-    branch(ws.repo, { name: "feature" });
-    branch(ws.repo, { name: "from-side", startPoint: "side" });
+    branch(ws.context, ws.repo, { name: "feature" });
+    branch(ws.context, ws.repo, { name: "from-side", startPoint: "side" });
     fixture.git("branch", "feature");
     fixture.git("branch", "from-side", "side");
 
@@ -164,35 +164,37 @@ describe("branch", () => {
   });
 
   it("points HEAD at the new branch when asked, without touching the tree", () => {
-    branch(ws.repo, { name: "feature", startPoint: "side", checkout: true });
+    branch(ws.context, ws.repo, { name: "feature", startPoint: "side", checkout: true });
     expect(ws.repo.head().ref).toBe("refs/heads/feature");
     expect(indexPaths()).toEqual([]);
   });
 
   it("deletes a branch but refuses to delete the checked-out one", () => {
-    branch(ws.repo, { name: "feature" });
+    branch(ws.context, ws.repo, { name: "feature" });
     fixture.git("branch", "feature");
 
-    branchDelete(ws.repo, { name: "feature" });
+    branchDelete(ws.context, ws.repo, { name: "feature" });
     fixture.git("branch", "-d", "feature");
     expect(branchList(ws.repo)).toEqual(lines(fixture.git("branch", "--format=%(refname:short)")));
 
-    expect(() => branchDelete(ws.repo, { name: "main" })).toThrow(/checked out/);
+    expect(() => branchDelete(ws.context, ws.repo, { name: "main" })).toThrow(/checked out/);
     expect(runGit("branch", "-d", "main").ok).toBe(false);
     expect(branchList(ws.repo)).toContain("main");
 
-    expect(() => branchDelete(ws.repo, { name: "nope" })).toThrow(/not found/);
+    expect(() => branchDelete(ws.context, ws.repo, { name: "nope" })).toThrow(/not found/);
     expect(runGit("branch", "-d", "nope").ok).toBe(false);
   });
 
   it("overwrites an existing branch only with force", () => {
-    branch(ws.repo, { name: "dup", startPoint: "side" });
+    branch(ws.context, ws.repo, { name: "dup", startPoint: "side" });
     fixture.git("branch", "dup", "side");
-    expect(() => branch(ws.repo, { name: "dup", startPoint: "main" })).toThrow(/already exists/);
+    expect(() => branch(ws.context, ws.repo, { name: "dup", startPoint: "main" })).toThrow(
+      /already exists/,
+    );
     expect(runGit("branch", "dup", "main").ok).toBe(false);
     expect(ws.repo.resolveRef("refs/heads/dup")).toBe(fixture.git("rev-parse", "side"));
 
-    branch(ws.repo, { name: "dup", startPoint: "main", force: true });
+    branch(ws.context, ws.repo, { name: "dup", startPoint: "main", force: true });
     fixture.git("branch", "-f", "dup", "main");
     expect(ws.repo.resolveRef("refs/heads/dup")).toBe(fixture.git("rev-parse", "dup"));
   });
@@ -218,8 +220,8 @@ describe("currentBranch", () => {
 
 describe("tag", () => {
   it("creates, lists and deletes lightweight tags", () => {
-    tag(ws.repo, { name: "v2" });
-    tag(ws.repo, { name: "old", object: "side" });
+    tag(ws.context, ws.repo, { name: "v2" });
+    tag(ws.context, ws.repo, { name: "old", object: "side" });
     fixture.git("tag", "v2");
     fixture.git("tag", "old", "side");
 
@@ -228,18 +230,20 @@ describe("tag", () => {
     expect(ws.repo.resolveRef("refs/tags/old")).toBe(fixture.git("rev-parse", "old"));
     expect(ws.repo.typeOf(ws.repo.resolveRef("refs/tags/v2") ?? "")).toBe("commit");
 
-    tagDelete(ws.repo, { name: "v2" });
+    tagDelete(ws.context, ws.repo, { name: "v2" });
     fixture.git("tag", "-d", "v2");
     expect(tagList(ws.repo)).toEqual(lines(fixture.git("tag", "-l")));
-    expect(() => tagDelete(ws.repo, { name: "v2" })).toThrow(/not found/);
+    expect(() => tagDelete(ws.context, ws.repo, { name: "v2" })).toThrow(/not found/);
     expect(runGit("tag", "-d", "v2").ok).toBe(false);
   });
 
   it("overwrites an existing tag only with force", () => {
-    expect(() => tag(ws.repo, { name: "v1", object: "side" })).toThrow(/already exists/);
+    expect(() => tag(ws.context, ws.repo, { name: "v1", object: "side" })).toThrow(
+      /already exists/,
+    );
     expect(runGit("tag", "v1", "side").ok).toBe(false);
 
-    tag(ws.repo, { name: "v1", object: "side", force: true });
+    tag(ws.context, ws.repo, { name: "v1", object: "side", force: true });
     fixture.git("tag", "-f", "v1", "side");
     expect(ws.repo.resolveRef("refs/tags/v1")).toBe(fixture.git("rev-parse", "v1"));
   });
@@ -993,24 +997,33 @@ describe("plumbing", () => {
     const sideOid = fixture.git("rev-parse", "side");
     const mainOid = fixture.git("rev-parse", "main");
 
-    updateRef(ws.repo, { ref: "refs/heads/fresh", value: sideOid });
+    updateRef(ws.context, ws.repo, { ref: "refs/heads/fresh", value: sideOid });
     fixture.git("update-ref", "refs/heads/fresh", sideOid);
     expect(ws.repo.resolveRef("refs/heads/fresh")).toBe(fixture.git("rev-parse", "fresh"));
 
     // A ref name resolves like a revision does.
-    updateRef(ws.repo, { ref: "refs/heads/named", value: "main" });
+    updateRef(ws.context, ws.repo, { ref: "refs/heads/named", value: "main" });
     expect(ws.repo.resolveRef("refs/heads/named")).toBe(mainOid);
 
-    expect(() => updateRef(ws.repo, { ref: "refs/heads/fresh", value: mainOid })).toThrow(
-      /already exists/,
-    );
-    updateRef(ws.repo, { ref: "refs/heads/fresh", value: mainOid, force: true });
+    expect(() =>
+      updateRef(ws.context, ws.repo, { ref: "refs/heads/fresh", value: mainOid }),
+    ).toThrow(/already exists/);
+    updateRef(ws.context, ws.repo, { ref: "refs/heads/fresh", value: mainOid, force: true });
     expect(ws.repo.resolveRef("refs/heads/fresh")).toBe(mainOid);
 
-    updateRef(ws.repo, { ref: "refs/heads/alias", value: "refs/heads/side", symbolic: true });
+    updateRef(ws.context, ws.repo, {
+      ref: "refs/heads/alias",
+      value: "refs/heads/side",
+      symbolic: true,
+    });
     expect(ws.repo.resolveRef("refs/heads/alias")).toBe(sideOid);
 
-    updateRef(ws.repo, { ref: "HEAD", value: "refs/heads/side", symbolic: true, force: true });
+    updateRef(ws.context, ws.repo, {
+      ref: "HEAD",
+      value: "refs/heads/side",
+      symbolic: true,
+      force: true,
+    });
     fixture.git("symbolic-ref", "HEAD", "refs/heads/side");
     expect(symbolicRef(ws.repo)).toBe(fixture.git("symbolic-ref", "HEAD"));
   });

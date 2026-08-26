@@ -5,7 +5,7 @@ import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
-import { commitMaterializationSqlStatements } from "./commit.js";
+import { commitMaterializationSqlStatements, commitPublicationSqlStatements } from "./commit.js";
 import { type IntegrationPlan, MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ } from "./integration.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import { projectMergePlan } from "./merge-projection.js";
@@ -63,7 +63,8 @@ export function integrationSqlStatements(plan: IntegrationPlan, treeStatements: 
   return treeStatements + plan.blobReadCalls * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
 }
 
-export const integrationCommitSqlStatements = commitMaterializationSqlStatements;
+export const integrationCommitMaterializationSqlStatements = commitMaterializationSqlStatements;
+export const integrationCommitSqlStatements = commitPublicationSqlStatements;
 
 export const MAX_INTEGRATION_COMMIT_SQL_STATEMENTS = integrationCommitSqlStatements({
   leafEntries: MAX_INTEGRATION_INDEX_ENTRIES,

@@ -416,7 +416,7 @@ describe("sparse checkout", () => {
     expect(worktree.reads).toBe(0);
     expect(worktree.rangeReads).toBe(0);
     expect(worktree.bulkReadPaths).toEqual([]);
-    expect(workspace.storage.statementCount).toBeLessThan(50);
+    expect(workspace.storage.statementCount).toBe(59);
     expect(workspace.storage.rowCount).toBeLessThan(10_000);
     expect(workspace.repo.head().oid).toBe(target);
     expect(workspace.context.sparseWorkspace?.readState(workspace.repo.store.repoId)).toEqual({
@@ -718,5 +718,56 @@ describe("sparse checkout", () => {
     );
     expect(reseals).toEqual([]);
     expect(workspace.repo.head().oid).not.toBe(target);
+  });
+
+  it("rolls sparse apply, HEAD, history, and tracker publication back together", () => {
+    const { workspace, base, target, paths } = makeChangedFiles(2, 1);
+    const source = requireSparseWorkspace(workspace);
+    const path = paths[0];
+    if (path === undefined) throw new Error("sparse rollback path missing");
+    const before = {
+      head: workspace.repo.store.head(),
+      index: workspace.repo.store.indexGet(path),
+      content: utf8Decoder.decode(workspace.worktree.readFile(`/${path}`)),
+      entries: workspace.database.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+      ordinal: workspace.database.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    };
+    const context: GitContext = {
+      ...workspace.context,
+      sparseWorkspace: source,
+      indexTracker: {
+        reseal() {
+          throw new Error("injected tracker reseal failure");
+        },
+      },
+    };
+    const worktree = new NoScanWorktree(workspace.worktree);
+
+    expect(() => checkout(context, workspace.repo, worktree, { ref: target })).toThrow(
+      /tracker reseal failure/,
+    );
+
+    expect(base).not.toBe(target);
+    expect(workspace.repo.store.head()).toBe(before.head);
+    expect(workspace.repo.store.indexGet(path)).toEqual(before.index);
+    expect(utf8Decoder.decode(workspace.worktree.readFile(`/${path}`))).toBe(before.content);
+    expect(
+      workspace.database.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    ).toBe(before.entries);
+    expect(
+      workspace.database.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    ).toBe(before.ordinal);
   });
 });

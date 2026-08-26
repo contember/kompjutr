@@ -161,6 +161,8 @@ const REF_MUTATION_SQL_HEADROOM_BYTES = 8 * 1024 * 1024;
 export const MAX_REF_MUTATION_RETAINED_BYTES = 64 * 1024 * 1024;
 export const REF_MUTATION_FIXED_RETAINED_BYTES =
   REF_MUTATION_SQL_HEADROOM_BYTES + REF_ROW_RETAINED_BYTES + 2 * MAX_REFLOG_RAW_TARGET_BYTES;
+/** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
+export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 8;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */

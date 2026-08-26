@@ -385,6 +385,7 @@ export function startReplay(
         parent: [head.oid],
         identities,
         expectedHead: head,
+        refLogReason: policy.kind,
       });
       return { outcome: "committed", oid: result.oid };
     } finally {
@@ -456,6 +457,7 @@ export function continueReplay(
         parent: [journal.state.originalHeadOid],
         identities,
         expectedHead: head,
+        refLogReason: policy.kind,
       });
       repo.store.clearOperationState();
       return { outcome: "committed", oid: result.oid };

@@ -634,6 +634,7 @@ function mergeInTransaction(
       parent: [head.oid, incomingOid],
       identities,
       expectedHead: head,
+      refLogReason: "merge: commit",
     });
   } finally {
     reservation.dispose();
@@ -681,6 +682,7 @@ export function mergeContinue(
         parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
         identities,
         expectedHead: head,
+        refLogReason: "merge: commit",
       });
       repo.store.clearMergeState();
       return result;

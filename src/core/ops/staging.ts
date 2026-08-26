@@ -6,6 +6,7 @@
 // after that is bounded by what actually changed.
 
 import { contentIdKey, type IndexEntry, type IndexSink } from "../../sqlite/store.js";
+import type { GitContext } from "../context.js";
 import { GitError, PathspecNotFoundError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
@@ -14,6 +15,7 @@ import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree, matchesPaths } from "./checkout.js";
+import { operationRefLogMetadata } from "./ref-log.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
   hashExactWorktreePaths,
@@ -722,9 +724,14 @@ export interface ResetOptions {
  * `paths` and `hard` are documented as mutually exclusive; `hard` wins if
  * both arrive. A bare reset unstages everything without moving any ref.
  */
-export function reset(repo: Repository, worktree: Worktree, options: ResetOptions = {}): void {
+export function reset(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: ResetOptions = {},
+): void {
   if (options.hard === true) {
-    hardReset(repo, worktree, options.ref);
+    hardReset(context, repo, worktree, options.ref);
     return;
   }
 
@@ -770,14 +777,21 @@ export function lsFiles(repo: Repository): string[] {
 }
 
 /** Restore index and working tree to `ref`, dragging the current branch along. */
-function hardReset(repo: Repository, worktree: Worktree, ref?: string): void {
-  const commit = targetCommit(repo, ref);
-  const tree = commit === null ? null : repo.readCommit(commit).tree;
-  const head = repo.head();
-  if (commit !== null && head.ref !== null) repo.store.setRef(head.ref, commit);
-  checkoutTree(repo, worktree, tree, {
-    discardUnmerged: true,
-    restoreStructure: true,
+function hardReset(context: GitContext, repo: Repository, worktree: Worktree, ref?: string): void {
+  repo.store.db.transactionSync(() => {
+    const commit = targetCommit(repo, ref);
+    const tree = commit === null ? null : repo.readCommit(commit).tree;
+    const head = repo.head();
+    if (commit !== null) {
+      const metadata = operationRefLogMetadata(context, repo, "reset: hard");
+      const mutation =
+        head.ref === null ? { head: commit } : { puts: [{ name: head.ref, target: commit }] };
+      repo.store.mutateRefs(mutation, metadata);
+    }
+    checkoutTree(repo, worktree, tree, {
+      discardUnmerged: true,
+      restoreStructure: true,
+    });
   });
 }
 

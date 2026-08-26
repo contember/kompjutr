@@ -1,12 +1,14 @@
 // Recording a commit: the index becomes trees, the trees become a commit,
 // and the ref HEAD points at moves to it.
 
+import { MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, MissingIdentityError } from "../errors.js";
 import { type Commit, hashObject, type Person, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import type { CommitResult } from "./kinds.js";
 import { MAX_MERGE_IDENTITY_BYTES, MAX_MERGE_MESSAGE_BYTES } from "./merge-state.js";
+import { committerRefLogMetadata, type RefLogReason } from "./ref-log.js";
 import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js";
 
 const OBJECT_BATCH_BYTES = 1024 * 1024;
@@ -36,6 +38,7 @@ export interface IndexedCommitOptions {
   parent: readonly string[];
   identities: CommitIdentities;
   expectedHead: ResolvedHead;
+  refLogReason: RefLogReason;
 }
 
 export interface UnpublishedCommitOptions {
@@ -73,6 +76,11 @@ export function commitMaterializationSqlStatements(stats: TreeBuildPreflightStat
   );
 }
 
+/** Materialization plus the atomic single-ref/causal-HEAD publication seam. */
+export function commitPublicationSqlStatements(stats: TreeBuildPreflightStats): number {
+  return commitMaterializationSqlStatements(stats) + MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS;
+}
+
 export function commit(
   context: GitContext,
   repo: Repository,
@@ -105,7 +113,14 @@ export function commit(
     if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
       throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
     }
-    return publishCommitResult(repo, head, result);
+    const reason: RefLogReason =
+      options.amend === true ? "commit (amend)" : head.oid === null ? "commit (initial)" : "commit";
+    return publishCommitResult(
+      repo,
+      head,
+      result,
+      committerRefLogMetadata(identities.committer, reason),
+    );
   });
 }
 
@@ -156,17 +171,23 @@ function writeCommitObjects(
 /** Caller owns the transaction and has already validated `expectedHead`. */
 function publishCommit(repo: Repository, options: IndexedCommitOptions): CommitResult {
   const result = writeCommitObjects(repo, options, { mode: "clean", value: options.message });
-  return publishCommitResult(repo, options.expectedHead, result);
+  return publishCommitResult(
+    repo,
+    options.expectedHead,
+    result,
+    committerRefLogMetadata(options.identities.committer, options.refLogReason),
+  );
 }
 
 function publishCommitResult(
   repo: Repository,
   expectedHead: ResolvedHead,
   result: UnpublishedCommitResult,
+  metadata: ReturnType<typeof committerRefLogMetadata>,
 ): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
-  if (expectedHead.ref === null) repo.store.setHead(result.oid);
-  else repo.store.setRef(expectedHead.ref, result.oid);
+  if (expectedHead.ref === null) repo.store.mutateRefs({ head: result.oid }, metadata);
+  else repo.store.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata);
   return { oid: result.oid };
 }
 

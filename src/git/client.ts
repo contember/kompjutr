@@ -341,13 +341,13 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       const repo = at(input.dir);
       if (input.hard === true) {
         repo.store.db.transactionSync(() => {
-          resetOp(repo, context.worktree, input);
+          resetOp(context, repo, context.worktree, input);
           repo.store.clearOperationState();
         });
         return;
       }
       repo.store.requireNoOperationState();
-      resetOp(repo, context.worktree, input);
+      resetOp(context, repo, context.worktree, input);
     },
     async commit(input) {
       const repo = at(input.dir);
@@ -390,12 +390,12 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async branch(input) {
       const repo = at(input.dir);
       repo.store.requireNoOperationState();
-      branchOp(repo, input);
+      branchOp(context, repo, input);
     },
     async branchDelete(input) {
       const repo = at(input.dir);
       repo.store.requireNoOperationState();
-      branchDeleteOp(repo, input);
+      branchDeleteOp(context, repo, input);
     },
     async branchList(input = {}) {
       return branchListOp(at(input.dir));
@@ -403,12 +403,12 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async tag(input) {
       const repo = at(input.dir);
       repo.store.requireNoOperationState();
-      tagOp(repo, input);
+      tagOp(context, repo, input);
     },
     async tagDelete(input) {
       const repo = at(input.dir);
       repo.store.requireNoOperationState();
-      tagDeleteOp(repo, input);
+      tagDeleteOp(context, repo, input);
     },
     async tagList(input = {}) {
       return tagListOp(at(input.dir));
@@ -447,7 +447,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async updateRef(input) {
       const repo = at(input.dir);
       repo.store.requireNoOperationState();
-      updateRefOp(repo, input);
+      updateRefOp(context, repo, input);
     },
     async push(input = {}) {
       const repo = at(input.dir);

@@ -91,6 +91,7 @@ describe("commit transactions", () => {
           },
         },
         expectedHead,
+        refLogReason: "commit",
       }),
     ).toThrow("injected ref publication failure");
 

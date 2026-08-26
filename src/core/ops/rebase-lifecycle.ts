@@ -12,7 +12,7 @@ import { resolveIdentity, writeUnpublishedCommit } from "./commit.js";
 import { MAX_INTEGRATION_STRUCTURE_BYTES } from "./integration.js";
 import {
   INTEGRATION_EXECUTION_HEADROOM_BYTES,
-  integrationCommitSqlStatements,
+  integrationCommitMaterializationSqlStatements,
   integrationIndexMatchesTree,
   projectedTouchedShape,
   projectIntegrationWithCollisions,
@@ -550,7 +550,7 @@ function applyOneStep(
           if (sourceIsEmpty(plan)) {
             requireTransitionBudget(
               journal,
-              integrationCommitSqlStatements(treeStats),
+              integrationCommitMaterializationSqlStatements(treeStats),
               replayPlanSqlStatements(plan),
             );
             const result = writeUnpublishedCommit(repo, {
@@ -589,7 +589,8 @@ function applyOneStep(
             prospectiveIntegrationIndexEntries(repo, projected),
           );
           const conflicted = plan.integration.entries.some((entry) => entry.kind === "conflict");
-          const commitSqlStatements = integrationCommitSqlStatements(projectedTreeStats);
+          const commitSqlStatements =
+            integrationCommitMaterializationSqlStatements(projectedTreeStats);
           requireTransitionBudget(
             journal,
             conflicted ? 256 : 192 + commitSqlStatements,
@@ -910,7 +911,7 @@ export function continueRebase(
             192 +
               (resultEmpty
                 ? (baseline?.sqlStatements ?? 0)
-                : integrationCommitSqlStatements(treeStats)),
+                : integrationCommitMaterializationSqlStatements(treeStats)),
             replayPlanSqlStatements(plan),
           );
           if (resultEmpty) {

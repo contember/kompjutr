@@ -27,7 +27,7 @@ const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
  * SQL statements one 2,000-file commit costs. Deterministic; see the scale
  * test. The trees and commit share one bounded object batch and cache write.
  */
-const SCALE_STATEMENTS = 14;
+const SCALE_STATEMENTS = 20;
 
 const fixtures: GitFixture[] = [];
 
@@ -222,6 +222,9 @@ describe("explicit-parent commit seam", () => {
     const before = {
       head: repo.workspace.repo.store.head(),
       refs: repo.workspace.repo.store.listRefs(),
+      reflogEntries:
+        repo.workspace.repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries") ??
+        -1,
     };
     const author: Person = {
       name: "Original Author",
@@ -247,6 +250,9 @@ describe("explicit-parent commit seam", () => {
 
     expect(repo.workspace.repo.store.head()).toBe(before.head);
     expect(repo.workspace.repo.store.listRefs()).toEqual(before.refs);
+    expect(
+      repo.workspace.repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries"),
+    ).toBe(before.reflogEntries);
     expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(first);
     const expected = {
       tree: result.tree,
@@ -313,7 +319,11 @@ describe("explicit-parent commit seam", () => {
     const unpublished = repo.workspace.repo.store.db.transactionSync(() =>
       writeUnpublishedCommit(repo.workspace.repo, options),
     );
-    const published = commitIndex(repo.workspace.repo, { ...options, expectedHead });
+    const published = commitIndex(repo.workspace.repo, {
+      ...options,
+      expectedHead,
+      refLogReason: "commit",
+    });
 
     expect(published.oid).toBe(unpublished.oid);
     expect(repo.workspace.repo.resolveRef("refs/heads/main")).toBe(unpublished.oid);
@@ -333,6 +343,7 @@ describe("explicit-parent commit seam", () => {
       parent: [first, second],
       identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
       expectedHead: head,
+      refLogReason: "merge: commit",
     });
 
     expect(repo.workspace.repo.readCommit(result.oid).parent).toEqual([first, second]);
@@ -348,6 +359,9 @@ describe("explicit-parent commit seam", () => {
     if (expectedHead.ref === null) throw new Error("fixture HEAD is detached");
     repo.workspace.repo.store.setRef(expectedHead.ref, first);
     const before = repo.workspace.repo.store.objectCount();
+    const beforeReflog = repo.workspace.repo.store.db.scalar<number>(
+      "SELECT COUNT(*) FROM git_reflog_entries",
+    );
 
     expect(() =>
       commitIndex(repo.workspace.repo, {
@@ -355,9 +369,13 @@ describe("explicit-parent commit seam", () => {
         parent: [first],
         identities: resolveIdentity(repo.workspace.context, repo.workspace.repo, {}),
         expectedHead,
+        refLogReason: "commit",
       }),
     ).toThrow(expect.objectContaining({ code: "ESTALEHEAD" }));
     expect(repo.workspace.repo.store.objectCount()).toBe(before);
+    expect(
+      repo.workspace.repo.store.db.scalar<number>("SELECT COUNT(*) FROM git_reflog_entries"),
+    ).toBe(beforeReflog);
     expect(repo.workspace.repo.resolveRef(expectedHead.ref)).toBe(first);
   });
 });
@@ -660,7 +678,7 @@ describe("scale", () => {
     expect(statements).toBe(SCALE_STATEMENTS);
   });
 
-  it("commits 3,293 tree and commit objects within 15 statements", () => {
+  it("commits 3,293 tree and commit objects within 21 statements", () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     const workspace = makeRepo("/");
@@ -693,6 +711,6 @@ describe("scale", () => {
     expect(workspace.repo.readCommit(oid).tree).toBe(expectedTree);
     expect(oid).toBe(expectedCommit);
     expect(workspace.repo.store.objectCount() - before).toBe(3293);
-    expect(statements).toBe(15);
+    expect(statements).toBe(21);
   });
 });

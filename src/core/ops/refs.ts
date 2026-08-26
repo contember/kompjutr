@@ -11,6 +11,7 @@ import { comparePaths, joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
 import { treeOf } from "./reads.js";
+import { operationRefLogMetadata } from "./ref-log.js";
 import { trySparseCleanCheckout } from "./sparse-checkout.js";
 import { treeStream } from "./tree-stream.js";
 import {
@@ -41,16 +42,23 @@ export interface BranchOptions {
   force?: boolean;
 }
 
-export function branch(repo: Repository, options: BranchOptions): void {
+export function branch(context: GitContext, repo: Repository, options: BranchOptions): void {
   const full = branchRef(options.name);
-  if (options.force !== true && repo.store.getRef(full) !== null) {
+  const current = repo.store.getRef(full);
+  if (options.force !== true && current !== null) {
     throw new GitError("EBRANCHFAIL", `a branch named '${options.name}' already exists`);
   }
   // A branch names a commit, so an annotated tag start point is peeled.
   const oid = repo.peel(repo.revParse(options.startPoint ?? "HEAD"));
   repo.store.db.transactionSync(() => {
-    repo.store.setRef(full, oid);
-    if (options.checkout === true) repo.store.setHead(`ref: ${full}`);
+    const mutation =
+      options.checkout === true
+        ? { puts: [{ name: full, target: oid }], head: `ref: ${full}` }
+        : { puts: [{ name: full, target: oid }] };
+    repo.store.mutateRefs(
+      mutation,
+      operationRefLogMetadata(context, repo, current === null ? "branch: create" : "branch: reset"),
+    );
   });
 }
 
@@ -58,7 +66,11 @@ export interface BranchDeleteOptions {
   name: string;
 }
 
-export function branchDelete(repo: Repository, options: BranchDeleteOptions): void {
+export function branchDelete(
+  context: GitContext,
+  repo: Repository,
+  options: BranchDeleteOptions,
+): void {
   const full = branchRef(options.name);
   if (repo.store.getRef(full) === null) {
     throw new GitError("EBRANCHFAIL", `branch '${options.name}' not found`);
@@ -66,7 +78,10 @@ export function branchDelete(repo: Repository, options: BranchDeleteOptions): vo
   if (repo.head().ref === full) {
     throw new GitError("EBRANCHFAIL", `cannot delete branch '${options.name}': it is checked out`);
   }
-  repo.store.deleteRef(full);
+  repo.store.mutateRefs(
+    { deletes: [full] },
+    operationRefLogMetadata(context, repo, "branch: delete"),
+  );
 }
 
 export function branchList(repo: Repository): string[] {
@@ -101,24 +116,28 @@ export interface TagOptions {
 }
 
 /** Lightweight tags only: a ref row, no tag object. */
-export function tag(repo: Repository, options: TagOptions): void {
+export function tag(context: GitContext, repo: Repository, options: TagOptions): void {
   const full = tagRef(options.name);
-  if (options.force !== true && repo.store.getRef(full) !== null) {
+  const current = repo.store.getRef(full);
+  if (options.force !== true && current !== null) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' already exists`);
   }
-  repo.store.setRef(full, repo.revParse(options.object ?? "HEAD"));
+  repo.store.mutateRefs(
+    { puts: [{ name: full, target: repo.revParse(options.object ?? "HEAD") }] },
+    operationRefLogMetadata(context, repo, current === null ? "tag: create" : "tag: update"),
+  );
 }
 
 export interface TagDeleteOptions {
   name: string;
 }
 
-export function tagDelete(repo: Repository, options: TagDeleteOptions): void {
+export function tagDelete(context: GitContext, repo: Repository, options: TagDeleteOptions): void {
   const full = tagRef(options.name);
   if (repo.store.getRef(full) === null) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' not found`);
   }
-  repo.store.deleteRef(full);
+  repo.store.mutateRefs({ deletes: [full] }, operationRefLogMetadata(context, repo, "tag: delete"));
 }
 
 export function tagList(repo: Repository): string[] {
@@ -144,43 +163,52 @@ export function checkout(
   const commit = repo.peel(repo.revParse(options.ref));
   const tree = treeOf(repo, commit);
 
-  const tracker = context.indexTracker;
-  if (
-    paths === undefined &&
-    tracker !== undefined &&
-    trySparseCleanCheckout(context, repo, worktree, tree)
-  ) {
-    moveHead(repo, options.ref, commit);
-    tracker.reseal(repo.store.repoId, tree, []);
-    return;
-  }
-
-  if (options.force !== true) {
-    const blocked = checkoutBlockers(repo, worktree, tree, paths, paths === undefined);
-    if (blocked.tracked.length > 0) {
-      throw new GitError(
-        "ECHECKOUTFAIL",
-        `local changes to ${blocked.tracked.join(", ")} would be overwritten by checkout`,
-      );
-    }
-    if (blocked.untracked.length > 0) {
-      throw new GitError(
-        "ECHECKOUTFAIL",
-        `untracked working tree files would be overwritten by checkout: ${blocked.untracked.join(", ")}`,
-      );
-    }
-  }
-
   if (paths !== undefined) {
+    requireCheckoutAllowed(repo, worktree, tree, paths, false, options.force === true);
     // Path checkout restores named targets without pruning absent ones.
     checkoutTree(repo, worktree, tree, { paths, prune: false, restoreStructure: true });
     return;
   }
-  checkoutTree(repo, worktree, tree, {
-    preserveMatchingIndex: options.force !== true,
-    restoreStructure: options.force === true,
+
+  repo.store.db.transactionSync(() => {
+    const tracker = context.indexTracker;
+    if (tracker !== undefined && trySparseCleanCheckout(context, repo, worktree, tree)) {
+      moveHead(context, repo, options.ref, commit);
+      tracker.reseal(repo.store.repoId, tree, []);
+      return;
+    }
+
+    requireCheckoutAllowed(repo, worktree, tree, undefined, true, options.force === true);
+    checkoutTree(repo, worktree, tree, {
+      preserveMatchingIndex: options.force !== true,
+      restoreStructure: options.force === true,
+    });
+    moveHead(context, repo, options.ref, commit);
   });
-  moveHead(repo, options.ref, commit);
+}
+
+function requireCheckoutAllowed(
+  repo: Repository,
+  worktree: Worktree,
+  tree: string | null,
+  paths: string[] | undefined,
+  prune: boolean,
+  force: boolean,
+): void {
+  if (force) return;
+  const blocked = checkoutBlockers(repo, worktree, tree, paths, prune);
+  if (blocked.tracked.length > 0) {
+    throw new GitError(
+      "ECHECKOUTFAIL",
+      `local changes to ${blocked.tracked.join(", ")} would be overwritten by checkout`,
+    );
+  }
+  if (blocked.untracked.length > 0) {
+    throw new GitError(
+      "ECHECKOUTFAIL",
+      `untracked working tree files would be overwritten by checkout: ${blocked.untracked.join(", ")}`,
+    );
+  }
 }
 
 export interface SwitchOptions {
@@ -196,11 +224,13 @@ export function switchBranch(
   worktree: Worktree,
   options: SwitchOptions,
 ): void {
-  // The branch is created first, so a name collision leaves the tree alone.
-  if (options.create === true) {
-    branch(repo, { name: options.name, startPoint: options.startPoint });
-  }
-  checkout(context, repo, worktree, { ref: options.name });
+  repo.store.db.transactionSync(() => {
+    // The branch is created first, so a name collision leaves the tree alone.
+    if (options.create === true) {
+      branch(context, repo, { name: options.name, startPoint: options.startPoint });
+    }
+    checkout(context, repo, worktree, { ref: options.name });
+  });
 }
 
 function branchRef(name: string): string {
@@ -218,10 +248,13 @@ function tagRef(name: string): string {
  * detaches at the commit for anything else — a tag, a remote-tracking
  * branch, or a raw oid.
  */
-function moveHead(repo: Repository, ref: string, commit: string): void {
+function moveHead(context: GitContext, repo: Repository, ref: string, commit: string): void {
   const expanded = repo.expandRef(ref);
   const full = expanded === "HEAD" ? repo.head().ref : expanded;
-  repo.store.setHead(full?.startsWith(HEADS) ? `ref: ${full}` : commit);
+  repo.store.mutateRefs(
+    { head: full?.startsWith(HEADS) ? `ref: ${full}` : commit },
+    operationRefLogMetadata(context, repo, "checkout"),
+  );
 }
 
 /**

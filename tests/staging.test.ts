@@ -589,7 +589,7 @@ describe("reset", () => {
     add(workspace.repo, workspace.worktree, { paths: [], all: true });
     fixture.git("add", "-A");
 
-    reset(workspace.repo, workspace.worktree, { paths: ["a.txt"] });
+    reset(workspace.context, workspace.repo, workspace.worktree, { paths: ["a.txt"] });
     fixture.git("reset", "-q", "--", "a.txt");
 
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
@@ -607,7 +607,7 @@ describe("reset", () => {
     add(workspace.repo, workspace.worktree, { paths: [], all: true });
     fixture.git("add", "-A");
 
-    reset(workspace.repo, workspace.worktree, {});
+    reset(workspace.context, workspace.repo, workspace.worktree, {});
     fixture.git("reset", "-q");
 
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
@@ -627,7 +627,7 @@ describe("reset", () => {
     add(workspace.repo, workspace.worktree, { paths: [], all: true });
     fixture.git("add", "-A");
 
-    reset(workspace.repo, workspace.worktree, { hard: true });
+    reset(workspace.context, workspace.repo, workspace.worktree, { hard: true });
     fixture.git("reset", "--hard", "-q");
 
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
@@ -644,7 +644,10 @@ describe("reset", () => {
     fixture.commit("second");
     const workspace = await clonedFrom(fixture);
 
-    reset(workspace.repo, workspace.worktree, { hard: true, ref: "HEAD~1" });
+    reset(workspace.context, workspace.repo, workspace.worktree, {
+      hard: true,
+      ref: "HEAD~1",
+    });
     fixture.git("reset", "--hard", "-q", "HEAD~1");
 
     expect(workspace.repo.resolveRef("refs/heads/main")).toBe(fixture.git("rev-parse", "HEAD"));
