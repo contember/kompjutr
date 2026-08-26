@@ -15,16 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-26-multi-checkout-consumer-foundation.md`](sprints/sprint-2026-08-26-multi-checkout-consumer-foundation.md)
-  — one shared SQLite Git store, isolated session checkouts, and bounded
-  divergence/raw-ref reads required by Roj.
+None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Multi-checkout consumer admission is active: split store/checkout identity,
-  add linked-worktree lifecycle, and prove the Roj-facing read contract.
+- Multi-checkout consumer admission is shipped. The next production evidence is
+  the Durable Object regression probe and concurrent/restart conformance; safe
+  merged-branch deletion and garbage collection remain separate follow-up work.
 
 ## Key reference
 
@@ -45,9 +44,13 @@ decisions → reference → archive.
 - [`decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md`](decisions/0006-keep-content-identities-opaque-and-bound-the-cache.md)
 - [`decisions/0007-key-parsed-trees-by-source-surrogate.md`](decisions/0007-key-parsed-trees-by-source-surrogate.md)
 - [`decisions/0008-retain-deleted-ref-history.md`](decisions/0008-retain-deleted-ref-history.md)
+- [`decisions/0009-split-shared-store-from-checkouts.md`](decisions/0009-split-shared-store-from-checkouts.md)
 
 ## Historical records
 
+- [`archive/sprint-2026-08-26-multi-checkout-consumer-foundation.md`](archive/sprint-2026-08-26-multi-checkout-consumer-foundation.md)
+  — one shared Git store, isolated linked checkouts, bounded consumer reads, and
+  one undeployed schema baseline.
 - [`archive/sprint-2026-08-26-reflogs-and-ref-recovery.md`](archive/sprint-2026-08-26-reflogs-and-ref-recovery.md)
   — transactional bounded ref history, public CAS recovery, fixed retention
   roots, and one undeployed Git schema baseline.

@@ -1,12 +1,29 @@
+> **OUTCOME — shipped 2026-08-26.** One SQLite-native Git store now serves up
+> to 1,024 isolated checkouts with shared objects, packs, refs, config, shallow
+> state, and direct-ref history. The native surface adds atomic linked-checkout
+> lifecycle, bounded caller-selected divergence, and exact raw-ref reads, with
+> checkout-private `HEAD`, index, worktree, operation journal, and `HEAD` history.
+> The complete Roj admission journey survives a cold reopen, conflict recovery,
+> publication, removal, and prune. The undeployed schema remains one exact
+> version-1 initializer with no migration or upgrade chain. Commit map: WU1 →
+> `952ee47`; WU2 → `0747e25`; WU3 → `4c0a89f` with E2E harness correction
+> `13e7321`; WU6 → `f863edf`; WU4 → `16fb225`, `478a62d`, and `5027e1d`;
+> WU5 → `b95cc8f`; WU7 → `a9c9643`, `afa43fd`, and `c5edc8d`.
+> Verification: leased full suite — 110 files, 1,938 passed, 5 skipped;
+> leased typecheck, Biome check, leased clean build, 570-file package smoke, and
+> docs lint. Backlog closed: 40, 47, and 48. Deferred: the consumer-side adapter;
+> partial clone, atomic multi-ref push, remote ref discovery, scratch-index and
+> patch interchange; merged-branch deletion and garbage collection; production
+> Durable Object probing; systematic concurrent/interrupted-operation coverage;
+> deployment and publication.
+
 # Sprint — Multi-checkout consumer foundation (2026-08-26)
 
 **Goal.** Make one SQLite-native Git store serve isolated session checkouts, expose
 the two bounded reads required by Roj, and prove the complete checkout lifecycle
 without adding an upgrade chain for the undeployed schema.
 
-**Theme.** Backlog [40](../backlog/40-linked-worktrees.md),
-[47](../backlog/47-divergence-against-arbitrary-ref.md), and
-[48](../backlog/48-read-symbolic-ref-target.md) are one admission boundary. The
+**Theme.** Backlog items 40, 47, and 48 are one admission boundary. The
 consumer can already express ordinary local Git work, but cannot create two
 isolated sessions over one object/ref store or recover its base-branch metadata
 after a restart. Success is two checkout roots sharing objects and refs while
@@ -362,3 +379,20 @@ schema/mutation review before the next dependent phase. Do not overlap writers i
   and combined direct/checkout history accepts 9,727 rows but rejects 9,728
   before traversal. All 73 focused tests, typecheck, and independent review
   passed; no new production mutation path was required.
+- 2026-08-26 — WU7 extended the differential harness with named checkout
+  sessions and proved the full consumer admission journey: shared polling,
+  isolated edits, peer publication, conflicted rebase, B-first cold reopen,
+  continue, fast-forward publication, removal, absent-root prune, clean survivor,
+  and no active journal. Independent review found and closed unsafe fixture path
+  derivation and a wrong real-Git checkout selector before the journey landed.
+- 2026-08-26 — Final cleanup made every build replace `dist` before TypeScript
+  compilation and expanded the packed-consumer smoke to cover all new public
+  values and types while proving the internal exact-path source stays private.
+  A repository audit found one current schema-v1 initializer, exact reopen
+  validation, and no migration module, upgrade branch, or stale migration output.
+  Independent package and documentation reviews approved the result.
+- 2026-08-26 — Final gates passed: leased full suite (110 files, 1,938 passed,
+  5 skipped), leased typecheck, Biome check, leased clean build, 570-file package
+  smoke, and docs lint. The first full run exposed one stale post-destroy test
+  access through a revoked checkout facade; `c5edc8d` preserved its foreign-key
+  cascade witness through the raw test database, and the complete rerun passed.

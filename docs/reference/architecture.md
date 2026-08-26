@@ -51,44 +51,80 @@ metadata.
 
 ## Repository model
 
-Several repositories can share one workspace. The nearest registered ancestor
-of a requested directory selects the repository. Nested repositories are
+Several shared Git stores can live in one workspace, and each store can own
+several checkouts. The nearest registered checkout ancestor of a requested
+directory selects a checkout-bound `Repository` view. Nested checkout roots are
 excluded from parent working-tree scans.
 
 Repository state is relational rather than a fake `.git` tree:
 
-- `git_repositories` stores the root and HEAD.
-- `git_refs`, `git_config`, and `git_shallow` store repository metadata.
-- `git_reflog_state` and `git_reflog_entries` store bounded ref history.
-- `git_index` stores one row per path and stage.
-- `git_objects` and `git_object_chunks` store locally created objects.
-- `git_pack_*` stores received pack bytes and their index.
-- `git_blob_ids` caches opaque filesystem content identities to blob OIDs.
-- `git_tree_*` stores source-qualified parsed tree edges through narrow source
-  surrogates.
-- `git_commits` stores validated parsed commit projections.
-- `git_operation_state`, `git_operation_steps`, and `git_operation_touched`
-  store one authenticated bounded recovery journal per repository.
+- Global `git_meta` stores the schema version.
+- Shared-store-owned tables are `git_repositories`, `git_refs`, `git_config`,
+  `git_shallow`, `git_objects`, `git_object_chunks`, `git_pack_meta`,
+  `git_pack_data`, `git_pack_objects`, `git_pack_pending`, `git_blob_id_state`,
+  `git_blob_ids`, `git_tree_sources`, `git_tree_entries`, `git_tree_effective`,
+  `git_commits`, `git_reflog_state`, and `git_reflog_entries`. They use
+  `repo_id`, except that `git_tree_entries` is owned through its source surrogate.
+- Checkout-owned tables are `git_checkouts`, `git_index`, `git_index_state`,
+  `git_index_dirty`, `git_operation_state`, `git_operation_steps`,
+  `git_operation_touched`, and `git_checkout_reflog_entries`. Rows below
+  `git_checkouts` use `checkout_id`.
+
+`git_repositories` is only the shared identity. `git_checkouts` owns the
+immutable canonical root, raw `HEAD`, and primary marker. Checkout views of the
+same store use one shared object, pack, ref, config, shallow, and cache namespace.
+Their working trees, indexes, tracker state, operation journals, and raw `HEAD`
+remain independent.
 
 No operation depends on a `.git` directory.
 
 Every Git-visible direct-ref or raw `HEAD` movement passes through one store
 mutation seam. The seam captures raw and resolved old/new endpoints, applies the
-ref change, assigns repository-wide ordinals, appends the reflog rows, and prunes
-retention in the same synchronous transaction. A checked-out direct-ref movement
-records the direct ref before its causal `HEAD` entry. Failed, stale, no-op, and
-rolled-back mutations record nothing.
+ref change, assigns store-wide ordinals, appends the reflog rows, and prunes
+retention in the same synchronous transaction. Moving a branch attached to any
+checkout records the shared direct ref before that checkout's causal `HEAD`
+entry, even when another checkout initiated the mutation. Failed, stale, no-op,
+and rolled-back mutations record nothing.
 
-Reflog reads are newest-first and page strictly before a repository-wide ordinal.
-An entry is active only while it is both at most 90 days old and among the newest
-1,024 entries for its ref. `HEAD@{0}` through `HEAD@{1023}` select active new-OID
-endpoints. `recoverRef()` selects an active old or new endpoint, verifies the
-object, and moves one direct `refs/*` destination with expected-current CAS. Ref
-deletion keeps its history for the active window. The internal active-root cursor
-validates retained rows, streams distinct old/new OIDs in byte order through one
-`db.iterate()` traversal, and accepts at most 9,727 physical rows. Its SQL state,
-8 MiB object cache, 4 MiB pack-row cache, and 4 MiB JS headroom total at most
-100 MiB minus one byte.
+Reflog reads are newest-first and page strictly before a store-wide ordinal.
+Direct-ref retention is per shared ref; `HEAD` retention is per checkout. An
+entry is active only while it is both at most 90 days old and among the newest
+1,024 entries in its scope. `HEAD@{0}` through `HEAD@{1023}` select active
+new-OID endpoints only from the checkout selected by the operation's directory.
+`recoverRef()` selects an active old or new endpoint, verifies the object, and
+moves one direct `refs/*` destination with expected-current CAS. Ref deletion
+keeps its history for the active window. The internal active-root cursor combines
+direct and checkout `HEAD` rows, validates them, streams distinct old/new OIDs in
+byte order through one `db.iterate()` traversal, and accepts at most 9,727
+physical rows. Its SQL state, 8 MiB object cache, 4 MiB pack-row cache, and 4 MiB
+JS headroom total at most 100 MiB minus one byte.
+
+Each store has exactly one primary checkout and at most 1,024 live checkouts.
+Checkout roots are globally unique canonical absolute paths of at most 4,096
+UTF-8 bytes; raw `HEAD` is at most 1,024 bytes. Listing is ordered by UTF-8 path
+bytes and retains at most 6 MiB. A raw `HEAD` exactly attached to
+`refs/heads/*`, including an unborn branch, owns that branch exclusively.
+Retargeting releases and acquires ownership atomically, and another owner fails
+with `EBRANCHINUSE`.
+
+`worktreeAdd()` accepts a missing or empty root and an existing branch, new
+branch, or detached target. Checkout registration, optional branch creation,
+index initialization, and filesystem population commit or roll back together.
+`worktreeRemove()` refuses the primary checkout, a live operation, and, unless
+`force` is true, a dirty checkout. Force bypasses only dirtiness. Removal deletes
+the filesystem root and checkout-owned rows while shared objects, refs, and
+direct-ref history survive. `worktreePrune()` atomically removes only non-primary
+checkouts whose exact roots are missing and fails the whole call if an eligible
+checkout has a live operation.
+
+`divergence()` resolves two caller-selected revision expressions and traverses
+one shared reachable graph. It returns exact `ahead` and `behind` counts plus
+`identical`, `ahead`, `behind`, `diverged`, `unrelated`, or `shallow`. The graph
+retains at most 50,000 commits and 32 MiB. `readRef()` accepts exact `HEAD` or a
+nonempty full `refs/...` name of at most 1,024 UTF-8 bytes and returns a
+`symbolic`, `direct`, or `absent` result. It does not follow a symbolic target or
+check object existence. `HEAD` reads the selected checkout; ordinary refs read
+the shared store.
 
 The blob-identity mapping is a disposable optimization, not an identity
 contract. Filesystem writers may mint arbitrary content identities; Git never
@@ -436,8 +472,9 @@ Initialization creates the complete current shape in one `transactionSync()`.
 Reopen accepts only version 1 and validates the exact name, type, and SQL of every
 Git schema object before returning. Partial, aliased, oversized, unexpected, or
 unsupported schemas fail closed before creation can mask them. Fresh
-initialization uses 45 statements; exact reopen uses two. Untrusted schema
-metadata is projected through byte bounds and retains less than 100 MiB.
+initialization is guarded below 1,000 statements; exact reopen uses two.
+Untrusted schema metadata is projected through byte bounds and retains less than
+100 MiB.
 
 ## Resource limits and open performance work
 

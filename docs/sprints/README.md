@@ -19,6 +19,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Multi-checkout consumer foundation (2026-08-26)](sprint-2026-08-26-multi-checkout-consumer-foundation.md)
-  — split shared Git state from checkout state, add bounded linked-worktree
-  lifecycle methods, and expose the two reads required by Roj.
+No sprint is active.

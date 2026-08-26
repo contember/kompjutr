@@ -52,6 +52,13 @@ so `push`, `fetch`, `pull`, `clone` and `ls-remote` never appear on that side.
 [Reference workload coverage](#reference-workload-coverage) collects what that
 workload would need gained, or routed differently.
 
+Roj can use the native surface for its admission slice: several isolated session
+checkouts over one shared store, bounded divergence against a caller-selected
+base, and an offline raw read of `refs/remotes/origin/HEAD`. Its adapter belongs
+to the consumer repository, not this package. The broader orchestrator requires
+partial clone, atomic checkpoint pushes, remote ref discovery, a scratch index,
+and patch interchange.
+
 ## Repository creation
 
 ### `git init` — `init()`
@@ -83,6 +90,26 @@ Clone sets `remote.<name>.url`, `remote.<name>.fetch`,
 repository behind.
 
 ## Working tree and index
+
+### `git worktree` — `worktreeAdd()`, `worktreeList()`, `worktreeRemove()`, `worktreePrune()`
+
+| Git | kompjutr | |
+|---|---|---|
+| `worktree add <path> <branch>` | `worktreeAdd({ root, target: { kind: "existing-branch", name } })` | ★ ✔ the branch must exist and must not be attached elsewhere |
+| `worktree add -b <name> <path> [<start>]` | `target: { kind: "new-branch", name, startPoint? }` | ★ ~ branch creation, checkout state, and filesystem population are atomic, unlike Git's possible leftover branch after a later add failure |
+| `worktree add --detach <path> [<start>]` | `target: { kind: "detached", startPoint? }` | ✔ |
+| `worktree list` | `worktreeList()` | ★ ~ returns frozen `WorktreeInfo[]` in UTF-8 root order, including exact `present` or `missing` root state |
+| `worktree remove <path>` | `worktreeRemove({ root })` | ★ ✔ refuses the primary, dirty, or busy checkout |
+| `worktree remove --force <path>` | `worktreeRemove({ root, force: true })` | ★ ~ bypasses dirtiness only; a live operation still fails with `EWORKTREEBUSY` |
+| `worktree prune` | `worktreePrune()` | ★ ✔ atomically removes every missing non-primary checkout, or none if an eligible checkout is busy |
+| `move`, `lock`, `unlock`, `repair` | — | ★ ✘ no `.git/worktrees` administrative layout, pointer files, locks, or root relocation |
+
+Every `dir`-routed Git operation selects the nearest checkout root. Checkouts of
+one store share objects, packs, ordinary refs, config, and shallow state while
+keeping raw `HEAD`, index, tracker, dirty state, operation state, and `HEAD`
+history isolated. Exactly one checkout is primary. A branch attached by exact
+raw `ref: refs/heads/*`, including an unborn branch, can belong to only one
+checkout; another attachment fails with `EBRANCHINUSE` and has no force bypass.
 
 ### `git status` — `status()`, `statusReport()`, `statusStream()`, formatters
 
@@ -268,8 +295,10 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | `git hash-object [-w]` | `hashObject()` | ~ blobs only; `write` stores it. ✘ `-t commit\|tree\|tag`, ✘ stdin batching |
 | `git update-ref <ref> <value> [<oldvalue>]` | `updateRef()` | ★ ~ `force` overwrites, `symbolic` writes `ref: …`. ✘ `-d` (delete), ✘ `--stdin`, ✘ old-value guard |
 | `git symbolic-ref [-q] HEAD` | `currentBranch({ fullname: true })` | ★ ~ returns the full `refs/heads/…`, and `undefined` when HEAD is detached |
+| `git symbolic-ref -q <ref>`, `for-each-ref --format=%(symref) <ref>` | `readRef({ ref })` | ★ ~ exact raw `HEAD` or full `refs/...`; returns `symbolic`, `direct`, or `absent` without following the target or checking object existence |
+| `git rev-list --left-right --count <current>...<upstream>` | `divergence({ current, upstream })` | ★ ~ returns exact `ahead`/`behind` plus `identical`, `ahead`, `behind`, `diverged`, `unrelated`, or `shallow` |
 | `git read-tree`, `git write-tree`, `git commit-tree` | — | ★ ✘ no index-only object plumbing, and no `GIT_INDEX_FILE` throwaway index |
-| `git rev-list`, `git for-each-ref`, `git merge-base` | — | ★ ✘ not public (merge-base selection is internal to merge and rebase) |
+| general `git rev-list`, ref enumeration through `git for-each-ref`, public `git merge-base` | — | ✘ the narrow divergence and exact raw-ref reads above do not expose general enumeration or merge-base selection |
 
 ## Branches, tags and refs
 
@@ -496,11 +525,14 @@ These have no method and no equivalent. `stash` and the argv entry point throw
 `UnsupportedOperationError`; the rest simply do not exist on the surface.
 
 - **State:** `stash` (push/list/pop throw), `rerere`, `notes`
-- **Layout:** `worktree` ★, `submodule` (gitlinks are preserved in trees but never
-  followed), `sparse-checkout` as a command — sparse hydration is an internal
-  optimisation, not a user-facing mode
+- **Layout:** worktree `move`, `repair`, `lock`, `unlock`, worktree-local config,
+  and `.git/worktrees` administration; `submodule` (gitlinks are preserved in
+  trees but never followed); `sparse-checkout` as a command — sparse hydration is
+  an internal optimisation, not a user-facing mode
 - **Inspection:** `blame`, `bisect`, `describe`, `shortlog`, `grep`,
-  `rev-list` ★, `for-each-ref`, `merge-base` ★, `ls-remote` ★, `whatchanged`
+  general `rev-list`, ref enumeration through `for-each-ref`, public `merge-base`,
+  `ls-remote` ★, `whatchanged`; bounded divergence and one exact raw-ref read are
+  available through the narrower methods above
 - **Patches:** `apply` ★, `am`, `format-patch`, `send-email`, `cherry`
 - **Maintenance:** `gc`, `fsck`, `repack`, `prune`, `count-objects`, `verify-pack`
 - **Rewriting:** `filter-branch`, `replace`, `fast-import`, `fast-export`
@@ -519,6 +551,7 @@ merge — with these differences:
 
 - ✘ no `cherryPick`, `revert` or `rebase`;
 - ✘ no `reflog` or `recoverRef` surface;
+- ✘ no linked-checkout lifecycle, `divergence`, or `readRef` surface;
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
@@ -537,8 +570,14 @@ worktree scan rows, path length, journal steps) are listed in
 
 Two limits bite most often in ordinary use: the 2,200-byte cap on an emitted
 Git path, and the 4,096-step cap on a rebase or replay journal. Revision input is
-limited to 1,024 code units and 32 total `^`/`~` traversals. An active reflog-root
-scan fails closed above 9,727 physical rows; its SQL state, shared caches, and JS
+limited to 1,024 code units and 32 total `^`/`~` traversals. Divergence retains at
+most 50,000 commits and 32 MiB. A raw-ref name and returned target are each at
+most 1,024 UTF-8 bytes.
+
+One shared store has at most 1,024 checkouts. A checkout root is at most 4,096
+UTF-8 bytes, raw `HEAD` is at most 1,024 bytes, and one complete checkout listing
+retains at most 6 MiB. An active reflog-root scan fails closed above 9,727
+physical direct-ref and checkout-HEAD rows; its SQL state, shared caches, and JS
 headroom total at most 100 MiB minus one byte.
 
 ## Path and ordering rules
@@ -555,13 +594,15 @@ is already served by the surface as it stands: clone by branch, add / rm / reset
 checkout / clean, commit, status (v1 and short, including unmerged rows), merge
 `--ff-only`, rebase with continue and abort plus index-stage conflict resolution,
 branch create and delete, remote add / remove / list, fetch of one branch, force
-push of one branch, and every local read the agent makes.
+push of one branch, linked-checkout add / list / remove / prune, caller-selected
+divergence, offline raw-ref reads, and every local read the agent makes. The
+consumer adapter is outside this package.
 
 ### Hard gaps — no route through the current surface
 
 | Missing | What issues it |
 |---|---|
-| `worktree add` / `remove` / `prune` / `repair` / `unlock` | one worktree per session on a shared clone; sessions are created, restored after a sandbox is rebuilt, and torn down ([backlog 40](../backlog/40-linked-worktrees.md)) |
+| `worktree repair` / `unlock` | the broader Git-layout recovery and lock lifecycle; the SQLite-native admission path has no pointer or lock state to repair |
 | Several refspecs in one push, `--atomic`, and refs outside `refs/heads/*` | one checkpoint mirrors the session branch *and* writes or deletes its snapshot ref in a single atomic push; pruning deletes a batch of mirror refs at once ([backlog 08](../backlog/08-extend-push-refspecs.md)) |
 | `--filter=blob:none` partial clone | the initial clone of every project repository ([backlog 41](../backlog/41-partial-clone.md)) |
 | Wildcard fetch refspec (`+refs/checkpoints/*:refs/checkpoints/*`) | pulling snapshot refs back after a sandbox is rebuilt ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
@@ -569,7 +610,6 @@ push of one branch, and every local read the agent makes.
 | `read-tree` / `write-tree` / `commit-tree` under `GIT_INDEX_FILE` | snapshotting an uncommitted worktree into a commit without touching the session index ([backlog 43](../backlog/43-index-and-object-write-plumbing.md)) |
 | `apply --3way --cached` | re-applying that snapshot onto a rebased tip ([backlog 44](../backlog/44-patch-interchange.md)) |
 | `diff --binary --full-index <a> <b>` | producing the patch that re-apply consumes ([backlog 44](../backlog/44-patch-interchange.md)) |
-| `rev-list --count <a>..<b>`, `merge-base` | unpublished-commit counts, and the already-based-on-`main` check ([backlog 39](../backlog/39-plumbing-read-surface.md)) |
 | `update-ref <ref> <new> <old>` compare-and-swap | publishing a rebase result only if the branch has not moved meanwhile ([backlog 39](../backlog/39-plumbing-read-surface.md)) |
 | `rev-parse <rev>^{commit}` / `^{tree}` / `<rev>:<path>` | snapshot parent and tree probes, and a lockfile-changed check ([backlog 46](../backlog/46-rev-parse-revision-syntax.md)) |
 | `status -z`, `diff -z` | NUL-framed path lists parsed by the orchestrator ([backlog 45](../backlog/45-framing-safe-porcelain-output.md)) |
@@ -590,11 +630,13 @@ push of one branch, and every local read the agent makes.
 | `push -u origin main` | `push()` then `configSet("branch.main.remote"/"…merge")` |
 | `remote get-url` / `set-url` | `configGet()` / `configSet()` on `remote.<n>.url` |
 | `symbolic-ref -q HEAD` | `currentBranch({ fullname: true })` |
+| `symbolic-ref -q refs/remotes/origin/HEAD` | `readRef({ ref: "refs/remotes/origin/HEAD" })` |
+| `rev-list --left-right --count <current>...<upstream>` | `divergence({ current, upstream })` |
 
 Credential helpers stay out of scope — `onAuth` covers what this workload needs
-from them. `worktree`, `apply` and `ls-remote` were in the same tier C bucket
-(*reopen only with a concrete workload behind it*) until this workload gave them
-one; they are now [40](../backlog/40-linked-worktrees.md),
+from them. The typed checkout lifecycle covers session creation and teardown;
+Git's administrative `repair` and `unlock` shapes have no SQLite-native state to
+operate on. Patch interchange and live remote discovery remain concrete gaps in
 [44](../backlog/44-patch-interchange.md) and
 [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md).
 

@@ -32,12 +32,10 @@ not effort: a wrong answer outranks a missing one.
   [37](37-history-reads-patch-and-paths.md) ·
   [38](38-clone-depth-and-deepening.md) ·
   [39](39-plumbing-read-surface.md) ·
-  [40](40-linked-worktrees.md) ·
   [41](41-partial-clone.md) ·
   [42](42-remote-ref-discovery-and-refspec-fetch.md) ·
   [43](43-index-and-object-write-plumbing.md) ·
   [44](44-patch-interchange.md) ·
-  [47](47-divergence-against-arbitrary-ref.md) ·
   [06](06-stash-operations.md) ·
   [18](18-branch-and-remote-management.md) ·
   [28](28-pull-rebase.md)
@@ -48,16 +46,14 @@ not effort: a wrong answer outranks a missing one.
   [26](26-interactive-rebase.md) ·
   [27](27-rebase-merges.md) ·
   [29](29-rebase-update-refs.md) ·
-  [46](46-rev-parse-revision-syntax.md) ·
-  [48](48-read-symbolic-ref-target.md)
+  [46](46-rev-parse-revision-syntax.md)
 - **C — deliberately out of scope.** Not filed: `bisect`, `blame`, `describe`,
   `shortlog`, `grep`, `archive`, `bundle`, `am`/`format-patch`, submodules,
   notes, hooks, signing, credential helpers, LFS, `.gitattributes` filters,
   config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
-  concrete workload behind it. Worktrees, `apply` and `ls-remote` left this tier
-  that way — see [reference workload
-  coverage](../reference/git-support.md#reference-workload-coverage) — and are
-  now [40](40-linked-worktrees.md), [44](44-patch-interchange.md) and
+  concrete workload behind it. `apply` and `ls-remote` have concrete demand from
+  the [reference workload](../reference/git-support.md#reference-workload-coverage)
+  and are tracked in [44](44-patch-interchange.md) and
   [42](42-remote-ref-discovery-and-refspec-fetch.md).
 
 ## Shell correctness and query shape
@@ -114,17 +110,12 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [42](42-remote-ref-discovery-and-refspec-fetch.md) with
    [08](08-extend-push-refspecs.md) (shared refspec type),
    [41](41-partial-clone.md) alongside [38](38-clone-depth-and-deepening.md)
-   (both touch the clone contract), and [40](40-linked-worktrees.md) last — it
-   splits the repository row and wants the schema quiet around it.
+   (both touch the clone contract).
 4. **Add the highest-return daily workflows:**
    [28](28-pull-rebase.md),
    [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
    [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
    [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
-   [47](47-divergence-against-arbitrary-ref.md) and
-   [48](48-read-symbolic-ref-target.md) are small and independent; take them here
-   whenever a consumer needs them. Land 47 before
-   [39](39-plumbing-read-surface.md), which may later subsume it.
 5. **Broaden management and diagnostic surfaces:**
    [18](18-branch-and-remote-management.md),
    [25](25-rebase-targets-and-roots.md),
@@ -144,7 +135,7 @@ the tier rule above a wrong answer outranks a missing one, so take them early:
 it, and 52 needs a decision on whether its two narrowings are gaps or contracts
 before it is work at all.
 
-Before scheduling them, split 04, 16, 17, 39, and 40 into smaller work units
+Before scheduling them, split 04, 16, 17, and 39 into smaller work units
 with independent witnesses. Their current acceptance scopes are larger than one
 focused sprint.
 
@@ -172,15 +163,12 @@ focused sprint.
 - [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)
 - [38 — Align clone depth with Git and allow deepening](38-clone-depth-and-deepening.md)
 - [39 — Complete the plumbing read surface](39-plumbing-read-surface.md)
-- [40 — Support linked worktrees over one repository](40-linked-worktrees.md)
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [42 — Add remote ref discovery and refspec fetch](42-remote-ref-discovery-and-refspec-fetch.md)
 - [43 — Add index and object write plumbing](43-index-and-object-write-plumbing.md)
 - [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
 - [45 — Make porcelain output framing-safe](45-framing-safe-porcelain-output.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
-- [47 — Count divergence against an arbitrary ref](47-divergence-against-arbitrary-ref.md)
-- [48 — Read a symbolic ref's target](48-read-symbolic-ref-target.md)
 - [49 — Copy a set of paths as one operation](49-set-based-copy.md)
 - [50 — Report the untracked file a cached removal leaves behind](50-untracked-row-after-cached-removal.md)
 - [51 — Relocate every distinct-type merge conflict, not only file/directory](51-relocate-distinct-type-conflicts.md)
