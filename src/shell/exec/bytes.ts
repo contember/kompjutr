@@ -6,6 +6,8 @@
 // chunks — not of lines — so `cat` can forward a file unchanged and a file
 // with no trailing newline does not grow one on the way through.
 
+import type { RetainedBudget } from "./context.js";
+
 /** A stage's output. Sync because the whole filesystem API is sync. */
 export type ByteStream = Generator<Uint8Array, void, undefined>;
 
@@ -39,6 +41,59 @@ export function drain(stream: ByteStream): Uint8Array {
   return concat([...stream]);
 }
 
+export interface HeldBytes {
+  readonly bytes: Uint8Array;
+  release(): void;
+}
+
+/** Drain semantic input under the shared retained-memory ceiling. */
+export function drainBounded(stream: ByteStream, budget: RetainedBudget, label: string): HeldBytes {
+  const chunks: Uint8Array[] = [];
+  const releases: Array<() => void> = [];
+  try {
+    for (const chunk of stream) {
+      releases.push(budget.retain(chunk.length, label));
+      chunks.push(chunk);
+    }
+    if (chunks.length === 1) {
+      const only = chunks[0];
+      if (only === undefined) throw new Error("drainBounded: missing retained chunk");
+      return {
+        bytes: only,
+        release: idempotent(() => {
+          for (const release of releases) release();
+        }),
+      };
+    }
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const releaseJoined = budget.retain(total, `${label} join`);
+    try {
+      const bytes = concat(chunks);
+      for (const release of releases) release();
+      return {
+        bytes,
+        release: releaseJoined,
+      };
+    } catch (error) {
+      releaseJoined();
+      throw error;
+    }
+  } catch (error) {
+    for (const release of releases) release();
+    throw error;
+  }
+}
+
+function idempotent(release: () => void): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    release();
+  };
+}
+
 /**
  * Split a chunk stream into lines, newline excluded.
  *
@@ -46,23 +101,62 @@ export function drain(stream: ByteStream): Uint8Array {
  * two — and `sawTrailingNewline` records which it was, so a stage can put
  * the file back the way it found it.
  */
-export function* lines(stream: ByteStream): Generator<Uint8Array, void, undefined> {
+export function* lines(
+  stream: ByteStream,
+  budget?: RetainedBudget,
+): Generator<Uint8Array, void, undefined> {
   let carry: Uint8Array | null = null;
-  for (const chunk of stream) {
-    let start = 0;
-    for (let index = 0; index < chunk.length; index++) {
-      if (chunk[index] !== NEWLINE) continue;
-      const slice = chunk.subarray(start, index);
-      yield carry === null ? slice : concat([carry, slice]);
-      carry = null;
-      start = index + 1;
+  let releaseCarry: (() => void) | null = null;
+  try {
+    for (const chunk of stream) {
+      let start = 0;
+      for (let index = 0; index < chunk.length; index++) {
+        if (chunk[index] !== NEWLINE) continue;
+        const slice = chunk.subarray(start, index);
+        if (carry === null) {
+          const releaseLine = budget?.retain(slice.length, "line") ?? (() => {});
+          try {
+            yield slice;
+          } finally {
+            releaseLine();
+          }
+        } else {
+          const joinedLength = carry.length + slice.length;
+          const releaseJoined = budget?.retain(joinedLength, "line carry") ?? (() => {});
+          const joined = concat([carry, slice]);
+          releaseCarry?.();
+          carry = null;
+          releaseCarry = null;
+          try {
+            yield joined;
+          } finally {
+            releaseJoined();
+          }
+        }
+        start = index + 1;
+      }
+      if (start < chunk.length) {
+        const rest = chunk.subarray(start);
+        const nextLength = (carry?.length ?? 0) + rest.length;
+        const releaseNext = budget?.retain(nextLength, "line carry") ?? (() => {});
+        const next: Uint8Array = carry === null ? rest.slice() : concat([carry, rest]);
+        releaseCarry?.();
+        carry = next;
+        releaseCarry = releaseNext;
+      }
     }
-    if (start < chunk.length) {
-      const rest = chunk.subarray(start);
-      carry = carry === null ? rest.slice() : concat([carry, rest]);
+    if (carry !== null && carry.length > 0) {
+      try {
+        yield carry;
+      } finally {
+        releaseCarry?.();
+        releaseCarry = null;
+        carry = null;
+      }
     }
+  } finally {
+    releaseCarry?.();
   }
-  if (carry !== null && carry.length > 0) yield carry;
 }
 
 /** Re-join lines, each terminated. The inverse of `lines` for text input. */

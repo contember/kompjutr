@@ -8,6 +8,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem, ScanEntry } from "../../src/fs/types.js";
+import { encode } from "../../src/shell/exec/bytes.js";
+import { type Command, result } from "../../src/shell/exec/context.js";
 import { sqlGlobFor } from "../../src/shell/exec/glob.js";
 import { createShell, type Shell } from "../../src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
@@ -140,17 +142,278 @@ describe("a tree bigger than one discovery page", () => {
 });
 
 describe("argument expansion bounds", () => {
-  it("fails closed on the first path beyond the argv cap", () => {
+  it("accepts the exact path cap and fails closed on the first path beyond it", () => {
     fs.writeFiles(
-      Array.from({ length: 10_001 }, (_, index) => ({
+      Array.from({ length: 10_000 }, (_, index) => ({
         path: `/repo/glob/f${String(index).padStart(5, "0")}.txt`,
         bytes: new Uint8Array(0),
       })),
     );
 
+    expect(shell.run("true /repo/glob/*.txt").exitCode).toBe(0);
+    fs.writeFile("/repo/glob/f10000.txt", new Uint8Array(0));
     const run = shell.run("echo /repo/glob/*.txt");
     expect(run.exitCode).toBe(2);
     expect(run.stdout).toBe("");
     expect(run.stderr).toContain("E2BIG");
+  });
+});
+
+describe("retained-memory bounds", () => {
+  const chunks: Command = (context) =>
+    result(
+      (function* () {
+        for (const argument of context.argv) yield encode(argument);
+      })(),
+    );
+
+  it("caps stderr independently from stdout", () => {
+    const warn: Command = (context) => {
+      context.warn("x".repeat(100));
+      return result((function* () {})());
+    };
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([["warn", warn]]),
+      limits: {
+        maxOutputBytes: 32,
+        maxOperations: 100,
+        readBudget: 32,
+        maxRetainedBytes: 64,
+      },
+    });
+
+    const run = bounded.run("warn");
+    expect(run.stderr).toHaveLength(32);
+    expect(run.stdout).toBe("");
+    expect(run.truncated).toBe(true);
+  });
+
+  it("accepts stderr at its exact public limit", () => {
+    const warn: Command = (context) => {
+      context.warn("x".repeat(25));
+      return result((function* () {})());
+    };
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([["warn", warn]]),
+      limits: {
+        maxOutputBytes: 32,
+        maxOperations: 100,
+        readBudget: 32,
+        maxRetainedBytes: 64,
+      },
+    });
+
+    const run = bounded.run("warn");
+    expect(run.stderr).toHaveLength(32);
+    expect(run.truncated).toBe(false);
+  });
+
+  it("streams multi-file cat and redirects beyond the retained limit", () => {
+    fs.writeFiles([
+      { path: "/repo/a", bytes: ENCODER.encode("a".repeat(20)) },
+      { path: "/repo/b", bytes: ENCODER.encode("b".repeat(20)) },
+    ]);
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 32,
+        maxRetainedBytes: 32,
+      },
+    });
+
+    const streamed = bounded.run("cat a b");
+    expect(streamed.exitCode, streamed.stderr).toBe(0);
+    expect(streamed.stdout).toBe(`${"a".repeat(20)}${"b".repeat(20)}`);
+    const redirected = bounded.run("cat a b > combined");
+    expect(redirected.exitCode, redirected.stderr).toBe(0);
+    expect(redirected.stdout).toBe("");
+    expect(new TextDecoder().decode(fs.readFile("/repo/combined"))).toBe(
+      `${"a".repeat(20)}${"b".repeat(20)}`,
+    );
+
+    fs.writeFile("/repo/large", ENCODER.encode("x".repeat(40)));
+    const small = createShell({
+      fs,
+      cwd: "/repo",
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 8,
+        maxRetainedBytes: 8,
+      },
+    });
+    expect(small.run("cat large")).toMatchObject({ stdout: "x".repeat(40), exitCode: 0 });
+  });
+
+  it("accepts xargs at the exact limit and rejects the first byte over", () => {
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([["chunks", chunks]]),
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 8,
+        maxRetainedBytes: 44,
+      },
+    });
+
+    expect(bounded.run("chunks 12345678 | xargs echo")).toMatchObject({
+      stdout: "12345678\n",
+      exitCode: 0,
+    });
+    const over = bounded.run("chunks 123456789 | xargs echo");
+    expect(over.exitCode).toBe(2);
+    expect(over.stderr).toContain("retained-memory limit");
+  });
+
+  it("accepts a sort buffer at its exact limit and rejects the next input byte", () => {
+    const one: Command = () =>
+      result(
+        (function* () {
+          yield encode("a\n");
+        })(),
+      );
+    const two: Command = () =>
+      result(
+        (function* () {
+          yield encode("ab\n");
+        })(),
+      );
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([
+        ["one", one],
+        ["two", two],
+      ]),
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 8,
+        maxRetainedBytes: 3,
+      },
+    });
+
+    expect(bounded.run("one | sort")).toMatchObject({ stdout: "a\n", exitCode: 0 });
+    expect(bounded.run("two | sort").exitCode).toBe(2);
+  });
+
+  it("accepts line carry at its exact limit and rejects the next input byte", () => {
+    const eight: Command = () =>
+      result(
+        (function* () {
+          yield encode("1234");
+          yield encode("5678");
+        })(),
+      );
+    const nine: Command = () =>
+      result(
+        (function* () {
+          yield encode("1234");
+          yield encode("56789");
+        })(),
+      );
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([
+        ["eight", eight],
+        ["nine", nine],
+      ]),
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 16,
+        maxRetainedBytes: 13,
+      },
+    });
+
+    expect(bounded.run("eight | grep 1")).toMatchObject({ stdout: "12345678\n", exitCode: 0 });
+    expect(bounded.run("nine | grep 1").exitCode).toBe(2);
+  });
+
+  it("bounds growing head and tail probes at their exact limits", () => {
+    fs.writeFiles([{ path: "/repo/probe", bytes: ENCODER.encode("xxxx") }]);
+    const headBounded = createShell({
+      fs,
+      cwd: "/repo",
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 16,
+        maxRetainedBytes: 11,
+      },
+    });
+    const tailBounded = createShell({
+      fs,
+      cwd: "/repo",
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 16,
+        maxRetainedBytes: 19,
+      },
+    });
+
+    expect(headBounded.run("head -1 probe")).toMatchObject({ stdout: "xxxx", exitCode: 0 });
+    expect(tailBounded.run("tail -1 probe")).toMatchObject({ stdout: "xxxx\n", exitCode: 0 });
+
+    fs.writeFile("/repo/probe", ENCODER.encode("xxxxx"));
+    expect(headBounded.run("head -1 probe").exitCode).toBe(2);
+    expect(tailBounded.run("tail -1 probe").exitCode).toBe(2);
+  });
+
+  it("rolls a redirect back when an upstream retained limit fails", () => {
+    fs.writeFiles([{ path: "/repo/target", bytes: ENCODER.encode("old") }]);
+    const failLate: Command = (context) =>
+      result(
+        (function* () {
+          yield encode("partial");
+          const release = context.fs.retained.retain(100, "late failure");
+          release();
+        })(),
+      );
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([["fail-late", failLate]]),
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 100,
+        readBudget: 8,
+        maxRetainedBytes: 8,
+      },
+    });
+
+    const run = bounded.run("fail-late > target");
+    expect(run.exitCode).toBe(2);
+    expect(new TextDecoder().decode(fs.readFile("/repo/target"))).toBe("old");
+  });
+
+  it("does not normalize an injected coded exception during a redirect", () => {
+    fs.writeFiles([{ path: "/repo/target", bytes: ENCODER.encode("old") }]);
+    const broken: Command = () =>
+      result(
+        (function* () {
+          yield encode("partial");
+          throw Object.assign(new Error("injected failure"), { code: "EBUG" });
+        })(),
+      );
+    const bounded = createShell({
+      fs,
+      cwd: "/repo",
+      commands: new Map([["broken", broken]]),
+    });
+
+    expect(() => bounded.run("broken > target")).toThrow("injected failure");
+    expect(new TextDecoder().decode(fs.readFile("/repo/target"))).toBe("old");
   });
 });

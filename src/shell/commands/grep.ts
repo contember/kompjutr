@@ -177,12 +177,16 @@ export const grep: Command = (context) => {
       if (context.stdin === null) {
         return fail(context, "no input; give a file or pipe something in", 2);
       }
-      return searchStream(context.stdin, {
-        ...shared,
-        pattern: compiled,
-        withFilename: withFilename ?? false,
-        name: null,
-      });
+      return searchStream(
+        context.stdin,
+        {
+          ...shared,
+          pattern: compiled,
+          withFilename: withFilename ?? false,
+          name: null,
+        },
+        context.fs.retained,
+      );
     }
 
     const request: SearchRequest = {

@@ -7,7 +7,7 @@
 // the source behind it.
 
 import { type ByteStream, decode, encode, lines, NEWLINE } from "../exec/bytes.js";
-import type { CommandResult } from "../exec/context.js";
+import type { CommandResult, RetainedBudget } from "../exec/context.js";
 import type { SearchMode } from "./search.js";
 
 export interface StreamSearch {
@@ -22,12 +22,16 @@ export interface StreamSearch {
   readonly name: string | null;
 }
 
-export function searchStream(stdin: ByteStream, options: StreamSearch): CommandResult {
+export function searchStream(
+  stdin: ByteStream,
+  options: StreamSearch,
+  retained: RetainedBudget,
+): CommandResult {
   let matched = false;
 
   const stream = (function* (): ByteStream {
     const label = options.name ?? "(standard input)";
-    const history: Uint8Array[] = [];
+    const history: Array<{ bytes: Uint8Array; release(): void }> = [];
     const context = options.before > 0 || options.after > 0;
     let number = 0;
     let hits = 0;
@@ -42,40 +46,46 @@ export function searchStream(stdin: ByteStream, options: StreamSearch): CommandR
       yield render(label, at, text, isMatch, options);
     }
 
-    for (const text of lines(stdin)) {
-      number++;
-      options.pattern.lastIndex = 0;
-      const hit = options.pattern.test(decode(text)) !== options.invert;
+    try {
+      for (const text of lines(stdin, retained)) {
+        number++;
+        options.pattern.lastIndex = 0;
+        const hit = options.pattern.test(decode(text)) !== options.invert;
 
-      if (hit) {
-        matched = true;
-        hits++;
-        if (options.mode === "content") {
-          // `-B n`: the lines held back, oldest first.
-          for (let index = 0; index < history.length; index++) {
-            const held = history[index];
-            if (held === undefined) continue;
-            yield* put(number - history.length + index, held, false);
+        if (hit) {
+          matched = true;
+          hits++;
+          if (options.mode === "content") {
+            // `-B n`: the lines held back, oldest first.
+            for (let index = 0; index < history.length; index++) {
+              const held = history[index];
+              if (held === undefined) continue;
+              yield* put(number - history.length + index, held.bytes, false);
+              held.release();
+            }
+            history.length = 0;
+            yield* put(number, text, true);
+            pendingAfter = options.after;
           }
-          history.length = 0;
-          yield* put(number, text, true);
-          pendingAfter = options.after;
+          continue;
         }
-        continue;
-      }
 
-      if (options.mode !== "content") continue;
+        if (options.mode !== "content") continue;
 
-      if (pendingAfter > 0) {
-        pendingAfter--;
-        yield* put(number, text, false);
-        continue;
-      }
+        if (pendingAfter > 0) {
+          pendingAfter--;
+          yield* put(number, text, false);
+          continue;
+        }
 
-      if (options.before > 0) {
-        history.push(text);
-        if (history.length > options.before) history.shift();
+        if (options.before > 0) {
+          const release = retained.retain(text.length, "search context lines");
+          history.push({ bytes: text.slice(), release });
+          if (history.length > options.before) history.shift()?.release();
+        }
       }
+    } finally {
+      for (const held of history) held.release();
     }
 
     if (options.mode === "count") yield encode(`${hits}\n`);

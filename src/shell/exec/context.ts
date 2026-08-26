@@ -22,17 +22,21 @@ import type {
   ListOptions,
   ListPage,
   ReadBatch,
+  ReadOptions,
   RealPath,
   RegularFileHandle,
   RemoveOptions,
   ScanEntry,
   ScanOptions,
   Stat,
+  StreamWriteOptions,
   TouchOptions,
   WriteEntry,
   WriteOptions,
 } from "../../fs/types.js";
 import type { ByteStream } from "./bytes.js";
+
+const DEFAULT_RETAINED_BYTES = 16 * 1024 * 1024;
 
 export interface Limits {
   /** Bytes of stdout before the result is marked truncated. */
@@ -41,22 +45,59 @@ export interface Limits {
   readonly maxOperations: number;
   /** Bytes per SQL statement, handed straight to the bulk reads. */
   readonly readBudget: number;
+  /** Shell-owned intermediate bytes retained at once. Default 16 MiB. */
+  readonly maxRetainedBytes?: number;
 }
 
 export const DEFAULT_LIMITS: Limits = {
   maxOutputBytes: 1_000_000,
   maxOperations: 10_000,
   readBudget: 1_500_000,
+  maxRetainedBytes: DEFAULT_RETAINED_BYTES,
 };
 
 /** Raised when a ceiling is hit. Carries which one, so the message can say. */
 export class ShellLimitError extends Error {
-  readonly limit: "arguments" | "operations" | "output";
+  readonly limit: "arguments" | "operations" | "output" | "retained";
 
-  constructor(limit: "arguments" | "operations" | "output", message: string) {
+  constructor(limit: "arguments" | "operations" | "output" | "retained", message: string) {
     super(message);
     this.name = "ShellLimitError";
     this.limit = limit;
+  }
+}
+
+/** Tracks live intermediate bytes. Callers release reservations as buffers leave scope. */
+export class RetainedBudget {
+  #held = 0;
+
+  constructor(readonly max: number) {
+    if (!Number.isSafeInteger(max) || max < 1) {
+      throw new ShellLimitError("retained", "maxRetainedBytes must be a positive safe integer");
+    }
+  }
+
+  get available(): number {
+    return this.max - this.#held;
+  }
+
+  retain(bytes: number, label: string): () => void {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      throw new ShellLimitError("retained", `${label} has an invalid retained size`);
+    }
+    if (this.#held + bytes > this.max) {
+      throw new ShellLimitError(
+        "retained",
+        `${label} exceeds the ${this.max}-byte retained-memory limit`,
+      );
+    }
+    this.#held += bytes;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#held -= bytes;
+    };
   }
 }
 
@@ -69,18 +110,25 @@ export class ShellLimitError extends Error {
  */
 export class BoundedFs {
   #operations = 0;
+  readonly retained: RetainedBudget;
 
   constructor(
     private readonly fs: Filesystem,
     private readonly limits: Limits,
-  ) {}
+  ) {
+    this.retained = new RetainedBudget(limits.maxRetainedBytes ?? DEFAULT_RETAINED_BYTES);
+  }
 
   get operations(): number {
     return this.#operations;
   }
 
   get readBudget(): number {
-    return this.limits.readBudget;
+    return Math.min(this.limits.readBudget, this.retained.max);
+  }
+
+  get maxRetainedBytes(): number {
+    return this.retained.max;
   }
 
   #charge(): void {
@@ -155,7 +203,7 @@ export class BoundedFs {
     return this.fs.readFileHandles(handles, options);
   }
 
-  readFiles(paths: readonly string[], options?: { budget?: number }): ReadBatch {
+  readFiles(paths: readonly string[], options?: ReadOptions): ReadBatch {
     this.#charge();
     return this.fs.readFiles(paths, options);
   }
@@ -188,6 +236,11 @@ export class BoundedFs {
   touchFiles(paths: readonly string[], options?: TouchOptions): void {
     this.#charge();
     this.fs.touchFiles(paths, options);
+  }
+
+  writeFileStream(path: string, chunks: Iterable<Uint8Array>, options?: StreamWriteOptions): void {
+    this.#charge();
+    this.fs.writeFileStream(path, chunks, options);
   }
 
   makeDirectories(paths: readonly string[]): void {

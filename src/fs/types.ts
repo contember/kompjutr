@@ -180,6 +180,14 @@ export interface ReadBatch {
   remaining: string[];
 }
 
+export interface ReadOptions {
+  budget?: number;
+  /** Maximum file bytes returned by the complete call. */
+  maxBytes?: number;
+  /** Leave an oversized first file for a caller that can stream it. */
+  deferOversized?: boolean;
+}
+
 export interface WriteEntry {
   path: string;
   /** Omit for a directory or when `target` is set. */
@@ -225,6 +233,11 @@ export interface TouchOptions {
   mtime?: number;
   /** Create missing regular files. Default true. */
   create?: boolean;
+}
+
+export interface StreamWriteOptions {
+  /** Append to an existing regular file. Default false. */
+  append?: boolean;
 }
 
 export interface RemoveOptions {
@@ -307,7 +320,7 @@ export interface Filesystem {
   ): HandleReadBatch;
 
   /** Several files in one round trip, under a byte budget. */
-  readFiles(paths: readonly string[], options?: { budget?: number }): ReadBatch;
+  readFiles(paths: readonly string[], options?: ReadOptions): ReadBatch;
 
   /**
    * Every path under `root` matching a glob, in path order. One statement.
@@ -335,6 +348,9 @@ export interface Filesystem {
 
   /** Update timestamps as one preflighted mutation without reading content. */
   touchFiles(paths: readonly string[], options?: TouchOptions): void;
+
+  /** Atomically stream a regular-file write without retaining the full content. */
+  writeFileStream(path: string, chunks: Iterable<Uint8Array>, options?: StreamWriteOptions): void;
 
   /** Create directories, parents included. Existing ones are left alone. */
   makeDirectories(paths: readonly string[]): void;

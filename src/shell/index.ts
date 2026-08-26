@@ -64,12 +64,15 @@ export function createShell(options: ShellOptions): Shell {
       plan = planScript(parse(source));
     } catch (error) {
       if (error instanceof ShellSyntaxError) {
+        const message = new TextEncoder().encode(`kompjutr: ${error.message}\n`);
+        const maxOutputBytes = options.limits?.maxOutputBytes ?? DEFAULT_LIMITS.maxOutputBytes;
+        const stderr = message.subarray(0, Math.max(0, maxOutputBytes));
         return {
           stdout: new Uint8Array(0),
-          stderr: new TextEncoder().encode(`kompjutr: ${error.message}\n`),
+          stderr,
           exitCode: 2,
           cwd: before,
-          truncated: false,
+          truncated: stderr.length < message.length,
           operations: 0,
         };
       }

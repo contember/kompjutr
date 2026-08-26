@@ -83,7 +83,17 @@ export const sort: Command = (context) => {
   const source = sourceFor(context, parsed.operands);
   if (source === null) return result(nothing());
 
-  const collected = [...lines(source)].map(decode);
+  const releases: Array<() => void> = [];
+  const collected: string[] = [];
+  try {
+    for (const text of lines(source, context.fs.retained)) {
+      releases.push(context.fs.retained.retain(text.length * 2, "sort input"));
+      collected.push(decode(text));
+    }
+  } catch (error) {
+    for (const release of releases) release();
+    throw error;
+  }
   collected.sort((left, right) => {
     if (numeric) {
       const difference = Number.parseFloat(left) - Number.parseFloat(right);
@@ -98,7 +108,14 @@ export const sort: Command = (context) => {
   const out = unique
     ? collected.filter((value, index) => value !== collected[index - 1])
     : collected;
-  return result(terminated(out.map((value) => encode(value))));
+  const stdout = (function* (): ByteStream {
+    try {
+      yield* terminated(out.map((value) => encode(value)));
+    } finally {
+      for (const release of releases) release();
+    }
+  })();
+  return result(stdout);
 };
 
 export const uniq: Command = (context) => {
@@ -116,6 +133,7 @@ export const uniq: Command = (context) => {
 
   const stream = (function* (): ByteStream {
     let previous: string | null = null;
+    let releasePrevious: (() => void) | null = null;
     let run = 0;
     const flush = function* (): ByteStream {
       if (previous === null) return;
@@ -123,17 +141,25 @@ export const uniq: Command = (context) => {
       if (onlyUnique && run > 1) return;
       yield encode(withCount ? `${String(run).padStart(7)} ${previous}\n` : `${previous}\n`);
     };
-    for (const text of lines(source)) {
-      const value = decode(text);
-      if (value === previous) {
-        run++;
-        continue;
+    try {
+      for (const text of lines(source, context.fs.retained)) {
+        const release = context.fs.retained.retain(text.length * 2, "uniq line");
+        const value = decode(text);
+        if (value === previous) {
+          release();
+          run++;
+          continue;
+        }
+        yield* flush();
+        releasePrevious?.();
+        previous = value;
+        releasePrevious = release;
+        run = 1;
       }
       yield* flush();
-      previous = value;
-      run = 1;
+    } finally {
+      releasePrevious?.();
     }
-    yield* flush();
   })();
   return result(stream);
 };
@@ -153,7 +179,7 @@ export const sed: Command = (context) => {
     if (print !== null) {
       const from = Number(print[1]);
       const to = print[2] === undefined ? from : Number(print[2]);
-      return result(printRange(source, from, to, quiet));
+      return result(printRange(source, from, to, quiet, context.fs.retained));
     }
 
     const substitute = parseSubstitution(script);
@@ -165,7 +191,7 @@ export const sed: Command = (context) => {
         2,
       );
     }
-    return result(applySubstitution(source, substitute, quiet));
+    return result(applySubstitution(source, substitute, quiet, context.fs.retained));
   } catch (error) {
     if (error instanceof UsageError || error instanceof PatternError) {
       return fail(context, error.message, 2);
@@ -229,12 +255,13 @@ function* applySubstitution(
   source: ByteStream,
   substitution: Substitution,
   quiet: boolean,
+  retained: Parameters<Command>[0]["fs"]["retained"],
 ): ByteStream {
   const flags = substitution.global
     ? substitution.pattern.flags
     : substitution.pattern.flags.replace("g", "");
   const pattern = new RegExp(substitution.pattern.source, flags);
-  for (const text of lines(source)) {
+  for (const text of lines(source, retained)) {
     const value = decode(text);
     const replaced = value.replace(pattern, substitution.replacement);
     if (quiet && replaced === value) continue;
@@ -242,9 +269,15 @@ function* applySubstitution(
   }
 }
 
-function* printRange(source: ByteStream, from: number, to: number, quiet: boolean): ByteStream {
+function* printRange(
+  source: ByteStream,
+  from: number,
+  to: number,
+  quiet: boolean,
+  retained: Parameters<Command>[0]["fs"]["retained"],
+): ByteStream {
   let number = 0;
-  for (const text of lines(source)) {
+  for (const text of lines(source, retained)) {
     number++;
     const inRange = number >= from && number <= to;
     // Without `-n`, sed prints every line and duplicates the range.
@@ -262,11 +295,25 @@ function sourceFor(
   return (function* (): ByteStream {
     for (const operand of operands) {
       const path = resolve(context.cwd, operand);
-      if (context.fs.stat(path) === null) {
+      const stat = context.fs.statTarget(path);
+      if (stat === null) {
         context.warn(`${operand}: No such file or directory`);
         continue;
       }
-      yield context.fs.readFile(path);
+      if (stat.type !== "file") {
+        yield context.fs.readFile(path);
+        continue;
+      }
+      const chunkSize = context.fs.readBudget;
+      for (let offset = 0; offset < stat.size; offset += chunkSize) {
+        const length = Math.min(chunkSize, stat.size - offset);
+        const release = context.fs.retained.retain(length, "text file input");
+        try {
+          yield context.fs.readRange(path, offset, length);
+        } finally {
+          release();
+        }
+      }
     }
   })();
 }

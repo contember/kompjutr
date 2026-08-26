@@ -215,12 +215,16 @@ export const rg: Command = (context) => {
     const shared = { invert, mode, lineNumbers, before, after };
 
     if (operands.length === 0 && context.stdin !== null) {
-      return searchStream(context.stdin, {
-        ...shared,
-        pattern: compiled,
-        withFilename: withFilename ?? false,
-        name: "<stdin>",
-      });
+      return searchStream(
+        context.stdin,
+        {
+          ...shared,
+          pattern: compiled,
+          withFilename: withFilename ?? false,
+          name: "<stdin>",
+        },
+        context.fs.retained,
+      );
     }
 
     // rg with no path searches the working directory, recursively.

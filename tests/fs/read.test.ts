@@ -435,6 +435,23 @@ describe("readFiles — remaining", () => {
     for (const [path, bytes] of contents) expectBytes(batch.files.get(path), bytes);
   });
 
+  it("returns only a prefix under a call-wide byte ceiling", () => {
+    const fixture = new Fixture();
+    fixture.transaction(() => {
+      fixture.file("/repo/a", pseudoRandom(6, 1));
+      fixture.file("/repo/b", pseudoRandom(6, 2));
+      fixture.file("/repo/c", pseudoRandom(2, 3));
+    });
+
+    const batch = readFiles(fixture.db, ["/repo/a", "/repo/b", "/repo/c"], {
+      budget: 100,
+      maxBytes: 8,
+    });
+
+    expect([...batch.files.keys()]).toEqual(["/repo/a"]);
+    expect(batch.remaining).toEqual(["/repo/b", "/repo/c"]);
+  });
+
   it("makes progress on every re-call and terminates", () => {
     const fixture = new Fixture();
     const expected = new Map<string, number>();

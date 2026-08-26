@@ -29,22 +29,48 @@ export const cat: Command = (context) => {
 
   let status = 0;
   const stream = (function* (): ByteStream {
-    // One round trip for the whole list rather than one per file.
     let pending: readonly string[] = paths;
-    const seen = new Map<string, Uint8Array>();
     while (pending.length > 0) {
-      const batch = context.fs.readFiles(pending, { budget: context.fs.readBudget });
-      for (const [path, bytes] of batch.files) seen.set(path, bytes);
-      pending = batch.remaining;
-    }
-    for (const path of paths) {
-      const bytes = seen.get(path);
-      if (bytes === undefined) {
-        context.warn(`${path}: No such file or directory`);
-        status = 1;
+      if (context.fs.retained.available === 0) {
+        context.fs.retained.retain(1, "cat batch");
+      }
+      const batch = context.fs.readFiles(pending, {
+        budget: context.fs.readBudget,
+        maxBytes: context.fs.retained.available,
+        deferOversized: true,
+      });
+      const consumed = pending.length - batch.remaining.length;
+      if (consumed === 0) {
+        const path = pending[0];
+        if (path === undefined) return;
+        const stat = context.fs.statTarget(path);
+        if (stat === null) {
+          context.warn(`${path}: No such file or directory`);
+          status = 1;
+        } else {
+          yield* streamFile(context, path, stat.size, "cat file");
+        }
+        pending = pending.slice(1);
         continue;
       }
-      yield bytes;
+
+      let held = 0;
+      for (const bytes of batch.files.values()) held += bytes.length;
+      const release = context.fs.retained.retain(held, "cat batch");
+      try {
+        for (let index = 0; index < consumed; index++) {
+          const path = pending[index];
+          if (path === undefined) continue;
+          const bytes = batch.files.get(path);
+          if (bytes === undefined) {
+            context.warn(`${path}: No such file or directory`);
+            status = 1;
+          } else yield bytes;
+        }
+      } finally {
+        release();
+      }
+      pending = batch.remaining;
     }
   })();
   return { stdout: stream, status: () => status };
@@ -168,7 +194,7 @@ export const tail: Command = (context) => {
 
     const source = operands.length === 0 ? context.stdin : fileStream(context, operands);
     if (source === null) return result(empty());
-    return result(lastLines(source, wanted));
+    return result(lastLines(source, wanted, context.fs.retained));
   } catch (error) {
     if (error instanceof UsageError) return fail(context, error.message, 2);
     throw error;
@@ -245,9 +271,29 @@ function fileStream(context: CommandContext, operands: readonly string[]): ByteS
         context.warn(`${path}: No such file or directory`);
         continue;
       }
-      yield context.fs.readFile(path);
+      yield* streamFile(context, path, stat.size, "file input");
     }
   })();
+}
+
+function* streamFile(
+  context: CommandContext,
+  path: string,
+  size: number,
+  label: string,
+): ByteStream {
+  let offset = 0;
+  while (offset < size) {
+    if (context.fs.retained.available === 0) context.fs.retained.retain(1, label);
+    const length = Math.min(context.fs.readBudget, context.fs.retained.available, size - offset);
+    const release = context.fs.retained.retain(length, label);
+    try {
+      yield context.fs.readRange(path, offset, length);
+    } finally {
+      release();
+    }
+    offset += length;
+  }
 }
 
 /**
@@ -286,14 +332,23 @@ function* takeBytes(source: ByteStream, wanted: number): ByteStream {
 }
 
 /** A bounded ring buffer: memory is O(N), not O(input). */
-function* lastLines(source: ByteStream, wanted: number): ByteStream {
+function* lastLines(
+  source: ByteStream,
+  wanted: number,
+  retained: CommandContext["fs"]["retained"],
+): ByteStream {
   if (wanted === 0) return;
-  const held: Uint8Array[] = [];
-  for (const text of lines(source)) {
-    held.push(text);
-    if (held.length > wanted) held.shift();
+  const held: Array<{ bytes: Uint8Array; release(): void }> = [];
+  try {
+    for (const text of lines(source, retained)) {
+      const release = retained.retain(text.length, "tail line buffer");
+      held.push({ bytes: text.slice(), release });
+      if (held.length > wanted) held.shift()?.release();
+    }
+    yield* terminated(held.map((entry) => entry.bytes));
+  } finally {
+    for (const entry of held) entry.release();
   }
-  yield* terminated(held);
 }
 
 /** `head -N file` in one `readRange`, extended only if the probe fell short. */
@@ -306,20 +361,25 @@ function* headOfFile(
   if (wanted === 0 || size === 0) return;
   let span = Math.min(size, Math.max(LINE_PROBE, wanted * 128));
   for (;;) {
-    const bytes = context.fs.readRange(path, 0, span);
-    let seen = 0;
-    for (let index = 0; index < bytes.length; index++) {
-      if (bytes[index] !== NEWLINE) continue;
-      seen++;
-      if (seen < wanted) continue;
-      yield bytes.subarray(0, index + 1);
-      return;
-    }
-    // Fewer newlines than asked for: either the file is shorter than N
-    // lines, or the probe was.
-    if (span >= size) {
-      yield bytes;
-      return;
+    const release = context.fs.retained.retain(span, "head range probe");
+    try {
+      const bytes = context.fs.readRange(path, 0, span);
+      let seen = 0;
+      for (let index = 0; index < bytes.length; index++) {
+        if (bytes[index] !== NEWLINE) continue;
+        seen++;
+        if (seen < wanted) continue;
+        yield bytes.subarray(0, index + 1);
+        return;
+      }
+      // Fewer newlines than asked for: either the file is shorter than N
+      // lines, or the probe was.
+      if (span >= size) {
+        yield bytes;
+        return;
+      }
+    } finally {
+      release();
     }
     span = Math.min(size, span * 4);
   }
@@ -335,15 +395,20 @@ function* tailOfFile(
   let span = Math.min(size, Math.max(LINE_PROBE, wanted * 128));
   for (;;) {
     const offset = Math.max(0, size - span);
-    const bytes = context.fs.readRange(path, offset, span);
-    const newlines = countNewlines(bytes, offset === 0);
-    if (newlines >= wanted || offset === 0) {
-      yield* lastLines(one(bytes), wanted);
-      return;
-    }
-    if (span >= size) {
-      yield* lastLines(one(bytes), wanted);
-      return;
+    const release = context.fs.retained.retain(span, "tail range probe");
+    try {
+      const bytes = context.fs.readRange(path, offset, span);
+      const newlines = countNewlines(bytes, offset === 0);
+      if (newlines >= wanted || offset === 0) {
+        yield* lastLines(one(bytes), wanted, context.fs.retained);
+        return;
+      }
+      if (span >= size) {
+        yield* lastLines(one(bytes), wanted, context.fs.retained);
+        return;
+      }
+    } finally {
+      release();
     }
     span = Math.min(size, span * 4);
   }

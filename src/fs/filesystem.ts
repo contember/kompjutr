@@ -16,6 +16,7 @@ import {
   scan as scanPage,
 } from "./store/scan.js";
 import { discoverFilesContaining } from "./store/search.js";
+import { writeFileStream as writeStoredStream } from "./store/stream-write.js";
 import { TOUCH_PATH_LIMIT, touchFiles as touchStoredFiles } from "./store/touch.js";
 import {
   makeDirectories as makeStoredDirectories,
@@ -34,9 +35,11 @@ import type {
   ListOptions,
   ListPage,
   ReadBatch,
+  ReadOptions,
   RemoveOptions,
   ScanEntry,
   ScanOptions,
+  StreamWriteOptions,
   TouchOptions,
   WriteEntry,
   WriteOptions,
@@ -58,7 +61,7 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     listRoots.clear();
   };
 
-  const readFiles = (paths: readonly string[], readOptions?: { budget?: number }): ReadBatch => {
+  const readFiles = (paths: readonly string[], readOptions?: ReadOptions): ReadBatch => {
     const resolved = realpaths(db, paths);
     const originals = new Map<string, string[]>();
     for (let index = 0; index < paths.length; index++) {
@@ -176,6 +179,14 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
       }
       touchStoredFiles(db, realpaths(db, paths), touchOptions.mtime ?? now(), touchOptions.create);
       if (paths.length > 0) mutated();
+    },
+    writeFileStream(
+      path: string,
+      chunks: Iterable<Uint8Array>,
+      streamOptions: StreamWriteOptions = {},
+    ): void {
+      writeStoredStream(db, realpath(db, path), chunks, streamOptions.append === true, now());
+      mutated();
     },
     makeDirectories(paths: readonly string[]): void {
       makeStoredDirectories(db, paths, now);

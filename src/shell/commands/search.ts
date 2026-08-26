@@ -103,9 +103,17 @@ export function search(fs: BoundedFs, request: SearchRequest): SearchOutcome {
       }
 
       if (stat.type !== "dir") {
-        const bytes = fs.readFile(root);
-        // Named on the command line: searched whatever it holds.
-        yield* emit(root, bytes, request, request.withFilename ?? several, noteMatch, "report");
+        if (stat.size > fs.retained.available) {
+          fs.retained.retain(stat.size, "named search file");
+        }
+        const release = fs.retained.retain(stat.size, "named search file");
+        try {
+          const bytes = fs.readFile(root);
+          // Named on the command line: searched whatever it holds.
+          yield* emit(root, bytes, request, request.withFilename ?? several, noteMatch, "report");
+        } finally {
+          release();
+        }
         continue;
       }
 
@@ -276,10 +284,24 @@ function* read(
 ): Generator<FoundFile, void, undefined> {
   let pending: readonly RegularFileHandle[] = handles;
   while (pending.length > 0) {
-    const batch = fs.readFileHandles(pending, { budget: fs.readBudget });
-    for (const handle of pending) {
-      const bytes = batch.files.get(handle.path);
-      if (bytes !== undefined) yield { path: handle.path, bytes };
+    const first = pending[0];
+    if (first !== undefined && first.size > fs.retained.available) {
+      const release = fs.retained.retain(first.size, "search file batch");
+      release();
+    }
+    const batch = fs.readFileHandles(pending, {
+      budget: Math.max(1, Math.min(fs.readBudget, fs.retained.available)),
+    });
+    let held = 0;
+    for (const bytes of batch.files.values()) held += bytes.length;
+    const release = fs.retained.retain(held, "search file batch");
+    try {
+      for (const handle of pending) {
+        const bytes = batch.files.get(handle.path);
+        if (bytes !== undefined) yield { path: handle.path, bytes };
+      }
+    } finally {
+      release();
     }
     pending = batch.remaining;
   }

@@ -11,7 +11,13 @@
 import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
 import { normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
-import type { HandleReadBatch, ReadBatch, RealPath, RegularFileHandle } from "../types.js";
+import type {
+  HandleReadBatch,
+  ReadBatch,
+  ReadOptions,
+  RealPath,
+  RegularFileHandle,
+} from "../types.js";
 import { realpath } from "./resolve.js";
 
 /** Bytes per statement, below the platform's 2 MB bound-value ceiling. */
@@ -646,10 +652,14 @@ function lookupFile(db: SqlDatabase, path: string): Target {
 export function readFiles(
   db: SqlDatabase,
   paths: readonly string[],
-  options: { budget?: number } = {},
+  options: ReadOptions = {},
 ): ReadBatch {
   const budget = options.budget ?? DEFAULT_READ_BUDGET;
   if (!(budget > 0)) throw new Error("readFiles: budget must be positive");
+  const maxBytes = options.maxBytes ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("readFiles: maxBytes must be a positive safe integer");
+  }
 
   // Deduplicate on the canonical path; key the result by the caller's string.
   const order: string[] = [];
@@ -684,6 +694,7 @@ export function readFiles(
 
   let pending: Planned[] = [];
   let pendingBytes = 0;
+  let selectedBytes = 0;
   const flush = (): void => {
     if (pending.length === 0) return;
     deliver(pending, readTargets(db, pending, rowLimitFor(pending, budget)));
@@ -699,7 +710,18 @@ export function readFiles(
     if (row === undefined || row.type !== "file") continue;
     const target = validatedTarget(row);
 
+    if (selectedBytes + target.size > maxBytes) {
+      flush();
+      stopped = index;
+      break;
+    }
+
     if (target.size > budget) {
+      if (options.deferOversized === true) {
+        flush();
+        stopped = index;
+        break;
+      }
       // Deferring is only safe while the caller can still make progress by
       // re-calling; if nothing has been read yet, re-calling would loop
       // forever, so page this one file instead.
@@ -709,12 +731,14 @@ export function readFiles(
       }
       const single: Planned = { real, ...target };
       deliver([single], readTargets(db, [single], rowLimitFor([single], budget)));
+      selectedBytes += target.size;
       continue;
     }
 
     if (pendingBytes + target.size > budget) flush();
     pending.push({ real, ...target });
     pendingBytes += target.size;
+    selectedBytes += target.size;
   }
   flush();
 

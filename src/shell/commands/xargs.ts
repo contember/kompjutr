@@ -11,7 +11,7 @@
 // Every sub-invocation shares the caller's `BoundedFs`, so the operation
 // ceiling still bounds the whole thing however many groups there are.
 
-import { type ByteStream, decode, drain } from "../exec/bytes.js";
+import { type ByteStream, decode, drainBounded } from "../exec/bytes.js";
 import { type Command, fail } from "../exec/context.js";
 import { count, UsageError } from "./flags.js";
 
@@ -63,25 +63,52 @@ export const xargs: Command = (context) => {
     // `xargs` with no command runs `echo`, as GNU does.
     const [name = "echo", ...fixed] = rest;
 
-    const input = context.stdin === null ? "" : decode(drain(context.stdin));
-    // `-I` takes a whole line as one argument; everything else splits on
-    // whitespace, so a path with a space in it needs `-0` to survive.
-    const items = split(input, { replace: replace !== null, nulSeparated, delimiter });
+    const held =
+      context.stdin === null
+        ? { bytes: new Uint8Array(0), release: () => {} }
+        : drainBounded(context.stdin, context.fs.retained, "xargs input");
+    const releases = [held.release];
+    let items: string[];
+    try {
+      releases.push(context.fs.retained.retain(held.bytes.length * 2, "xargs decoded input"));
+      const input = decode(held.bytes);
+      // Splitting can retain a second string representation of the complete
+      // input. Reserve it before asking the runtime to create the substrings.
+      releases.push(context.fs.retained.retain(input.length * 2, "xargs parsed items"));
+      // `-I` takes a whole line as one argument; everything else splits on
+      // whitespace, so a path with a space in it needs `-0` to survive.
+      items = split(input, { replace: replace !== null, nulSeparated, delimiter });
+    } catch (error) {
+      releaseAll(releases)();
+      throw error;
+    }
+    const release = releaseAll(releases);
 
     if (items.length === 0) {
       // GNU runs the command once with no arguments unless `-r`. `-I` never
       // runs on empty input, because there would be nothing to substitute.
-      if (skipWhenEmpty || replace !== null) return { stdout: empty(), status: () => 0 };
-      return runGroups(context, name, [fixed]);
+      if (skipWhenEmpty || replace !== null) {
+        release();
+        return { stdout: empty(), status: () => 0 };
+      }
+      return runGroups(context, name, [fixed], release);
     }
 
     if (replace !== null) {
       const marker = replace;
-      return runGroups(
-        context,
-        name,
-        items.map((item) => fixed.map((argument) => argument.split(marker).join(item))),
-      );
+      try {
+        const groups = items.map((item) =>
+          fixed.map((argument) => {
+            const length = replacedLength(argument, marker, item);
+            releases.push(context.fs.retained.retain(length * 2, "xargs replacement groups"));
+            return argument.split(marker).join(item);
+          }),
+        );
+        return runGroups(context, name, groups, release);
+      } catch (error) {
+        release();
+        throw error;
+      }
     }
 
     const size = maxArgs ?? items.length;
@@ -89,12 +116,36 @@ export const xargs: Command = (context) => {
     for (let index = 0; index < items.length; index += size) {
       groups.push([...fixed, ...items.slice(index, index + size)]);
     }
-    return runGroups(context, name, groups);
+    return runGroups(context, name, groups, release);
   } catch (error) {
     if (error instanceof UsageError) return fail(context, error.message, 2);
     throw error;
   }
 };
+
+function releaseAll(releases: ReadonlyArray<() => void>): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const release of releases) release();
+  };
+}
+
+function replacedLength(value: string, marker: string, replacement: string): number {
+  if (marker === "") {
+    return value.length + Math.max(0, value.length - 1) * replacement.length;
+  }
+  let occurrences = 0;
+  let offset = 0;
+  for (;;) {
+    const found = value.indexOf(marker, offset);
+    if (found < 0) break;
+    occurrences++;
+    offset = found + marker.length;
+  }
+  return value.length + occurrences * (replacement.length - marker.length);
+}
 
 /**
  * Run one group after another, concatenating the output.
@@ -108,18 +159,23 @@ function runGroups(
   context: Parameters<Command>[0],
   name: string,
   groups: ReadonlyArray<readonly string[]>,
+  release: () => void,
 ): ReturnType<Command> {
   let status = 0;
   const stdout = (function* (): ByteStream {
-    for (const argv of groups) {
-      const produced = context.invoke(name, argv);
-      if (produced === null) {
-        context.warn(`${name}: command not found`);
-        status = 127;
-        return;
+    try {
+      for (const argv of groups) {
+        const produced = context.invoke(name, argv);
+        if (produced === null) {
+          context.warn(`${name}: command not found`);
+          status = 127;
+          return;
+        }
+        yield* produced.stdout;
+        if (produced.status() !== 0) status = CHILD_FAILED;
       }
-      yield* produced.stdout;
-      if (produced.status() !== 0) status = CHILD_FAILED;
+    } finally {
+      release();
     }
   })();
   return { stdout, status: () => status };

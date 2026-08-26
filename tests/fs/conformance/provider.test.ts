@@ -17,6 +17,7 @@ import { removeFiles } from "../../../src/fs/store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "../../../src/fs/store/resolve.js";
 import { discoverFiles, glob, globPage, listEntries, scan } from "../../../src/fs/store/scan.js";
 import { discoverFilesContaining } from "../../../src/fs/store/search.js";
+import { writeFileStream } from "../../../src/fs/store/stream-write.js";
 import { touchFiles } from "../../../src/fs/store/touch.js";
 import { makeDirectories, writeFiles } from "../../../src/fs/store/write.js";
 import type { Filesystem } from "../../../src/fs/types.js";
@@ -63,6 +64,8 @@ function createTestProvider(): NodeFsCompat {
     },
     touchFiles: (paths, options) =>
       touchFiles(db, realpaths(db, paths), options?.mtime ?? FIXED_TIME, options?.create),
+    writeFileStream: (path, chunks, options) =>
+      writeFileStream(db, realpath(db, path), chunks, options?.append === true, FIXED_TIME),
     makeDirectories: (paths) => makeDirectories(db, paths),
     removeFiles: (paths, options) => removeFiles(db, paths, options),
     withReadScope: (work) => work(),

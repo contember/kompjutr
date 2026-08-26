@@ -10,7 +10,7 @@ import { join, normalize } from "../../fs/path.js";
 import type { Filesystem } from "../../fs/types.js";
 import { ShellSyntaxError } from "../parse/ast.js";
 import type { Argument, Plan, PlannedCommand, PlannedPipeline } from "../plan/types.js";
-import { type ByteStream, concat, encode, line } from "./bytes.js";
+import { type ByteStream, concat, line } from "./bytes.js";
 import {
   BoundedFs,
   type Command,
@@ -49,7 +49,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
   const limits = options.limits ?? DEFAULT_LIMITS;
   const fs = new BoundedFs(options.fs, limits);
   const out = new Sink(limits.maxOutputBytes);
-  const errors: Uint8Array[] = [];
+  const errors = new Sink(limits.maxOutputBytes);
   let cwd = normalize(options.cwd);
   let exitCode = 0;
   let previousConnector: "&&" | "||" | ";" | null = null;
@@ -76,7 +76,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
     }
   } catch (error) {
     if (error instanceof ShellLimitError || error instanceof ShellSyntaxError) {
-      errors.push(line(`kompjutr: ${error.message}`));
+      errors.writeBytes(line(`kompjutr: ${error.message}`));
       exitCode = 2;
     } else {
       throw error;
@@ -85,10 +85,10 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
 
   return {
     stdout: out.bytes(),
-    stderr: concat(errors),
+    stderr: errors.bytes(),
     exitCode,
     cwd,
-    truncated: out.truncated,
+    truncated: out.truncated || errors.truncated,
     operations: fs.operations,
   };
 }
@@ -98,51 +98,107 @@ interface PipelineEnvironment {
   readonly cwd: string;
   readonly commands: ReadonlyMap<string, Command>;
   readonly out: Sink;
-  readonly errors: Uint8Array[];
+  readonly errors: Sink;
   chdir(path: string): void;
 }
 
 function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): number {
   let stream: ByteStream | null = null;
   const statuses: Array<() => number> = [];
+  let settled = false;
 
-  for (let index = 0; index < pipeline.commands.length; index++) {
-    const planned = pipeline.commands[index];
-    if (planned === undefined) continue;
+  try {
+    for (let index = 0; index < pipeline.commands.length; index++) {
+      const planned = pipeline.commands[index];
+      if (planned === undefined) continue;
 
-    const command = env.commands.get(planned.name);
-    if (command === undefined) {
-      env.errors.push(line(`kompjutr: ${planned.name}: command not found`));
-      return 127;
+      const command = env.commands.get(planned.name);
+      if (command === undefined) {
+        env.errors.writeBytes(line(`kompjutr: ${planned.name}: command not found`));
+        return 127;
+      }
+
+      const expanded = expandArguments(planned.args, env.fs, env.cwd);
+      const argv = expanded.argv;
+
+      if (planned.stdin !== null) {
+        try {
+          const path = resolve(env.cwd, single(planned.stdin, env.fs, env.cwd));
+          stream = readWholeFile(env.fs, path);
+        } catch (error) {
+          expanded.release();
+          throw error;
+        }
+      }
+
+      const mergedErrors: HeldChunk[] = [];
+      const context = commandContext(planned, argv, stream, pipeline.limitHint, env, mergedErrors);
+      let produced: CommandResult;
+      try {
+        produced = command(context);
+      } catch (error) {
+        expanded.release();
+        throw error;
+      }
+      const output = stageOutput(produced.stdout, mergedErrors, expanded.release);
+      if (planned.stdout === null) {
+        stream = output;
+      } else {
+        let target: string;
+        try {
+          target = resolve(env.cwd, single(planned.stdout.path, env.fs, env.cwd));
+        } catch (error) {
+          output.return();
+          throw error;
+        }
+        try {
+          writeStream(env.fs, target, planned.stdout.append, protectUpstream(output));
+        } catch (error) {
+          output.return();
+          if (error instanceof UpstreamError) throw error.original;
+          if (
+            error instanceof Error &&
+            "code" in error &&
+            typeof error.code === "string" &&
+            error.code.startsWith("E")
+          ) {
+            env.errors.writeBytes(line(`${planned.name}: ${error.message}`));
+            return 1;
+          }
+          throw error;
+        }
+        stream = empty();
+      }
+      statuses.push(produced.status);
     }
 
-    const argv = expandArguments(planned.args, env.fs, env.cwd);
-
-    if (planned.stdin !== null) {
-      const path = resolve(env.cwd, single(planned.stdin, env.fs, env.cwd));
-      stream = readWholeFile(env.fs, path);
+    if (stream === null) {
+      settled = true;
+      return 0;
     }
+    env.out.write(stream);
+    settled = true;
 
-    const mergedErrors: Uint8Array[] = [];
-    const context = commandContext(planned, argv, stream, pipeline.limitHint, env, mergedErrors);
-    const produced = command(context);
-    const output = stageOutput(produced.stdout, mergedErrors);
-    if (planned.stdout === null) {
-      stream = output;
-    } else {
-      const target = resolve(env.cwd, single(planned.stdout.path, env.fs, env.cwd));
-      writeStream(env.fs, target, planned.stdout.append, output);
-      stream = empty();
-    }
-    statuses.push(produced.status);
+    // A pipeline's status is its last stage's, as in bash without pipefail.
+    const last = statuses[statuses.length - 1];
+    return last === undefined ? 0 : last();
+  } finally {
+    if (!settled) stream?.return();
   }
+}
 
-  if (stream === null) return 0;
-  env.out.write(stream);
+class UpstreamError extends Error {
+  constructor(readonly original: unknown) {
+    super("redirect upstream failed");
+  }
+}
 
-  // A pipeline's status is its last stage's, as in bash without pipefail.
-  const last = statuses[statuses.length - 1];
-  return last === undefined ? 0 : last();
+function* protectUpstream(stream: ByteStream): ByteStream {
+  try {
+    yield* stream;
+  } catch (error) {
+    throw new UpstreamError(error);
+  }
 }
 
 function commandContext(
@@ -151,7 +207,7 @@ function commandContext(
   stdin: ByteStream | null,
   limitHint: number | null,
   env: PipelineEnvironment,
-  mergedErrors: Uint8Array[],
+  mergedErrors: HeldChunk[],
 ): CommandContext {
   const context: CommandContext = {
     fs: env.fs,
@@ -163,8 +219,12 @@ function commandContext(
       if (planned.stderr === "drop") return;
       const bytes = line(`${planned.name}: ${message}`);
       // `2>&1` joins this stage before any downstream pipe consumes it.
-      if (planned.stderr === "merge") mergedErrors.push(bytes);
-      else env.errors.push(bytes);
+      if (planned.stderr === "merge") {
+        mergedErrors.push({
+          bytes,
+          release: env.fs.retained.retain(bytes.length, "merged stderr"),
+        });
+      } else env.errors.writeBytes(bytes);
     },
     chdir: env.chdir,
     invoke: (name: string, subArgv: readonly string[]): CommandResult | null => {
@@ -178,18 +238,44 @@ function commandContext(
   return context;
 }
 
+interface HeldChunk {
+  readonly bytes: Uint8Array;
+  release(): void;
+}
+
 /** Interleave diagnostics emitted while pulling a command with its stdout. */
-function* stageOutput(stdout: ByteStream, mergedErrors: Uint8Array[]): ByteStream {
+function* stageOutput(
+  stdout: ByteStream,
+  mergedErrors: HeldChunk[],
+  releaseStage: () => void,
+): ByteStream {
   let warningIndex = 0;
-  for (;;) {
-    const next = stdout.next();
-    while (warningIndex < mergedErrors.length) {
-      const warning = mergedErrors[warningIndex];
-      warningIndex++;
-      if (warning !== undefined) yield warning;
+  let done = false;
+  try {
+    for (;;) {
+      const next = stdout.next();
+      while (warningIndex < mergedErrors.length) {
+        const warning = mergedErrors[warningIndex];
+        warningIndex++;
+        if (warning === undefined) continue;
+        try {
+          yield warning.bytes;
+        } finally {
+          warning.release();
+        }
+      }
+      if (next.done) {
+        done = true;
+        return;
+      }
+      yield next.value;
     }
-    if (next.done) return;
-    yield next.value;
+  } finally {
+    for (; warningIndex < mergedErrors.length; warningIndex++) {
+      mergedErrors[warningIndex]?.release();
+    }
+    if (!done) stdout.return();
+    releaseStage();
   }
 }
 
@@ -205,43 +291,65 @@ function* empty(): ByteStream {
  * bash's default (`nullglob` off) and is what makes `ls *.md` in an empty
  * directory report "no such file" rather than listing everything.
  */
-function expandArguments(args: readonly Argument[], fs: BoundedFs, cwd: string): readonly string[] {
+interface ExpandedArguments {
+  readonly argv: readonly string[];
+  release(): void;
+}
+
+function expandArguments(args: readonly Argument[], fs: BoundedFs, cwd: string): ExpandedArguments {
   const out: string[] = [];
+  const releases: Array<() => void> = [];
   let bytes = 0;
   const push = (value: string): void => {
-    const nextBytes = bytes + ENCODER.encode(value).byteLength;
+    const valueBytes = ENCODER.encode(value).byteLength;
+    const nextBytes = bytes + valueBytes;
     if (out.length >= ARGUMENT_COUNT_MAX || nextBytes > ARGUMENT_BYTES_MAX) {
       throw new ShellLimitError(
         "arguments",
         `E2BIG: expanded argv exceeds ${ARGUMENT_COUNT_MAX} entries or ${ARGUMENT_BYTES_MAX} bytes`,
       );
     }
+    releases.push(fs.retained.retain(valueBytes, "command arguments"));
     out.push(value);
     bytes = nextBytes;
   };
 
-  for (const arg of args) {
-    if (arg.kind === "literal") {
-      push(arg.value);
-      continue;
+  try {
+    for (const arg of args) {
+      if (arg.kind === "literal") {
+        push(arg.value);
+        continue;
+      }
+      let matched = false;
+      for (const match of expandGlob(arg.pattern, fs, cwd)) {
+        push(match);
+        matched = true;
+      }
+      if (!matched) push(arg.pattern);
     }
-    let matched = false;
-    for (const match of expandGlob(arg.pattern, fs, cwd)) {
-      push(match);
-      matched = true;
-    }
-    if (!matched) push(arg.pattern);
+  } catch (error) {
+    for (const release of releases) release();
+    throw error;
   }
-  return out;
+  return {
+    argv: out,
+    release: () => {
+      for (const release of releases) release();
+    },
+  };
 }
 
 function single(arg: Argument, fs: BoundedFs, cwd: string): string {
   const expanded = expandArguments([arg], fs, cwd);
-  const first = expanded[0];
-  if (expanded.length !== 1 || first === undefined) {
-    throw new ShellSyntaxError("redirection", "ambiguous redirect", 0);
+  try {
+    const first = expanded.argv[0];
+    if (expanded.argv.length !== 1 || first === undefined) {
+      throw new ShellSyntaxError("redirection", "ambiguous redirect", 0);
+    }
+    return first;
+  } finally {
+    expanded.release();
   }
-  return first;
 }
 
 /**
@@ -294,18 +402,38 @@ export function resolve(cwd: string, path: string): string {
 }
 
 function* readWholeFile(fs: BoundedFs, path: string): ByteStream {
-  yield fs.readFile(path);
+  const stat = fs.statTarget(path);
+  if (stat === null || stat.type !== "file") {
+    // Preserve the stable filesystem error shape from the read surface.
+    yield fs.readFile(path);
+    return;
+  }
+  let offset = 0;
+  while (offset < stat.size) {
+    if (fs.retained.available === 0) fs.retained.retain(1, "stdin redirect");
+    const length = Math.min(
+      fs.readBudget,
+      Math.max(1, Math.floor(fs.retained.available / 2)),
+      stat.size - offset,
+    );
+    const release = fs.retained.retain(length, "stdin redirect");
+    try {
+      yield fs.readRange(path, offset, length);
+    } finally {
+      release();
+    }
+    offset += length;
+  }
 }
 
 function writeStream(fs: BoundedFs, path: string, append: boolean, stream: ByteStream): void {
-  const chunks = [...stream];
-  const bytes = append ? concat([existing(fs, path), ...chunks]) : concat(chunks);
-  fs.writeFiles([{ path, bytes }]);
-}
-
-function existing(fs: BoundedFs, path: string): Uint8Array {
-  const stat = fs.stat(path);
-  return stat === null ? encode("") : fs.readFile(path);
+  if (path === "/dev/null") {
+    for (const _chunk of stream) {
+      // Drain so lazy status and diagnostics still settle.
+    }
+    return;
+  }
+  fs.writeFileStream(path, stream, { append });
 }
 
 /** stdout, with the ceiling enforced as it is written rather than after. */
