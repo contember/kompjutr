@@ -338,27 +338,21 @@ function comparable(
   Partial<Pick<E2ESnapshot, "head" | "currentBranch" | "log">> {
   if (snapshot.operation !== "rebase") return snapshot;
   const { head: _head, currentBranch: _branch, log: _log, ...rest } = snapshot;
-  return { ...rest, status: maskHeadDerived(rest.status) };
+  return { ...rest, status: headRelativeRowsRemoved(rest.status) };
 }
 
 /**
- * Porcelain v2 reports each ordinary row's mode and OID *in HEAD*, so those
- * two fields inherit the mid-rebase HEAD difference above. Masking them keeps
- * the rest of the row — the codes, the index and worktree modes and OIDs, and
- * every unmerged `u` row — under comparison.
+ * An ordinary porcelain v2 row is entirely HEAD-relative — both its two HEAD
+ * columns and whether it appears at all, since a path in the branch tip but
+ * not in the new base shows as deleted on one side and not on the other. So
+ * while a rebase is pending only the rows that do not depend on where HEAD
+ * sits are compared: unmerged stages, untracked and ignored paths. File
+ * content itself stays fully compared through the worktree snapshot.
  */
-function maskHeadDerived(status: string): string {
+function headRelativeRowsRemoved(status: string): string {
   return status
     .split("\n")
-    .map((line) => {
-      if (!line.startsWith("1 ") && !line.startsWith("2 ")) return line;
-      // <kind> <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>...
-      const fields = line.split(" ");
-      if (fields.length < 9) return line;
-      fields[3] = "<head-mode>";
-      fields[6] = "<head-oid>";
-      return fields.join(" ");
-    })
+    .filter((line) => line.startsWith("u ") || line.startsWith("? ") || line.startsWith("! "))
     .join("\n");
 }
 
@@ -821,7 +815,10 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
       const args = ["merge", "-q", "-m", step.message ?? "Merge origin"];
       if (step.fastForwardOnly === true) args.push("--ff-only");
       else if (step.fastForward === false) args.push("--no-ff");
-      args.push(fixture.git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"));
+      // Merge the upstream by OID, not by name: `git pull` labels a conflict
+      // hunk with the fetched commit, and `git merge <ref>` would label it
+      // with the ref instead, so the marker bytes would not match kompjutr's.
+      args.push(fixture.git("rev-parse", "@{upstream}"));
       return integrationOutcome(fixture, args);
     }
     case "push": {
