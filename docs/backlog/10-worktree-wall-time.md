@@ -16,6 +16,14 @@ for clean status after commit and ordinary branch checkout on the 24,252-file
 fixture. The README therefore still calls out full-repository status and checkout
 as blockers for a performance-complete release.
 
+The status half is attributed. Its contributors are filed as separate items
+with independent witnesses — [54](54-prune-ignored-directories-in-status-walk.md)
+(ignored directories are walked, not pruned),
+[55](55-sparse-status-across-untracked-files.md) (one untracked file forces the
+full path), [56](56-reseal-index-tracker-on-commit.md) (the first status after
+commit pays a full tree diff), and [57](57-single-prepass-in-full-status.md)
+(the index is streamed three times). The checkout half is not yet attributed.
+
 ## Approach / acceptance
 
 - Profile under a CPU lease and attribute time to filesystem scans, tree/index

@@ -70,7 +70,11 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [11](11-production-do-regression-probe.md), and
    [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
    work unit; the production probe is now unblocked by the verified CI/release
-   seam.
+   seam. The status half of 10 now has attributed causes with their own
+   witnesses: [54](54-prune-ignored-directories-in-status-walk.md) and
+   [56](56-reseal-index-tracker-on-commit.md) are small and independent, take
+   them first; then [55](55-sparse-status-across-untracked-files.md); then
+   [57](57-single-prepass-in-full-status.md).
 3. **Close the reference-workload gaps.** These come from the only production
    workload documented end to end
    ([coverage](../reference/git-support.md#reference-workload-coverage)), so they
@@ -143,3 +147,7 @@ focused sprint.
 - [51 — Relocate every distinct-type merge conflict, not only file/directory](51-relocate-distinct-type-conflicts.md)
 - [52 — Match Git's default ref coverage on fetch and pull](52-default-ref-coverage-on-fetch-and-pull.md)
 - [53 — Record the narrowings the Git support reference does not state](53-record-undocumented-narrowings.md)
+- [54 — Prune ignored directories from the full status walk](54-prune-ignored-directories-in-status-walk.md)
+- [55 — Keep status sparse across untracked files under normal collapsing](55-sparse-status-across-untracked-files.md)
+- [56 — Move the index tracker baseline on commit](56-reseal-index-tracker-on-commit.md)
+- [57 — Stream HEAD and the index once in the full status prepass](57-single-prepass-in-full-status.md)
