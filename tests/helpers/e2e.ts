@@ -792,7 +792,7 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
     case "rebase":
       return integrationOutcome(fixture, ["rebase", "-q", step.upstream]);
     case "rebaseContinue":
-      return integrationOutcome(fixture, ["rebase", "--continue"]);
+      return integrationOutcome(fixture, ["-c", "core.editor=true", "rebase", "--continue"]);
     case "rebaseSkip":
       return integrationOutcome(fixture, ["rebase", "--skip"]);
     case "rebaseAbort":
