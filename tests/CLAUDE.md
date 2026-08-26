@@ -12,6 +12,8 @@ helpers/git-parity.ts upstream behavioural scenarios through Git and kompjutr
 helpers/http-backend.ts real Smart HTTP through `git http-backend`
 helpers/parity.ts    differential harness for grep and rg
 helpers/workspace.ts full runtime under test
+helpers/e2e.ts       journey harness: a step DSL played against both sides
+e2e/                 whole-workflow journeys built on it
 fs/conformance/      the dofs suite, ported; MIT, keep the file headers
 shell/               parse, plan, bounds, cost, parity, session
 ```
@@ -40,6 +42,27 @@ implementation can be asked instead.
 
 If a parity test fails, the shell is wrong until proven otherwise. Never relax
 an assertion to make it pass, and never weaken the controlled dimensions.
+
+## Journeys — the layer above one operation
+
+`tests/e2e/` covers what per-operation tests cannot: a defect that only appears
+when two correct operations meet. A journey is a list of steps; the harness
+(`helpers/e2e.ts`) plays each one against kompjutr *and* the `git` binary and
+compares the whole public repository state afterwards — refs, index, porcelain
+v2 text, worktree bytes and modes, the log, and which integration is pending.
+
+- **A journey asserts nothing about Git that it could ask Git instead.** Never
+  transcribe expected conflict markers or porcelain rows; they are compared.
+- **Each side owns a private bare origin**, kompjutr's served over Smart HTTP.
+  Colleague work goes in through a `peer` step, which runs on both sides.
+- `reopen` rebuilds the `Workspace` over the same storage — a Durable Object
+  eviction, and a no-op for git, which is the point.
+- One comparison is deliberately narrowed: while a rebase is pending, HEAD, the
+  branch, the log and porcelain v2's HEAD-derived mode and OID are not
+  compared, because Git detaches onto the new base while kompjutr leaves the
+  branch at its original OID. Everything else still is. **Do not widen it** —
+  reach for `runLocal` and an explicit assertion only where Git has no
+  equivalent at all, and say so in a comment.
 
 ## Rules
 

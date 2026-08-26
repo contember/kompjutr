@@ -17,6 +17,8 @@ decisions → reference → archive.
 
 - [`sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md`](sprints/sprint-2026-08-26-reflogs-and-ref-recovery.md)
   — transactional ref history, bounded recovery APIs, and future GC roots.
+- [`sprints/sprint-2026-08-26-e2e-journeys.md`](sprints/sprint-2026-08-26-e2e-journeys.md)
+  — whole-workflow tests played against the git binary, step by step.
 
 ## What's hot
 

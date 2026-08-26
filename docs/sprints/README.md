@@ -21,3 +21,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 - [Bounded reflogs and ref recovery](sprint-2026-08-26-reflogs-and-ref-recovery.md)
   — transactional ref history, bounded recovery APIs, and future GC roots.
+- [End-to-end journeys](sprint-2026-08-26-e2e-journeys.md)
+  — whole-workflow tests played against the git binary, step by step.
