@@ -19,9 +19,10 @@
 
 # Sprint — Multi-checkout consumer foundation (2026-08-26)
 
-**Goal.** Make one SQLite-native Git store serve isolated session checkouts, expose
-the two bounded reads required by Roj, and prove the complete checkout lifecycle
-without adding an upgrade chain for the undeployed schema.
+**Goal.** Make one SQLite-native Git store serve isolated session checkouts,
+expose the two bounded reads required by a session-oriented consumer, and prove
+the complete checkout lifecycle without adding an upgrade chain for the
+undeployed schema.
 
 **Theme.** Backlog items 40, 47, and 48 are one admission boundary. The
 consumer can already express ordinary local Git work, but cannot create two
@@ -224,12 +225,13 @@ models overlap.
   `tests/reflog-operations.test.ts`, `tests/rebase-restart.test.ts`,
   `tests/worktrees.test.ts`.
 
-### WU6 — Expose the two bounded Roj reads (effort M)
+### WU6 — Expose the two bounded consumer reads (effort M)
 
-- **Problem.** Roj's status poll needs divergence against a caller-selected base
-  and the raw target of `refs/remotes/origin/HEAD`. Reconstructing divergence
-  from `log()` materialises history, while `revParse()` deliberately resolves a
-  symbolic ref instead of reporting its target.
+- **Problem.** The consumer's status poll needs divergence against a
+  caller-selected base and the raw target of `refs/remotes/origin/HEAD`.
+  Reconstructing divergence from `log()` materialises history, while
+  `revParse()` deliberately resolves a symbolic ref instead of reporting its
+  target.
 - **Verify first.** Re-run the consumer call inventory recorded by backlog 47 and
   48. Pin real Git for `rev-list --left-right --count`, `symbolic-ref -q`, and
   `for-each-ref --format=%(symref)` across detached, shallow, unrelated,
@@ -276,9 +278,9 @@ models overlap.
 
 ## Out of scope (explicit)
 
-- The actual Roj adapter change is a separate consumer-repository sprint. This
+- The actual consumer adapter change is a separate consumer-repository sprint. This
   sprint delivers and proves the kompjutr admission surface only.
-- [49 — set-based copy](../backlog/49-set-based-copy.md) is not required by the
+- Set-based filesystem copy shipped independently and is not required by the
   current linked-worktree session model.
 - Multi-ref checkpoint pushes, partial clone, wildcard refspec fetch, remote ref
   discovery, scratch indexes, and patch interchange remain in backlog
@@ -287,7 +289,7 @@ models overlap.
   [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md),
   [43](../backlog/43-index-and-object-write-plumbing.md), and
   [44](../backlog/44-patch-interchange.md). They belong to the broader checkpoint
-  workload, not the current Roj admission gate.
+  workload, not the current consumer admission gate.
 - Safe merged-branch deletion and storage reclamation remain follow-up production
   safety work in [33](../backlog/33-branch-delete-merged-check.md) and
   [04](../backlog/04-repack-and-garbage-collection.md).

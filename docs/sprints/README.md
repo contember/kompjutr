@@ -19,6 +19,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Shell correctness and bounds (2026-08-26)](sprint-2026-08-26-shell-correctness-and-bounds.md)
-  — make the accepted Bash-shaped subset truthful, add set-based copy, touch,
-  and listing, and enforce one retained-memory boundary.
+No sprint is active.

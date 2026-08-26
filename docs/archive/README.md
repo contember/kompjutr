@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Shell correctness and bounds](sprint-2026-08-26-shell-correctness-and-bounds.md)
+  — truthful shell lists and commands, set-based filesystem mutations, paged
+  discovery, atomic redirects, and one measured retained-memory boundary.
 - [Multi-checkout consumer foundation](sprint-2026-08-26-multi-checkout-consumer-foundation.md)
   — one shared Git store, isolated linked checkouts, bounded consumer reads, and
   one undeployed schema baseline.

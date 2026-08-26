@@ -1,11 +1,26 @@
+> **OUTCOME — shipped 2026-08-26.** The accepted shell subset now evaluates
+> complete AND-OR lists, routes redirects per stage, rejects unsupported flags,
+> pages path expansion and discovery, and uses set-based metadata listing,
+> SQLite-internal copy, and metadata-only touch. One 16 MiB default
+> retained-memory budget now covers argv, line state, blocking stages, search, xargs,
+> merged diagnostics, and redirect inputs; stdout and stderr keep independent
+> public caps, and redirects stream atomically. Commit map: plan → `2d7b185`;
+> WU1 → `f9161f8`; WU2 → `333d2c3`; WU3 → `9454a94`; WU4 → `aef7bea`;
+> WU5 → `880a530`; WU6 → `fcef49c`; WU7 → `a0130e0`; WU8 → `59ce213`.
+> Verification: typecheck and Biome check; CPU-leased build; CPU-leased full
+> suite — 110 files, 1,936 passed, 5 skipped; clean 574-file package smoke;
+> docs lint. Backlog closed: 49 and 54–60. Deferred: general Bash constructs,
+> locale-sensitive collation, ignore-file handling, filesystem watchers, a
+> process runtime, and a shell-to-Git dependency remain deliberately out of
+> scope.
+
 # Sprint — Shell correctness and bounds (2026-08-26)
 
 **Goal.** Make every accepted shell construct truthful, move copy, touch, and
 listing onto bounded set-based filesystem operations, and enforce one explicit
 retained-memory boundary across complete pipelines.
 
-**Theme.** Backlog [49](../backlog/49-set-based-copy.md) and
-[54–60](../backlog/54-shell-and-or-lists.md) describe one trust boundary. The
+**Theme.** Backlog items 49 and 54–60 described one trust boundary. The
 current shell already accepts these constructs and commands, so plausible wrong
 answers, silent truncation, per-path query loops, and isolate-wide intermediate
 allocations are correctness defects rather than optional features. Success is a
@@ -276,3 +291,9 @@ line, blocking-stage, and redirect state all fail closed below the project-wide
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0007"). -->
+
+- WU8's exact command inventory found that `sed 2p` did not duplicate the
+  selected line. The parity correction landed in `59ce213`.
+- The first full-suite attempt waited for Git's interactive rebase editor in
+  the agent PTY. The deterministic editor setting is now in `tests/CLAUDE.md`;
+  the repeated leased suite passed.
