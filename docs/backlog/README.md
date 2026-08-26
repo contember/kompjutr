@@ -21,7 +21,10 @@ not effort: a wrong answer outranks a missing one.
 - **S — silent divergence.** kompjutr returns a plausible result where Git
   returns a different one or refuses. Nothing warns the caller.
   [33](33-branch-delete-merged-check.md) ·
-  [45](45-framing-safe-porcelain-output.md)
+  [45](45-framing-safe-porcelain-output.md) ·
+  [50](50-untracked-row-after-cached-removal.md) ·
+  [51](51-relocate-distinct-type-conflicts.md) ·
+  [52](52-default-ref-coverage-on-fetch-and-pull.md)
 - **A — blocks a common workflow, loudly.** The call fails or the capability is
   absent; no data is at risk.
   [35](35-staged-diff.md) ·
@@ -98,6 +101,16 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md). Item 29 also
    remains blocked by 12.
 
+Outside the phases: [50](50-untracked-row-after-cached-removal.md),
+[51](51-relocate-distinct-type-conflicts.md),
+[52](52-default-ref-coverage-on-fetch-and-pull.md) and
+[53](53-record-undocumented-narrowings.md) are corrections rather than
+capabilities — the end-to-end journeys caught them against the git binary. By
+the tier rule above a wrong answer outranks a missing one, so take them early:
+50 and 53 are small and independent, 51 wants the merge projection quiet around
+it, and 52 needs a decision on whether its two narrowings are gaps or contracts
+before it is work at all.
+
 Before scheduling them, split 04, 16, 17, 39, and 40 into smaller work units
 with independent witnesses. Their current acceptance scopes are larger than one
 focused sprint.
@@ -134,3 +147,7 @@ focused sprint.
 - [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
 - [45 — Make porcelain output framing-safe](45-framing-safe-porcelain-output.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
+- [50 — Report the untracked file a cached removal leaves behind](50-untracked-row-after-cached-removal.md)
+- [51 — Relocate every distinct-type merge conflict, not only file/directory](51-relocate-distinct-type-conflicts.md)
+- [52 — Match Git's default ref coverage on fetch and pull](52-default-ref-coverage-on-fetch-and-pull.md)
+- [53 — Record the narrowings the Git support reference does not state](53-record-undocumented-narrowings.md)
