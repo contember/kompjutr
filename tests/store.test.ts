@@ -6,7 +6,9 @@ import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
+import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
+import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/schema.js";
 import {
   ancestors,
   blobIdMismatchRetainedBytes,
@@ -64,6 +66,7 @@ describe("repository registry", () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
     );
     expect(tables.map((t) => t.name)).toEqual([
+      "git_blob_id_state",
       "git_blob_ids",
       "git_commits",
       "git_config",
@@ -157,7 +160,8 @@ describe("blob id batches", () => {
     const found = store.lookupBlobIds(mappings.map((mapping) => mapping.contentId));
     const totalStatements = db.storage.statementCount;
 
-    expect(writtenStatements).toBeLessThanOrEqual(10);
+    expect(writtenStatements).toBe(3);
+    expect(db.scalar<number>("SELECT generation FROM git_blob_id_state WHERE repo_id = 1")).toBe(3);
     expect(totalStatements).toBeLessThanOrEqual(20);
     expect(found.size).toBe(mappings.length);
     for (const mapping of mappings) {
@@ -177,10 +181,12 @@ describe("blob id batches", () => {
     const missing = new Uint8Array([0, 3, 0]);
     const matchingOid = "1".repeat(40);
     const actualOid = "2".repeat(40);
+    db.storage.resetCounters();
     store.upsertBlobIds([
       { contentId: matching, oid: matchingOid },
       { contentId: mismatched, oid: actualOid },
     ]);
+    expect(db.storage.statementCount).toBe(1);
 
     db.storage.resetCounters();
     const result = store.blobIdMismatches([
@@ -205,17 +211,14 @@ describe("blob id batches", () => {
   it("bounds all expected and returned identity state before SQL", () => {
     const { db, store } = open();
     const oid = "1".repeat(40);
-    const full = new Uint8Array(1024 * 1024);
+    const full = new Uint8Array(MAX_CACHED_CONTENT_ID_BYTES);
     const emptyCost = blobIdMismatchRetainedBytes({ contentId: new Uint8Array(0), oid });
     const fullCost = blobIdMismatchRetainedBytes({ contentId: full, oid });
-    const prefix = Array.from({ length: 15 }, (_, index) => {
-      const contentId = full.slice();
-      contentId[0] = index;
-      return { contentId, oid };
-    });
+    const prefixLength = Math.floor(MAX_BLOB_ID_MISMATCH_RETAINED_BYTES / fullCost);
+    const prefix = Array.from({ length: prefixLength }, () => ({ contentId: full, oid }));
     const lastLength = MAX_BLOB_ID_MISMATCH_RETAINED_BYTES - prefix.length * fullCost - emptyCost;
     expect(lastLength).toBeGreaterThan(0);
-    expect(lastLength).toBeLessThanOrEqual(1024 * 1024);
+    expect(lastLength).toBeLessThanOrEqual(MAX_CACHED_CONTENT_ID_BYTES);
     const exact = [...prefix, { contentId: new Uint8Array(lastLength), oid }];
     expect(exact.reduce((bytes, mapping) => bytes + blobIdMismatchRetainedBytes(mapping), 0)).toBe(
       MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
@@ -226,9 +229,9 @@ describe("blob id batches", () => {
     expect(db.storage.statementCount).toBeLessThanOrEqual(20);
 
     db.storage.resetCounters();
-    expect(() =>
-      store.blobIdMismatches([...prefix, { contentId: new Uint8Array(lastLength + 1), oid }]),
-    ).toThrow(/comparison state exceeds/);
+    expect(() => store.blobIdMismatches([...exact, { contentId: new Uint8Array(0), oid }])).toThrow(
+      /comparison state exceeds/,
+    );
     expect(db.storage.statementCount).toBe(0);
   });
 
@@ -238,12 +241,17 @@ describe("blob id batches", () => {
     expect(() => store.blobIdMismatches([{ contentId, oid: "not-an-oid" }])).toThrow(
       /invalid blob oid/,
     );
-    expect(() =>
-      store.blobIdMismatches([{ contentId: new Uint8Array(1024 * 1024 + 1), oid: "1".repeat(40) }]),
-    ).toThrow(/exceeds the 1 MiB/);
+    const longId = new Uint8Array(MAX_CACHED_CONTENT_ID_BYTES + 1).fill(7);
+    store.upsertBlobIds([{ contentId: longId, oid: "1".repeat(40) }]);
+    expect(store.lookupBlobIds([longId])).toEqual(new Map());
+    expect(store.blobIdMismatches([{ contentId: longId, oid: "1".repeat(40) }])).toEqual(
+      new Map([[0, null]]),
+    );
 
     store.upsertBlobIds([{ contentId, oid: "1".repeat(40) }]);
+    store.db.run("PRAGMA ignore_check_constraints = ON");
     store.db.run("UPDATE git_blob_ids SET oid = 'broken' WHERE repo_id = ?", 1);
+    store.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => store.blobIdMismatches([{ contentId, oid: "2".repeat(40) }])).toThrow(
       /invalid mapping/,
     );
@@ -261,6 +269,80 @@ describe("blob id batches", () => {
     expect(second.lookupBlobIds([contentId]).get(contentIdKey(contentId))).toBe("2".repeat(40));
     first.destroy();
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids")).toBe(1);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_blob_id_state")).toBe(1);
+  });
+
+  it("rejects null, unknown, and malformed cache control rows", () => {
+    const { db, store } = open();
+    const retained = new Uint8Array([7]);
+    store.upsertBlobIds([{ contentId: retained, oid: "1".repeat(40) }]);
+
+    for (const operation of [null, "unknown"]) {
+      expect(() =>
+        db.run("INSERT INTO git_blob_id_updates VALUES (1, zeroblob(0), '', ?, -1)", operation),
+      ).toThrow(/invalid blob id cache operation/);
+    }
+    expect(() =>
+      db.run("INSERT INTO git_blob_id_updates VALUES (0, zeroblob(0), '', 'finish', 0)"),
+    ).toThrow(/invalid blob id cache finish/);
+    expect(store.lookupBlobIds([retained])).toEqual(new Map([["07", "1".repeat(40)]]));
+  });
+
+  it("evicts the oldest generations at the hard per-repository row cap", () => {
+    const { db, store } = open();
+    const page = (start: number, count: number, oid: string) =>
+      Array.from({ length: count }, (_, offset) => {
+        const value = start + offset;
+        return {
+          contentId: new Uint8Array([
+            value & 0xff,
+            (value >>> 8) & 0xff,
+            (value >>> 16) & 0xff,
+            (value >>> 24) & 0xff,
+          ]),
+          oid,
+        };
+      });
+    const generationRows = 4_096;
+    for (let generation = 0; generation < 17; generation++) {
+      store.upsertBlobIds(
+        page(
+          generation * generationRows,
+          generationRows,
+          (generation + 1).toString(16).padStart(40, "0"),
+        ),
+      );
+    }
+    const newestOid = (17).toString(16).padStart(40, "0");
+    const newestContentId = page(16 * generationRows, 1, newestOid)[0]!.contentId;
+
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = 1")).toBe(
+      MAX_BLOB_ID_CACHE_ROWS,
+    );
+    expect(store.lookupBlobIds([new Uint8Array(4)])).toEqual(new Map());
+    expect(store.lookupBlobIds([newestContentId]).get(contentIdKey(newestContentId))).toBe(
+      newestOid,
+    );
+  });
+
+  it("rolls back a cache update when its generation is exhausted", () => {
+    const { db, store } = open();
+    const retained = new Uint8Array([1]);
+    store.upsertBlobIds([{ contentId: retained, oid: "1".repeat(40) }]);
+    db.run(
+      "UPDATE git_blob_id_state SET generation = ? WHERE repo_id = 1",
+      Number.MAX_SAFE_INTEGER,
+    );
+
+    expect(() =>
+      store.upsertBlobIds([{ contentId: new Uint8Array([2]), oid: "2".repeat(40) }]),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(store.lookupBlobIds([retained, new Uint8Array([2])])).toEqual(
+      new Map([["01", "1".repeat(40)]]),
+    );
+    expect(db.scalar<number>("SELECT generation FROM git_blob_id_state WHERE repo_id = 1")).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
   });
 });
 
@@ -364,7 +446,9 @@ describe("loose objects", () => {
 describe("effective tree sources", () => {
   const effective = (db: TestDatabase, repoId: number, oid: string) =>
     db.one<{ storage: string; source_id: number }>(
-      "SELECT storage, source_id FROM git_tree_effective WHERE repo_id = ? AND tree_oid = ?",
+      `SELECT source.storage, source.source_id FROM git_tree_effective effective
+       JOIN git_tree_sources source ON source.source_key = effective.source_key
+       WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
       repoId,
       oid,
     );

@@ -52,7 +52,8 @@ function installPackCopy(
     );
     workspace.database.db.run(
       `INSERT INTO git_tree_sources
-       SELECT repo_id, tree_oid, 'pack', ?, object_size, entry_count, base_cost
+         (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
+       SELECT repo_id, tree_oid, 'pack', ?, 1, object_size, entry_count, base_cost
          FROM git_tree_sources
         WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose'`,
       packId,
@@ -61,10 +62,15 @@ function installPackCopy(
     );
     workspace.database.db.run(
       `INSERT INTO git_tree_entries
-       SELECT repo_id, tree_oid, 'pack', ?, ordinal, mode, name, name_bytes, oid,
-              raw_entry, cumulative_base
-         FROM git_tree_entries
-        WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose'`,
+         (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
+       SELECT packed.source_key, entry.ordinal, entry.mode, entry.name_bytes, entry.oid,
+              entry.raw_entry, entry.cumulative_base
+         FROM git_tree_entries entry
+         JOIN git_tree_sources loose ON loose.source_key = entry.source_key
+         JOIN git_tree_sources packed
+           ON packed.repo_id = loose.repo_id AND packed.tree_oid = loose.tree_oid
+          AND packed.storage = 'pack' AND packed.source_id = ?
+        WHERE loose.repo_id = ? AND loose.tree_oid = ? AND loose.storage = 'loose'`,
       packId,
       repoId,
       tree,
@@ -242,7 +248,7 @@ describe("SQLite sparse workspace source", () => {
         currentTreeOid: null,
         paths: ["a.txt"],
       }),
-    ).toThrowError(/source metadata is inconsistent/);
+    ).toThrowError(/source is missing or invalid/);
   });
 
   it("does not borrow a packed tree through a wrong-type loose shadow", () => {
@@ -273,7 +279,10 @@ describe("SQLite sparse workspace source", () => {
     const tree = workspace.repo.headTree();
     workspace.database.db.run(
       `UPDATE git_tree_entries SET raw_entry = X'00'
-        WHERE repo_id = ? AND tree_oid = ? AND name = 'link'`,
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND name_bytes = CAST('link' AS BLOB)`,
       workspace.repo.store.repoId,
       tree,
     );
@@ -316,7 +325,7 @@ describe("SQLite sparse workspace source", () => {
     const tree = workspace.repo.headTree();
     if (tree === null) throw new Error("missing HEAD tree");
     const row = workspace.database.db.one<{ raw_entry: Uint8Array }>(
-      `SELECT raw_entry FROM git_tree_entries
+      `SELECT raw_entry FROM git_tree_entries_wide
         WHERE repo_id = ? AND tree_oid = ? AND name = 'dir'`,
       workspace.repo.store.repoId,
       tree,
@@ -326,7 +335,10 @@ describe("SQLite sparse workspace source", () => {
     raw.set(fromHex(tree), raw.length - 20);
     workspace.database.db.run(
       `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
-        WHERE repo_id = ? AND tree_oid = ? AND name = 'dir'`,
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND name_bytes = CAST('dir' AS BLOB)`,
       tree,
       raw,
       workspace.repo.store.repoId,
@@ -350,7 +362,7 @@ describe("SQLite sparse workspace source", () => {
     const root = workspace.repo.headTree();
     if (root === null) throw new Error("missing HEAD tree");
     const child = workspace.database.db.scalar<string>(
-      `SELECT oid FROM git_tree_entries
+      `SELECT oid FROM git_tree_entries_wide
         WHERE repo_id = ? AND tree_oid = ? AND name = 'dir'`,
       workspace.repo.store.repoId,
       root,
@@ -362,7 +374,10 @@ describe("SQLite sparse workspace source", () => {
       workspace.database.db.run(
         `UPDATE git_tree_entries
             SET mode = '40000', oid = ?, raw_entry = ?, cumulative_base = ?
-          WHERE repo_id = ? AND tree_oid = ? AND name = 'b.txt'`,
+          WHERE source_key = (
+            SELECT source_key FROM git_tree_sources
+             WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+          ) AND name_bytes = CAST('b.txt' AS BLOB)`,
         root,
         raw,
         cumulativeBase,

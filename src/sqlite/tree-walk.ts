@@ -30,37 +30,38 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
     AS (VALUES (?, ?, ?, ?, ?, ?)),
   source_valid(repo_id, tree_oid, storage, source_id, object_size,
                entry_count, base_cost) AS NOT MATERIALIZED (
-    SELECT x.repo_id, x.tree_oid, x.storage, x.source_id, s.object_size,
+    SELECT x.repo_id, x.tree_oid, s.storage, s.source_id, s.object_size,
            s.entry_count, s.base_cost
       FROM git_tree_effective x
       CROSS JOIN params p
       CROSS JOIN git_tree_sources s
      WHERE x.repo_id = p.repo_id
        AND length(x.tree_oid) = 40 AND x.tree_oid NOT GLOB '*[^0-9a-f]*'
+       AND s.source_key = x.source_key
        AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
-       AND s.storage = x.storage AND s.source_id = x.source_id
+       AND s.complete = 1
        AND s.entry_count >= 0 AND s.object_size >= 0
        AND s.base_cost = s.object_size + (p.queue_fixed + 18) * s.entry_count
        AND (
-         (x.storage = 'loose' AND x.source_id = 0 AND EXISTS (
+         (s.storage = 'loose' AND s.source_id = 0 AND EXISTS (
            SELECT 1 FROM git_objects o
             WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
               AND o.type = 'tree' AND o.size = s.object_size
          ))
          OR
-         (x.storage = 'pack' AND EXISTS (
+         (s.storage = 'pack' AND EXISTS (
            SELECT 1
              FROM git_pack_objects o
              JOIN git_pack_meta m
                ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
               AND m.state = 'complete'
             WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
-              AND o.pack_id = x.source_id AND o.type = 'tree'
+              AND o.pack_id = s.source_id AND o.type = 'tree'
               AND o.size = s.object_size
          ))
        )
        AND NOT EXISTS (
-         SELECT 1 FROM git_tree_entries e
+         SELECT 1 FROM git_tree_entries_wide e
           WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
             AND e.storage = s.storage AND e.source_id = s.source_id
             AND e.ordinal IN (-1, s.entry_count)
@@ -68,7 +69,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
        AND (
          (s.entry_count = 0 AND s.base_cost = 0)
          OR EXISTS (
-           SELECT 1 FROM git_tree_entries e
+           SELECT 1 FROM git_tree_entries_wide e
             WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
               AND e.storage = s.storage AND e.source_id = s.source_id
               AND e.ordinal = s.entry_count - 1
@@ -90,7 +91,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
                THEN 'tree entries do not match the parsed source marker'
              WHEN e.ordinal > 0 AND NOT EXISTS (
-               SELECT 1 FROM git_tree_entries previous
+               SELECT 1 FROM git_tree_entries_wide previous
                 WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
                   AND previous.storage = e.storage AND previous.source_id = e.source_id
                   AND previous.ordinal = e.ordinal - 1
@@ -98,7 +99,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
                     + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
                     + COALESCE((
-                        SELECT previous.cumulative_base FROM git_tree_entries previous
+                        SELECT previous.cumulative_base FROM git_tree_entries_wide previous
                          WHERE previous.repo_id = e.repo_id
                            AND previous.tree_oid = e.tree_oid
                            AND previous.storage = e.storage
@@ -159,7 +160,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              + (s.entry_count - e.ordinal - 1) * 50
       FROM params p
       CROSS JOIN source_valid s
-      CROSS JOIN git_tree_entries e
+      CROSS JOIN git_tree_entries_wide e
      WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
        AND s.base_cost + s.entry_count * 50 <= p.queue_cap
        AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
@@ -197,7 +198,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
                THEN 'tree entries do not match the parsed source marker'
              WHEN e.ordinal > 0 AND NOT EXISTS (
-               SELECT 1 FROM git_tree_entries previous
+               SELECT 1 FROM git_tree_entries_wide previous
                 WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
                   AND previous.storage = e.storage AND previous.source_id = e.source_id
                   AND previous.ordinal = e.ordinal - 1
@@ -205,7 +206,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
                     + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
                     + COALESCE((
-                        SELECT previous.cumulative_base FROM git_tree_entries previous
+                        SELECT previous.cumulative_base FROM git_tree_entries_wide previous
                          WHERE previous.repo_id = e.repo_id
                            AND previous.tree_oid = e.tree_oid
                            AND previous.storage = e.storage
@@ -272,7 +273,7 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
       FROM walk w
       CROSS JOIN params p
       CROSS JOIN source_valid s
-      CROSS JOIN git_tree_entries e
+      CROSS JOIN git_tree_entries_wide e
      WHERE w.error IS NULL AND w.descend = 1
        AND instr(w.ancestry, '/' || w.oid || '/') = 0
        AND s.repo_id = p.repo_id AND s.tree_oid = w.oid
@@ -305,36 +306,37 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
     AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
   source_valid(repo_id, tree_oid, storage, source_id, object_size,
                entry_count, base_cost) AS NOT MATERIALIZED (
-    SELECT x.repo_id, x.tree_oid, x.storage, x.source_id, s.object_size,
+    SELECT x.repo_id, x.tree_oid, s.storage, s.source_id, s.object_size,
            s.entry_count, s.base_cost
       FROM git_tree_effective x
       CROSS JOIN params p
       CROSS JOIN git_tree_sources s
      WHERE x.repo_id = p.repo_id
        AND length(x.tree_oid) = 40 AND x.tree_oid NOT GLOB '*[^0-9a-f]*'
+       AND s.source_key = x.source_key
        AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
-       AND s.storage = x.storage AND s.source_id = x.source_id
+       AND s.complete = 1
        AND s.entry_count >= 0 AND s.object_size >= 0
        AND s.base_cost = s.object_size + (p.queue_fixed + 18) * s.entry_count
        AND (
-         (x.storage = 'loose' AND x.source_id = 0 AND EXISTS (
+         (s.storage = 'loose' AND s.source_id = 0 AND EXISTS (
            SELECT 1 FROM git_objects o
             WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
               AND o.type = 'tree' AND o.size = s.object_size
          ))
          OR
-         (x.storage = 'pack' AND EXISTS (
+         (s.storage = 'pack' AND EXISTS (
            SELECT 1 FROM git_pack_objects o
              JOIN git_pack_meta m
                ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
               AND m.state = 'complete'
             WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
-              AND o.pack_id = x.source_id AND o.type = 'tree'
+              AND o.pack_id = s.source_id AND o.type = 'tree'
               AND o.size = s.object_size
          ))
        )
        AND NOT EXISTS (
-         SELECT 1 FROM git_tree_entries e
+         SELECT 1 FROM git_tree_entries_wide e
           WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
             AND e.storage = s.storage AND e.source_id = s.source_id
             AND e.ordinal IN (-1, s.entry_count)
@@ -342,7 +344,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
        AND (
          (s.entry_count = 0 AND s.base_cost = 0)
          OR EXISTS (
-           SELECT 1 FROM git_tree_entries e
+           SELECT 1 FROM git_tree_entries_wide e
             WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
               AND e.storage = s.storage AND e.source_id = s.source_id
               AND e.ordinal = s.entry_count - 1
@@ -362,7 +364,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
              WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
                THEN 'tree entries do not match the parsed source marker'
              WHEN e.ordinal > 0 AND NOT EXISTS (
-               SELECT 1 FROM git_tree_entries previous
+               SELECT 1 FROM git_tree_entries_wide previous
                 WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
                   AND previous.storage = e.storage AND previous.source_id = e.source_id
                   AND previous.ordinal = e.ordinal - 1
@@ -370,7 +372,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
              WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
                     + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
                     + COALESCE((
-                        SELECT previous.cumulative_base FROM git_tree_entries previous
+                        SELECT previous.cumulative_base FROM git_tree_entries_wide previous
                          WHERE previous.repo_id = e.repo_id
                            AND previous.tree_oid = e.tree_oid
                            AND previous.storage = e.storage
@@ -409,7 +411,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                 THEN 'E2BIG' ELSE 'ECORRUPT' END
       FROM params p
       CROSS JOIN source_valid s
-      CROSS JOIN git_tree_entries e
+      CROSS JOIN git_tree_entries_wide e
      WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
        AND e.storage = s.storage AND e.source_id = s.source_id
   ),

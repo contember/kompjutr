@@ -230,13 +230,14 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
   ),
   selected AS MATERIALIZED (
     SELECT w.ordinal, w.side, w.segment, w.final, w.validated, w.tree_oid,
-           x.storage, x.source_id, s.object_size, s.entry_count, s.base_cost
+           s.storage, s.source_id, s.object_size, s.entry_count, s.base_cost
       FROM wanted w
       LEFT JOIN git_tree_effective x
         ON x.repo_id = ? AND x.tree_oid = w.tree_oid
       LEFT JOIN git_tree_sources s
-        ON s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
-       AND s.storage = x.storage AND s.source_id = x.source_id
+        ON s.source_key = x.source_key
+       AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
+       AND s.complete = 1
   ),
   distinct_sources AS MATERIALIZED (
     SELECT DISTINCT tree_oid, storage, source_id, object_size, entry_count, base_cost
@@ -265,19 +266,19 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
   preflight AS MATERIALIZED (
     SELECT source.*,
            (SELECT count(*) FROM (
-              SELECT 1 FROM git_tree_entries entry
+              SELECT 1 FROM git_tree_entries_wide entry
                WHERE entry.repo_id = ? AND entry.tree_oid = source.tree_oid
                  AND entry.storage = source.storage AND entry.source_id = source.source_id
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
             )) AS bounded_count,
            (SELECT coalesce(sum(length(raw_entry)), 0) FROM (
-              SELECT entry.raw_entry FROM git_tree_entries entry
+              SELECT entry.raw_entry FROM git_tree_entries_wide entry
                WHERE entry.repo_id = ? AND entry.tree_oid = source.tree_oid
                  AND entry.storage = source.storage AND entry.source_id = source.source_id
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
             )) AS raw_bytes,
            (SELECT coalesce(sum(length(raw_entry) + length(name_bytes)), 0) FROM (
-              SELECT entry.raw_entry, entry.name_bytes FROM git_tree_entries entry
+              SELECT entry.raw_entry, entry.name_bytes FROM git_tree_entries_wide entry
                WHERE entry.repo_id = ? AND entry.tree_oid = source.tree_oid
                  AND entry.storage = source.storage AND entry.source_id = source.source_id
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
@@ -315,7 +316,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                OR instr(CAST(entry.name_bytes AS TEXT), '/') != 0
                OR CAST(entry.name_bytes AS TEXT) != entry.name
                OR EXISTS (
-                 SELECT 1 FROM git_tree_entries duplicate
+                 SELECT 1 FROM git_tree_entries_wide duplicate
                   WHERE duplicate.repo_id = ? AND duplicate.tree_oid = entry.tree_oid
                     AND duplicate.storage = entry.storage
                     AND duplicate.source_id = entry.source_id
@@ -341,7 +342,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                OR entry.cumulative_base != ${TREE_QUEUE_ROW_FIXED_BYTES}
                     + length(entry.name_bytes) + length(CAST(entry.mode AS BLOB))
                     + length(CAST(entry.oid AS BLOB)) + coalesce((
-                      SELECT previous.cumulative_base FROM git_tree_entries previous
+                      SELECT previous.cumulative_base FROM git_tree_entries_wide previous
                        WHERE previous.repo_id = ? AND previous.tree_oid = entry.tree_oid
                          AND previous.storage = entry.storage
                          AND previous.source_id = entry.source_id
@@ -349,7 +350,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                     ), 0)
              THEN 1 ELSE 0 END), 0) AS invalid_entries
       FROM admitted source
-      LEFT JOIN git_tree_entries entry
+      LEFT JOIN git_tree_entries_wide entry
         ON entry.repo_id = ? AND entry.tree_oid = source.tree_oid
        AND entry.storage = source.storage AND entry.source_id = source.source_id
      GROUP BY source.tree_oid, source.storage, source.source_id
@@ -404,14 +405,14 @@ SELECT selected.ordinal, selected.side, selected.final, selected.validated,
   LEFT JOIN entry_checks checks
     ON checks.tree_oid = selected.tree_oid AND checks.storage = selected.storage
    AND checks.source_id = selected.source_id
-  LEFT JOIN git_tree_entries edge INDEXED BY git_tree_entries_by_name_bytes
+  LEFT JOIN git_tree_entries_wide edge
     ON edge.repo_id = ? AND edge.tree_oid = selected.tree_oid
    AND edge.storage = selected.storage AND edge.source_id = selected.source_id
    AND edge.name_bytes = CAST(selected.segment AS BLOB)
    AND typeof(edge.name_bytes) = 'blob' AND length(edge.name_bytes) <= ${MAX_PATH_BYTES}
    AND edge.ordinal = (
      SELECT min(candidate.ordinal)
-       FROM git_tree_entries candidate INDEXED BY git_tree_entries_by_name_bytes
+       FROM git_tree_entries_wide candidate
       WHERE candidate.repo_id = ? AND candidate.tree_oid = selected.tree_oid
         AND candidate.storage = selected.storage AND candidate.source_id = selected.source_id
         AND candidate.name_bytes = CAST(selected.segment AS BLOB)

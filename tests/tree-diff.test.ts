@@ -177,7 +177,14 @@ describe("tree diff", () => {
         { mode: MODE_FILE, name: "visible", oid: oid(3) },
       ]),
     );
-    db.run("UPDATE git_tree_entries SET oid = ? WHERE repo_id = 1 AND tree_oid = ?", oid(9), equal);
+    db.run(
+      `UPDATE git_tree_entries SET oid = ? WHERE source_key = (
+         SELECT source_key FROM git_tree_sources
+          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+       )`,
+      oid(9),
+      equal,
+    );
     expect([...store.walkTreeDiff(before, after)]).toEqual([
       {
         path: "visible",
@@ -251,7 +258,10 @@ describe("tree diff", () => {
       serializeTree([{ mode: MODE_TREE, name: "dir", oid: afterChild }]),
     );
     db.run(
-      "UPDATE git_tree_entries SET oid = ? WHERE repo_id = 1 AND tree_oid = ?",
+      `UPDATE git_tree_entries SET oid = ? WHERE source_key = (
+         SELECT source_key FROM git_tree_sources
+          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+       )`,
       oid(8),
       beforeChild,
     );
@@ -303,7 +313,10 @@ describe("tree diff", () => {
     if (changed === undefined) throw new Error("cycle fixture is empty");
     db.run(
       `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
-        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0`,
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND ordinal = 0`,
       cycleRoot,
       changed.rawEntry,
       cycleChild,
@@ -405,10 +418,12 @@ describe("tree diff", () => {
     const tree = store.write("tree", data);
     db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", tree);
     expect([...store.walkTreeDiff(null, tree)]).toHaveLength(1);
+    db.run("PRAGMA ignore_check_constraints = ON");
     db.run(
       "UPDATE git_pack_meta SET state = 'receiving' WHERE repo_id = 1 AND pack_id = ?",
       packId,
     );
+    db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => [...store.walkTreeDiff(null, tree)]).toThrow(/reimport or reclone/);
   });
 

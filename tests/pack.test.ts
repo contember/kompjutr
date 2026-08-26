@@ -762,8 +762,8 @@ describe("synthetic pack ingest", () => {
     const boundary = await measure(990);
     const overBoundary = await measure(991);
     const wide = await measure(3_293);
-    expect(small).toBe(11);
-    expect(large).toBe(11);
+    expect(small).toBe(12);
+    expect(large).toBe(12);
     expect(boundary).toBeLessThanOrEqual(20);
     expect(overBoundary).toBeLessThanOrEqual(20);
     expect(wide).toBeLessThanOrEqual(25);
@@ -1605,14 +1605,20 @@ describe("synthetic pack ingest", () => {
 
     expect(
       store.db.one(
-        "SELECT storage FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        `SELECT s.storage
+           FROM git_tree_effective e
+           JOIN git_tree_sources s ON s.source_key = e.source_key
+          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
         oid,
       ),
     ).toBeUndefined();
     store.db.run("UPDATE git_pack_meta SET state = 'complete' WHERE repo_id = 1 AND pack_id = 7");
     expect(
       store.db.one(
-        "SELECT storage, source_id FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        `SELECT s.storage, s.source_id
+           FROM git_tree_effective e
+           JOIN git_tree_sources s ON s.source_key = e.source_key
+          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
         oid,
       ),
     ).toEqual({ storage: "pack", source_id: 7 });
@@ -1630,7 +1636,10 @@ describe("synthetic pack ingest", () => {
     const { packId } = await store.packs.ingest(slices(concat(chunks), 64));
     expect(
       store.db.one(
-        "SELECT storage FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        `SELECT s.storage
+           FROM git_tree_effective e
+           JOIN git_tree_sources s ON s.source_key = e.source_key
+          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
         oid,
       ),
     ).toEqual({ storage: "pack" });
@@ -1641,7 +1650,10 @@ describe("synthetic pack ingest", () => {
     );
     expect(
       store.db.one(
-        "SELECT storage FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?",
+        `SELECT s.storage
+           FROM git_tree_effective e
+           JOIN git_tree_sources s ON s.source_key = e.source_key
+          WHERE e.repo_id = 1 AND e.tree_oid = ?`,
         oid,
       ),
     ).toBeUndefined();

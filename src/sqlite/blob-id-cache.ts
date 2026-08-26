@@ -1,0 +1,4 @@
+export const MAX_BLOB_ID_CACHE_ROWS = 65_536;
+export const MAX_CACHED_CONTENT_ID_BYTES = 256;
+export const MAX_BLOB_ID_CACHE_CONTENT_BYTES = MAX_BLOB_ID_CACHE_ROWS * MAX_CACHED_CONTENT_ID_BYTES;
+export const BLOB_ID_GENERATION_EXHAUSTED = "blob id cache generation is exhausted";

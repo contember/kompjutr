@@ -885,7 +885,10 @@ describe("batched tree reads", () => {
     if (cycle === undefined) throw new Error("cycle fixture did not produce a tree entry");
     db.run(
       `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
-        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0`,
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND ordinal = 0`,
       root,
       cycle.rawEntry,
       root,
@@ -907,7 +910,10 @@ describe("batched tree reads", () => {
 
     const gap = make();
     gap.db.run(
-      "DELETE FROM git_tree_entries WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 1",
+      `DELETE FROM git_tree_entries WHERE source_key = (
+         SELECT source_key FROM git_tree_sources
+          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+       ) AND ordinal = 1`,
       gap.oid,
     );
     expect(() => [...gap.store.walkTree(gap.oid)]).toThrow(/ordinal gap/);
@@ -954,7 +960,10 @@ describe("batched tree reads", () => {
     const entry = make();
     entry.db.run(
       `UPDATE git_tree_entries SET cumulative_base = cumulative_base - 1
-        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 1`,
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND ordinal = 1`,
       entry.oid,
     );
     expect(() => [...entry.store.walkTree(entry.oid)]).toThrow(/queue metadata is inconsistent/);
@@ -967,7 +976,10 @@ describe("batched tree reads", () => {
     const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
     const oid = store.write("tree", data);
     db.run(
-      "UPDATE git_tree_entries SET oid = ? WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0",
+      `UPDATE git_tree_entries SET oid = ? WHERE source_key = (
+         SELECT source_key FROM git_tree_sources
+          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+       ) AND ordinal = 0`,
       numberedOid(2),
       oid,
     );
@@ -975,18 +987,59 @@ describe("batched tree reads", () => {
     expect(() => [...store.walkTree(oid)]).toThrow(/integrity check failed/);
   });
 
+  it("rejects an effective tree repointed to a same-shaped source identity", () => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const first = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]),
+    );
+    const second = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "b", oid: numberedOid(2) }]),
+    );
+    const secondSource = db.scalar<number>(
+      "SELECT source_key FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?",
+      second,
+    );
+    if (secondSource === undefined) throw new Error("second tree source is missing");
+    expect(() =>
+      db.run(
+        "UPDATE git_tree_effective SET source_key = ? WHERE repo_id = 1 AND tree_oid = ?",
+        secondSource,
+        first,
+      ),
+    ).toThrow(/FOREIGN KEY constraint failed/);
+
+    db.run("PRAGMA foreign_keys = OFF");
+    db.run(
+      "UPDATE git_tree_effective SET source_key = ? WHERE repo_id = 1 AND tree_oid = ?",
+      secondSource,
+      first,
+    );
+    db.run("PRAGMA foreign_keys = ON");
+    expect(() => [...store.walkTree(first)]).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
   it("returns no corrupt BLOB or unbounded path cell on an error row", () => {
     const db = new BindingDatabase();
     const store = openScale(db);
     const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
     const oid = store.write("tree", data);
+    db.run("PRAGMA ignore_check_constraints = ON");
     db.run(
       `UPDATE git_tree_entries
-          SET name = 'oversized', name_bytes = zeroblob(10000000),
+          SET name_bytes = zeroblob(10000000),
               raw_entry = zeroblob(10000000), oid = printf('%.*c', 10000000, 'a')
-        WHERE repo_id = 1 AND tree_oid = ? AND ordinal = 0`,
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND ordinal = 0`,
       oid,
     );
+    db.run("PRAGMA ignore_check_constraints = OFF");
     db.maxResultBytes = 0;
 
     expect(() => [...store.walkTree(oid)]).toThrow();

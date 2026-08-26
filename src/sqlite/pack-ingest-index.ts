@@ -17,7 +17,7 @@ import {
   indexTreeSource,
   indexTreeSources,
   type TreeSourceInput,
-} from "./schema.js";
+} from "./tree-index.js";
 
 export const PACK_TREE_BATCH_BYTES = 1024 * 1024;
 const PACK_TREE_BATCH_SOURCES = 2048;

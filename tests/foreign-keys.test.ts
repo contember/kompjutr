@@ -20,20 +20,12 @@ function expectForeignKeysEnabled(db: ForeignKeyDatabase): void {
   expect(db.scalar<unknown>("PRAGMA foreign_keys")).toBe(1);
 }
 
-function insertTreeEntry(
-  db: ForeignKeyDatabase,
-  storage: "loose" | "pack",
-  sourceId: number,
-  treeOid: string,
-): void {
+function insertTreeEntry(db: ForeignKeyDatabase, sourceKey: number): void {
   db.run(
     `INSERT INTO git_tree_entries
-       (repo_id, tree_oid, storage, source_id, ordinal, mode, name, name_bytes,
-        oid, raw_entry, cumulative_base)
-     VALUES (91, ?, ?, ?, 0, '100644', 'file', ?, ?, ?, 0)`,
-    treeOid,
-    storage,
-    sourceId,
+       (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
+     VALUES (?, 0, '100644', ?, ?, ?, 0)`,
+    sourceKey,
     new TextEncoder().encode("file"),
     "1".repeat(40),
     new Uint8Array([1]),
@@ -48,8 +40,8 @@ function insertTreeSource(
 ): void {
   db.run(
     `INSERT INTO git_tree_sources
-       (repo_id, tree_oid, storage, source_id, object_size, entry_count, base_cost)
-     VALUES (91, ?, ?, ?, 1, 1, 1)`,
+       (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
+     VALUES (91, ?, ?, ?, 1, 1, 1, 1)`,
     treeOid,
     storage,
     sourceId,
@@ -59,9 +51,7 @@ function insertTreeSource(
 function expectEnforcedBehavior(db: ForeignKeyDatabase): void {
   expectForeignKeysEnabled(db);
 
-  expect(() => insertTreeEntry(db, "loose", 0, "9".repeat(40))).toThrow(
-    /FOREIGN KEY constraint failed/,
-  );
+  expect(() => insertTreeEntry(db, 999)).toThrow(/FOREIGN KEY constraint failed/);
 
   const sources: readonly {
     storage: "loose" | "pack";
@@ -73,7 +63,15 @@ function expectEnforcedBehavior(db: ForeignKeyDatabase): void {
   ];
   for (const source of sources) {
     insertTreeSource(db, source.storage, source.sourceId, source.treeOid);
-    insertTreeEntry(db, source.storage, source.sourceId, source.treeOid);
+    const sourceKey = db.scalar<number>(
+      `SELECT source_key FROM git_tree_sources
+        WHERE repo_id = 91 AND tree_oid = ? AND storage = ? AND source_id = ?`,
+      source.treeOid,
+      source.storage,
+      source.sourceId,
+    );
+    if (sourceKey === undefined) throw new Error("tree source insert did not return a key");
+    insertTreeEntry(db, sourceKey);
 
     // Delete the parent directly so no explicit cleanup path can hide a failed cascade.
     db.run(
@@ -84,13 +82,7 @@ function expectEnforcedBehavior(db: ForeignKeyDatabase): void {
       source.sourceId,
     );
     expect(
-      db.scalar<number>(
-        `SELECT COUNT(*) FROM git_tree_entries
-         WHERE repo_id = 91 AND tree_oid = ? AND storage = ? AND source_id = ?`,
-        source.treeOid,
-        source.storage,
-        source.sourceId,
-      ),
+      db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries WHERE source_key = ?", sourceKey),
     ).toBe(0);
   }
 }
@@ -146,9 +138,17 @@ describe("foreign-key contract", () => {
     new SqliteGitDatabase(first);
 
     insertTreeSource(first, "loose", 0, "a".repeat(40));
-    insertTreeEntry(first, "loose", 0, "a".repeat(40));
+    const looseKey = first.scalar<number>(
+      "SELECT source_key FROM git_tree_sources WHERE repo_id = 91 AND storage = 'loose'",
+    );
+    if (looseKey === undefined) throw new Error("loose tree source missing");
+    insertTreeEntry(first, looseKey);
     insertTreeSource(first, "pack", 7, "b".repeat(40));
-    insertTreeEntry(first, "pack", 7, "b".repeat(40));
+    const packKey = first.scalar<number>(
+      "SELECT source_key FROM git_tree_sources WHERE repo_id = 91 AND storage = 'pack'",
+    );
+    if (packKey === undefined) throw new Error("packed tree source missing");
+    insertTreeEntry(first, packKey);
     expect(first.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
       String(SCHEMA_VERSION),
     );
@@ -170,7 +170,7 @@ describe("foreign-key contract", () => {
     expect(
       reopened.all<{ storage: string; source_id: number; tree_oid: string }>(
         `SELECT storage, source_id, tree_oid
-         FROM git_tree_entries WHERE repo_id = 91 ORDER BY source_id`,
+         FROM git_tree_entries_wide WHERE repo_id = 91 ORDER BY source_id`,
       ),
     ).toEqual([
       { storage: "loose", source_id: 0, tree_oid: "a".repeat(40) },

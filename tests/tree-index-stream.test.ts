@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
 import { parseTreeStream, serializeTree, type TreeEntry, TreeParser } from "../src/core/objects.js";
 import { readBlob, type SqlDatabase } from "../src/sqlite/db.js";
+import { PackTreeIndex } from "../src/sqlite/pack-ingest-index.js";
 import {
   createTreeIndexSink,
   indexTreeSource,
@@ -10,11 +11,16 @@ import {
   TREE_QUEUE_ROW_FIXED_BYTES,
   type TreeSource,
 } from "../src/sqlite/schema.js";
+import { indexSeededTreeSource } from "../src/sqlite/tree-index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const OID = "11".repeat(20);
 const TREE_OID = "22".repeat(20);
 const ONE_MIB = 1024 * 1024;
+
+it("loads the pack tree index directly without a schema module cycle", () => {
+  expect(typeof PackTreeIndex).toBe("function");
+});
 
 function rawEntry(mode: string, name: string, oid = OID): Uint8Array {
   const oidBytes = new Uint8Array(20);
@@ -210,7 +216,7 @@ describe("incremental tree index sink", () => {
     });
     expect(
       inner.scalar<number>(
-        "SELECT COUNT(*) FROM git_tree_entries WHERE repo_id = 1 AND tree_oid = ?",
+        "SELECT COUNT(*) FROM git_tree_entries_wide WHERE repo_id = 1 AND tree_oid = ?",
         TREE_OID,
       ),
     ).toBe(count);
@@ -219,7 +225,7 @@ describe("incremental tree index sink", () => {
       raw_entry: Uint8Array;
       cumulative_base: number;
     }>(
-      `SELECT ordinal, raw_entry, cumulative_base FROM git_tree_entries
+      `SELECT ordinal, raw_entry, cumulative_base FROM git_tree_entries_wide
         WHERE repo_id = 1 AND tree_oid = ? AND ordinal IN (0, ?)
         ORDER BY ordinal`,
       TREE_OID,
@@ -259,16 +265,27 @@ describe("incremental tree index sink", () => {
     const direct = db.all<Record<string, unknown>>(
       `SELECT ordinal, mode, name, hex(name_bytes) AS name_bytes, oid,
               hex(raw_entry) AS raw_entry, cumulative_base
-         FROM git_tree_entries WHERE tree_oid = ? ORDER BY ordinal`,
+         FROM git_tree_entries_wide WHERE tree_oid = ? ORDER BY ordinal`,
       TREE_OID,
     );
     const legacy = db.all<Record<string, unknown>>(
       `SELECT ordinal, mode, name, hex(name_bytes) AS name_bytes, oid,
               hex(raw_entry) AS raw_entry, cumulative_base
-         FROM git_tree_entries WHERE tree_oid = ? ORDER BY ordinal`,
+         FROM git_tree_entries_wide WHERE tree_oid = ? ORDER BY ordinal`,
       "55".repeat(20),
     );
     expect(legacy).toEqual(direct);
+  });
+
+  it("fails closed when a seeded loose source is missing", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    const data = rawEntry("100644", "file");
+
+    expect(() =>
+      db.transactionSync(() => indexSeededTreeSource(db, source(data.length), [data])),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
   });
 
   it("rejects invalid modes, names, and object sizes without a marker", () => {

@@ -1138,7 +1138,10 @@ export class PackStore {
 
   #deletePack(packId: number): void {
     this.#db.run(
-      "DELETE FROM git_tree_entries WHERE repo_id = ? AND storage = 'pack' AND source_id = ?",
+      `DELETE FROM git_tree_effective WHERE source_key IN (
+         SELECT source_key FROM git_tree_sources
+          WHERE repo_id = ? AND storage = 'pack' AND source_id = ?
+       )`,
       this.#repoId,
       packId,
     );

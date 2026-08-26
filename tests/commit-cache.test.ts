@@ -306,11 +306,13 @@ describe("parsed commit cache", () => {
     const data = serializeCommit(fixture());
     const oid = store.write("commit", data);
 
+    store.db.run("PRAGMA ignore_check_constraints = ON");
     store.db.run(
       "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
       1,
       oid,
     );
+    store.db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => store.cachedCommit(oid)).toThrow(/invalid parents/);
     store.db.run(
       "UPDATE git_commits SET parents = ?, cache_bytes = cache_bytes + 1 WHERE repo_id = ? AND oid = ?",
@@ -580,11 +582,13 @@ describe("parsed commit cache", () => {
   it("fails a corrupt tail row before returning the valid root", () => {
     const store = open();
     const [parent, root] = commitChain(store, 2);
+    store.db.run("PRAGMA ignore_check_constraints = ON");
     store.db.run(
       "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
       1,
       parent,
     );
+    store.db.run("PRAGMA ignore_check_constraints = OFF");
     const walk = store.commitGraph(root!)[Symbol.iterator]();
 
     expect(() => walk.next()).toThrow(/cache is corrupt/);

@@ -75,7 +75,9 @@ import {
 
 export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 
-import { indexTreeSource, indexTreeSources, initializeGitSchema } from "./schema.js";
+import { BLOB_ID_GENERATION_EXHAUSTED, MAX_CACHED_CONTENT_ID_BYTES } from "./blob-id-cache.js";
+import { initializeGitSchema } from "./schema.js";
+import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
 import {
   iterateTree,
   iterateTreeDiff,
@@ -363,7 +365,14 @@ interface ExpectedContentIdPage {
   rows: { i: number; a: number; n: number; o: string }[];
 }
 
+interface BlobIdWriteRow {
+  a: number;
+  n: number;
+  o: string;
+}
+
 export const MAX_BLOB_ID_MISMATCH_RETAINED_BYTES = 16 * 1024 * 1024;
+export const MAX_BLOB_ID_INPUT_RETAINED_BYTES = 16 * 1024 * 1024;
 const BLOB_ID_MISMATCH_ROW_BYTES = 384;
 
 export function blobIdMismatchRetainedBytes(mapping: BlobIdMapping): number {
@@ -372,11 +381,21 @@ export function blobIdMismatchRetainedBytes(mapping: BlobIdMapping): number {
 
 function contentIdPages(contentIds: Iterable<Uint8Array>): ContentIdPage[] {
   const unique = new Map<string, Uint8Array>();
+  let retainedBytes = 0;
   for (const contentId of contentIds) {
-    if (contentId.length > CONTENT_ID_PAYLOAD) {
-      throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
+    if (contentId.length > MAX_CACHED_CONTENT_ID_BYTES) continue;
+    const key = contentIdKey(contentId);
+    if (!unique.has(key)) {
+      const bytes = BLOB_ID_MISMATCH_ROW_BYTES + contentId.length + key.length * 2;
+      if (bytes > MAX_BLOB_ID_INPUT_RETAINED_BYTES - retainedBytes) {
+        throw new GitError(
+          "E2BIG",
+          `blob id lookup state exceeds ${MAX_BLOB_ID_INPUT_RETAINED_BYTES} bytes`,
+        );
+      }
+      retainedBytes += bytes;
     }
-    unique.set(contentIdKey(contentId), contentId);
+    unique.set(key, contentId);
   }
   const pages: ContentIdPage[] = [];
   let parts: Uint8Array[] = [];
@@ -404,6 +423,49 @@ function contentIdPages(contentIds: Iterable<Uint8Array>): ContentIdPage[] {
   return pages;
 }
 
+function writeBlobIdPage(
+  db: SqlDatabase,
+  repoId: number,
+  payload: Uint8Array,
+  rows: readonly BlobIdWriteRow[],
+  begin: boolean,
+  finish: boolean,
+): void {
+  try {
+    db.run(
+      `WITH input(repo_id, payload, batch) AS MATERIALIZED (VALUES (?, ?, ?))
+       INSERT INTO git_blob_id_updates (repo_id, content_id, oid, operation, ordinal)
+       SELECT repo_id, content_id, oid, operation, ordinal
+         FROM (
+           SELECT CAST(repo_id AS INTEGER) AS repo_id, zeroblob(0) AS content_id, '' AS oid,
+                  'begin' AS operation, -1 AS ordinal
+             FROM input WHERE json_extract(batch, '$.b') = 1
+           UNION ALL
+           SELECT CAST(repo_id AS INTEGER),
+                  CASE WHEN json_extract(j.value, '$.n') = 0 THEN zeroblob(0)
+                       ELSE substr(payload, json_extract(j.value, '$.a'),
+                                            json_extract(j.value, '$.n'))
+                   END,
+                  json_extract(j.value, '$.o'), 'mapping', CAST(j.key AS INTEGER)
+             FROM input, json_each(input.batch, '$.r') j
+           UNION ALL
+           SELECT CAST(repo_id AS INTEGER), zeroblob(0), '', 'finish',
+                  json_array_length(batch, '$.r')
+             FROM input WHERE json_extract(batch, '$.f') = 1
+         )
+        ORDER BY ordinal`,
+      repoId,
+      blob(payload),
+      JSON.stringify({ b: begin ? 1 : 0, f: finish ? 1 : 0, r: rows }),
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(BLOB_ID_GENERATION_EXHAUSTED)) {
+      throw new GitError("E2BIG", BLOB_ID_GENERATION_EXHAUSTED, { cause: error });
+    }
+    throw error;
+  }
+}
+
 /** Expected mappings in pages whose BLOB and JSON inputs stay bounded. */
 function* expectedContentIdPages(
   mappings: readonly BlobIdMapping[],
@@ -415,6 +477,7 @@ function* expectedContentIdPages(
   for (let ordinal = 0; ordinal < mappings.length; ordinal++) {
     const mapping = mappings[ordinal];
     if (mapping === undefined) continue;
+    if (mapping.contentId.length > MAX_CACHED_CONTENT_ID_BYTES) continue;
     if (
       rows.length > 0 &&
       (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
@@ -998,7 +1061,7 @@ function requireBooleanProbe(value: unknown, label: string): boolean {
 
 class InitialBlobIdBuffer {
   #payload: Uint8Array | null = new Uint8Array(CONTENT_ID_PAYLOAD);
-  #rows: { a: number; n: number; o: string }[] = [];
+  #rows: BlobIdWriteRow[] = [];
   #length = 0;
 
   constructor(
@@ -1011,14 +1074,19 @@ class InitialBlobIdBuffer {
   }
 
   get reservedBytes(): number {
-    return this.retainedBytes + this.#rows.length * INITIAL_BLOB_ROW_JSON_BYTES * 2 + 4;
+    return this.retainedBytes + this.#rows.length * INITIAL_BLOB_ROW_JSON_BYTES * 2 + 32;
   }
 
   additionalReservedBytes(): number {
     return BLOB_ID_MISMATCH_ROW_BYTES + INITIAL_BLOB_ROW_JSON_BYTES * 2;
   }
 
+  willCache(mapping: BlobIdMapping): boolean {
+    return mapping.contentId.length <= MAX_CACHED_CONTENT_ID_BYTES;
+  }
+
   needsFlush(mapping: BlobIdMapping): boolean {
+    if (!this.willCache(mapping)) return false;
     return (
       this.#rows.length >= CONTENT_ID_PAGE ||
       this.#length + mapping.contentId.length > CONTENT_ID_PAYLOAD
@@ -1027,13 +1095,11 @@ class InitialBlobIdBuffer {
 
   validate(mapping: BlobIdMapping): void {
     if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-    if (mapping.contentId.length > CONTENT_ID_PAYLOAD) {
-      throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
-    }
   }
 
   add(mapping: BlobIdMapping): void {
     this.validate(mapping);
+    if (!this.willCache(mapping)) return;
     if (
       this.#rows.length > 0 &&
       (this.#rows.length >= CONTENT_ID_PAGE ||
@@ -1052,22 +1118,13 @@ class InitialBlobIdBuffer {
     if (this.#rows.length === 0) return;
     const payload = this.#payload;
     if (payload === null) throw new Error("initial blob id buffer is disposed");
-    this.db.run(
-      `INSERT INTO git_blob_ids (repo_id, content_id, oid)
-       SELECT ?,
-              CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
-                   ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
-               END,
-              json_extract(value, '$.o')
-         FROM json_each(?)
-        WHERE true
-       ON CONFLICT(repo_id, content_id) DO UPDATE SET oid = excluded.oid`,
-      this.repoId,
-      blob(payload),
-      JSON.stringify(this.#rows),
-    );
+    writeBlobIdPage(this.db, this.repoId, payload, this.#rows, true, true);
     this.#rows = [];
     this.#length = 0;
+  }
+
+  finish(): void {
+    this.flush();
   }
 
   dispose(): void {
@@ -1328,13 +1385,12 @@ export class RepoStore {
    */
   blobIdMismatches(expected: Iterable<BlobIdMapping>): Map<number, string | null> {
     const retained: BlobIdMapping[] = [];
+    const mismatches = new Map<number, string | null>();
     let retainedBytes = 0;
     for (const mapping of expected) {
       if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-      if (mapping.contentId.length > CONTENT_ID_PAYLOAD) {
-        throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
-      }
-      const bytes = blobIdMismatchRetainedBytes(mapping);
+      const cacheable = mapping.contentId.length <= MAX_CACHED_CONTENT_ID_BYTES;
+      const bytes = cacheable ? blobIdMismatchRetainedBytes(mapping) : BLOB_ID_MISMATCH_ROW_BYTES;
       if (bytes > MAX_BLOB_ID_MISMATCH_RETAINED_BYTES - retainedBytes) {
         throw new GitError(
           "E2BIG",
@@ -1343,9 +1399,9 @@ export class RepoStore {
       }
       retainedBytes += bytes;
       retained.push(mapping);
+      if (!cacheable) mismatches.set(retained.length - 1, null);
     }
 
-    const mismatches = new Map<number, string | null>();
     for (const page of expectedContentIdPages(retained)) {
       for (const row of this.#db.all<{ ordinal: number; oid: string | null }>(
         `WITH expected(ordinal, content_id, expected_oid) AS MATERIALIZED (
@@ -1385,12 +1441,23 @@ export class RepoStore {
   /** Upsert opaque content-id mappings in bounded BLOB payloads. */
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
     const unique = new Map<string, BlobIdMapping>();
+    let retainedBytes = 0;
     for (const mapping of mappings) {
       if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-      if (mapping.contentId.length > CONTENT_ID_PAYLOAD) {
-        throw new GitError("E2BIG", "content id exceeds the 1 MiB batch value limit");
+      if (mapping.contentId.length > MAX_CACHED_CONTENT_ID_BYTES) continue;
+      const key = contentIdKey(mapping.contentId);
+      const previous = unique.get(key);
+      if (previous === undefined) {
+        const bytes = blobIdMismatchRetainedBytes(mapping) + key.length * 2;
+        if (bytes > MAX_BLOB_ID_INPUT_RETAINED_BYTES - retainedBytes) {
+          throw new GitError(
+            "E2BIG",
+            `blob id update state exceeds ${MAX_BLOB_ID_INPUT_RETAINED_BYTES} bytes`,
+          );
+        }
+        retainedBytes += bytes;
       }
-      unique.set(contentIdKey(mapping.contentId), mapping);
+      unique.set(key, mapping);
     }
     if (unique.size === 0) return;
     this.#db.transactionSync(() => {
@@ -1399,20 +1466,7 @@ export class RepoStore {
       let length = 0;
       const flush = (): void => {
         if (rows.length === 0) return;
-        this.#db.run(
-          `INSERT INTO git_blob_ids (repo_id, content_id, oid)
-         SELECT ?,
-                CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
-                     ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
-                 END,
-                json_extract(value, '$.o')
-           FROM json_each(?)
-          WHERE true
-         ON CONFLICT(repo_id, content_id) DO UPDATE SET oid = excluded.oid`,
-          this.#repoId,
-          blob(concat(parts)),
-          JSON.stringify(rows),
-        );
+        writeBlobIdPage(this.#db, this.#repoId, concat(parts), rows, true, true);
         parts = [];
         rows = [];
         length = 0;
@@ -1791,7 +1845,7 @@ export class RepoStore {
         }
       }
       if (type === "tree") {
-        indexTreeSource(
+        indexSeededTreeSource(
           this.#db,
           {
             repoId: this.#repoId,
@@ -1892,7 +1946,7 @@ export class RepoStore {
           );
         }
         if (type === "tree") {
-          indexTreeSource(
+          indexSeededTreeSource(
             this.#db,
             {
               repoId: this.#repoId,
@@ -1969,7 +2023,7 @@ export class RepoStore {
       };
       const storage = storageChunks();
       if (type === "tree") {
-        indexTreeSource(
+        indexSeededTreeSource(
           this.#db,
           {
             repoId: this.#repoId,
@@ -2157,7 +2211,7 @@ export class RepoStore {
           JSON.stringify(payload.rows),
         );
       }
-      indexTreeSources(
+      indexSeededTreeSources(
         this.#db,
         fresh.flatMap((object) => {
           if (object.type !== "tree" || object.treeData === undefined) return [];
@@ -3532,6 +3586,7 @@ export class RepoStore {
         addBlobId: (mapping) => {
           attempt(() => {
             blobIds.validate(mapping);
+            if (!blobIds.willCache(mapping)) return;
             if (blobIds.needsFlush(mapping)) blobIds.flush();
             requireRoom(blobIds.additionalReservedBytes(), "blob");
             blobIds.add(mapping);
@@ -3543,7 +3598,7 @@ export class RepoStore {
       };
       const finish = (): void => {
         attempt(() => pending.flush());
-        attempt(() => blobIds.flush());
+        attempt(() => blobIds.finish());
       };
 
       try {
@@ -3858,12 +3913,12 @@ export class RepoStore {
         "git_operation_state",
         "git_refs",
         "git_blob_ids",
+        "git_blob_id_state",
         "git_config",
         "git_index",
         "git_shallow",
         "git_commits",
         "git_tree_effective",
-        "git_tree_entries",
         "git_tree_sources",
         "git_objects",
         "git_object_chunks",

@@ -5,7 +5,8 @@
 // the working tree is imported.
 
 import { describe, expect, it } from "vitest";
-import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
+import { concat } from "../src/core/bytes.js";
+import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import {
   type MergeStateMetadata,
   type MergeTouchedPath,
@@ -17,10 +18,13 @@ import {
   operationJournalV10RetainedBytes,
   type ReplayStateMetadata,
 } from "../src/core/ops/operation-state.js";
+import { PackWriter } from "../src/core/pack/writer.js";
 import { initializeFsSchema, ROOT_INODE } from "../src/fs/schema.js";
+import { blob } from "../src/sqlite/db.js";
 import { initializeGitSchema, SCHEMA_VERSION } from "../src/sqlite/schema.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
+import { createFrozenV11Schema } from "./helpers/schema-v11.js";
 
 /** The v1 schema, as it shipped: no git_blob_ids, no git_commits, no `stored`. */
 function createV1(db: TestDatabase): void {
@@ -33,6 +37,82 @@ function createV1(db: TestDatabase): void {
      PRIMARY KEY (repo_id, oid)
    )`);
   db.run("INSERT INTO git_meta (key, value) VALUES ('schema_version', '1')");
+}
+
+function seedV11Repository(db: TestDatabase, repoId = 1): void {
+  db.run(
+    "INSERT INTO git_repositories (id, root, head) VALUES (?, ?, 'ref: refs/heads/main')",
+    repoId,
+    `/repo-${repoId}`,
+  );
+}
+
+function seedV11Loose(
+  db: TestDatabase,
+  repoId: number,
+  type: "tree" | "commit",
+  data: Uint8Array,
+): string {
+  const oid = hashObject(type, data);
+  db.run(
+    "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
+    repoId,
+    oid,
+    type,
+    data.length,
+  );
+  if (data.length === 0) {
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
+      repoId,
+      oid,
+    );
+  } else {
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+      repoId,
+      oid,
+      blob(data),
+    );
+  }
+  return oid;
+}
+
+function seedV11PackedEmptyTree(db: TestDatabase, repoId: number, packId: number): string {
+  const data = serializeTree([]);
+  const oid = hashObject("tree", data);
+  const parts: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => parts.push(chunk));
+  writer.header(1);
+  writer.object("tree", data);
+  writer.finish();
+  const pack = concat(parts);
+  const dataOffset = 13;
+  const dataLength = pack.length - dataOffset - 20;
+  db.run(
+    `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+     VALUES (?, ?, ?, 1, 'complete', 0)`,
+    repoId,
+    packId,
+    pack.length,
+  );
+  db.run(
+    "INSERT INTO git_pack_data (repo_id, pack_id, seq, data) VALUES (?, ?, 0, ?)",
+    repoId,
+    packId,
+    blob(pack),
+  );
+  db.run(
+    `INSERT INTO git_pack_objects
+       (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+     VALUES (?, ?, ?, 12, ?, ?, 'tree', 0, 0, NULL)`,
+    repoId,
+    oid,
+    packId,
+    dataOffset,
+    dataLength,
+  );
+  return oid;
 }
 
 function columnsOf(db: TestDatabase, table: string): string[] {
@@ -284,7 +364,10 @@ describe("git schema", () => {
     const db = new TestDatabase();
     db.run("PRAGMA foreign_keys = OFF");
     createV1(db);
-    db.run("INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, 'abc', 'blob', 7)");
+    db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, ?, 'blob', 7)",
+      "a".repeat(40),
+    );
 
     new SqliteGitDatabase(db);
 
@@ -293,7 +376,7 @@ describe("git schema", () => {
       String(SCHEMA_VERSION),
     );
     expect(db.one("SELECT oid, type, size, stored FROM git_objects")).toEqual({
-      oid: "abc",
+      oid: "a".repeat(40),
       type: "blob",
       size: 7,
       stored: "zlib",
@@ -308,7 +391,8 @@ describe("git schema", () => {
       String(SCHEMA_VERSION),
     );
     expect(columnsOf(db, "git_objects")).toContain("stored");
-    expect(columnsOf(db, "git_blob_ids")).toEqual(["repo_id", "content_id", "oid"]);
+    expect(columnsOf(db, "git_blob_ids")).toEqual(["repo_id", "content_id", "oid", "generation"]);
+    expect(columnsOf(db, "git_blob_id_state")).toEqual(["repo_id", "generation"]);
     expect(columnsOf(db, "git_index")).toEqual([
       "repo_id",
       "path",
@@ -424,42 +508,32 @@ describe("git schema", () => {
       "cache_bytes",
     ]);
     expect(columnsOf(db, "git_tree_sources")).toEqual([
+      "source_key",
       "repo_id",
       "tree_oid",
       "storage",
       "source_id",
+      "complete",
       "object_size",
       "entry_count",
       "base_cost",
     ]);
     expect(columnsOf(db, "git_tree_entries")).toEqual([
-      "repo_id",
-      "tree_oid",
-      "storage",
-      "source_id",
+      "source_key",
       "ordinal",
       "mode",
-      "name",
       "name_bytes",
       "oid",
       "raw_entry",
       "cumulative_base",
     ]);
-    expect(columnsOf(db, "git_tree_effective")).toEqual([
-      "repo_id",
-      "tree_oid",
-      "storage",
-      "source_id",
-    ]);
+    expect(columnsOf(db, "git_tree_effective")).toEqual(["repo_id", "tree_oid", "source_key"]);
     expect(
       treeNameBytesIndexColumns(db)
         .filter((column) => column.key === 1)
         .map((column) => ({ name: column.name, coll: column.coll, desc: column.desc })),
     ).toEqual([
-      { name: "repo_id", coll: "BINARY", desc: 0 },
-      { name: "tree_oid", coll: "BINARY", desc: 0 },
-      { name: "storage", coll: "BINARY", desc: 0 },
-      { name: "source_id", coll: "BINARY", desc: 0 },
+      { name: "source_key", coll: "BINARY", desc: 0 },
       { name: "name_bytes", coll: "BINARY", desc: 0 },
     ]);
     expect(treeNameBytesIndex(db)).toEqual({
@@ -476,16 +550,66 @@ describe("git schema", () => {
     ).toContain("WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200");
   });
 
+  it("fails before current CREATE statements can mask a missing v11 authoritative table", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    db.run("DROP TABLE git_pack_data");
+    db.storage.resetCounters();
+
+    expect(() => initializeGitSchema(db)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("11");
+    expect(
+      db.scalar<number>(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'git_pack_data'",
+      ),
+    ).toBe(0);
+  });
+
+  it("rejects non-BLOB v11 loose chunks with ECORRUPT and preserves them on rollback", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    seedV11Repository(db);
+    const oid = seedV11Loose(db, 1, "tree", serializeTree([]));
+    db.run("UPDATE git_object_chunks SET data = 'not-a-blob' WHERE repo_id = 1 AND oid = ?", oid);
+
+    expect(() => initializeGitSchema(db)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(db.scalar<string>("SELECT typeof(data) FROM git_object_chunks WHERE oid = ?", oid)).toBe(
+      "text",
+    );
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("11");
+  });
+
+  it("rejects invalid v11 pack creation metadata before rebuilding projections", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    seedV11Repository(db);
+    seedV11PackedEmptyTree(db, 1, 7);
+    db.run("UPDATE git_pack_meta SET created = -1 WHERE repo_id = 1 AND pack_id = 7");
+
+    expect(() => initializeGitSchema(db)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(db.scalar<number>("SELECT created FROM git_pack_meta WHERE pack_id = 7")).toBe(-1);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("11");
+  });
+
   it("migrates a v1 database without touching its rows", () => {
     const db = new TestDatabase();
     createV1(db);
-    db.run("INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, 'abc', 'blob', 7)");
+    db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size) VALUES (1, ?, 'blob', 7)",
+      "a".repeat(40),
+    );
 
     initializeGitSchema(db);
 
     expect(columnsOf(db, "git_objects")).toContain("stored");
     expect(db.one("SELECT oid, type, size, stored FROM git_objects")).toEqual({
-      oid: "abc",
+      oid: "a".repeat(40),
       type: "blob",
       size: 7,
       // Existing rows inherit the default, which is what they were.
@@ -523,7 +647,8 @@ describe("git schema", () => {
     ) WITHOUT ROWID`);
     db.run("INSERT INTO git_commits VALUES (1, 'cached', '', 'tree', 123)");
     db.run(
-      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, 'raw', 'commit', 7, 'raw')",
+      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (1, ?, 'blob', 7, 'raw')",
+      "b".repeat(40),
     );
     db.run("UPDATE git_meta SET value = '3' WHERE key = 'schema_version'");
 
@@ -531,8 +656,8 @@ describe("git schema", () => {
 
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
     expect(db.one("SELECT oid, type, size, stored FROM git_objects")).toEqual({
-      oid: "raw",
-      type: "commit",
+      oid: "b".repeat(40),
+      type: "blob",
       size: 7,
       stored: "raw",
     });
@@ -598,22 +723,18 @@ describe("git schema", () => {
     );
   });
 
-  it("adds the tree name-bytes index to v6 without changing rows", () => {
+  it("rebuilds corrupt legacy tree projections from authoritative loose bytes", () => {
     const db = new TestDatabase();
-    initializeGitSchema(db);
-    db.run("DROP INDEX git_tree_entries_by_name_bytes");
-    db.run("INSERT INTO git_tree_sources VALUES (1, 'tree', 'loose', 0, 3, 3, 3)");
-    db.run(
-      `INSERT INTO git_tree_entries VALUES
-         (1, 'tree', 'loose', 0, 0, '100644', 'file', X'66696C65', 'blob-0', X'00', 1),
-         (1, 'tree', 'loose', 0, 1, '100644', 'file', X'66696C65', 'blob-1', X'01', 2)`,
+    const database = new SqliteGitDatabase(db);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    const oid = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_FILE, name: "file", oid: "1".repeat(40) },
+        { mode: MODE_FILE, name: "other", oid: "2".repeat(40) },
+      ]),
     );
-    // Migration leaves corrupt v6 rows for read-time source validation.
-    db.run(
-      `INSERT INTO git_tree_entries VALUES
-         (1, 'tree', 'loose', 0, 2, '100644', 'oversized', ?, 'blob-2', X'02', 3)`,
-      new Uint8Array(2201),
-    );
+    db.run("UPDATE git_tree_entries SET raw_entry = X'00'");
     db.run("UPDATE git_meta SET value = '6' WHERE key = 'schema_version'");
 
     initializeGitSchema(db);
@@ -622,20 +743,20 @@ describe("git schema", () => {
       db.one(`SELECT repo_id, tree_oid, storage, source_id, ordinal, mode, name,
                      hex(name_bytes) AS name_bytes, oid, hex(raw_entry) AS raw_entry,
                      cumulative_base
-                FROM git_tree_entries
+                FROM git_tree_entries_wide
                WHERE ordinal = 0`),
     ).toEqual({
       repo_id: 1,
-      tree_oid: "tree",
+      tree_oid: oid,
       storage: "loose",
       source_id: 0,
       ordinal: 0,
       mode: "100644",
       name: "file",
       name_bytes: "66696C65",
-      oid: "blob-0",
-      raw_entry: "00",
-      cumulative_base: 1,
+      oid: "1".repeat(40),
+      raw_entry: `3130303634342066696C6500${"11".repeat(20)}`,
+      cumulative_base: 242,
     });
     expect(
       db.all<{ ordinal: number; nameBytes: number }>(
@@ -645,8 +766,7 @@ describe("git schema", () => {
       ),
     ).toEqual([
       { ordinal: 0, nameBytes: 4 },
-      { ordinal: 1, nameBytes: 4 },
-      { ordinal: 2, nameBytes: 2201 },
+      { ordinal: 1, nameBytes: 5 },
     ]);
     expect(
       db.scalar<number>(`SELECT COUNT(*)
@@ -662,10 +782,185 @@ describe("git schema", () => {
       treeNameBytesIndexColumns(db)
         .filter((column) => column.key === 1)
         .map((column) => column.name),
-    ).toEqual(["repo_id", "tree_oid", "storage", "source_id", "name_bytes"]);
+    ).toEqual(["source_key", "name_bytes"]);
     expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe(
       String(SCHEMA_VERSION),
     );
+  });
+
+  it("batches a large genuine v11 rebuild and preserves loose shadowing over a complete pack", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    seedV11Repository(db);
+    const person = {
+      name: "Migration",
+      email: "migration@example.com",
+      timestamp: 1_700_000_000,
+      timezoneOffset: 0,
+    };
+    db.transactionSync(() => {
+      for (let index = 0; index < 2_000; index++) {
+        const tree = seedV11Loose(
+          db,
+          1,
+          "tree",
+          serializeTree([
+            {
+              mode: MODE_FILE,
+              name: `file-${index}`,
+              oid: (index + 1).toString(16).padStart(40, "0"),
+            },
+          ]),
+        );
+        seedV11Loose(
+          db,
+          1,
+          "commit",
+          serializeCommit({
+            tree,
+            parent: [],
+            author: person,
+            committer: person,
+            message: `commit ${index}\n`,
+          }),
+        );
+      }
+    });
+    const shadowed = seedV11Loose(db, 1, "tree", serializeTree([]));
+    expect(seedV11PackedEmptyTree(db, 1, 7)).toBe(shadowed);
+    db.run(
+      `INSERT INTO git_tree_sources
+         (repo_id, tree_oid, storage, source_id, object_size, entry_count, base_cost)
+       VALUES (1, ?, 'loose', 0, 0, 0, 0), (1, ?, 'pack', 7, 0, 0, 0)`,
+      shadowed,
+      shadowed,
+    );
+    expect(columnsOf(db, "git_tree_entries")).toContain("name");
+    db.storage.resetCounters();
+
+    initializeGitSchema(db);
+
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(2_000);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
+      2_002,
+    );
+    expect(
+      db.scalar<string>(
+        `SELECT source.storage FROM git_tree_effective effective
+         JOIN git_tree_sources source ON source.source_key = effective.source_key
+        WHERE effective.repo_id = 1 AND effective.tree_oid = ?`,
+        shadowed,
+      ),
+    ).toBe("loose");
+    db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", shadowed);
+    expect(
+      db.scalar<string>(
+        `SELECT source.storage FROM git_tree_effective effective
+         JOIN git_tree_sources source ON source.source_key = effective.source_key
+        WHERE effective.repo_id = 1 AND effective.tree_oid = ?`,
+        shadowed,
+      ),
+    ).toBe("pack");
+  });
+
+  it("rolls a corrupt genuine v11 migration back to its exact natural-key shape and data", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    seedV11Repository(db);
+    const data = serializeTree([{ mode: MODE_FILE, name: "file", oid: "4".repeat(40) }]);
+    const oid = seedV11Loose(db, 1, "tree", data);
+    db.run(
+      `INSERT INTO git_tree_sources
+         (repo_id, tree_oid, storage, source_id, object_size, entry_count, base_cost)
+       VALUES (1, ?, 'loose', 0, ?, 1, ?)`,
+      oid,
+      data.length,
+      data.length + 242,
+    );
+    db.run(
+      `INSERT INTO git_tree_entries
+         (repo_id, tree_oid, storage, source_id, ordinal, mode, name, name_bytes,
+          oid, raw_entry, cumulative_base)
+       VALUES (1, ?, 'loose', 0, 0, '100644', 'file', X'66696c65', ?, X'00', ?)`,
+      oid,
+      "4".repeat(40),
+      data.length + 242,
+    );
+    db.run("UPDATE git_object_chunks SET data = X'00' WHERE repo_id = 1 AND oid = ?", oid);
+
+    expect(() => initializeGitSchema(db)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("11");
+    expect(columnsOf(db, "git_tree_sources")).toEqual([
+      "repo_id",
+      "tree_oid",
+      "storage",
+      "source_id",
+      "object_size",
+      "entry_count",
+      "base_cost",
+    ]);
+    expect(columnsOf(db, "git_tree_entries")).toContain("name");
+    expect(db.scalar<string>("SELECT hex(data) FROM git_object_chunks WHERE oid = ?", oid)).toBe(
+      "00",
+    );
+    expect(
+      db.scalar<string>("SELECT hex(raw_entry) FROM git_tree_entries WHERE tree_oid = ?", oid),
+    ).toBe("00");
+    expect(db.scalar<number>("SELECT COUNT(*) FROM sqlite_schema WHERE name GLOB '*_v11'")).toBe(0);
+  });
+
+  it("returns E2BIG and preserves v11 before initialization executes 1,000 statements", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    const tree = serializeTree([]);
+    db.transactionSync(() => {
+      for (let repoId = 1; repoId <= 250; repoId++) {
+        seedV11Repository(db, repoId);
+        seedV11Loose(db, repoId, "tree", tree);
+      }
+    });
+    db.storage.resetCounters();
+
+    expect(() => initializeGitSchema(db)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(db.storage.statementCount).toBe(999);
+    expect(db.scalar<string>("SELECT value FROM git_meta WHERE key = 'schema_version'")).toBe("11");
+    expect(columnsOf(db, "git_tree_sources")).not.toContain("source_key");
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_objects")).toBe(250);
+  });
+
+  it("preserves a bounded v11 blob cache and drops an over-width repository cache", () => {
+    const db = new TestDatabase();
+    createFrozenV11Schema(db);
+    seedV11Repository(db, 1);
+    seedV11Repository(db, 2);
+    db.run(
+      "INSERT INTO git_blob_ids (repo_id, content_id, oid) VALUES (1, X'01', ?), (1, X'02', ?)",
+      "1".repeat(40),
+      "2".repeat(40),
+    );
+    db.run(
+      "INSERT INTO git_blob_ids (repo_id, content_id, oid) VALUES (2, ?, ?)",
+      blob(new Uint8Array(257)),
+      "3".repeat(40),
+    );
+
+    initializeGitSchema(db);
+
+    expect(
+      db.all<{ repo_id: number; content_id: string; generation: number }>(
+        `SELECT repo_id, hex(content_id) AS content_id, generation
+           FROM git_blob_ids ORDER BY repo_id, content_id`,
+      ),
+    ).toEqual([
+      { repo_id: 1, content_id: "01", generation: 1 },
+      { repo_id: 1, content_id: "02", generation: 1 },
+    ]);
+    expect(db.all("SELECT repo_id, generation FROM git_blob_id_state")).toEqual([
+      { repo_id: 1, generation: 1 },
+    ]);
   });
 
   it("adds empty operation journal tables to v7", () => {
@@ -948,8 +1243,8 @@ describe("git schema", () => {
     const plan = db.all<{ detail: string }>(`EXPLAIN QUERY PLAN
       SELECT ordinal
         FROM git_tree_entries
-       WHERE repo_id = 1 AND tree_oid = 'tree' AND storage = 'loose'
-         AND source_id = 0 AND typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200
+       WHERE source_key = 1
+         AND typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200
          AND name_bytes = X'66696C65'
        ORDER BY name_bytes`);
 
@@ -989,8 +1284,10 @@ describe("git schema", () => {
       "tree",
       serializeTree([{ mode: MODE_FILE, name: "file", oid: "1".repeat(40) }]),
     );
-    db.run("DELETE FROM git_tree_entries WHERE repo_id = 1 AND tree_oid = ?", oid);
-    db.run("DELETE FROM git_tree_sources WHERE repo_id = 1 AND tree_oid = ?", oid);
+    db.run(
+      "UPDATE git_tree_sources SET complete = 0, entry_count = NULL, base_cost = NULL WHERE repo_id = 1 AND tree_oid = ?",
+      oid,
+    );
 
     const iterator = store.walkTree(oid);
     expect(() => iterator.next()).toThrow(/reimport or reclone/);

@@ -414,7 +414,12 @@ describe("ordering, bounds, and trust", () => {
     store.db.run("UPDATE git_objects SET type = 'tree' WHERE repo_id = ? AND oid = ?", 1, blob);
     expect(() => classifyEqual(blob)).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
 
-    store.db.run("UPDATE git_objects SET size = -1 WHERE repo_id = ? AND oid = ?", 1, tree);
+    store.db.run("PRAGMA ignore_check_constraints = ON");
+    try {
+      store.db.run("UPDATE git_objects SET size = -1 WHERE repo_id = ? AND oid = ?", 1, tree);
+    } finally {
+      store.db.run("PRAGMA ignore_check_constraints = OFF");
+    }
     expect(() => classifyEqual(tree)).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
 
     store.db.run(

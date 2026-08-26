@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { concat, toHex, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
+import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/blob-id-cache.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   type IndexEntry,
@@ -45,7 +46,7 @@ class WidestDatabase implements SqlDatabase {
   run(query: string, ...bindings: unknown[]): void {
     this.#measure(bindings);
     if (/^\s*DELETE\b/.test(query)) this.deleteStatements++;
-    if (/^\s*(?:WITH[\s\S]*?)?INSERT INTO git_(?:index|blob_ids)\b/.test(query)) {
+    if (/^\s*(?:WITH[\s\S]*?)?INSERT INTO git_(?:index|blob_ids|blob_id_updates)\b/.test(query)) {
       this.initialStateWrites++;
       if (this.initialStateWrites === this.failInitialStateWrite) {
         throw new Error("injected initial state write");
@@ -534,6 +535,34 @@ describe("tryCreateInitialState", () => {
       expect(store.indexEntries()).toEqual([]);
       expect(store.lookupBlobIds([contentId(1)])).toEqual(new Map());
     }
+  });
+
+  it("keeps initial state bounded when its disposable cache exceeds the row cap", () => {
+    const store = open();
+    const result = store.tryCreateInitialState((session) => {
+      session.put(entry("kept.txt", 0, oid(1)));
+      for (let index = 0; index <= MAX_BLOB_ID_CACHE_ROWS; index++) {
+        session.addBlobId({ contentId: contentId(index), oid: oid(index + 1) });
+      }
+      return "created";
+    });
+    const oldestContentId = contentId(0);
+    const overCapContentId = contentId(MAX_BLOB_ID_CACHE_ROWS);
+
+    expect(result).toEqual({ available: true, value: "created" });
+    expect(store.indexEntries()).toEqual([entry("kept.txt", 0, oid(1))]);
+    expect(
+      store.db.scalar<number>("SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = ?", store.repoId),
+    ).toBeLessThanOrEqual(MAX_BLOB_ID_CACHE_ROWS);
+    expect(store.lookupBlobIds([oldestContentId, overCapContentId])).toEqual(
+      new Map([[toHex(overCapContentId), oid(MAX_BLOB_ID_CACHE_ROWS + 1)]]),
+    );
+    expect(
+      store.blobIdMismatches([
+        { contentId: oldestContentId, oid: oid(1) },
+        { contentId: overCapContentId, oid: oid(MAX_BLOB_ID_CACHE_ROWS + 1) },
+      ]),
+    ).toEqual(new Map([[0, null]]));
   });
 
   it("invalidates captured sessions after body errors and thenables", () => {
