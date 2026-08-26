@@ -313,3 +313,6 @@ counts are recorded in the archived outcome.
   compatibility client despite the explicit facade exclusion, and atomic
   branch-create-plus-checkout needs one outer transaction to avoid publishing a
   branch/reflog entry when checkout later refuses.
+- 2026-08-26 — Owner approved both WU2 exceptions. The compatibility change is
+  limited to internal context plumbing with no public facade change; branch
+  creation plus checkout becomes one atomic operation.
