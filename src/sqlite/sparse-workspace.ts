@@ -1,6 +1,8 @@
 import { isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import type {
+  SparseIndexAncestorRequest,
+  SparseIndexAncestorResult,
   SparseTreeLeaf,
   SparseWorkspaceRequest,
   SparseWorkspaceResult,
@@ -21,12 +23,15 @@ const MAX_ROOT_SEGMENTS = 128;
 const MAX_REQUEST_JSON_BYTES = 1024 * 1024;
 const MAX_DEPTH = 64;
 const MAX_EDGE_STEPS = 32_768;
+const MAX_INDEX_ANCESTORS = 32_768;
+const MAX_INDEX_ANCESTOR_ROWS = 32_768;
 const MAX_SOURCE_ENTRIES = 8_192;
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_WORKTREE_RETAINED_BYTES = 4 * 1024 * 1024;
 export const MAX_SPARSE_WORKSPACE_RETAINED_BYTES = 8 * 1024 * 1024;
 const ROW_RETAINED_BYTES = 1_024;
 const INDEX_ENTRY_RETAINED_BYTES = 320;
+const INDEX_ANCESTOR_RETAINED_BYTES = 192;
 const SEGMENT_RETAINED_BYTES = 40;
 const CURSOR_RETAINED_BYTES = 256;
 const OID_RETAINED_BYTES = 112;
@@ -221,6 +226,91 @@ function validateRequest(request: SparseWorkspaceRequest, retainedLimit: number)
   const json = JSON.stringify(request.paths);
   retainedBytes += json.length * 2;
   return { json, segments, retainedBytes };
+}
+
+function validateIndexAncestorRequest(input: unknown): {
+  request: SparseIndexAncestorRequest;
+  pathBytes: number[];
+  json: string;
+  retainedBytes: number;
+} {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw inputError("sparse index ancestor request is invalid");
+  }
+  const checkoutId = Reflect.get(input, "checkoutId");
+  const ancestorsInput = Reflect.get(input, "ancestors");
+  const maxRetainedBytes = Reflect.get(input, "maxRetainedBytes");
+  if (!Number.isSafeInteger(checkoutId) || typeof checkoutId !== "number" || checkoutId <= 0) {
+    throw inputError("sparse index ancestor checkout id is invalid");
+  }
+  if (!Array.isArray(ancestorsInput)) {
+    throw inputError("sparse index ancestor paths are invalid");
+  }
+  if (ancestorsInput.length > MAX_INDEX_ANCESTORS) {
+    throw tooLarge(`sparse index ancestor request exceeds ${MAX_INDEX_ANCESTORS} paths`);
+  }
+  const ancestors: string[] = [];
+  for (let index = 0; index < ancestorsInput.length; index++) {
+    if (!Object.hasOwn(ancestorsInput, index)) {
+      throw inputError("sparse index ancestor paths are not dense");
+    }
+    const path: unknown = Reflect.get(ancestorsInput, String(index));
+    if (typeof path !== "string") {
+      throw inputError("sparse index ancestor path is invalid");
+    }
+    ancestors.push(path);
+  }
+  if (
+    maxRetainedBytes !== undefined &&
+    (typeof maxRetainedBytes !== "number" || !Number.isSafeInteger(maxRetainedBytes))
+  ) {
+    throw inputError("sparse workspace retained limit is invalid");
+  }
+  const request: SparseIndexAncestorRequest = {
+    checkoutId,
+    ancestors,
+    ...(maxRetainedBytes === undefined ? {} : { maxRetainedBytes }),
+  };
+  const retainedLimit = requestRetainedLimit(request.maxRetainedBytes);
+
+  const parts: string[] = [];
+  const pathBytes: number[] = [];
+  let retainedBytes = 0;
+  let jsonBytes = 2;
+  let jsonChars = 2;
+  let previous: string | null = null;
+  for (const path of request.ancestors) {
+    const parsed = parseRelativePath(path);
+    if (parsed.segments.length > MAX_DEPTH) {
+      throw tooLarge(`sparse index ancestor path exceeds ${MAX_DEPTH} segments`);
+    }
+    if (previous !== null && comparePaths(previous, path) >= 0) {
+      throw inputError("sparse index ancestor paths are not in strict Git order");
+    }
+    const part = JSON.stringify(path);
+    const separatorBytes = previous === null ? 0 : 1;
+    const nextJsonBytes = jsonBytes + encoder.encode(part).length + separatorBytes;
+    const nextJsonChars = jsonChars + part.length + separatorBytes;
+    const nextRetainedBytes = retainedBytes + INDEX_ANCESTOR_RETAINED_BYTES + path.length * 4;
+    if (nextJsonBytes > MAX_REQUEST_JSON_BYTES) {
+      throw tooLarge(`sparse index ancestor request exceeds ${MAX_REQUEST_JSON_BYTES} JSON bytes`);
+    }
+    if (nextRetainedBytes > retainedLimit - nextJsonChars * 2) {
+      throw tooLarge(`sparse index ancestor retained state exceeds ${retainedLimit} bytes`);
+    }
+    parts.push(part);
+    pathBytes.push(parsed.bytes);
+    jsonBytes = nextJsonBytes;
+    jsonChars = nextJsonChars;
+    retainedBytes = nextRetainedBytes;
+    previous = path;
+  }
+  return {
+    request,
+    pathBytes,
+    json: `[${parts.join(",")}]`,
+    retainedBytes: retainedBytes + jsonChars * 2,
+  };
 }
 
 export const SPARSE_TREE_DEPTH_SQL = `WITH
@@ -735,6 +825,58 @@ function resolveTrees(
   return { available: true, baseline, current };
 }
 
+function validStoredIndexPath(path: string, bytes: number): boolean {
+  try {
+    return parseRelativePath(path).bytes === bytes;
+  } catch {
+    return false;
+  }
+}
+
+function validatedSparseIndexEntry(row: Record<string, unknown>): IndexEntry {
+  const path = row.path;
+  const pathBytes = numberField(row.path_bytes);
+  const stage = numberField(row.stage);
+  const mode = numberField(row.mode);
+  const oid = row.oid;
+  const size = numberField(row.size);
+  const mtime = numberField(row.mtime);
+  const ino = numberField(row.ino);
+  const rev = numberField(row.rev);
+  if (
+    row.path_type !== "text" ||
+    typeof path !== "string" ||
+    pathBytes === null ||
+    pathBytes < 0 ||
+    pathBytes > MAX_PATH_BYTES ||
+    !validStoredIndexPath(path, pathBytes) ||
+    row.stage_type !== "integer" ||
+    stage === null ||
+    stage < 0 ||
+    stage > 3 ||
+    row.mode_type !== "integer" ||
+    mode === null ||
+    ![0o100644, 0o100755, 0o120000, 0o160000].includes(mode) ||
+    row.oid_type !== "text" ||
+    typeof oid !== "string" ||
+    !isOid(oid) ||
+    !["null", "integer"].includes(typeof row.size_type === "string" ? row.size_type : "") ||
+    !["null", "integer"].includes(typeof row.mtime_type === "string" ? row.mtime_type : "") ||
+    !["null", "integer"].includes(typeof row.ino_type === "string" ? row.ino_type : "") ||
+    !["null", "integer"].includes(typeof row.rev_type === "string" ? row.rev_type : "") ||
+    (row.size !== null && size === null) ||
+    (row.mtime !== null && mtime === null) ||
+    (row.ino !== null && ino === null) ||
+    (row.rev !== null && rev === null) ||
+    (size !== null && size < 0) ||
+    (ino !== null && ino <= 0) ||
+    (rev !== null && rev < 0)
+  ) {
+    throw new CorruptError("sparse index lookup returned a malformed row");
+  }
+  return { path, stage, mode, oid, size, mtime, ino, rev };
+}
+
 const INDEX_SQL = `WITH wanted(ordinal, path) AS MATERIALIZED (
   SELECT CAST(key AS INTEGER), value FROM json_each(?)
 ), preflight AS MATERIALIZED (
@@ -750,15 +892,12 @@ const INDEX_SQL = `WITH wanted(ordinal, path) AS MATERIALIZED (
     FROM wanted
 )
 SELECT preflight.ordinal,
-       CASE WHEN typeof(entry.path) = 'text' AND length(CAST(entry.path AS BLOB)) <= ${MAX_PATH_BYTES}
-            THEN entry.path END AS path,
-       CASE WHEN typeof(entry.stage) = 'integer' THEN entry.stage END AS stage,
-       CASE WHEN typeof(entry.mode) = 'integer' THEN entry.mode END AS mode,
-       CASE WHEN typeof(entry.oid) = 'text' AND length(entry.oid) = 40 THEN entry.oid END AS oid,
-       CASE WHEN entry.size IS NULL OR typeof(entry.size) = 'integer' THEN entry.size END AS size,
-       CASE WHEN entry.mtime IS NULL OR typeof(entry.mtime) = 'integer' THEN entry.mtime END AS mtime,
-       CASE WHEN entry.ino IS NULL OR typeof(entry.ino) = 'integer' THEN entry.ino END AS ino,
-       CASE WHEN entry.rev IS NULL OR typeof(entry.rev) = 'integer' THEN entry.rev END AS rev,
+       entry.path, typeof(entry.path) AS path_type,
+       length(CAST(entry.path AS BLOB)) AS path_bytes,
+       entry.stage, typeof(entry.stage) AS stage_type,
+       entry.mode, typeof(entry.mode) AS mode_type,
+       entry.oid, typeof(entry.oid) AS oid_type,
+       entry.size, entry.mtime, entry.ino, entry.rev,
        typeof(entry.size) AS size_type, typeof(entry.mtime) AS mtime_type,
        typeof(entry.ino) AS ino_type, typeof(entry.rev) AS rev_type
        , 0 AS malformed
@@ -766,8 +905,8 @@ SELECT preflight.ordinal,
   JOIN git_index entry ON entry.checkout_id = ? AND entry.path = preflight.path
    AND entry.stage IN (0, 1, 2, 3)
 UNION ALL
-SELECT ordinal, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-       'null', 'null', 'null', 'null', 1
+SELECT ordinal, NULL, 'null', NULL, NULL, 'null', NULL, 'null', NULL, 'null',
+       NULL, NULL, NULL, NULL, 'null', 'null', 'null', 'null', 1
   FROM preflight WHERE bounded_count != valid_count OR bounded_count > 4
 ORDER BY ordinal, stage`;
 
@@ -786,38 +925,12 @@ function readIndex(
       throw new CorruptError("sparse index lookup returned malformed stages");
     }
     const ordinal = numberField(row.ordinal);
-    const stage = numberField(row.stage);
-    const mode = numberField(row.mode);
-    const oid = row.oid;
-    const path = row.path;
-    if (
-      ordinal === null ||
-      ordinal < 0 ||
-      ordinal >= result.length ||
-      typeof path !== "string" ||
-      stage === null ||
-      stage < 0 ||
-      stage > 3 ||
-      mode === null ||
-      ![0o100644, 0o100755, 0o120000, 0o160000].includes(mode) ||
-      typeof oid !== "string" ||
-      !isOid(oid) ||
-      !["null", "integer"].includes(typeof row.size_type === "string" ? row.size_type : "") ||
-      !["null", "integer"].includes(typeof row.mtime_type === "string" ? row.mtime_type : "") ||
-      !["null", "integer"].includes(typeof row.ino_type === "string" ? row.ino_type : "") ||
-      !["null", "integer"].includes(typeof row.rev_type === "string" ? row.rev_type : "") ||
-      (row.size !== null && numberField(row.size) === null) ||
-      (row.mtime !== null && numberField(row.mtime) === null) ||
-      (row.ino !== null && numberField(row.ino) === null) ||
-      (row.rev !== null && numberField(row.rev) === null) ||
-      (row.size !== null && (numberField(row.size) ?? -1) < 0) ||
-      (row.ino !== null && (numberField(row.ino) ?? 0) <= 0) ||
-      (row.rev !== null && (numberField(row.rev) ?? -1) < 0)
-    ) {
+    if (ordinal === null || ordinal < 0 || ordinal >= result.length) {
       throw new CorruptError("sparse index lookup returned a malformed row");
     }
+    const entry = validatedSparseIndexEntry(row);
     const entries = result[ordinal];
-    if (entries === undefined || entries.some((entry) => entry.stage === stage)) {
+    if (entries === undefined || entries.some((candidate) => candidate.stage === entry.stage)) {
       throw new CorruptError("sparse index lookup returned duplicate stages");
     }
     if (retainedBytes > retainedLimit - INDEX_ENTRY_RETAINED_BYTES) {
@@ -825,18 +938,138 @@ function readIndex(
       continue;
     }
     retainedBytes += INDEX_ENTRY_RETAINED_BYTES;
-    entries.push({
-      path,
-      stage,
-      mode,
-      oid,
-      size: numberField(row.size),
-      mtime: numberField(row.mtime),
-      ino: numberField(row.ino),
-      rev: numberField(row.rev),
-    });
+    entries.push(entry);
   }
   return { available, rows: result, retainedBytes };
+}
+
+const INDEX_ANCESTOR_FACTS_SQL = `WITH wanted(ordinal, path) AS MATERIALIZED (
+  SELECT CAST(key AS INTEGER), value FROM json_each(?)
+), index_ancestor_rows(
+  ordinal, association, checkout_id, path, stage, mode, oid, size, mtime, ino, rev
+) AS MATERIALIZED (
+  SELECT wanted.ordinal, 0, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    JOIN git_index candidate
+      ON candidate.checkout_id = ? AND candidate.path = wanted.path
+  UNION ALL
+  SELECT wanted.ordinal, 1, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    JOIN git_index candidate
+      ON candidate.checkout_id = ?
+     AND candidate.path COLLATE BINARY >= wanted.path || '/'
+     AND candidate.path COLLATE BINARY < wanted.path || '0'
+  UNION ALL
+  SELECT wanted.ordinal, 0, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    JOIN git_index candidate
+      ON candidate.checkout_id = ? AND candidate.path = CAST(wanted.path AS BLOB)
+  UNION ALL
+  SELECT wanted.ordinal, 1, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    JOIN git_index candidate
+      ON candidate.checkout_id = ?
+     AND candidate.path >= CAST(wanted.path || '/' AS BLOB)
+     AND candidate.path < CAST(wanted.path || '0' AS BLOB)
+  LIMIT ${MAX_INDEX_ANCESTOR_ROWS + 1}
+)
+SELECT wanted.ordinal, wanted.path AS wanted_path,
+       typeof(wanted.path) AS wanted_path_type,
+       length(CAST(wanted.path AS BLOB)) AS wanted_path_bytes,
+       index_ancestor_rows.association,
+       CASE WHEN index_ancestor_rows.checkout_id IS NULL THEN 0 ELSE 1 END AS row_present,
+       index_ancestor_rows.path,
+       typeof(index_ancestor_rows.path) AS path_type,
+       length(CAST(index_ancestor_rows.path AS BLOB)) AS path_bytes,
+       index_ancestor_rows.stage, typeof(index_ancestor_rows.stage) AS stage_type,
+       index_ancestor_rows.mode, typeof(index_ancestor_rows.mode) AS mode_type,
+       index_ancestor_rows.oid, typeof(index_ancestor_rows.oid) AS oid_type,
+       index_ancestor_rows.size, index_ancestor_rows.mtime,
+       index_ancestor_rows.ino, index_ancestor_rows.rev,
+       typeof(index_ancestor_rows.size) AS size_type,
+       typeof(index_ancestor_rows.mtime) AS mtime_type,
+       typeof(index_ancestor_rows.ino) AS ino_type,
+       typeof(index_ancestor_rows.rev) AS rev_type
+  FROM wanted
+  LEFT JOIN index_ancestor_rows ON index_ancestor_rows.ordinal = wanted.ordinal
+ ORDER BY wanted.ordinal, index_ancestor_rows.association,
+          index_ancestor_rows.path, index_ancestor_rows.stage`;
+
+function indexAncestorFacts(
+  db: SqlDatabase,
+  request: SparseIndexAncestorRequest,
+): SparseIndexAncestorResult {
+  const validated = validateIndexAncestorRequest(request);
+  if (validated.request.ancestors.length === 0) return { facts: [], retainedBytes: 0 };
+
+  const facts: SparseIndexAncestorResult["facts"] = validated.request.ancestors.map((path) => ({
+    path,
+    exact: false,
+    descendant: false,
+  }));
+  let candidateRows = 0;
+  let lastOrdinal = -1;
+  for (const row of db.iterate(
+    INDEX_ANCESTOR_FACTS_SQL,
+    validated.json,
+    validated.request.checkoutId,
+    validated.request.checkoutId,
+    validated.request.checkoutId,
+    validated.request.checkoutId,
+  )) {
+    const ordinal = numberField(row.ordinal);
+    const wantedPathBytes = numberField(row.wanted_path_bytes);
+    const expected = ordinal === null ? undefined : validated.request.ancestors[ordinal];
+    const expectedPathBytes = ordinal === null ? undefined : validated.pathBytes[ordinal];
+    if (
+      ordinal === null ||
+      ordinal < lastOrdinal ||
+      ordinal > lastOrdinal + 1 ||
+      expected === undefined ||
+      expectedPathBytes === undefined ||
+      row.wanted_path_type !== "text" ||
+      typeof row.wanted_path !== "string" ||
+      row.wanted_path !== expected ||
+      wantedPathBytes === null ||
+      wantedPathBytes < 0 ||
+      wantedPathBytes > MAX_PATH_BYTES ||
+      expectedPathBytes !== wantedPathBytes
+    ) {
+      throw new CorruptError("sparse index ancestor lookup returned a malformed row");
+    }
+    lastOrdinal = ordinal;
+    const present = numberField(row.row_present);
+    if (present !== 0 && present !== 1) {
+      throw new CorruptError("sparse index ancestor lookup returned invalid row presence");
+    }
+    if (present === 0) continue;
+
+    const entry = validatedSparseIndexEntry(row);
+    candidateRows++;
+    if (candidateRows > MAX_INDEX_ANCESTOR_ROWS) {
+      throw tooLarge(`sparse index ancestor lookup exceeds ${MAX_INDEX_ANCESTOR_ROWS} rows`);
+    }
+    const association = numberField(row.association);
+    const fact = facts[ordinal];
+    if (
+      fact === undefined ||
+      (association !== 0 && association !== 1) ||
+      (association === 0 && entry.path !== expected) ||
+      (association === 1 && !entry.path.startsWith(`${expected}/`))
+    ) {
+      throw new CorruptError("sparse index ancestor lookup returned an unrelated index row");
+    }
+    if (association === 0) fact.exact = true;
+    else fact.descendant = true;
+  }
+  if (lastOrdinal !== validated.request.ancestors.length - 1) {
+    throw new CorruptError("sparse index ancestor lookup lost requested paths");
+  }
+  return { facts, retainedBytes: validated.retainedBytes };
 }
 
 const WORKTREE_SQL = `WITH wanted(ordinal, relative) AS MATERIALIZED (
@@ -1114,5 +1347,6 @@ export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorksp
     readState: (checkoutId) => readIndexTrackerState(db, checkoutId),
     dirtyPaths: (checkoutId) => iterateIndexTrackerDirty(db, checkoutId),
     hydrate: (request) => hydrate(db, request),
+    indexAncestorFacts: (request) => indexAncestorFacts(db, request),
   };
 }

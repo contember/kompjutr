@@ -135,7 +135,6 @@ describe("createSqliteGitClient", () => {
     await expect(
       git.status({ paths: ["debug.log"], includeIgnored: true, untrackedFiles: "all" }),
     ).resolves.toEqual([{ path: "debug.log", index: "!", worktree: "!" }]);
-
     const report = await git.statusReport({ branch: true, paths: ["fresh"] });
     expect(report).toEqual({
       entries: [{ path: "fresh/", index: " ", worktree: "?" }],
@@ -144,6 +143,16 @@ describe("createSqliteGitClient", () => {
     await expect(git.statusReport({ paths: ["fresh"] })).resolves.toEqual({
       entries: [{ path: "fresh/", index: " ", worktree: "?" }],
     });
+
+    await commitFile(git, workspace, "/", "cached.txt", "cached\n", "cached fixture");
+    await git.rm({ paths: ["cached.txt"], cached: true });
+    await expect(git.status({ paths: ["cached.txt"], untrackedFiles: "all" })).resolves.toEqual([
+      { path: "cached.txt", index: "D", worktree: " " },
+      { path: "cached.txt", index: " ", worktree: "?" },
+    ]);
+    await expect(
+      git.status({ paths: ["cached.txt"], untrackedFiles: "no", includeIgnored: true }),
+    ).resolves.toEqual([{ path: "cached.txt", index: "D", worktree: " " }]);
   });
 
   it("exposes divergence and raw ref reads for symbolic and detached HEAD", async () => {

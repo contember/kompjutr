@@ -50,9 +50,28 @@ export type SparseWorkspaceResult =
   | { available: false }
   | { available: true; rows: SparseWorkspaceRow[]; retainedBytes: number };
 
+export interface SparseIndexAncestorRequest {
+  checkoutId: number;
+  ancestors: string[];
+  /** Caller-owned headroom available for retained lookup state. */
+  maxRetainedBytes?: number;
+}
+
+export interface SparseIndexAncestorFact {
+  path: string;
+  exact: boolean;
+  descendant: boolean;
+}
+
+export interface SparseIndexAncestorResult {
+  facts: SparseIndexAncestorFact[];
+  retainedBytes: number;
+}
+
 /** Optional same-database fast path. Generic clients omit this capability. */
 export interface SparseWorkspaceSource {
   readState(checkoutId: number): SparseWorkspaceState;
   dirtyPaths(checkoutId: number): Iterable<SparseWorkspaceDirty>;
   hydrate(request: SparseWorkspaceRequest): SparseWorkspaceResult;
+  indexAncestorFacts?(request: SparseIndexAncestorRequest): SparseIndexAncestorResult;
 }

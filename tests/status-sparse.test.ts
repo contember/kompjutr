@@ -3,11 +3,14 @@ import type { GitContext, IndexTrackerSeedEntry } from "../src/core/context.js";
 import { openRepository } from "../src/core/context.js";
 import { CorruptError, GitError } from "../src/core/errors.js";
 import { commit } from "../src/core/ops/commit.js";
-import { eagerStatus, status, statusStream } from "../src/core/ops/status.js";
+import { eagerStatus, type StatusOptions, status, statusStream } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
+import type { SqlDatabase } from "../src/sqlite/db.js";
 import { INDEX_DIRTY, readIndexTrackerState, WORKTREE_DIRTY } from "../src/sqlite/index-tracker.js";
+import { createSqliteSparseWorkspaceSource } from "../src/sqlite/sparse-workspace.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
+import { GitFixture } from "./helpers/git.js";
 import {
   configureFixtureIdentity,
   requireSparseWorkspace,
@@ -27,6 +30,39 @@ class NoScanWorktree extends CountingWorktree {
 class FailingHashWorktree extends CountingWorktree {
   override readFiles(): never {
     throw new Error("injected hash failure");
+  }
+}
+
+class MutatingAncestorDatabase implements SqlDatabase {
+  constructor(
+    private readonly inner: SqlDatabase,
+    private readonly mutate: (row: Record<string, unknown>) => Record<string, unknown>,
+  ) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    for (const row of this.inner.iterate(query, ...bindings)) {
+      yield query.includes("index_ancestor_rows") ? this.mutate(row) : row;
+    }
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
   }
 }
 
@@ -65,6 +101,97 @@ function bareIndexEntry(path: string, mode = 0o100644): IndexEntry {
     ino: null,
   };
 }
+
+interface AncestorIndexCorruption {
+  name: string;
+  mutate(workspace: TestRepository): void;
+}
+
+const ANCESTOR_INDEX_CORRUPTIONS: readonly AncestorIndexCorruption[] = [
+  {
+    name: "BLOB path",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET path = ? WHERE checkout_id = ? AND path = ?",
+        new TextEncoder().encode("tracked/file.txt"),
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "BLOB stage",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET stage = ? WHERE checkout_id = ? AND path = ?",
+        new Uint8Array([1]),
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "invalid mode",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET mode = 0 WHERE checkout_id = ? AND path = ?",
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "invalid oid",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET oid = 'broken' WHERE checkout_id = ? AND path = ?",
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "negative size",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET size = -1 WHERE checkout_id = ? AND path = ?",
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "BLOB mtime",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET mtime = ? WHERE checkout_id = ? AND path = ?",
+        new Uint8Array([1]),
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "nonpositive inode",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET ino = 0 WHERE checkout_id = ? AND path = ?",
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+  {
+    name: "negative revision",
+    mutate(workspace) {
+      workspace.storage.sql.exec(
+        "UPDATE git_index SET rev = -1 WHERE checkout_id = ? AND path = ?",
+        workspace.repo.checkout.checkoutId,
+        "tracked/file.txt",
+      );
+    },
+  },
+];
 
 describe("sparse eager status", () => {
   it("reseals one authoritative full status for an incomplete repository", () => {
@@ -339,14 +466,17 @@ describe("sparse eager status", () => {
     ]);
   });
 
-  it("falls back for normal untracked collapsing and stays sparse for all", () => {
+  it("keeps normal untracked collapsing and all-file reporting sparse", () => {
     const normal = makeRepo("/");
     sealIndexTracker(normal);
     writeWorkFile(normal, "/fresh/a.txt", "fresh\n");
     expect(
-      eagerStatus(normal.repo, normal.worktree, {}, sparseTrackerContext(normal)).map(
-        (row) => row.path,
-      ),
+      eagerStatus(
+        normal.repo,
+        new NoScanWorktree(normal.worktree),
+        {},
+        sparseTrackerContext(normal),
+      ).map((row) => row.path),
     ).toEqual(["fresh/"]);
 
     const all = makeRepo("/");
@@ -383,7 +513,7 @@ describe("sparse eager status", () => {
     ]);
   });
 
-  it("chooses normal-untracked fallback before hashing a tracked candidate", () => {
+  it("hashes a tracked candidate while normal untracked collapsing stays sparse", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a.txt", "before\n");
     commitFiles(workspace, ["a.txt"]);
@@ -393,10 +523,11 @@ describe("sparse eager status", () => {
     writeWorkFile(workspace, "/z-untracked.txt", "untracked\n");
     const worktree = new NoScanWorktree(workspace.worktree);
 
-    expect(() =>
-      eagerStatus(workspace.repo, worktree, {}, sparseTrackerContext(workspace)),
-    ).toThrowError(/must not scan/);
-    expect(worktree.bulkReadPaths).toEqual([]);
+    expect(eagerStatus(workspace.repo, worktree, {}, sparseTrackerContext(workspace))).toEqual([
+      expect.objectContaining({ path: "a.txt", index: " ", worktree: "M" }),
+      expect.objectContaining({ path: "z-untracked.txt", index: " ", worktree: "?" }),
+    ]);
+    expect(worktree.bulkReadPaths).toEqual(["/a.txt"]);
   });
 
   it("retains worktree dirtiness when a staged deletion leaves the old file", () => {
@@ -413,11 +544,293 @@ describe("sparse eager status", () => {
         { untrackedFiles: "all" },
         sparseTrackerContext(workspace),
       ),
-    ).toEqual([expect.objectContaining({ path: "kept.txt", index: "D", worktree: " " })]);
+    ).toEqual([
+      expect.objectContaining({ path: "kept.txt", index: "D", worktree: " " }),
+      expect.objectContaining({ path: "kept.txt", index: " ", worktree: "?" }),
+    ]);
     expect([
       ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
     ]).toEqual([{ path: "kept.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY }]);
   });
+
+  it("matches full normal collapse for tracked, whole, nested, replaced, and ignored paths", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/.gitignore", "*.log\n");
+    for (const path of [
+      "top.txt",
+      "tracked/keep.txt",
+      "tracked/removed.txt",
+      "whole/a.txt",
+      "whole/nested/b.txt",
+      "cached.log",
+      "replaced",
+    ]) {
+      writeWorkFile(workspace, `/${path}`, `${path}\n`);
+    }
+    commitFiles(workspace, [
+      ".gitignore",
+      "cached.log",
+      "replaced",
+      "top.txt",
+      "tracked/keep.txt",
+      "tracked/removed.txt",
+      "whole/a.txt",
+      "whole/nested/b.txt",
+    ]);
+    sealIndexTracker(workspace);
+    for (const path of [
+      "cached.log",
+      "top.txt",
+      "tracked/removed.txt",
+      "whole/a.txt",
+      "whole/nested/b.txt",
+    ]) {
+      workspace.repo.checkout.indexRemove(path);
+    }
+    workspace.worktree.unlink("/replaced");
+    writeWorkFile(workspace, "/replaced/inner.txt", "inner\n");
+
+    expect(
+      status(workspace.repo, workspace.worktree)
+        .filter((row) => row.worktree === "?")
+        .map((row) => row.path),
+    ).toEqual(["top.txt", "tracked/removed.txt", "whole/"]);
+
+    const optionWitnesses: StatusOptions[] = [
+      { untrackedFiles: "no", includeIgnored: true },
+      { untrackedFiles: "normal" },
+      { untrackedFiles: "normal", includeIgnored: true },
+      { untrackedFiles: "all", includeIgnored: true },
+    ];
+    for (const options of optionWitnesses) {
+      const expected = status(workspace.repo, workspace.worktree, options);
+      expect(
+        eagerStatus(
+          workspace.repo,
+          new NoScanWorktree(workspace.worktree),
+          options,
+          sparseTrackerContext(workspace),
+        ),
+        JSON.stringify(options),
+      ).toEqual(expected);
+    }
+
+    const normal = eagerStatus(
+      workspace.repo,
+      new NoScanWorktree(workspace.worktree),
+      {},
+      sparseTrackerContext(workspace),
+    );
+    expect(normal.filter((row) => row.worktree === "?").map((row) => row.path)).toEqual([
+      "top.txt",
+      "tracked/removed.txt",
+      "whole/",
+    ]);
+    expect(normal.filter((row) => row.path === "replaced/inner.txt")).toEqual([]);
+    expect(
+      [...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId)].map(
+        (entry) => entry.path,
+      ),
+    ).toEqual(
+      expect.arrayContaining([
+        "cached.log",
+        "top.txt",
+        "tracked/removed.txt",
+        "whole/a.txt",
+        "whole/nested/b.txt",
+      ]),
+    );
+  });
+
+  it("matches full status and Git when only unmerged stages track an untracked directory", () => {
+    const fixture = new GitFixture().init();
+    try {
+      fixture.write("conflict/file.txt", "base\n");
+      const base = fixture.commit("base");
+      fixture.git("checkout", "-q", "-b", "topic", base);
+      fixture.write("conflict/file.txt", "incoming\n");
+      fixture.commit("incoming");
+      fixture.git("checkout", "-q", "main");
+      fixture.write("conflict/file.txt", "current\n");
+      fixture.commit("current");
+      expect(() => fixture.git("merge", "topic")).toThrow();
+      fixture.write("conflict/untracked/deep.txt", "fresh\n");
+      const gitRows = fixture
+        .git("status", "--porcelain=v2", "--untracked-files=normal")
+        .split("\n");
+      expect(
+        gitRows.some((row) => row.startsWith("u UU ") && row.endsWith(" conflict/file.txt")),
+      ).toBe(true);
+      expect(gitRows).toContain("? conflict/untracked/");
+
+      const workspace = makeRepo("/");
+      writeWorkFile(workspace, "/conflict/file.txt", "base\n");
+      commitFiles(workspace, ["conflict/file.txt"]);
+      sealIndexTracker(workspace);
+      const baseEntry = workspace.repo.checkout.indexGet("conflict/file.txt", 0);
+      if (baseEntry === null) throw new Error("base index entry is missing");
+      workspace.repo.checkout.indexRemove("conflict/file.txt");
+      const currentOid = workspace.repo.store.write("blob", new TextEncoder().encode("current\n"));
+      const incomingOid = workspace.repo.store.write(
+        "blob",
+        new TextEncoder().encode("incoming\n"),
+      );
+      const stages: Array<{ stage: number; oid: string }> = [
+        { stage: 1, oid: baseEntry.oid },
+        { stage: 2, oid: currentOid },
+        { stage: 3, oid: incomingOid },
+      ];
+      for (const { stage, oid } of stages) {
+        workspace.repo.checkout.indexPut({
+          path: "conflict/file.txt",
+          stage,
+          mode: 0o100644,
+          oid,
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+      }
+      writeWorkFile(workspace, "/conflict/file.txt", "conflicted\n");
+      writeWorkFile(workspace, "/conflict/untracked/deep.txt", "fresh\n");
+
+      const full = status(workspace.repo, workspace.worktree);
+      const sparse = eagerStatus(
+        workspace.repo,
+        new NoScanWorktree(workspace.worktree),
+        {},
+        sparseTrackerContext(workspace),
+      );
+      expect(sparse).toEqual(full);
+      expect(
+        sparse.map((row) => ({ path: row.path, index: row.index, worktree: row.worktree })),
+      ).toEqual([
+        { path: "conflict/file.txt", index: "U", worktree: "U" },
+        { path: "conflict/untracked/", index: " ", worktree: "?" },
+      ]);
+      expect([
+        ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
+      ]).toEqual([
+        { path: "conflict/file.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY },
+        { path: "conflict/untracked/deep.txt", flags: WORKTREE_DIRTY },
+      ]);
+    } finally {
+      fixture.dispose();
+    }
+  });
+
+  it("keeps sparse statement count flat as normal untracked leaves grow", () => {
+    const measure = (count: number): number => {
+      const workspace = makeRepo("/");
+      sealIndexTracker(workspace);
+      for (let index = 0; index < count; index++) {
+        writeWorkFile(
+          workspace,
+          `/fresh/d${index.toString().padStart(3, "0")}/leaf.txt`,
+          "fresh\n",
+        );
+      }
+      workspace.storage.histogram = new Map();
+      workspace.storage.resetCounters();
+      expect(
+        eagerStatus(
+          workspace.repo,
+          new NoScanWorktree(workspace.worktree),
+          {},
+          sparseTrackerContext(workspace),
+        ).map((row) => row.path),
+      ).toEqual(["fresh/"]);
+      const ancestorStatements = [...(workspace.storage.histogram ?? [])]
+        .filter(([query]) => query.includes("index_ancestor_rows"))
+        .reduce((total, [, statements]) => total + statements, 0);
+      expect(ancestorStatements).toBe(1);
+      return workspace.storage.statementCount;
+    };
+
+    const one = measure(1);
+    const many = measure(400);
+    expect(many).toBeLessThanOrEqual(one + 2);
+  });
+
+  it("rejects ancestor facts above retained headroom before SQL", () => {
+    const workspace = makeRepo("/");
+    const lookup = requireSparseWorkspace(workspace).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("SQLite sparse workspace has no ancestor lookup");
+    workspace.storage.resetCounters();
+
+    expect(() =>
+      lookup({
+        checkoutId: workspace.repo.checkout.checkoutId,
+        ancestors: ["fresh"],
+        maxRetainedBytes: 0,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.storage.statementCount).toBe(0);
+  });
+
+  it("rejects malformed ancestor requests before SQL", () => {
+    const workspace = makeRepo("/");
+    const lookup = requireSparseWorkspace(workspace).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("SQLite sparse workspace has no ancestor lookup");
+    const sparseAncestors = new Array<string>(1);
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    const malformed: unknown[] = [
+      null,
+      {},
+      { checkoutId, ancestors: null },
+      { checkoutId, ancestors: sparseAncestors },
+      { checkoutId, ancestors: ["valid", 1] },
+      { checkoutId, ancestors: ["valid"], maxRetainedBytes: "large" },
+    ];
+
+    for (const request of malformed) {
+      workspace.storage.resetCounters();
+      expect(() => Reflect.apply(lookup, undefined, [request])).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(workspace.storage.statementCount).toBe(0);
+    }
+  });
+
+  it.each([-1, 1])("rejects malformed ancestor path_bytes=%i", (pathBytes) => {
+    const workspace = makeRepo("/");
+    const source = createSqliteSparseWorkspaceSource(
+      new MutatingAncestorDatabase(workspace.database.db, (row) => ({
+        ...row,
+        wanted_path_bytes: pathBytes,
+      })),
+    );
+    const lookup = source.indexAncestorFacts;
+    if (lookup === undefined) throw new Error("SQLite sparse workspace has no ancestor lookup");
+
+    expect(() =>
+      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["føø"] }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it.each(ANCESTOR_INDEX_CORRUPTIONS)(
+    "fails closed on a relevant $name index row without resealing",
+    ({ mutate }) => {
+      const workspace = makeRepo("/");
+      writeWorkFile(workspace, "/tracked/file.txt", "tracked\n");
+      commitFiles(workspace, ["tracked/file.txt"]);
+      sealIndexTracker(workspace);
+      writeWorkFile(workspace, "/tracked/new/deep.txt", "fresh\n");
+      mutate(workspace);
+      const dirtyAfterCorruption = [
+        ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
+      ];
+      const recorded = recordingContext(workspace);
+
+      expect(() =>
+        eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, recorded.context),
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+      expect(recorded.reseals).toEqual([]);
+      expect([
+        ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
+      ]).toEqual(dirtyAfterCorruption);
+    },
+  );
 
   it("falls back when capabilities or tracker state are unavailable", () => {
     const workspace = makeRepo("/");

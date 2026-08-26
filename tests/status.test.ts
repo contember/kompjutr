@@ -9,10 +9,12 @@ import {
   formatPorcelainV2,
   formatShort,
   STATUS_RETAINED_BYTES,
+  type StatusOptions,
   status,
   statusIndexRetainedBytes,
   statusMatrix,
   statusReport,
+  statusStream,
 } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -34,7 +36,8 @@ type Step =
   | { op: "symlink"; path: string; target: string }
   | { op: "remove"; path: string }
   | { op: "stage"; path: string }
-  | { op: "gitRemove"; path: string };
+  | { op: "gitRemove"; path: string }
+  | { op: "gitRemoveCached"; path: string };
 
 interface Scenario {
   name: string;
@@ -70,6 +73,9 @@ function applyToFixture(fixture: GitFixture, step: Step): void {
     case "gitRemove":
       fixture.git("rm", "-q", "--", step.path);
       return;
+    case "gitRemoveCached":
+      fixture.git("rm", "-q", "--cached", "--", step.path);
+      return;
   }
 }
 
@@ -98,6 +104,9 @@ function applyToWorkspace(workspace: TestRepository, step: Step): void {
     }
     case "gitRemove":
       worktree.unlink(absolute);
+      repo.checkout.indexRemove(step.path);
+      return;
+    case "gitRemoveCached":
       repo.checkout.indexRemove(step.path);
       return;
   }
@@ -553,7 +562,24 @@ describe("status", () => {
 
     const entries = status(workspace.repo, workspace.worktree);
     expect(entries.map((entry) => entry.path)).toEqual([privateUse, nonBmp]);
-    expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2"));
+    expect(formatPorcelainV2(entries, undefined, { quotePath: false })).toBe(
+      gitStatus(fixture, "--porcelain=v2"),
+    );
+  });
+
+  it("keeps lazy status in path order while eager status groups ordinary rows first", async () => {
+    const { workspace } = await build({
+      name: "lazy versus grouped order",
+      commits: [[{ op: "write", path: "z-tracked.txt", content: "tracked\n" }]],
+      mutate: [{ op: "remove", path: "z-tracked.txt" }],
+    });
+    const lazy = statusStream(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
+    writeWorkFile(workspace, "/a-untracked.txt", "fresh\n");
+
+    expect([...lazy].map((row) => row.path)).toEqual(["a-untracked.txt", "z-tracked.txt"]);
+    expect(
+      status(workspace.repo, workspace.worktree, { untrackedFiles: "all" }).map((row) => row.path),
+    ).toEqual(["z-tracked.txt", "a-untracked.txt"]);
   });
 
   it("lists untracked files one by one for untrackedFiles: all", async () => {
@@ -569,6 +595,73 @@ describe("status", () => {
     });
     const entries = status(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
     expect(formatPorcelainV2(entries)).toBe(gitStatus(fixture, "--porcelain=v2", "-uall"));
+  });
+
+  it("matches Git when cached removal leaves an independently untracked path", async () => {
+    const { fixture, workspace } = await build({
+      name: "cached removal",
+      commits: [
+        [
+          { op: "write", path: "top.txt", content: "top\n" },
+          { op: "write", path: "tracked/keep.txt", content: "keep\n" },
+          { op: "write", path: "tracked/removed.txt", content: "removed\n" },
+          { op: "write", path: "whole/a.txt", content: "a\n" },
+          { op: "write", path: "whole/b.txt", content: "b\n" },
+          { op: "write", path: "cached.log", content: "ignored\n" },
+          { op: "write", path: "rename-source.txt", content: "rename\n" },
+        ],
+        [{ op: "write", path: ".gitignore", content: "*.log\n" }],
+      ],
+      mutate: [
+        { op: "gitRemoveCached", path: "top.txt" },
+        { op: "gitRemoveCached", path: "tracked/removed.txt" },
+        { op: "gitRemoveCached", path: "whole/a.txt" },
+        { op: "gitRemoveCached", path: "whole/b.txt" },
+        { op: "gitRemoveCached", path: "cached.log" },
+        { op: "gitRemoveCached", path: "rename-source.txt" },
+        { op: "write", path: "rename-destination.txt", content: "rename\n" },
+        { op: "stage", path: "rename-destination.txt" },
+      ],
+    });
+
+    const witnesses: Array<{ options: StatusOptions; flags: string[] }> = [
+      {
+        options: { untrackedFiles: "no", includeIgnored: true },
+        flags: ["--untracked-files=no", "--ignored"],
+      },
+      {
+        options: { untrackedFiles: "normal" },
+        flags: ["--untracked-files=normal"],
+      },
+      {
+        options: { untrackedFiles: "normal", includeIgnored: true },
+        flags: ["--untracked-files=normal", "--ignored"],
+      },
+      {
+        options: { untrackedFiles: "all", includeIgnored: true },
+        flags: ["--untracked-files=all", "--ignored"],
+      },
+    ];
+    for (const witness of witnesses) {
+      const entries = status(workspace.repo, workspace.worktree, witness.options);
+      expect(formatPorcelainV2(entries)).toBe(
+        gitStatus(fixture, "--porcelain=v2", ...witness.flags),
+      );
+    }
+
+    const all = status(workspace.repo, workspace.worktree, { untrackedFiles: "all" });
+    expect(
+      all
+        .filter((entry) => entry.path === "top.txt")
+        .map((entry) => `${entry.index}${entry.worktree}`),
+    ).toEqual(["D ", " ?"]);
+    const normal = status(workspace.repo, workspace.worktree);
+    expect(normal.filter((entry) => entry.worktree === "?").map((entry) => entry.path)).toEqual([
+      "rename-source.txt",
+      "top.txt",
+      "tracked/removed.txt",
+      "whole/",
+    ]);
   });
 
   it("matches Git for an exact staged rename with a regular mode change", async () => {

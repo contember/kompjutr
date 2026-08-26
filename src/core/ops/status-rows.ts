@@ -136,9 +136,10 @@ export interface StatusOptions {
   ignores?: IgnoreMatcher;
   /**
    * "normal" (git's default) collapses a wholly untracked directory into
-   * one `dir/` entry; "all" lists every file under it.
+   * one `dir/` entry; "all" lists every file under it; "no" omits all
+   * untracked and ignored rows.
    */
-  untrackedFiles?: "normal" | "all";
+  untrackedFiles?: "no" | "normal" | "all";
   /** Detect staged exact renames. Explicit values override `status.renames`. */
   renames?: boolean;
 }

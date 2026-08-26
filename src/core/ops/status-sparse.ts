@@ -1,9 +1,14 @@
 import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../context.js";
-import { CorruptError, hasErrorCode } from "../errors.js";
-import { loadIgnoreMatcher } from "../ignore/index.js";
+import { CorruptError, GitError, hasErrorCode } from "../errors.js";
+import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import type { Repository } from "../repository.js";
-import type { SparseWorkspaceResult, SparseWorkspaceRow } from "../sparse-workspace.js";
+import { retainedStringBytes } from "../retained.js";
+import type {
+  SparseIndexAncestorFact,
+  SparseWorkspaceResult,
+  SparseWorkspaceRow,
+} from "../sparse-workspace.js";
 import { comparePaths } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import type { TargetEntry } from "./checkout.js";
@@ -28,6 +33,11 @@ import {
 } from "./worktree-io.js";
 
 const SPARSE_STATUS_PATHS = 1_000;
+const SPARSE_STATUS_CANDIDATE_BYTES = 4 * 1024 * 1024;
+const SPARSE_STATUS_ANCESTORS = 32_768;
+const SPARSE_STATUS_ANCESTOR_BYTES = 4 * 1024 * 1024;
+const SPARSE_STATUS_RETAINED_BYTES = 8 * 1024 * 1024;
+const SPARSE_STATUS_PATH_FIXED_BYTES = 96;
 const SPARSE_INDEX_DIRTY = 1;
 const SPARSE_WORKTREE_DIRTY = 2;
 const FULL_STATUS_TRACKER_ROWS = 32_000;
@@ -161,9 +171,18 @@ export function sparseStatus(
   if (hydrated.rows.length !== candidates.length) {
     throw new CorruptError("sparse status hydration returned the wrong row count");
   }
+  if (
+    !Number.isSafeInteger(hydrated.retainedBytes) ||
+    hydrated.retainedBytes < 0 ||
+    hydrated.retainedBytes > SPARSE_STATUS_RETAINED_BYTES
+  ) {
+    throw new CorruptError("sparse status hydration returned invalid retained bytes");
+  }
 
+  const untrackedMode = options.untrackedFiles ?? "normal";
   let ignores = options.ignores;
   const ignoredUntracked = new Set<string>();
+  const reportableUntracked: string[] = [];
   for (let index = 0; index < candidates.length; index++) {
     const path = candidates[index];
     const row = hydrated.rows[index];
@@ -171,19 +190,52 @@ export function sparseStatus(
       throw new CorruptError("sparse status hydration returned unordered rows");
     }
     const group = oneStatusIndexGroup(row.index, row.path);
-    const untracked =
-      row.current === null && group === undefined && sparseWorktreePath(row) !== undefined;
-    if (!untracked) continue;
+    if (group !== undefined || sparseWorktreePath(row) === undefined || untrackedMode === "no") {
+      continue;
+    }
     if (ignores === undefined) ignores = loadIgnoreMatcher(worktree, repo.root);
     const ignored = ignores.ignores(path, false);
     if (ignored) ignoredUntracked.add(path);
-    const reportable = options.includeIgnored === true || !ignored;
-    if (reportable && (options.untrackedFiles ?? "normal") === "normal") return null;
+    if (options.includeIgnored === true || !ignored) reportableUntracked.push(path);
+  }
+
+  let ancestorFacts = new Map<string, SparseIndexAncestorFact>();
+  if (untrackedMode === "normal" && reportableUntracked.length !== 0) {
+    try {
+      const ancestors = sparseUntrackedAncestors(reportableUntracked);
+      if (ancestors.paths.length !== 0) {
+        if (source.indexAncestorFacts === undefined) return null;
+        const retainedHeadroom =
+          SPARSE_STATUS_RETAINED_BYTES - hydrated.retainedBytes - ancestors.retainedBytes;
+        if (retainedHeadroom < 0) {
+          throw new GitError("E2BIG", "sparse status retained state exceeds its bound");
+        }
+        const result = source.indexAncestorFacts({
+          checkoutId: repo.checkout.checkoutId,
+          ancestors: ancestors.paths,
+          maxRetainedBytes: retainedHeadroom,
+        });
+        if (
+          !Number.isSafeInteger(result.retainedBytes) ||
+          result.retainedBytes < 0 ||
+          result.retainedBytes > retainedHeadroom ||
+          result.facts.length !== ancestors.paths.length
+        ) {
+          throw new CorruptError("sparse index ancestor lookup returned invalid retained state");
+        }
+        ancestorFacts = validatedAncestorFacts(ancestors.paths, result.facts);
+      }
+    } catch (error) {
+      if (hasErrorCode(error, "E2BIG")) return null;
+      throw error;
+    }
   }
 
   const worktreeComparison = compareSparseWorktree(repo, worktree, hydrated.rows);
   const buffered: BufferedStatusRow[] = [];
   const retained = new Map<string, number>();
+  const collapsedIgnored = new Set<string>();
+  const collapsedUntracked = new Set<string>();
   for (let index = 0; index < candidates.length; index++) {
     const path = candidates[index];
     const row = hydrated.rows[index];
@@ -192,20 +244,31 @@ export function sparseStatus(
     const group = oneStatusIndexGroup(row.index, row.path);
     const stage = group?.kind === "tracked" ? group.entry : undefined;
     const worktreePath = sparseWorktreePath(row);
-    const untracked = row.current === null && group === undefined && worktreePath !== undefined;
+    const untracked = group === undefined && worktreePath !== undefined;
     const ignored = ignoredUntracked.has(path);
-    if (untracked && options.includeIgnored !== true && ignored) {
-      retained.set(path, SPARSE_WORKTREE_DIRTY);
-    } else if (untracked) {
-      buffered.push({
-        kind: "ready",
-        detail: ignored ? ignoredRow(path) : untrackedRow(path),
-      });
-    } else if (group?.kind === "unmerged") {
+    if (group?.kind === "unmerged") {
       buffered.push({ kind: "ready", detail: unmergedRow(group, worktreePath) });
     } else {
       const detail = trackedRow(path, sparseTarget(path, row), stage, worktreePath);
       if (detail !== null) buffered.push(detail);
+    }
+    if (untracked && untrackedMode !== "no") {
+      if (options.includeIgnored !== true && ignored) {
+        retained.set(path, SPARSE_WORKTREE_DIRTY);
+      } else {
+        const reportedPath =
+          untrackedMode === "normal"
+            ? sparseCollapsedUntrackedPath(path, ignored, ancestorFacts, ignores)
+            : path;
+        const collapsed = ignored ? collapsedIgnored : collapsedUntracked;
+        if (reportedPath !== null && !collapsed.has(reportedPath)) {
+          collapsed.add(reportedPath);
+          buffered.push({
+            kind: "ready",
+            detail: ignored ? ignoredRow(reportedPath) : untrackedRow(reportedPath),
+          });
+        }
+      }
     }
     let flags = retained.get(path) ?? 0;
     if (sparseIndexDirty(row, group) || stage?.mode === 0o160000) flags |= SPARSE_INDEX_DIRTY;
@@ -301,15 +364,84 @@ function sparseStatusCandidates(
   currentTreeOid: string | null,
 ): string[] | null {
   const paths = new Set<string>();
+  let retainedBytes = 0;
+  const add = (path: string): boolean => {
+    if (paths.has(path)) return true;
+    const next = retainedBytes + SPARSE_STATUS_PATH_FIXED_BYTES + retainedStringBytes(path);
+    if (paths.size === SPARSE_STATUS_PATHS || next > SPARSE_STATUS_CANDIDATE_BYTES) return false;
+    paths.add(path);
+    retainedBytes = next;
+    return true;
+  };
   for (const entry of dirty) {
-    paths.add(entry.path);
-    if (paths.size > SPARSE_STATUS_PATHS) return null;
+    if (!add(entry.path)) return null;
   }
   for (const entry of repo.walkTreeDiff(baselineTreeOid, currentTreeOid)) {
-    paths.add(entry.path);
-    if (paths.size > SPARSE_STATUS_PATHS) return null;
+    if (!add(entry.path)) return null;
   }
   return [...paths].sort(comparePaths);
+}
+
+function sparseUntrackedAncestors(paths: readonly string[]): {
+  paths: string[];
+  retainedBytes: number;
+} {
+  const ancestors = new Set<string>();
+  let retainedBytes = 0;
+  for (const path of paths) {
+    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+      const ancestor = path.slice(0, slash);
+      if (ancestors.has(ancestor)) continue;
+      const next = retainedBytes + SPARSE_STATUS_PATH_FIXED_BYTES + retainedStringBytes(ancestor);
+      if (ancestors.size === SPARSE_STATUS_ANCESTORS || next > SPARSE_STATUS_ANCESTOR_BYTES) {
+        throw new GitError("E2BIG", "sparse status ancestor state exceeds its bound");
+      }
+      ancestors.add(ancestor);
+      retainedBytes = next;
+    }
+  }
+  return { paths: [...ancestors].sort(comparePaths), retainedBytes };
+}
+
+function validatedAncestorFacts(
+  ancestors: readonly string[],
+  facts: readonly SparseIndexAncestorFact[],
+): Map<string, SparseIndexAncestorFact> {
+  const result = new Map<string, SparseIndexAncestorFact>();
+  for (let index = 0; index < ancestors.length; index++) {
+    const path = ancestors[index];
+    const fact = facts[index];
+    if (
+      path === undefined ||
+      fact === undefined ||
+      fact.path !== path ||
+      typeof fact.exact !== "boolean" ||
+      typeof fact.descendant !== "boolean"
+    ) {
+      throw new CorruptError("sparse index ancestor lookup returned unordered facts");
+    }
+    result.set(path, fact);
+  }
+  return result;
+}
+
+function sparseCollapsedUntrackedPath(
+  path: string,
+  ignored: boolean,
+  facts: ReadonlyMap<string, SparseIndexAncestorFact>,
+  ignores: IgnoreMatcher | undefined,
+): string | null {
+  for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+    const directory = path.slice(0, slash);
+    const fact = facts.get(directory);
+    if (fact === undefined) {
+      throw new CorruptError("sparse index ancestor lookup omitted a path");
+    }
+    if (!fact.descendant && (!ignored || ignores?.ignores(directory, true) === true)) {
+      return fact.exact ? null : `${directory}/`;
+    }
+  }
+  return path;
 }
 
 function sparseTarget(path: string, row: SparseWorkspaceRow): TargetEntry | undefined {

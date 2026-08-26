@@ -105,11 +105,20 @@ export function status(
   worktree: Worktree,
   options: StatusOptions = {},
 ): StatusDetail[] {
-  // Sorted over the rows, which is the output — a collapsed `dir/` entry
-  // does not sort where the file that produced it did.
-  return [...statusStream(repo, worktree, options)].sort((left, right) =>
-    comparePaths(left.path, right.path),
-  );
+  // Git groups ordinary, untracked, and ignored rows, then path-orders each group.
+  return sortStatusDetails([...statusStream(repo, worktree, options)]);
+}
+
+function sortStatusDetails(rows: StatusDetail[]): StatusDetail[] {
+  return rows.sort((left, right) => {
+    const section = statusSection(left) - statusSection(right);
+    return section === 0 ? comparePaths(left.path, right.path) : section;
+  });
+}
+
+function statusSection(row: StatusDetail): number {
+  if (row.ignored === true) return 2;
+  return row.worktree === "?" ? 1 : 0;
 }
 
 /** Eager status plus optional porcelain-v2 branch metadata. */
@@ -181,12 +190,12 @@ export function eagerStatus(
     const baselineTreeOid = repo.headTree();
     const seed = new FullStatusTrackerSeed();
     const renames = classifyStatusRenames(repo, baselineTreeOid, options);
-    const rows = [
+    const rows = sortStatusDetails([
       ...applyStatusRenames(
         statusStreamInternal(repo, worktree, options, baselineTreeOid, seed),
         renames,
       ),
-    ].sort((left, right) => comparePaths(left.path, right.path));
+    ]);
     if (seed.resealable) {
       tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries());
     }
@@ -200,7 +209,7 @@ export function eagerStatus(
     return sparse;
   }
   const renames = classifyStatusRenames(repo, repo.headTree(), options);
-  return [...applyStatusRenames(sparse, renames)];
+  return sortStatusDetails([...applyStatusRenames(sparse, renames)]);
 }
 
 /**
@@ -268,7 +277,7 @@ function* applyStatusRenames(
     classification.renames.map((rename) => [rename.destination.path, rename]),
   );
   for (const row of rows) {
-    if (sources.has(row.path)) continue;
+    if (sources.has(row.path) && row.ignored !== true && row.worktree !== "?") continue;
     const rename = destinations.get(row.path);
     if (rename === undefined) {
       yield row;
@@ -292,7 +301,8 @@ function* statusStreamInternal(
   headTreeOid: string | null,
   seed?: FullStatusTrackerSeed,
 ): Generator<StatusDetail> {
-  const collapse = (options.untrackedFiles ?? "normal") === "normal";
+  const untrackedMode = options.untrackedFiles ?? "normal";
+  const collapse = untrackedMode === "normal";
   const excluded = excludedRoots(repo.root, options.excludeRoots);
   const snapshot = snapshotStatusIndex(repo, collapse, collapse || excluded.length > 0);
   const ignores = options.ignores ?? loadIgnoreMatcher(worktree, repo.root);
@@ -301,6 +311,37 @@ function* statusStreamInternal(
   let sourceRows = 0;
   let collapsedIgnored: string | null = null;
   let collapsedUntracked: string | null = null;
+  const observeUntracked = (candidate: string): void => {
+    seed?.observeUntracked(candidate);
+    if (untrackedMode === "no") return;
+    const ignored = ignores.ignores(candidate, false);
+    if (isExcluded(candidate, excluded) || (options.includeIgnored !== true && ignored)) return;
+
+    let path = candidate;
+    if (collapse) {
+      if (
+        (collapsedIgnored !== null && path.startsWith(`${collapsedIgnored}/`)) ||
+        (!ignored && collapsedUntracked !== null && path.startsWith(`${collapsedUntracked}/`))
+      ) {
+        return;
+      }
+      const directory = ignored
+        ? shallowestIgnoredDirectory(path, snapshot.trackedDirs, ignores)
+        : shallowestUntrackedDirectory(path, snapshot.trackedDirs);
+      if (directory !== null && matchesPaths(directory, options.paths)) {
+        if (ignored) collapsedIgnored = directory;
+        else collapsedUntracked = directory;
+        path = `${directory}/`;
+      }
+    }
+    if (
+      (matchesPaths(path, options.paths) || matchesPaths(candidate, options.paths)) &&
+      // A tracked file replaced by a directory is a deletion, not a new directory.
+      (!collapse || !path.endsWith("/") || !snapshot.trackedPaths.has(stripSlash(path)))
+    ) {
+      buffered.push({ kind: "ready", detail: ignored ? ignoredRow(path) : untrackedRow(path) });
+    }
+  };
 
   for (const row of joinSorted3(
     treeStream(repo, headTreeOid),
@@ -321,45 +362,9 @@ function* statusStreamInternal(
         else seed?.observeTracked(row.a, row.b?.entry, row.c, detail);
         if (matches && detail !== null) buffered.push(detail);
       }
-      // A tracked path is never also untracked, whatever is on disk.
+      if (row.b === undefined && row.c !== undefined) observeUntracked(row.path);
     } else if (row.c !== undefined) {
-      seed?.observeUntracked(row.path);
-      const ignored = ignores.ignores(row.path, false);
-      if (isExcluded(row.path, excluded) || (options.includeIgnored !== true && ignored)) {
-        if (sourceRows >= STATUS_WINDOW_ROWS) {
-          yield* flushStatusRows(repo, worktree, buffered, seed);
-          sourceRows = 0;
-        }
-        continue;
-      }
-      let path = row.path;
-      if (collapse) {
-        if (
-          (collapsedIgnored !== null && path.startsWith(`${collapsedIgnored}/`)) ||
-          (!ignored && collapsedUntracked !== null && path.startsWith(`${collapsedUntracked}/`))
-        ) {
-          if (sourceRows >= STATUS_WINDOW_ROWS) {
-            yield* flushStatusRows(repo, worktree, buffered, seed);
-            sourceRows = 0;
-          }
-          continue;
-        }
-        const directory = ignored
-          ? shallowestIgnoredDirectory(path, snapshot.trackedDirs, ignores)
-          : shallowestUntrackedDirectory(path, snapshot.trackedDirs);
-        if (directory !== null && matchesPaths(directory, options.paths)) {
-          if (ignored) collapsedIgnored = directory;
-          else collapsedUntracked = directory;
-          path = `${directory}/`;
-        }
-      }
-      if (
-        (matchesPaths(path, options.paths) || matchesPaths(row.path, options.paths)) &&
-        // A tracked file replaced by a directory is a deletion, not a new directory.
-        (!collapse || !snapshot.trackedPaths.has(stripSlash(path)))
-      ) {
-        buffered.push({ kind: "ready", detail: ignored ? ignoredRow(path) : untrackedRow(path) });
-      }
+      observeUntracked(row.path);
     }
 
     if (sourceRows >= STATUS_WINDOW_ROWS) {
@@ -446,8 +451,8 @@ function worktreeWalkOptions(
 }
 
 /**
- * Snapshot only stage-zero path keys. Normal untracked collapsing needs all
- * tracked directories before the merge reaches its first worktree path.
+ * Snapshot one path per validated index group. Normal untracked collapsing
+ * treats unmerged stages as tracked and needs every tracked directory early.
  */
 function snapshotStatusIndex(
   repo: Repository,
