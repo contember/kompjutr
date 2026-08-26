@@ -22,3 +22,4 @@ a commit message suffices.
 - [0006 — Keep content identities opaque and bound the Git blob cache](0006-keep-content-identities-opaque-and-bound-the-cache.md) — accepted (2026-08-26)
 - [0007 — Key parsed trees by source surrogate](0007-key-parsed-trees-by-source-surrogate.md) — accepted (2026-08-26)
 - [0008 — Retain bounded deleted-ref history](0008-retain-deleted-ref-history.md) — accepted (2026-08-26)
+- [0009 — Split the shared Git store from checkouts](0009-split-shared-store-from-checkouts.md) — accepted (2026-08-26)

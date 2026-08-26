@@ -83,10 +83,10 @@ models overlap.
   branch exclusivity, lifecycle errors, the fixed checkout-count and retained
   state bounds, and how a checkout-scoped HEAD selector is resolved. Record that
   the version-1 baseline is replaced rather than migrated.
-- **Acceptance / witness.** One ownership-matrix test documents every table and
-  fails if a checkout-scoped table is keyed only by the shared store id or a
-  shared table is duplicated per checkout. ADR-0009 is Accepted before schema
-  implementation starts.
+- **Acceptance / witness.** ADR-0009 is Accepted before schema implementation
+  starts. Its executable ownership-matrix test lands with WU2, when the target
+  tables exist; it must fail if a checkout-scoped table is keyed only by the
+  shared store id or a shared table is duplicated per checkout.
 - **Touch points.** `src/sqlite/schema.ts`, `src/sqlite/reflog-schema.ts`,
   `src/sqlite/operation-schema.ts`, `tests/schema.test.ts`,
   `docs/decisions/0009-*.md`, `docs/decisions/README.md`.
@@ -109,6 +109,7 @@ models overlap.
   foreign-key cascades and create the primary checkout atomically with init.
 - **Acceptance / witness.** A fresh database creates one store and one primary
   checkout within the existing 1,000-statement budget; exact reopen is a no-op.
+  The executable ownership matrix classifies every target table against ADR-0009.
   Two raw checkout facades read the same object/ref/config rows and different
   HEAD/index/operation rows. Cross-store or cross-checkout corruption fails
   closed. No migration module, frozen historical schema, or upgrade test exists.
@@ -150,22 +151,25 @@ models overlap.
 - **Verify first.** Pin real Git results for add from default HEAD, add from an
   explicit start point, detached add, an already-checked-out branch, an existing
   root, clean and dirty removal, forced removal, a live operation, missing roots,
-  prune, and repeated/idempotent calls. Measure retained bytes for the proposed
-  checkout cap before fixing its numeric value.
+  prune, and repeated/idempotent calls. Recheck the retained-state model for the
+  fixed 1,024-checkout cap.
 - **Scope.** Add typed `worktreeAdd`, `worktreeList`, `worktreeRemove`, and
-  `worktreePrune` methods. `worktreeAdd` creates a checkout plus branch/HEAD/index
-  state and materialises it atomically from the caller's perspective.
+  `worktreePrune` methods. `worktreeAdd` accepts a missing or empty root and
+  creates checkout plus branch/HEAD/index state in one filesystem/SQLite
+  transaction; any failure rolls back every write.
   `worktreeList` is ordered with `comparePaths` and capped. Branch ownership is
-  enforced in storage with a stable `EBRANCHINUSE`-class error, including direct
-  HEAD mutations. Removal refuses dirty or active checkouts unless the specific
-  operation is explicitly forceable, and never half-deletes. Prune removes only
-  a bounded set of checkout rows whose roots are proven absent.
-- **Acceptance / witness.** Differential tests match Git for every verify-first
-  case. Two session branches share newly written objects and refs immediately,
-  but modifying/staging one root leaves the other root and index unchanged. A
-  1,000-statement and sub-100-MiB witness covers the maximum accepted lifecycle
-  operation; the first input beyond each bound fails closed rather than
-  truncating.
+  enforced in storage with `EBRANCHINUSE`, including direct
+  HEAD mutations. Removal always refuses a live operation and force may bypass
+  only dirty state; primary removal is forbidden. Prune atomically removes only
+  bounded, absent, non-primary checkouts and aborts unchanged if any eligible
+  checkout has a live operation.
+- **Acceptance / witness.** Differential tests pin Git for every verify-first
+  case and explicit divergence tests enforce ADR-0009's atomic add, immutable
+  branch ownership, and non-forceable live-operation refusal. Two session branches
+  share newly written objects and refs immediately, but modifying/staging one root
+  leaves the other root and index unchanged. A 1,000-statement and sub-100-MiB
+  witness covers the maximum accepted lifecycle operation; the first input beyond
+  each bound fails closed rather than truncating.
 - **Touch points.** New `src/core/ops/worktrees.ts`, `src/core/context.ts`,
   `src/core/repository.ts`, `src/sqlite/store.ts`, `src/git/client.ts`,
   `src/git/index.ts`, `src/index.ts`, new `tests/worktrees.test.ts`,
@@ -186,15 +190,17 @@ models overlap.
   append its direct-ref entry and the causal checkout HEAD entry in the same
   `transactionSync()` publication; branch exclusivity makes that checkout
   unambiguous. Aggregate retained reflog roots across direct refs and every live
-  checkout without materialising an unbounded cursor. Scope `HEAD@{n}` and
-  operation recovery to the selected checkout. Refuse removal while its journal
-  is live.
+  checkout without materialising an unbounded cursor. A bounded scalar row count
+  above the existing root-scan limit fails with `E2BIG` before allocation or
+  yield. Scope zero-based newest-first `HEAD@{n}` and operation recovery to the
+  selected checkout. Refuse removal while its journal is live.
 - **Acceptance / witness.** Checkout A can suspend a conflict while checkout B
   remains clean and usable. Reopening the database through B first and A second
   preserves both states. Continue/abort in A cannot read or mutate B's index,
   worktree, HEAD log, or operation rows. Shared refs remain visible to both.
-  Reflog root enumeration remains one lazy bounded `iterate()` traversal and
-  includes every retained checkout endpoint exactly once.
+  Reflog root enumeration witnesses the exact accepted row-count boundary and its
+  first rejection without partial output. At or below the limit, one lazy bounded
+  `iterate()` traversal includes every retained checkout endpoint exactly once.
 - **Touch points.** `src/sqlite/store.ts`, `src/sqlite/reflog-schema.ts`,
   `src/sqlite/operation-schema.ts`, `src/core/ops/operation-state.ts`,
   integration/replay/rebase lifecycle modules, `tests/reflog-api.test.ts`,
@@ -295,8 +301,8 @@ models overlap.
   has been deployed. WU2 edits schema version 1 directly and adds no migration.
 - Lifecycle methods are typed operations; kompjutr still gains no argv parser or
   `.git` compatibility layout.
-- The checkout cap must be fixed and fail closed. WU1 records the numeric bound
-  only after retained-state accounting; WU4 pins it with first-over-limit tests.
+- The checkout cap is 1,024 and fails closed before creation. WU4 and WU5 pin its
+  first-over-limit and retained-state models.
 - WU1 graduates the store/checkout identity and reflog ownership into ADR-0009.
 
 ## Sequencing
@@ -320,3 +326,11 @@ schema/mutation review before the next dependent phase. Do not overlap writers i
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). After graduating,
      trim to a one-line pointer ("→ ADR-0009"). -->
+
+- 2026-08-26 — WU1 froze shared-store and checkout ownership, a fail-closed
+  1,024-checkout cap, storage-enforced branch exclusivity, causal checkout `HEAD`
+  history, caller-atomic add, destructive checkout removal, and direct replacement
+  of the undeployed version-1 baseline. → [ADR-0009](../decisions/0009-split-shared-store-from-checkouts.md)
+- 2026-08-26 — Sequencing deviation: WU1 froze the ownership matrix in ADR-0009;
+  its executable schema witness moves to WU2 because the checkout tables do not
+  exist before the baseline split.
