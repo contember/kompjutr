@@ -1796,9 +1796,11 @@ export class PackStore {
     if (wanted.length === 0) return new Map();
     const result = new Map<string, ExternalObjectMetadata>();
     for (const row of this.#db.all<{ oid: string; type: string; size: number }>(
+      // CROSS JOIN pins the order: without it SQLite drives from
+      // git_pack_objects and re-scans the bound set once per packed object.
       `SELECT object.oid, object.type, object.size
          FROM json_each(?) wanted
-         JOIN git_pack_objects object
+         CROSS JOIN git_pack_objects object
            ON object.repo_id = ? AND object.oid = wanted.value
          JOIN git_pack_meta pack
            ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id

@@ -58,6 +58,45 @@ class ReorderedRangeDatabase implements SqlDatabase {
   }
 }
 
+class RecordingDatabase implements SqlDatabase {
+  readonly queries: { query: string; bindings: unknown[] }[] = [];
+
+  constructor(readonly inner: TestDatabase) {}
+
+  get storage() {
+    return this.inner.storage;
+  }
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.queries.push({ query, bindings });
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    this.queries.push({ query, bindings });
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    this.queries.push({ query, bindings });
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    this.queries.push({ query, bindings });
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.queries.push({ query, bindings });
+    return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
 function open() {
   const database = new SqliteGitDatabase(new TestDatabase(), { objectCacheBytes: 1024 * 1024 });
   return database.open(database.create("/repo", "ref: refs/heads/main"));
@@ -360,6 +399,40 @@ describe("synthetic pack ingest", () => {
     if (repository === null) throw new Error("repository missing after pack ingest");
     expect(coldDatabase.open(repository).readBlobs([targetOid]).blobs.get(targetOid)).toEqual(
       target,
+    );
+  });
+
+  it("drives the packed base lookup from the requested oids", async () => {
+    const inner = new TestDatabase();
+    const recorder = new RecordingDatabase(inner);
+    const database = new SqliteGitDatabase(recorder);
+    const store = database.open(database.create("/repo", "ref: refs/heads/main"));
+    // The delta precedes its base, so the entry is deferred and draining it
+    // looks the base up through the statement under test.
+    const base = utf8.encode("base content\n".repeat(20));
+    const baseOid = hashObject("blob", base);
+    const target = utf8.encode(`${utf8Decoder.decode(base)}extra\n`);
+    const targetOid = hashObject("blob", target);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.refDelta(baseOid, literalDelta(base.length, target));
+    writer.object("blob", base);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+    expect(store.readBlobs([targetOid]).blobs.get(targetOid)).toEqual(target);
+
+    const issued = recorder.queries.find((entry) => entry.query.includes("json_each(?) wanted"));
+    if (issued === undefined) throw new Error("the packed base lookup was never issued");
+    const plan = inner
+      .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)
+      .map((row) => row.detail);
+    // Without the CROSS JOIN, SQLite drives from git_pack_objects and rescans
+    // the bound oids once per packed object: 450 ms rather than 0.4 ms on a
+    // 30,613-object pack.
+    expect(plan[0]).toMatch(/VIRTUAL TABLE/);
+    expect(plan.slice(1).join("\n")).toMatch(
+      /SEARCH object USING INDEX sqlite_autoindex_git_pack_objects_1/,
     );
   });
 
