@@ -330,3 +330,11 @@ counts are recorded in the archived outcome.
   `HEAD@{n}`. Because the existing suffix parser was unbounded, WU3 also caps a
   revision expression at 1,024 code units and 32 total traversal operations;
   overflow fails with `E2BIG`.
+- 2026-08-26 — WU3 landed in `c52257a`. The native API now exposes bounded
+  reflog pages and CAS recovery, `HEAD@{0..1023}` composes with the bounded
+  revision suffix parser, and one lazy SQL cursor validates and streams distinct
+  active recovery roots. Independent trust review raised the root-scan ceiling
+  from 64 MiB to 96 MiB, still below the operation invariant, so the supported
+  9,329-ref mutation shape enumerates every root in one statement; 11,264 rows
+  are accepted and 11,265 fail closed. Root verification passed the 158-test
+  focused set, the final 20/20 reflog API set, leased typecheck, and Biome checks.
