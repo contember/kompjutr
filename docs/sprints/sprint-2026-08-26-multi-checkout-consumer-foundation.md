@@ -349,3 +349,16 @@ schema/mutation review before the next dependent phase. Do not overlap writers i
   parity covered multiple merge bases, shallow counts, chained and dangling refs,
   detached and unborn `HEAD`, and cold checkout selection. The focused 76 tests,
   the executable 50,001-commit rejection, typecheck, and check passed.
+- 2026-08-26 — WU4 added atomic linked-checkout add/list/remove/prune over the
+  shared store, exact no-follow root-state reads, storage-enforced checkout caps,
+  and public lifecycle types. Real-Git controls cover the full add/removal/prune
+  matrix, including the deliberate divergence that force never bypasses a live
+  kompjutr operation. The focused 21 lifecycle/export tests, 103 regressions,
+  typecheck, check, and independent mutation review passed.
+- 2026-08-26 — WU5 proved checkout-private operation recovery and `HEAD`
+  history through B-first cold reopen, continue and abort, while shared refs and
+  the primary-owned shared/pack facade remain live after secondary removal.
+  Cross-checkout publication records only the owning checkout's causal `HEAD`,
+  and combined direct/checkout history accepts 9,727 rows but rejects 9,728
+  before traversal. All 73 focused tests, typecheck, and independent review
+  passed; no new production mutation path was required.

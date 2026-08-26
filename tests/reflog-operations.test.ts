@@ -12,6 +12,7 @@ import {
   tagDelete,
 } from "../src/core/ops/refs.js";
 import { add, reset } from "../src/core/ops/staging.js";
+import { Repository } from "../src/core/repository.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -522,6 +523,93 @@ describe("local ref operations", () => {
         workspace.repo.store.repoId,
       ),
     ).toBe(count);
+  });
+
+  it("routes a shared branch publication to its owning checkout and rolls every event back", () => {
+    const workspace = repository();
+    const first = workspace.repo.store.write("blob", new TextEncoder().encode("first\n"));
+    const second = workspace.repo.store.write("blob", new TextEncoder().encode("second\n"));
+    const third = workspace.repo.store.write("blob", new TextEncoder().encode("third\n"));
+    workspace.repo.store.setRef("refs/heads/main", first);
+    workspace.repo.store.setRef("refs/heads/side", first);
+    const checkoutB = workspace.database.createCheckout(
+      workspace.repo.store.repoId,
+      "/checkout-b",
+      "ref: refs/heads/side",
+    );
+    const repositoryB = new Repository(workspace.database.openCheckout(checkoutB));
+    const before = {
+      direct: workspace.repo.store.reflog("refs/heads/main"),
+      checkoutA: workspace.repo.checkout.reflog("HEAD"),
+      checkoutB: repositoryB.checkout.reflog("HEAD"),
+      ordinal: workspace.repo.store.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    };
+    if (before.ordinal === undefined) throw new Error("reflog allocator is missing");
+
+    updateRef(workspace.context, repositoryB, {
+      ref: "refs/heads/main",
+      value: second,
+      force: true,
+    });
+
+    const direct = workspace.repo.store.reflog("refs/heads/main");
+    const checkoutAEntries = workspace.repo.checkout.reflog("HEAD");
+    const checkoutBEntries = repositoryB.checkout.reflog("HEAD");
+    expect(direct).toHaveLength(before.direct.length + 1);
+    expect(checkoutAEntries).toHaveLength(before.checkoutA.length + 1);
+    expect(checkoutBEntries).toEqual(before.checkoutB);
+    expect(direct[0]).toMatchObject({
+      oldOid: first,
+      newOid: second,
+      reason: "update-ref",
+      ordinal: before.ordinal + 1,
+    });
+    expect(checkoutAEntries[0]).toMatchObject({
+      oldRaw: "ref: refs/heads/main",
+      newRaw: "ref: refs/heads/main",
+      oldOid: first,
+      newOid: second,
+      reason: "update-ref",
+      ordinal: before.ordinal + 2,
+    });
+    expect(
+      workspace.repo.store.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    ).toBe(before.ordinal + 2);
+
+    const published = {
+      direct,
+      checkoutA: checkoutAEntries,
+      checkoutB: checkoutBEntries,
+      ordinal: before.ordinal + 2,
+    };
+    workspace.repo.store.db.run(`CREATE TRIGGER fail_causal_head_publication
+      BEFORE INSERT ON git_checkout_reflog_entries
+      WHEN NEW.checkout_id = ${workspace.repo.checkout.checkoutId}
+      BEGIN SELECT RAISE(ABORT, 'injected causal HEAD publication failure'); END`);
+
+    expect(() =>
+      updateRef(workspace.context, repositoryB, {
+        ref: "refs/heads/main",
+        value: third,
+        force: true,
+      }),
+    ).toThrow(/injected causal HEAD publication failure/);
+    expect(workspace.repo.store.getRef("refs/heads/main")).toBe(second);
+    expect(workspace.repo.store.reflog("refs/heads/main")).toEqual(published.direct);
+    expect(workspace.repo.checkout.reflog("HEAD")).toEqual(published.checkoutA);
+    expect(repositoryB.checkout.reflog("HEAD")).toEqual(published.checkoutB);
+    expect(
+      workspace.repo.store.db.scalar<number>(
+        "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    ).toBe(published.ordinal);
   });
 
   it("rolls a full checkout back after worktree mutation when reflog insertion fails", () => {

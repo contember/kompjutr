@@ -328,6 +328,53 @@ describe("checkout lifecycle storage", () => {
     );
   });
 
+  it("keeps the primary shared backend alive after a B-first cold open removes B", () => {
+    const db = new TestDatabase();
+    const setup = new SqliteGitDatabase(db);
+    const primary = setup.createRepository("/primary", "ref: refs/heads/main");
+    const setupStore = setup.openCheckout(primary);
+    const before = setupStore.write("blob", utf8.encode("before removal\n"));
+    setupStore.setRef("refs/tags/shared", before);
+    setup.createCheckout(primary.repoId, "/secondary", OTHER_OID);
+
+    const cold = new SqliteGitDatabase(db);
+    const secondaryRow = cold.checkoutAt("/secondary");
+    if (secondaryRow === null) throw new Error("cold secondary checkout is missing");
+    const secondary = cold.openCheckout(secondaryRow);
+    const shared = secondary.shared;
+    const primaryRow = cold.checkoutAt("/primary");
+    if (primaryRow === null) throw new Error("cold primary checkout is missing");
+    const survivor = cold.openCheckout(primaryRow);
+    expect(secondary.packs).toBe(survivor.packs);
+    expect(shared.packs).toBe(survivor.packs);
+
+    cold.removeCheckout(secondaryRow.id, () => undefined);
+
+    expect(() => secondary.indexGet("private.txt")).toThrowError(
+      expect.objectContaining({ code: "EWORKTREENOTFOUND" }),
+    );
+    expect(() => secondary.shared).toThrowError(
+      expect.objectContaining({ code: "EWORKTREENOTFOUND" }),
+    );
+    expect(() => secondary.packs).toThrowError(
+      expect.objectContaining({ code: "EWORKTREENOTFOUND" }),
+    );
+
+    expect(shared.read(before)?.data).toEqual(utf8.encode("before removal\n"));
+    const after = shared.write("blob", utf8.encode("after removal\n"));
+    shared.setRef("refs/tags/shared", after);
+    expect(shared.getRef("refs/tags/shared")).toBe(after);
+    expect(shared.reflog("refs/tags/shared")[0]).toMatchObject({
+      oldOid: before,
+      newOid: after,
+      reason: "ref update",
+    });
+    shared.configSet("survivor.value", "alive");
+    expect(survivor.shared.configGet("survivor.value")).toBe("alive");
+    expect(shared.packs.count()).toBe(0);
+    expect(new Set(shared.activeRefLogOids())).toEqual(new Set([before, after]));
+  });
+
   it("rolls back the root callback and keeps the cached checkout on failed removal", () => {
     const { database, primary } = repository();
     const checkout = database.createCheckout(primary.repoId, "/session", OTHER_OID);

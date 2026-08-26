@@ -1,8 +1,12 @@
+import { rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { GitContext } from "../src/core/context.js";
 import { serializeCommit, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
+import { commit } from "../src/core/ops/commit.js";
 import { integrationIndexMatchesTree } from "../src/core/ops/integration-worktree.js";
 import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
 import {
@@ -18,6 +22,8 @@ import {
   calculateRebaseTransitionSqlStatements,
 } from "../src/core/ops/rebase-lifecycle.js";
 import { add } from "../src/core/ops/staging.js";
+import { status } from "../src/core/ops/status.js";
+import { worktreeAdd } from "../src/core/ops/worktrees.js";
 import { Repository } from "../src/core/repository.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -63,6 +69,22 @@ function reopen(workspace: TestRepository): { context: GitContext; repo: Reposit
     context: { ...workspace.context, database },
     repo: new Repository(database.openCheckout(row)),
   };
+}
+
+function reopenBThenA(
+  workspace: TestRepository,
+  bRoot: string,
+): { context: GitContext; a: Repository; b: Repository } {
+  const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+    now: workspace.context.now,
+  });
+  const bRow = database.checkoutAt(bRoot);
+  if (bRow === null) throw new Error("reopened checkout B is missing");
+  const b = new Repository(database.openCheckout(bRow));
+  const aRow = database.checkoutAt("/");
+  if (aRow === null) throw new Error("reopened checkout A is missing");
+  const a = new Repository(database.openCheckout(aRow));
+  return { context: { ...workspace.context, database }, a, b };
 }
 
 function history(
@@ -111,6 +133,77 @@ function objectProjectionCounts(workspace: TestRepository): {
     .toArray()[0];
   if (row === undefined) throw new Error("object projection counts are missing");
   return row;
+}
+
+function operationRowCount(workspace: TestRepository, checkoutId: number): number {
+  return (
+    workspace.repo.store.db.scalar<number>(
+      `SELECT (SELECT count(*) FROM git_operation_state WHERE checkout_id = ?)
+            + (SELECT count(*) FROM git_operation_steps WHERE checkout_id = ?)
+            + (SELECT count(*) FROM git_operation_touched WHERE checkout_id = ?)`,
+      checkoutId,
+      checkoutId,
+      checkoutId,
+    ) ?? 0
+  );
+}
+
+function checkoutIsolationSnapshot(workspace: TestRepository, repo: Repository) {
+  return {
+    rawHead: repo.checkout.head(),
+    headLog: repo.checkout.reflog("HEAD"),
+    operationRows: operationRowCount(workspace, repo.checkout.checkoutId),
+    index: [...repo.checkout.indexScan()],
+    worktree: workspace.worktree.scan(repo.root, { limit: 100 }).map((entry) => ({
+      path: entry.path,
+      type: entry.type,
+      mode: entry.mode,
+      size: entry.size,
+      mtime: entry.mtime,
+      ino: entry.ino,
+      nlink: entry.nlink,
+      rev: entry.rev,
+      target: entry.target,
+      contentId: entry.contentId,
+      bytes: entry.type === "file" ? workspace.worktree.readFile(entry.path) : null,
+    })),
+  };
+}
+
+async function suspendedMultiCheckout(): Promise<{
+  workspace: TestRepository;
+  a: Repository;
+  b: Repository;
+  original: string;
+  upstream: string;
+  bCommit: string;
+}> {
+  const source = fixture();
+  const { original, upstream } = history(source, true);
+  const workspace = await imported(source);
+  const created = worktreeAdd(workspace.context, workspace.repo, {
+    root: "/checkout-b",
+    target: { kind: "new-branch", name: "session-b", startPoint: "current" },
+  });
+  const row = workspace.database.checkoutAt(created.root);
+  if (row === null) throw new Error("checkout B is missing");
+  const b = new Repository(workspace.database.openCheckout(row));
+
+  expect(rebase(workspace.context, workspace.repo, workspace.worktree, { upstream })).toMatchObject(
+    { outcome: "conflicted", replayed: 1 },
+  );
+  expect(workspace.repo.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
+  expect(b.checkout.readOperationState()).toBeNull();
+  expect(status(b, workspace.worktree)).toEqual([]);
+
+  writeWorkFile(workspace, "/checkout-b/b-only.txt", "checkout B\n");
+  add(b, workspace.worktree, { paths: ["b-only.txt"] });
+  const bCommit = commit(workspace.context, b, { message: "checkout B commit" }).oid;
+  expect(status(b, workspace.worktree)).toEqual([]);
+  expect(b.checkout.readOperationState()).toBeNull();
+  expect(workspace.repo.store.getRef("refs/heads/session-b")).toBe(bCommit);
+  expect(b.store.getRef("refs/heads/current")).toBe(original);
+  return { workspace, a: workspace.repo, b, original, upstream, bCommit };
 }
 
 describe("rebase restart recovery", () => {
@@ -605,5 +698,86 @@ describe("rebase restart recovery", () => {
     expect(workspace.repo.checkout.requireOperationState("rebase").integrityOid).toBe(
       journal.integrityOid,
     );
+  });
+});
+
+describe("multi-checkout rebase restart isolation", () => {
+  it("reopens checkout B before A and continues A without changing B", async () => {
+    const suspended = await suspendedMultiCheckout();
+    const before = checkoutIsolationSnapshot(suspended.workspace, suspended.b);
+    expect(before.rawHead).toBe("ref: refs/heads/session-b");
+    expect(before.headLog.length).toBeGreaterThan(0);
+    expect(before.operationRows).toBe(0);
+    expect(before.index.length).toBeGreaterThan(0);
+
+    const cold = reopenBThenA(suspended.workspace, suspended.b.root);
+    expect(cold.b.store).toBe(cold.a.store);
+    expect(cold.b.store.getRef("refs/heads/session-b")).toBe(suspended.bCommit);
+    expect(cold.a.store.getRef("refs/heads/session-b")).toBe(suspended.bCommit);
+    expect(cold.b.checkout.readOperationState()).toBeNull();
+    expect(cold.a.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
+
+    writeWorkFile(suspended.workspace, "/shared.txt", "continued by A\n");
+    add(cold.a, suspended.workspace.worktree, { paths: ["shared.txt"] });
+    const result = rebaseContinue(cold.context, cold.a, suspended.workspace.worktree);
+
+    expect(result).toMatchObject({ outcome: "completed", replayed: 2 });
+    if (result.outcome !== "completed") throw new Error("checkout A rebase did not complete");
+    expect(cold.a.checkout.readOperationState()).toBeNull();
+    expect(operationRowCount(suspended.workspace, cold.a.checkout.checkoutId)).toBe(0);
+    expect(cold.b.store.getRef("refs/heads/current")).toBe(result.oid);
+    expect(cold.b.store.getRef("refs/heads/upstream")).toBe(suspended.upstream);
+    expect(cold.b.store.getRef("refs/heads/session-b")).toBe(suspended.bCommit);
+    expect(status(cold.b, suspended.workspace.worktree)).toEqual([]);
+    expect(checkoutIsolationSnapshot(suspended.workspace, cold.b)).toEqual(before);
+  });
+
+  it("reopens checkout B before A and aborts A without changing B", async () => {
+    const suspended = await suspendedMultiCheckout();
+    const before = checkoutIsolationSnapshot(suspended.workspace, suspended.b);
+    expect(before.rawHead).toBe("ref: refs/heads/session-b");
+    expect(before.headLog.length).toBeGreaterThan(0);
+    expect(before.operationRows).toBe(0);
+
+    const cold = reopenBThenA(suspended.workspace, suspended.b.root);
+    expect(cold.b.store).toBe(cold.a.store);
+    expect(cold.b.checkout.readOperationState()).toBeNull();
+    expect(cold.a.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
+    rebaseAbort(cold.a, suspended.workspace.worktree);
+
+    expect(cold.a.head()).toEqual({ ref: "refs/heads/current", oid: suspended.original });
+    expect(cold.a.checkout.readOperationState()).toBeNull();
+    expect(operationRowCount(suspended.workspace, cold.a.checkout.checkoutId)).toBe(0);
+    expect(integrationIndexMatchesTree(cold.a, cold.a.readCommit(suspended.original).tree)).toBe(
+      true,
+    );
+    expect(cold.b.store.getRef("refs/heads/current")).toBe(suspended.original);
+    expect(cold.b.store.getRef("refs/heads/upstream")).toBe(suspended.upstream);
+    expect(cold.b.store.getRef("refs/heads/session-b")).toBe(suspended.bCommit);
+    expect(status(cold.b, suspended.workspace.worktree)).toEqual([]);
+    expect(checkoutIsolationSnapshot(suspended.workspace, cold.b)).toEqual(before);
+  });
+
+  it("matches real Git: a conflicted rebase in A does not block a clean commit in B", () => {
+    const source = fixture();
+    const { upstream } = history(source, true);
+    const bRoot = `${source.dir}-checkout-b`;
+    try {
+      source.git("worktree", "add", "-b", "session-b", bRoot, "current");
+      expect(() => source.git("rebase", "upstream")).toThrow();
+      writeFileSync(join(bRoot, "b-only.txt"), "checkout B\n");
+      source.git("-C", bRoot, "add", "b-only.txt");
+      source.git("-C", bRoot, "commit", "-m", "checkout B commit");
+      const bHead = source.git("-C", bRoot, "rev-parse", "HEAD");
+
+      expect(source.git("rev-parse", "refs/heads/session-b")).toBe(bHead);
+      expect(source.git("rev-parse", "refs/heads/upstream")).toBe(upstream);
+      expect(source.git("-C", bRoot, "status", "--porcelain")).toBe("");
+      source.git("rebase", "--abort");
+      expect(source.git("-C", bRoot, "rev-parse", "HEAD")).toBe(bHead);
+      expect(source.git("-C", bRoot, "status", "--porcelain")).toBe("");
+    } finally {
+      rmSync(bRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { recoverRef } from "../src/core/ops/ref-log.js";
+import { Repository } from "../src/core/repository.js";
 import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
@@ -26,9 +27,9 @@ const FIRST = "1".repeat(40);
 const SECOND = "2".repeat(40);
 const THIRD = "3".repeat(40);
 
-function bindGit(workspace: TestRepository): Git {
+function bindGit(workspace: TestRepository, database = workspace.database): Git {
   return createGit()({
-    database: workspace.database,
+    database,
     worktree: workspace.worktree,
     now: workspace.context.now,
     timezoneOffset: workspace.context.timezoneOffset,
@@ -164,42 +165,76 @@ function appendRefLog(db: SqlDatabase, repoId: number, ref: string, ordinal: num
   });
 }
 
-function seedDistinctActiveRefLogs(db: SqlDatabase, repoId: number, count: number): void {
+function seedCombinedActiveRefLogs(
+  db: SqlDatabase,
+  repoId: number,
+  checkoutIds: readonly number[],
+  checkoutRows: number,
+  directRows: number,
+): readonly string[] {
+  const checkoutEndpoints: string[] = [];
   db.transactionSync(() => {
     db.run("DELETE FROM git_reflog_entries WHERE repo_id = ?", repoId);
     db.run("DELETE FROM git_checkout_reflog_entries WHERE repo_id = ?", repoId);
     db.run("UPDATE git_reflog_state SET next_ordinal = 0 WHERE repo_id = ?", repoId);
-    if (count === 0) return;
-    db.run(
-      `WITH RECURSIVE sequence(ordinal) AS (
-         VALUES (1)
-         UNION ALL
-         SELECT ordinal + 1 FROM sequence WHERE ordinal < ?
-       )
-       INSERT INTO git_reflog_entries
-         (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
-          actor_name, actor_email, timestamp, timezone, reason)
-       SELECT ?, 'refs/tags/root-' || printf('%04d', ordinal), ordinal,
-              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
-              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
-              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
-              CASE ordinal % 2 WHEN 0 THEN ? ELSE ? END,
-              NULL, NULL, ?, 0, 'active-root-' || ordinal
-         FROM sequence`,
-      count,
-      repoId,
-      FIRST,
-      SECOND,
-      SECOND,
-      FIRST,
-      FIRST,
-      SECOND,
-      SECOND,
-      FIRST,
-      NOW_SECONDS,
-    );
-    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", count, repoId);
+    let allocated = 0;
+    for (let index = 0; index < checkoutIds.length; index++) {
+      const checkoutId = checkoutIds[index];
+      if (checkoutId === undefined) throw new Error("combined seed checkout is missing");
+      const oldOid = (0x1_000 + index * 2).toString(16).padStart(40, "0");
+      const newOid = (0x1_001 + index * 2).toString(16).padStart(40, "0");
+      checkoutEndpoints.push(oldOid, newOid);
+      db.run(
+        `WITH RECURSIVE sequence(offset) AS (
+           VALUES (1)
+           UNION ALL
+           SELECT offset + 1 FROM sequence WHERE offset < ?
+         )
+         INSERT INTO git_checkout_reflog_entries
+           (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         SELECT ?, ?, ? + offset, ?, ?, ?, ?, NULL, NULL, ?, 0,
+                'combined-checkout-' || offset
+           FROM sequence`,
+        checkoutRows,
+        checkoutId,
+        repoId,
+        allocated,
+        oldOid,
+        newOid,
+        oldOid,
+        newOid,
+        NOW_SECONDS,
+      );
+      allocated += checkoutRows;
+    }
+    if (directRows > 0) {
+      db.run(
+        `WITH RECURSIVE sequence(offset) AS (
+           VALUES (1)
+           UNION ALL
+           SELECT offset + 1 FROM sequence WHERE offset < ?
+         )
+         INSERT INTO git_reflog_entries
+           (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+            actor_name, actor_email, timestamp, timezone, reason)
+         SELECT ?, 'refs/tags/combined-' || printf('%04d', offset), ? + offset,
+                ?, ?, ?, ?, NULL, NULL, ?, 0, 'combined-direct-' || offset
+           FROM sequence`,
+        directRows,
+        repoId,
+        allocated,
+        FIRST,
+        SECOND,
+        FIRST,
+        SECOND,
+        NOW_SECONDS,
+      );
+      allocated += directRows;
+    }
+    db.run("UPDATE git_reflog_state SET next_ordinal = ? WHERE repo_id = ?", allocated, repoId);
   });
+  return Object.freeze(checkoutEndpoints);
 }
 
 class GuardedDatabase implements SqlDatabase {
@@ -349,6 +384,57 @@ describe("HEAD reflog selectors", () => {
 
     now += (RETENTION_SECONDS + 1) * 1_000;
     await expect(git.revParse({ ref: "HEAD@{1}" })).rejects.toMatchObject({ code: "ENOTFOUND" });
+  });
+
+  it("selects interleaved HEAD histories by checkout across a cold reopen", async () => {
+    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
+    const first = workspace.repo.store.write("blob", new TextEncoder().encode("first\n"));
+    const second = workspace.repo.store.write("blob", new TextEncoder().encode("second\n"));
+    const third = workspace.repo.store.write("blob", new TextEncoder().encode("third\n"));
+    workspace.repo.mutateRefs({ head: first }, metadata("seed-a"));
+    const checkoutB = workspace.database.createCheckout(
+      workspace.repo.store.repoId,
+      "/checkout-b",
+      first,
+    );
+    const repositoryB = new Repository(workspace.database.openCheckout(checkoutB));
+    seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 0);
+
+    workspace.repo.mutateRefs({ head: second }, metadata("a-1"));
+    repositoryB.mutateRefs({ head: third }, metadata("b-1"));
+    workspace.repo.mutateRefs({ head: third }, metadata("a-2"));
+    repositoryB.mutateRefs({ head: second }, metadata("b-2"));
+
+    expect(workspace.repo.checkout.reflog("HEAD").map((entry) => entry.ordinal)).toEqual([3, 1]);
+    expect(repositoryB.checkout.reflog("HEAD").map((entry) => entry.ordinal)).toEqual([4, 2]);
+    const git = bindGit(workspace);
+    await expect(git.reflog({ dir: "/", ref: "HEAD" })).resolves.toMatchObject([
+      { reason: "a-2", newOid: third },
+      { reason: "a-1", newOid: second },
+    ]);
+    await expect(git.reflog({ dir: "/checkout-b", ref: "HEAD" })).resolves.toMatchObject([
+      { reason: "b-2", newOid: second },
+      { reason: "b-1", newOid: third },
+    ]);
+    await expect(git.revParse({ dir: "/", ref: "HEAD@{0}" })).resolves.toBe(third);
+    await expect(git.revParse({ dir: "/", ref: "HEAD@{1}" })).resolves.toBe(second);
+    await expect(git.revParse({ dir: "/checkout-b", ref: "HEAD@{0}" })).resolves.toBe(second);
+    await expect(git.revParse({ dir: "/checkout-b", ref: "HEAD@{1}" })).resolves.toBe(third);
+
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
+      now: () => NOW_MILLISECONDS,
+    });
+    const reopened = bindGit(workspace, reopenedDatabase);
+    await expect(
+      reopened.revParse({ dir: "/checkout-b", ref: "HEAD@{0}" }),
+      "checkout B opens first",
+    ).resolves.toBe(second);
+    await expect(
+      reopened.revParse({ dir: "/", ref: "HEAD@{0}" }),
+      "checkout A opens after B",
+    ).resolves.toBe(third);
+    await expect(reopened.revParse({ dir: "/checkout-b", ref: "HEAD@{1}" })).resolves.toBe(third);
+    await expect(reopened.revParse({ dir: "/", ref: "HEAD@{1}" })).resolves.toBe(second);
   });
 });
 
@@ -680,22 +766,68 @@ describe("active reflog roots", () => {
     expect(workspace.storage.statementCount).toBe(3);
   });
 
-  it("accepts the exact SQL-state budget and rejects one physical row over before grouping", () => {
+  it("accepts 9,727 combined retained rows and rejects 9,728 before traversal", () => {
     const db = new GuardedDatabase();
     const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
     const repository = database.createRepository("/repo", "ref: refs/heads/main");
     const store = database.openCheckout(repository);
-    seedDistinctActiveRefLogs(db, store.repoId, MAX_REFLOG_ROOT_SCAN_ENTRIES);
+    const checkoutIds = [repository.id];
+    for (let index = 1; index < 8; index++) {
+      checkoutIds.push(database.createCheckout(store.repoId, `/checkout-${index}`, FIRST).id);
+    }
+    const checkoutRows = 1_024;
+    const directRows = MAX_REFLOG_ROOT_SCAN_ENTRIES - checkoutIds.length * checkoutRows;
+    const checkoutEndpoints = seedCombinedActiveRefLogs(
+      db,
+      store.repoId,
+      checkoutIds,
+      checkoutRows,
+      directRows,
+    );
     db.forbidAll = true;
     db.iterateCalls = 0;
 
     expect(
       db.scalar<number>("SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?", store.repoId),
-    ).toBe(9_727);
-    expect([...store.activeRefLogOids()]).toEqual([FIRST, SECOND]);
+    ).toBe(directRows);
+    expect(
+      db.scalar<number>(
+        "SELECT count(DISTINCT ref_name) FROM git_reflog_entries WHERE repo_id = ?",
+        store.repoId,
+      ),
+    ).toBe(directRows);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
+        store.repoId,
+      ),
+    ).toBe(checkoutIds.length * checkoutRows);
+    for (const checkoutId of checkoutIds) {
+      expect(
+        db.scalar<number>(
+          "SELECT count(*) FROM git_checkout_reflog_entries WHERE checkout_id = ?",
+          checkoutId,
+        ),
+      ).toBe(checkoutRows);
+    }
+    expect(directRows + checkoutIds.length * checkoutRows).toBe(9_727);
+    expect(new Set(checkoutEndpoints).size).toBe(checkoutEndpoints.length);
+    const accepted = store.activeRefLogOids();
+    expect(db.iterateCalls).toBe(0);
+    const roots = [...accepted];
+    expect(roots).toHaveLength(checkoutEndpoints.length + 2);
+    expect(roots).toEqual(expect.arrayContaining([FIRST, SECOND, ...checkoutEndpoints]));
     expect(db.iterateCalls).toBe(1);
 
     appendRefLog(db, store.repoId, "refs/tags/root-overflow", MAX_REFLOG_ROOT_SCAN_ENTRIES + 1);
+    expect(
+      db.scalar<number>(
+        `SELECT (SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?)
+              + (SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?)`,
+        store.repoId,
+        store.repoId,
+      ),
+    ).toBe(9_728);
     db.iterateCalls = 0;
     db.closedIterators = 0;
     const over = store.activeRefLogOids();

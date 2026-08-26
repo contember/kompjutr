@@ -2604,6 +2604,10 @@ export class SqliteGitDatabase {
     );
     if (primaryRaw === undefined) throw new CorruptError("repository primary checkout is missing");
     const primary = requireStoredCheckoutRow(primaryRaw);
+    if (primary.repoId !== repoId || !primary.isPrimary) {
+      throw new CorruptError("repository primary checkout lookup returned another checkout");
+    }
+    // The non-removable primary keeps shared operations and pack callbacks live.
     const lifetime = new CheckoutStoreLifetime();
     const primaryStore = new CheckoutStore(
       store,
