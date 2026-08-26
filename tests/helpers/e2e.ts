@@ -10,8 +10,8 @@
 // local path, because the mirror is the reference, not the subject.
 
 import { Buffer } from "node:buffer";
-import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { expect } from "vitest";
 
@@ -19,6 +19,7 @@ import type { GitContext } from "../../src/core/context.js";
 import { openRepository } from "../../src/core/context.js";
 import type { StatusBranch } from "../../src/core/ops/status.js";
 import { formatPorcelainV2, statusReport } from "../../src/core/ops/status.js";
+import type { WorktreeAddTarget } from "../../src/core/ops/worktrees.js";
 import { comparePaths } from "../../src/core/streams.js";
 import type { Git } from "../../src/git/client.js";
 import { createGit } from "../../src/git/client.js";
@@ -48,6 +49,8 @@ const IDENTITY = { name: "Fixture", email: "fixture@example.com" };
  * records a remote's default branch as a ref. Compared refs drop it.
  */
 const REMOTE_HEAD = /^refs\/remotes\/[^/]+\/HEAD$/;
+const WORKTREE_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const MAX_WORKTREE_NAME_UNITS = 64;
 
 // -- the action DSL ----------------------------------------------------
 
@@ -102,6 +105,12 @@ type NetworkAction =
   | { op: "pull"; message?: string; fastForward?: boolean; fastForwardOnly?: boolean }
   | { op: "push"; ref?: string; remoteRef?: string; force?: boolean; delete?: boolean };
 
+type LifecycleAction =
+  | { op: "worktreeAdd"; name: string; target: WorktreeAddTarget }
+  | { op: "worktreeRemove"; name: string; force?: boolean }
+  | { op: "worktreeMakeAbsent"; name: string }
+  | { op: "worktreePrune" };
+
 /**
  * Work by somebody else, run as real git against both sides' peer clones so
  * the two origins stay in lockstep. `reopen` drops kompjutr's cached handles
@@ -127,6 +136,7 @@ export type E2EAction =
   | RefAction
   | IntegrationAction
   | NetworkAction
+  | LifecycleAction
   | WorldAction;
 
 /** What a step is expected to do. Defaults to a clean success. */
@@ -136,7 +146,11 @@ export interface StepExpectation {
   code?: string;
 }
 
-export type E2EStep = E2EAction & { expect?: StepExpectation };
+export type E2EStep = E2EAction & {
+  expect?: StepExpectation;
+  /** Logical linked checkout selected for this step. The primary is the default. */
+  worktree?: string;
+};
 
 /**
  * Three outcomes, because a conflict is neither. Git reports one by exiting
@@ -185,6 +199,18 @@ export interface E2ESnapshot {
   operation: "merge" | "cherry-pick" | "revert" | "rebase" | null;
 }
 
+export interface E2EWorktreeState {
+  name: string;
+  head: string;
+  isPrimary: boolean;
+  state: "present" | "missing";
+}
+
+interface CheckoutRoots {
+  kompjutr: string;
+  git: string;
+}
+
 // -- the world ---------------------------------------------------------
 
 export interface E2EWorldOptions {
@@ -218,12 +244,16 @@ export interface E2EWorld {
   /** Play steps on kompjutr only, for journeys real git cannot mirror. */
   runLocal(...steps: E2EStep[]): Promise<void>;
   /** Compare both sides now. `run` does this for you after every step. */
-  compare(label?: string): Promise<void>;
-  snapshot(): Promise<{ kompjutr: E2ESnapshot; git: E2ESnapshot }>;
+  compare(label?: string, worktree?: string): Promise<void>;
+  snapshot(worktree?: string): Promise<{ kompjutr: E2ESnapshot; git: E2ESnapshot }>;
+  /** Compare registrations after normalising implementation-specific roots and ids. */
+  worktrees(): Promise<{ kompjutr: E2EWorktreeState[]; git: E2EWorktreeState[] }>;
+  checkoutRoot(worktree?: string): string;
+  mirrorCheckout(worktree?: string): GitFixture;
   /** Drop kompjutr's cached handles, as a Durable Object eviction would. */
   reopen(): void;
   /** Read a working-tree file from the kompjutr side. */
-  read(path: string): Promise<string>;
+  read(path: string, worktree?: string): Promise<string>;
   dispose(): Promise<void>;
 }
 
@@ -252,6 +282,8 @@ export async function createWorld(options: E2EWorldOptions = {}): Promise<E2EWor
   const storage = new SqliteTestStorage();
   let workspace = newWorkspace(storage);
   const mirror = track(new GitFixture());
+  const checkoutRoots = new Map<string, CheckoutRoots>();
+  const linkedGitRoots = new Set<string>();
 
   if (start === "clone") {
     // kompjutr's clone defaults are shallow, single-branch and tagless; the
@@ -269,6 +301,38 @@ export async function createWorld(options: E2EWorldOptions = {}): Promise<E2EWor
     await workspace.git.init({ dir: WORK });
     mirror.init();
   }
+
+  checkoutRoots.set("primary", { kompjutr: WORK, git: mirror.dir });
+
+  const roots = (worktree = "primary"): CheckoutRoots => {
+    const selected = checkoutRoots.get(worktree);
+    if (selected === undefined) throw new Error(`unknown e2e worktree: ${worktree}`);
+    return selected;
+  };
+
+  const addRoots = (name: string): CheckoutRoots => {
+    if (name === "primary" || name.length > MAX_WORKTREE_NAME_UNITS || !WORKTREE_NAME.test(name)) {
+      throw new Error(`invalid e2e worktree name: ${name}`);
+    }
+    if (checkoutRoots.has(name)) throw new Error(`duplicate e2e worktree: ${name}`);
+    const parent = dirname(mirror.dir);
+    const intendedBasename = `${basename(mirror.dir)}-worktree-${name}`;
+    const gitRoot = resolve(parent, intendedBasename);
+    if (
+      dirname(gitRoot) !== parent ||
+      basename(gitRoot) !== intendedBasename ||
+      gitRoot !== `${mirror.dir}-worktree-${name}`
+    ) {
+      throw new Error(`unsafe e2e worktree root: ${gitRoot}`);
+    }
+    const selected = {
+      kompjutr: `/worktree-${name}`,
+      git: gitRoot,
+    };
+    checkoutRoots.set(name, selected);
+    linkedGitRoots.add(selected.git);
+    return selected;
+  };
 
   const world: E2EWorld = {
     get git() {
@@ -295,33 +359,72 @@ export async function createWorld(options: E2EWorldOptions = {}): Promise<E2EWor
         await playStep(world, step, index, false);
       }
     },
-    async compare(label) {
-      const { kompjutr, git } = await world.snapshot();
+    async compare(label, worktree) {
+      const { kompjutr, git } = await world.snapshot(worktree);
       const reason = label ?? "kompjutr state differs from git";
       expect(kompjutr.operation, `${reason}: pending operation`).toEqual(git.operation);
       expect(comparable(kompjutr), reason).toEqual(comparable(git));
     },
-    async snapshot() {
+    async snapshot(worktree) {
+      const selected = roots(worktree);
       const [kompjutr, git] = await Promise.all([
-        snapshotKompjutr(workspace, storage, originK),
-        snapshotGit(mirror, originG),
+        snapshotKompjutr(workspace, storage, originK, selected.kompjutr),
+        snapshotGit(new GitFixture(selected.git), originG),
       ]);
       return { kompjutr, git };
+    },
+    async worktrees() {
+      const [kompjutr, git] = await Promise.all([
+        kompjutrWorktrees(workspace.git, checkoutRoots),
+        Promise.resolve(gitWorktrees(mirror, checkoutRoots)),
+      ]);
+      return { kompjutr, git };
+    },
+    checkoutRoot(worktree) {
+      return roots(worktree).kompjutr;
+    },
+    mirrorCheckout(worktree) {
+      return new GitFixture(roots(worktree).git);
     },
     reopen() {
       workspace = newWorkspace(storage);
     },
-    async read(path) {
-      const bytes: unknown = await workspace.fs.readFile(join(WORK, path), "utf8");
+    async read(path, worktree) {
+      const bytes: unknown = await workspace.fs.readFile(
+        join(roots(worktree).kompjutr, path),
+        "utf8",
+      );
       if (typeof bytes !== "string") throw new Error(`${path} did not read back as text`);
       return bytes;
     },
     async dispose() {
       await server.close();
+      for (const root of linkedGitRoots) rmSync(root, { recursive: true, force: true });
       for (const fixture of disposables) fixture.dispose();
     },
   };
+  worldRoots.set(world, { roots, addRoots });
   return world;
+}
+
+const worldRoots = new WeakMap<
+  E2EWorld,
+  {
+    roots: (worktree?: string) => CheckoutRoots;
+    addRoots: (name: string) => CheckoutRoots;
+  }
+>();
+
+function rootsOf(world: E2EWorld, worktree?: string): CheckoutRoots {
+  const state = worldRoots.get(world);
+  if (state === undefined) throw new Error("e2e world root map is unavailable");
+  return state.roots(worktree);
+}
+
+function addRootsTo(world: E2EWorld, name: string): CheckoutRoots {
+  const state = worldRoots.get(world);
+  if (state === undefined) throw new Error("e2e world root map is unavailable");
+  return state.addRoots(name);
 }
 
 /**
@@ -411,7 +514,7 @@ async function playStep(
       `${label}: git was ${git.kind}, kompjutr was ${kompjutr.kind}${codeSuffix(kompjutr)}`,
     );
   }
-  await world.compare(`${label}: state diverged`);
+  await world.compare(`${label}: state diverged`, step.worktree);
 }
 
 function codeSuffix(outcome: Outcome): string {
@@ -440,8 +543,8 @@ const CONFLICTED: Outcome = { kind: "conflicted" };
 async function applyToKompjutr(world: E2EWorld, step: E2EStep): Promise<Outcome> {
   const { workspace } = world;
   const git = world.git;
-  const dir = WORK;
-  const at = (path: string): string => join(WORK, path);
+  const dir = rootsOf(world, step.worktree).kompjutr;
+  const at = (path: string): string => join(dir, path);
 
   switch (step.op) {
     case "write":
@@ -607,6 +710,25 @@ async function applyToKompjutr(world: E2EWorld, step: E2EStep): Promise<Outcome>
       return CLEAN;
     }
 
+    case "worktreeAdd": {
+      const root = addRootsTo(world, step.name).kompjutr;
+      await git.worktreeAdd({ dir, root, target: step.target });
+      return CLEAN;
+    }
+    case "worktreeRemove":
+      await git.worktreeRemove({
+        dir,
+        root: rootsOf(world, step.name).kompjutr,
+        force: step.force,
+      });
+      return CLEAN;
+    case "worktreeMakeAbsent":
+      await workspace.fs.rm(rootsOf(world, step.name).kompjutr, { recursive: true, force: true });
+      return CLEAN;
+    case "worktreePrune":
+      await git.worktreePrune({ dir });
+      return CLEAN;
+
     case "peer":
       step.act(world.peerK);
       return CLEAN;
@@ -640,7 +762,7 @@ function rebaseOutcome(result: { outcome: string }): Outcome {
 // -- the real-git side -------------------------------------------------
 
 function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
-  const fixture = world.mirror;
+  const fixture = new GitFixture(rootsOf(world, step.worktree).git);
 
   switch (step.op) {
     case "write":
@@ -835,6 +957,33 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
       return integrationOutcome(fixture, args);
     }
 
+    case "worktreeAdd": {
+      const selected = rootsOf(world, step.name);
+      const args = ["worktree", "add", "-q"];
+      if (step.target.kind === "existing-branch") {
+        args.push(selected.git, step.target.name);
+      } else if (step.target.kind === "new-branch") {
+        args.push("-b", step.target.name, selected.git, step.target.startPoint ?? "HEAD");
+      } else {
+        args.push("--detach", selected.git, step.target.startPoint ?? "HEAD");
+      }
+      fixture.git(...args);
+      return CLEAN;
+    }
+    case "worktreeRemove": {
+      const args = ["worktree", "remove"];
+      if (step.force === true) args.push("--force");
+      args.push(rootsOf(world, step.name).git);
+      fixture.git(...args);
+      return CLEAN;
+    }
+    case "worktreeMakeAbsent":
+      rmSync(rootsOf(world, step.name).git, { recursive: true, force: true });
+      return CLEAN;
+    case "worktreePrune":
+      fixture.git("worktree", "prune");
+      return CLEAN;
+
     case "peer":
       step.act(world.peerG);
       return CLEAN;
@@ -877,10 +1026,11 @@ async function snapshotKompjutr(
   workspace: Workspace,
   storage: SqliteTestStorage,
   origin: GitFixture,
+  root: string,
 ): Promise<E2ESnapshot> {
   const git = workspace.git;
   const context = probeContext(workspace, storage);
-  const repo = openRepository(context, WORK);
+  const repo = openRepository(context, root);
   const head = safeOid(repo);
 
   const report = statusReport(repo, context.worktree, { untrackedFiles: "normal" });
@@ -888,7 +1038,7 @@ async function snapshotKompjutr(
 
   return {
     head,
-    currentBranch: (await git.currentBranch({ dir: WORK, fullname: true })) ?? null,
+    currentBranch: (await git.currentBranch({ dir: root, fullname: true })) ?? null,
     refs: comparableRefs(
       repo.store
         .listRefs("refs/")
@@ -896,11 +1046,11 @@ async function snapshotKompjutr(
         .filter((ref) => !ref.oid.startsWith("ref: ")),
     ),
     originRefs: gitRefsOf(origin),
-    index: await git.lsFiles({ dir: WORK }),
+    index: await git.lsFiles({ dir: root }),
     // `GitFixture.git` trims its output; trim ours to match.
     status: formatPorcelainV2(report.entries, branch).trimEnd(),
-    worktree: await kompjutrWorktree(workspace),
-    log: await kompjutrLog(git, head),
+    worktree: await kompjutrWorktree(workspace, root),
+    log: await kompjutrLog(git, head, root),
     operation: repo.checkout.readOperationState()?.kind ?? null,
   };
 }
@@ -927,10 +1077,10 @@ function probeContext(workspace: Workspace, storage: SqliteTestStorage): GitCont
   };
 }
 
-async function kompjutrWorktree(workspace: Workspace): Promise<WorktreeState[]> {
+async function kompjutrWorktree(workspace: Workspace, root: string): Promise<WorktreeState[]> {
   const out: WorktreeState[] = [];
-  for (const entry of await workspace.fs.walk(WORK)) {
-    const path = entry.path.slice(WORK.length + 1);
+  for (const entry of await workspace.fs.walk(root)) {
+    const path = entry.path.slice(root.length + 1);
     if (path === "") continue;
     if (entry.type === "symlink") {
       out.push({ path, type: "symlink", target: workspace.filesystem.readlink(entry.path) });
@@ -951,9 +1101,9 @@ async function kompjutrWorktree(workspace: Workspace): Promise<WorktreeState[]> 
 
 const LOG_DEPTH = 64;
 
-async function kompjutrLog(git: Git, head: string | null): Promise<LogEntry[]> {
+async function kompjutrLog(git: Git, head: string | null, root: string): Promise<LogEntry[]> {
   if (head === null) return [];
-  const commits = await git.log({ dir: WORK, depth: LOG_DEPTH });
+  const commits = await git.log({ dir: root, depth: LOG_DEPTH });
   return commits.map((commit) => ({
     oid: commit.oid,
     message: commit.message.trimEnd(),
@@ -1030,14 +1180,78 @@ function gitLog(fixture: GitFixture, head: string | null): LogEntry[] {
 }
 
 function gitOperation(fixture: GitFixture): E2ESnapshot["operation"] {
-  const gitDir = join(fixture.dir, ".git");
-  if (existsSync(join(gitDir, "rebase-merge")) || existsSync(join(gitDir, "rebase-apply"))) {
+  if (gitPathExists(fixture, "rebase-merge") || gitPathExists(fixture, "rebase-apply")) {
     return "rebase";
   }
-  if (existsSync(join(gitDir, "CHERRY_PICK_HEAD"))) return "cherry-pick";
-  if (existsSync(join(gitDir, "REVERT_HEAD"))) return "revert";
-  if (existsSync(join(gitDir, "MERGE_HEAD"))) return "merge";
+  if (gitPathExists(fixture, "CHERRY_PICK_HEAD")) return "cherry-pick";
+  if (gitPathExists(fixture, "REVERT_HEAD")) return "revert";
+  if (gitPathExists(fixture, "MERGE_HEAD")) return "merge";
   return null;
+}
+
+function gitPathExists(fixture: GitFixture, path: string): boolean {
+  const rendered = fixture.git("rev-parse", "--git-path", path);
+  return existsSync(isAbsolute(rendered) ? rendered : join(fixture.dir, rendered));
+}
+
+async function kompjutrWorktrees(
+  git: Git,
+  roots: ReadonlyMap<string, CheckoutRoots>,
+): Promise<E2EWorktreeState[]> {
+  const result: E2EWorktreeState[] = [];
+  for (const item of await git.worktreeList({ dir: WORK })) {
+    const name = checkoutName(roots, "kompjutr", item.root);
+    result.push({
+      name,
+      head: item.head,
+      isPrimary: item.isPrimary,
+      state: item.state,
+    });
+  }
+  result.sort((left, right) => comparePaths(left.name, right.name));
+  return result;
+}
+
+function gitWorktrees(
+  fixture: GitFixture,
+  roots: ReadonlyMap<string, CheckoutRoots>,
+): E2EWorktreeState[] {
+  const output = fixture.git("worktree", "list", "--porcelain");
+  if (output === "") return [];
+  const result: E2EWorktreeState[] = [];
+  for (const block of output.split(/\n\n+/)) {
+    let root: string | undefined;
+    let oid: string | undefined;
+    let branch: string | undefined;
+    for (const line of block.split("\n")) {
+      if (line.startsWith("worktree ")) root = line.slice("worktree ".length);
+      else if (line.startsWith("HEAD ")) oid = line.slice("HEAD ".length);
+      else if (line.startsWith("branch ")) branch = line.slice("branch ".length);
+    }
+    if (root === undefined || oid === undefined) {
+      throw new Error(`invalid git worktree porcelain block: ${block}`);
+    }
+    const name = checkoutName(roots, "git", root);
+    result.push({
+      name,
+      head: branch === undefined ? oid : `ref: ${branch}`,
+      isPrimary: name === "primary",
+      state: existsSync(root) ? "present" : "missing",
+    });
+  }
+  result.sort((left, right) => comparePaths(left.name, right.name));
+  return result;
+}
+
+function checkoutName(
+  roots: ReadonlyMap<string, CheckoutRoots>,
+  side: keyof CheckoutRoots,
+  root: string,
+): string {
+  for (const [name, pair] of roots) {
+    if (pair[side] === root) return name;
+  }
+  throw new Error(`git listed an unmanaged e2e worktree: ${root}`);
 }
 
 function distinct(paths: string[]): string[] {
