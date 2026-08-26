@@ -86,6 +86,13 @@ import {
   rebaseSkip as rebaseSkipOp,
 } from "../core/ops/rebase.js";
 import {
+  type RecoverRefOptions,
+  type RefLogEntry,
+  type RefLogReadOptions,
+  recoverRef as recoverRefOp,
+  reflog as reflogOp,
+} from "../core/ops/ref-log.js";
+import {
   type BranchDeleteOptions,
   type BranchOptions,
   branchDelete as branchDeleteOp,
@@ -170,6 +177,8 @@ export type GitRemoteRemoveOptions = RemoteRemoveOptions & GitDirOptions;
 export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
 export type GitCatFileOptions = CatFileOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
+export type GitRefLogOptions = RefLogReadOptions & GitDirOptions;
+export type GitRecoverRefOptions = RecoverRefOptions & GitDirOptions;
 export type GitPushOptions = PushOptions & GitDirOptions;
 export type GitPullOptions = PullOptions & GitDirOptions;
 
@@ -199,6 +208,8 @@ export interface Git {
   log(input?: GitDirOptions & { ref?: string; depth?: number }): Promise<CommitView[]>;
   show(input: GitDirOptions & { ref: string }): Promise<CommitView>;
   revParse(input: GitDirOptions & { ref: string }): Promise<string>;
+  reflog(input?: GitRefLogOptions): Promise<RefLogEntry[]>;
+  recoverRef(input: GitRecoverRefOptions): Promise<void>;
   repoRoot(input?: GitDirOptions): Promise<string>;
   currentBranch(input?: GitDirOptions & CurrentBranchOptions): Promise<string | undefined>;
   lsFiles(input?: GitDirOptions & { ref?: string }): Promise<string[]>;
@@ -373,6 +384,14 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async revParse(input) {
       return at(input.dir).revParse(input.ref);
+    },
+    async reflog(input = {}) {
+      return reflogOp(at(input.dir), input);
+    },
+    async recoverRef(input) {
+      const repo = at(input.dir);
+      repo.store.requireNoOperationState();
+      recoverRefOp(context, repo, input);
     },
     async repoRoot(input = {}) {
       return repoRootOp(context, input);

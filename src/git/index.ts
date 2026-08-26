@@ -27,6 +27,15 @@ export type {
 } from "../core/ops/kinds.js";
 export type { CommitView, TreeEntryView } from "../core/ops/reads.js";
 export {
+  type RecoverRefOptions,
+  type RefLogEndpoint,
+  type RefLogEntry,
+  type RefLogReadOptions,
+  type RefLogRecoverySource,
+  recoverRef,
+  reflog,
+} from "../core/ops/ref-log.js";
+export {
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
@@ -79,6 +88,8 @@ export {
   type GitPushOptions,
   type GitRebaseContinueOptions,
   type GitRebaseOptions,
+  type GitRecoverRefOptions,
+  type GitRefLogOptions,
   type GitRemoteAddOptions,
   type GitRemoteRemoveOptions,
   type GitResetOptions,

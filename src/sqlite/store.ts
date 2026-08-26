@@ -153,6 +153,13 @@ const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const REFLOG_RETENTION_SECONDS = 90 * 24 * 60 * 60;
 const REFLOG_RETENTION_ROWS = 1_024;
+/** Two conservative SQL slots per row bound validation, grouping, and ordering together. */
+export const MAX_REFLOG_ROOT_SCAN_BYTES = 96 * 1024 * 1024;
+export const REFLOG_ROOT_SCAN_FIXED_BYTES = 8 * 1024 * 1024;
+export const REFLOG_ROOT_ENDPOINT_BYTES = 4_096;
+export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
+  (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / (2 * REFLOG_ROOT_ENDPOINT_BYTES),
+);
 const MAX_REF_MUTATION_INPUTS = 100_000;
 const REF_ROW_RETAINED_BYTES = 256;
 const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
@@ -206,7 +213,7 @@ export interface RefMutation {
   expected?: RefMutationExpected;
 }
 
-interface StoredRefLogEntry {
+export interface RefLogEntry {
   refName: string;
   ordinal: number;
   oldRaw: string | null;
@@ -217,6 +224,13 @@ interface StoredRefLogEntry {
   timestamp: number;
   timezoneOffset: number;
   reason: string;
+}
+
+export interface RefLogReadOptions {
+  /** Maximum rows returned. Public reads cap this at 1,000. */
+  limit?: number;
+  /** Resume strictly before this repository-wide ordinal. */
+  before?: number;
 }
 
 interface RefLogEvent {
@@ -760,7 +774,7 @@ function requireRefLogIdentityText(value: unknown, label: string): string {
   return value;
 }
 
-function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number): StoredRefLogEntry {
+function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number): RefLogEntry {
   if (row.repo_id !== repoId) throw new CorruptError("reflog row belongs to another repository");
   const refName = requireRefName(row.ref_name, "reflog ref name", "stored", true);
   const ordinal = requireSafeRefLogInteger(row.ordinal, "reflog ordinal", 1, MAX_REFLOG_ORDINAL);
@@ -812,6 +826,63 @@ function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number):
     timezoneOffset,
     reason: row.reason,
   };
+}
+
+function requireRefLogReadInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw new GitError("EINVAL", `${label} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return value;
+}
+
+function requireRefLogLimit(value: unknown): number {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 1_000) {
+    throw new GitError("E2BIG", "reflog limit exceeds 1,000 entries");
+  }
+  return requireRefLogReadInteger(value, "reflog limit", 0, 1_000);
+}
+
+function validateRefLogRootScanBudget(value: unknown): void {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new CorruptError("reflog root budget query returned an invalid row count");
+  }
+  if (value > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
+    throw new GitError("E2BIG", "active reflog root scan exceeds its 96 MiB SQL-state bound");
+  }
+}
+
+function requireRefLogHeader(row: Record<string, unknown>, repoId: number): number {
+  if (row.repo_id !== repoId) throw new CorruptError("reflog header belongs to another repository");
+  requireRawRefTarget(row.head, "stored HEAD target", "stored");
+  const nextOrdinal = requireSafeRefLogInteger(
+    row.next_ordinal,
+    "reflog next ordinal",
+    0,
+    MAX_REFLOG_ORDINAL,
+  );
+  const latest =
+    row.latest_ordinal === null
+      ? null
+      : requireSafeRefLogInteger(
+          row.latest_ordinal,
+          "newest reflog ordinal",
+          1,
+          MAX_REFLOG_ORDINAL,
+        );
+  if ((nextOrdinal === 0 && latest !== null) || (nextOrdinal !== 0 && latest !== nextOrdinal)) {
+    throw new CorruptError("reflog state does not match its newest entry");
+  }
+  return nextOrdinal;
 }
 
 function validateRefLogMetadata(metadata: RefLogMetadata): RefLogMetadata {
@@ -3000,10 +3071,10 @@ export class RepoStore {
   }
 
   /** Apply current ref state and its bounded history through one atomic seam. */
-  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): void {
+  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
     const normalized = normalizeRefMutation(mutation);
     const checkedMetadata = validateRefLogMetadata(metadata);
-    this.#db.transactionSync(() => {
+    return this.#db.transactionSync(() => {
       const header = this.#db.one<{
         head: unknown;
         next_ordinal: unknown;
@@ -3145,7 +3216,7 @@ export class RepoStore {
           reason: checkedMetadata.reason,
         });
       }
-      if (pending.length === 0) return;
+      if (pending.length === 0) return false;
       if (pending.length > MAX_REFLOG_ORDINAL - nextOrdinal) {
         throw new GitError("E2BIG", "repository reflog ordinal is exhausted");
       }
@@ -3244,6 +3315,7 @@ export class RepoStore {
           page,
         );
       }
+      return true;
     });
   }
 
@@ -3273,40 +3345,248 @@ export class RepoStore {
     this.mutateRefs({ head: value }, this.#genericRefLogMetadata("HEAD update"));
   }
 
-  /** Active stored entries for one ref, newest first. */
-  reflog(refName: string): StoredRefLogEntry[] {
+  /** Active stored entries for one exact ref, newest first. */
+  reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {
     const name = requireRefName(refName, "reflog ref name", "input", true);
     const now = this.#nowSeconds();
     if (!Number.isSafeInteger(now) || now < 0 || now > MAX_REFLOG_ORDINAL) {
       throw new GitError("EINVAL", "reflog clock must return a safe nonnegative epoch time");
     }
+    const limit =
+      options.limit === undefined ? REFLOG_RETENTION_ROWS : requireRefLogLimit(options.limit);
+    const before =
+      options.before === undefined
+        ? undefined
+        : requireRefLogReadInteger(options.before, "reflog cursor", 1, MAX_REFLOG_ORDINAL);
     const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-    const entries: StoredRefLogEntry[] = [];
-    let scanned = 0;
+    const active: RefLogEntry[] = [];
+    let headerSeen = false;
+    let nextOrdinal = 0;
     let previousOrdinal: number | null = null;
     for (const row of this.#db.iterate(
-      `SELECT repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
-              actor_name, actor_email, timestamp, timezone, reason
+      `SELECT 0 AS kind, repository.id AS repo_id, repository.head,
+              state.next_ordinal,
+              (SELECT max(latest.ordinal)
+                 FROM git_reflog_entries latest
+                WHERE latest.repo_id = repository.id
+                  AND typeof(latest.ordinal) = 'integer'
+                  AND latest.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}) AS latest_ordinal,
+              NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
+              NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
+              NULL AS timestamp, NULL AS timezone, NULL AS reason
+         FROM git_repositories repository
+         LEFT JOIN git_reflog_state state ON state.repo_id = repository.id
+        WHERE repository.id = ?
+       UNION ALL
+       SELECT 1 AS kind, entry.repo_id, NULL AS head, NULL AS next_ordinal,
+              NULL AS latest_ordinal, entry.ref_name, entry.ordinal,
+              entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+              entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone, entry.reason
          FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
-        WHERE repo_id = ? AND ref_name = ?
-        ORDER BY ordinal DESC
+        WHERE entry.repo_id = ? AND entry.ref_name = ?
+        ORDER BY kind, ordinal DESC
         LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
+      this.#repoId,
       this.#repoId,
       name,
     )) {
+      if (row.kind === 0) {
+        if (headerSeen) throw new CorruptError("reflog query returned duplicate headers");
+        headerSeen = true;
+        nextOrdinal = requireRefLogHeader(row, this.#repoId);
+        continue;
+      }
+      if (row.kind !== 1 || !headerSeen) {
+        throw new CorruptError("reflog query returned an invalid row sequence");
+      }
       const entry = requireStoredRefLogEntry(row, this.#repoId);
       if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
+      if (entry.ordinal > nextOrdinal) {
+        throw new CorruptError("reflog entry exceeds the repository allocation state");
+      }
       if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
         throw new CorruptError("reflog entries are not in strict descending ordinal order");
       }
       previousOrdinal = entry.ordinal;
-      scanned++;
-      if (scanned > REFLOG_RETENTION_ROWS) {
-        throw new CorruptError("reflog physical count retention is not enforced");
-      }
-      if (entry.timestamp >= cutoff) entries.push(entry);
+      if (entry.timestamp >= cutoff) active.push(entry);
     }
-    return entries;
+    if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
+    const page: RefLogEntry[] = [];
+    for (const entry of active) {
+      if (before !== undefined && entry.ordinal >= before) continue;
+      if (page.length < limit) page.push(entry);
+    }
+    return page;
+  }
+
+  /** Distinct active reflog roots in strict byte order. */
+  *activeRefLogOids(): Generator<string> {
+    const now = this.#nowSeconds();
+    if (!Number.isSafeInteger(now) || now < 0 || now > MAX_REFLOG_ORDINAL) {
+      throw new GitError("EINVAL", "reflog clock must return a safe nonnegative epoch time");
+    }
+    const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
+    let headerSeen = false;
+    let budgetSeen = false;
+    let nextOrdinal = 0;
+    let previousRef: string | null = null;
+    let previousEntryOrdinal: number | null = null;
+    let entriesForRef = 0;
+    let previousOid: string | null = null;
+    for (const row of this.#db.iterate(
+      `SELECT 0 AS kind, repository.id AS repo_id, repository.head,
+              state.next_ordinal,
+              (SELECT max(latest.ordinal)
+                 FROM git_reflog_entries latest
+                WHERE latest.repo_id = repository.id
+                  AND typeof(latest.ordinal) = 'integer'
+                  AND latest.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}) AS latest_ordinal,
+              NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
+              NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
+              NULL AS timestamp, NULL AS timezone, NULL AS reason, NULL AS root_oid,
+              NULL AS entry_count
+         FROM git_repositories repository
+         LEFT JOIN git_reflog_state state ON state.repo_id = repository.id
+        WHERE repository.id = ?
+       UNION ALL
+       SELECT 1 AS kind, invalid.repo_id, NULL AS head, NULL AS next_ordinal,
+              NULL AS latest_ordinal, NULL AS ref_name, invalid.ordinal,
+              NULL AS old_raw, NULL AS new_raw, NULL AS old_oid, NULL AS new_oid,
+              NULL AS actor_name, NULL AS actor_email, NULL AS timestamp,
+              NULL AS timezone, NULL AS reason, NULL AS root_oid, NULL AS entry_count
+         FROM (
+           SELECT entry.repo_id, entry.ordinal
+             FROM git_reflog_entries entry
+            WHERE entry.repo_id = ?
+              AND (typeof(entry.ordinal) != 'integer'
+                   OR entry.ordinal < 1 OR entry.ordinal > ${MAX_REFLOG_ORDINAL})
+            LIMIT 1
+         ) invalid
+       UNION ALL
+       SELECT 2 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
+              NULL AS latest_ordinal, NULL AS ref_name, NULL AS ordinal,
+              NULL AS old_raw, NULL AS new_raw, NULL AS old_oid, NULL AS new_oid,
+              NULL AS actor_name, NULL AS actor_email, NULL AS timestamp,
+              NULL AS timezone, NULL AS reason, NULL AS root_oid, budget.entry_count
+         FROM (
+           SELECT count(*) AS entry_count
+             FROM git_reflog_entries entry
+            WHERE entry.repo_id = ?
+         ) budget
+       UNION ALL
+       SELECT 3 AS kind, retained.repo_id, NULL AS head, NULL AS next_ordinal,
+              NULL AS latest_ordinal, retained.ref_name, retained.ordinal,
+              retained.old_raw, retained.new_raw, retained.old_oid, retained.new_oid,
+              retained.actor_name, retained.actor_email, retained.timestamp, retained.timezone,
+              retained.reason, NULL AS root_oid, NULL AS entry_count
+         FROM (
+           SELECT ranked.*
+             FROM (
+               SELECT entry.*,
+                      row_number() OVER (
+                        PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
+                      ) AS retained_rank
+                 FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
+                WHERE entry.repo_id = ?
+                  AND typeof(entry.ordinal) = 'integer'
+                  AND entry.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}
+             ) ranked
+            WHERE ranked.retained_rank <= ${REFLOG_RETENTION_ROWS}
+            ORDER BY ranked.ref_name, ranked.ordinal DESC
+         ) retained
+       UNION ALL
+       SELECT 4 AS kind, NULL AS repo_id, NULL AS head, NULL AS next_ordinal,
+              NULL AS latest_ordinal, NULL AS ref_name, NULL AS ordinal,
+              NULL AS old_raw, NULL AS new_raw, NULL AS old_oid, NULL AS new_oid,
+              NULL AS actor_name, NULL AS actor_email, NULL AS timestamp,
+              NULL AS timezone, NULL AS reason, roots.oid AS root_oid, NULL AS entry_count
+         FROM (
+           SELECT endpoint.oid
+             FROM (
+               WITH ranked AS (
+                 SELECT entry.old_oid, entry.new_oid, entry.timestamp,
+                        row_number() OVER (
+                          PARTITION BY entry.ref_name ORDER BY entry.ordinal DESC
+                        ) AS retained_rank
+                   FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
+                  WHERE entry.repo_id = ?
+                    AND typeof(entry.ordinal) = 'integer'
+                    AND entry.ordinal BETWEEN 1 AND ${MAX_REFLOG_ORDINAL}
+               )
+               SELECT ranked.old_oid AS oid
+                 FROM ranked
+                WHERE ranked.retained_rank <= ${REFLOG_RETENTION_ROWS}
+                  AND ranked.timestamp >= ?
+               UNION ALL
+               SELECT ranked.new_oid AS oid
+                 FROM ranked
+                WHERE ranked.retained_rank <= ${REFLOG_RETENTION_ROWS}
+                  AND ranked.timestamp >= ?
+             ) endpoint
+            WHERE endpoint.oid IS NOT NULL
+            GROUP BY endpoint.oid
+            ORDER BY endpoint.oid
+         ) roots
+       `,
+      this.#repoId,
+      this.#repoId,
+      this.#repoId,
+      this.#repoId,
+      this.#repoId,
+      cutoff,
+      cutoff,
+    )) {
+      if (row.kind === 0) {
+        if (headerSeen) throw new CorruptError("reflog root query returned duplicate headers");
+        headerSeen = true;
+        nextOrdinal = requireRefLogHeader(row, this.#repoId);
+        continue;
+      }
+      if (!headerSeen) throw new CorruptError("reflog root query omitted its header");
+      if (row.kind === 1) {
+        throw new CorruptError("reflog root query found an invalid ordinal");
+      }
+      if (row.kind === 2) {
+        if (budgetSeen) throw new CorruptError("reflog root query returned duplicate budgets");
+        validateRefLogRootScanBudget(row.entry_count);
+        budgetSeen = true;
+        continue;
+      }
+      if (!budgetSeen) throw new CorruptError("reflog root query omitted its budget");
+      if (row.kind === 3) {
+        const entry = requireStoredRefLogEntry(row, this.#repoId);
+        if (entry.ordinal > nextOrdinal) {
+          throw new CorruptError("reflog entry exceeds the repository allocation state");
+        }
+        if (previousRef === null || entry.refName !== previousRef) {
+          if (previousRef !== null && comparePaths(previousRef, entry.refName) >= 0) {
+            throw new CorruptError("reflog entries are not in strict ref byte order");
+          }
+          previousRef = entry.refName;
+          previousEntryOrdinal = null;
+          entriesForRef = 0;
+        }
+        if (previousEntryOrdinal !== null && previousEntryOrdinal <= entry.ordinal) {
+          throw new CorruptError("reflog entries are not in strict descending ordinal order");
+        }
+        previousEntryOrdinal = entry.ordinal;
+        entriesForRef++;
+        if (entriesForRef > REFLOG_RETENTION_ROWS) {
+          throw new CorruptError("reflog root query exceeded its retained row bound");
+        }
+        continue;
+      }
+      if (row.kind !== 4 || typeof row.root_oid !== "string" || !isOid(row.root_oid)) {
+        throw new CorruptError("reflog root query returned an invalid object id");
+      }
+      if (previousOid !== null && comparePaths(previousOid, row.root_oid) >= 0) {
+        throw new CorruptError("reflog roots are not in strict byte order");
+      }
+      previousOid = row.root_oid;
+      yield row.root_oid;
+    }
+    if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
+    if (!budgetSeen) throw new CorruptError("repository is missing its reflog root budget");
   }
 
   // -- config ---------------------------------------------------------

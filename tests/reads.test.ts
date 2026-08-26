@@ -136,7 +136,25 @@ describe("rev-parse", () => {
 
   it("reports an unknown revision", () => {
     expect(() => repo.revParse("nope")).toThrow(/unknown revision/);
-    expect(() => repo.revParse("HEAD~99")).toThrow(/unknown revision/);
+    expect(() => repo.revParse("HEAD~32")).toThrow(/unknown revision/);
+    expect(() => repo.revParse("HEAD~33")).toThrow(expect.objectContaining({ code: "E2BIG" }));
+  });
+
+  it("bounds the whole expression before parsing", () => {
+    expect(repo.revParse(`HEAD${" ".repeat(1_020)}`)).toBe(repo.revParse("HEAD"));
+    expect(() => repo.revParse(`HEAD${" ".repeat(1_021)}`)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+  });
+
+  it("bounds composed traversals and parses suffix decimals without numeric overflow", () => {
+    expect(repo.revParse(`HEAD${"^0".repeat(32)}`)).toBe(repo.revParse("HEAD"));
+    expect(() => repo.revParse(`HEAD${"^0".repeat(33)}`)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(() => repo.revParse(`HEAD^${"9".repeat(1_019)}`)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
   });
 
   it("reports the current branch", () => {

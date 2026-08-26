@@ -1,8 +1,13 @@
 // Typed operation metadata for the atomic ref-mutation seam.
 
-import type { RefLogActor, RefLogMetadata } from "../../sqlite/store.js";
+import type {
+  RefLogActor,
+  RefLogEntry,
+  RefLogMetadata,
+  RefLogReadOptions as StoreRefLogReadOptions,
+} from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
-import { hasErrorCode } from "../errors.js";
+import { GitError, hasErrorCode, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
 import type { Person } from "../objects.js";
 import type { Repository } from "../repository.js";
 
@@ -38,6 +43,80 @@ export type RefLogReason =
 export interface OptionalRefLogIdentity {
   identity?: GitIdentity;
   env?: Record<string, string>;
+}
+
+export type { RefLogEntry } from "../../sqlite/store.js";
+
+export interface RefLogReadOptions extends StoreRefLogReadOptions {
+  /** Exact stored ref name. Defaults to HEAD. */
+  ref?: string;
+}
+
+export type RefLogEndpoint = "old" | "new";
+
+export interface RefLogRecoverySource {
+  ref: string;
+  ordinal: number;
+  endpoint: RefLogEndpoint;
+}
+
+export interface RecoverRefOptions {
+  /** Direct destination under refs/. */
+  ref: string;
+  source: RefLogRecoverySource;
+  /** Exact raw destination value observed by the caller, including absence. */
+  expectedCurrent: string | null;
+}
+
+export function reflog(repo: Repository, options: RefLogReadOptions = {}): RefLogEntry[] {
+  return repo.reflog(options.ref ?? "HEAD", {
+    limit: options.limit ?? 100,
+    before: options.before,
+  });
+}
+
+export function recoverRef(
+  context: GitContext,
+  repo: Repository,
+  options: RecoverRefOptions,
+): void {
+  if (!options.ref.startsWith("refs/") || options.ref.length === "refs/".length) {
+    throw new GitError("EINVAL", "recovery destination must be a direct refs/* name");
+  }
+  if (
+    typeof options.source !== "object" ||
+    options.source === null ||
+    typeof options.source.ref !== "string" ||
+    options.source.ref === "" ||
+    !Number.isSafeInteger(options.source.ordinal) ||
+    options.source.ordinal < 1 ||
+    (options.source.endpoint !== "old" && options.source.endpoint !== "new")
+  ) {
+    throw new GitError("EINVAL", "reflog recovery source is invalid");
+  }
+
+  repo.store.db.transactionSync(() => {
+    repo.store.requireNoOperationState();
+    const entry = repo
+      .reflog(options.source.ref)
+      .find((candidate) => candidate.ordinal === options.source.ordinal);
+    if (entry === undefined) {
+      throw new RefNotFoundError(`${options.source.ref}@{${options.source.ordinal}}`);
+    }
+    const oid = options.source.endpoint === "old" ? entry.oldOid : entry.newOid;
+    if (oid === null) {
+      throw new RefNotFoundError(`${options.source.ref}@{${options.source.ordinal}}`);
+    }
+    if (!repo.has(oid)) throw new ObjectNotFoundError(oid);
+    const changed = repo.store.mutateRefs(
+      {
+        puts: [{ name: options.ref, target: oid }],
+        expected: { name: options.ref, target: options.expectedCurrent },
+      },
+      operationRefLogMetadata(context, repo, "recover-ref"),
+    );
+    if (!changed) throw new GitError("EINVAL", `ref ${options.ref} already has the selected value`);
+  });
 }
 
 /** Best optional actor, followed by a timestamp captured at publication. */

@@ -10,6 +10,11 @@ import type {
   GitRebaseContinueOptions,
   GitRebaseOptions,
   RebaseResult as GitRebaseResult,
+  GitRecoverRefOptions,
+  RefLogEndpoint as GitRefLogEndpoint,
+  RefLogEntry as GitRefLogEntry,
+  GitRefLogOptions,
+  RefLogRecoverySource as GitRefLogRecoverySource,
   ReplayEmptyReason as GitReplayEmptyReason,
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
@@ -23,6 +28,11 @@ import type {
   GitRebaseContinueOptions as RootRebaseContinueOptions,
   GitRebaseOptions as RootRebaseOptions,
   RebaseResult as RootRebaseResult,
+  GitRecoverRefOptions as RootRecoverRefOptions,
+  RefLogEndpoint as RootRefLogEndpoint,
+  RefLogEntry as RootRefLogEntry,
+  GitRefLogOptions as RootRefLogOptions,
+  RefLogRecoverySource as RootRefLogRecoverySource,
   ReplayEmptyReason as RootReplayEmptyReason,
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
@@ -31,6 +41,49 @@ import type {
   GitStatusReport as RootStatusReport,
   GitStatusReportOptions as RootStatusReportOptions,
 } from "../src/index.js";
+
+describe("public reflog exports", () => {
+  it("exposes matching listing and recovery types from both entrypoints", () => {
+    const endpoint: RootRefLogEndpoint = "old";
+    const gitEndpoint: GitRefLogEndpoint = endpoint;
+    const source: RootRefLogRecoverySource = {
+      ref: "HEAD",
+      ordinal: 7,
+      endpoint,
+    };
+    const gitSource: GitRefLogRecoverySource = source;
+    const read: RootRefLogOptions = { dir: "/repo", ref: "HEAD", limit: 100, before: 9 };
+    const gitRead: GitRefLogOptions = read;
+    const recovery: RootRecoverRefOptions = {
+      dir: "/repo",
+      ref: "refs/heads/main",
+      source,
+      expectedCurrent: null,
+    };
+    const gitRecovery: GitRecoverRefOptions = recovery;
+    const entry: RootRefLogEntry = {
+      refName: "HEAD",
+      ordinal: 7,
+      oldRaw: null,
+      newRaw: "1".repeat(40),
+      oldOid: null,
+      newOid: "1".repeat(40),
+      actor: null,
+      timestamp: 1,
+      timezoneOffset: 0,
+      reason: "commit (initial)",
+    };
+    const gitEntry: GitRefLogEntry = entry;
+
+    expect([
+      gitEndpoint,
+      gitSource.ordinal,
+      gitRead.limit,
+      gitRecovery.ref,
+      gitEntry.newOid,
+    ]).toEqual(["old", 7, 100, "refs/heads/main", "1".repeat(40)]);
+  });
+});
 
 interface ReplayMethods {
   cherryPick(input: RootCherryPickOptions): Promise<RootReplayResult>;

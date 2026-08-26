@@ -11,6 +11,8 @@ import {
 import type {
   BlobReadBatch,
   ObjectReadBatch,
+  RefLogEntry,
+  RefLogReadOptions,
   RepoStore,
   WalkTreeDiffEntry,
   WalkTreeDiffObject,
@@ -38,6 +40,22 @@ const REF_SEARCH = [
   (name: string) => `refs/remotes/${name}`,
   (name: string) => `refs/remotes/${name}/HEAD`,
 ];
+
+const MAX_REVISION_EXPRESSION_UNITS = 1_024;
+const MAX_REVISION_TRAVERSALS = 32;
+const MAX_HEAD_REFLOG_INDEX = 1_023;
+
+function boundedDecimal(digits: string, maximum: number): number | null {
+  if (digits === "") return null;
+  let value = 0;
+  for (let index = 0; index < digits.length; index++) {
+    const digit = digits.charCodeAt(index) - 0x30;
+    if (digit < 0 || digit > 9) return null;
+    if (value > Math.floor((maximum - digit) / 10)) return null;
+    value = value * 10 + digit;
+  }
+  return value;
+}
 
 export interface ResolvedHead {
   /** Full ref name HEAD points at, or null when detached. */
@@ -270,6 +288,14 @@ export class Repository {
     return this.store.listRefs("refs/tags/").map((row) => row.name.slice("refs/tags/".length));
   }
 
+  reflog(ref = "HEAD", options: RefLogReadOptions = {}): RefLogEntry[] {
+    return this.store.reflog(ref, options);
+  }
+
+  activeRefLogOids(): Generator<string> {
+    return this.store.activeRefLogOids();
+  }
+
   // -- revisions ------------------------------------------------------
 
   /**
@@ -277,6 +303,9 @@ export class Repository {
    * `^`, `^N` and `~N` suffixes, chained.
    */
   revParse(expression: string): string {
+    if (expression.length > MAX_REVISION_EXPRESSION_UNITS) {
+      throw new GitError("E2BIG", "revision expression exceeds 1024 UTF-16 code units");
+    }
     const trimmed = expression.trim();
     if (trimmed === "") throw new RefNotFoundError(expression);
 
@@ -293,19 +322,29 @@ export class Repository {
     const base = trimmed.slice(0, split);
     const suffix = trimmed.slice(split);
 
-    let oid = this.#resolveBase(base);
+    let oid = this.#resolveBase(base, expression);
     let position = 0;
+    let traversals = 0;
     while (position < suffix.length) {
       const operator = suffix[position++]!;
-      let digits = "";
+      const digitsStart = position;
       while (position < suffix.length && suffix[position]! >= "0" && suffix[position]! <= "9") {
-        digits += suffix[position++]!;
+        position++;
       }
+      const digits = suffix.slice(digitsStart, position);
       if (operator === "~") {
-        const count = digits === "" ? 1 : Number.parseInt(digits, 10);
+        const count = digits === "" ? 1 : boundedDecimal(digits, Number.MAX_SAFE_INTEGER);
+        if (count === null || count > MAX_REVISION_TRAVERSALS - traversals) {
+          throw new GitError("E2BIG", "revision expression exceeds 32 traversal operations");
+        }
+        traversals += count;
         for (let i = 0; i < count; i++) oid = this.#firstParent(oid, expression);
       } else if (operator === "^") {
-        const which = digits === "" ? 1 : Number.parseInt(digits, 10);
+        const which = digits === "" ? 1 : boundedDecimal(digits, Number.MAX_SAFE_INTEGER);
+        if (which === null || traversals >= MAX_REVISION_TRAVERSALS) {
+          throw new GitError("E2BIG", "revision expression exceeds 32 traversal operations");
+        }
+        traversals++;
         if (which === 0) {
           oid = this.peel(oid);
           continue;
@@ -318,8 +357,22 @@ export class Repository {
     return oid;
   }
 
-  #resolveBase(base: string): string {
+  #resolveBase(base: string, expression: string): string {
     if (base === "") throw new RefNotFoundError(base);
+    const selectorStart = base.indexOf("@{");
+    if (selectorStart !== -1) {
+      if (!base.startsWith("HEAD@{") || !base.endsWith("}")) {
+        throw new RefNotFoundError(expression);
+      }
+      const digits = base.slice(6, -1);
+      const index = boundedDecimal(digits, MAX_HEAD_REFLOG_INDEX);
+      if (index === null) throw new RefNotFoundError(expression);
+      const entry = this.store.reflog("HEAD")[index];
+      if (entry?.newOid === undefined || entry.newOid === null) {
+        throw new RefNotFoundError(expression);
+      }
+      return entry.newOid;
+    }
     const viaRef = this.resolveRef(base);
     if (viaRef !== null) return viaRef;
     if (isOid(base) && this.store.has(base)) return base;
