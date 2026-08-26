@@ -71,7 +71,7 @@ type IndexAction =
 
 type RefAction =
   | { op: "branch"; name: string; startPoint?: string; force?: boolean; checkout?: boolean }
-  | { op: "branchDelete"; name: string }
+  | { op: "branchDelete"; name: string; force?: boolean }
   | { op: "checkout"; ref: string; paths?: string[]; force?: boolean }
   | { op: "tag"; name: string; object?: string; force?: boolean }
   | { op: "tagDelete"; name: string };
@@ -621,7 +621,7 @@ async function applyToKompjutr(world: E2EWorld, step: E2EStep): Promise<Outcome>
       });
       return CLEAN;
     case "branchDelete":
-      await git.branchDelete({ dir, name: step.name });
+      await git.branchDelete({ dir, name: step.name, force: step.force });
       return CLEAN;
     case "checkout":
       await git.checkout({ dir, ref: step.ref, paths: step.paths, force: step.force });
@@ -840,7 +840,7 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
       return CLEAN;
     }
     case "branchDelete":
-      fixture.git("branch", "-D", step.name);
+      fixture.git("branch", step.force === true ? "-D" : "-d", step.name);
       return CLEAN;
     case "checkout": {
       const args = ["checkout", "-q"];
@@ -925,6 +925,7 @@ function applyToGit(world: E2EWorld, step: E2EStep): Outcome {
       const args = ["fetch", "-q"];
       if (step.prune === true) args.push("--prune");
       if (step.tags === true) args.push("--tags");
+      else if (step.tags === false) args.push("--no-tags");
       args.push(step.remote ?? "origin");
       fixture.git(...args);
       return CLEAN;

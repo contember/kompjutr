@@ -173,24 +173,20 @@ describe("solo workflow", () => {
       { op: "rm", paths: ["drop.txt"] },
     );
 
-    // Cached: the index entry goes, the file stays behind as untracked.
-    //
-    // KNOWN DIVERGENCE: git then reports the path twice — `1 D.` for the
-    // HEAD-to-index deletion and `? untrack.txt` for the file still on disk —
-    // while kompjutr emits one row per path and drops the untracked half
-    // (src/core/ops/status.ts: "A tracked path is never also untracked").
-    // The comparison is left intact and pinned here.
-    await expect(world.run({ op: "rm", paths: ["untrack.txt"], cached: true })).rejects.toThrow(
-      /state diverged/,
-    );
+    // Cached: the index deletion and the file left behind are separate rows.
+    await world.run({ op: "rm", paths: ["untrack.txt"], cached: true });
 
     const cached = await world.snapshot();
     expect(cached.kompjutr.index).not.toContain("untrack.txt");
-    expect(cached.git.status).toContain("? untrack.txt");
-    expect(cached.kompjutr.status).not.toContain("? untrack.txt");
+    const cachedRows = cached.kompjutr.status
+      .split("\n")
+      .filter((row) => row.endsWith(" untrack.txt"));
+    expect(cachedRows).toHaveLength(2);
+    expect(cachedRows.some((row) => row.startsWith("1 D."))).toBe(true);
+    expect(cachedRows).toContain("? untrack.txt");
 
     await world.run(
-      // Deleting the leftover file puts the two status reports back in step.
+      // Clean up the file left behind by the cached removal.
       { op: "remove", path: "untrack.txt" },
       // A directory needs `recursive`, exactly as `git rm` does.
       { op: "rm", paths: ["docs"], expect: { outcome: "failed", code: "EISDIR" } },
@@ -343,7 +339,7 @@ describe("solo workflow", () => {
       { op: "checkout", ref: "main" },
       { op: "branchDelete", name: "main", expect: { outcome: "failed", code: "EBRANCHFAIL" } },
       { op: "branchDelete", name: "release" },
-      { op: "branchDelete", name: "feature" },
+      { op: "branchDelete", name: "feature", force: true },
     );
 
     const pruned = await world.snapshot();

@@ -105,6 +105,7 @@ beforeAll(async () => {
   fixture.git("checkout", "-q", "main");
   fixture.git("merge", "-q", "--no-ff", "-m", "merge side", "side");
   fixture.git("tag", "v1");
+  fixture.git("tag", "-a", "v1-annotated", "-m", "annotated release");
 
   const database = new SqliteGitDatabase(new TestDatabase());
   const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -134,6 +135,17 @@ describe("rev-parse", () => {
     expect(repo.revParse(head.slice(0, 8))).toBe(head);
   });
 
+  it("keeps annotated tag identity until an explicit peel", () => {
+    const raw = repo.revParse("v1-annotated");
+    const peeled = repo.revParse("v1-annotated^0");
+
+    expect(raw).toBe(fixture.git("rev-parse", "v1-annotated"));
+    expect(peeled).toBe(fixture.git("rev-parse", "v1-annotated^0"));
+    expect(repo.typeOf(raw)).toBe("tag");
+    expect(repo.typeOf(peeled)).toBe("commit");
+    expect(raw).not.toBe(peeled);
+  });
+
   it("reports an unknown revision", () => {
     expect(() => repo.revParse("nope")).toThrow(/unknown revision/);
     expect(() => repo.revParse("HEAD~32")).toThrow(/unknown revision/);
@@ -160,7 +172,7 @@ describe("rev-parse", () => {
   it("reports the current branch", () => {
     expect(repo.head().ref).toBe("refs/heads/main");
     expect(repo.branches().sort()).toEqual(["main", "side"]);
-    expect(repo.tags()).toEqual(["v1"]);
+    expect(repo.tags()).toEqual(["v1", "v1-annotated"]);
   });
 });
 
