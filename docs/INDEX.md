@@ -15,7 +15,9 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-26-shell-correctness-and-bounds.md`](sprints/sprint-2026-08-26-shell-correctness-and-bounds.md)
+  — truthful shell control flow and command behavior, set-based filesystem
+  shapes, and an end-to-end retained-memory boundary.
 
 ## What's hot
 
@@ -24,6 +26,8 @@ None.
 - Multi-checkout consumer admission is shipped. The next production evidence is
   the Durable Object regression probe and concurrent/restart conformance; safe
   merged-branch deletion and garbage collection remain separate follow-up work.
+- Shell correctness is active: remove silent command divergences, replace
+  path loops with bounded set operations, and close intermediate memory gaps.
 
 ## Key reference
 
