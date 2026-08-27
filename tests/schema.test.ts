@@ -81,6 +81,7 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_loose_object_lifecycle" },
   { type: "table", name: "git_maintenance_control" },
   { type: "table", name: "git_maintenance_objects" },
+  { type: "index", name: "git_maintenance_objects_queue" },
   { type: "table", name: "git_maintenance_repack_batches" },
   { type: "table", name: "git_maintenance_repack_objects" },
   { type: "table", name: "git_maintenance_runs" },

@@ -695,6 +695,9 @@ const STATEMENTS = [
        REFERENCES git_maintenance_runs (repo_id, run_id) ON DELETE CASCADE
    ) WITHOUT ROWID`,
 
+  `CREATE INDEX IF NOT EXISTS git_maintenance_objects_queue
+     ON git_maintenance_objects (repo_id, run_id, expanded, physical_only, oid)`,
+
   `CREATE TABLE IF NOT EXISTS git_maintenance_shallow (
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
      run_id INTEGER NOT NULL CHECK (
