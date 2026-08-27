@@ -465,7 +465,7 @@ describe("parsed commit cache", () => {
       widestStringBytes: 908_203,
       widestCommitRows: 2_048,
       commitStatements: 3,
-      statements: 11,
+      statements: 13,
     });
   });
 
