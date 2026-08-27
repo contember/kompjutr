@@ -533,6 +533,78 @@ describe("synthetic pack ingest", () => {
     expect(store.read(oid)?.data).toEqual(current);
   });
 
+  it("revalidates loose availability and invalidates both storage cache generations", async () => {
+    const store = open();
+    const removedData = utf8.encode("removed loose\n");
+    const remainingData = utf8.encode("remaining loose\n");
+    const packedData = utf8.encode("removed packed\n");
+    const removedOid = store.write("blob", removedData);
+    const remainingOid = store.write("blob", remainingData);
+    const packedOid = hashObject("blob", packedData);
+    const packed = await store.packs.ingest(slices(singleBlobPack(packedData), 19));
+    expect(store.read(removedOid)?.data).toEqual(removedData);
+    expect(store.read(remainingOid)?.data).toEqual(remainingData);
+    expect(store.read(packedOid)?.data).toEqual(packedData);
+    expect(store.packs.readRaw(packed.packId, 0, 4)).toEqual(utf8.encode("PACK"));
+
+    store.db.transactionSync(() => {
+      store.db.run(
+        "DELETE FROM git_objects WHERE repo_id = ? AND oid = ?",
+        store.sharedRepoId,
+        removedOid,
+      );
+      store.db.run(
+        "DELETE FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        store.sharedRepoId,
+        packed.packId,
+      );
+    });
+    expect(store.read(removedOid)?.data).toEqual(removedData);
+
+    store.shared.revalidateStorageCaches();
+    expect(store.shared.hasLoose).toBe(true);
+    expect(store.read(removedOid)).toBeNull();
+    expect(store.read(packedOid)).toBeNull();
+    expect(store.read(remainingOid)?.data).toEqual(remainingData);
+    const replacementData = utf8.encode("replacement packed\n");
+    const replacementOid = hashObject("blob", replacementData);
+    const replacement = await store.packs.ingest(slices(singleBlobPack(replacementData), 19));
+    expect(replacement.packId).toBe(packed.packId);
+    expect(store.read(replacementOid)?.data).toEqual(replacementData);
+  });
+
+  it("preserves storage cache state when loose availability validation fails", () => {
+    const inner = new TestDatabase();
+    const db = new MutatingQueryDatabase(inner, "loose-storage-availability", {
+      has_loose: 2,
+    });
+    const database = new SqliteGitDatabase(db, { objectCacheBytes: 1024 * 1024 });
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const cachedData = utf8.encode("cached loose\n");
+    const authoritativeData = utf8.encode("authoritative loose\n");
+    const cachedOid = store.write("blob", cachedData);
+    const authoritativeOid = store.writeStream("blob", authoritativeData.length, () => [
+      authoritativeData,
+    ]);
+    store.db.run(
+      "DELETE FROM git_objects WHERE repo_id = ? AND oid = ?",
+      store.sharedRepoId,
+      cachedOid,
+    );
+
+    expect(() => store.shared.revalidateStorageCaches()).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+
+    expect(store.shared.hasLoose).toBe(true);
+    expect(store.read(cachedOid)?.data).toEqual(cachedData);
+    expect(store.typeAndSize(authoritativeOid)).toEqual({
+      type: "blob",
+      size: authoritativeData.length,
+    });
+    expect(store.read(authoritativeOid)?.data).toEqual(authoritativeData);
+  });
+
   it("does not reclaim an active interleaved ingest", async () => {
     const store = open();
     const firstData = utf8.encode("first active ingest\n");
@@ -554,6 +626,18 @@ describe("synthetic pack ingest", () => {
         store.sharedRepoId,
       ),
     ).toEqual({ pack_id: 1, state: "pending" });
+    expect(() => store.packs.discardPending(1)).toThrowError(
+      expect.objectContaining({ code: "EBUSY" }),
+    );
+    expect(() => store.packs.discardOwnedComplete(1, () => undefined)).toThrowError(
+      expect.objectContaining({ code: "EBUSY" }),
+    );
+    expect(
+      store.db.scalar<string>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 1",
+        store.sharedRepoId,
+      ),
+    ).toBe("pending");
 
     const second = await store.packs.ingest(slices(singleBlobPack(secondData), 17));
     expect(
@@ -569,6 +653,67 @@ describe("synthetic pack ingest", () => {
     expect(second.packId).toBe(2);
     expect(store.read(hashObject("blob", firstData))?.data).toEqual(firstData);
     expect(store.read(hashObject("blob", secondData))?.data).toEqual(secondData);
+  });
+
+  it("defaults to broad pending cleanup while maintenance can skip it", async () => {
+    const ordinary = open();
+    ordinary.db.run(
+      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+       VALUES (?, 1, 0, 0, 'pending', 0)`,
+      ordinary.sharedRepoId,
+    );
+    const ordinaryResult = await ordinary.packs.ingest(
+      slices(singleBlobPack(utf8.encode("ordinary cleanup\n")), 13),
+    );
+    expect(ordinaryResult.packId).toBe(1);
+    expect(ordinary.db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(1);
+
+    const maintenance = open();
+    maintenance.db.run(
+      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+       VALUES (?, 1, 0, 0, 'pending', 0)`,
+      maintenance.sharedRepoId,
+    );
+    const maintenanceResult = await maintenance.packs.ingest(
+      slices(singleBlobPack(utf8.encode("maintenance skip\n")), 13),
+      { reclaimPending: false },
+    );
+    expect(maintenanceResult.packId).toBe(2);
+    expect(
+      maintenance.db.all<{ pack_id: number; state: string }>(
+        "SELECT pack_id, state FROM git_pack_meta ORDER BY pack_id",
+      ),
+    ).toEqual([
+      { pack_id: 1, state: "pending" },
+      { pack_id: 2, state: "complete" },
+    ]);
+  });
+
+  it("skips exactly the two broad cleanup probes when requested", async () => {
+    const ordinary = open();
+    const ordinaryDb = ordinary.db;
+    if (!(ordinaryDb instanceof TestDatabase)) throw new Error("expected test database");
+    ordinaryDb.storage.resetCounters();
+    await ordinary.packs.ingest(slices(singleBlobPack(utf8.encode("count ordinary\n")), 17));
+    const ordinaryStatements = ordinaryDb.storage.statementCount;
+
+    const maintenance = open();
+    const maintenanceDb = maintenance.db;
+    if (!(maintenanceDb instanceof TestDatabase)) throw new Error("expected test database");
+    maintenanceDb.storage.resetCounters();
+    await maintenance.packs.ingest(slices(singleBlobPack(utf8.encode("count maintenance\n")), 17), {
+      reclaimPending: false,
+    });
+    expect(maintenanceDb.storage.statementCount).toBe(ordinaryStatements - 2);
+
+    const invalidOptions = {};
+    Reflect.set(invalidOptions, "reclaimPending", "no");
+    await expect(
+      maintenance.packs.ingest(
+        slices(singleBlobPack(utf8.encode("invalid option\n")), 17),
+        invalidOptions,
+      ),
+    ).rejects.toThrow(/reclaimPending must be a boolean/);
   });
 
   it("reclaims an abandoned unowned pack after a cold reopen", async () => {
@@ -2358,6 +2503,245 @@ describe("synthetic pack ingest", () => {
         store.sharedRepoId,
       ),
     ).toEqual({ state: "selected", pack_id: null });
+  });
+
+  it.each(["throw", "return", "promise"])(
+    "rolls pending discard back when release hooks %s",
+    (mode) => {
+      const store = open();
+      seedRepackBatch(store);
+      store.db.run(
+        `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+         VALUES (?, 1, 0, 0, 'pending', 0)`,
+        store.sharedRepoId,
+      );
+      store.db.run(
+        `UPDATE git_maintenance_repack_batches
+            SET state = 'pending', pack_id = 1 WHERE repo_id = ?`,
+        store.sharedRepoId,
+      );
+
+      expect(() =>
+        store.packs.discardPending(1, (packId) => {
+          store.db.run(
+            `UPDATE git_maintenance_repack_batches
+                SET state = 'selected', pack_id = NULL WHERE repo_id = ? AND pack_id = ?`,
+            store.sharedRepoId,
+            packId,
+          );
+          if (mode === "throw") throw new Error("pending release failed");
+          if (mode === "promise") return Promise.resolve();
+          return "not undefined";
+        }),
+      ).toThrow(
+        mode === "throw"
+          ? /pending release failed/
+          : /ownership release hook must return undefined/,
+      );
+      expect(
+        store.db.one<{ state: string; pack_id: number }>(
+          "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+          store.sharedRepoId,
+        ),
+      ).toEqual({ state: "pending", pack_id: 1 });
+      expect(
+        store.db.scalar<string>(
+          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 1",
+          store.sharedRepoId,
+        ),
+      ).toBe("pending");
+    },
+  );
+
+  it("atomically releases and discards only one owned complete pack", async () => {
+    const store = open();
+    seedRepackBatch(store);
+    const looseData = utf8.encode("unrelated loose\n");
+    const looseOid = store.write("blob", looseData);
+    let activeDiscardCode: string | undefined;
+    const owned = await store.packs.ingest(
+      slices(singleBlobPack(utf8.encode("owned complete\n")), 11),
+      {
+        reclaimPending: false,
+        lifecycle: {
+          reserved: (packId) => {
+            store.db.run(
+              `UPDATE git_maintenance_repack_batches
+                SET state = 'pending', pack_id = ? WHERE repo_id = ? AND run_id = 1`,
+              packId,
+              store.sharedRepoId,
+            );
+          },
+          published: (result) => {
+            try {
+              store.packs.discardOwnedComplete(result.packId, () => undefined);
+            } catch (error) {
+              if (error instanceof GitError) activeDiscardCode = error.code;
+              else throw error;
+            }
+            store.db.run(
+              `UPDATE git_maintenance_repack_batches
+                SET state = 'published', stored_bytes = ? WHERE repo_id = ? AND run_id = 1`,
+              result.bytes,
+              store.sharedRepoId,
+            );
+          },
+        },
+      },
+    );
+    expect(activeDiscardCode).toBe("EBUSY");
+    const other = await store.packs.ingest(
+      slices(singleBlobPack(utf8.encode("other complete\n")), 11),
+      { reclaimPending: false },
+    );
+    const pendingId = other.packId + 1;
+    store.db.run(
+      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+       VALUES (?, ?, 0, 0, 'pending', 0)`,
+      store.sharedRepoId,
+      pendingId,
+    );
+
+    expect(() => store.packs.discardOwnedComplete(owned.packId, () => undefined)).toThrow();
+    expect(
+      store.db.one<{ state: string; pack_id: number }>(
+        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "published", pack_id: owned.packId });
+    expect(
+      store.db.scalar<string>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        store.sharedRepoId,
+        owned.packId,
+      ),
+    ).toBe("complete");
+
+    expect(
+      store.packs.discardOwnedComplete(owned.packId, (packId) => {
+        store.db.run(
+          `UPDATE git_maintenance_repack_batches
+              SET state = 'selected', pack_id = NULL, stored_bytes = 0
+            WHERE repo_id = ? AND run_id = 1 AND pack_id = ?`,
+          store.sharedRepoId,
+          packId,
+        );
+      }),
+    ).toBe(true);
+    expect(store.packs.discardOwnedComplete(owned.packId, () => undefined)).toBe(false);
+    expect(store.packs.discardPending(owned.packId)).toBe(false);
+    expect(
+      store.db.all<{ pack_id: number; state: string }>(
+        "SELECT pack_id, state FROM git_pack_meta ORDER BY pack_id",
+      ),
+    ).toEqual([
+      { pack_id: other.packId, state: "complete" },
+      { pack_id: pendingId, state: "pending" },
+    ]);
+    expect(
+      store.db.one<{ state: string; pack_id: number | null }>(
+        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "selected", pack_id: null });
+    expect(store.read(looseOid)?.data).toEqual(looseData);
+    expect(() => store.packs.discardOwnedComplete(pendingId, () => undefined)).toThrowError(
+      expect.objectContaining({ code: "EBUSY" }),
+    );
+  });
+
+  it.each(["throw", "return", "promise", "state"])(
+    "rolls owned complete discard back when release hooks %s",
+    async (mode) => {
+      const store = open();
+      seedRepackBatch(store);
+      const owned = await store.packs.ingest(
+        slices(singleBlobPack(utf8.encode(`rollback ${mode}\n`)), 9),
+        {
+          reclaimPending: false,
+          lifecycle: {
+            reserved: (packId) => {
+              store.db.run(
+                "UPDATE git_maintenance_repack_batches SET state = 'pending', pack_id = ? WHERE repo_id = ?",
+                packId,
+                store.sharedRepoId,
+              );
+            },
+            published: (result) => {
+              store.db.run(
+                "UPDATE git_maintenance_repack_batches SET state = 'published', stored_bytes = ? WHERE repo_id = ?",
+                result.bytes,
+                store.sharedRepoId,
+              );
+            },
+          },
+        },
+      );
+
+      expect(() =>
+        store.packs.discardOwnedComplete(owned.packId, (packId) => {
+          store.db.run(
+            "UPDATE git_maintenance_repack_batches SET state = 'selected', pack_id = NULL WHERE repo_id = ? AND pack_id = ?",
+            store.sharedRepoId,
+            packId,
+          );
+          if (mode === "throw") throw new Error("release failed");
+          if (mode === "promise") return Promise.resolve();
+          if (mode === "state") {
+            store.db.run(
+              "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?",
+              store.sharedRepoId,
+              packId,
+            );
+            return undefined;
+          }
+          return "not undefined";
+        }),
+      ).toThrow(
+        mode === "throw"
+          ? /release failed/
+          : mode === "state"
+            ? /ownership release changed complete pack state/
+            : /ownership release hook must return undefined/,
+      );
+      expect(
+        store.db.one<{ state: string; pack_id: number }>(
+          "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+          store.sharedRepoId,
+        ),
+      ).toEqual({ state: "published", pack_id: owned.packId });
+      expect(
+        store.db.scalar<string>(
+          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+          store.sharedRepoId,
+          owned.packId,
+        ),
+      ).toBe("complete");
+    },
+  );
+
+  it("rolls owned complete discard back when exact deletion validation fails", async () => {
+    const inner = new TestDatabase();
+    const db = new MutatingQueryDatabase(inner, "owned-complete-discard-validation", {
+      remains: 1,
+    });
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const result = await store.packs.ingest(
+      slices(singleBlobPack(utf8.encode("validation rollback\n")), 13),
+      { reclaimPending: false },
+    );
+
+    expect(() => store.packs.discardOwnedComplete(result.packId, () => undefined)).toThrow(
+      /complete discard did not remove exactly one pack/,
+    );
+    expect(
+      inner.scalar<string>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        store.sharedRepoId,
+        result.packId,
+      ),
+    ).toBe("complete");
   });
 
   it("matches exact complete membership and deletes complete packs in bounded batches", async () => {

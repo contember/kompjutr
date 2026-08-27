@@ -1812,20 +1812,29 @@ export class SharedRepoStore {
     this.#shallow = null;
   }
 
-  /** Discard transaction-local cache state and re-read committed loose-object availability. */
-  revalidateAfterRollback(): void {
+  /** Invalidate storage caches and re-read current loose-object availability. */
+  revalidateStorageCaches(): void {
+    let availability: boolean | undefined;
+    let rows = 0;
+    for (const row of this.db.iterate(
+      `SELECT /* loose-storage-availability */
+              COUNT(*) AS has_loose
+         FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)`,
+      this.repoId,
+    )) {
+      if ((row.has_loose !== 0 && row.has_loose !== 1) || rows !== 0) {
+        throw new CorruptError("loose object availability probe returned an invalid value");
+      }
+      availability = row.has_loose === 1;
+      rows++;
+    }
+    if (rows !== 1 || availability === undefined) {
+      throw new CorruptError("loose object availability probe returned an invalid value");
+    }
     this.#cacheGeneration++;
     this.#packs?.clearCaches();
-    this.#hasLoose = false;
+    this.#hasLoose = availability;
     this.#shallow = null;
-    const hasLoose = this.db.scalar<unknown>(
-      "SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)",
-      this.repoId,
-    );
-    if (hasLoose !== 0 && hasLoose !== 1) {
-      throw new CorruptError("loose object rollback probe returned an invalid value");
-    }
-    this.#hasLoose = hasLoose === 1;
   }
 
   cacheBytes(): { objects: number; chunks: number } {
@@ -2358,7 +2367,7 @@ export class SqliteGitDatabase {
       });
     } catch (error) {
       lifetime.revoke();
-      shared.revalidateAfterRollback();
+      shared.revalidateStorageCaches();
       throw error;
     }
 
