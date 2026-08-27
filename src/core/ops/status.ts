@@ -406,7 +406,7 @@ function* statusStreamInternal(
   for (const row of joinSorted3(
     treeStream(repo, headTreeOid),
     statusIndexGroups(repo.checkout.indexScan()),
-    worktreeEntries(repo, worktree, options, ignores, prunable, snapshot),
+    worktreeEntries(repo, worktree, options, ignores, prunable, snapshot, seed === undefined),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
     sourceRows++;
@@ -451,6 +451,7 @@ function worktreeEntries(
   ignores: IgnoreMatcher,
   excludeRoots: string[],
   snapshot: StatusIndexSnapshot,
+  allowIgnoredPrune: boolean,
 ): Generator<WorktreePath> {
   return walkWorktreeEntriesStream(worktree, repo.root, {
     excludeRoots,
@@ -459,7 +460,7 @@ function worktreeEntries(
     // Tracked paths remain visible even when a later ignore rule matches.
     includeIgnored: true,
     pruneDirectory:
-      options.includeIgnored !== true && snapshot.retainsTrackedPaths
+      allowIgnoredPrune && options.includeIgnored !== true && snapshot.retainsTrackedPaths
         ? (path) => ignores.ignores(path, true) && !hasTrackedPath(path, snapshot.trackedPaths)
         : undefined,
   });
