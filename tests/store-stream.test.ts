@@ -10,6 +10,7 @@ import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
 import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/blob-id-cache.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
+import { readMaintenanceRootEpoch } from "../src/sqlite/maintenance/control.js";
 import {
   type IndexEntry,
   type InitialStateSession,
@@ -208,7 +209,8 @@ describe("indexApply", () => {
       }
     });
 
-    expect(inner.storage.statementCount).toBe(4);
+    // Each durable index page also publishes the maintenance root epoch.
+    expect(inner.storage.statementCount).toBe(6);
     expect(db.widestBindings).toBeLessThanOrEqual(2);
     expect(store.indexEntries()).toEqual(
       Array.from({ length: 500 }, (_, index) => {
@@ -249,9 +251,9 @@ describe("indexApply", () => {
       return statements;
     };
 
-    expect(measure(100)).toBe(1);
-    expect(measure(1_000)).toBe(2);
-    expect(measure(9_329)).toBe(19);
+    expect(measure(100)).toBe(2);
+    expect(measure(1_000)).toBe(4);
+    expect(measure(9_329)).toBe(38);
   });
 
   it("bounds UTF-8 JSON bindings even when flushEvery is larger", () => {
@@ -274,7 +276,7 @@ describe("indexApply", () => {
     const statements = inner.storage.statementCount;
     const stored = store.indexEntries();
 
-    expect(statements).toBe(5);
+    expect(statements).toBe(10);
     expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
     expect(stored.map((row) => row.path)).toEqual(paths);
   });
@@ -314,7 +316,7 @@ describe("indexReplace", () => {
       ),
     );
 
-    expect(inner.storage.statementCount).toBe(3);
+    expect(inner.storage.statementCount).toBe(5);
     expect(db.widestBindings).toBeLessThanOrEqual(2);
     expect(store.indexEntries()).toHaveLength(1_000);
     expect(store.indexGet("old.txt")).toBeNull();
@@ -329,7 +331,7 @@ describe("indexReplace", () => {
       Array.from({ length: 9_329 }, (_, index) => entry(`f${String(index).padStart(4, "0")}.txt`)),
     );
 
-    expect(inner.storage.statementCount).toBe(20);
+    expect(inner.storage.statementCount).toBe(39);
     expect(store.indexEntries()).toHaveLength(9_329);
   });
 });
@@ -359,7 +361,7 @@ describe("tryCreateInitialState", () => {
     });
 
     expect(result).toEqual({ available: true, value: "created" });
-    expect(inner.storage.statementCount).toBe(3);
+    expect(inner.storage.statementCount).toBe(4);
     expect(db.initialStateWrites).toBe(2);
     expect(db.deleteStatements).toBe(0);
     expect(store.indexEntries()).toEqual([
@@ -379,10 +381,32 @@ describe("tryCreateInitialState", () => {
   it("allows an empty body", () => {
     const inner = new TestDatabase();
     const store = open(inner);
+    const rootEpoch = readMaintenanceRootEpoch(inner, store.repoId);
     inner.storage.resetCounters();
     expect(store.tryCreateInitialState(() => 42)).toEqual({ available: true, value: 42 });
     expect(inner.storage.statementCount).toBe(1);
+    expect(readMaintenanceRootEpoch(inner, store.repoId)).toBe(rootEpoch);
     expect(store.indexEntries()).toEqual([]);
+  });
+
+  it("persists blob mappings without changing index roots", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    const mapping = contentId(7);
+    const objectId = oid(8);
+    const rootEpoch = readMaintenanceRootEpoch(inner, store.repoId);
+    inner.storage.resetCounters();
+
+    expect(
+      store.tryCreateInitialState((session) => {
+        session.addBlobId({ contentId: mapping, oid: objectId });
+        return "cached";
+      }),
+    ).toEqual({ available: true, value: "cached" });
+    expect(inner.storage.statementCount).toBe(2);
+    expect(readMaintenanceRootEpoch(inner, store.repoId)).toBe(rootEpoch);
+    expect(store.indexEntries()).toEqual([]);
+    expect(store.lookupBlobIds([mapping])).toEqual(new Map([[toHex(mapping), objectId]]));
   });
 
   it("orders paths by Git UTF-8 bytes rather than JavaScript UTF-16 units", () => {
@@ -424,7 +448,7 @@ describe("tryCreateInitialState", () => {
       }),
     ).toEqual({ available: true, value: undefined });
     expect(acceptedHighWater).toBeLessThanOrEqual(4 * 1024 * 1024);
-    expect(acceptedInner.storage.statementCount).toBe(3);
+    expect(acceptedInner.storage.statementCount).toBe(4);
 
     const rejectedInner = new TestDatabase();
     const rejectedDb = new WidestDatabase(rejectedInner);
@@ -494,7 +518,7 @@ describe("tryCreateInitialState", () => {
     });
 
     expect(result).toEqual({ available: true, value: 24_252 });
-    expect(inner.storage.statementCount).toBe(55);
+    expect(inner.storage.statementCount).toBe(56);
     expect(db.deleteStatements).toBe(0);
     expect(db.widestBindings).toBeLessThanOrEqual(3);
     expect(db.widestBlob).toBeLessThanOrEqual(1024 * 1024);

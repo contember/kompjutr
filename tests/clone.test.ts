@@ -1192,10 +1192,11 @@ describe("fetch", () => {
         statements.push({ refs: count, fetch: fetchStatements, prune: pruneStatements });
       }
 
+      // Ref publication adds one maintenance root-epoch statement per fetch.
       expect(statements).toEqual([
-        { refs: 1, fetch: 31, prune: 15 },
-        { refs: 1_000, fetch: 31, prune: 15 },
-        { refs: 9_329, fetch: 43, prune: 27 },
+        { refs: 1, fetch: 32, prune: 16 },
+        { refs: 1_000, fetch: 32, prune: 16 },
+        { refs: 9_329, fetch: 44, prune: 28 },
       ]);
     } finally {
       await server.close();

@@ -5797,7 +5797,8 @@ export class CheckoutStore {
           throw new Error("initial state body returned an asynchronous result");
         }
         finish();
-        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+        // Blob-id cache writes alone do not change maintenance roots.
+        if (previousPath !== null) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
         return { available: true, value };
       } finally {
         active = false;
