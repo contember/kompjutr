@@ -9,6 +9,10 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Worktree performance and budget closure](sprint-2026-08-27-worktree-performance-and-budget.md)
+  — bounded selected-path add, subtree-reusing commit, sparse status and
+  checkout acceleration, truthful checkout measurement, and a repeated local
+  release-candidate baseline.
 - [Git boundary correctness](sprint-2026-08-26-git-boundary-correctness.md)
   — safe branch deletion, framing-safe and sparse-truthful status,
   file/symlink conflict materialisation, and Git-compatible network defaults.

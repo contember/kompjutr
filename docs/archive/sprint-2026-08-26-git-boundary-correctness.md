@@ -160,9 +160,9 @@ The sprint closes those gaps without adding submodule or byte-path architecture.
   [59](../backlog/59-byte-preserving-git-paths.md).
 - General fetch refspec parsing remains [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md).
 - Ignored-tree pruning, commit tracker reseal, and full-status prepass reduction
-  remain [54](../backlog/54-prune-ignored-directories-in-status-walk.md),
-  [56](../backlog/56-reseal-index-tracker-on-commit.md), and
-  [57](../backlog/57-single-prepass-in-full-status.md).
+  remain [54](sprint-2026-08-27-worktree-performance-and-budget.md),
+  [56](sprint-2026-08-27-worktree-performance-and-budget.md), and
+  [57](sprint-2026-08-27-worktree-performance-and-budget.md).
 - Deployment, publishing, and production probes are not part of this sprint.
 
 ## Decisions

@@ -15,16 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-27-worktree-performance-and-budget.md`](sprints/sprint-2026-08-27-worktree-performance-and-budget.md)
-  — close local worktree wall-time and statement-budget release blockers.
+No sprint is active.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Worktree performance and budget closure is active: correct checkout
-  measurement, bounded add/commit/status/checkout, then a repeated leased
-  release-candidate baseline.
+- Next qualification work is the production Durable Object probe and the
+  concurrent/restart conformance matrix. Storage maintenance and integrity
+  tooling remain separate backlog tracks.
 
 ## Key reference
 
@@ -50,6 +49,10 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-27-worktree-performance-and-budget.md`](archive/sprint-2026-08-27-worktree-performance-and-budget.md)
+  — bounded selected-path add, subtree-reusing commit, sparse status and
+  checkout acceleration, truthful checkout measurement, and a repeated local
+  release-candidate baseline.
 - [`archive/sprint-2026-08-26-git-boundary-correctness.md`](archive/sprint-2026-08-26-git-boundary-correctness.md)
   — safe branch deletion, framing-safe and sparse-truthful status,
   file/symlink conflict materialisation, and Git-compatible network defaults.

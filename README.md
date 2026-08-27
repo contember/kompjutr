@@ -173,8 +173,9 @@ source-qualified edge index and do not read object BLOBs.
 The universal targets are at most 1,000 SQL statements and less than 100 MiB of
 operation memory. The repository has adversarial gates for these bounds. The
 wall target is below 0.1 seconds for operations touching at most 1,000 changed
-paths. This wall target is not yet met by full-repository `status` and
-`checkout`; they remain bounded by full tree, index, and filesystem scans.
+paths. On the local 24,252-path Next.js fixture, explicit 100-path add and
+commit, clean post-commit status, and real 100-change checkout transitions meet
+that wall target. Modified and staged full-repository status remain above it.
 
 See [the architecture](docs/reference/architecture.md) for the storage model and current
 limits, and [the current benchmark](docs/reference/benchmark-current.md) for the native
@@ -182,8 +183,10 @@ Next.js workflow. Older comparisons are historical pre-standalone evidence.
 
 ## Status
 
-Experimental. The standalone API and compatibility adapter are tested, but the
-remaining wall-time gaps above still block a performance-complete release.
+Experimental. The standalone API and compatibility adapter are tested. A
+production Durable Object probe, concurrent and interrupted-operation
+conformance, storage maintenance, integrity tooling, and the first tag-driven
+release remain outstanding.
 
 ## Development and releases
 

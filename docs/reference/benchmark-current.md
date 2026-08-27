@@ -1,15 +1,19 @@
 # Current benchmark snapshot
 
-Measured 2026-08-24 at commit `a531efa` on Linux 6.17 and Node 24.4.0:
+Measured in three clean runs on 2026-08-27 at commit
+`d03aa708af926d3590fc4903bc6946b38698be7e` with Node v24.4.0, SQLite 3.50.2,
+git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
 
 ```bash
 cpu-lease run -n 2 --no-smt -- npm run bench:nextjs
 ```
 
-The fixture is `vercel/next.js` at `v15.5.2`, rebuilt as one shallow-cloneable
-commit with 24,252 tracked files. SQLite uses a temporary file. The local Smart
-HTTP origin is prepared outside measurement. Each phase resets SQLite counters
-and the process RSS high-water mark.
+The harness held two vCPUs with SMT siblings excluded. The fixture is
+`vercel/next.js` at `v15.5.2`, rebuilt as one shallow-cloneable commit with
+24,252 tracked files. SQLite uses a temporary file. The local Smart HTTP origin
+is prepared outside measurement. Each phase resets SQLite counters and the
+process RSS high-water mark. Wall values below are the median of three runs;
+statement and returned-row counts were identical in all three.
 
 This is `node:sqlite`, not Durable Object SQL. Statement counts transfer to the
 platform cost model. Local wall time and process RSS are regression signals, not
@@ -17,31 +21,35 @@ proof of a production isolate limit.
 
 ## Results
 
-| Operation | Wall | SQL | Rows | Peak RSS added |
-| --- | ---: | ---: | ---: | ---: |
-| `git.clone` | 11,669.9 ms | 791 | 78,526 | 245.6 MiB |
-| `git.status` — clean clone | 1.9 ms | 8 | 7 | 0.0 MiB |
-| `git.branch` | 1.5 ms | 8 | 5 | 0.0 MiB |
-| `fs.writeFiles` — 100 | 21.7 ms | 6 | 288 | 1.3 MiB |
-| `git.status` — 100 modified | 79.4 ms | 27 | 1,402 | 3.0 MiB |
-| `git.diffSummary` — 100 | 96.7 ms | 27 | 1,947 | 0.2 MiB |
-| `git.diff` — 100 | 67.1 ms | 26 | 1,945 | 0.4 MiB |
-| `git.add` — 100 | 656.4 ms | 245 | 31,380 | 3.4 MiB |
-| `git.status` — 100 staged | 43.8 ms | 24 | 1,056 | 0.3 MiB |
-| `git.commit` — 100 | 496.2 ms | 31 | 24,301 | 5.6 MiB |
-| `git.push` — 100 | 871.5 ms | 17 | 730 | 4.9 MiB |
-| `git.status` — clean commit | 502.2 ms | 23 | 1,156 | 0.0 MiB |
-| `git.checkout main` | 519.8 ms | 51 | 1,551 | 0.0 MiB |
-| `git.checkout main --force` | 7.1 ms | 31 | 16 | 0.0 MiB |
-| `git.status` — clean main | 0.7 ms | 9 | 7 | 0.0 MiB |
-| `git.checkout bench-work` | 526.5 ms | 51 | 1,750 | 0.0 MiB |
-| `git.checkout bench-work --force` | 6.7 ms | 27 | 16 | 0.0 MiB |
-| `git.status` — clean work | 0.7 ms | 8 | 7 | 0.0 MiB |
+| Operation | Median wall | SQL | Rows |
+| --- | ---: | ---: | ---: |
+| `git.clone` | 11,628.592 ms | 824 | 78,537 |
+| `git.status` — clean clone | 2.461 ms | 9 | 7 |
+| `git.branch` | 4.050 ms | 23 | 13 |
+| `fs.writeFiles` — 100 | 23.206 ms | 6 | 288 |
+| `git.status` — 100 modified | 1,234.155 ms | 59 | 49,538 |
+| `git.diffSummary` — 100 | 74.973 ms | 28 | 1,574 |
+| `git.diff` — 100 | 65.242 ms | 27 | 1,572 |
+| `git.add` — 100 | 75.338 ms | 15 | 1,752 |
+| `git.status` — 100 staged | 1,176.031 ms | 58 | 49,192 |
+| `git.commit` — 100 | 55.527 ms | 38 | 717 |
+| `git.push` — 100 | 414.325 ms | 29 | 738 |
+| `git.status` — clean commit | 29.487 ms | 23 | 683 |
+| `git.checkout main` | 87.534 ms | 59 | 819 |
+| `git.checkout main --force` | 70.305 ms | 60 | 919 |
+| `git.status` — clean main | 0.723 ms | 10 | 7 |
+| `git.checkout bench-work` | 71.178 ms | 59 | 1,018 |
+| `git.checkout bench-work --force` | 78.531 ms | 59 | 1,018 |
+| `git.status` — clean work | 0.791 ms | 9 | 7 |
 
-Every phase stays below the 1,000-statement operation ceiling. Push uses 17
-statements and adds 4.9 MiB of process RSS for the 100-file change. Clone remains
-the local memory hotspot: its 245.6 MiB RSS delta does not establish production
-isolate usage, while its 791 statements stay within the SQL ceiling.
+Every phase stayed below the 1,000-statement operation ceiling in all three
+runs, and every operation and status assertion passed. Every one of the three
+runs for each required row was below 100 ms: maxima were 76.957 ms for add,
+58.832 ms for commit, 29.558 ms for clean post-commit status, 89.446 ms for
+checkout to main, and 79.682 ms for checkout to bench-work. Both real force
+transitions were also below 100 ms in all three runs, with maxima of 72.793 and
+98.198 ms. The modified and staged status rows remain full-repository paths and
+do not meet that wall target.
 
 The harness writes detailed generated output to `bench/results/`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run. Historical
@@ -93,8 +101,9 @@ runtime claim.
 
 ## Clone storage
 
-Measured 2026-08-26 at commit `4f64cf9` with a clean `src` tree, Node v24.4.0
-and SQLite 3.50.2 on Linux 6.17.0-41-generic x64 and an AMD Ryzen 7 PRO 8840HS:
+Measured in three clean runs on 2026-08-27 at commit
+`d03aa708af926d3590fc4903bc6946b38698be7e` with Node v24.4.0, SQLite 3.50.2,
+git 2.54.0, Linux 6.17.0-41-generic x64, and an AMD Ryzen 7 PRO 8840HS:
 
 ```bash
 npm run bench:clone-storage
@@ -110,32 +119,32 @@ counted as apparent bytes per entry. Every run proves its own end state: HEAD,
 index entries and worktree files must match the fixture before a size is
 reported.
 
-| Fixture | Files | SQLite | `.git` | Worktree | git total | SQLite / git | `git.clone` | `git clone` | SQL |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `express` | 218 | 1.42 MiB | 229.1 KiB | 688.1 KiB | 917.2 KiB | 1.59× | 175 ms | 86 ms | 74 |
-| `tailwind` | 541 | 7.44 MiB | 1.12 MiB | 5.30 MiB | 6.41 MiB | 1.16× | 260 ms | 146 ms | 86 |
-| `vue` | 1,075 | 14.15 MiB | 2.51 MiB | 9.75 MiB | 12.25 MiB | 1.15× | 484 ms | 244 ms | 103 |
-| `eslint` | 2,358 | 32.70 MiB | 6.61 MiB | 22.47 MiB | 29.08 MiB | 1.12× | 1,130 ms | 506 ms | 150 |
-| `prettier` | 9,329 | 43.91 MiB | 7.99 MiB | 22.93 MiB | 30.92 MiB | 1.42× | 2,554 ms | 912 ms | 262 |
-| `nextjs` | 24,252 | 218.04 MiB | 45.81 MiB | 134.08 MiB | 179.89 MiB | 1.21× | 10,998 ms | 2,906 ms | 813 |
+| Fixture | Files | SQLite | git total | SQLite / git | `git.clone` median | Checkout median | Clone SQL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `express` | 218 | 1.46 MiB | 917.2 KiB | 1.63× | 167.272 ms | 30.614 ms | 85 |
+| `tailwind` | 541 | 7.47 MiB | 6.41 MiB | 1.16× | 253.542 ms | 104.934 ms | 97 |
+| `vue` | 1,075 | 14.18 MiB | 12.25 MiB | 1.16× | 509.732 ms | 250.671 ms | 114 |
+| `eslint` | 2,358 | 32.73 MiB | 29.08 MiB | 1.13× | 1,503.573 ms | 583.589 ms | 161 |
+| `prettier` | 9,329 | 43.95 MiB | 30.92 MiB | 1.42× | 3,286.099 ms | 1,417.923 ms | 273 |
+| `nextjs` | 24,252 | 218.07 MiB | 179.89 MiB | 1.21× | 9,151.759 ms | 5,339.358 ms | 824 |
 
-Sizes and statement counts are byte-identical across repeated runs. Wall time is
-not: three leased runs of the same ladder put `nextjs` at 9,715, 10,745 and
-10,998 ms and `eslint` at 1,117, 1,876 and 1,130 ms while every size stayed the
-same. Read the times as a regression signal, not a constant — and never read a
-sub-second improvement out of this column.
+All three runs passed provenance, end-state, storage, and SQL assertions. Sizes,
+facts, and statement counts were identical. Wall time is a regression signal,
+not a constant.
 
-Next.js is the row that carries. Its 218.04 MiB is 1.21× what git writes for the
+Next.js is the row that carries. Its 218.07 MiB is 1.21× what git writes for the
 same shallow clone, and the shape of that overhead is the whole story:
 
-| Group | Allocated | Payload | Overhead | Share |
-| --- | ---: | ---: | ---: | ---: |
-| Working tree (`fs_*`) | 153.55 MiB | 146.79 MiB | 4.4% | 70.4% |
-| Pack (`git_pack_*`) | 45.85 MiB | 45.19 MiB | 1.4% | 21.0% |
-| Tree projection (`git_tree_*`) | 11.45 MiB | 6.50 MiB | 43.2% | 5.3% |
-| Index (`git_index`, `git_blob_ids`) | 7.01 MiB | 6.14 MiB | 12.4% | 3.2% |
-| Repository and schema | 160.0 KiB | 70.5 KiB | 55.9% | 0.1% |
-| **Total** | **218.04 MiB** | **204.69 MiB** | **6.1%** | 100.0% |
+| Group | Allocated | Payload | Share |
+| --- | ---: | ---: | ---: |
+| Working tree (`fs_*`) | 153.55 MiB | 146.79 MiB | 70.4% |
+| Pack (`git_pack_*`) | 45.85 MiB | 45.19 MiB | 21.0% |
+| Tree projection (`git_tree_*`) | 11.45 MiB | 6.50 MiB | 5.3% |
+| Index (`git_index`, `git_blob_ids`) | 7.01 MiB | 6.14 MiB | 3.2% |
+| Loose objects | 20.0 KiB | 170 B | <0.1% |
+| Repository | 100.0 KiB | 1.4 KiB | <0.1% |
+| Schema | 96.0 KiB | 76.7 KiB | <0.1% |
+| **Total** | **218.07 MiB** | **204.70 MiB** | **100.0%** |
 
 The working tree holds the checkout uncompressed, so `fs_chunks` carries
 134.25 MiB of payload against the 134.08 MiB git writes to disk — a filesystem
@@ -151,21 +160,20 @@ exposes no `VACUUM`, so treat that as a diagnostic rather than a plan.
 Decomposing the same work — `init`, `fetch`, `updateRef`, `checkout`, each into
 its own database — attributes bytes and statements to the two halves:
 
-| Phase | SQL | Rows | DB after | Added |
+| Phase | Median wall | SQL | Rows | DB after |
 | --- | ---: | ---: | ---: | ---: |
-| `git.init` + `remoteAdd` | 11 | 3 | 300.0 KiB | 300.0 KiB |
-| `git.fetch` | 206 | 1,201 | 57.54 MiB | 57.24 MiB |
-| `git.updateRef` | 19 | 7 | 57.54 MiB | 0.0 KiB |
-| `git.checkout` | 1,117 | 155,446 | 218.07 MiB | 160.53 MiB |
+| `git.init` + `remoteAdd` | 3.907 ms | 16 | 6 | 336.0 KiB |
+| `git.fetch` | 4,100.493 ms | 208 | 1,202 | 57.57 MiB |
+| `git.updateRef` | 2.278 ms | 23 | 8 | 57.57 MiB |
+| `git.checkout` | 5,339.358 ms | 608 | 77,340 | 218.07 MiB |
 
-This is a decomposition, not the clone path: `clone` takes an initial-checkout
-fast path only a fresh repository can take, which is why it needs 813 statements
-where the decomposed sequence needs 1,353. The decomposed total lands within
-28 KiB of the clone's, so the attribution holds. **A standalone `git.checkout`
-that materialises 24,252 files uses 1,117 statements and exceeds the
-1,000-statement operation budget.** `clone` does not hit it and neither does a
-branch switch in an already-materialised tree — the nextjs workflow's
-`git.checkout main` costs 51 — but a checkout into an empty worktree does.
+This is a decomposition, not the clone path. Both paths use the shared
+create-only initial materializer, but the standalone sequence also performs the
+separate initialization, fetch, and ref publication phases. Clone uses 824
+statements; the standalone checkout itself uses 608. Both materialize exactly
+24,252 index entries and worktree leaves at the expected HEAD. Each final state
+has the same 228,667,392-byte allocated database size. Both stay below the
+1,000-statement operation budget.
 
 Generated output goes to `bench/results/clone-storage.{json,md}`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run.

@@ -63,15 +63,14 @@ production evidence arrives.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
-| — | Worktree performance and budget — **active** | 10, 54, 56, 57, 60, 61, 62 | — | Produces the release-candidate baseline sprint 2 measures, and the compiled matcher seam sprint 8 reuses. |
 | 1 | Repack and garbage collection | [04](04-repack-and-garbage-collection.md) | long | Storage growth is unbounded in a long-lived repository. Destructive maintenance wants its own gate before anything builds on it. |
-| 2 | Production Durable Object probe | [11](11-production-do-regression-probe.md) | normal | Consumes the active sprint's baseline while it is still current, and proves the performance claim in the real runtime rather than in Node. |
+| 2 | Production Durable Object probe | [11](11-production-do-regression-probe.md) | normal | Consumes the current local baseline while it is still current, and proves the performance claim in the real runtime rather than in Node. |
 | 3 | Concurrency and restart conformance | [16](16-concurrent-and-restart-conformance.md) | long | Last piece of production qualification. Protects every later sprint and may introduce an operation epoch or lock. |
 | 4 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | First reference-workload gap: a scratch index plus `readTree`, `writeTree` and `commitTree` over the existing bounded tree builder. |
 | 5 | Patch interchange | [44](44-patch-interchange.md) | long | Two halves — `--binary` and `--full-index` in the writer, then a new parser and `apply --3way` over the existing three-way engine. |
 | 6 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Fetch and push share the refspec type and its validation, so one sprint defines it in a seam unit first. |
 | 7 | Clone shape | [38](38-clone-depth-and-deepening.md), [41](41-partial-clone.md) | long | Both change the clone contract and both need an ADR. 41 additionally introduces a promisor object state every read path must honour. |
-| 8 | Everyday reads and pathspecs | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [36](36-glob-pathspecs.md) | normal | 36 reuses the compiled matcher seam from the active sprint. 35 and 37 are read-only and add no storage. |
+| 8 | Everyday reads and pathspecs | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [36](36-glob-pathspecs.md) | normal | 36 reuses the existing compiled matcher seam. 35 and 37 are read-only and add no storage. |
 | 9 | Network safety and stash | [13](13-force-with-lease.md), [15](15-abortable-network-operations.md), [06](06-stash-operations.md) | long | 13 and 15 are both network-operation safety. 06 joins them because it reuses the same merge engine and operation journal. |
 | 10 | Rebase extensions I | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | All three write to the planner and the lifecycle, so they cannot run in parallel. Sequential work units in one sprint is the correct shape. |
 | 11 | Management and plumbing reads | [18](18-branch-and-remote-management.md), [46](46-rev-parse-revision-syntax.md), [39](39-plumbing-read-surface.md) | long | 39 decomposes into about seven small units; 18 and 46 fill the sprint. Nothing here adds storage. |
@@ -96,7 +95,6 @@ units over the same files, and a long sprint does not make that safe.
 - [06 — Implement stash operations](06-stash-operations.md)
 - [08 — Extend push refspec support](08-extend-push-refspecs.md)
 - [09 — Add outbound delta compression](09-outbound-delta-compression.md)
-- [10 — Close worktree wall-time gaps](10-worktree-wall-time.md)
 - [11 — Add a production Durable Object regression probe](11-production-do-regression-probe.md)
 - [13 — Add force-with-lease push](13-force-with-lease.md)
 - [15 — Make network operations abortable](15-abortable-network-operations.md)
@@ -118,11 +116,5 @@ units over the same files, and a long sprint does not make that safe.
 - [43 — Add index and object write plumbing](43-index-and-object-write-plumbing.md)
 - [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
-- [54 — Prune ignored directories from the full status walk](54-prune-ignored-directories-in-status-walk.md)
-- [56 — Move the index tracker baseline on commit](56-reseal-index-tracker-on-commit.md)
-- [57 — Stream HEAD and the index once in the full status prepass](57-single-prepass-in-full-status.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
-- [60 — Force-checkout benchmark phases measure a no-op](60-force-checkout-benchmark-measures-a-no-op.md)
-- [61 — Bound `add` for explicit pathspecs](61-bounded-add-for-explicit-pathspecs.md)
-- [62 — Reuse unchanged HEAD subtrees when commit builds its tree](62-reuse-head-subtrees-on-commit.md)

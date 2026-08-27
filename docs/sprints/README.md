@@ -19,6 +19,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Worktree performance and budget closure](sprint-2026-08-27-worktree-performance-and-budget.md)
-  — truthful checkout measurement, bounded selected-path work, subtree reuse,
-  and the remaining status/checkout wall-time closure.
+No sprint is active.

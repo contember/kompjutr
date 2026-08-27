@@ -204,10 +204,18 @@ state. Shallow boundaries and DAG convergence are handled explicitly.
 Tree, index, and filesystem sources use the same UTF-8/Git path order. Hot
 operations merge their streams instead of issuing scalar reads per path:
 
-- `status` merges HEAD, one bounded index snapshot, and filesystem metadata.
+- Full `status` shares one authoritative HEAD/index prepass with rename
+  detection and prunes clean ignored directories only when its repair seed does
+  not require their leaves.
 - `diff` batches unresolved working-tree hashes and loose or packed blob reads.
-- `checkout` batches removals, object reads, writes, and index mutations.
-- `add`, `reset`, and `commit` use bounded index and object sinks.
+- `checkout` traverses only active tree differences when its sparse guards hold,
+  then batches removals, object reads, writes, and index mutations.
+- Explicit `add` classifies exact files before requesting recursive directory
+  facts. Its native selected-path source uses indexed equality lookups for the
+  common exact case and retains the bounded generic fallback.
+- `commit` snapshots the selected index once and reuses unchanged authenticated
+  HEAD subtrees. `reset` and every commit path use bounded index and object
+  sinks.
 
 `comparePaths` is the shared comparator. JavaScript string order is not valid
 because it compares UTF-16 code units rather than Git's byte order.
@@ -392,24 +400,30 @@ cached stat changes, and filesystem mutations. Changes that cannot be
 represented safely, including ignore-file and repository-root topology changes,
 invalidate the state instead of guessing.
 
-The tracker becomes authoritative only through a bounded reseal. The bulk
-initial-clone path seeds it after writing the initial index and working tree. An
-unfiltered full `status` can repair an unavailable tracker from the exact HEAD,
-index, and worktree merge. A successful sparse `status` recomputes the retained
-dirty flags and advances the baseline to the current HEAD. If the complete seed
-does not fit its limits, the tracker remains unavailable.
+The tracker becomes authoritative only through a bounded reseal. The shared
+create-only initial materializer seeds it after atomically writing a missing or
+empty worktree and an empty index; clone and eligible standalone checkout use
+that path. Commit advances the baseline to the published tree while preserving
+the dirty state that remains after publication. An unfiltered full `status` can
+repair an unavailable tracker from the exact HEAD, index, and worktree merge. A
+successful sparse `status` recomputes the retained dirty flags and advances the
+baseline to the current HEAD. If the complete seed does not fit its limits, the
+tracker remains unavailable.
 
 Sparse operations use the journal differently:
 
 - `status` combines dirty paths with the baseline-to-HEAD tree difference,
-  hydrates only those leaves, and reseals after a successful exact result.
+  resolves only those index and worktree leaves, and reseals after a successful
+  exact result.
 - working-tree `diff` uses the same candidate union without mutating the
   tracker; tree-to-tree `diff` can use the bounded relational tree difference
   directly.
 - clean whole-tree `checkout` requires an available baseline equal to HEAD, an
-  empty dirty journal, and no blocking index entries. It verifies the hydrated
-  leaves and the current working tree before applying the leaf difference, then
-  moves HEAD and reseals an empty journal at the target tree.
+  empty dirty journal, and no blocking index entries. A source-qualified
+  active-frontier cursor produces only changed tree edges; an exact selected
+  source then verifies the corresponding index and worktree leaves before the
+  operation applies the difference, moves HEAD, and reseals an empty journal at
+  the target tree.
 
 Hydration admits at most 1,000 strict Git-ordered paths, 2,200 UTF-8 bytes per
 path, 1 MiB of request JSON, and 8 MiB of retained result state. Tree depth,
@@ -476,7 +490,7 @@ initialization is guarded below 1,000 statements; exact reopen uses two.
 Untrusted schema metadata is projected through byte bounds and retains less than
 100 MiB.
 
-## Resource limits and open performance work
+## Resource limits and performance paths
 
 Operations have explicit statement, binding, BLOB-result, retained-state, and
 cache gates. The target is at most 1,000 SQL statements and less than 100 MiB for
@@ -484,9 +498,10 @@ every accepted operation. Operations that exceed an accepted structural limit
 throw a stable error instead of truncating or continuing unbounded.
 
 The separate wall target is below 0.1 seconds for operations touching at most
-1,000 changed paths. Tracker-backed `status`, `diff`, and clean whole-tree
-`checkout` avoid full-repository traversal when their sparse guards and budgets
-hold. Cold or invalid tracker state, path-filtered status, local checkout
+1,000 changed paths. Native selected-path lookups, authenticated commit
+snapshots, tracker-backed `status` and `diff`, and active-frontier whole-tree
+`checkout` avoid full-repository traversal when their guards and budgets hold.
+Cold or invalid tracker state, path-filtered status, structural checkout
 changes, and capacity fallback still use the exact full operation; checkout
 must also perform the required physical writes.
 

@@ -1,3 +1,23 @@
+> **OUTCOME — shipped 2026-08-27.** Explicit add now uses bounded exact-first
+> selection, commit reuses authenticated unchanged HEAD subtrees and advances
+> the tracker baseline, full status combines its prepass and safely prunes clean
+> ignored trees, and whole-tree checkout uses active-frontier differences and a
+> shared create-only initial materializer. The checkout harness measures real
+> source-to-target transitions. Commit map: plan → `16e8025`; WU1 → `dce2ab6`;
+> WU0 → `034bf7b`; WU2 → `8213000`, `2dd6040`, `272a8f4`, `d03aa70`; WU3 →
+> `e472d31`, `b77195d`, `de4fc72`; WU4 → `4154b9d`; WU5 → `b8eba1d`,
+> `bf86471`; WU6 → `3e7251e`, `ea59822`, `d4098af`; contract corrections →
+> `b2aab9c`, `d33239b`, `bf997c2`. Verification: `npm run check`, typecheck,
+> build, package smoke, docs lint, and the full suite — 119 files, 2,180 passed,
+> 5 skipped.
+> Three CPU-leased Next.js runs kept every operation below 1,000 statements;
+> every run for add, commit, clean post-commit status, and both real checkout
+> directions was below 100 ms. Their maxima were 76.957, 58.832, 29.558,
+> 89.446, and 79.682 ms. Backlog closed: 10, 54, 56, 57, and 60–62. Deferred:
+> production Durable Object timing, concurrency/restart conformance, repack and
+> garbage collection, audit/integrity tooling, glob pathspecs, deployment, and
+> publication.
+
 # Sprint — Worktree performance and budget closure (2026-08-27)
 
 **Goal.** Make the common Next.js-sized add, commit, status, and checkout paths
@@ -394,3 +414,32 @@ territories; CPU-heavy gates and every reported benchmark run use `cpu-lease`.
   rewrite needs an active-frontier `EXPLAIN` witness and corruption-before-yield
   coverage. The unit is green only after focused tests, two independent reviews,
   and a leased integrated run put all five required rows below 100 ms.
+- The exceptional wave landed the active-frontier tree diff in `3e7251e` and
+  `ea59822`, selected-workspace reuse in `d4098af`, the exact descendant seam in
+  `2dd6040`, and exact-first add in `272a8f4`. Review corrections
+  `de4fc72` and `d03aa70` tightened the direct status measurement and snapshotted
+  untrusted selected-path facts without changing the public or schema surface.
+- The clean three-run Next.js baseline at `d03aa70` used Node v24.4.0, SQLite
+  3.50.2, git 2.54.0, Linux 6.17.0-41-generic, and an AMD Ryzen 7 PRO 8840HS
+  under a two-vCPU no-SMT lease. Medians were 75.338 ms for add 100, 55.527 ms
+  for commit 100, 29.487 ms for clean post-commit status, 87.534 ms for checkout
+  to main, and 71.178 ms for checkout to bench-work. Every one of the three runs
+  for those five rows was below 100 ms; their maxima were 76.957, 58.832,
+  29.558, 89.446, and 79.682 ms. The real force transitions had medians of
+  70.305 and 78.531 ms and maxima of 72.793 and 98.198 ms. Every operation
+  stayed below 1,000 statements in all three runs and every operation/status
+  assertion passed.
+- Three self-leased clone-storage runs requested four no-SMT vCPUs and observed
+  CPU list `8,10`. Next.js clone had a 9,151.759 ms median and used 824
+  statements. Its standalone initial checkout had a 5,339.358 ms median and
+  used 608 statements. Both produced the exact expected HEAD, 24,252 index
+  entries, and 24,252 worktree leaves. Each final state had the same
+  228,667,392-byte allocated database size.
+- The final gate passed Biome check, typecheck, all 119 test files with 2,180
+  passed and 5 skipped, production build, package smoke, and docs lint.
+- Schema cleanup required no final code change. `SCHEMA_VERSION` is 1, fresh
+  initialization runs in one `transactionSync()`, and unsupported versions are
+  rejected. Commit `21fc1ea` had already removed the intermediate migration
+  modules, fixtures, and tests before this sprint closed.
+- Production Durable Object timing remains unverified. Backlogs 11, 16, 04, 17,
+  and 36 remain, as do deployment and publication.
