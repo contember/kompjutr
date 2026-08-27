@@ -314,3 +314,46 @@ territories; CPU-heavy gates and every reported benchmark run use `cpu-lease`.
 - The user-approved narrow tracker/tree seam is optional and fallback-compatible;
   it also advances all HEAD-publishing `commitIndex()` paths for one consistent
   tracker contract.
+- WU1–WU5 landed as `dce2ab6`, `034bf7b`, `8213000`, `e472d31`,
+  `b77195d`, `4154b9d`, and `b8eba1d`. The clone-storage harness follow-up is
+  `bf86471`. A leased decomposed Next.js checkout at that revision used 608 SQL
+  statements, below the WU5 limit of 1,000.
+- WU6's read-only gate used the real 24,252-path Next.js fixture under
+  `cpu-lease run -n 2 --no-smt`. After warm-up, three-run medians were 2,640.0 ms
+  for 100 concentrated changes and 1,916.6 ms for 100 spread changes. The
+  capability-disabled legacy controls were 4,860.2 ms and 4,861.0 ms; the
+  equal-tree sparse control was 10.09 ms. The 1,000-change concentrated sparse
+  run used 75 statements; the spread run fell back after sparse preflight and
+  still stayed bounded at 228 statements.
+- Phase probes attributed the 100-change cost to the authoritative direct tree
+  diff (692–741 ms) and duplicate tree resolution in the guard/hydration phase
+  (1,168–1,909 ms).
+  Initial-writer eligibility was 3.5–4.3 ms, the blocking-index guard 4.7 ms,
+  filesystem writes 11–14 ms, reseal 0.13–0.15 ms, and hashing had zero calls.
+  Existing `selectedPaths.select` was also unsuitable as-is (1,408 ms for 100
+  exact paths), while an equality-join feasibility probe took 1.90 ms for 100
+  paths and 17.53 ms for 1,000 paths.
+- WU6 implementation territory is now frozen to
+  `src/core/ops/sparse-checkout.ts`, `src/sqlite/sparse-workspace.ts`, and
+  `src/sqlite/tree-walk.ts`, with witnesses in `tests/checkout-sparse.test.ts`,
+  `tests/sparse-workspace.test.ts`, and `tests/tree-diff.test.ts`. The selected
+  source may add a bounded exact-only equality branch, while its general query
+  remains unchanged. The branch must preserve the existing two selected-fact
+  statements by folding deduplicated ancestor equality and integrity into the
+  worktree statement. It also retains the current bounds, ordering, cardinality,
+  full-row validation, and corruption behavior. Sparse checkout may combine
+  those validated index/worktree facts with authoritative diff candidates and
+  must retain the current hydrate and legacy fallbacks. Tree diff may carry the
+  already-validated `source_key` into direct `git_tree_entries` joins, but every
+  effective-source, authoritative object, completeness, ordinal, raw-edge,
+  cumulative-cost, path, cycle, and queue check remains mandatory.
+- The raw-object JavaScript diff alternative measured 46.6 ms for 100 changes,
+  but it is rejected: it bypasses the binding parsed-edge traversal contract and
+  changes missing/corrupt v3 projection behavior. WU6 adds no public capability,
+  schema, migration, or trust-boundary change.
+- Focused WU6 gates are the three owned test files plus regression runs for
+  `tests/staging.test.ts` and `tests/refs.test.ts`, typecheck, exact-file Biome,
+  and diff checks. Acceptance adds forward/reverse 100-change concentrated and
+  spread witnesses, exact 1,000/1,001 boundaries, malformed/unavailable source
+  behavior, structural fallback parity, and repeated leased Next.js checkout
+  rows below 100 ms in both real directions.
