@@ -30,6 +30,7 @@ decisions → reference → archive.
 
 - [`reference/architecture.md`](reference/architecture.md) — current runtime architecture and limits.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
+- [`reference/concurrency.md`](reference/concurrency.md) — async owners, durable seams, and restart outcomes.
 - [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.
 - [`reference/oid-encoding-measurement.md`](reference/oid-encoding-measurement.md) — measured TEXT-versus-BLOB OID evidence.
 - [`reference/production-probe.md`](reference/production-probe.md) — production Durable Object probe runbook and current witness.

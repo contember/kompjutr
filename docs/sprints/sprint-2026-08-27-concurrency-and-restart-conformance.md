@@ -299,3 +299,12 @@ git diff --check
 - 2026-08-27: Architecture gates are duplicate-OID pack ownership, stale
   same-namespace fetch publication, and cold provisional clone recovery. No
   repository-wide lock is justified before those witnesses run.
+- 2026-08-27: WU0 records the current finite seam matrix in
+  `docs/reference/concurrency.md`. Cells without an ownership or expected-state
+  guard are named `unfenced`; later units must replace those cells with a proved
+  outcome rather than treating them as supported concurrency.
+- 2026-08-27: WU0 added named one-shot and predicate barriers, bounded buffered
+  transport response/loss injection, fail-fast owner settlement, both-order
+  scheduling, cold reopen, and a bounded static readability oracle. The
+  transport helper payload ceiling is 960 KiB with 64 KiB reserved headroom;
+  the oracle reads payloads in at most 512 KiB windows.

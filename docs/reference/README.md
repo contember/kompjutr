@@ -12,6 +12,7 @@ behaviour.
 
 - [`architecture.md`](architecture.md) — runtime boundaries, storage model, invariants, and limits.
 - [`benchmark-current.md`](benchmark-current.md) — current native Next.js workflow snapshot.
+- [`concurrency.md`](concurrency.md) — asynchronous owners, durable seams, restart outcomes, and invariants.
 - [`git-support.md`](git-support.md) — per-command checklist of the supported Git surface and its options.
 - [`oid-encoding-measurement.md`](oid-encoding-measurement.md) — reproducible TEXT-versus-BLOB OID evidence.
 - [`production-probe.md`](production-probe.md) — authenticated production Durable Object probe runbook and current witness.
