@@ -19,4 +19,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [`sprint-2026-08-27-repack-and-garbage-collection.md`](sprint-2026-08-27-repack-and-garbage-collection.md)
+  — resumable root marking, loose-object repacking, and grace-period collection.

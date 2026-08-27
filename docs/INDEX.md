@@ -15,15 +15,16 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-27-repack-and-garbage-collection.md`](sprints/sprint-2026-08-27-repack-and-garbage-collection.md)
+  — resumable root marking, loose-object repacking, and grace-period collection.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- The production Durable Object probe is deployed and repeatable. Repack and
-  garbage collection is the next planned sprint; concurrency/restart conformance
-  follows it.
+- Repack and garbage collection is active. It starts with a deployed-schema v2
+  migration, then adds resumable marking, repacking, and grace-period sweep.
+- Concurrency/restart conformance follows this sprint.
 
 ## Key reference
 
