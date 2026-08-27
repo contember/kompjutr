@@ -68,6 +68,10 @@ blocker. Re-evaluate the order after each phase as production evidence arrives.
    witnesses: [54](54-prune-ignored-directories-in-status-walk.md) and
    [56](56-reseal-index-tracker-on-commit.md) are small and independent; take
    them first, then [57](57-single-prepass-in-full-status.md).
+   [61](61-bounded-add-for-explicit-pathspecs.md) and
+   [62](62-reuse-head-subtrees-on-commit.md) are the `add` and `commit`
+   counterparts. [60](60-force-checkout-benchmark-measures-a-no-op.md) fixes
+   the benchmark and goes before any of them is re-measured.
 3. **Close the reference-workload gaps.** These come from the only production
    workload documented end to end
    ([coverage](../reference/git-support.md#reference-workload-coverage)), so they
@@ -128,3 +132,6 @@ focused sprint.
 - [57 — Stream HEAD and the index once in the full status prepass](57-single-prepass-in-full-status.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
+- [60 — Force-checkout benchmark phases measure a no-op](60-force-checkout-benchmark-measures-a-no-op.md)
+- [61 — Bound `add` for explicit pathspecs](61-bounded-add-for-explicit-pathspecs.md)
+- [62 — Reuse unchanged HEAD subtrees when commit builds its tree](62-reuse-head-subtrees-on-commit.md)
