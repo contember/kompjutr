@@ -67,6 +67,14 @@ interface RunState {
   restarted: boolean;
 }
 
+export interface MaintenanceRootCursorState {
+  phase: string;
+  rootSource: MaintenanceRootSource;
+  cursorCheckoutId: number | null;
+  cursorText: string | null;
+  cursorOrdinal: number | null;
+}
+
 interface RootCandidate {
   oid: string;
   expectedType: ObjectType | null;
@@ -166,11 +174,12 @@ function requireRun(row: Record<string, unknown>, repoId: number): RunState {
     cursorOrdinal: requireNullableInteger(row.cursor_ordinal, "maintenance ordinal cursor"),
     restarted: row.restarted === 1,
   };
-  validateRunCursor(run);
+  validateMaintenanceRootCursor(run);
   return run;
 }
 
-function validateRunCursor(run: RunState): void {
+/** Validate the phase-specific durable root cursor shape. */
+export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): void {
   const none =
     run.cursorCheckoutId === null && run.cursorText === null && run.cursorOrdinal === null;
   if (run.phase !== "roots") {

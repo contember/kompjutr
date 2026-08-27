@@ -163,6 +163,29 @@ The modeled packed-read peak is below 100 MiB. It includes delta inputs and
 result, compressed rows, chunk and object caches, parser batches, and inflater
 headroom. Inputs that cannot fit the model fail before allocation.
 
+## Repository maintenance
+
+Each shared repository owns at most one durable maintenance run. The run moves
+through root discovery, reachability marking, loose classification, repacking,
+pack classification, loose and pack sweeping, and a terminal finish phase. One
+public `maintenance()` call advances one bounded durable action and then reports
+the validated stored phase and counters. Linked checkouts address the same run.
+
+Root-changing transactions increment a repository epoch. Drift during root or
+mark work reuses the root-discovery restart seam. Drift in a later phase first
+settles any owned repack batch, then resets the same run to roots without
+advancing a root page. Marks, shallow snapshots, reachability counters, and the
+eligibility time are cleared; already published complete packs, candidate ages,
+and destructive counters remain durable.
+
+Reachable loose objects are published in validated full-object packs before
+their exact loose and lifecycle rows are deleted. Unreachable loose objects and
+wholly unreachable complete packs become candidates after a stable mark. Sweep
+eligibility is fixed at 14 days after first classification. While the root epoch
+is stable, a finished run with a future eligibility time remains terminal until
+that exact time. Root drift rolls it over immediately. Rollover allocates a fresh
+run ID and zeroed counters while preserving candidates.
+
 ## Tree traversal
 
 Tree objects are parsed when they become visible. The index records exact raw

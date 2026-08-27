@@ -44,6 +44,7 @@ import type {
   ReplayResult,
   StatusEntry,
 } from "../core/ops/kinds.js";
+import { type MaintenanceResult, maintenance as maintenanceOp } from "../core/ops/maintenance.js";
 import {
   type MergeContinueOptions,
   type MergeOptions,
@@ -207,6 +208,8 @@ export type GitWorktreeAddOptions = WorktreeAddOptions & GitDirOptions;
 export type GitWorktreeRemoveOptions = WorktreeRemoveOptions & GitDirOptions;
 export type GitPushOptions = PushOptions & GitDirOptions;
 export type GitPullOptions = PullOptions & GitDirOptions;
+export type GitMaintenanceOptions = GitDirOptions;
+export type GitMaintenanceResult = MaintenanceResult;
 
 export interface GitCatFileResult {
   oid: string;
@@ -243,6 +246,7 @@ export interface Git {
   reflog(input?: GitRefLogOptions): Promise<RefLogEntry[]>;
   recoverRef(input: GitRecoverRefOptions): Promise<void>;
   repoRoot(input?: GitDirOptions): Promise<string>;
+  maintenance(input?: GitMaintenanceOptions): Promise<GitMaintenanceResult>;
   currentBranch(input?: GitDirOptions & CurrentBranchOptions): Promise<string | undefined>;
   lsFiles(input?: GitDirOptions & { ref?: string }): Promise<string[]>;
   lsTree(input: GitDirOptions & { ref: string; path?: string }): Promise<TreeEntryView[]>;
@@ -451,6 +455,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async repoRoot(input = {}) {
       return repoRootOp(context, input);
+    },
+    async maintenance(input = {}) {
+      return maintenanceOp(context, at(input.dir));
     },
     async currentBranch(input = {}) {
       return currentBranchOp(at(input.dir), input);

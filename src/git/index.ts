@@ -105,6 +105,8 @@ export {
   type GitFetchOptions,
   type GitHashObjectOptions,
   type GitInitOptions,
+  type GitMaintenanceOptions,
+  type GitMaintenanceResult,
   type GitMergeContinueOptions,
   type GitMergeOptions,
   type GitPullOptions,

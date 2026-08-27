@@ -564,6 +564,29 @@ publishes the branch once; continue, skip, and abort work after a cold reopen.
 Source-empty commits are retained, while commits whose patch becomes empty on
 the new parent are skipped.
 
+## Maintenance
+
+### Bounded storage maintenance — `maintenance()`
+
+`maintenance({ dir? })` advances one durable repository-scoped action. Repeated
+calls snapshot roots from every linked checkout, mark logical and physical
+reachability, repack reachable loose objects, classify unreachable storage, and
+sweep objects whose fixed 14-day grace period has elapsed. The operation has no
+public page-size, grace, or pack-tuning options.
+
+The result is discriminated by `status: "progress" | "complete"`. It reports the
+durable phase after the call, stable run ID, restart marker, reachable and queued
+objects, repacked objects, reclaimed objects and packs, and reclaimed bytes.
+`nextEligibleAt` is `null` during progress and reports the next grace boundary
+only on a complete `finish` result. While the root epoch is stable, calling
+again before a future boundary returns the same terminal result. Root drift or
+the eligibility boundary starts a fresh run without also consuming its first
+root page.
+
+Every call samples the runtime clock once and stays below the operation SQL and
+memory ceilings. Root changes restart discovery safely. Cold reopen and calls
+through any linked checkout resume the same shared run.
+
 ## Configuration
 
 ### `git config` — `configGet()`, `configSet()`
@@ -615,7 +638,9 @@ These have no method and no equivalent. `stash` and the argv entry point throw
   `ls-remote` ★, `whatchanged`; bounded divergence and one exact raw-ref read are
   available through the narrower methods above
 - **Patches:** `apply` ★, `am`, `format-patch`, `send-email`, `cherry`
-- **Maintenance:** `gc`, `fsck`, `repack`, `prune`, `count-objects`, `verify-pack`
+- **Maintenance binaries:** `gc`, `fsck`, `repack`, `prune`, `count-objects`,
+  `verify-pack`; storage maintenance is available only through the bounded
+  `maintenance()` operation above
 - **Rewriting:** `filter-branch`, `replace`, `fast-import`, `fast-export`
 - **Packaging:** `archive`, `bundle`
 - **Mechanisms:** hooks, GPG/SSH signing, credential helpers ★, `.gitattributes`

@@ -103,6 +103,8 @@ export {
   type GitCherryPickOptions,
   type GitDivergenceOptions,
   type GitFactory,
+  type GitMaintenanceOptions,
+  type GitMaintenanceResult,
   type GitMergeContinueOptions,
   type GitMergeOptions,
   type GitPullOptions,

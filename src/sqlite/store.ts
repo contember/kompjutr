@@ -2706,13 +2706,12 @@ export class SqliteGitDatabase {
   /** Advance one internal maintenance root page after validating every live journal. */
   advanceMaintenanceRootSnapshot(
     repoId: number,
-    pageRows?: number,
+    options: { nowMs: number; pageRows?: number },
   ): MaintenanceRootSnapshotProgress {
     this.openShared(repoId);
-    const now = this.#options.now ?? Date.now;
-    const options = {
+    const rootOptions = {
       repoId,
-      nowMs: now(),
+      nowMs: options.nowMs,
       readOperationRoots: (checkoutId: number) => {
         const checkout = this.#checkoutById(checkoutId);
         if (checkout.repoId !== repoId) {
@@ -2722,8 +2721,8 @@ export class SqliteGitDatabase {
         return journal === null ? [] : validatedOperationJournalRoots(journal);
       },
     };
-    if (pageRows === undefined) return advanceRootSnapshot(this.#db, options);
-    return advanceRootSnapshot(this.#db, { ...options, pageRows });
+    if (options.pageRows === undefined) return advanceRootSnapshot(this.#db, rootOptions);
+    return advanceRootSnapshot(this.#db, { ...rootOptions, pageRows: options.pageRows });
   }
 
   destroyRepository(repoId: number): void {

@@ -141,12 +141,18 @@ describe("maintenance roots", () => {
 
     let active = database;
     db.storage.resetCounters();
-    let progress = active.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
+    let progress = active.advanceMaintenanceRootSnapshot(checkout.repoId, {
+      nowMs: NOW,
+      pageRows: 1,
+    });
     expect(db.storage.statementCount).toBeLessThan(1_000);
     for (let calls = 1; !progress.complete && calls < 40; calls++) {
       active = new SqliteGitDatabase(db, { now: () => NOW + 200 * 24 * 60 * 60 * 1_000 });
       db.storage.resetCounters();
-      progress = active.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
+      progress = active.advanceMaintenanceRootSnapshot(checkout.repoId, {
+        nowMs: NOW + 200 * 24 * 60 * 60 * 1_000,
+        pageRows: 1,
+      });
       expect(db.storage.statementCount).toBeLessThan(1_000);
     }
 
@@ -190,12 +196,18 @@ describe("maintenance roots", () => {
     store.setRef("refs/heads/a", first);
     store.setRef("refs/heads/b", second);
 
-    const before = database.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
+    const before = database.advanceMaintenanceRootSnapshot(checkout.repoId, {
+      nowMs: NOW,
+      pageRows: 1,
+    });
     expect(before).toMatchObject({ rootSource: "refs", complete: false, restarted: false });
     expect(rootMask(db, checkout.repoId, first)).toBe(1);
     store.deleteRef("refs/heads/a");
 
-    const after = database.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
+    const after = database.advanceMaintenanceRootSnapshot(checkout.repoId, {
+      nowMs: NOW,
+      pageRows: 1,
+    });
     expect(after).toMatchObject({
       runId: before.runId,
       rootSource: "heads",
@@ -260,11 +272,17 @@ describe("maintenance roots", () => {
     db.run("UPDATE git_reflog_state SET next_ordinal = 8202 WHERE repo_id = ?", checkout.repoId);
 
     db.storage.resetCounters();
-    let progress = database.advanceMaintenanceRootSnapshot(checkout.repoId, 128);
+    let progress = database.advanceMaintenanceRootSnapshot(checkout.repoId, {
+      nowMs: NOW,
+      pageRows: 128,
+    });
     expect(db.storage.statementCount).toBeLessThan(1_000);
     for (let calls = 1; !progress.complete && calls < 100; calls++) {
       db.storage.resetCounters();
-      progress = database.advanceMaintenanceRootSnapshot(checkout.repoId, 128);
+      progress = database.advanceMaintenanceRootSnapshot(checkout.repoId, {
+        nowMs: NOW,
+        pageRows: 128,
+      });
       expect(db.storage.statementCount).toBeLessThan(1_000);
     }
 
@@ -467,9 +485,9 @@ describe("maintenance roots", () => {
       checkout.id,
     );
 
-    expect(() => database.advanceMaintenanceRootSnapshot(checkout.repoId, 1)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+    expect(() =>
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_objects")).toBe(0);
     expect(
       db.one<{ root_source: string; cursor_checkout_id: number | null }>(
@@ -491,9 +509,9 @@ describe("maintenance roots", () => {
       checkout.repoId,
       `ref: ${name}`,
     );
-    expect(() => database.advanceMaintenanceRootSnapshot(checkout.repoId, 1)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+    expect(() =>
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it.each([
@@ -505,10 +523,10 @@ describe("maintenance roots", () => {
   ])("rejects invalid stored symbolic HEAD name %s", (name) => {
     const { db, database, checkout } = open();
     db.run("UPDATE git_checkouts SET head = ? WHERE id = ?", `ref: ${name}`, checkout.id);
-    database.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
-    expect(() => database.advanceMaintenanceRootSnapshot(checkout.repoId, 1)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+    database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 });
+    expect(() =>
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("rejects a duplicate global reflog ordinal at a page boundary", () => {
@@ -533,17 +551,20 @@ describe("maintenance roots", () => {
       oid,
       Math.floor(NOW / 1_000),
     );
-    database.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
-    database.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
-    expect(() => database.advanceMaintenanceRootSnapshot(checkout.repoId, 1)).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
+    database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 });
+    database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 });
+    expect(() =>
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("leaves downstream maintenance state untouched on epoch drift", () => {
     const { db, database, checkout, store } = open();
     const oid = store.write("blob", utf8.encode("downstream"));
-    const first = database.advanceMaintenanceRootSnapshot(checkout.repoId, 1);
+    const first = database.advanceMaintenanceRootSnapshot(checkout.repoId, {
+      nowMs: NOW,
+      pageRows: 1,
+    });
     db.run(
       `UPDATE git_maintenance_runs
           SET phase = 'repack', root_source = 'done', cursor_checkout_id = NULL,
@@ -565,9 +586,9 @@ describe("maintenance roots", () => {
       "SELECT * FROM git_maintenance_runs WHERE repo_id = ?",
       checkout.repoId,
     );
-    expect(() => database.advanceMaintenanceRootSnapshot(checkout.repoId, 1)).toThrowError(
-      expect.objectContaining({ code: "ESTALE" }),
-    );
+    expect(() =>
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toThrowError(expect.objectContaining({ code: "ESTALE" }));
     expect(db.one("SELECT * FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId)).toEqual(
       before,
     );
