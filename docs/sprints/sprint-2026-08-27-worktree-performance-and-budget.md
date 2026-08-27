@@ -1,0 +1,316 @@
+# Sprint — Worktree performance and budget closure (2026-08-27)
+
+**Goal.** Make the common Next.js-sized add, commit, status, and checkout paths
+meet their truthful SQL and wall-time contracts without weakening bounded
+fallbacks or Git parity.
+
+**Theme.** Backlog items 10, 54, 56, 57, and 60–62 describe one remaining
+release boundary: work proportional to the full repository still hides behind
+operations that touch at most 1,000 paths, one benchmark reports checkout work
+it never performed, and standalone checkout can exceed the universal statement
+ceiling. The sprint first fixes measurement and shared optional acceleration
+seams, then closes each hot path against the same 24,252-file fixture.
+
+## Refs re-verified at HEAD (2026-08-27)
+
+`✔` = confirmed live · `⚠` = drift/nuance caught.
+
+- ✔ The current curated workflow reports `add — 100` at 656.4 ms, `commit —
+  100` at 496.2 ms, clean post-commit status at 502.2 ms, and the two real
+  branch transitions at 519.8 and 526.5 ms —
+  `docs/reference/benchmark-current.md:17`.
+- ✔ Both force-checkout phases immediately repeat the branch already checked
+  out, so their 7.1 and 6.7 ms rows are no-op measurements —
+  `bench/nextjs-workflow.ts:209`.
+- ✔ Explicit `add` performs one scalar worktree lookup and possibly one scalar
+  index prefix probe per spec, then streams the full index and applies a linear
+  matcher to each row — `src/core/ops/staging.ts:74`,
+  `src/core/ops/staging.ts:130`, `src/core/ops/staging.ts:833`.
+- ⚠ The current sparse hydration source cannot implement explicit-path `add`:
+  it mixes tree and checkout facts, caps requests at 1,000 paths, and is not
+  available to the operation. A separate optional same-database selected-path
+  source is required; generic and Computer callers keep the current bounded
+  fallback — `src/core/context.ts:24`, `src/sqlite/sparse-workspace.ts:1247`.
+- ✔ Full status performs a rename HEAD/index prepass, a second index snapshot,
+  and the main HEAD/index/worktree join. The 24,252-file witness records 75
+  index page statements — `src/core/ops/status.ts:234`,
+  `src/core/ops/status.ts:297`, `tests/status.test.ts:996`.
+- ⚠ Combining rename classification with the index snapshot can reduce index
+  passes from three to two, but exact rename detection still requires two HEAD
+  traversals while `statusStream()` stays lazy and bounded —
+  `src/core/ops/status.ts:224`, `src/core/ops/status.ts:267`.
+- ✔ Status deliberately walks with `includeIgnored: true` so tracked ignored
+  paths remain visible, then discards untracked ignored rows in JavaScript —
+  `src/core/ops/status.ts:314`, `src/core/ops/status.ts:387`.
+- ⚠ A directory-prune callback can skip every later scan page under an ignored
+  subtree, but the filesystem has already materialised the current 1,000-row
+  page. The witness must allow at most that first-page spill rather than claim
+  zero raw descendant rows — `src/core/ops/worktree-io.ts:131`,
+  `src/core/ops/worktree-io.ts:190`.
+- ✔ Commit always scans the whole index and serialises every open directory;
+  the tracker exposes a sealed baseline and bounded dirty rows but no narrow
+  baseline advance or authoritative commit-tree snapshot —
+  `src/core/ops/commit.ts:149`, `src/core/ops/tree-build.ts:243`,
+  `src/sqlite/index-tracker.ts:376`.
+- ✔ Ordinary commit and `commitIndex()` publication stay inside one synchronous
+  SQLite transaction. Merge and replay also publish through `commitIndex()`,
+  while `writeUnpublishedCommit()` must neither reuse HEAD state nor move the
+  tracker — `src/core/ops/commit.ts:84`, `src/core/ops/commit.ts:128`,
+  `src/core/ops/commit.ts:140`.
+- ✔ Standalone checkout into an empty 24,252-file worktree costs 1,117 SQL
+  statements, while clone stays at 813 through a bounded initial-state writer —
+  `docs/reference/benchmark-current.md:151`, `src/core/ops/network.ts:565`.
+- ⚠ Empty-worktree materialisation and ordinary branch transition are separate
+  defects. The first can reuse the existing initial writer; the second is a
+  51-statement CPU hotspot whose root cause remains profile-gated —
+  `src/core/ops/refs.ts:202`, `src/core/ops/sparse-checkout.ts:136`.
+
+## Work units
+
+### WU0 — Freeze optional acceleration seams (effort L)
+
+- **Problem.** Add, status, commit, and checkout currently share linear pathspec
+  helpers, one worktree walker, and context/runtime composition. Parallel units
+  would otherwise edit the same hot files or invent incompatible cache rules.
+- **Verify first.** Pin current pathspec semantics for empty/dot/trailing-slash,
+  non-BMP order, file/directory replacement, ignored paths, and conflict stages;
+  pin tracker corruption and unavailable-source fallbacks.
+- **Scope.** Extract one compiled byte-ordered exact/prefix matcher while keeping
+  the existing `matchesPaths` re-export; add an optional directory-prune predicate
+  to the worktree walker; add separate optional same-database sources for
+  explicit-path facts and commit-tree reuse; add
+  `IndexTrackerWriter.advanceBaseline()`. Add a positive capability check that
+  proves the initial worktree writer participates in the supplied Git database's
+  synchronous transaction domain. Wire native workspace composition. Generic
+  and compatibility paths remain available without these sources.
+- **Acceptance / witness.** Existing pathspec and walker output is unchanged;
+  selected-path facts are paged, bounded, ordered, and fully validate SQL rows;
+  tree snapshots authenticate every reused source. A request that exceeds a
+  declared input or retained-state bound returns `available: false` or stable
+  `E2BIG` before emitting partial facts; malformed stored rows and invalid dirty
+  state remain corruption and fail closed. Baseline advance changes only a
+  sealed state and participates in its caller's outer transaction. The initial
+  writer capability returns true only for the exact native Git database wrapper
+  composed over the same raw database.
+- **Touch points.** `src/core/context.ts`, `src/core/sparse-workspace.ts`,
+  `src/core/ops/checkout.ts`, `src/core/ops/worktree-io.ts`,
+  `src/fs/store/initial-write.ts`, `src/git/client.ts`,
+  `src/sqlite/index-tracker.ts`, `src/sqlite/sparse-workspace.ts`,
+  `src/runtime/workspace.ts`, `tests/index-tracker.test.ts`,
+  `tests/sparse-workspace.test.ts`, `tests/workspace.test.ts`, and focused
+  pathspec/walker tests selected and recorded before WU0 implementation.
+
+### WU1 — Correct force-checkout measurement (#60, effort S)
+
+- **Problem.** The force rows time an equal-tree no-op and cannot be used as
+  evidence about real checkout work.
+- **Verify first.** Record that each current force phase starts with HEAD already
+  on its target and that direct equal-tree diff performs no work.
+- **Scope.** Make each force phase perform the same real branch transition as its
+  non-force counterpart, without folding setup into the timed phase. Keep push
+  and fixture cleanup guarantees unchanged.
+- **Acceptance / witness.** Harness state proves source and target differ before
+  both force phases. A leased baseline run reports comparable rows and statement
+  shape for equivalent force/non-force transitions; no force row can pass on an
+  equal-tree transition.
+- **Touch points.** `bench/nextjs-workflow.ts`, focused benchmark helpers/tests;
+  measurement output is recorded in WU7.
+
+### WU2 — Bound explicit-path add (#61, effort L)
+
+- **Problem.** N explicit specs spend O(N) scalar statements before the walk and
+  scan unrelated index/worktree rows with O(N) JavaScript matching.
+- **Verify first.** Pin Git parity for mixed exact and directory specs, overlaps,
+  unmatched specs, ignored paths, conflict stages, symlink ancestors, and
+  file/directory replacements.
+- **Scope.** Use WU0's native source for bulk exact and multi-prefix selection;
+  classify exact and directory sides without losing replacement semantics; use
+  one compiled matcher for remaining merge joins. Preserve the full streaming
+  implementation for `all` and `trackedOnly`, and preserve generic fallback.
+- **Acceptance / witness.** Exact selection uses two selected-path fact
+  statements and returns only N worktree/index facts for N = 1, 100, and 1,000,
+  independent of repository size. Directory cost follows selected
+  subtrees, not the repository. A 1,000-file mutation stays below 1,000 SQL
+  statements; `add — 100` is below 100 ms in repeated leased runs. Total
+  mutation/hash statements may follow their bounded batch formula and are not
+  falsely claimed constant.
+- **Touch points.** `src/core/ops/staging.ts` and `tests/staging.test.ts`. WU0
+  exclusively owns the source implementation and its focused tests.
+
+### WU3 — Prune ignored status and merge its index prepass (#54, #57, effort M)
+
+- **Problem.** Full status streams ignored subtrees it will not report and, with
+  renames enabled, pages the entire index three times.
+- **Verify first.** Pin current Git output for tracked files inside ignored
+  directories, ignored-row modes, rename fallback, and abandoned lazy streams.
+- **Scope.** Feed WU0's directory-prune predicate with "ignored directory and no
+  tracked descendant" when ignored rows were not requested. Combine rename
+  classification and tracked-directory/path collection in one bounded prepass.
+  Keep the main lazy join and exact-rename fallback unchanged.
+- **Acceptance / witness.** An ignored subtree with at least 2,500 files yields
+  no descendants to the join, reads at most the first 999 descendant rows, and
+  uses a constant first-page-plus-seek scan shape. Tracked descendants and
+  `includeIgnored: true` disable pruning. At 24,252 paths, rename-enabled status
+  uses 50 index page statements instead of 75; rename-disabled normal status
+  uses two index passes, and rename-disabled `untrackedFiles: "all"` uses one.
+  HEAD remains two traversals with renames and one without. Construction and
+  abandonment remain lazy.
+- **Touch points.** `src/core/ops/status.ts` and `tests/status.test.ts`.
+
+### WU4 — Advance commit baselines and reuse unchanged subtrees (#56, #62, effort XL)
+
+- **Problem.** Commit rebuilds every tree from a full index scan, then leaves the
+  sealed tracker on the previous HEAD so the next clean status diffs two trees.
+- **Verify first.** Pin full-build OIDs against Git and record tracker/dirty state
+  after ordinary commit, merge, cherry-pick, revert, and unpublished writes.
+- **Scope.** When WU0 supplies an authenticated snapshot whose sealed baseline
+  equals HEAD, validate all dirty/index/tree rows before object writes, rebuild
+  affected directories bottom-up, and reuse untouched HEAD subtree OIDs. Only
+  availability or structural-cap failures fall back to the current full build;
+  corruption propagates. After successful HEAD publication, advance the sealed
+  baseline in the same transaction for ordinary and `commitIndex()` paths,
+  retaining dirty rows. Unpublished commits stay on the full path and do not
+  advance state.
+- **Acceptance / witness.** Fast and forced-full trees are byte-identical to Git
+  across add/delete/modify/mode/rename, empty/new/deep directories, root changes,
+  and file/directory replacement. Missing/incomplete/mismatched state and a
+  snapshot request rejected for declared capacity fall back; malformed tracker,
+  index, or tree state publishes neither objects nor refs. A 100-path
+  commit reads affected rows instead of 24,252 index entries, completes below
+  100 ms in repeated leased runs, and the following clean status avoids a
+  baseline-to-HEAD tree diff. Merge/replay publication advances the baseline;
+  unpublished writes do not.
+- **Touch points.** `src/core/ops/commit.ts`, `src/core/ops/tree-build.ts`,
+  `src/core/ops/merge.ts`, `src/core/ops/replay-lifecycle.ts`,
+  `tests/commit.test.ts`, `tests/status-sparse.test.ts`,
+  `tests/transactions.test.ts`, and the existing merge/replay test files named
+  in the assignment. WU0 exclusively owns the snapshot contracts and sources.
+
+### WU5 — Reuse initial materialisation for standalone checkout (effort M)
+
+- **Problem.** Whole-tree checkout into an absent or empty worktree/index repeats
+  general removal and materialisation paths and exceeds the statement ceiling,
+  while clone already has an atomic bounded create-only writer.
+- **Verify first.** Pin the 1,117-statement decomposed Next.js checkout and prove
+  the initial writer's absent/empty-root, empty-all-stages, gitlink-dirty, and
+  rollback contracts.
+- **Scope.** Extract the network-local initial materialiser and use it from clone
+  and whole-tree checkout before sparse/full fallback. Eligibility requires no
+  path filter, an absent or empty root, every index stage empty, and a WU0 writer
+  capability that positively identifies the current Git database as its
+  synchronous transaction domain. Unavailable or capacity refusal leaves no
+  partial state and takes the existing path.
+- **Acceptance / witness.** Initial checkout writes exact bytes, modes, symlinks,
+  index, HEAD/reflog, and a clean sealed tracker; gitlinks remain skipped and
+  dirty. Nonempty root/index, conflict stages, and path checkout remain on legacy
+  semantics. Injected late failures roll back filesystem, index, mappings,
+  tracker, refs, and reflog. The 24,252-file decomposed checkout is below 1,000
+  SQL statements with exact end-state parity; no sub-100-ms claim is made for
+  materialising that many files.
+- **Touch points.** New `src/core/ops/initial-checkout.ts`,
+  `src/core/ops/network.ts`, `src/core/ops/refs.ts`, initial checkout/clone tests,
+  and `bench/clone-storage.ts`. WU0 exclusively owns `src/core/context.ts` and
+  `src/fs/store/initial-write.ts` capability contracts.
+
+### WU6 — Close ordinary branch-checkout wall time (#10 checkout half, effort L)
+
+- **Problem.** Two branch transitions that change only 100 files cost about 520
+  ms despite staying at 51 SQL statements; tree-diff validation is only a lead,
+  not a proven attribution.
+- **Verify first.** Profile direct tree diff, guard/hydrate, hashing, writes, and
+  reseal separately for 100 and 1,000 changed leaves, concentrated and spread,
+  on the same 24,252-file trees. Compare sparse checkout with forced legacy
+  fallback; equal-tree diff is the negative control.
+- **Scope.** Optimize the measured dominant phase only. Preserve authoritative
+  tree-source validation, sparse fallback, structural guards, path ordering,
+  and all resource ceilings. A result requiring a new public/storage contract or
+  a changed trust boundary is a material re-gate, not an implicit expansion.
+  Profiling is a read-only gate. Before implementation, the leader records the
+  attribution, exact production/test write territory, and focused gates in this
+  run log and commits that amendment. No WU6 implementation starts before that
+  territory is frozen.
+- **Acceptance / witness.** Both real 100-change branch directions complete below
+  100 ms across repeated leased runs; the 1,000-change boundary remains below
+  1,000 SQL statements with exact index/worktree/HEAD parity. Corrupt, shallow,
+  over-cap, dirty, conflict, and structural cases retain their current fail-closed
+  or bounded fallback behavior.
+- **Touch points.** None until the read-only profile gate freezes exact paths.
+  The expected candidates are `src/core/ops/sparse-checkout.ts`, bounded
+  tree-diff or hydration code, checkout-focused tests, and profiling helpers;
+  they are not authorized write territory merely by appearing here.
+
+### WU7 — Integrated measurement and release claim (effort M)
+
+- **Problem.** Per-unit cost witnesses do not prove the complete workflow or a
+  publishable performance claim.
+- **Verify first.** Run functional gates before any timing run and confirm the
+  CPU lease has idle SMT siblings.
+- **Scope.** Run repeated leased Next.js workflow and clone-storage measurements;
+  update the curated snapshot and README resource/status claim from the measured
+  result; close consumed backlog and archive the sprint.
+- **Acceptance / witness.** Every accepted operation remains below 1,000 SQL
+  statements. The exact leased wall-time rows `add — 100`, `commit — 100`, clean
+  post-commit status, and both real 100-change checkout directions are each below
+  100 ms across repeated runs. The 1,000-path add/commit/checkout witnesses prove
+  the statement ceiling and bounded row/batch scaling, not a sub-100-ms claim.
+  Full CI-equivalent checks, package smoke, docs lint, and repeated measurement
+  state checks pass.
+- **Touch points.** `bench/`, `docs/reference/benchmark-current.md`, `README.md`,
+  sprint/backlog/docs indexes.
+
+## Out of scope (explicit)
+
+- Production Durable Object execution remains
+  [11](../backlog/11-production-do-regression-probe.md); this sprint produces the
+  local release-candidate baseline it should test but does not deploy.
+- Systematic async interleaving and restart conformance remains
+  [16](../backlog/16-concurrent-and-restart-conformance.md).
+- Repack/garbage collection and public audit/snapshot formats remain
+  [04](../backlog/04-repack-and-garbage-collection.md) and
+  [17](../backlog/17-integrity-audit-and-snapshots.md); no object deletion or new
+  persistent format lands here.
+- Glob pathspec syntax remains [36](../backlog/36-glob-pathspecs.md). WU0 only
+  compiles the existing exact-or-directory-prefix contract.
+- Deployment, publication, version changes, benchmark claims from unleased runs,
+  and changes to the universal memory/statement ceilings are excluded.
+
+## Decisions
+
+- Native same-database acceleration is optional behind narrow context sources;
+  generic and Computer-compatible callers retain the correct bounded fallback.
+- SQL rows used by a fast path are untrusted. Corruption fails closed; only an
+  unavailable source or an explicitly bounded capacity refusal may fall back.
+- Baseline advance applies to every HEAD-publishing `commitIndex()` path in the
+  same transaction. `writeUnpublishedCommit()` never moves it.
+- Exact rename status keeps two HEAD traversals to preserve lazy bounded output;
+  #57 closes redundant index passes, not that deliberate traversal.
+- Ignored-directory pruning accepts one already-materialised scan-page spill and
+  prevents all later pages; a stronger zero-row claim would require a separate
+  database range-prune architecture.
+- Initial checkout reuses the proven create-only writer. It does not generalise
+  or weaken ordinary structural checkout semantics.
+- Ordinary checkout implementation follows measured attribution. No tree-walk,
+  hydration, or filesystem redesign is assumed before the profile.
+
+## Sequencing
+
+| Wave | Units | Parallelism |
+|---|---|---|
+| 0 | sprint contract; WU0 seams; WU1 benchmark truth | two implementers after the contract |
+| 1 | WU2 add; WU3 status; WU4 commit | three disjoint implementers after seams freeze |
+| 2 | WU5 initial checkout; WU6 profiled branch checkout | sequential where profiling or shared checkout ownership requires it |
+| 3 | WU7 integrated gates, measurements, docs, backlog closure | leader-owned and serialized |
+
+Every implementation receives an independent review from an agent that did not
+write it. The leader verifies and commits each green unit before the next unit
+may reuse its result. Single-tree isolation is used with explicit write
+territories; CPU-heavy gates and every reported benchmark run use `cpu-lease`.
+
+## Run log
+
+- The user approved the performance-and-budget option before execution.
+- Grounding corrected the raw-row and HEAD-traversal claims in #54 and #57; this
+  active plan is the execution contract.
+- The user-approved narrow tracker/tree seam is optional and fallback-compatible;
+  it also advances all HEAD-publishing `commitIndex()` paths for one consistent
+  tracker contract.

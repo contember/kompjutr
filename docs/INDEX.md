@@ -15,14 +15,16 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- None.
+- [`sprints/sprint-2026-08-27-worktree-performance-and-budget.md`](sprints/sprint-2026-08-27-worktree-performance-and-budget.md)
+  — close local worktree wall-time and statement-budget release blockers.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Production qualification is next: correct the force-checkout benchmark before
-  measuring worktree cost, then run the production and concurrency probes.
+- Worktree performance and budget closure is active: correct checkout
+  measurement, bounded add/commit/status/checkout, then a repeated leased
+  release-candidate baseline.
 
 ## Key reference
 
