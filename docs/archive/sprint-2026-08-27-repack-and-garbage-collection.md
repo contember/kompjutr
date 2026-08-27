@@ -1,3 +1,20 @@
+> **OUTCOME — shipped 2026-08-27.** Added one resumable repository maintenance
+> state machine that snapshots every authoritative root, marks logical and
+> physical reachability, republishes reachable loose objects as bounded validated
+> packs, and reclaims only loose objects and wholly unreachable packs after the
+> reflog and 14-day grace windows. Public `maintenance()` calls are restartable,
+> report durable progress, and preserve interleaved foreground and fetch state.
+> Commit map: plan → `24fdbf9`; WU1 → `fb64135`, `a16fbae`; WU2 → `7359173`,
+> `52e57b0`; WU3 → `706d348`; WU4 → `38271ed`; WU5 → `b3fa23e`; WU6 →
+> `c31382e`; WU7 → `0af272b`; WU8 → `650c83b`; final root-epoch and cost
+> correction → `bd452af`. Verification: full suite — 128 files, 2,319 passed,
+> 5 skipped —
+> plus typecheck, Biome, build, and a relative-link audit. The 50,001-commit
+> restart witness completed, and every cold storage-pressure call stayed below
+> 1,000 SQL statements and at or below 64 MiB retained memory. Backlog closed: 04.
+> Deferred: mixed-pack compaction and outbound delta compression (09), the
+> systematic concurrency/restart matrix (16), and integrity snapshots (17).
+
 # Sprint — Repack and garbage collection (2026-08-27)
 
 **Goal.** Bound repository storage growth with resumable loose-object repacking

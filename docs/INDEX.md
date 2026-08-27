@@ -15,17 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-27-repack-and-garbage-collection.md`](sprints/sprint-2026-08-27-repack-and-garbage-collection.md)
-  — resumable root marking, loose-object repacking, and grace-period collection.
+- None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Repack and garbage collection is active. It extends the development-only
-  schema v1 baseline, which has no production-user compatibility contract, then
-  adds resumable marking, repacking, and grace-period sweep.
-- Concurrency/restart conformance follows this sprint.
+- Concurrency/restart conformance is next. It qualifies operation pairs and
+  durable restart boundaries against the shipped maintenance lifecycle.
 
 ## Key reference
 
@@ -53,6 +50,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-27-repack-and-garbage-collection.md`](archive/sprint-2026-08-27-repack-and-garbage-collection.md)
+  — resumable root marking, bounded loose-object repacking, grace-period
+  collection, and crash/concurrency/cost qualification.
 - [`archive/sprint-2026-08-27-production-do-probe.md`](archive/sprint-2026-08-27-production-do-probe.md)
   — authenticated production Git lifecycle with isolate and storage resets,
   physical audit, wall time, and platform analytics.

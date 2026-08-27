@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Repack and garbage collection](sprint-2026-08-27-repack-and-garbage-collection.md)
+  — resumable root marking, bounded loose-object repacking, grace-period
+  collection, and crash/concurrency/cost qualification.
 - [Production Durable Object probe](sprint-2026-08-27-production-do-probe.md)
   — retained authenticated Worker, bounded Git lifecycle, real isolate and
   storage resets, physical audit, external wall time, and platform analytics.

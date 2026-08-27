@@ -148,14 +148,13 @@ same shallow clone, and the shape of that overhead is the whole story:
 
 The working tree holds the checkout uncompressed, so `fs_chunks` carries
 134.25 MiB of payload against the 134.08 MiB git writes to disk — a filesystem
-is a filesystem either way. The pack is retained verbatim next to it, which is
-why the total is above git's: nothing yet drops the pack after checkout, and
-[repack and garbage collection](../backlog/04-repack-and-garbage-collection.md)
-is where that would change. Derived rows — tree projections, the index and the
-blob-id cache — cost 18.46 MiB, 8.5% of the database, and are the only part a
-plain `.git` does not have an equivalent for. B-tree overhead over the whole
-database is 6.1%; `VACUUM` would reclaim a further 2.9%, and Durable Object SQL
-exposes no `VACUUM`, so treat that as a diagnostic rather than a plan.
+is a filesystem either way. The live received pack remains authoritative next
+to it; maintenance removes only wholly unreachable packs and does not compact
+mixed packs. Derived rows — tree projections, the index and the blob-id cache —
+cost 18.46 MiB, 8.5% of the database, and are the only part a plain `.git` does
+not have an equivalent for. B-tree overhead over the whole database is 6.1%;
+`VACUUM` would reclaim a further 2.9%, and Durable Object SQL exposes no
+`VACUUM`, so treat that as a diagnostic rather than a plan.
 
 Decomposing the same work — `init`, `fetch`, `updateRef`, `checkout`, each into
 its own database — attributes bytes and statements to the two halves:

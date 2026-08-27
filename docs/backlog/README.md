@@ -63,35 +63,32 @@ as production evidence arrives.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
-| 1 | Repack and garbage collection | [04](04-repack-and-garbage-collection.md) | long | Storage growth is unbounded in a long-lived repository. Destructive maintenance wants its own gate before anything builds on it. |
-| 2 | Concurrency and restart conformance | [16](16-concurrent-and-restart-conformance.md) | long | Last piece of production qualification. Protects every later sprint and may introduce an operation epoch or lock. |
-| 3 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | First reference-workload gap: a scratch index plus `readTree`, `writeTree` and `commitTree` over the existing bounded tree builder. |
-| 4 | Patch interchange | [44](44-patch-interchange.md) | long | Two halves — `--binary` and `--full-index` in the writer, then a new parser and `apply --3way` over the existing three-way engine. |
-| 5 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Fetch and push share the refspec type and its validation, so one sprint defines it in a seam unit first. |
-| 6 | Workload plumbing and revision reads | [39](39-plumbing-read-surface.md), [46](46-rev-parse-revision-syntax.md) | long | Both close gaps issued by the reference workload. Together they sit at the upper bound of a long sprint; 39 provides guarded ref updates and bounded reads, while 46 provides revision and path resolution. |
-| 7 | Clone shape | [38](38-clone-depth-and-deepening.md), [41](41-partial-clone.md) | long | Both change the clone contract and both need an ADR. 41 additionally introduces a promisor object state every read path must honour. |
-| 8 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Runs after 04 and 16 settle authoritative-state and interruption rules, and after 43 and 41 add the planned index and promisor storage shapes. |
-| 9 | Everyday reads and pathspecs | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [36](36-glob-pathspecs.md) | long | 36 reuses the existing compiled matcher seam. Together the staged diff, two history reads, and cross-command matcher fill a long sprint. |
-| 10 | Network operation safety | [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Both harden network operations after the fetch, push, clone, and promisor contracts have settled: 13 protects remote refs, while 15 protects local state and resources during cancellation. |
-| 11 | Stash operations | [06](06-stash-operations.md) | normal | A self-contained daily workflow over the existing merge engine and operation journal, without a dependency on the network-safety work. |
-| 12 | Branch and remote management | [18](18-branch-and-remote-management.md) | normal | Follows the refspec work so branch, remote, URL, upstream, and tracking-ref management build on the settled transport configuration. |
-| 13 | Rebase extensions I | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | All three write to the planner and the lifecycle, so they run as sequential work units rather than in parallel. |
-| 14 | Interactive rebase | [26](26-interactive-rebase.md) | long | Lands after the explicit-target work so its todo model builds on the settled planner and lifecycle. Bounded todo editing and autosquash remain one focused unit. |
-| 15 | Rebase merge topology | [27](27-rebase-merges.md) | long | Hardest of the rebase family; scheduled after sprints 13 and 14 so topology work lands on the settled planner and journal model. |
-| 16 | Gitlink conflicts | [58](58-materialize-gitlink-conflicts.md) | normal | The current behaviour fails loudly and no reference workload needs the missing materialisation, so it stays behind the common and evidence-backed workflows. |
+| 1 | Concurrency and restart conformance | [16](16-concurrent-and-restart-conformance.md) | long | Last piece of production qualification. Protects every later sprint and may introduce an operation epoch or lock. |
+| 2 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | First reference-workload gap: a scratch index plus `readTree`, `writeTree` and `commitTree` over the existing bounded tree builder. |
+| 3 | Patch interchange | [44](44-patch-interchange.md) | long | Two halves — `--binary` and `--full-index` in the writer, then a new parser and `apply --3way` over the existing three-way engine. |
+| 4 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Fetch and push share the refspec type and its validation, so one sprint defines it in a seam unit first. |
+| 5 | Workload plumbing and revision reads | [39](39-plumbing-read-surface.md), [46](46-rev-parse-revision-syntax.md) | long | Both close gaps issued by the reference workload. Together they sit at the upper bound of a long sprint; 39 provides guarded ref updates and bounded reads, while 46 provides revision and path resolution. |
+| 6 | Clone shape | [38](38-clone-depth-and-deepening.md), [41](41-partial-clone.md) | long | Both change the clone contract and both need an ADR. 41 additionally introduces a promisor object state every read path must honour. |
+| 7 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Runs after 16 settles authoritative-state and interruption rules, and after 43 and 41 add the planned index and promisor storage shapes. |
+| 8 | Everyday reads and pathspecs | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [36](36-glob-pathspecs.md) | long | 36 reuses the existing compiled matcher seam. Together the staged diff, two history reads, and cross-command matcher fill a long sprint. |
+| 9 | Network operation safety | [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Both harden network operations after the fetch, push, clone, and promisor contracts have settled: 13 protects remote refs, while 15 protects local state and resources during cancellation. |
+| 10 | Stash operations | [06](06-stash-operations.md) | normal | A self-contained daily workflow over the existing merge engine and operation journal, without a dependency on the network-safety work. |
+| 11 | Branch and remote management | [18](18-branch-and-remote-management.md) | normal | Follows the refspec work so branch, remote, URL, upstream, and tracking-ref management build on the settled transport configuration. |
+| 12 | Rebase extensions I | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | All three write to the planner and the lifecycle, so they run as sequential work units rather than in parallel. |
+| 13 | Interactive rebase | [26](26-interactive-rebase.md) | long | Lands after the explicit-target work so its todo model builds on the settled planner and lifecycle. Bounded todo editing and autosquash remain one focused unit. |
+| 14 | Rebase merge topology | [27](27-rebase-merges.md) | long | Hardest of the rebase family; scheduled after sprints 12 and 13 so topology work lands on the settled planner and journal model. |
+| 15 | Gitlink conflicts | [58](58-materialize-gitlink-conflicts.md) | normal | The current behaviour fails loudly and no reference workload needs the missing materialisation, so it stays behind the common and evidence-backed workflows. |
 | — | Unscheduled | [09](09-outbound-delta-compression.md) | — | Optimization deferred until a concrete workload justifies it. |
 | — | Unscheduled | [59](59-byte-preserving-git-paths.md) | — | The current UTF-8 boundary fails closed. Widen the public path model only when a concrete non-UTF-8 workload justifies the cross-cutting migration. |
 
-Sprints 1 and 2 add no new Git capability; they finish the runtime-investment
-sequence after the shipped production probe. Repack defines the maintenance
-operation that sprint 2 includes in its concurrency matrix.
+Sprint 1 adds no new Git capability. It completes runtime qualification after
+the shipped production probe and maintenance sprint.
 
 Do not merge 26 and 27 into one sprint. They are two independent extra-large
 units over the same files, and a long sprint does not make that safe.
 
 ## Items
 
-- [04 — Add incremental repack and garbage collection](04-repack-and-garbage-collection.md)
 - [06 — Implement stash operations](06-stash-operations.md)
 - [08 — Extend push refspec support](08-extend-push-refspecs.md)
 - [09 — Add outbound delta compression](09-outbound-delta-compression.md)

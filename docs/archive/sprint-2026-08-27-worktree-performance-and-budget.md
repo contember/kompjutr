@@ -281,12 +281,12 @@ seams, then closes each hot path against the same 24,252-file fixture.
 ## Out of scope (explicit)
 
 - Production Durable Object execution remains
-  [11](../backlog/11-production-do-regression-probe.md); this sprint produces the
+  [11](sprint-2026-08-27-production-do-probe.md); this sprint produces the
   local release-candidate baseline it should test but does not deploy.
 - Systematic async interleaving and restart conformance remains
   [16](../backlog/16-concurrent-and-restart-conformance.md).
 - Repack/garbage collection and public audit/snapshot formats remain
-  [04](../backlog/04-repack-and-garbage-collection.md) and
+  [04](sprint-2026-08-27-repack-and-garbage-collection.md) and
   [17](../backlog/17-integrity-audit-and-snapshots.md); no object deletion or new
   persistent format lands here.
 - Glob pathspec syntax remains [36](../backlog/36-glob-pathspecs.md). WU0 only

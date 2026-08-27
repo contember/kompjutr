@@ -232,7 +232,7 @@ Consumed backlog items 01 and 03, which were deleted on ship.
   sprint covers the pull-specific await boundary and stale-HEAD/upstream races.
 - Reflogs, ref recovery, and garbage-collection roots remain in
   [backlog item 12](sprint-2026-08-26-reflogs-and-ref-recovery.md) and
-  [backlog item 04](../backlog/04-repack-and-garbage-collection.md).
+  [backlog item 04](sprint-2026-08-27-repack-and-garbage-collection.md).
 - Arbitrary fetch refspec expansion, multi-upstream integration, octopus merge,
   unrelated-history opt-in, SSH, signing, hooks, submodule checkout, and custom
   merge drivers are not introduced by pull.

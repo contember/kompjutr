@@ -257,7 +257,7 @@ sprint.
 - Parsed-tree key narrowing, `git_blob_ids` lifecycle, and write-time CHECKs —
   backlogs 20, 21, and 23.
 - Full production Durable Object release probing and the concurrent/restart
-  matrix — backlogs [11](../backlog/11-production-do-regression-probe.md) and
+  matrix — backlogs [11](sprint-2026-08-27-production-do-probe.md) and
   [16](../backlog/16-concurrent-and-restart-conformance.md). WU2 owns only the
   focused local workerd FK witness needed for its decision.
 - Worktree wall-time optimization and timing gates in ordinary CI — backlog

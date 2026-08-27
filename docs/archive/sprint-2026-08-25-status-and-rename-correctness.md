@@ -247,7 +247,7 @@ compatibility and public-export tests, `docs/reference/git-support.md`.
 - Reflogs, branch-delete ancestry enforcement, and repository maintenance —
   backlogs [12](sprint-2026-08-26-reflogs-and-ref-recovery.md),
   [33](sprint-2026-08-26-git-boundary-correctness.md#wu1--safe-branch-deletion-33-effort-m), and
-  [04](../backlog/04-repack-and-garbage-collection.md).
+  [04](sprint-2026-08-27-repack-and-garbage-collection.md).
 - Publishing a release. The tag workflow is checked in, but configuring the
   `npm` environment and trusted publisher, selecting the first version, and
   pushing its tag remain separate explicit actions.
