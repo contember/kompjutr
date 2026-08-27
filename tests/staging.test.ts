@@ -2,13 +2,21 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8, utf8Decoder } from "../src/core/bytes.js";
 import type { GitContext } from "../src/core/context.js";
-import { PathspecNotFoundError } from "../src/core/errors.js";
+import { GitError, PathspecNotFoundError } from "../src/core/errors.js";
 import { IGNORE_LIMITS } from "../src/core/ignore/index.js";
 import { hashObject } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { add, lsFiles, reset, rm } from "../src/core/ops/staging.js";
 import type { Repository } from "../src/core/repository.js";
-import { createSqliteSelectedPathSource } from "../src/sqlite/sparse-workspace.js";
+import type {
+  SelectedPathResult,
+  SparseIndexAncestorResult,
+} from "../src/core/sparse-workspace.js";
+import type { SqlDatabase } from "../src/sqlite/db.js";
+import {
+  createSqliteSelectedPathSource,
+  createSqliteSparseWorkspaceSource,
+} from "../src/sqlite/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -47,6 +55,38 @@ afterEach(() => {
   while (fixtures.length > 0) fixtures.pop()?.dispose();
 });
 
+class RecordingIndexAncestorDatabase implements SqlDatabase {
+  constructor(
+    private readonly delegate: SqlDatabase,
+    private readonly queries: string[],
+  ) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.queries.push(query);
+    return this.delegate.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
+
 /** A workspace whose objects, refs, working tree and index match a fixture's HEAD. */
 async function clonedFrom(fixture: GitFixture): Promise<TestRepository> {
   const workspace = makeRepo("/");
@@ -76,17 +116,87 @@ function removeBoth(workspace: TestRepository, fixture: GitFixture, path: string
 function nativeAddContext(
   workspace: TestRepository,
   statementCounts?: number[],
-): Pick<GitContext, "selectedPaths"> {
+  rowCounts?: number[],
+  ancestorStatementCounts?: number[],
+  ancestorRowCounts?: number[],
+  ancestorQueries?: string[],
+): Pick<GitContext, "selectedPaths" | "sparseWorkspace"> {
   const source = createSqliteSelectedPathSource(workspace.database.db);
+  const ancestorDatabase =
+    ancestorQueries === undefined
+      ? workspace.database.db
+      : new RecordingIndexAncestorDatabase(workspace.database.db, ancestorQueries);
+  const sparseWorkspace = createSqliteSparseWorkspaceSource(ancestorDatabase);
+  const indexAncestorFacts = sparseWorkspace.indexAncestorFacts;
+  if (indexAncestorFacts === undefined) throw new Error("native ancestor source is unavailable");
   return {
-    selectedPaths: {
-      select(request) {
+    sparseWorkspace: {
+      ...sparseWorkspace,
+      indexAncestorFacts(request) {
         const before = workspace.storage.statementCount;
-        const result = source.select(request);
-        statementCounts?.push(workspace.storage.statementCount - before);
+        const rowsBefore = workspace.storage.rowCount;
+        const result = indexAncestorFacts(request);
+        ancestorStatementCounts?.push(workspace.storage.statementCount - before);
+        ancestorRowCounts?.push(workspace.storage.rowCount - rowsBefore);
         return result;
       },
     },
+    selectedPaths: {
+      select(request) {
+        const before = workspace.storage.statementCount;
+        const rowsBefore = workspace.storage.rowCount;
+        const result = source.select(request);
+        statementCounts?.push(workspace.storage.statementCount - before);
+        rowCounts?.push(workspace.storage.rowCount - rowsBefore);
+        return result;
+      },
+    },
+  };
+}
+
+type AvailableSelectedPathResult = Extract<SelectedPathResult, { available: true }>;
+
+function fakeSelectedAddResult(
+  workspace: TestRepository,
+  path: string,
+): AvailableSelectedPathResult {
+  const stat = workspace.worktree.stat(`/${path}`);
+  if (stat === null) throw new Error(`missing fake selected path: ${path}`);
+  return {
+    available: true,
+    index: [
+      {
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: hashObject("blob", utf8.encode("indexed\n")),
+        size: stat.size,
+        mtime: stat.mtime,
+        ino: stat.ino,
+        rev: stat.rev,
+      },
+    ],
+    worktree: [{ path, stat }],
+    retainedBytes: 1_000_000,
+  };
+}
+
+function requireFakeIndex(result: AvailableSelectedPathResult) {
+  const entry = result.index[0];
+  if (entry === undefined) throw new Error("missing fake selected index row");
+  return entry;
+}
+
+function requireFakeWorktree(result: AvailableSelectedPathResult) {
+  const entry = result.worktree[0];
+  if (entry === undefined) throw new Error("missing fake selected worktree row");
+  return entry;
+}
+
+function fakeAncestorResult(paths: readonly string[]): SparseIndexAncestorResult {
+  return {
+    facts: paths.map((path) => ({ path, exact: false, descendant: false })),
+    retainedBytes: 10_000,
   };
 }
 
@@ -127,10 +237,17 @@ describe("add", () => {
     }
     fixture.gitInput(`${conflictRows.join("\n")}\n`, "update-index", "--index-info");
     const specs = [bmp, "dir/nested", "exact.txt", "dir", astral, "conflict.txt"];
+    const sourceStatements: number[] = [];
 
-    add(workspace.repo, workspace.worktree, { paths: specs }, nativeAddContext(workspace));
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: specs },
+      nativeAddContext(workspace, sourceStatements),
+    );
     fixture.git("add", "--", ...specs);
 
+    expect(sourceStatements).toEqual([2, 2]);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
     expect(lsFiles(workspace.repo)).not.toContain("unrelated.txt");
   });
@@ -148,16 +265,62 @@ describe("add", () => {
     workspace.worktree.removeFiles(["/to-file"], { recursive: true, force: true });
     fixture.remove("to-file");
     writeBoth(workspace, fixture, "to-file", "new file\n");
+    const sourceStatements: number[] = [];
 
     add(
       workspace.repo,
       workspace.worktree,
       { paths: ["to-file", "to-dir"] },
-      nativeAddContext(workspace),
+      nativeAddContext(workspace, sourceStatements),
     );
     fixture.git("add", "--", "to-file", "to-dir");
 
+    expect(sourceStatements).toEqual([2, 2]);
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+  });
+
+  it("removes an indexed descendant when an exact worktree path is a file", () => {
+    const workspace = makeRepo("/");
+    const oldOid = workspace.repo.store.write("blob", utf8.encode("old\n"));
+    workspace.repo.checkout.indexReplace([
+      {
+        path: "a",
+        stage: 0,
+        mode: 0o100644,
+        oid: oldOid,
+        size: null,
+        mtime: null,
+        ino: null,
+      },
+      {
+        path: "a/b",
+        stage: 0,
+        mode: 0o100644,
+        oid: oldOid,
+        size: null,
+        mtime: null,
+        ino: null,
+      },
+    ]);
+    writeWorkFile(workspace, "/a", "resolved\n");
+    const sourceStatements: number[] = [];
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["a"] },
+      nativeAddContext(workspace, sourceStatements),
+    );
+
+    expect(sourceStatements).toEqual([2, 2]);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([
+      expect.objectContaining({
+        path: "a",
+        stage: 0,
+        mode: 0o100644,
+        oid: hashObject("blob", utf8.encode("resolved\n")),
+      }),
+    ]);
   });
 
   it("keeps native ignored and unmatched semantics without publishing partial index changes", () => {
@@ -206,6 +369,352 @@ describe("add", () => {
 
     expect(sourceStatements).toEqual([2]);
     expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+  });
+
+  it("falls back before mutation when exact classification exceeds source capacity", () => {
+    const fixture = newFixture();
+    const workspace = makeRepo("/");
+    writeBoth(workspace, fixture, "a.txt", "a\n");
+    writeBoth(workspace, fixture, "b.txt", "b\n");
+    const selectedPaths = createSqliteSelectedPathSource(workspace.database.db);
+    const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["a.txt"] },
+      {
+        selectedPaths,
+        sparseWorkspace: {
+          ...sparseWorkspace,
+          indexAncestorFacts() {
+            throw new GitError("E2BIG", "injected selected ancestor capacity");
+          },
+        },
+      },
+    );
+    fixture.git("add", "a.txt");
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(lsFiles(workspace.repo)).toEqual(["a.txt"]);
+  });
+
+  it("rejects malformed ancestor success before index or object mutation", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "a\n");
+    writeWorkFile(workspace, "/b.txt", "b\n");
+    const selectedPaths = createSqliteSelectedPathSource(workspace.database.db);
+    const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const corruptions: Array<{
+      name: string;
+      mutate: (result: SparseIndexAncestorResult) => void;
+    }> = [
+      { name: "facts shape", mutate: (result) => void Reflect.set(result, "facts", null) },
+      {
+        name: "sparse facts",
+        mutate(result) {
+          delete result.facts[0];
+        },
+      },
+      { name: "fact shape", mutate: (result) => void Reflect.set(result.facts, "0", null) },
+      {
+        name: "fact path",
+        mutate: (result) => void Reflect.set(result.facts[0] ?? {}, "path", "unrelated.txt"),
+      },
+      {
+        name: "fact exact",
+        mutate: (result) => void Reflect.set(result.facts[0] ?? {}, "exact", 1),
+      },
+      {
+        name: "fact descendant",
+        mutate: (result) => void Reflect.set(result.facts[0] ?? {}, "descendant", 1),
+      },
+      {
+        name: "fact order",
+        mutate(result) {
+          result.facts.reverse();
+        },
+      },
+      {
+        name: "fact duplicate",
+        mutate(result) {
+          const first = result.facts[0];
+          if (first === undefined) throw new Error("missing first fake ancestor fact");
+          Reflect.set(result.facts[1] ?? {}, "path", first.path);
+        },
+      },
+      { name: "retained type", mutate: (result) => void Reflect.set(result, "retainedBytes", 1.5) },
+    ];
+
+    for (const corruption of corruptions) {
+      const beforeIndex = workspace.repo.checkout.indexEntries();
+      const beforeObjects = workspace.repo.store.objectCount();
+      expect(
+        () =>
+          add(
+            workspace.repo,
+            workspace.worktree,
+            { paths: ["a.txt", "b.txt"] },
+            {
+              selectedPaths,
+              sparseWorkspace: {
+                ...sparseWorkspace,
+                indexAncestorFacts() {
+                  const result = fakeAncestorResult(["a.txt", "b.txt"]);
+                  corruption.mutate(result);
+                  return result;
+                },
+              },
+            },
+          ),
+        corruption.name,
+      ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+      expect(workspace.repo.checkout.indexEntries(), corruption.name).toEqual(beforeIndex);
+      expect(workspace.repo.store.objectCount(), corruption.name).toBe(beforeObjects);
+    }
+  });
+
+  it("rejects ancestor retained underreport before index or object mutation", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "a\n");
+    const beforeIndex = workspace.repo.checkout.indexEntries();
+    const beforeObjects = workspace.repo.store.objectCount();
+    const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
+
+    expect(() =>
+      add(
+        workspace.repo,
+        workspace.worktree,
+        { paths: ["a.txt"] },
+        {
+          selectedPaths: createSqliteSelectedPathSource(workspace.database.db),
+          sparseWorkspace: {
+            ...sparseWorkspace,
+            indexAncestorFacts() {
+              return { ...fakeAncestorResult(["a.txt"]), retainedBytes: 0 };
+            },
+          },
+        },
+      ),
+    ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(workspace.repo.checkout.indexEntries()).toEqual(beforeIndex);
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+  });
+
+  it("rejects malformed selected success facts before index or object mutation", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a/file.txt", "worktree\n");
+    const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const corruptions: Array<{
+      name: string;
+      mutate: (result: AvailableSelectedPathResult) => void;
+    }> = [
+      { name: "availability", mutate: (result) => void Reflect.set(result, "available", 1) },
+      { name: "index array", mutate: (result) => void Reflect.set(result, "index", null) },
+      { name: "worktree array", mutate: (result) => void Reflect.set(result, "worktree", null) },
+      {
+        name: "index cardinality",
+        mutate(result) {
+          const entry = requireFakeIndex(result);
+          for (let stage = 0; stage < 4; stage++) result.index.push({ ...entry, stage });
+        },
+      },
+      {
+        name: "worktree cardinality",
+        mutate(result) {
+          result.worktree.push({ ...requireFakeWorktree(result) });
+        },
+      },
+      {
+        name: "index path",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "path", "/a"),
+      },
+      {
+        name: "index stage",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "stage", 4),
+      },
+      {
+        name: "index mode",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "mode", 0),
+      },
+      {
+        name: "index oid",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "oid", "bad"),
+      },
+      {
+        name: "index size",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "size", -1),
+      },
+      {
+        name: "index mtime",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "mtime", 0.5),
+      },
+      {
+        name: "index inode",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "ino", 0),
+      },
+      {
+        name: "index revision",
+        mutate: (result) => void Reflect.set(requireFakeIndex(result), "rev", -1),
+      },
+      {
+        name: "worktree path",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result), "path", "/a"),
+      },
+      {
+        name: "worktree stat",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result), "stat", null),
+      },
+      {
+        name: "worktree type",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "type", "other"),
+      },
+      {
+        name: "worktree mode",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "mode", -1),
+      },
+      {
+        name: "worktree size",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "size", -1),
+      },
+      {
+        name: "worktree mtime",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "mtime", 0.5),
+      },
+      {
+        name: "worktree inode",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "ino", 0),
+      },
+      {
+        name: "worktree links",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "nlink", 0),
+      },
+      {
+        name: "worktree revision",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "rev", -1),
+      },
+      {
+        name: "worktree target",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "target", "bad"),
+      },
+      {
+        name: "worktree content id",
+        mutate: (result) => void Reflect.set(requireFakeWorktree(result).stat, "contentId", "bad"),
+      },
+      {
+        name: "directory payload",
+        mutate(result) {
+          Reflect.set(requireFakeWorktree(result).stat, "type", "dir");
+        },
+      },
+      {
+        name: "symlink payload",
+        mutate(result) {
+          Reflect.set(requireFakeWorktree(result).stat, "type", "symlink");
+        },
+      },
+    ];
+
+    for (const corruption of corruptions) {
+      const beforeIndex = workspace.repo.checkout.indexEntries();
+      const beforeObjects = workspace.repo.store.objectCount();
+      expect(
+        () =>
+          add(
+            workspace.repo,
+            workspace.worktree,
+            { paths: ["a/file.txt"] },
+            {
+              sparseWorkspace,
+              selectedPaths: {
+                select() {
+                  const result = fakeSelectedAddResult(workspace, "a/file.txt");
+                  corruption.mutate(result);
+                  return result;
+                },
+              },
+            },
+          ),
+        corruption.name,
+      ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+      expect(workspace.repo.checkout.indexEntries(), corruption.name).toEqual(beforeIndex);
+      expect(workspace.repo.store.objectCount(), corruption.name).toBe(beforeObjects);
+    }
+  });
+
+  it("rejects selected ordering, relation, duplicates, and retained underreport before mutation", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a/file.txt", "worktree\n");
+    const cases: Array<{
+      name: string;
+      mutate: (result: AvailableSelectedPathResult) => void;
+    }> = [
+      {
+        name: "index duplicate",
+        mutate(result) {
+          result.index.push({ ...requireFakeIndex(result) });
+        },
+      },
+      {
+        name: "index order",
+        mutate(result) {
+          const entry = requireFakeIndex(result);
+          Reflect.set(entry, "path", "a/z.txt");
+          result.index.push({ ...entry, path: "a/a.txt", stage: 1 });
+        },
+      },
+      {
+        name: "worktree duplicate",
+        mutate(result) {
+          result.worktree.push({ ...requireFakeWorktree(result) });
+        },
+      },
+      {
+        name: "worktree order",
+        mutate(result) {
+          const entry = requireFakeWorktree(result);
+          Reflect.set(entry, "path", "a/z.txt");
+          result.worktree.push({ ...entry, path: "a/a.txt" });
+        },
+      },
+      {
+        name: "unrelated path",
+        mutate(result) {
+          Reflect.set(requireFakeIndex(result), "path", "b/file.txt");
+        },
+      },
+      {
+        name: "retained underreport",
+        mutate(result) {
+          result.retainedBytes = 0;
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const beforeIndex = workspace.repo.checkout.indexEntries();
+      const beforeObjects = workspace.repo.store.objectCount();
+      expect(
+        () =>
+          add(
+            workspace.repo,
+            workspace.worktree,
+            { paths: ["a"] },
+            {
+              selectedPaths: {
+                select() {
+                  const result = fakeSelectedAddResult(workspace, "a/file.txt");
+                  testCase.mutate(result);
+                  return result;
+                },
+              },
+            },
+          ),
+        testCase.name,
+      ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+      expect(workspace.repo.checkout.indexEntries(), testCase.name).toEqual(beforeIndex);
+      expect(workspace.repo.store.objectCount(), testCase.name).toBe(beforeObjects);
+    }
   });
 
   it("stages a single new file the way git does", () => {
@@ -889,6 +1398,88 @@ describe("cost", () => {
       selected.every((path) => workspace.repo.checkout.indexGet(path)?.oid === changedOid),
     ).toBe(true);
     expect(workspace.repo.checkout.indexGet(paths[100] ?? "")?.oid).toBe(originalOid);
+  });
+
+  it("selects 100 exact files from 24,252 native rows without general source scans", () => {
+    const fixture = newFixture();
+    const workspace = makeRepo("/");
+    const original = "original\n";
+    const changed = "changed\n";
+    const originalBytes = utf8.encode(original);
+    const changedBytes = utf8.encode(changed);
+    const originalOid = workspace.repo.store.write("blob", originalBytes);
+    const paths = Array.from({ length: 24_252 }, (_, index) => {
+      const directory = Math.floor(index / 243);
+      const file = index % 243;
+      return `p${directory.toString().padStart(3, "0")}/f${file.toString().padStart(3, "0")}.ts`;
+    });
+    for (const path of paths) fixture.write(path, original);
+    fixture.git("add", "-A");
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes: originalBytes })),
+    );
+    workspace.repo.checkout.indexReplace(
+      paths.map((path) => ({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: originalOid,
+        size: originalBytes.length,
+        mtime: null,
+        ino: null,
+      })),
+    );
+    const selected = Array.from({ length: 100 }, (_, index) => paths[index * 243] ?? "");
+    workspace.worktree.writeFiles(
+      selected.map((path) => ({ path: `/${path}`, bytes: changedBytes })),
+    );
+    for (const path of selected) fixture.write(path, changed);
+    const sourceStatements: number[] = [];
+    const sourceRows: number[] = [];
+    const ancestorStatements: number[] = [];
+    const ancestorRows: number[] = [];
+    const ancestorQueries: string[] = [];
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+
+    add(
+      workspace.repo,
+      new BulkOnlyWorktree(workspace.worktree),
+      { paths: selected },
+      nativeAddContext(
+        workspace,
+        sourceStatements,
+        sourceRows,
+        ancestorStatements,
+        ancestorRows,
+        ancestorQueries,
+      ),
+    );
+    fixture.git("add", "--", ...selected);
+
+    const queries = [...workspace.storage.histogram.keys()];
+    expect(sourceStatements).toEqual([2]);
+    expect(sourceRows).toEqual([202]);
+    expect(ancestorStatements).toEqual([1]);
+    expect(ancestorRows).toEqual([100]);
+    expect(ancestorQueries).toHaveLength(1);
+    const ancestorQuery = ancestorQueries[0];
+    if (ancestorQuery === undefined) throw new Error("missing recorded ancestor query");
+    expect(ancestorQuery).toContain("exact_index_ancestor_rows(");
+    expect(ancestorQuery).not.toContain("), index_ancestor_rows(");
+    expect(queries.some((query) => query.startsWith("WITH wanted(path) AS"))).toBe(true);
+    expect(queries.some((query) => query.startsWith("WITH wanted(relative) AS"))).toBe(true);
+    expect(queries.some((query) => query.startsWith("WITH wanted(path, recursive)"))).toBe(false);
+    expect(queries.some((query) => query.startsWith("WITH wanted(relative, recursive)"))).toBe(
+      false,
+    );
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
+    const witnesses = [...selected, paths[12_126] ?? "", paths.at(-1) ?? ""];
+    const witnessSet = new Set(witnesses);
+    expect(
+      indexLines(workspace.repo).filter((line) => witnessSet.has(line.split("\t")[1] ?? "")),
+    ).toEqual(fixture.git("ls-files", "-s", "--", ...witnesses).split("\n"));
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
   });
 
   it.each([1, 100, 1_000])(
