@@ -1814,6 +1814,10 @@ export class SharedRepoStore {
 
   /** Invalidate storage caches and re-read current loose-object availability. */
   revalidateStorageCaches(): void {
+    this.#cacheGeneration++;
+    this.#packs?.clearCaches();
+    this.#hasLoose = true;
+    this.#shallow = null;
     let availability: boolean | undefined;
     let rows = 0;
     for (const row of this.db.iterate(
@@ -1831,10 +1835,7 @@ export class SharedRepoStore {
     if (rows !== 1 || availability === undefined) {
       throw new CorruptError("loose object availability probe returned an invalid value");
     }
-    this.#cacheGeneration++;
-    this.#packs?.clearCaches();
     this.#hasLoose = availability;
-    this.#shallow = null;
   }
 
   cacheBytes(): { objects: number; chunks: number } {

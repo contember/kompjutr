@@ -573,7 +573,7 @@ describe("synthetic pack ingest", () => {
     expect(store.read(replacementOid)?.data).toEqual(replacementData);
   });
 
-  it("preserves storage cache state when loose availability validation fails", () => {
+  it("invalidates stale caches and keeps loose reads enabled when availability validation fails", () => {
     const inner = new TestDatabase();
     const db = new MutatingQueryDatabase(inner, "loose-storage-availability", {
       has_loose: 2,
@@ -597,7 +597,7 @@ describe("synthetic pack ingest", () => {
     );
 
     expect(store.shared.hasLoose).toBe(true);
-    expect(store.read(cachedOid)?.data).toEqual(cachedData);
+    expect(store.read(cachedOid)).toBeNull();
     expect(store.typeAndSize(authoritativeOid)).toEqual({
       type: "blob",
       size: authoritativeData.length,
