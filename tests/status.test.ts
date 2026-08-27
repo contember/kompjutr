@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 
 import { fromHex, utf8 } from "../src/core/bytes.js";
+import type { IgnoreMatcher } from "../src/core/ignore/index.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import {
@@ -18,6 +19,7 @@ import {
 } from "../src/core/ops/status.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
+import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -151,6 +153,16 @@ class BulkOnlyWorktree extends CountingWorktree {
   }
 }
 
+class ScanCountingWorktree extends BulkOnlyWorktree {
+  readonly scanPages: Array<{ afterSubtree: string | undefined; rows: ScanEntry[] }> = [];
+
+  override scan(root: string, options: ScanOptions): ScanEntry[] {
+    const rows = super.scan(root, options);
+    this.scanPages.push({ afterSubtree: options.afterSubtree, rows });
+    return rows;
+  }
+}
+
 function buildStatusScale(
   fileCount = 9_329,
   directoryCount = 3_346,
@@ -230,6 +242,13 @@ function indexScanStatements(workspace: TestRepository): number {
     if (query.startsWith("SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index")) {
       return count;
     }
+  }
+  return 0;
+}
+
+function treeScanStatements(workspace: TestRepository): number {
+  for (const [query, count] of workspace.storage.histogram ?? []) {
+    if (query.startsWith("WITH RECURSIVE params(repo_id, root_oid")) return count;
   }
   return 0;
 }
@@ -580,6 +599,27 @@ describe("status", () => {
     expect(
       status(workspace.repo, workspace.worktree, { untrackedFiles: "all" }).map((row) => row.path),
     ).toEqual(["z-tracked.txt", "a-untracked.txt"]);
+  });
+
+  it("does no SQL when a lazy status stream is constructed and abandoned", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/untracked.txt", "fresh\n");
+    const trackerBefore = workspace.database.db.scalar<unknown>(
+      "SELECT count(*) FROM git_index_state WHERE checkout_id = ?",
+      workspace.repo.checkout.checkoutId,
+    );
+    workspace.storage.resetCounters();
+
+    const lazy = statusStream(workspace.repo, workspace.worktree);
+    expect(workspace.storage.statementCount).toBe(0);
+    lazy.return(undefined);
+    expect(workspace.storage.statementCount).toBe(0);
+    expect(
+      workspace.database.db.scalar<unknown>(
+        "SELECT count(*) FROM git_index_state WHERE checkout_id = ?",
+        workspace.repo.checkout.checkoutId,
+      ),
+    ).toBe(trackerBefore);
   });
 
   it("lists untracked files one by one for untrackedFiles: all", async () => {
@@ -970,9 +1010,20 @@ describe("status cost", () => {
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    // Snapshot + status merge + bounded rename identity prepass.
-    expect(indexScanStatements(workspace)).toBe(30);
+    // One prepass combines tracked paths with rename classification, then one merge follows.
+    expect(indexScanStatements(workspace)).toBe(20);
+    expect(treeScanStatements(workspace)).toBe(2);
     expect(worktree.bulkReadPaths).toEqual([]);
+
+    workspace.storage.resetCounters();
+    expect(status(workspace.repo, worktree, { renames: false })).toEqual([]);
+    expect(indexScanStatements(workspace)).toBe(20);
+    expect(treeScanStatements(workspace)).toBe(1);
+
+    workspace.storage.resetCounters();
+    expect(status(workspace.repo, worktree, { renames: false, untrackedFiles: "all" })).toEqual([]);
+    expect(indexScanStatements(workspace)).toBe(10);
+    expect(treeScanStatements(workspace)).toBe(1);
 
     workspace.tick(60_000);
     const changed = entries.slice(0, 1_000);
@@ -986,7 +1037,8 @@ describe("status cost", () => {
     expect(result).toHaveLength(1_000);
     expect(result.every((entry) => entry.worktree === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(230);
-    expect(indexScanStatements(workspace)).toBe(30);
+    expect(indexScanStatements(workspace)).toBe(20);
+    expect(treeScanStatements(workspace)).toBe(2);
     expect(worktree.bulkReadPaths).toHaveLength(1_000);
     expect(new Set(worktree.bulkReadPaths)).toEqual(
       new Set(changed.map((entry) => `/${entry.path}`)),
@@ -1009,7 +1061,7 @@ describe("status cost", () => {
     workspace.storage.resetCounters();
     expect(status(workspace.repo, worktree)).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
-    expect(indexScanStatements(workspace)).toBe(75);
+    expect(indexScanStatements(workspace)).toBe(50);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -1025,7 +1077,7 @@ describe("status cost", () => {
     expect(result.map((entry) => entry.path)).toEqual(expectedPaths);
     expect(result.every((entry) => entry.index === " " && entry.worktree === "M")).toBe(true);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
-    expect(indexScanStatements(workspace)).toBe(75);
+    expect(indexScanStatements(workspace)).toBe(50);
     expect(worktree.bulkReadPaths).toEqual(expectedPaths.map((path) => `/${path}`));
   });
 
@@ -1033,6 +1085,7 @@ describe("status cost", () => {
     const { workspace, entries } = buildStatusScale(5_001, 100, "old/");
     stageScaleMove(workspace, entries);
     const worktree = new BulkOnlyWorktree(workspace.worktree);
+    workspace.storage.histogram = new Map();
 
     workspace.storage.resetCounters();
     const result = status(workspace.repo, worktree);
@@ -1043,7 +1096,12 @@ describe("status cost", () => {
     expect(result.some((entry) => entry.index === "R")).toBe(false);
     expect(result.some((entry) => "originalPath" in entry)).toBe(false);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(treeScanStatements(workspace)).toBe(2);
     expect(worktree.bulkReadPaths).toEqual([]);
+
+    workspace.storage.resetCounters();
+    expect(status(workspace.repo, worktree, { renames: false })).toHaveLength(10_002);
+    expect(treeScanStatements(workspace)).toBe(1);
   });
 
   it("does not infer an oid-shaped content identity and learns it after hashing", () => {
@@ -1094,6 +1152,71 @@ describe("status cost", () => {
     const large = measure(1_501);
     expect(large).toBeLessThanOrEqual(170);
     expect(large).toBeLessThanOrEqual(small + 2);
+  });
+
+  it("prunes a wholly ignored directory only after proving it has no tracked descendant", () => {
+    const measure = (count: number, tracked: boolean, includeIgnored: boolean) => {
+      const workspace = makeRepo("/");
+      const bytes = utf8.encode("ignored\n");
+      workspace.worktree.writeFiles(
+        Array.from({ length: count }, (_, index) => ({
+          path: `/ignored/file${index.toString().padStart(4, "0")}.txt`,
+          bytes,
+        })),
+      );
+      if (tracked) {
+        const hashed = hashWorktreePath(workspace.repo, workspace.worktree, "ignored/file0000.txt");
+        if (hashed === null) throw new Error("tracked ignored witness was not written");
+        workspace.repo.checkout.indexPut(indexEntryFor("ignored/file0000.txt", hashed));
+      }
+      let joinedFiles = 0;
+      const ignores: IgnoreMatcher = {
+        ignores(path, isDirectory) {
+          if (!isDirectory) joinedFiles++;
+          return path === "ignored" || path.startsWith("ignored/");
+        },
+      };
+      const worktree = new ScanCountingWorktree(workspace.worktree);
+      workspace.storage.resetCounters();
+      const rows = status(workspace.repo, worktree, {
+        renames: false,
+        ignores,
+        includeIgnored,
+      });
+      return {
+        rows,
+        joinedFiles,
+        pages: worktree.scanPages,
+        statements: workspace.storage.statementCount,
+      };
+    };
+
+    const pruned = measure(2_500, false, false);
+    const wider = measure(5_000, false, false);
+    expect(pruned.rows).toEqual([]);
+    expect(pruned.joinedFiles).toBe(0);
+    expect(pruned.pages).toHaveLength(2);
+    expect(pruned.pages[0]?.rows.filter((row) => row.path.startsWith("/ignored/"))).toHaveLength(
+      999,
+    );
+    expect(pruned.pages[1]).toMatchObject({ afterSubtree: "/ignored", rows: [] });
+    expect(wider.joinedFiles).toBe(0);
+    expect(wider.pages).toHaveLength(2);
+    expect(wider.statements).toBe(pruned.statements);
+
+    const withTracked = measure(2_500, true, false);
+    expect(withTracked.rows).toEqual([
+      expect.objectContaining({ path: "ignored/file0000.txt", index: "A" }),
+    ]);
+    expect(withTracked.joinedFiles).toBe(2_499);
+    expect(withTracked.pages).toHaveLength(3);
+    expect(withTracked.pages.every((page) => page.afterSubtree === undefined)).toBe(true);
+
+    const included = measure(2_500, false, true);
+    expect(included.rows).toEqual([expect.objectContaining({ path: "ignored/", ignored: true })]);
+    expect(included.joinedFiles).toBe(2_500);
+    expect(included.pages).toHaveLength(3);
+    expect(included.pages.every((page) => page.afterSubtree === undefined)).toBe(true);
   });
 
   it("fails before one retained tracked path and directory crosses the memory cap", () => {

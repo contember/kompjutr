@@ -87,6 +87,12 @@ interface StatusIndexSnapshot {
   retainsTrackedPaths: boolean;
 }
 
+interface FullStatusPrepass {
+  snapshot: StatusIndexSnapshot;
+  excluded: ExcludedRoot[];
+  renames: ExactRenameClassification | undefined;
+}
+
 class RetainedStatusBudget {
   #bytes = 0;
 
@@ -189,11 +195,11 @@ export function eagerStatus(
   if (!state.available) {
     const baselineTreeOid = repo.headTree();
     const seed = new FullStatusTrackerSeed();
-    const renames = classifyStatusRenames(repo, baselineTreeOid, options);
+    const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
     const rows = sortStatusDetails([
       ...applyStatusRenames(
-        statusStreamInternal(repo, worktree, options, baselineTreeOid, seed),
-        renames,
+        statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
+        prepass.renames,
       ),
     ]);
     if (seed.resealable) {
@@ -227,8 +233,62 @@ export function* statusStream(
   options: StatusOptions = {},
 ): Generator<StatusDetail> {
   const headTreeOid = repo.headTree();
-  const renames = classifyStatusRenames(repo, headTreeOid, options);
-  yield* applyStatusRenames(statusStreamInternal(repo, worktree, options, headTreeOid), renames);
+  const prepass = fullStatusPrepass(repo, headTreeOid, options);
+  yield* applyStatusRenames(
+    statusStreamInternal(repo, worktree, options, headTreeOid, prepass),
+    prepass.renames,
+  );
+}
+
+function fullStatusPrepass(
+  repo: Repository,
+  headTreeOid: string | null,
+  options: StatusOptions,
+): FullStatusPrepass {
+  const collapse = (options.untrackedFiles ?? "normal") === "normal";
+  const excluded = excludedRoots(repo.root, options.excludeRoots);
+  const includeTrackedPaths = collapse || excluded.length > 0;
+  if (!renameDetectionEnabled(repo, "status", options.renames)) {
+    return {
+      snapshot: snapshotStatusIndex(repo, collapse, includeTrackedPaths),
+      excluded,
+      renames: undefined,
+    };
+  }
+
+  const snapshot = emptyStatusIndexSnapshot(includeTrackedPaths);
+  const classifier = new ExactRenameClassifier();
+  let classifying = true;
+  for (const row of joinSorted(
+    treeStream(repo, headTreeOid),
+    statusIndexGroups(repo.checkout.indexScan()),
+    {
+      left: (entry) => entry.path,
+      right: (entry) => entry.path,
+    },
+  )) {
+    if (row.right !== undefined) retainStatusIndexPath(snapshot, row.right.path, collapse);
+    if (!classifying || !matchesPaths(row.path, options.paths) || row.right?.kind === "unmerged") {
+      continue;
+    }
+    const head = row.left;
+    const index = row.right?.entry;
+    let retained = true;
+    if (head !== undefined && index === undefined && isRenameMode(head.mode)) {
+      retained = classifier.addSource({ path: row.path, mode: head.mode, oid: head.oid });
+    } else if (head === undefined && index !== undefined && index.mode !== 0o160000) {
+      retained = classifier.addDestination({
+        path: row.path,
+        mode: octalMode(index.mode),
+        oid: index.oid,
+      });
+    }
+    if (!retained) {
+      classifying = false;
+      if (!collapse && !includeTrackedPaths) break;
+    }
+  }
+  return { snapshot, excluded, renames: classifier.finish() };
 }
 
 function classifyStatusRenames(
@@ -299,12 +359,12 @@ function* statusStreamInternal(
   worktree: Worktree,
   options: StatusOptions,
   headTreeOid: string | null,
+  prepass: FullStatusPrepass,
   seed?: FullStatusTrackerSeed,
 ): Generator<StatusDetail> {
   const untrackedMode = options.untrackedFiles ?? "normal";
   const collapse = untrackedMode === "normal";
-  const excluded = excludedRoots(repo.root, options.excludeRoots);
-  const snapshot = snapshotStatusIndex(repo, collapse, collapse || excluded.length > 0);
+  const { excluded, snapshot } = prepass;
   const ignores = options.ignores ?? loadIgnoreMatcher(worktree, repo.root);
   const prunable = prunableExcludeRoots(excluded, snapshot.trackedPaths);
   const buffered: BufferedStatusRow[] = [];
@@ -346,7 +406,7 @@ function* statusStreamInternal(
   for (const row of joinSorted3(
     treeStream(repo, headTreeOid),
     statusIndexGroups(repo.checkout.indexScan()),
-    worktreeEntries(repo, worktree, options, ignores, prunable),
+    worktreeEntries(repo, worktree, options, ignores, prunable, snapshot),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
     sourceRows++;
@@ -390,6 +450,7 @@ function worktreeEntries(
   options: StatusOptions,
   ignores: IgnoreMatcher,
   excludeRoots: string[],
+  snapshot: StatusIndexSnapshot,
 ): Generator<WorktreePath> {
   return walkWorktreeEntriesStream(worktree, repo.root, {
     excludeRoots,
@@ -397,6 +458,10 @@ function worktreeEntries(
     ignores,
     // Tracked paths remain visible even when a later ignore rule matches.
     includeIgnored: true,
+    pruneDirectory:
+      options.includeIgnored !== true && snapshot.retainsTrackedPaths
+        ? (path) => ignores.ignores(path, true) && !hasTrackedPath(path, snapshot.trackedPaths)
+        : undefined,
   });
 }
 
@@ -459,27 +524,37 @@ function snapshotStatusIndex(
   includeDirectories: boolean,
   includeTrackedPaths: boolean,
 ): StatusIndexSnapshot {
+  const snapshot = emptyStatusIndexSnapshot(includeTrackedPaths);
+  if (!includeDirectories && !includeTrackedPaths) return snapshot;
+  for (const group of statusIndexGroups(repo.checkout.indexScan())) {
+    retainStatusIndexPath(snapshot, group.path, includeDirectories);
+  }
+  return snapshot;
+}
+
+function emptyStatusIndexSnapshot(retainsTrackedPaths: boolean): StatusIndexSnapshot {
   const budget = new RetainedStatusBudget(STATUS_RETAINED_BYTES);
   const trackedDirs = new Set<string>();
   const trackedPaths = new Set<string>();
-  if (!includeDirectories && !includeTrackedPaths) {
-    return { trackedDirs, trackedPaths, budget, retainsTrackedPaths: false };
+  return { trackedDirs, trackedPaths, budget, retainsTrackedPaths };
+}
+
+function retainStatusIndexPath(
+  snapshot: StatusIndexSnapshot,
+  path: string,
+  includeDirectories: boolean,
+): void {
+  if (snapshot.retainsTrackedPaths && !snapshot.trackedPaths.has(path)) {
+    snapshot.budget.add(trackedPathRetainedBytes(path));
+    snapshot.trackedPaths.add(path);
   }
-  for (const group of statusIndexGroups(repo.checkout.indexScan())) {
-    const path = group.path;
-    if (includeTrackedPaths) {
-      budget.add(trackedPathRetainedBytes(path));
-      trackedPaths.add(path);
-    }
-    if (!includeDirectories) continue;
-    for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
-      const directory = path.slice(0, slash);
-      if (trackedDirs.has(directory)) continue;
-      budget.add(DIRECTORY_FIXED_BYTES + retainedStringBytes(directory));
-      trackedDirs.add(directory);
-    }
+  if (!includeDirectories) return;
+  for (let slash = path.indexOf("/"); slash !== -1; slash = path.indexOf("/", slash + 1)) {
+    const directory = path.slice(0, slash);
+    if (snapshot.trackedDirs.has(directory)) continue;
+    snapshot.budget.add(DIRECTORY_FIXED_BYTES + retainedStringBytes(directory));
+    snapshot.trackedDirs.add(directory);
   }
-  return { trackedDirs, trackedPaths, budget, retainsTrackedPaths: includeTrackedPaths };
 }
 
 function retainTrackedPath(snapshot: StatusIndexSnapshot, path: string): void {
