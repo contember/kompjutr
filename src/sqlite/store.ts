@@ -65,6 +65,12 @@ import {
   readCommitGraph,
 } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
+import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
+import {
+  advanceMaintenanceRootSnapshot as advanceRootSnapshot,
+  type MaintenanceRootSnapshotProgress,
+  validatedOperationJournalRoots,
+} from "./maintenance/roots.js";
 import { MemoryCoordinator, type MemoryReservation } from "./memory.js";
 import {
   MAX_PACK_BLOB_BATCH_BYTES,
@@ -73,6 +79,12 @@ import {
   type PackCacheOptions,
   PackStore,
 } from "./packs.js";
+import {
+  boundedRefText,
+  rawSymbolicTarget,
+  requireRawRefTarget,
+  requireRefName,
+} from "./ref-validation.js";
 
 export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 
@@ -185,7 +197,7 @@ export const MAX_REF_MUTATION_RETAINED_BYTES = 64 * 1024 * 1024;
 export const REF_MUTATION_FIXED_RETAINED_BYTES =
   REF_MUTATION_SQL_HEADROOM_BYTES + REF_ROW_RETAINED_BYTES + 2 * MAX_REFLOG_RAW_TARGET_BYTES;
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
-export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 10;
+export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 11;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
@@ -668,75 +680,6 @@ function* jsonPages<T>(items: Iterable<T>, label: string): Generator<string> {
     rows.push(row);
   }
   if (rows.length > 0) yield `[${rows.join(",")}]`;
-}
-
-function invalidRefValue(source: "input" | "stored", message: string): never {
-  if (source === "stored") throw new CorruptError(message);
-  throw new GitError("EINVAL", message);
-}
-
-function boundedRefText(
-  value: string,
-  label: string,
-  limit: number,
-  source: "input" | "stored",
-): number {
-  let bytes = 0;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit === 0 || unit === 0x0a || unit === 0x0d) {
-      invalidRefValue(source, `${label} contains an invalid character`);
-    }
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (low < 0xdc00 || low > 0xdfff) {
-        invalidRefValue(source, `${label} is not canonical UTF-16`);
-      }
-      index++;
-      bytes += 4;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      invalidRefValue(source, `${label} is not canonical UTF-16`);
-    } else {
-      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
-    }
-    if (bytes > limit) {
-      if (source === "stored") throw new CorruptError(`${label} exceeds its stored byte bound`);
-      throw new GitError("E2BIG", `${label} exceeds ${limit} UTF-8 bytes`);
-    }
-  }
-  return bytes;
-}
-
-function requireRefName(
-  value: unknown,
-  label: string,
-  source: "input" | "stored",
-  allowHead = false,
-): string {
-  if (typeof value !== "string" || value === "" || (!allowHead && value === "HEAD")) {
-    invalidRefValue(source, `${label} is invalid`);
-  }
-  boundedRefText(value, label, MAX_REFLOG_REF_BYTES, source);
-  return value;
-}
-
-function rawSymbolicTarget(value: string): string | null {
-  if (!value.startsWith("ref: ")) return null;
-  const target = value.slice(5);
-  if (target === "" || target === "HEAD" || target.startsWith("ref: ")) return null;
-  return target;
-}
-
-function requireRawRefTarget(value: unknown, label: string, source: "input" | "stored"): string {
-  if (typeof value !== "string" || value === "") {
-    invalidRefValue(source, `${label} is invalid`);
-  }
-  boundedRefText(value, label, MAX_REFLOG_RAW_TARGET_BYTES, source);
-  if (isOid(value)) return value;
-  const symbolic = rawSymbolicTarget(value);
-  if (symbolic === null) invalidRefValue(source, `${label} is not an OID or symbolic ref`);
-  requireRefName(symbolic, `${label} symbolic ref`, source);
-  return value;
 }
 
 function requireNullableRawRefTarget(value: unknown, label: string): string | null {
@@ -2410,6 +2353,7 @@ export class SqliteGitDatabase {
         ) {
           throw new CorruptError("initialized checkout identity changed");
         }
+        bumpMaintenanceRootEpoch(this.#db, repoId);
         return { row, store, lifetime };
       });
     } catch (error) {
@@ -2463,6 +2407,7 @@ export class SqliteGitDatabase {
       ) {
         throw new CorruptError("checkout disappeared during removal");
       }
+      bumpMaintenanceRootEpoch(this.#db, row.repoId);
       return Object.freeze(row);
     });
     this.#evictCheckout(removed.id);
@@ -2545,6 +2490,7 @@ export class SqliteGitDatabase {
       if (deletedIds.size !== rows.length || rows.some((row) => !deletedIds.has(row.id))) {
         throw new CorruptError("bulk checkout removal deleted an unexpected set");
       }
+      bumpMaintenanceRootEpoch(this.#db, repoId);
       return Object.freeze(rows.map((row) => Object.freeze(row)));
     });
     for (const row of removed) this.#evictCheckout(row.id);
@@ -2745,6 +2691,29 @@ export class SqliteGitDatabase {
     this.#checkoutLifetimes.delete(checkoutId);
     this.#checkoutStores.delete(checkoutId);
     this.#checkoutRowGenerations.delete(checkoutId);
+  }
+
+  /** Advance one internal maintenance root page after validating every live journal. */
+  advanceMaintenanceRootSnapshot(
+    repoId: number,
+    pageRows?: number,
+  ): MaintenanceRootSnapshotProgress {
+    this.openShared(repoId);
+    const now = this.#options.now ?? Date.now;
+    const options = {
+      repoId,
+      nowMs: now(),
+      readOperationRoots: (checkoutId: number) => {
+        const checkout = this.#checkoutById(checkoutId);
+        if (checkout.repoId !== repoId) {
+          throw new CorruptError("maintenance operation root crossed repositories");
+        }
+        const journal = this.openCheckout(checkout).readOperationState();
+        return journal === null ? [] : validatedOperationJournalRoots(journal);
+      },
+    };
+    if (pageRows === undefined) return advanceRootSnapshot(this.#db, options);
+    return advanceRootSnapshot(this.#db, { ...options, pageRows });
   }
 
   destroyRepository(repoId: number): void {
@@ -4561,6 +4530,7 @@ export class CheckoutStore {
           page,
         );
       }
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
       return true;
     });
   }
@@ -5213,6 +5183,7 @@ export class CheckoutStore {
       this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
       this.#insertOperationSteps(steps);
       this.#insertOperationTouched(touched);
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 
@@ -5594,6 +5565,7 @@ export class CheckoutStore {
         this.#checkoutId,
         expectedIntegrityOid,
       );
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 
@@ -5639,6 +5611,7 @@ export class CheckoutStore {
       this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
       this.#insertOperationSteps(steps);
       this.#insertOperationTouched(touched);
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 
@@ -5663,6 +5636,7 @@ export class CheckoutStore {
       this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
       this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
       this.#db.run("DELETE FROM git_operation_state WHERE checkout_id = ?", this.#checkoutId);
+      if (existed) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
       return existed;
     });
   }
@@ -5814,6 +5788,7 @@ export class CheckoutStore {
           throw new Error("initial state body returned an asynchronous result");
         }
         finish();
+        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
         return { available: true, value };
       } finally {
         active = false;
@@ -5844,35 +5819,44 @@ export class CheckoutStore {
   }
 
   indexPut(entry: IndexEntry): void {
-    this.#db.run(
-      `INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(checkout_id, path, stage) DO UPDATE SET
-         mode = excluded.mode, oid = excluded.oid, size = excluded.size,
-         mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
-      this.#checkoutId,
-      entry.path,
-      entry.stage,
-      entry.mode,
-      entry.oid,
-      entry.size,
-      entry.mtime,
-      entry.ino,
-      entry.rev ?? null,
-    );
+    this.#db.transactionSync(() => {
+      this.#db.run(
+        `INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(checkout_id, path, stage) DO UPDATE SET
+           mode = excluded.mode, oid = excluded.oid, size = excluded.size,
+           mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
+        this.#checkoutId,
+        entry.path,
+        entry.stage,
+        entry.mode,
+        entry.oid,
+        entry.size,
+        entry.mtime,
+        entry.ino,
+        entry.rev ?? null,
+      );
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+    });
   }
 
   /** Remove every stage of `path`. */
   indexRemove(path: string): void {
-    this.#db.run(
-      "DELETE FROM git_index WHERE checkout_id = ? AND path = ?",
-      this.#checkoutId,
-      path,
-    );
+    this.#db.transactionSync(() => {
+      this.#db.run(
+        "DELETE FROM git_index WHERE checkout_id = ? AND path = ?",
+        this.#checkoutId,
+        path,
+      );
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+    });
   }
 
   indexClear(): void {
-    this.#db.run("DELETE FROM git_index WHERE checkout_id = ?", this.#checkoutId);
+    this.#db.transactionSync(() => {
+      this.#db.run("DELETE FROM git_index WHERE checkout_id = ?", this.#checkoutId);
+      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+    });
   }
 
   #applyIndexMutations(pending: readonly BufferedIndexMutation[]): void {
@@ -5939,14 +5923,15 @@ export class CheckoutStore {
     let first = true;
     const pending = new IndexMutationBuffer(flushEvery, (mutations) => {
       this.#db.transactionSync(() => {
-        if (first) this.indexClear();
+        if (first) this.#db.run("DELETE FROM git_index WHERE checkout_id = ?", this.#checkoutId);
         this.#applyIndexMutations(mutations);
+        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
       });
       first = false;
     });
     for (const entry of entries) pending.add(entry);
     pending.flush();
-    if (first) this.#db.transactionSync(() => this.indexClear());
+    if (first) this.indexClear();
   }
 
   /**
@@ -6013,6 +5998,7 @@ export class CheckoutStore {
     const pending = new IndexMutationBuffer(flushEvery, (mutations) => {
       this.#db.transactionSync(() => {
         this.#applyIndexMutations(mutations);
+        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
       });
     });
     const sink: IndexSink = {
@@ -6091,7 +6077,9 @@ export class CheckoutStore {
       }
     };
     this.#db.transactionSync(() => {
+      let mutated = false;
       for (const page of jsonPages(checked(remove), "shallow deletion")) {
+        mutated = true;
         this.#db.run(
           "DELETE FROM git_shallow WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
           this.#repoId,
@@ -6099,6 +6087,7 @@ export class CheckoutStore {
         );
       }
       for (const page of jsonPages(checked(add), "shallow update")) {
+        mutated = true;
         this.#db.run(
           `INSERT OR IGNORE INTO git_shallow (repo_id, oid)
            SELECT ?, value FROM json_each(?)`,
@@ -6106,6 +6095,7 @@ export class CheckoutStore {
           page,
         );
       }
+      if (mutated) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
     this.shared.invalidateShallow();
   }

@@ -566,7 +566,7 @@ describe("worktree prune", () => {
     workspace.storage.resetCounters();
     const pruned = worktreePrune(workspace.context, workspace.repo);
     expect(pruned).toHaveLength(1_023);
-    expect(workspace.storage.statementCount).toBe(5);
+    expect(workspace.storage.statementCount).toBe(6);
     expect(workspace.database.listCheckouts(workspace.repo.store.repoId)).toHaveLength(1);
   });
 });

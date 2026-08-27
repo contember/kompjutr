@@ -1,7 +1,11 @@
 import { isOid } from "../core/bytes.js";
-import { CorruptError } from "../core/errors.js";
+import { CorruptError, GitError } from "../core/errors.js";
 import { comparePaths } from "../core/streams.js";
 import type { SqlDatabase } from "./db.js";
+import {
+  bumpMaintenanceRootEpoch,
+  MAINTENANCE_ROOT_EPOCH_EXHAUSTED,
+} from "./maintenance/control.js";
 
 export const INDEX_DIRTY = 1;
 export const WORKTREE_DIRTY = 2;
@@ -58,16 +62,33 @@ function ownerRows(paths: string): string {
             )`;
 }
 
+function baselineInvalidationEpoch(checkoutIds: string): string {
+  const repositories = `SELECT DISTINCT checkout.repo_id
+    FROM git_checkouts checkout
+    JOIN git_index_state state ON state.checkout_id = checkout.id AND state.complete = 1
+    JOIN (${checkoutIds}) affected ON affected.checkout_id = checkout.id`;
+  return `SELECT CASE WHEN EXISTS (
+            SELECT 1 FROM (${repositories}) repository
+            JOIN git_maintenance_control control ON control.repo_id = repository.repo_id
+             WHERE control.root_epoch = ${Number.MAX_SAFE_INTEGER}
+          ) THEN RAISE(ABORT, '${MAINTENANCE_ROOT_EPOCH_EXHAUSTED}') END;
+          INSERT INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+          SELECT repo_id, 1, 1 FROM (${repositories}) WHERE true
+          ON CONFLICT(repo_id) DO UPDATE SET root_epoch = root_epoch + 1;`;
+}
+
 function worktreeJournal(paths: string): string {
   const owners = ownerRows(paths);
   const invalid = `(${invalidPathSql("relative")})
     OR relative = '.gitignore'
     OR substr(relative, -11) = '/.gitignore'`;
-  return `UPDATE git_index_state
+  const invalidOwners = `SELECT checkout_id FROM (${owners}) owners WHERE ${invalid}`;
+  return `${baselineInvalidationEpoch(invalidOwners)}
+          UPDATE git_index_state
              SET complete = 0
            WHERE complete = 1
              AND checkout_id IN (
-               SELECT checkout_id FROM (${owners}) owners WHERE ${invalid}
+               ${invalidOwners}
              );
           INSERT INTO git_index_dirty (checkout_id, path, flags)
           SELECT checkout_id, relative, ${WORKTREE_DIRTY}
@@ -85,7 +106,9 @@ function worktreeJournal(paths: string): string {
 
 function indexUpsert(row: "OLD" | "NEW", flags: number): string {
   const invalid = invalidPathSql(`${row}.path`);
-  return `UPDATE git_index_state
+  const invalidCheckout = `SELECT ${row}.checkout_id AS checkout_id WHERE ${invalid}`;
+  return `${baselineInvalidationEpoch(invalidCheckout)}
+          UPDATE git_index_state
              SET complete = 0
            WHERE checkout_id = ${row}.checkout_id AND complete = 1 AND (${invalid});
           INSERT INTO git_index_dirty (checkout_id, path, flags)
@@ -361,6 +384,29 @@ export function initializeIndexTracker(db: SqlDatabase): void {
         installed.get(TRIGGER_NAMES[index] ?? "") !== normalizedSql(definition),
     );
     if (replace) {
+      const exhausted = db.scalar<unknown>(
+        `SELECT EXISTS(
+           SELECT 1
+             FROM git_index_state state
+             JOIN git_checkouts checkout ON checkout.id = state.checkout_id
+             JOIN git_maintenance_control control ON control.repo_id = checkout.repo_id
+            WHERE state.complete = 1 AND control.root_epoch = ?
+            LIMIT 1
+         )`,
+        Number.MAX_SAFE_INTEGER,
+      );
+      if (exhausted !== 0 && exhausted !== 1) {
+        throw new CorruptError("index tracker epoch exhaustion probe is invalid");
+      }
+      if (exhausted === 1) throw new GitError("E2BIG", MAINTENANCE_ROOT_EPOCH_EXHAUSTED);
+      db.run(
+        `INSERT INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+         SELECT DISTINCT checkout.repo_id, 1, 1
+           FROM git_index_state state
+           JOIN git_checkouts checkout ON checkout.id = state.checkout_id
+          WHERE state.complete = 1
+         ON CONFLICT(repo_id) DO UPDATE SET root_epoch = root_epoch + 1`,
+      );
       db.run("UPDATE git_index_state SET complete = 0 WHERE complete = 1");
       for (const name of TRIGGER_NAMES) db.run(`DROP TRIGGER IF EXISTS ${name}`);
       for (const trigger of TRIGGERS) db.run(trigger);
@@ -484,13 +530,32 @@ export function iterateIndexTrackerDirty(
 
 export function invalidateIndexTracker(db: SqlDatabase, checkoutId: number): void {
   validateCheckoutId(checkoutId);
-  db.run(
-    `INSERT INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
-     VALUES (?, NULL, ?, 0)
-     ON CONFLICT (checkout_id) DO UPDATE SET complete = 0`,
-    checkoutId,
-    TRACKER_FORMAT,
-  );
+  db.transactionSync(() => {
+    const checkout = db.one<Record<string, unknown>>(
+      `SELECT checkout.repo_id, state.complete
+         FROM git_checkouts checkout
+         LEFT JOIN git_index_state state ON state.checkout_id = checkout.id
+        WHERE checkout.id = ?`,
+      checkoutId,
+    );
+    if (checkout === undefined) throw new CorruptError("index tracker checkout is missing");
+    if (
+      typeof checkout.repo_id !== "number" ||
+      !Number.isSafeInteger(checkout.repo_id) ||
+      checkout.repo_id < 1 ||
+      (checkout.complete !== null && checkout.complete !== 0 && checkout.complete !== 1)
+    ) {
+      throw new CorruptError("index tracker checkout state is malformed");
+    }
+    db.run(
+      `INSERT INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
+       VALUES (?, NULL, ?, 0)
+       ON CONFLICT (checkout_id) DO UPDATE SET complete = 0`,
+      checkoutId,
+      TRACKER_FORMAT,
+    );
+    if (checkout.complete === 1) bumpMaintenanceRootEpoch(db, checkout.repo_id);
+  });
 }
 
 /** Move only a complete tracker's baseline; the caller owns any outer transaction. */
@@ -503,25 +568,32 @@ export function advanceIndexTrackerBaseline(
   if (baselineTreeOid !== null && !isOid(baselineTreeOid)) {
     throw new CorruptError("invalid index tracker baseline tree");
   }
-  const row = db.one<Record<string, unknown>>(
-    `UPDATE git_index_state
-        SET baseline_tree_oid = ?
-      WHERE checkout_id = ? AND format = ? AND complete = 1
-      RETURNING checkout_id, baseline_tree_oid, format, complete`,
-    baselineTreeOid,
-    checkoutId,
-    TRACKER_FORMAT,
-  );
-  if (row === undefined) return false;
-  if (
-    row.checkout_id !== checkoutId ||
-    row.baseline_tree_oid !== baselineTreeOid ||
-    row.format !== TRACKER_FORMAT ||
-    row.complete !== 1
-  ) {
-    throw new CorruptError("index tracker baseline update returned malformed state");
-  }
-  return true;
+  return db.transactionSync(() => {
+    const row = db.one<Record<string, unknown>>(
+      `UPDATE git_index_state
+          SET baseline_tree_oid = ?
+        WHERE checkout_id = ? AND format = ? AND complete = 1
+        RETURNING checkout_id, baseline_tree_oid, format, complete`,
+      baselineTreeOid,
+      checkoutId,
+      TRACKER_FORMAT,
+    );
+    if (row === undefined) return false;
+    if (
+      row.checkout_id !== checkoutId ||
+      row.baseline_tree_oid !== baselineTreeOid ||
+      row.format !== TRACKER_FORMAT ||
+      row.complete !== 1
+    ) {
+      throw new CorruptError("index tracker baseline update returned malformed state");
+    }
+    const repoId = db.scalar<unknown>("SELECT repo_id FROM git_checkouts WHERE id = ?", checkoutId);
+    if (typeof repoId !== "number" || !Number.isSafeInteger(repoId) || repoId < 1) {
+      throw new CorruptError("index tracker baseline repository is invalid");
+    }
+    bumpMaintenanceRootEpoch(db, repoId);
+    return true;
+  });
 }
 
 export function resealIndexTracker(
@@ -536,8 +608,10 @@ export function resealIndexTracker(
   }
   return db.transactionSync(() => {
     const checkout = db.one<Record<string, unknown>>(
-      `SELECT checkout.root, checkout.repo_id
-         FROM git_checkouts checkout WHERE checkout.id = ?`,
+      `SELECT checkout.root, checkout.repo_id, state.complete AS previous_complete
+         FROM git_checkouts checkout
+         LEFT JOIN git_index_state state ON state.checkout_id = checkout.id
+        WHERE checkout.id = ?`,
       checkoutId,
     );
     if (checkout === undefined) return false;
@@ -553,7 +627,10 @@ export function resealIndexTracker(
       !Number.isSafeInteger(checkout.repo_id) ||
       checkout.repo_id < 1 ||
       typeof checkout.root !== "string" ||
-      !validRoot(checkout.root)
+      !validRoot(checkout.root) ||
+      (checkout.previous_complete !== null &&
+        checkout.previous_complete !== 0 &&
+        checkout.previous_complete !== 1)
     ) {
       throw new CorruptError("index tracker checkout row is malformed");
     }
@@ -563,7 +640,12 @@ export function resealIndexTracker(
         WHERE paths.path = ?`,
       checkout.root,
     );
-    if (root === undefined || root.type !== "dir") return false;
+    if (root === undefined || root.type !== "dir") {
+      if (checkout.previous_complete === 1) {
+        bumpMaintenanceRootEpoch(db, checkout.repo_id);
+      }
+      return false;
+    }
 
     db.run("DELETE FROM git_index_dirty WHERE checkout_id = ?", checkoutId);
     let page: IndexTrackerDirty[] = [];
@@ -597,6 +679,7 @@ export function resealIndexTracker(
       TRACKER_FORMAT,
       checkoutId,
     );
+    bumpMaintenanceRootEpoch(db, checkout.repo_id);
     return true;
   });
 }

@@ -38,7 +38,7 @@ const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
  * SQL statements one 2,000-file commit costs. Deterministic; see the scale
  * test. The trees and commit share one bounded object batch and cache write.
  */
-const SCALE_STATEMENTS = 24;
+const SCALE_STATEMENTS = 26;
 
 const fixtures: GitFixture[] = [];
 
@@ -881,7 +881,7 @@ describe("bounded commit tree acceleration", () => {
     );
     expect(queries).toContain("WITH wanted(path) AS MATERIALIZED");
     expect(queries).not.toContain("WITH wanted(path, recursive) AS MATERIALIZED");
-    expect(counts).toEqual({ statements: 31, rows: 126 });
+    expect(counts).toEqual({ statements: 35, rows: 129 });
     expect([
       ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ?? []),
     ]).toEqual([{ path: "dir/file-050.txt", flags: 3 }]);
@@ -1090,7 +1090,7 @@ describe("scale", () => {
     expect(statements).toBe(SCALE_STATEMENTS);
   });
 
-  it("commits 3,293 tree and commit objects within 25 statements", () => {
+  it("commits 3,293 tree and commit objects within 27 statements", () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     const workspace = makeRepo("/");
@@ -1123,6 +1123,6 @@ describe("scale", () => {
     expect(workspace.repo.readCommit(oid).tree).toBe(expectedTree);
     expect(oid).toBe(expectedCommit);
     expect(workspace.repo.store.objectCount() - before).toBe(3293);
-    expect(statements).toBe(25);
+    expect(statements).toBe(27);
   });
 });

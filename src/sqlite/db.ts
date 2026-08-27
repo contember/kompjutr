@@ -1,3 +1,5 @@
+import { rethrowMaintenanceRootEpochError } from "./maintenance/control.js";
+
 /** A structural subset of the Durable Object SQL cursor. */
 export interface SQLCursorLike<Row extends object = Record<string, unknown>> extends Iterable<Row> {
   toArray(): Row[];
@@ -102,7 +104,11 @@ export class Database implements SqlDatabase {
   }
 
   run(query: string, ...bindings: unknown[]): void {
-    this.sql.exec(query, ...bindings);
+    try {
+      this.sql.exec(query, ...bindings);
+    } catch (error) {
+      rethrowMaintenanceRootEpochError(error);
+    }
   }
 
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {

@@ -1154,7 +1154,7 @@ describe("refs, config and index", () => {
       refs.slice(0, 1_000),
       refs.slice(-1_000).map((ref) => ref.name),
     );
-    expect(db.storage.statementCount).toBeLessThanOrEqual(9);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(10);
     expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
       10_329,
     );
@@ -1171,12 +1171,12 @@ describe("refs, config and index", () => {
 
     db.storage.resetCounters();
     store.setShallow(oids);
-    expect(db.storage.statementCount).toBeLessThanOrEqual(5);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(6);
     expect(store.shallow().size).toBe(oids.length);
 
     db.storage.resetCounters();
     store.setShallow([], oids.slice(0, 1_000));
-    expect(db.storage.statementCount).toBeLessThanOrEqual(1);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(2);
     expect(store.shallow().size).toBe(oids.length - 1_000);
   });
 
