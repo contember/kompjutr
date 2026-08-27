@@ -801,13 +801,16 @@ describe("object batches", () => {
     const oids = store.writeObjects((batch) => objects.map((data) => batch.write("tree", data)));
 
     // Object storage and the parsed-tree index both stay constant in statements.
-    expect(inner.storage.statementCount).toBe(15);
+    expect(inner.storage.statementCount).toBe(16);
     // Four columns of multi-row VALUES would cap at 25 rows; the payload
     // form binds three parameters whatever the batch holds.
     expect(db.widestBindings).toBeLessThanOrEqual(100);
 
     // The count means nothing unless every object actually landed.
     expect(new Set(oids).size).toBe(objects.length);
+    expect(
+      inner.scalar<number>("SELECT COUNT(*) FROM git_loose_object_lifecycle WHERE repo_id = ?", 1),
+    ).toBe(objects.length);
     objects.forEach((data, at) => {
       expect(oids[at]).toBe(hashObject("tree", data));
       expect(store.read(oids[at]!)?.data).toEqual(data);

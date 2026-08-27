@@ -5,6 +5,8 @@ working tree, Git objects, refs, index, and received packs are all rows in the
 Durable Object's SQLite database. There is no `.git` directory and no external
 filesystem runtime.
 
+The project is still in development and has no production users, so backward compatibility, including schema migrations, is not required unless explicitly requested.
+
 ## Commands
 
 ```bash

@@ -12,9 +12,9 @@ windows.
 
 Planning was grounded at `4a95725`.
 
-- ✔ Git schema initialization accepts only exact schema v1, but schema v1 now
-  exists in the retained production probe — `src/sqlite/schema.ts:25`,
-  `docs/reference/production-probe.md:77`.
+- ✔ Git schema initialization accepts one exact development-only schema v1
+  baseline. It has no production-user compatibility contract and remains
+  directly editable — `src/sqlite/schema.ts:25`.
 - ✔ Loose objects have no creation timestamp; complete packs already do —
   `src/sqlite/schema.ts:345`, `src/sqlite/schema.ts:373`.
 - ✔ Pack ingest already stages invisible rows, validates the trailer, object
@@ -36,21 +36,19 @@ Planning was grounded at `4a95725`.
 
 ## Work units
 
-### WU1 — Freeze v1 and add the v2 migration seam (effort L)
+### WU1 — Extend the development-only v1 baseline with maintenance state (effort L)
 
-- **Problem.** The first deployed schema has no upgrade chain, and maintenance
-  needs durable lifecycle, run, mark, batch, and candidate rows.
-- **Verify first.** Prove exact-v1 validation, rollback behaviour, and the current
-  schema statement ceiling in `tests/schema.test.ts`.
-- **Scope.** Freeze the historical v1 catalog; create fresh databases directly at
-  v2; atomically validate and migrate populated v1 databases; add sidecar loose
-  birth metadata and bounded maintenance tables; backfill legacy loose births
-  incrementally at the current clock.
-- **Acceptance / witness.** Exact populated v1 data migrates without loss;
-  malformed v1 and injected late failure leave v1 untouched; reopen is
-  idempotent; every loose write path creates lifecycle metadata atomically.
-- **Touch points.** `src/sqlite/schema.ts`, new `src/sqlite/migrations.ts`, schema
-  and lifecycle tests.
+- **Problem.** Maintenance needs durable lifecycle, run, mark, batch, and
+  candidate rows in the exact schema baseline.
+- **Verify first.** Prove exact-v1 validation, initialization rollback, and the
+  current schema statement ceiling in `tests/schema.test.ts`.
+- **Scope.** Add sidecar loose birth metadata and bounded maintenance tables
+  directly to schema v1. Record lifecycle metadata in every loose write path.
+- **Acceptance / witness.** Fresh creation and reopen validate the exact v1
+  catalog; failed initialization leaves an empty database; every loose write
+  path creates lifecycle metadata atomically.
+- **Touch points.** `src/sqlite/schema.ts`, `src/sqlite/store.ts`, schema and
+  lifecycle tests.
 
 ### WU2 — Extract a bounded full-object pack pipeline (effort L)
 
@@ -181,8 +179,9 @@ Planning was grounded at `4a95725`.
 
 ## Decisions
 
-- Schema v1 is now historical. v2 uses a real atomic v1→v2 migration and an ADR;
-  direct edits to the v1 catalog are forbidden.
+- Schema v1 remains the one editable development-only baseline with no
+  production-user compatibility contract. This sprint adds maintenance state
+  directly and introduces no compatibility migration.
 - Maintenance uses restart-on-root-epoch-drift, not a long-lived repository write
   lock. Mutations stay available; sustained churn may delay collection safely.
 - Collection grace is a fixed 14 days after first complete unreachable
@@ -197,15 +196,15 @@ Planning was grounded at `4a95725`.
   authoritative object disappears.
 - Maintenance packs contain full objects. Physical delta bases in received packs
   remain protected with the whole pack. Only wholly unreachable packs are swept.
-- The migration, concurrency, grace, and pack-publication choices will be
-  recorded as ADRs before their implementation seams are frozen.
+- The concurrency, grace, and pack-publication choices will be recorded as ADRs
+  before their implementation seams are frozen.
 
 ## Sequencing
 
 | Wave | Units | Isolation and contract |
 |---|---|---|
-| 0 | WU1 | Serial shared seam: schema v2, migration, durable types, ADRs. |
-| 1 | WU2 + WU3 | Parallel after v2: pack pipeline owns pack files; roots owns store/root files. |
+| 0 | WU1 | Serial shared seam: schema v1 maintenance state, durable types, ADR. |
+| 1 | WU2 + WU3 | Parallel after the schema seam: pack pipeline owns pack files; roots owns store/root files. |
 | 2 | WU4 | Consumes the frozen root and direct-object contracts. |
 | 3 | WU5 + WU6 | Separate repack and sweep modules over the frozen coordinator state. |
 | 4 | WU7 + WU8 | Public integration, composed qualification, reference updates. |
@@ -227,7 +226,7 @@ cpu-lease run -n 2 -- npm run build
 
 ## Run log
 
-- 2026-08-27: Production probe made schema v1 historical; WU1 changed from a
-  baseline edit to a real v1→v2 migration.
+- 2026-08-27: Corrected the schema premise: v1 is a development-only baseline
+  with no production-user compatibility contract, so WU1 extends it directly.
 - 2026-08-27: Planning audit chose 14-day first-unreachable grace,
   restart-on-epoch concurrency, and whole-pack-only collection.

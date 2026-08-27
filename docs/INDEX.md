@@ -22,8 +22,9 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Repack and garbage collection is active. It starts with a deployed-schema v2
-  migration, then adds resumable marking, repacking, and grace-period sweep.
+- Repack and garbage collection is active. It extends the development-only
+  schema v1 baseline, which has no production-user compatibility contract, then
+  adds resumable marking, repacking, and grace-period sweep.
 - Concurrency/restart conformance follows this sprint.
 
 ## Key reference
@@ -48,6 +49,7 @@ decisions → reference → archive.
 - [`decisions/0008-retain-deleted-ref-history.md`](decisions/0008-retain-deleted-ref-history.md)
 - [`decisions/0009-split-shared-store-from-checkouts.md`](decisions/0009-split-shared-store-from-checkouts.md)
 - [`decisions/0010-require-valid-utf8-git-paths.md`](decisions/0010-require-valid-utf8-git-paths.md)
+- [`decisions/0012-run-maintenance-as-resumable-generations.md`](decisions/0012-run-maintenance-as-resumable-generations.md)
 
 ## Historical records
 
@@ -66,10 +68,10 @@ decisions → reference → archive.
   discovery, atomic redirects, and one measured retained-memory boundary.
 - [`archive/sprint-2026-08-26-multi-checkout-consumer-foundation.md`](archive/sprint-2026-08-26-multi-checkout-consumer-foundation.md)
   — one shared Git store, isolated linked checkouts, bounded consumer reads, and
-  one undeployed schema baseline.
+  one development-only schema baseline.
 - [`archive/sprint-2026-08-26-reflogs-and-ref-recovery.md`](archive/sprint-2026-08-26-reflogs-and-ref-recovery.md)
   — transactional bounded ref history, public CAS recovery, fixed retention
-  roots, and one undeployed Git schema baseline.
+  roots, and one development-only Git schema baseline.
 - [`archive/sprint-2026-08-26-e2e-journeys.md`](archive/sprint-2026-08-26-e2e-journeys.md)
   — a differential journey harness and six workflow files, plus the six
   divergences from Git they pinned.

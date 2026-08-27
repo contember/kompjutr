@@ -3346,6 +3346,7 @@ export class CheckoutStore {
     }
     const stored = looseEncoding(data.length);
     const storedData = encodeLoose(data, stored);
+    const createdMs = this.#nowMilliseconds();
     this.#db.transactionSync(() => {
       this.#db.run(
         "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
@@ -3354,6 +3355,13 @@ export class CheckoutStore {
         type,
         data.length,
         stored,
+      );
+      this.#db.run(
+        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+         VALUES (?, ?, ?)`,
+        this.#repoId,
+        oid,
+        createdMs,
       );
       this.#db.run(
         "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
@@ -3457,6 +3465,7 @@ export class CheckoutStore {
       if (toHex(storageHash.digest()) !== oid) {
         throw new CorruptError(`stream changed after hashing ${oid}`);
       }
+      const createdMs = this.#nowMilliseconds();
       this.#db.transactionSync(() => {
         this.#db.run(
           "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
@@ -3464,6 +3473,13 @@ export class CheckoutStore {
           oid,
           type,
           size,
+        );
+        this.#db.run(
+          `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+           VALUES (?, ?, ?)`,
+          this.#repoId,
+          oid,
+          createdMs,
         );
         this.#db.run(
           "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
@@ -3513,6 +3529,7 @@ export class CheckoutStore {
       rows.push(chunk);
     };
 
+    const createdMs = this.#nowMilliseconds();
     this.#db.transactionSync(() => {
       this.#db.run(
         "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
@@ -3520,6 +3537,13 @@ export class CheckoutStore {
         oid,
         type,
         size,
+      );
+      this.#db.run(
+        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+         VALUES (?, ?, ?)`,
+        this.#repoId,
+        oid,
+        createdMs,
       );
       this.#db.run(
         "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
@@ -3728,6 +3752,13 @@ export class CheckoutStore {
       }
 
       const oids = JSON.stringify(fresh.map((object) => object.oid));
+      this.#db.run(
+        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+         SELECT ?, value, ? FROM json_each(?)`,
+        this.#repoId,
+        this.#nowMilliseconds(),
+        oids,
+      );
       // The transaction keeps metadata invisible until all chunks and parsed
       // tree rows are ready, while RETURNING replaces a separate probe.
       this.#db.run(
@@ -6079,8 +6110,16 @@ export class CheckoutStore {
     this.shared.invalidateShallow();
   }
 
+  #nowMilliseconds(): number {
+    const now = this.#now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new GitError("EINVAL", "Git store clock must return non-negative integer milliseconds");
+    }
+    return now;
+  }
+
   #nowSeconds(): number {
-    return Math.floor(this.#now() / 1_000);
+    return Math.floor(this.#nowMilliseconds() / 1_000);
   }
 
   #genericRefLogMetadata(reason: string): RefLogMetadata {

@@ -24,3 +24,4 @@ a commit message suffices.
 - [0008 — Retain bounded deleted-ref history](0008-retain-deleted-ref-history.md) — accepted (2026-08-26)
 - [0009 — Split the shared Git store from checkouts](0009-split-shared-store-from-checkouts.md) — accepted (2026-08-26)
 - [0010 — Require valid UTF-8 Git paths](0010-require-valid-utf8-git-paths.md) — accepted (2026-08-26)
+- [0012 — Run maintenance as resumable generations](0012-run-maintenance-as-resumable-generations.md) — accepted (2026-08-27)
