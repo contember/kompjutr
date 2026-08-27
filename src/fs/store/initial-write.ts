@@ -670,7 +670,7 @@ class InitialWorktreeSessionImpl implements InitialWorktreeSession {
   }
 }
 
-/** Internal clone-only writer. Ordinary filesystem writes must not use this path. */
+/** Internal create-only writer for clone and eligible first checkout. */
 export class InitialWorktreeWriter {
   constructor(
     private readonly db: SqlDatabase,

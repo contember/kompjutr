@@ -12,6 +12,7 @@ import { comparePaths, joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import { resolveBranchUpstream } from "./branch-upstream.js";
 import { checkoutTree, matchesPaths, stageZero, type TargetEntry } from "./checkout.js";
+import { isInitialCheckoutFallback, tryInitialCheckout } from "./initial-checkout.js";
 import { selectMergeBases } from "./merge-base.js";
 import { treeOf } from "./reads.js";
 import { operationRefLogMetadata } from "./ref-log.js";
@@ -210,21 +211,47 @@ export function checkout(
     return;
   }
 
-  repo.store.db.transactionSync(() => {
-    const tracker = context.indexTracker;
-    if (tracker !== undefined && trySparseCleanCheckout(context, repo, worktree, tree)) {
-      moveHead(context, repo, options.ref, commit);
-      tracker.reseal(repo.checkout.checkoutId, tree, []);
-      return;
-    }
-
-    requireCheckoutAllowed(repo, worktree, tree, undefined, true, options.force === true);
-    checkoutTree(repo, worktree, tree, {
-      preserveMatchingIndex: options.force !== true,
-      restoreStructure: options.force === true,
+  try {
+    repo.store.db.transactionSync(() => {
+      if (
+        tryInitialCheckout(context, repo, tree, {
+          requireSharedDatabase: true,
+          fallbackOnCapacity: true,
+          afterMaterialize: () => moveHead(context, repo, options.ref, commit),
+        })
+      ) {
+        return;
+      }
+      const tracker = context.indexTracker;
+      if (tracker !== undefined && trySparseCleanCheckout(context, repo, worktree, tree)) {
+        moveHead(context, repo, options.ref, commit);
+        tracker.reseal(repo.checkout.checkoutId, tree, []);
+        return;
+      }
+      checkoutLegacy(context, repo, worktree, options, tree, commit);
     });
-    moveHead(context, repo, options.ref, commit);
+  } catch (error) {
+    if (!isInitialCheckoutFallback(error)) throw error;
+    repo.store.db.transactionSync(() => {
+      checkoutLegacy(context, repo, worktree, options, tree, commit);
+    });
+  }
+}
+
+function checkoutLegacy(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: CheckoutOptions,
+  tree: string,
+  commit: string,
+): void {
+  requireCheckoutAllowed(repo, worktree, tree, undefined, true, options.force === true);
+  checkoutTree(repo, worktree, tree, {
+    preserveMatchingIndex: options.force !== true,
+    restoreStructure: options.force === true,
   });
+  moveHead(context, repo, options.ref, commit);
 }
 
 function requireCheckoutAllowed(

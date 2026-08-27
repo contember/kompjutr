@@ -38,7 +38,7 @@ export interface InitialWorktreeSession {
 
 export type InitialWorktreeResult<T> = { kind: "committed"; value: T } | { kind: "unavailable" };
 
-/** Optional clone-only bulk writer. Core depends only on this structural seam. */
+/** Optional create-only bulk writer shared by clone and eligible first checkout. */
 export interface InitialWorktreeWriter {
   /** True only when writes share the supplied native Git database transaction. */
   supportsDatabase?(database: SqliteGitDatabase): boolean;

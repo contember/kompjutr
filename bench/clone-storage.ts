@@ -41,6 +41,7 @@ const LEASE_MARKER = "KOMPJUTR_CLONE_STORAGE_LEASED";
 const LEASE_VCPUS = 4;
 const LEASE_LOGICAL_CPUS = 2;
 const REPO = "/repo";
+const INITIAL_CHECKOUT_STATEMENT_BUDGET = 1_000;
 
 /**
  * Every table the runtime may create, mapped to the cost it belongs to.
@@ -420,10 +421,9 @@ async function runClone(
 }
 
 /**
- * The same clone, split at the seams the size question cares about. This is a
- * decomposition, not the clone path: `clone` has an initial-checkout fast path
- * that only a fresh repository can take, so the totals are reported side by
- * side instead of being assumed equal.
+ * The same clone, split at the seams the size question cares about. The final
+ * checkout shares clone's create-only materialiser, but the operation sequence
+ * differs, so totals are reported side by side instead of assumed equal.
  */
 async function runPhases(
   directory: string,
@@ -465,11 +465,16 @@ async function runPhases(
         });
       }),
     );
-    samples.push(
-      await measure(instance, "git.checkout", async () => {
-        await instance.git.checkout({ dir: REPO, ref: ORIGIN_BRANCH });
-      }),
-    );
+    const checkout = await measure(instance, "git.checkout", async () => {
+      await instance.git.checkout({ dir: REPO, ref: ORIGIN_BRANCH });
+    });
+    if (fixture.name === "nextjs" && checkout.statements >= INITIAL_CHECKOUT_STATEMENT_BUDGET) {
+      throw new Error(
+        `nextjs initial checkout used ${checkout.statements} statements, ` +
+          `expected fewer than ${INITIAL_CHECKOUT_STATEMENT_BUDGET}`,
+      );
+    }
+    samples.push(checkout);
     return { samples, facts: await checkoutFacts(instance) };
   } finally {
     instance.storage.db.close();
@@ -759,9 +764,9 @@ function markdown(results: readonly FixtureResult[], environment: object): strin
       "",
       "### Decomposed clone",
       "",
-      "`init` → `fetch` → `updateRef` → `checkout`, in a separate database. This is a",
-      "decomposition, not the clone path: `clone` takes an initial-checkout fast path a",
-      "fresh repository alone can take.",
+      "`init` → `fetch` → `updateRef` → `checkout`, in a separate database. The final",
+      "phase exercises standalone initial checkout because its root and every index stage",
+      "are still empty; `nextjs` must complete it in fewer than 1,000 SQL statements.",
       "",
       ...phaseTable(result),
       "",

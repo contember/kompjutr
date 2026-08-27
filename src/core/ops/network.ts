@@ -6,9 +6,9 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import { type InitialStateSession, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
-import { fromHex, isOid } from "../bytes.js";
-import type { GitContext, IndexTrackerSeedEntry, InitialWorktreeSession } from "../context.js";
+import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { isOid } from "../bytes.js";
+import type { GitContext } from "../context.js";
 import { AlreadyInitializedError, CorruptError, GitError } from "../errors.js";
 import { type ObjectType, parseTag, type RawObject } from "../objects.js";
 import { normalizePath } from "../paths.js";
@@ -22,23 +22,12 @@ import {
 } from "../protocol/remote.js";
 import { type AuthCallback, RemoteAuthSession } from "../protocol/transport.js";
 import { Repository } from "../repository.js";
-import { fileModeFor } from "../worktree.js";
 import { checkoutTree } from "./checkout.js";
+import { isInitialCheckoutFallback, tryInitialCheckout } from "./initial-checkout.js";
 import { operationRefLogMetadata } from "./ref-log.js";
-import { type TargetEntry, treeStream } from "./tree-stream.js";
 
 /** How many commits back from each local tip are offered as `have`s. */
 const HAVE_BUDGET = 256;
-const INITIAL_CLONE_WINDOW_ROWS = 1_000;
-const INITIAL_CLONE_BLOB_BYTES = MAX_BLOB_BATCH_BYTES;
-const INITIAL_CLONE_SMALL_FILE_BYTES = 1024 * 1024;
-const INITIAL_CLONE_TRACKER_ROWS = 32_000;
-const INITIAL_CLONE_TRACKER_BYTES = 4 * 1024 * 1024;
-const INITIAL_CLONE_TRACKER_FIXED_BYTES = 64 * 1024;
-const INITIAL_CLONE_TRACKER_ROW_BYTES = 128;
-const INITIAL_CLONE_INDEX_DIRTY = 1;
-const INITIAL_CLONE_READ_FALLBACK = Symbol("initial clone blob exceeds batch budget");
-const initialCloneTextDecoder = new TextDecoder();
 const TAG_OBJECT_PAGE = 4_096;
 const TAG_PEEL_HOPS = 16;
 const TAG_AUTH_BYTES = 64 * 1024 * 1024;
@@ -556,128 +545,11 @@ export async function fetchInto(
   };
 }
 
-function directErrorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = Reflect.get(error, "code");
-  return typeof code === "string" ? code : undefined;
-}
-
-function readInitialCloneBlobs(repo: Repository, entries: readonly TargetEntry[]) {
-  try {
-    return repo.readBlobs(
-      entries.map((entry) => entry.oid),
-      { budgetBytes: INITIAL_CLONE_BLOB_BYTES },
-    );
-  } catch (error) {
-    if (directErrorCode(error) === "EFBIG") throw INITIAL_CLONE_READ_FALLBACK;
-    throw error;
-  }
-}
-
-function writeInitialCloneEntry(
-  worktree: InitialWorktreeSession,
-  index: InitialStateSession,
-  entry: TargetEntry,
-  data: Uint8Array,
-): void {
-  const contentId = fromHex(entry.oid);
-  if (entry.mode === "120000") {
-    worktree.writeSymlink(entry.path, initialCloneTextDecoder.decode(data), { contentId });
-  } else if (data.length <= INITIAL_CLONE_SMALL_FILE_BYTES) {
-    worktree.writeFile(entry.path, data, { mode: fileModeFor(entry.mode), contentId });
-  } else {
-    worktree.writeFileStream(entry.path, data.length, [data], {
-      mode: fileModeFor(entry.mode),
-      contentId,
-    });
-  }
-  index.put({
-    path: entry.path,
-    stage: 0,
-    mode: Number.parseInt(entry.mode, 8),
-    oid: entry.oid,
-    size: data.length,
-    mtime: null,
-    ino: null,
-  });
-  index.addBlobId({ contentId, oid: entry.oid });
-}
-
-function flushInitialCloneWindow(
-  repo: Repository,
-  worktree: InitialWorktreeSession,
-  index: InitialStateSession,
-  window: TargetEntry[],
-): void {
-  let pending = window.splice(0, window.length);
-  while (pending.length > 0) {
-    const { blobs } = readInitialCloneBlobs(repo, pending);
-    let processed = 0;
-    while (processed < pending.length) {
-      const entry = pending[processed]!;
-      const data = blobs.get(entry.oid);
-      if (data === undefined) break;
-      writeInitialCloneEntry(worktree, index, entry, data);
-      processed++;
-    }
-    if (processed === 0) throw new CorruptError("initial clone blob batch made no progress");
-    pending = pending.slice(processed);
-  }
-}
-
-function writeInitialClone(
-  repo: Repository,
-  treeOid: string,
-  worktree: InitialWorktreeSession,
-  index: InitialStateSession,
-): IndexTrackerSeedEntry[] | null {
-  const window: TargetEntry[] = [];
-  let trackerSeed: IndexTrackerSeedEntry[] | null = [];
-  let trackerSeedBytes = INITIAL_CLONE_TRACKER_FIXED_BYTES;
-  for (const entry of treeStream(repo, treeOid)) {
-    if (entry.mode === "160000") {
-      if (trackerSeed !== null) {
-        const retainedBytes = INITIAL_CLONE_TRACKER_ROW_BYTES + entry.path.length * 2;
-        if (
-          trackerSeed.length === INITIAL_CLONE_TRACKER_ROWS ||
-          trackerSeedBytes > INITIAL_CLONE_TRACKER_BYTES - retainedBytes
-        ) {
-          trackerSeed = null;
-        } else {
-          trackerSeed.push({ path: entry.path, flags: INITIAL_CLONE_INDEX_DIRTY });
-          trackerSeedBytes += retainedBytes;
-        }
-      }
-      continue;
-    }
-    window.push(entry);
-    if (window.length === INITIAL_CLONE_WINDOW_ROWS) {
-      flushInitialCloneWindow(repo, worktree, index, window);
-    }
-  }
-  flushInitialCloneWindow(repo, worktree, index, window);
-  return trackerSeed;
-}
-
 function tryInitialClone(context: GitContext, repo: Repository, treeOid: string): boolean {
-  const writer = context.initialWorktree;
-  if (writer === undefined) return false;
   try {
-    const worktree = writer.tryRun(
-      repo.root,
-      (worktreeSession) =>
-        repo.checkout.tryCreateInitialState((indexSession) =>
-          writeInitialClone(repo, treeOid, worktreeSession, indexSession),
-        ),
-      (state) => {
-        if (state.available && state.value !== null && context.indexTracker !== undefined) {
-          context.indexTracker.reseal(repo.checkout.checkoutId, treeOid, state.value);
-        }
-      },
-    );
-    return worktree.kind === "committed" && worktree.value.available;
+    return tryInitialCheckout(context, repo, treeOid);
   } catch (error) {
-    if (error === INITIAL_CLONE_READ_FALLBACK) return false;
+    if (isInitialCheckoutFallback(error)) return false;
     throw error;
   }
 }

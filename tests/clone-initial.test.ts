@@ -323,6 +323,24 @@ describe("clone initial-state fast path", () => {
       expect(count(failing, "git_repositories")).toBe(0);
       expect(failing.filesystem.stat("/repo")).toBeNull();
       expect(failingStorage.walkStatements).toBe(0);
+
+      const injectedCapacity = new GitError("E2BIG", "injected writer capacity failure");
+      const capacityFactory: GitFactory = (binding) => {
+        const failing: InitialWorktreeWriter = {
+          tryRun() {
+            throw injectedCapacity;
+          },
+        };
+        return createGit()({ ...binding, initialWorktree: failing });
+      };
+      const capacityStorage = new RecordingStorage();
+      const capacity = makeRuntime(capacityStorage, capacityFactory);
+      await expect(capacity.git.clone({ url: server.url, dir: "/repo" })).rejects.toBe(
+        injectedCapacity,
+      );
+      expect(count(capacity, "git_repositories")).toBe(0);
+      expect(capacity.filesystem.stat("/repo")).toBeNull();
+      expect(capacityStorage.walkStatements).toBe(0);
     } finally {
       await server.close();
       fixture.dispose();
