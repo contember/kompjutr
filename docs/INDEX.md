@@ -15,14 +15,16 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- None.
+- [`sprints/sprint-2026-08-27-concurrency-and-restart-conformance.md`](sprints/sprint-2026-08-27-concurrency-and-restart-conformance.md)
+  — deterministic async operation pairs and cold restart boundaries.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Concurrency/restart conformance is next. It qualifies operation pairs and
-  durable restart boundaries against the shipped maintenance lifecycle.
+- Concurrency/restart conformance is active. It qualifies the five real async
+  operations against shared refs, index, worktree, journals, packs, and
+  maintenance state.
 
 ## Key reference
 
