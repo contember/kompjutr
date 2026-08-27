@@ -104,6 +104,77 @@ class ExplainSnapshotDatabase implements SqlDatabase {
   }
 }
 
+class ExplainIndexAncestorDatabase implements SqlDatabase {
+  readonly details: string[] = [];
+  query = "";
+
+  constructor(private readonly delegate: SqlDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    if (query.includes("exact_index_ancestor_rows")) {
+      this.query = query;
+      for (const row of this.delegate.all<{ detail: unknown }>(
+        `EXPLAIN QUERY PLAN ${query}`,
+        ...bindings,
+      )) {
+        if (typeof row.detail === "string") this.details.push(row.detail);
+      }
+    }
+    yield* this.delegate.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
+
+class RecordingIndexAncestorDatabase implements SqlDatabase {
+  query = "";
+
+  constructor(private readonly delegate: SqlDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    if (query.includes("index_ancestor_rows")) this.query = query;
+    yield* this.delegate.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
+
 class RecordingTreeDepthDatabase implements SqlDatabase {
   readonly payloads: string[] = [];
 
@@ -522,6 +593,356 @@ describe("SQLite sparse workspace source", () => {
         specs: [{ path: "dir/b.txt", recursive: false }],
       }),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("resolves exact stages and descendant witnesses through primary-key searches", () => {
+    const workspace = makeRepo("/");
+    const oid = "1".repeat(40);
+    for (const path of ["a", "a/b"]) {
+      workspace.repo.checkout.indexPut({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+    for (const stage of [1, 2, 3]) {
+      workspace.repo.checkout.indexPut({
+        path: "conflict",
+        stage,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+    const explained = new ExplainIndexAncestorDatabase(workspace.database.db);
+    const lookup = createSqliteSparseWorkspaceSource(explained).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+
+    expect(
+      lookup({
+        checkoutId: workspace.repo.checkout.checkoutId,
+        ancestors: ["a", "conflict", "missing"],
+      }).facts,
+    ).toEqual([
+      { path: "a", exact: true, descendant: true },
+      { path: "conflict", exact: true, descendant: false },
+      { path: "missing", exact: false, descendant: false },
+    ]);
+    expect(explained.query).toContain("exact_index_ancestor_rows");
+    expect(
+      explained.details.some(
+        (detail) =>
+          detail.includes(
+            "SEARCH exact_candidate USING COVERING INDEX sqlite_autoindex_git_index_1",
+          ) &&
+          detail.includes("checkout_id=") &&
+          detail.includes("path="),
+      ),
+      explained.details.join("\n"),
+    ).toBe(true);
+    expect(
+      explained.details.some(
+        (detail) =>
+          detail.includes(
+            "SEARCH descendant_candidate USING COVERING INDEX sqlite_autoindex_git_index_1",
+          ) &&
+          detail.includes("checkout_id=") &&
+          detail.includes("path>"),
+      ),
+      explained.details.join("\n"),
+    ).toBe(true);
+    expect(
+      explained.details.some((detail) =>
+        /SCAN (candidate|exact_candidate|descendant_candidate)(?:\s|$)/.test(detail),
+      ),
+      explained.details.join("\n"),
+    ).toBe(false);
+  });
+
+  it("keeps one hundred exact probes independent of a 24,252-row index", () => {
+    const workspace = makeRepo("/");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    workspace.database.db.run(
+      `WITH RECURSIVE sequence(value) AS (
+         VALUES (0)
+         UNION ALL SELECT value + 1 FROM sequence WHERE value < 24251
+       )
+       INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
+       SELECT ?, printf('p%03d/f%03d.ts', value / 243, value % 243), 0, 33188, ?,
+              NULL, NULL, NULL, NULL
+         FROM sequence`,
+      checkoutId,
+      "1".repeat(40),
+    );
+    const paths = Array.from({ length: 100 }, (_, index) => {
+      const value = index * 243;
+      return `p${Math.floor(value / 243)
+        .toString()
+        .padStart(3, "0")}/f${(value % 243).toString().padStart(3, "0")}.ts`;
+    });
+    const recorded = new RecordingIndexAncestorDatabase(workspace.database.db);
+    const lookup = createSqliteSparseWorkspaceSource(recorded).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+
+    const result = lookup({ checkoutId, ancestors: paths });
+
+    expect(result.facts).toEqual(paths.map((path) => ({ path, exact: true, descendant: false })));
+    expect(workspace.storage.statementCount).toBe(1);
+    expect(workspace.storage.rowCount).toBe(100);
+    expect(recorded.query).toContain("exact_index_ancestor_rows");
+  });
+
+  it.each([
+    ["exact", "a"],
+    ["descendant", "a/b"],
+  ])("rejects a BLOB-backed %s index witness", (_label, storedPath) => {
+    const workspace = makeRepo("/");
+    workspace.repo.checkout.indexPut({
+      path: storedPath,
+      stage: 0,
+      mode: 0o100644,
+      oid: "1".repeat(40),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    workspace.database.db.run(
+      "UPDATE git_index SET path = CAST(path AS BLOB) WHERE checkout_id = ? AND path = ?",
+      workspace.repo.checkout.checkoutId,
+      storedPath,
+    );
+    const recorded = new RecordingIndexAncestorDatabase(workspace.database.db);
+    const lookup = createSqliteSparseWorkspaceSource(recorded).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+
+    expect(() =>
+      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["a"] }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("fully validates exact and descendant index witnesses", () => {
+    for (const storedPath of ["a", "a/b"]) {
+      const workspace = makeRepo("/");
+      workspace.repo.checkout.indexPut({
+        path: storedPath,
+        stage: 0,
+        mode: 0o100644,
+        oid: "1".repeat(40),
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+      workspace.database.db.run(
+        "UPDATE git_index SET oid = 'bad' WHERE checkout_id = ? AND path = ?",
+        workspace.repo.checkout.checkoutId,
+        storedPath,
+      );
+      const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
+      if (lookup === undefined) throw new Error("missing index ancestor source");
+
+      expect(() =>
+        lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["a"] }),
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    }
+  });
+
+  it.each([
+    ["exact", "a", -1],
+    ["exact", "a", 4],
+    ["exact", "a", "bad"],
+    ["descendant", "a/z-invalid", -1],
+    ["descendant", "a/z-invalid", 4],
+    ["descendant", "a/z-invalid", "bad"],
+  ])("rejects a hidden %s index row at %s with stage %s", (_kind, corruptPath, stage) => {
+    const workspace = makeRepo("/");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    const oid = "1".repeat(40);
+    for (const path of ["a", "a/a-valid"]) {
+      workspace.repo.checkout.indexPut({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+    workspace.database.db.run(
+      `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
+       VALUES (?, ?, ?, ?, ?)`,
+      checkoutId,
+      corruptPath,
+      stage,
+      0o100644,
+      oid,
+    );
+    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+
+    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
+  it.each([
+    [
+      "path",
+      "UPDATE git_index SET path = 'a/z/../bad' WHERE checkout_id = ? AND path = 'a/z-invalid'",
+    ],
+    ["mode", "UPDATE git_index SET mode = 'bad' WHERE checkout_id = ? AND path = 'a/z-invalid'"],
+    ["oid", "UPDATE git_index SET oid = 'bad' WHERE checkout_id = ? AND path = 'a/z-invalid'"],
+    ["stat", "UPDATE git_index SET size = -1 WHERE checkout_id = ? AND path = 'a/z-invalid'"],
+  ])("rejects malformed later descendant %s after a valid witness", (_field, corruption) => {
+    const workspace = makeRepo("/");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    for (const path of ["a/a-valid", "a/z-invalid"]) {
+      workspace.repo.checkout.indexPut({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid: "1".repeat(40),
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+    workspace.database.db.run(corruption, checkoutId);
+    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+
+    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
+  it("rejects invalid UTF-8 in a later descendant before returning facts", () => {
+    const workspace = makeRepo("/");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    workspace.repo.checkout.indexPut({
+      path: "a/a-valid",
+      stage: 0,
+      mode: 0o100644,
+      oid: "1".repeat(40),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    workspace.database.db.run("PRAGMA foreign_keys = OFF");
+    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
+    try {
+      workspace.database.db.run(
+        `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
+         VALUES (?, CAST(X'612F7A2F80' AS TEXT), 0, 33188, ?)`,
+        checkoutId,
+        "1".repeat(40),
+      );
+    } finally {
+      workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
+      workspace.database.db.run("PRAGMA foreign_keys = ON");
+    }
+    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+
+    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
+  it("bounds descendant integrity at the exact row limit and first excess", () => {
+    const workspace = makeRepo("/");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    workspace.database.db.run(
+      `WITH RECURSIVE sequence(value) AS (
+         VALUES (0)
+         UNION ALL SELECT value + 1 FROM sequence WHERE value < 5999
+       )
+       INSERT INTO git_index (checkout_id, path, stage, mode, oid)
+       SELECT ?, printf('a/f%04d', value), 0, 33188, ? FROM sequence`,
+      checkoutId,
+      "1".repeat(40),
+    );
+    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+
+    expect(lookup({ checkoutId, ancestors: ["a"] }).facts).toEqual([
+      { path: "a", exact: false, descendant: true },
+    ]);
+    workspace.database.db.run(
+      `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
+       VALUES (?, 'a/f6000', 0, 33188, ?)`,
+      checkoutId,
+      "1".repeat(40),
+    );
+    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+  });
+
+  it("uses the exact branch through 1000 paths and the general branch at first excess", () => {
+    const workspace = makeRepo("/");
+    const recorded = new RecordingIndexAncestorDatabase(workspace.database.db);
+    const lookup = createSqliteSparseWorkspaceSource(recorded).indexAncestorFacts;
+    if (lookup === undefined) throw new Error("missing index ancestor source");
+    workspace.storage.histogram = new Map();
+    const paths = Array.from(
+      { length: 1_001 },
+      (_, index) => `p${index.toString().padStart(4, "0")}`,
+    );
+
+    workspace.storage.resetCounters();
+    const exact = lookup({
+      checkoutId: workspace.repo.checkout.checkoutId,
+      ancestors: paths.slice(0, 1_000),
+    });
+    expect(exact.facts).toHaveLength(1_000);
+    expect(workspace.storage.statementCount).toBe(1);
+    expect(workspace.storage.rowCount).toBe(1_000);
+    expect(recorded.query).toContain("exact_index_ancestor_rows");
+
+    workspace.storage.resetCounters();
+    recorded.query = "";
+    expect(
+      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: paths }).facts,
+    ).toHaveLength(1_001);
+    expect(workspace.storage.statementCount).toBe(1);
+    expect(recorded.query).toContain("index_ancestor_rows");
+    expect(recorded.query).not.toContain("exact_index_ancestor_rows");
+
+    expect(
+      lookup({
+        checkoutId: workspace.repo.checkout.checkoutId,
+        ancestors: paths.slice(0, 1_000),
+        maxRetainedBytes: exact.retainedBytes,
+      }).facts,
+    ).toHaveLength(1_000);
+    workspace.storage.resetCounters();
+    expect(() =>
+      lookup({
+        checkoutId: workspace.repo.checkout.checkoutId,
+        ancestors: paths.slice(0, 1_000),
+        maxRetainedBytes: exact.retainedBytes - 1,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.storage.statementCount).toBe(0);
+
+    const escaped = Array.from(
+      { length: 1_000 },
+      (_, index) => `q${index.toString().padStart(4, "0")}${"\u0001".repeat(175)}`,
+    );
+    workspace.storage.resetCounters();
+    expect(() =>
+      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: escaped }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.storage.statementCount).toBe(0);
   });
 
   it("falls back for symlink ancestors and bounds selected request count", () => {

@@ -35,6 +35,8 @@ const MAX_DEPTH = 64;
 const MAX_EDGE_STEPS = 32_768;
 const MAX_INDEX_ANCESTORS = 32_768;
 const MAX_INDEX_ANCESTOR_ROWS = 32_768;
+const MAX_EXACT_INDEX_ANCESTORS = 1_000;
+const MAX_EXACT_INDEX_ANCESTOR_ROWS = MAX_EXACT_INDEX_ANCESTORS * 6;
 const MAX_SELECTED_ROWS = 32_768;
 const MAX_SELECTED_EXACT_ANCESTORS = 32_768;
 const MAX_SNAPSHOT_DIRECTORIES = 1_000;
@@ -1061,6 +1063,89 @@ SELECT wanted.ordinal, wanted.path AS wanted_path,
  ORDER BY wanted.ordinal, index_ancestor_rows.association,
           index_ancestor_rows.path, index_ancestor_rows.stage`;
 
+const EXACT_INDEX_ANCESTOR_FACTS_SQL = `WITH wanted(ordinal, path) AS MATERIALIZED (
+  SELECT CAST(key AS INTEGER), value FROM json_each(?)
+), settings(checkout_id) AS (
+  VALUES (?)
+), exact_index_ancestor_rows(
+  ordinal, association, checkout_id, path, stage, mode, oid, size, mtime, ino, rev
+) AS MATERIALIZED (
+  SELECT wanted.ordinal, 0, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    CROSS JOIN settings
+    CROSS JOIN git_index candidate
+   WHERE candidate.rowid IN (
+       SELECT exact_candidate.rowid FROM git_index exact_candidate
+        WHERE exact_candidate.checkout_id = settings.checkout_id
+          AND exact_candidate.path = wanted.path
+        ORDER BY exact_candidate.path, exact_candidate.stage LIMIT 5
+     )
+  UNION ALL
+  SELECT wanted.ordinal, 0, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    CROSS JOIN settings
+    CROSS JOIN git_index candidate
+   WHERE candidate.rowid IN (
+       SELECT exact_candidate.rowid FROM git_index exact_candidate
+        WHERE exact_candidate.checkout_id = settings.checkout_id
+          AND exact_candidate.path = CAST(wanted.path AS BLOB)
+        ORDER BY exact_candidate.path, exact_candidate.stage LIMIT 1
+     )
+  UNION ALL
+  SELECT wanted.ordinal, 1, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    CROSS JOIN settings
+    CROSS JOIN git_index candidate
+   WHERE candidate.rowid IN (
+       SELECT descendant_candidate.rowid FROM git_index descendant_candidate
+        WHERE descendant_candidate.checkout_id = settings.checkout_id
+          AND descendant_candidate.path COLLATE BINARY >= wanted.path || '/'
+          AND descendant_candidate.path COLLATE BINARY < wanted.path || '0'
+        ORDER BY descendant_candidate.path, descendant_candidate.stage
+        LIMIT ${MAX_EXACT_INDEX_ANCESTOR_ROWS + 1}
+     )
+  UNION ALL
+  SELECT wanted.ordinal, 1, candidate.checkout_id, candidate.path, candidate.stage,
+         candidate.mode, candidate.oid, candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted
+    CROSS JOIN settings
+    CROSS JOIN git_index candidate
+   WHERE candidate.rowid IN (
+       SELECT descendant_candidate.rowid FROM git_index descendant_candidate
+        WHERE descendant_candidate.checkout_id = settings.checkout_id
+          AND descendant_candidate.path >= CAST(wanted.path || '/' AS BLOB)
+          AND descendant_candidate.path < CAST(wanted.path || '0' AS BLOB)
+        ORDER BY descendant_candidate.path, descendant_candidate.stage
+        LIMIT ${MAX_EXACT_INDEX_ANCESTOR_ROWS + 1}
+     )
+  LIMIT ${MAX_EXACT_INDEX_ANCESTOR_ROWS + 1}
+)
+SELECT wanted.ordinal, wanted.path AS wanted_path,
+       typeof(wanted.path) AS wanted_path_type,
+       length(CAST(wanted.path AS BLOB)) AS wanted_path_bytes,
+       exact_index_ancestor_rows.association,
+       CASE WHEN exact_index_ancestor_rows.checkout_id IS NULL THEN 0 ELSE 1 END AS row_present,
+       exact_index_ancestor_rows.path,
+       typeof(exact_index_ancestor_rows.path) AS path_type,
+       length(CAST(exact_index_ancestor_rows.path AS BLOB)) AS path_bytes,
+       exact_index_ancestor_rows.stage, typeof(exact_index_ancestor_rows.stage) AS stage_type,
+       exact_index_ancestor_rows.mode, typeof(exact_index_ancestor_rows.mode) AS mode_type,
+       exact_index_ancestor_rows.oid, typeof(exact_index_ancestor_rows.oid) AS oid_type,
+       exact_index_ancestor_rows.size, exact_index_ancestor_rows.mtime,
+       exact_index_ancestor_rows.ino, exact_index_ancestor_rows.rev,
+       typeof(exact_index_ancestor_rows.size) AS size_type,
+       typeof(exact_index_ancestor_rows.mtime) AS mtime_type,
+       typeof(exact_index_ancestor_rows.ino) AS ino_type,
+       typeof(exact_index_ancestor_rows.rev) AS rev_type
+  FROM wanted
+  LEFT JOIN exact_index_ancestor_rows
+    ON exact_index_ancestor_rows.ordinal = wanted.ordinal
+ ORDER BY wanted.ordinal, exact_index_ancestor_rows.association,
+          exact_index_ancestor_rows.path, exact_index_ancestor_rows.stage`;
+
 function indexAncestorFacts(
   db: SqlDatabase,
   request: SparseIndexAncestorRequest,
@@ -1073,16 +1158,24 @@ function indexAncestorFacts(
     exact: false,
     descendant: false,
   }));
+  const exactRequest = validated.request.ancestors.length <= MAX_EXACT_INDEX_ANCESTORS;
+  const query = exactRequest ? EXACT_INDEX_ANCESTOR_FACTS_SQL : INDEX_ANCESTOR_FACTS_SQL;
+  const bindings = exactRequest
+    ? [validated.json, validated.request.checkoutId]
+    : [
+        validated.json,
+        validated.request.checkoutId,
+        validated.request.checkoutId,
+        validated.request.checkoutId,
+        validated.request.checkoutId,
+      ];
+  const candidateLimit = exactRequest ? MAX_EXACT_INDEX_ANCESTOR_ROWS : MAX_INDEX_ANCESTOR_ROWS;
   let candidateRows = 0;
   let lastOrdinal = -1;
-  for (const row of db.iterate(
-    INDEX_ANCESTOR_FACTS_SQL,
-    validated.json,
-    validated.request.checkoutId,
-    validated.request.checkoutId,
-    validated.request.checkoutId,
-    validated.request.checkoutId,
-  )) {
+  let previousAssociation = -1;
+  let previousPath: string | null = null;
+  let previousStage = -1;
+  for (const row of db.iterate(query, ...bindings)) {
     const ordinal = numberField(row.ordinal);
     const wantedPathBytes = numberField(row.wanted_path_bytes);
     const expected = ordinal === null ? undefined : validated.request.ancestors[ordinal];
@@ -1103,17 +1196,27 @@ function indexAncestorFacts(
     ) {
       throw new CorruptError("sparse index ancestor lookup returned a malformed row");
     }
-    lastOrdinal = ordinal;
     const present = numberField(row.row_present);
     if (present !== 0 && present !== 1) {
       throw new CorruptError("sparse index ancestor lookup returned invalid row presence");
     }
-    if (present === 0) continue;
+    if (ordinal !== lastOrdinal) {
+      previousAssociation = -1;
+      previousPath = null;
+      previousStage = -1;
+    }
+    lastOrdinal = ordinal;
+    if (present === 0) {
+      if (row.association !== null || previousAssociation !== -1) {
+        throw new CorruptError("sparse index ancestor lookup returned invalid cardinality");
+      }
+      continue;
+    }
 
     const entry = validatedSparseIndexEntry(row);
     candidateRows++;
-    if (candidateRows > MAX_INDEX_ANCESTOR_ROWS) {
-      throw tooLarge(`sparse index ancestor lookup exceeds ${MAX_INDEX_ANCESTOR_ROWS} rows`);
+    if (candidateRows > candidateLimit) {
+      throw tooLarge(`sparse index ancestor lookup exceeds ${candidateLimit} rows`);
     }
     const association = numberField(row.association);
     const fact = facts[ordinal];
@@ -1121,10 +1224,18 @@ function indexAncestorFacts(
       fact === undefined ||
       (association !== 0 && association !== 1) ||
       (association === 0 && entry.path !== expected) ||
-      (association === 1 && !entry.path.startsWith(`${expected}/`))
+      (association === 1 && !entry.path.startsWith(`${expected}/`)) ||
+      association < previousAssociation ||
+      (association === previousAssociation &&
+        previousPath !== null &&
+        (comparePaths(previousPath, entry.path) > 0 ||
+          (previousPath === entry.path && previousStage >= entry.stage)))
     ) {
       throw new CorruptError("sparse index ancestor lookup returned an unrelated index row");
     }
+    previousAssociation = association;
+    previousPath = entry.path;
+    previousStage = entry.stage;
     if (association === 0) fact.exact = true;
     else fact.descendant = true;
   }
