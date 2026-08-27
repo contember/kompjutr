@@ -3,13 +3,19 @@
 
 import { MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
-import { GitError, MissingIdentityError } from "../errors.js";
+import { GitError, hasErrorCode, MissingIdentityError } from "../errors.js";
 import { type Commit, hashObject, type Person, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import type { CommitResult } from "./kinds.js";
 import { MAX_MERGE_IDENTITY_BYTES, MAX_MERGE_MESSAGE_BYTES } from "./merge-state.js";
 import { committerRefLogMetadata, type RefLogReason } from "./ref-log.js";
-import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js";
+import {
+  buildTreeInBatch,
+  planSparseTreeBuild,
+  type SparseTreeBuildPlan,
+  type TreeBuildPreflightStats,
+  writeSparseTreePlanInBatch,
+} from "./tree-build.js";
 
 const OBJECT_BATCH_BYTES = 1024 * 1024;
 const OBJECT_BATCH_COUNT = 4_096;
@@ -53,6 +59,7 @@ export interface UnpublishedCommitResult {
 }
 
 type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
+type PublishedCommitContext = Pick<GitContext, "commitTrees" | "indexTracker">;
 
 /** Conservatively account for one bounded index-tree and commit materialization. */
 export function commitMaterializationSqlStatements(stats: TreeBuildPreflightStats): number {
@@ -95,12 +102,9 @@ export function commit(
     const head = repo.head();
     const amended = options.amend === true ? readAmended(repo, head) : undefined;
     const parent = amended !== undefined ? amended.parent : head.oid === null ? [] : [head.oid];
+    const headTree = amended?.tree ?? (head.oid === null ? null : repo.readCommit(head.oid).tree);
     const baselineTree =
-      amended !== undefined
-        ? undefined
-        : head.oid === null
-          ? EMPTY_TREE_OID
-          : repo.readCommit(head.oid).tree;
+      amended !== undefined ? undefined : headTree === null ? EMPTY_TREE_OID : headTree;
     const identities = resolveIdentity(context, repo, options, amended);
     const result = writeCommitObjects(
       repo,
@@ -109,6 +113,8 @@ export function commit(
         identities,
       },
       { mode: "clean", value: options.message },
+      context,
+      headTree,
     );
     if (baselineTree !== undefined && options.allowEmpty !== true && result.tree === baselineTree) {
       throw new GitError("EEMPTYCOMMIT", "cannot commit: the index tree is unchanged");
@@ -120,12 +126,17 @@ export function commit(
       head,
       result,
       committerRefLogMetadata(identities.committer, reason),
+      context,
     );
   });
 }
 
 /** Build the stage-zero index and move only the HEAD observed by the caller. */
-export function commitIndex(repo: Repository, options: IndexedCommitOptions): CommitResult {
+export function commitIndex(
+  repo: Repository,
+  options: IndexedCommitOptions,
+  context?: PublishedCommitContext,
+): CommitResult {
   if (options.message.trim() === "") throw new GitError("EMSG", "commit message is required");
 
   return repo.store.db.transactionSync(() => {
@@ -133,7 +144,8 @@ export function commitIndex(repo: Repository, options: IndexedCommitOptions): Co
     if (head.ref !== options.expectedHead.ref || head.oid !== options.expectedHead.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while the commit was being prepared");
     }
-    return publishCommit(repo, options);
+    const headTree = head.oid === null ? null : repo.readCommit(head.oid).tree;
+    return publishCommit(repo, options, context, headTree);
   });
 }
 
@@ -150,32 +162,92 @@ function writeCommitObjects(
   repo: Repository,
   options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
   message: CommitMessage,
+  context?: PublishedCommitContext,
+  baselineTreeOid?: string | null,
 ): UnpublishedCommitResult {
+  const sparse =
+    context === undefined || baselineTreeOid === undefined
+      ? null
+      : sparseTreePlan(context, repo, baselineTreeOid);
+  if (sparse !== null) {
+    const tree = sparse.tree;
+    const commitData = serializedCommit(options, message, tree);
+    return repo.store.writeObjects((batch) => {
+      writeSparseTreePlanInBatch(batch, sparse);
+      return { oid: batch.write("commit", commitData), tree };
+    });
+  }
   // A paged scan, so the index never exists as one array alongside the build.
   return repo.store.writeObjects((batch) => {
     const tree = buildTreeInBatch(batch, repo.checkout.indexScan({ pageSize: 2048 }));
-    const oid = batch.write(
-      "commit",
-      serializeCommit({
-        tree,
-        parent: [...options.parent],
-        author: options.identities.author,
-        committer: options.identities.committer,
-        message: message.mode === "clean" ? cleanMessage(message.value) : message.value,
-      }),
-    );
+    const oid = batch.write("commit", serializedCommit(options, message, tree));
     return { oid, tree };
   });
 }
 
+function serializedCommit(
+  options: Pick<UnpublishedCommitOptions, "parent" | "identities">,
+  message: CommitMessage,
+  tree: string,
+): Uint8Array {
+  return serializeCommit({
+    tree,
+    parent: [...options.parent],
+    author: options.identities.author,
+    committer: options.identities.committer,
+    message: message.mode === "clean" ? cleanMessage(message.value) : message.value,
+  });
+}
+
+function sparseTreePlan(
+  context: PublishedCommitContext,
+  repo: Repository,
+  baselineTreeOid: string | null,
+): Extract<SparseTreeBuildPlan, { available: true }> | null {
+  const source = context.commitTrees;
+  if (source === undefined) return null;
+  let snapshot: ReturnType<typeof source.snapshot>;
+  try {
+    snapshot = source.snapshot({
+      repoId: repo.store.repoId,
+      checkoutId: repo.checkout.checkoutId,
+      root: repo.root,
+      baselineTreeOid,
+    });
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+  if (!snapshot.available) return null;
+  try {
+    const plan = planSparseTreeBuild(snapshot, baselineTreeOid);
+    return plan.available ? plan : null;
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return null;
+    throw error;
+  }
+}
+
 /** Caller owns the transaction and has already validated `expectedHead`. */
-function publishCommit(repo: Repository, options: IndexedCommitOptions): CommitResult {
-  const result = writeCommitObjects(repo, options, { mode: "clean", value: options.message });
+function publishCommit(
+  repo: Repository,
+  options: IndexedCommitOptions,
+  context: PublishedCommitContext | undefined,
+  baselineTreeOid: string | null,
+): CommitResult {
+  const result = writeCommitObjects(
+    repo,
+    options,
+    { mode: "clean", value: options.message },
+    context,
+    baselineTreeOid,
+  );
   return publishCommitResult(
     repo,
     options.expectedHead,
     result,
     committerRefLogMetadata(options.identities.committer, options.refLogReason),
+    context,
   );
 }
 
@@ -184,10 +256,13 @@ function publishCommitResult(
   expectedHead: ResolvedHead,
   result: UnpublishedCommitResult,
   metadata: ReturnType<typeof committerRefLogMetadata>,
+  context?: PublishedCommitContext,
 ): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
   if (expectedHead.ref === null) repo.mutateRefs({ head: result.oid }, metadata);
   else repo.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata);
+  // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
+  context?.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, result.tree);
   return { oid: result.oid };
 }
 

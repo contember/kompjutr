@@ -380,13 +380,17 @@ export function startReplay(
       });
       if (conflicted) return { outcome: "conflicted" };
       const identities = policy.resolveIdentities(context, repo, plan, input);
-      const result = commitIndex(repo, {
-        message,
-        parent: [head.oid],
-        identities,
-        expectedHead: head,
-        refLogReason: policy.kind,
-      });
+      const result = commitIndex(
+        repo,
+        {
+          message,
+          parent: [head.oid],
+          identities,
+          expectedHead: head,
+          refLogReason: policy.kind,
+        },
+        context,
+      );
       return { outcome: "committed", oid: result.oid };
     } finally {
       reservation.dispose();
@@ -452,13 +456,17 @@ export function continueReplay(
             OPERATION_STATE_TRANSITION_SQL_STATEMENTS,
         ),
       );
-      const result = commitIndex(repo, {
-        message: input.message ?? journal.state.message,
-        parent: [journal.state.originalHeadOid],
-        identities,
-        expectedHead: head,
-        refLogReason: policy.kind,
-      });
+      const result = commitIndex(
+        repo,
+        {
+          message: input.message ?? journal.state.message,
+          parent: [journal.state.originalHeadOid],
+          identities,
+          expectedHead: head,
+          refLogReason: policy.kind,
+        },
+        context,
+      );
       repo.checkout.clearOperationState();
       return { outcome: "committed", oid: result.oid };
     } finally {

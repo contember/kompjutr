@@ -7,8 +7,17 @@ import { eagerStatus, type StatusOptions, status, statusStream } from "../src/co
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
-import { INDEX_DIRTY, readIndexTrackerState, WORKTREE_DIRTY } from "../src/sqlite/index-tracker.js";
-import { createSqliteSparseWorkspaceSource } from "../src/sqlite/sparse-workspace.js";
+import {
+  advanceIndexTrackerBaseline,
+  INDEX_DIRTY,
+  readIndexTrackerState,
+  resealIndexTracker,
+  WORKTREE_DIRTY,
+} from "../src/sqlite/index-tracker.js";
+import {
+  createSqliteCommitTreeSnapshotSource,
+  createSqliteSparseWorkspaceSource,
+} from "../src/sqlite/sparse-workspace.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import {
@@ -994,6 +1003,37 @@ describe("sparse eager status", () => {
       available: true,
       baselineTreeOid: workspace.repo.headTree(),
     });
+  });
+
+  it("uses the advanced commit baseline while retaining the dirty journal", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "one\n");
+    commitFiles(workspace, ["a.txt"]);
+    sealIndexTracker(workspace);
+    writeWorkFile(workspace, "/a.txt", "two\n");
+    stageWorktreePaths(workspace, ["a.txt"]);
+    const context: GitContext = {
+      ...workspace.context,
+      commitTrees: createSqliteCommitTreeSnapshotSource(workspace.database.db),
+      indexTracker: {
+        reseal: (checkoutId, baselineTreeOid, entries) =>
+          resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries),
+        advanceBaseline: (checkoutId, baselineTreeOid) =>
+          advanceIndexTrackerBaseline(workspace.database.db, checkoutId, baselineTreeOid),
+      },
+    };
+
+    const oid = commit(context, workspace.repo, { message: "second" }).oid;
+
+    expect([
+      ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
+    ]).toEqual([{ path: "a.txt", flags: INDEX_DIRTY | WORKTREE_DIRTY }]);
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({ available: true, baselineTreeOid: workspace.repo.readCommit(oid).tree });
+    expect(
+      eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, context),
+    ).toEqual([]);
   });
 
   it("propagates sparse hydration corruption without resealing", () => {

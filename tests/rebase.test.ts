@@ -39,6 +39,26 @@ function textAt(workspace: TestRepository, path: string): string | null {
   return utf8Decoder.decode(workspace.worktree.readFile(`/${path}`));
 }
 
+function recordingBaselineContext(workspace: TestRepository): {
+  context: typeof workspace.context;
+  advances: Array<{ checkoutId: number; tree: string | null }>;
+} {
+  const advances: Array<{ checkoutId: number; tree: string | null }> = [];
+  return {
+    context: {
+      ...workspace.context,
+      indexTracker: {
+        reseal: () => true,
+        advanceBaseline: (checkoutId, tree) => {
+          advances.push({ checkoutId, tree });
+          return true;
+        },
+      },
+    },
+    advances,
+  };
+}
+
 function reopenRepo(workspace: TestRepository): Repository {
   const database = new SqliteGitDatabase(new TestDatabase(workspace.storage), {
     now: workspace.context.now,
@@ -95,8 +115,9 @@ describe("rebase lifecycle", () => {
       publications++;
       return originalUpdate(mutation, metadata);
     };
+    const recorded = recordingBaselineContext(workspace);
 
-    const result = rebase(workspace.context, workspace.repo, workspace.worktree, {
+    const result = rebase(recorded.context, workspace.repo, workspace.worktree, {
       upstream,
     });
 
@@ -118,6 +139,9 @@ describe("rebase lifecycle", () => {
     );
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
     expect(publications).toBe(1);
+    expect(recorded.advances).toEqual([
+      { checkoutId: workspace.repo.checkout.checkoutId, tree: final.tree },
+    ]);
     expect(original).not.toBe(expected);
     const named = workspace.repo.store.reflog("refs/heads/current")[0];
     const head = workspace.repo.checkout.reflog("HEAD")[0];
@@ -147,9 +171,10 @@ describe("rebase lifecycle", () => {
 
     source.git("checkout", "-q", "-b", "behind", first);
     const behind = await imported(source);
+    const behindRecorded = recordingBaselineContext(behind);
     const fastActor = { name: "Fast Forward", email: "fast-forward@example.com" };
     expect(
-      rebase(behind.context, behind.repo, behind.worktree, {
+      rebase(behindRecorded.context, behind.repo, behind.worktree, {
         upstream: second,
         committer: fastActor,
       }),
@@ -160,6 +185,9 @@ describe("rebase lifecycle", () => {
       skipped: 0,
       fastForward: true,
     });
+    expect(behindRecorded.advances).toEqual([
+      { checkoutId: behind.repo.checkout.checkoutId, tree: behind.repo.readCommit(second).tree },
+    ]);
     expect(behind.repo.checkout.readOperationState()).toBeNull();
     const named = behind.repo.store.reflog("refs/heads/behind")[0];
     const head = behind.repo.checkout.reflog("HEAD")[0];
@@ -183,10 +211,14 @@ describe("rebase lifecycle", () => {
 
     source.git("checkout", "-q", "main");
     const current = await imported(source);
-    expect(rebase(current.context, current.repo, current.worktree, { upstream: first })).toEqual({
+    const currentRecorded = recordingBaselineContext(current);
+    expect(
+      rebase(currentRecorded.context, current.repo, current.worktree, { upstream: first }),
+    ).toEqual({
       outcome: "up-to-date",
       oid: second,
     });
+    expect(currentRecorded.advances).toEqual([]);
     expect(current.repo.checkout.readOperationState()).toBeNull();
     expect(current.repo.store.reflog("refs/heads/main")).toEqual([]);
     expect(current.repo.checkout.reflog("HEAD")).toEqual([]);

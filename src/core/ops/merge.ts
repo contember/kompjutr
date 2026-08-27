@@ -658,6 +658,8 @@ function mergeInTransaction(
           },
         ),
       );
+      // A failed optional advance leaves a baseline mismatch, which forces the safe full path.
+      context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, nextTree);
       return { oid: incomingOid, fastForward: true };
     }
     requireBoundedIntegrationIndex(repo);
@@ -672,13 +674,17 @@ function mergeInTransaction(
       mergeMetadata.message,
       identities,
     );
-    return commitIndex(repo, {
-      message: mergeMetadata.message,
-      parent: [head.oid, incomingOid],
-      identities,
-      expectedHead: head,
-      refLogReason: mergeReason(mergeMetadata.mergeOrigin, "commit"),
-    });
+    return commitIndex(
+      repo,
+      {
+        message: mergeMetadata.message,
+        parent: [head.oid, incomingOid],
+        identities,
+        expectedHead: head,
+        refLogReason: mergeReason(mergeMetadata.mergeOrigin, "commit"),
+      },
+      context,
+    );
   } finally {
     reservation.dispose();
   }
@@ -720,13 +726,17 @@ export function mergeContinue(
       });
       const message = options.message ?? journal.state.message;
       validateMergeCommitInput(journal.state, message, identities);
-      const result = commitIndex(repo, {
-        message,
-        parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
-        identities,
-        expectedHead: head,
-        refLogReason: mergeReason(journal.state.mergeOrigin, "commit"),
-      });
+      const result = commitIndex(
+        repo,
+        {
+          message,
+          parent: [journal.state.currentParentOid, journal.state.incomingParentOid],
+          identities,
+          expectedHead: head,
+          refLogReason: mergeReason(journal.state.mergeOrigin, "commit"),
+        },
+        context,
+      );
       repo.checkout.clearMergeState();
       return result;
     } finally {

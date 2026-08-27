@@ -52,6 +52,26 @@ function textAt(workspace: TestRepository, path: string): string | null {
   return utf8Decoder.decode(workspace.worktree.readFile(`/${path}`));
 }
 
+function recordingBaselineContext(workspace: TestRepository): {
+  context: GitContext;
+  advances: Array<{ checkoutId: number; tree: string | null }>;
+} {
+  const advances: Array<{ checkoutId: number; tree: string | null }> = [];
+  return {
+    context: {
+      ...workspace.context,
+      indexTracker: {
+        reseal: () => true,
+        advanceBaseline: (checkoutId, tree) => {
+          advances.push({ checkoutId, tree });
+          return true;
+        },
+      },
+    },
+    advances,
+  };
+}
+
 function fixtureCommitMessage(source: GitFixture, oid: string): string {
   const commit = utf8Decoder.decode(source.catFile(oid));
   const separator = commit.indexOf("\n\n");
@@ -73,14 +93,18 @@ describe("revert lifecycle", () => {
     const current = source.commit("later");
     const workspace = await imported(source);
     workspace.tick(120_000);
+    const recorded = recordingBaselineContext(workspace);
 
-    const result = revert(workspace.context, workspace.repo, workspace.worktree, {
+    const result = revert(recorded.context, workspace.repo, workspace.worktree, {
       source: reverted,
     });
 
     expect(result.outcome).toBe("committed");
     if (result.outcome !== "committed") throw new Error("revert did not commit");
     const commit = workspace.repo.readCommit(result.oid);
+    expect(recorded.advances).toEqual([
+      { checkoutId: workspace.repo.checkout.checkoutId, tree: commit.tree },
+    ]);
     expect(commit.parent).toEqual([current]);
     expect(commit.message).toBe(
       `Revert "  subject   with\ttab  "\n\nThis reverts commit ${reverted}.\n`,

@@ -6,7 +6,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8, utf8Decoder } from "../src/core/bytes.js";
-import { type Person, serializeCommit } from "../src/core/objects.js";
+import type { GitContext } from "../src/core/context.js";
+import { GitError } from "../src/core/errors.js";
+import { hashObject, type Person, serializeCommit, serializeTree } from "../src/core/objects.js";
 import {
   commit,
   commitIndex,
@@ -14,8 +16,17 @@ import {
   writeUnpublishedCommit,
 } from "../src/core/ops/commit.js";
 import { log } from "../src/core/ops/reads.js";
+import { eagerStatus } from "../src/core/ops/status.js";
 import { buildTree } from "../src/core/ops/tree-build.js";
 import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/core/ops/worktree-io.js";
+import type { CommitTreeSnapshotSource } from "../src/core/sparse-workspace.js";
+import {
+  advanceIndexTrackerBaseline,
+  invalidateIndexTracker,
+  readIndexTrackerState,
+  resealIndexTracker,
+} from "../src/sqlite/index-tracker.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/sqlite/sparse-workspace.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -49,6 +60,54 @@ function stageAll(workspace: TestRepository): void {
     if (hashed === null) throw new Error(`cannot stage ${relative}`);
     workspace.repo.checkout.indexPut(indexEntryFor(relative, hashed));
   }
+}
+
+function stagePath(workspace: TestRepository, path: string): void {
+  const hashed = hashWorktreePath(workspace.repo, workspace.worktree, path);
+  if (hashed === null) throw new Error(`cannot stage ${path}`);
+  workspace.repo.checkout.indexPut(indexEntryFor(path, hashed));
+}
+
+function acceleratedContext(
+  workspace: TestRepository,
+  commitTrees: CommitTreeSnapshotSource = createSqliteCommitTreeSnapshotSource(
+    workspace.database.db,
+  ),
+): GitContext {
+  return {
+    ...workspace.context,
+    commitTrees,
+    indexTracker: {
+      reseal: (checkoutId, baselineTreeOid, entries) =>
+        resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries),
+      advanceBaseline: (checkoutId, baselineTreeOid) =>
+        advanceIndexTrackerBaseline(workspace.database.db, checkoutId, baselineTreeOid),
+    },
+  };
+}
+
+function sealCommitBaseline(workspace: TestRepository): void {
+  expect(
+    resealIndexTracker(
+      workspace.database.db,
+      workspace.repo.checkout.checkoutId,
+      workspace.repo.headTree(),
+      [],
+    ),
+  ).toBe(true);
+}
+
+function collectTreeOids(workspace: TestRepository, root: string): Set<string> {
+  const result = new Set<string>();
+  const visit = (oid: string): void => {
+    if (result.has(oid)) return;
+    result.add(oid);
+    for (const entry of workspace.repo.readTree(oid)) {
+      if (entry.mode === "40000" || entry.mode === "040000") visit(entry.oid);
+    }
+  };
+  visit(root);
+  return result;
 }
 
 interface Mirror {
@@ -639,6 +698,357 @@ describe("tree reuse", () => {
     expect(workspace.repo.resolveTreePath(secondTree, "a/b")?.oid).not.toBe(
       workspace.repo.resolveTreePath(firstTree, "a/b")?.oid,
     );
+  });
+});
+
+describe("bounded commit tree acceleration", () => {
+  it("matches the full builder and Git across narrow tree shape changes", () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    const workspace = makeRepo("/");
+    useIdentity(workspace);
+    const initial: ReadonlyArray<readonly [string, string]> = [
+      ["stable/keep.txt", "keep\n"],
+      ["edit.txt", "before\n"],
+      ["gone.txt", "gone\n"],
+      ["move-old.txt", "moved\n"],
+      ["file-node", "file\n"],
+      ["dir-node/child.txt", "child\n"],
+      ["empty-dir/only.txt", "only\n"],
+      ["mode.sh", "#!/bin/sh\n"],
+    ];
+    for (const [path, content] of initial) {
+      fixture.write(path, content);
+      writeWorkFile(workspace, `/${path}`, content);
+    }
+    fixture.commit("base");
+    stageAll(workspace);
+    commit(workspace.context, workspace.repo, { message: "base" });
+    sealCommitBaseline(workspace);
+    const baselineTree = workspace.repo.headTree();
+    if (baselineTree === null) throw new Error("fixture baseline tree is missing");
+
+    fixture.write("edit.txt", "after\n");
+    writeWorkFile(workspace, "/edit.txt", "after\n");
+    stagePath(workspace, "edit.txt");
+
+    fixture.remove("gone.txt");
+    workspace.worktree.unlink("/gone.txt");
+    workspace.repo.checkout.indexRemove("gone.txt");
+
+    fixture.remove("move-old.txt").write("move-new.txt", "moved\n");
+    workspace.worktree.unlink("/move-old.txt");
+    writeWorkFile(workspace, "/move-new.txt", "moved\n");
+    workspace.repo.checkout.indexRemove("move-old.txt");
+    stagePath(workspace, "move-new.txt");
+
+    fixture.remove("file-node").write("file-node/deep/new.txt", "new\n");
+    workspace.worktree.unlink("/file-node");
+    writeWorkFile(workspace, "/file-node/deep/new.txt", "new\n");
+    workspace.repo.checkout.indexRemove("file-node");
+    stagePath(workspace, "file-node/deep/new.txt");
+
+    fixture.remove("dir-node").write("dir-node", "replacement\n");
+    workspace.worktree.unlink("/dir-node/child.txt");
+    workspace.worktree.rmdir("/dir-node");
+    writeWorkFile(workspace, "/dir-node", "replacement\n");
+    workspace.repo.checkout.indexRemove("dir-node/child.txt");
+    stagePath(workspace, "dir-node");
+
+    fixture.remove("empty-dir/only.txt");
+    workspace.worktree.unlink("/empty-dir/only.txt");
+    workspace.repo.checkout.indexRemove("empty-dir/only.txt");
+
+    fixture.write("new/deep/root.txt", "root\n");
+    writeWorkFile(workspace, "/new/deep/root.txt", "root\n");
+    stagePath(workspace, "new/deep/root.txt");
+
+    fixture.symlink("stable/keep.txt", "new-link");
+    workspace.worktree.symlink("stable/keep.txt", "/new-link");
+    stagePath(workspace, "new-link");
+
+    fixture.writeExecutable("mode.sh", "#!/bin/sh\n");
+    workspace.worktree.writeFiles([
+      { path: "/mode.sh", bytes: utf8.encode("#!/bin/sh\n"), mode: 0o755 },
+    ]);
+    stagePath(workspace, "mode.sh");
+
+    fixture.git("add", "-A");
+    const expectedTree = fixture.git("write-tree");
+    const fullWorkspace = makeRepo("/");
+    for (const entry of workspace.repo.checkout.indexScan()) {
+      fullWorkspace.repo.checkout.indexPut(entry);
+    }
+    const fullTree = buildTree(fullWorkspace.repo, fullWorkspace.repo.checkout.indexScan());
+    expect(fullTree).toBe(expectedTree);
+    const expectedStable = workspace.repo.resolveTreePath(baselineTree, "stable")?.oid;
+    const expectedTreeOids = collectTreeOids(fullWorkspace, fullTree);
+    const baselineTreeOids = collectTreeOids(workspace, baselineTree);
+    const plannedTreeOids = [...expectedTreeOids].filter((oid) => !baselineTreeOids.has(oid));
+    expect(plannedTreeOids.length).toBeGreaterThan(0);
+    for (const treeOid of plannedTreeOids) {
+      expect(workspace.repo.store.read(treeOid)).toBeNull();
+    }
+
+    workspace.storage.resetCounters();
+    workspace.storage.histogram = new Map();
+    const oid = commit(acceleratedContext(workspace), workspace.repo, { message: "shapes" }).oid;
+    const tree = workspace.repo.readCommit(oid).tree;
+
+    expect(tree).toBe(fullTree);
+    expect(tree).toBe(expectedTree);
+    expect(workspace.repo.resolveTreePath(tree, "stable")?.oid).toBe(expectedStable);
+    for (const treeOid of expectedTreeOids) {
+      expect(workspace.repo.store.read(treeOid)?.type).toBe("tree");
+      expect(() => workspace.repo.readTree(treeOid)).not.toThrow();
+    }
+    const statements = [...workspace.storage.histogram.keys()].join("\n");
+    expect(statements).not.toContain(
+      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id",
+    );
+  });
+
+  it("builds a new root from a sealed unborn baseline", () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    const workspace = makeRepo("/");
+    useIdentity(workspace);
+    sealCommitBaseline(workspace);
+    fixture.write("root.txt", "root\n").write("deep/new.txt", "deep\n");
+    writeWorkFile(workspace, "/root.txt", "root\n");
+    writeWorkFile(workspace, "/deep/new.txt", "deep\n");
+    stagePath(workspace, "root.txt");
+    stagePath(workspace, "deep/new.txt");
+    fixture.git("add", "-A");
+    const expectedTree = fixture.git("write-tree");
+
+    const oid = commit(acceleratedContext(workspace), workspace.repo, { message: "initial" }).oid;
+
+    expect(workspace.repo.readCommit(oid).tree).toBe(expectedTree);
+  });
+
+  it("publishes Git's empty tree for clean and worktree-only sealed unborn snapshots", () => {
+    for (const worktreeDirty of [false, true]) {
+      const fixture = new GitFixture().init();
+      fixtures.push(fixture);
+      const workspace = makeRepo("/");
+      useIdentity(workspace);
+      sealCommitBaseline(workspace);
+      if (worktreeDirty) {
+        fixture.write("untracked.txt", "untracked\n");
+        writeWorkFile(workspace, "/untracked.txt", "untracked\n");
+      }
+      fixture.git("commit", "-q", "--allow-empty", "-m", "empty");
+      const expected = fixture.git("rev-parse", "HEAD");
+
+      const oid = commit(acceleratedContext(workspace), workspace.repo, {
+        message: "empty",
+        allowEmpty: true,
+      }).oid;
+      const tree = workspace.repo.readCommit(oid).tree;
+      const object = workspace.repo.read(tree);
+
+      expect(oid).toBe(expected);
+      expect(tree).toBe(hashObject("tree", serializeTree([])));
+      expect(object).toEqual({ type: "tree", data: serializeTree([]) });
+    }
+  });
+
+  it("does not scan a 100-path index for one dirty path and advances the sealed baseline", () => {
+    const workspace = makeRepo("/");
+    useIdentity(workspace);
+    for (let index = 0; index < 100; index++) {
+      const path = `dir/file-${index.toString().padStart(3, "0")}.txt`;
+      writeWorkFile(workspace, `/${path}`, `${index}\n`);
+    }
+    stageAll(workspace);
+    commit(workspace.context, workspace.repo, { message: "base" });
+    sealCommitBaseline(workspace);
+    writeWorkFile(workspace, "/dir/file-050.txt", "changed\n");
+    stagePath(workspace, "dir/file-050.txt");
+
+    workspace.storage.histogram = new Map();
+    workspace.storage.resetCounters();
+    const oid = commit(acceleratedContext(workspace), workspace.repo, { message: "narrow" }).oid;
+    const counts = {
+      statements: workspace.storage.statementCount,
+      rows: workspace.storage.rowCount,
+    };
+    const queries = [...workspace.storage.histogram.keys()].join("\n");
+
+    expect(queries).not.toContain(
+      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id",
+    );
+    expect(counts).toEqual({ statements: 31, rows: 126 });
+    expect([
+      ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ?? []),
+    ]).toEqual([{ path: "dir/file-050.txt", flags: 3 }]);
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({ available: true, baselineTreeOid: workspace.repo.readCommit(oid).tree });
+    expect(workspace.repo.headTree()).toBe(workspace.repo.readCommit(oid).tree);
+  });
+
+  it("falls back only for unavailable, mismatched, incomplete, or capacity-limited snapshots", () => {
+    const cases: Array<"unavailable" | "mismatched" | "incomplete" | "capacity"> = [
+      "unavailable",
+      "mismatched",
+      "incomplete",
+      "capacity",
+    ];
+    for (const mode of cases) {
+      const workspace = makeRepo("/");
+      useIdentity(workspace);
+      writeWorkFile(workspace, "/a.txt", "one\n");
+      stageAll(workspace);
+      commit(workspace.context, workspace.repo, { message: "base" });
+      sealCommitBaseline(workspace);
+      writeWorkFile(workspace, "/a.txt", "two\n");
+      stagePath(workspace, "a.txt");
+
+      let source: CommitTreeSnapshotSource = createSqliteCommitTreeSnapshotSource(
+        workspace.database.db,
+      );
+      if (mode === "unavailable") source = { snapshot: () => ({ available: false }) };
+      if (mode === "capacity") {
+        source = {
+          snapshot: () => {
+            throw new GitError("E2BIG", "injected commit snapshot capacity");
+          },
+        };
+      }
+      if (mode === "mismatched") {
+        expect(
+          resealIndexTracker(
+            workspace.database.db,
+            workspace.repo.checkout.checkoutId,
+            "9".repeat(40),
+            [],
+          ),
+        ).toBe(true);
+      }
+      if (mode === "incomplete") {
+        invalidateIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId);
+      }
+      workspace.storage.histogram = new Map();
+      workspace.storage.resetCounters();
+
+      const oid = commit(acceleratedContext(workspace, source), workspace.repo, {
+        message: mode,
+      }).oid;
+
+      expect(
+        workspace.repo.resolveTreePath(workspace.repo.readCommit(oid).tree, "a.txt")?.oid,
+      ).toBe(workspace.repo.checkout.indexGet("a.txt")?.oid);
+      expect([...workspace.storage.histogram.keys()].join("\n")).toContain(
+        "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id",
+      );
+    }
+  });
+
+  it("keeps the prior tracker safely usable when baseline advancement declines", () => {
+    const workspace = makeRepo("/");
+    useIdentity(workspace);
+    writeWorkFile(workspace, "/a.txt", "one\n");
+    stageAll(workspace);
+    commit(workspace.context, workspace.repo, { message: "base" });
+    sealCommitBaseline(workspace);
+    const baseline = workspace.repo.headTree();
+    if (baseline === null) throw new Error("fixture baseline tree is missing");
+    writeWorkFile(workspace, "/a.txt", "two\n");
+    stagePath(workspace, "a.txt");
+    const context = acceleratedContext(workspace);
+    context.indexTracker = {
+      reseal: (checkoutId, baselineTreeOid, entries) =>
+        resealIndexTracker(workspace.database.db, checkoutId, baselineTreeOid, entries),
+      advanceBaseline: () => false,
+    };
+
+    const oid = commit(context, workspace.repo, { message: "declined" }).oid;
+    const publishedTree = workspace.repo.readCommit(oid).tree;
+
+    expect(publishedTree).not.toBe(baseline);
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({ available: true, baselineTreeOid: baseline });
+    expect([
+      ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ?? []),
+    ]).toEqual([{ path: "a.txt", flags: 3 }]);
+    expect(eagerStatus(workspace.repo, workspace.worktree, {}, context)).toEqual([]);
+  });
+
+  it("propagates malformed tracker, index, and authenticated ancestry snapshots", () => {
+    const corruptions: Array<"tracker" | "index" | "ancestry"> = ["tracker", "index", "ancestry"];
+    for (const corruption of corruptions) {
+      const workspace = makeRepo("/");
+      useIdentity(workspace);
+      writeWorkFile(workspace, "/dir/a.txt", "one\n");
+      stageAll(workspace);
+      commit(workspace.context, workspace.repo, { message: "base" });
+      sealCommitBaseline(workspace);
+      writeWorkFile(workspace, "/dir/a.txt", "two\n");
+      stagePath(workspace, "dir/a.txt");
+      const native = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+      const corrupt: CommitTreeSnapshotSource = {
+        snapshot(request) {
+          const result = native.snapshot(request);
+          if (!result.available) return result;
+          if (corruption === "tracker") {
+            return {
+              ...result,
+              dirty: result.dirty.map((entry, ordinal) =>
+                ordinal === 0 ? { ...entry, flags: 0 } : entry,
+              ),
+            };
+          }
+          if (corruption === "index") {
+            return {
+              ...result,
+              index: result.index.map((entry, ordinal) =>
+                ordinal === 0 ? { ...entry, mode: 0 } : entry,
+              ),
+            };
+          }
+          const empty = serializeTree([]);
+          return {
+            ...result,
+            directories: result.directories.map((directory) =>
+              directory.path === "dir"
+                ? { ...directory, oid: hashObject("tree", empty), entries: [] }
+                : directory,
+            ),
+          };
+        },
+      };
+      const before = {
+        head: workspace.repo.head(),
+        objects: workspace.repo.store.objectCount(),
+        refs: workspace.repo.store.listRefs(),
+        index: workspace.repo.checkout.indexEntries(),
+        tracker: readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+        dirty: [
+          ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ??
+            []),
+        ],
+      };
+
+      expect(() =>
+        commit(acceleratedContext(workspace, corrupt), workspace.repo, {
+          message: corruption,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+      expect({
+        head: workspace.repo.head(),
+        objects: workspace.repo.store.objectCount(),
+        refs: workspace.repo.store.listRefs(),
+        index: workspace.repo.checkout.indexEntries(),
+        tracker: readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+        dirty: [
+          ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ??
+            []),
+        ],
+      }).toEqual(before);
+    }
   });
 });
 

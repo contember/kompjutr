@@ -765,6 +765,8 @@ function publishCompleted(
       },
       persistedRefLogMetadata(context, journal.state.committer, "rebase: replay"),
     );
+    // False leaves the old baseline mismatched, so later sparse reads fall back safely.
+    context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, tree);
     repo.checkout.clearOperationState();
     return {
       outcome: "completed",
@@ -873,6 +875,8 @@ export function startRebase(
             env: options.env,
           }),
         );
+        // False leaves the old baseline mismatched, so later sparse reads fall back safely.
+        context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, upstreamTree);
         return { relation: plan.relation, oid: plan.upstreamOid };
       }
       const actor = operationRefLogMetadata(context, repo, "rebase: replay", {

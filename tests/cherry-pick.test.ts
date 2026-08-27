@@ -58,6 +58,26 @@ function textAt(workspace: TestRepository, path: string): string | null {
   return utf8Decoder.decode(workspace.worktree.readFile(`/${path}`));
 }
 
+function recordingBaselineContext(workspace: TestRepository): {
+  context: GitContext;
+  advances: Array<{ checkoutId: number; tree: string | null }>;
+} {
+  const advances: Array<{ checkoutId: number; tree: string | null }> = [];
+  return {
+    context: {
+      ...workspace.context,
+      indexTracker: {
+        reseal: () => true,
+        advanceBaseline: (checkoutId, tree) => {
+          advances.push({ checkoutId, tree });
+          return true;
+        },
+      },
+    },
+    advances,
+  };
+}
+
 function durableSnapshot(workspace: TestRepository): {
   head: ReturnType<Repository["head"]>;
   objects: number;
@@ -206,8 +226,9 @@ describe("cherry-pick lifecycle", () => {
     source.git("checkout", "-q", "main");
     const workspace = await imported(source);
     workspace.tick(60_000);
+    const recorded = recordingBaselineContext(workspace);
 
-    const result = cherryPick(workspace.context, workspace.repo, workspace.worktree, {
+    const result = cherryPick(recorded.context, workspace.repo, workspace.worktree, {
       source: picked,
     });
 
@@ -215,6 +236,9 @@ describe("cherry-pick lifecycle", () => {
     if (result.outcome !== "committed") throw new Error("cherry-pick did not commit");
     const commit = workspace.repo.readCommit(result.oid);
     const original = workspace.repo.readCommit(picked);
+    expect(recorded.advances).toEqual([
+      { checkoutId: workspace.repo.checkout.checkoutId, tree: commit.tree },
+    ]);
     expect(commit.parent).toEqual([base]);
     expect(commit.author).toEqual(original.author);
     expect(commit.committer.timestamp).toBe(original.committer.timestamp + 60);
