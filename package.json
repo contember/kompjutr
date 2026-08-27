@@ -57,7 +57,11 @@
     "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts",
     "bench:clone-storage": "node --experimental-transform-types --import ./bench/register.mjs bench/clone-storage.ts",
     "bench:tree-schema": "node --experimental-transform-types --import ./bench/register.mjs bench/tree-schema.ts",
-    "bench:workerd:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/workerd/run.ts"
+    "bench:workerd:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/workerd/run.ts",
+    "probe:dry-run": "wrangler deploy --config bench/production/wrangler.jsonc --dry-run --outdir ../../tmp/production-probe",
+    "probe:deploy": "wrangler deploy --config bench/production/wrangler.jsonc",
+    "probe:run": "node --experimental-transform-types --import ./bench/register.mjs bench/production/run.ts",
+    "probe:analytics": "node --experimental-transform-types --import ./bench/register.mjs bench/production/analytics.ts"
   },
   "dependencies": {
     "pako": "2.2.0"
@@ -80,6 +84,7 @@
     "isomorphic-git": "^1.41.7",
     "miniflare": "5.20260820.0-alpha",
     "typescript": "^5.9.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "wrangler": "4.127.0"
   }
 }
