@@ -10,7 +10,7 @@ import {
   prepareFixture,
   trackedEntries,
 } from "./fixtures.js";
-import type { Scenario } from "./harness.js";
+import type { Harness, Scenario } from "./harness.js";
 
 const REPO = "/repo";
 const CHANGE_COUNT = 100;
@@ -81,6 +81,25 @@ function expectStatus(
 function expectClean(rows: readonly { path: string }[], label: string): void {
   if (rows.length === 0) return;
   throw new Error(`${label} returned ${rows.length} entries, expected none`);
+}
+
+async function prepareForceCheckout(
+  harness: Harness,
+  source: string,
+  target: string,
+  label: string,
+): Promise<void> {
+  await harness.git.checkout({ dir: REPO, ref: source });
+  const branch = await harness.git.currentBranch({ dir: REPO });
+  const headOid = await harness.git.revParse({ dir: REPO, ref: "HEAD" });
+  const sourceCommit = await harness.git.show({ dir: REPO, ref: source });
+  const targetCommit = await harness.git.show({ dir: REPO, ref: target });
+  if (branch !== source || headOid !== sourceCommit.oid) {
+    throw new Error(`${label} setup did not leave HEAD on ${source}`);
+  }
+  if (sourceCommit.oid === targetCommit.oid || sourceCommit.tree === targetCommit.tree) {
+    throw new Error(`${label} requires distinct source and target commits and trees`);
+  }
 }
 
 function traceCloneMemory(message: string, statements: number): void {
@@ -213,6 +232,9 @@ export const NEXTJS_WORKFLOW: Scenario = {
     },
     {
       name: "git.checkout main (force)",
+      async before({ harness }) {
+        await prepareForceCheckout(harness, "bench-work", ORIGIN_BRANCH, "forced main checkout");
+      },
       async run({ harness }) {
         await harness.git.checkout({ dir: REPO, ref: ORIGIN_BRANCH, force: true });
       },
@@ -231,6 +253,9 @@ export const NEXTJS_WORKFLOW: Scenario = {
     },
     {
       name: "git.checkout bench-work (force)",
+      async before({ harness }) {
+        await prepareForceCheckout(harness, ORIGIN_BRANCH, "bench-work", "forced work checkout");
+      },
       async run({ harness }) {
         await harness.git.checkout({ dir: REPO, ref: "bench-work", force: true });
       },
