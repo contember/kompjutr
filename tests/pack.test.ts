@@ -15,11 +15,21 @@ import {
   serializeTree,
 } from "../src/core/objects.js";
 import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
+import {
+  type FullObjectPackInput,
+  streamFullObjectPack,
+} from "../src/core/pack/full-object-stream.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { MAX_INDEXED_COMMIT_BYTES, prepareCommitCache } from "../src/sqlite/commits.js";
 import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
-import { MAX_DELTA_DEPTH, MAX_PACK_DELTA_WORKING_BYTES, PACK_CHUNK } from "../src/sqlite/packs.js";
+import {
+  type CompletePackObject,
+  MAX_DELTA_DEPTH,
+  MAX_PACK_DELETE_BATCH,
+  MAX_PACK_DELTA_WORKING_BYTES,
+  PACK_CHUNK,
+} from "../src/sqlite/packs.js";
 import { CheckoutStore, SharedRepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
@@ -90,6 +100,40 @@ class RecordingDatabase implements SqlDatabase {
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
     this.queries.push({ query, bindings });
     return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+class MutatingQueryDatabase implements SqlDatabase {
+  constructor(
+    readonly inner: TestDatabase,
+    readonly marker: string,
+    readonly replacement: Readonly<Record<string, unknown>>,
+  ) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    for (const row of this.inner.iterate(query, ...bindings)) {
+      yield query.includes(this.marker) ? { ...row, ...this.replacement } : row;
+    }
   }
 
   transactionSync<T>(closure: () => T): T {
@@ -200,14 +244,192 @@ function deltaPack(depth: number): { bytes: Uint8Array; target: Uint8Array; targ
   return { bytes: concat(chunks), target, targetOid };
 }
 
-function singleBlobPack(data: Uint8Array): Uint8Array {
+function singleObjectPack(type: ObjectType, data: Uint8Array): Uint8Array {
   const chunks: Uint8Array[] = [];
   const writer = new PackWriter((chunk) => chunks.push(chunk));
   writer.header(1);
-  writer.object("blob", data);
+  writer.object(type, data);
   writer.finish();
   return concat(chunks);
 }
+
+function singleBlobPack(data: Uint8Array): Uint8Array {
+  return singleObjectPack("blob", data);
+}
+
+async function collectPack(source: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of source) chunks.push(chunk);
+  return concat(chunks);
+}
+
+function seedRepackBatch(store: ReturnType<typeof open>): void {
+  store.db.run(
+    `INSERT INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+     VALUES (?, 0, 2)`,
+    store.sharedRepoId,
+  );
+  store.db.run(
+    `INSERT INTO git_maintenance_runs
+       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
+     VALUES (?, 1, 0, 'repack', 1, 'done')`,
+    store.sharedRepoId,
+  );
+  store.db.run(
+    `INSERT INTO git_maintenance_repack_batches
+       (repo_id, run_id, batch_id, state, pack_id, object_count, inflated_bytes, stored_bytes)
+     VALUES (?, 1, 1, 'selected', NULL, 1, 1, 0)`,
+    store.sharedRepoId,
+  );
+}
+
+describe("full-object pack stream", () => {
+  it("preserves the push writer bytes across chunked and buffered objects", async () => {
+    const chunked = new Uint8Array(40_000);
+    for (let index = 0; index < chunked.length; index++) chunked[index] = index & 0xff;
+    const buffered = utf8.encode("buffered object\n");
+    const objects: FullObjectPackInput[] = [
+      { oid: hashObject("blob", chunked), type: "blob", size: chunked.length },
+      { oid: hashObject("blob", buffered), type: "blob", size: buffered.length },
+    ];
+    const chunkedInput = [chunked.subarray(0, 12_345), chunked.subarray(12_345)];
+
+    const expectedChunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => expectedChunks.push(chunk));
+    writer.header(objects.length);
+    const first = writer.startObject("blob", chunked.length, objects[0]!.oid);
+    for (const chunk of chunkedInput) {
+      for (let offset = 0; offset < chunk.length; offset += 16 * 1024) {
+        first.push(chunk.subarray(offset, offset + 16 * 1024));
+      }
+    }
+    first.finish();
+    const second = writer.startObject("blob", buffered.length, objects[1]!.oid);
+    second.push(buffered);
+    second.finish();
+    writer.finish();
+
+    const actual = await collectPack(
+      streamFullObjectPack(
+        objects,
+        {
+          readBatch: () => new Map([[objects[1]!.oid, { type: "blob", data: buffered }]]),
+          readChunks: (object) => (object.oid === objects[0]!.oid ? chunkedInput : null),
+        },
+        {
+          maxObjects: 2,
+          maxInflatedBytes: chunked.length + buffered.length,
+          maxStoredBytes: Number.MAX_SAFE_INTEGER,
+          readBatchBytes: buffered.length,
+          allowOversizedObject: true,
+        },
+      ),
+    );
+    expect(actual).toEqual(concat(expectedChunks));
+
+    const store = open();
+    const result = await store.packs.ingest(slices(actual, 127));
+    expect(result.count).toBe(2);
+    expect(store.read(objects[0]!.oid)?.data).toEqual(chunked);
+    expect(store.read(objects[1]!.oid)?.data).toEqual(buffered);
+  });
+
+  it("enforces exact planning, read, inflated, and stored byte boundaries", async () => {
+    const data = [new Uint8Array([1, 2]), new Uint8Array([3, 4]), new Uint8Array([5])];
+    const objects: FullObjectPackInput[] = data.map((bytes) => ({
+      oid: hashObject("blob", bytes),
+      type: "blob",
+      size: bytes.length,
+    }));
+    const source = new Map(objects.map((object, index) => [object.oid, data[index]!]));
+    const reads: string[][] = [];
+    const reader = {
+      readBatch: (requested: readonly FullObjectPackInput[]) => {
+        reads.push(requested.map((object) => object.oid));
+        const batch = new Map<string, RawObject>();
+        for (const object of requested) {
+          batch.set(object.oid, { type: "blob", data: source.get(object.oid)! });
+        }
+        return batch;
+      },
+      readChunks: () => null,
+    };
+    const limits = {
+      maxObjects: 3,
+      maxInflatedBytes: 5,
+      maxStoredBytes: Number.MAX_SAFE_INTEGER,
+      readBatchBytes: 4,
+    };
+    const pack = await collectPack(streamFullObjectPack(objects, reader, limits));
+    expect(reads.map((page) => page.length)).toEqual([2, 1]);
+    expect(await collectPack(streamFullObjectPack(objects, reader, limits))).toEqual(pack);
+
+    await expect(
+      collectPack(streamFullObjectPack(objects, reader, { ...limits, maxObjects: 2 })),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    await expect(
+      collectPack(streamFullObjectPack(objects, reader, { ...limits, maxInflatedBytes: 4 })),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    expect(
+      await collectPack(
+        streamFullObjectPack(objects, reader, { ...limits, maxStoredBytes: pack.length }),
+      ),
+    ).toEqual(pack);
+    await expect(
+      collectPack(
+        streamFullObjectPack(objects, reader, { ...limits, maxStoredBytes: pack.length - 1 }),
+      ),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    await expect(
+      collectPack(streamFullObjectPack([objects[0]!, objects[0]!], reader, limits)),
+    ).rejects.toThrow(/plan is invalid/);
+  });
+
+  it("requires explicit chunking for an object above the read boundary", async () => {
+    const data = new Uint8Array([1, 2, 3, 4, 5]);
+    const object: FullObjectPackInput = {
+      oid: hashObject("blob", data),
+      type: "blob",
+      size: data.length,
+    };
+    let chunkReads = 0;
+    const reader = {
+      readBatch: () => new Map<string, RawObject>(),
+      readChunks: () => {
+        chunkReads++;
+        return [data];
+      },
+    };
+    const limits = {
+      maxObjects: 1,
+      maxInflatedBytes: data.length,
+      maxStoredBytes: Number.MAX_SAFE_INTEGER,
+      readBatchBytes: data.length - 1,
+    };
+
+    await expect(collectPack(streamFullObjectPack([object], reader, limits))).rejects.toMatchObject(
+      {
+        code: "E2BIG",
+      },
+    );
+    expect(chunkReads).toBe(0);
+    const pack = await collectPack(
+      streamFullObjectPack([object], reader, {
+        ...limits,
+        maxInflatedBytes: data.length - 1,
+        allowOversizedObject: true,
+      }),
+    );
+    expect(chunkReads).toBe(1);
+    const fixture = new GitFixture().init();
+    try {
+      fixture.write("generated.pack", pack);
+      expect(fixture.git("index-pack", "--strict", "generated.pack")).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      fixture.dispose();
+    }
+  });
+});
 
 describe("delta", () => {
   it("round-trips a literal-only delta", () => {
@@ -309,6 +531,60 @@ describe("synthetic pack ingest", () => {
     const result = await store.packs.ingest(slices(singleBlobPack(current), 64));
     expect(result.packId).toBe(1);
     expect(store.read(oid)?.data).toEqual(current);
+  });
+
+  it("does not reclaim an active interleaved ingest", async () => {
+    const store = open();
+    const firstData = utf8.encode("first active ingest\n");
+    const secondData = utf8.encode("second active ingest\n");
+    const firstPack = singleBlobPack(firstData);
+    let releaseFirst: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const paused = async function* (): AsyncIterable<Uint8Array> {
+      await gate;
+      yield firstPack;
+    };
+
+    const firstIngest = store.packs.ingest(paused());
+    expect(
+      store.db.one<{ pack_id: number; state: string }>(
+        "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = ?",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ pack_id: 1, state: "pending" });
+
+    const second = await store.packs.ingest(slices(singleBlobPack(secondData), 17));
+    expect(
+      store.db.scalar<string>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = 1",
+        store.sharedRepoId,
+      ),
+    ).toBe("pending");
+    releaseFirst?.();
+    const first = await firstIngest;
+
+    expect(first.packId).toBe(1);
+    expect(second.packId).toBe(2);
+    expect(store.read(hashObject("blob", firstData))?.data).toEqual(firstData);
+    expect(store.read(hashObject("blob", secondData))?.data).toEqual(secondData);
+  });
+
+  it("reclaims an abandoned unowned pack after a cold reopen", async () => {
+    const store = open();
+    const bad = singleBlobPack(utf8.encode("cold abandoned ingest\n"));
+    bad[bad.length - 1]! ^= 0xff;
+    await expect(store.packs.ingest(slices(bad, 31))).rejects.toThrow(/checksum/);
+    const db = store.db;
+    if (!(db instanceof TestDatabase)) throw new Error("expected test database");
+    const coldDatabase = new SqliteGitDatabase(db);
+    const checkout = coldDatabase.findCheckout("/repo");
+    if (checkout === null) throw new Error("repository missing after reopen");
+    const cold = coldDatabase.openCheckout(checkout);
+
+    expect(cold.packs.reclaimPending()).toBe(1);
+    expect(db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
   });
 
   it("bulk-reads 1,000 shuffled packed and delta blobs without scalar fallback", async () => {
@@ -1885,6 +2161,436 @@ describe("synthetic pack ingest", () => {
     expect(store.has(hashObject("blob", big))).toBe(true);
     expect(store.read(hashObject("blob", small))?.data).toEqual(small);
     expect(store.read(hashObject("blob", big))?.data).toEqual(big);
+  });
+
+  it("records an owned reservation and publication in the pack transactions", async () => {
+    const store = open();
+    seedRepackBatch(store);
+    const data = new Uint8Array([1]);
+    const oid = hashObject("blob", data);
+    let reservedVisible = false;
+    let publishedVisible = false;
+
+    const result = await store.packs.ingest(slices(singleBlobPack(data), 7), {
+      lifecycle: {
+        reserved: (packId) => {
+          reservedVisible =
+            store.db.scalar<string>(
+              "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+              store.sharedRepoId,
+              packId,
+            ) === "pending";
+          store.db.run(
+            `UPDATE git_maintenance_repack_batches
+                SET state = 'pending', pack_id = ?
+              WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+            packId,
+            store.sharedRepoId,
+          );
+        },
+        published: (published) => {
+          publishedVisible =
+            store.db.scalar<string>(
+              "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+              store.sharedRepoId,
+              published.packId,
+            ) === "complete";
+          store.db.run(
+            `UPDATE git_maintenance_repack_batches
+                SET state = 'published', stored_bytes = ?
+              WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+            published.bytes,
+            store.sharedRepoId,
+          );
+        },
+      },
+    });
+
+    expect({ reservedVisible, publishedVisible }).toEqual({
+      reservedVisible: true,
+      publishedVisible: true,
+    });
+    expect(
+      store.db.one<{ state: string; pack_id: number; stored_bytes: number }>(
+        `SELECT state, pack_id, stored_bytes FROM git_maintenance_repack_batches
+          WHERE repo_id = ?`,
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "published", pack_id: result.packId, stored_bytes: result.bytes });
+    expect(
+      store.packs.completePackMatches(result.packId, [{ oid, type: "blob", size: data.length }]),
+    ).toBe(true);
+  });
+
+  it("rolls back the pack reservation when its owner cannot record it", async () => {
+    const store = open();
+    seedRepackBatch(store);
+    const data = new Uint8Array([1]);
+
+    await expect(
+      store.packs.ingest(slices(singleBlobPack(data), 7), {
+        lifecycle: {
+          reserved: async (packId) => {
+            store.db.run(
+              `UPDATE git_maintenance_repack_batches
+                  SET state = 'pending', pack_id = ?
+                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+              packId,
+              store.sharedRepoId,
+            );
+          },
+          published: () => {},
+        },
+      }),
+    ).rejects.toThrow(/reserved hook must return undefined/);
+
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
+    expect(
+      store.db.one<{ state: string; pack_id: number | null }>(
+        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "selected", pack_id: null });
+  });
+
+  it("rolls pack and owner publication back when the published hook throws", async () => {
+    const store = open();
+    seedRepackBatch(store);
+    const data = serializeTree([]);
+    const oid = hashObject("tree", data);
+
+    await expect(
+      store.packs.ingest(slices(singleObjectPack("tree", data), 7), {
+        lifecycle: {
+          reserved: (packId) => {
+            store.db.run(
+              `UPDATE git_maintenance_repack_batches
+                  SET state = 'pending', pack_id = ?
+                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+              packId,
+              store.sharedRepoId,
+            );
+          },
+          published: (published) => {
+            store.db.run(
+              `UPDATE git_maintenance_repack_batches
+                  SET state = 'published', stored_bytes = ?
+                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+              published.bytes,
+              store.sharedRepoId,
+            );
+            throw new Error("injected publication failure");
+          },
+        },
+      }),
+    ).rejects.toThrow(/injected publication failure/);
+
+    expect(
+      store.db.one<{ state: string; count: number }>(
+        "SELECT state, count FROM git_pack_meta WHERE repo_id = ? AND pack_id = 1",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "pending", count: 0 });
+    expect(
+      store.db.one<{ state: string; pack_id: number; stored_bytes: number }>(
+        "SELECT state, pack_id, stored_bytes FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "pending", pack_id: 1, stored_bytes: 0 });
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(1);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(0);
+    expect(store.packs.completePackedEntry(oid)).toBeNull();
+    expect(store.read(oid)).toBeNull();
+    expect(
+      store.packs.discardPending(1, (packId) => {
+        store.db.run(
+          `UPDATE git_maintenance_repack_batches
+              SET state = 'selected', pack_id = NULL
+            WHERE repo_id = ? AND pack_id = ?`,
+          store.sharedRepoId,
+          packId,
+        );
+      }),
+    ).toBe(true);
+  });
+
+  it("preserves owned pending packs during broad cleanup and discards one exactly", async () => {
+    const store = open();
+    seedRepackBatch(store);
+    const bad = singleBlobPack(new Uint8Array([1]));
+    bad[bad.length - 1]! ^= 0xff;
+    let ownedPackId = -1;
+
+    await expect(
+      store.packs.ingest(slices(bad, 7), {
+        lifecycle: {
+          reserved: (packId) => {
+            ownedPackId = packId;
+            store.db.run(
+              `UPDATE git_maintenance_repack_batches
+                  SET state = 'pending', pack_id = ?
+                WHERE repo_id = ? AND run_id = 1 AND batch_id = 1`,
+              packId,
+              store.sharedRepoId,
+            );
+          },
+          published: () => {},
+        },
+      }),
+    ).rejects.toThrow(/checksum/);
+
+    expect(store.packs.reclaimPending()).toBe(0);
+    expect(
+      store.packs.discardPending(ownedPackId, (packId) => {
+        store.db.run(
+          `UPDATE git_maintenance_repack_batches
+              SET state = 'selected', pack_id = NULL
+            WHERE repo_id = ? AND run_id = 1 AND batch_id = 1 AND pack_id = ?`,
+          store.sharedRepoId,
+          packId,
+        );
+      }),
+    ).toBe(true);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
+    expect(
+      store.db.one<{ state: string; pack_id: number | null }>(
+        "SELECT state, pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+        store.sharedRepoId,
+      ),
+    ).toEqual({ state: "selected", pack_id: null });
+  });
+
+  it("matches exact complete membership and deletes complete packs in bounded batches", async () => {
+    const store = open();
+    const firstData = utf8.encode("first complete pack\n");
+    const secondData = utf8.encode("second complete pack\n");
+    const firstOid = hashObject("blob", firstData);
+    const secondOid = hashObject("blob", secondData);
+    const first = await store.packs.ingest(slices(singleBlobPack(firstData), 17));
+    const second = await store.packs.ingest(slices(singleBlobPack(secondData), 17));
+
+    expect(
+      store.packs.completePackMatches(first.packId, [
+        { oid: firstOid, type: "blob", size: firstData.length },
+      ]),
+    ).toBe(true);
+    expect(store.packs.completePackMatches(first.packId, [])).toBe(false);
+    expect(
+      store.packs.completePackMatches(first.packId, [
+        { oid: secondOid, type: "blob", size: secondData.length },
+      ]),
+    ).toBe(false);
+    expect(
+      store.packs.completePackMatches(first.packId, [
+        { oid: firstOid, type: "tree", size: firstData.length },
+      ]),
+    ).toBe(false);
+    expect(
+      store.packs.completePackMatches(first.packId, [
+        { oid: firstOid, type: "blob", size: firstData.length + 1 },
+      ]),
+    ).toBe(false);
+    expect(store.read(firstOid)?.data).toEqual(firstData);
+    expect(store.read(secondOid)?.data).toEqual(secondData);
+    expect(() =>
+      store.packs.deleteCompletePacks(
+        Array.from({ length: MAX_PACK_DELETE_BATCH + 1 }, (_, packId) => packId),
+      ),
+    ).toThrow(/exceeds 128 inputs/);
+
+    const pendingId = second.packId + 1;
+    store.db.run(
+      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+       VALUES (?, ?, 0, 0, 'pending', 0)`,
+      store.sharedRepoId,
+      pendingId,
+    );
+    expect(() => store.packs.deleteCompletePacks([first.packId, pendingId])).toThrow(/pending/);
+    expect(
+      store.packs.completePackMatches(first.packId, [
+        { oid: firstOid, type: "blob", size: firstData.length },
+      ]),
+    ).toBe(true);
+    expect(store.packs.discardPending(pendingId)).toBe(true);
+
+    expect(store.packs.deleteCompletePacks([first.packId, second.packId])).toBe(2);
+    expect(store.read(firstOid)).toBeNull();
+    expect(store.read(secondOid)).toBeNull();
+    expect(store.packs.deleteCompletePacks([first.packId, second.packId])).toBe(0);
+  });
+
+  it("validates exact pack membership rows and rejects duplicate expectations", async () => {
+    const inner = new TestDatabase();
+    const db = new MutatingQueryDatabase(inner, "complete-pack-membership", { offset: -1 });
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const data = utf8.encode("membership corruption\n");
+    const oid = hashObject("blob", data);
+    const result = await store.packs.ingest(slices(singleBlobPack(data), 19));
+    const object: CompletePackObject = { oid, type: "blob", size: data.length };
+
+    expect(() => store.packs.completePackMatches(result.packId, [object])).toThrow(
+      /invalid object membership/,
+    );
+    expect(() => store.packs.completePackMatches(result.packId, [object, object])).toThrow(
+      /duplicate pack object/,
+    );
+    expect(() =>
+      store.packs.completePackMatches(result.packId, [
+        { oid: "invalid", type: "blob", size: data.length },
+      ]),
+    ).toThrow(/invalid object metadata/);
+  });
+
+  it("reads complete packed metadata through a loose shadow", async () => {
+    const store = open();
+    const data = utf8.encode("packed metadata shadow\n");
+    const oid = hashObject("blob", data);
+    const result = await store.packs.ingest(slices(singleBlobPack(data), 23));
+    store.db.run(
+      "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'blob', ?, 'raw')",
+      store.sharedRepoId,
+      oid,
+      data.length,
+    );
+    store.db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+      store.sharedRepoId,
+      oid,
+      data,
+    );
+    store.db.run(
+      `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+       VALUES (?, ?, 1)`,
+      store.sharedRepoId,
+      oid,
+    );
+
+    expect(store.packs.completePackedEntry(oid)).toEqual({
+      packId: result.packId,
+      type: "blob",
+      size: data.length,
+      baseOid: null,
+    });
+    store.db.run(
+      "UPDATE git_pack_meta SET state = 'pending' WHERE repo_id = ? AND pack_id = ?",
+      store.sharedRepoId,
+      result.packId,
+    );
+    expect(store.packs.completePackedEntry(oid)).toBeNull();
+    expect(() => store.packs.completePackedEntry("invalid")).toThrow(/valid object id/);
+  });
+
+  it("rejects corrupt complete packed metadata and delta bases", async () => {
+    for (const replacement of [{ type: "invalid" }, { size: -1 }, { base_oid: "invalid" }]) {
+      const inner = new TestDatabase();
+      const db = new MutatingQueryDatabase(inner, "complete-packed-entry", replacement);
+      const database = new SqliteGitDatabase(db);
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
+      const data = utf8.encode(`corrupt packed metadata ${JSON.stringify(replacement)}\n`);
+      const oid = hashObject("blob", data);
+      await store.packs.ingest(slices(singleBlobPack(data), 29));
+
+      expect(() => store.packs.completePackedEntry(oid)).toThrow(/invalid metadata/);
+    }
+  });
+
+  it("deletes packed commit and tree projections with warmed pack caches", async () => {
+    const store = open();
+    const tree = serializeTree([{ mode: MODE_FILE, name: "missing", oid: "1".repeat(40) }]);
+    const treeOid = hashObject("tree", tree);
+    const person = {
+      name: "Pack Author",
+      email: "author@example.com",
+      timestamp: 1_700_000_000,
+      timezoneOffset: 0,
+    };
+    const commitData = serializeCommit({
+      tree: treeOid,
+      parent: [],
+      author: person,
+      committer: person,
+      message: "packed commit\n",
+    });
+    const commitOid = hashObject("commit", commitData);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("tree", tree);
+    writer.object("commit", commitData);
+    writer.finish();
+    const result = await store.packs.ingest(slices(concat(chunks), 31));
+
+    expect(store.read(treeOid)?.data).toEqual(tree);
+    expect(store.read(commitOid)?.data).toEqual(commitData);
+    expect(store.cachedCommit(commitOid)?.commit.message).toBe("packed commit\n");
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(1);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
+
+    expect(store.packs.deleteCompletePacks([result.packId])).toBe(1);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_meta")).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_tree_effective")).toBe(0);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
+    expect(store.read(treeOid)).toBeNull();
+    expect(store.read(commitOid)).toBeNull();
+    expect(store.cachedCommit(commitOid)).toBeNull();
+    expect(store.packs.deleteCompletePacks([result.packId])).toBe(0);
+  });
+
+  it("keeps commit and effective tree projections for loose shadows", async () => {
+    const store = open();
+    const tree = serializeTree([{ mode: MODE_FILE, name: "missing", oid: "1".repeat(40) }]);
+    const treeOid = hashObject("tree", tree);
+    const person = {
+      name: "Shadow Author",
+      email: "shadow@example.com",
+      timestamp: 1_700_000_001,
+      timezoneOffset: 0,
+    };
+    const commitData = serializeCommit({
+      tree: treeOid,
+      parent: [],
+      author: person,
+      committer: person,
+      message: "shadowed commit\n",
+    });
+    const commitOid = hashObject("commit", commitData);
+    expect(store.write("tree", tree)).toBe(treeOid);
+    expect(store.write("commit", commitData)).toBe(commitOid);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("tree", tree);
+    writer.object("commit", commitData);
+    writer.finish();
+    const result = await store.packs.ingest(slices(concat(chunks), 31));
+
+    expect(
+      store.db.one<{ storage: string }>(
+        `SELECT source.storage FROM git_tree_effective effective
+         JOIN git_tree_sources source ON source.source_key = effective.source_key
+         WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
+        store.sharedRepoId,
+        treeOid,
+      ),
+    ).toEqual({ storage: "loose" });
+    expect(store.packs.deleteCompletePacks([result.packId])).toBe(1);
+    expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(1);
+    expect(store.cachedCommit(commitOid)?.commit.message).toBe("shadowed commit\n");
+    expect(store.read(treeOid)?.data).toEqual(tree);
+    expect(store.read(commitOid)?.data).toEqual(commitData);
+    expect(
+      store.db.one<{ storage: string }>(
+        `SELECT source.storage FROM git_tree_effective effective
+         JOIN git_tree_sources source ON source.source_key = effective.source_key
+         WHERE effective.repo_id = ? AND effective.tree_oid = ?`,
+        store.sharedRepoId,
+        treeOid,
+      ),
+    ).toEqual({ storage: "loose" });
   });
 });
 

@@ -1,9 +1,9 @@
 // Bounded outbound closure and replayable full-object pack generation.
 
-import { MAX_BLOB_BATCH_BYTES, type ObjectReadBatch } from "../../sqlite/store.js";
-import { CorruptError, GitError, hasErrorCode, ObjectNotFoundError } from "../errors.js";
+import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { CorruptError, GitError } from "../errors.js";
 import type { ObjectType } from "../objects.js";
-import { PackWriter } from "../pack/writer.js";
+import { streamFullObjectPack } from "../pack/full-object-stream.js";
 import { ZERO_OID } from "../protocol/receive-pack.js";
 import type { Repository } from "../repository.js";
 
@@ -13,7 +13,6 @@ export const MAX_PUSH_PLAN_BYTES = 16 * 1024 * 1024;
 
 const PUSH_PLAN_OBJECT_BYTES = 160;
 const OBJECT_PAGE = 4096;
-const DEFLATE_INPUT = 16 * 1024;
 
 export interface PushObject {
   oid: string;
@@ -172,38 +171,6 @@ export function planPushObjects(
   return { objects: hydrated, newCommits: wanted.length };
 }
 
-function drainReady(ready: Uint8Array[]): Uint8Array[] {
-  const chunks = ready.slice();
-  ready.length = 0;
-  return chunks;
-}
-
-function* inputSlices(bytes: Uint8Array): Generator<Uint8Array> {
-  for (let offset = 0; offset < bytes.length; offset += DEFLATE_INPUT) {
-    yield bytes.subarray(offset, offset + DEFLATE_INPUT);
-  }
-}
-
-function* writeLargeObject(
-  repo: Repository,
-  writer: PackWriter,
-  object: PushObject,
-  ready: Uint8Array[],
-): Generator<Uint8Array> {
-  const chunks = repo.store.readChunks(object.oid);
-  if (chunks === null) throw new ObjectNotFoundError(object.oid);
-  const entry = writer.startObject(object.type, object.size, object.oid);
-  yield* drainReady(ready);
-  for (const chunk of chunks) {
-    for (const slice of inputSlices(chunk)) {
-      entry.push(slice);
-      yield* drainReady(ready);
-    }
-  }
-  entry.finish();
-  yield* drainReady(ready);
-}
-
 /** Open a fresh, byte-identical pack stream for an HTTP attempt. */
 export async function* openPushPack(repo: Repository, plan: PushPlan): AsyncGenerator<Uint8Array> {
   try {
@@ -216,43 +183,22 @@ export async function* openPushPack(repo: Repository, plan: PushPlan): AsyncGene
 }
 
 async function* generatePushPack(repo: Repository, plan: PushPlan): AsyncGenerator<Uint8Array> {
-  const ready: Uint8Array[] = [];
-  const writer = new PackWriter((chunk) => ready.push(chunk));
-  writer.header(plan.objects.length);
-  yield* drainReady(ready);
-
-  let at = 0;
-  while (at < plan.objects.length) {
-    const page = plan.objects.slice(at, at + OBJECT_PAGE);
-    let batch: ObjectReadBatch;
-    try {
-      batch = repo.readObjects(
-        page.map((object) => object.oid),
-        { budgetBytes: MAX_BLOB_BATCH_BYTES },
-      );
-    } catch (error) {
-      if (!hasErrorCode(error, "EFBIG")) throw error;
-      yield* writeLargeObject(repo, writer, page[0]!, ready);
-      at++;
-      continue;
-    }
-    if (batch.objects.size === 0) throw new CorruptError("push object batch made no progress");
-    for (const [oid, raw] of batch.objects) {
-      const object = plan.objects[at]!;
-      if (object.oid !== oid || object.type !== raw.type || object.size !== raw.data.length) {
-        throw new CorruptError("push object batch returned objects out of plan order");
-      }
-      const entry = writer.startObject(raw.type, raw.data.length, oid);
-      yield* drainReady(ready);
-      for (const slice of inputSlices(raw.data)) {
-        entry.push(slice);
-        yield* drainReady(ready);
-      }
-      entry.finish();
-      yield* drainReady(ready);
-      at++;
-    }
-  }
-  writer.finish();
-  yield* drainReady(ready);
+  yield* streamFullObjectPack(
+    plan.objects,
+    {
+      readBatch: (objects) =>
+        repo.readObjects(
+          objects.map((object) => object.oid),
+          { budgetBytes: MAX_BLOB_BATCH_BYTES },
+        ).objects,
+      readChunks: (object) => repo.store.readChunks(object.oid),
+    },
+    {
+      maxObjects: MAX_PUSH_OBJECTS,
+      maxInflatedBytes: Number.MAX_SAFE_INTEGER,
+      maxStoredBytes: Number.MAX_SAFE_INTEGER,
+      readBatchBytes: MAX_BLOB_BATCH_BYTES,
+      allowOversizedObject: true,
+    },
+  );
 }

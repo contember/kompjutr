@@ -43,6 +43,8 @@ import {
 
 /** Bytes per `git_pack_data` row. Comfortably under the DO row limit. */
 export const PACK_CHUNK = 1024 * 1024;
+export const MAX_PACK_MEMBERSHIP_OBJECTS = 2_048;
+export const MAX_PACK_DELETE_BATCH = 128;
 
 /**
  * Git's default pack depth is 50, but a pack from another implementation can
@@ -240,12 +242,57 @@ export interface PackIngestOptions {
   /** Awaited periodically so the runtime can flush its write buffer. */
   yieldNow?: () => Promise<void>;
   now?: () => number;
+  /** Synchronous hooks run inside the reservation and publication transactions. */
+  lifecycle?: PackIngestLifecycle;
 }
 
 export interface PackIngestResult {
   packId: number;
   count: number;
   bytes: number;
+}
+
+export interface PackIngestLifecycle {
+  reserved(packId: number): unknown;
+  published(result: PackIngestResult): unknown;
+}
+
+export interface CompletePackObject {
+  oid: string;
+  type: ObjectType;
+  size: number;
+}
+
+export interface CompletePackedEntry {
+  packId: number;
+  type: ObjectType;
+  size: number;
+  baseOid: string | null;
+}
+
+function requirePackId(packId: number): void {
+  if (!Number.isSafeInteger(packId) || packId < 0) {
+    throw new RangeError("pack id must be a non-negative safe integer");
+  }
+}
+
+function uniquePackIds(packIds: readonly number[], limit: number): number[] {
+  if (packIds.length > limit) {
+    throw new GitError("E2BIG", `pack batch exceeds ${limit} inputs`);
+  }
+  const unique = new Set<number>();
+  for (const packId of packIds) {
+    requirePackId(packId);
+    if (unique.has(packId)) throw new RangeError(`duplicate pack id ${packId}`);
+    unique.add(packId);
+  }
+  return [...unique];
+}
+
+function requireLifecycleResult(result: unknown, hook: string): void {
+  if (result === undefined) return;
+  void Promise.resolve(result).catch(() => {});
+  throw new Error(`pack lifecycle ${hook} hook must return undefined`);
 }
 
 /** Resolves an oid the pack index does not hold (loose storage, thin-pack bases). */
@@ -339,6 +386,7 @@ export class PackStore {
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
   readonly #maxDeltaDepth: number;
+  readonly #activePending = new Set<number>();
   #lastIngestMemoryHighWater = 0;
 
   constructor(
@@ -1115,19 +1163,49 @@ export class PackStore {
     this.#cacheGeneration++;
   }
 
-  /** Drop every pack left half-written by an interrupted ingest. */
+  /** Drop unowned packs left half-written by interrupted ordinary ingest. */
   reclaimPending(): number {
-    const pending = this.#db.all<{ pack_id: number }>(
-      "SELECT pack_id FROM git_pack_meta WHERE repo_id = ? AND state != 'complete'",
-      this.#repoId,
+    const ids = new Set<number>();
+    const collect = (rows: Iterable<Record<string, unknown>>): void => {
+      for (const row of rows) {
+        const packId = row.pack_id;
+        if (typeof packId !== "number" || !Number.isSafeInteger(packId) || packId < 0) {
+          throw new CorruptError("pending pack query returned an invalid pack id");
+        }
+        ids.add(packId);
+      }
+    };
+    collect(
+      this.#db.iterate(
+        `SELECT pack.pack_id AS pack_id
+           FROM git_pack_meta pack
+          WHERE pack.repo_id = ? AND pack.state != 'complete'
+            AND pack.pack_id NOT IN (SELECT value FROM json_each(?))
+            AND NOT EXISTS (
+              SELECT 1 FROM git_maintenance_repack_batches batch
+               WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id
+            )
+          ORDER BY pack.pack_id LIMIT ?`,
+        this.#repoId,
+        JSON.stringify([...this.#activePending]),
+        MAX_PACK_DELETE_BATCH + 1,
+      ),
     );
-    const orphaned = this.#db.all<{ pack_id: number }>(
-      `SELECT DISTINCT d.pack_id AS pack_id FROM git_pack_data d
-         LEFT JOIN git_pack_meta m ON m.repo_id = d.repo_id AND m.pack_id = d.pack_id
-        WHERE d.repo_id = ? AND m.pack_id IS NULL`,
-      this.#repoId,
+    collect(
+      this.#db.iterate(
+        `SELECT DISTINCT data.pack_id AS pack_id
+           FROM git_pack_data data
+           LEFT JOIN git_pack_meta pack
+             ON pack.repo_id = data.repo_id AND pack.pack_id = data.pack_id
+          WHERE data.repo_id = ? AND pack.pack_id IS NULL
+          ORDER BY data.pack_id LIMIT ?`,
+        this.#repoId,
+        MAX_PACK_DELETE_BATCH + 1,
+      ),
     );
-    const ids = new Set([...pending, ...orphaned].map((row) => row.pack_id));
+    if (ids.size > MAX_PACK_DELETE_BATCH) {
+      throw new GitError("E2BIG", `pending pack cleanup exceeds ${MAX_PACK_DELETE_BATCH} packs`);
+    }
     if (ids.size === 0) return 0;
     this.#db.transactionSync(() => {
       for (const packId of ids) this.#deletePack(packId);
@@ -1136,7 +1214,207 @@ export class PackStore {
     return ids.size;
   }
 
+  /** Delete exactly one pending pack after its owner releases the durable reference. */
+  discardPending(packId: number, releaseOwnership?: (packId: number) => void): boolean {
+    requirePackId(packId);
+    const removed = this.#db.transactionSync(() => {
+      const row = this.#db.one<{ state: unknown }>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        this.#repoId,
+        packId,
+      );
+      if (row === undefined) return false;
+      if (row.state !== "pending" && row.state !== "complete") {
+        throw new CorruptError(`pack ${packId}: invalid state`);
+      }
+      if (row.state !== "pending") {
+        throw new GitError("EBUSY", `pack ${packId} is already complete`);
+      }
+      releaseOwnership?.(packId);
+      this.#deletePack(packId);
+      return true;
+    });
+    if (removed) this.clearCaches();
+    return removed;
+  }
+
+  /** Verify that one complete pack contains exactly the requested object metadata. */
+  completePackMatches(packId: number, objects: readonly CompletePackObject[]): boolean {
+    requirePackId(packId);
+    if (objects.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
+      throw new GitError("E2BIG", `pack membership exceeds ${MAX_PACK_MEMBERSHIP_OBJECTS} objects`);
+    }
+    const expected = new Map<string, { type: ObjectType; size: number }>();
+    for (const object of objects) {
+      if (
+        !isOid(object.oid) ||
+        !isObjectType(object.type) ||
+        !Number.isSafeInteger(object.size) ||
+        object.size < 0
+      ) {
+        throw new RangeError("pack membership contains invalid object metadata");
+      }
+      if (expected.has(object.oid)) throw new RangeError(`duplicate pack object ${object.oid}`);
+      expected.set(object.oid, { type: object.type, size: object.size });
+    }
+    const meta = this.#db.one<{ state: unknown; count: unknown }>(
+      "SELECT state, count FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+      this.#repoId,
+      packId,
+    );
+    if (meta === undefined) return false;
+    if (
+      (meta.state !== "pending" && meta.state !== "complete") ||
+      typeof meta.count !== "number" ||
+      !Number.isSafeInteger(meta.count) ||
+      meta.count < 0
+    ) {
+      throw new CorruptError(`pack ${packId}: invalid metadata`);
+    }
+    if (meta.state !== "complete" || meta.count !== expected.size) return false;
+
+    let found = 0;
+    let previousOid: string | null = null;
+    for (const row of this.#db.iterate(
+      `SELECT /* complete-pack-membership */ oid, pack_id, offset, type, size FROM git_pack_objects
+        WHERE repo_id = ? AND pack_id = ?
+        ORDER BY oid COLLATE BINARY LIMIT ?`,
+      this.#repoId,
+      packId,
+      expected.size + 1,
+    )) {
+      const oid = row.oid;
+      const rowPackId = row.pack_id;
+      const offset = row.offset;
+      const type = row.type;
+      const size = row.size;
+      if (
+        typeof oid !== "string" ||
+        !isOid(oid) ||
+        typeof rowPackId !== "number" ||
+        !Number.isSafeInteger(rowPackId) ||
+        rowPackId !== packId ||
+        typeof offset !== "number" ||
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        typeof type !== "string" ||
+        !isObjectType(type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        (previousOid !== null && oid <= previousOid)
+      ) {
+        throw new CorruptError(`pack ${packId}: invalid object membership`);
+      }
+      const wanted = expected.get(oid);
+      if (wanted === undefined || wanted.type !== type || wanted.size !== size) return false;
+      expected.delete(oid);
+      previousOid = oid;
+      found++;
+    }
+    return found === objects.length && expected.size === 0;
+  }
+
+  /** Read packed metadata directly, ignoring any loose object that shadows it. */
+  completePackedEntry(oid: string): CompletePackedEntry | null {
+    if (!isOid(oid)) throw new RangeError("packed entry requires a valid object id");
+    let result: CompletePackedEntry | null = null;
+    let rows = 0;
+    for (const row of this.#db.iterate(
+      `SELECT /* complete-packed-entry */ object.oid, object.pack_id,
+              object.type, object.size, object.base_oid
+         FROM git_pack_objects object
+         JOIN git_pack_meta pack
+           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+          AND pack.state = 'complete'
+        WHERE object.repo_id = ? AND object.oid = ?
+        LIMIT 2`,
+      this.#repoId,
+      oid,
+    )) {
+      const rowOid = row.oid;
+      const packId = row.pack_id;
+      const type = row.type;
+      const size = row.size;
+      const baseOid = row.base_oid;
+      if (
+        typeof rowOid !== "string" ||
+        rowOid !== oid ||
+        !isOid(rowOid) ||
+        typeof packId !== "number" ||
+        !Number.isSafeInteger(packId) ||
+        packId < 0 ||
+        typeof type !== "string" ||
+        !isObjectType(type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid)))
+      ) {
+        throw new CorruptError(`packed entry ${oid} has invalid metadata`);
+      }
+      rows++;
+      if (rows > 1) throw new CorruptError(`packed entry ${oid} is not unique`);
+      result = { packId, type, size, baseOid };
+    }
+    return result;
+  }
+
+  /** Delete a bounded set of complete packs; absent ids make retries idempotent. */
+  deleteCompletePacks(packIds: readonly number[]): number {
+    const ids = uniquePackIds(packIds, MAX_PACK_DELETE_BATCH);
+    if (ids.length === 0) return 0;
+    const requested = new Set(ids);
+    const states = new Map<number, "pending" | "complete">();
+    for (const row of this.#db.iterate(
+      `SELECT pack_id, state FROM git_pack_meta
+        WHERE repo_id = ? AND pack_id IN (SELECT value FROM json_each(?))`,
+      this.#repoId,
+      JSON.stringify(ids),
+    )) {
+      const packId = row.pack_id;
+      const state = row.state;
+      if (
+        typeof packId !== "number" ||
+        !Number.isSafeInteger(packId) ||
+        packId < 0 ||
+        (state !== "pending" && state !== "complete") ||
+        !requested.has(packId) ||
+        states.has(packId)
+      ) {
+        throw new CorruptError("complete pack deletion query returned an invalid row");
+      }
+      states.set(packId, state);
+    }
+    for (const [packId, state] of states) {
+      if (state !== "complete") throw new GitError("EBUSY", `pack ${packId} is still pending`);
+    }
+    if (states.size === 0) return 0;
+    this.#db.transactionSync(() => {
+      for (const packId of states.keys()) this.#deletePack(packId);
+    });
+    this.clearCaches();
+    return states.size;
+  }
+
   #deletePack(packId: number): void {
+    this.#db.run(
+      `DELETE FROM git_commits
+        WHERE repo_id = ?
+          AND oid IN (
+            SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ? AND type = 'commit'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_objects loose
+             WHERE loose.repo_id = git_commits.repo_id
+               AND loose.oid = git_commits.oid
+               AND loose.type = 'commit'
+               AND loose.size = git_commits.object_size
+          )`,
+      this.#repoId,
+      this.#repoId,
+      packId,
+    );
     this.#db.run(
       `DELETE FROM git_tree_effective WHERE source_key IN (
          SELECT source_key FROM git_tree_sources
@@ -1179,23 +1457,16 @@ export class PackStore {
     const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
     const yieldNow = options.yieldNow ?? (() => Promise.resolve());
 
+    let activePackId: number | undefined;
     try {
-      reservation.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
       this.reclaimPending();
-      const packId =
-        (this.#db.scalar<number | null>(
-          "SELECT MAX(pack_id) FROM git_pack_meta WHERE repo_id = ?",
-          this.#repoId,
-        ) ?? 0) + 1;
-      this.#db.run(
-        "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (?, ?, 0, 0, 'pending', ?)",
-        this.#repoId,
-        packId,
-        now(),
-      );
+      const packId = this.#reservePending(now, options.lifecycle);
+      activePackId = packId;
 
       const total = await this.#writeChunks(source, packId, maxBytes, say, yieldNow, memory);
+      reservation.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
       const { count, commits } = await this.#indexPack(packId, total, say, yieldNow, memory);
+      const result = { packId, count, bytes: total };
 
       this.#db.transactionSync(() => {
         this.#db.run(
@@ -1206,10 +1477,14 @@ export class PackStore {
           packId,
         );
         commits.finish();
+        if (options.lifecycle !== undefined) {
+          requireLifecycleResult(options.lifecycle.published(result), "published");
+        }
       });
       reservation.clear("commit");
-      return { packId, count, bytes: total };
+      return result;
     } finally {
+      if (activePackId !== undefined) this.#activePending.delete(activePackId);
       this.#lastIngestMemoryHighWater = reservation.highWaterBytes;
       if (!reservation.disposed) {
         try {
@@ -1227,6 +1502,41 @@ export class PackStore {
           reservation.dispose();
         }
       }
+    }
+  }
+
+  #reservePending(now: () => number, lifecycle: PackIngestLifecycle | undefined): number {
+    let activePackId: number | undefined;
+    try {
+      return this.#db.transactionSync(() => {
+        const latest = this.#db.scalar<number | null>(
+          "SELECT MAX(pack_id) FROM git_pack_meta WHERE repo_id = ?",
+          this.#repoId,
+        );
+        if (
+          latest !== undefined &&
+          latest !== null &&
+          (!Number.isSafeInteger(latest) || latest < 0 || latest === Number.MAX_SAFE_INTEGER)
+        ) {
+          throw new CorruptError("pack id allocation state is invalid");
+        }
+        const packId = (latest ?? 0) + 1;
+        this.#db.run(
+          "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (?, ?, 0, 0, 'pending', ?)",
+          this.#repoId,
+          packId,
+          now(),
+        );
+        this.#activePending.add(packId);
+        activePackId = packId;
+        if (lifecycle !== undefined) {
+          requireLifecycleResult(lifecycle.reserved(packId), "reserved");
+        }
+        return packId;
+      });
+    } catch (error) {
+      if (activePackId !== undefined) this.#activePending.delete(activePackId);
+      throw error;
     }
   }
 
