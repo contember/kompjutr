@@ -739,20 +739,28 @@ describe("sparse eager status", () => {
           "fresh\n",
         );
       }
-      workspace.storage.histogram = new Map();
+      const source = requireSparseWorkspace(workspace);
+      const lookup = source.indexAncestorFacts;
+      if (lookup === undefined) throw new Error("SQLite sparse workspace has no ancestor lookup");
+      const ancestorStatements: number[] = [];
       workspace.storage.resetCounters();
       expect(
         eagerStatus(
           workspace.repo,
           new NoScanWorktree(workspace.worktree),
           {},
-          sparseTrackerContext(workspace),
+          sparseTrackerContext(workspace, {
+            ...source,
+            indexAncestorFacts(request) {
+              const before = workspace.storage.statementCount;
+              const result = lookup(request);
+              ancestorStatements.push(workspace.storage.statementCount - before);
+              return result;
+            },
+          }),
         ).map((row) => row.path),
       ).toEqual(["fresh/"]);
-      const ancestorStatements = [...(workspace.storage.histogram ?? [])]
-        .filter(([query]) => query.includes("index_ancestor_rows"))
-        .reduce((total, [, statements]) => total + statements, 0);
-      expect(ancestorStatements).toBe(1);
+      expect(ancestorStatements).toEqual([1]);
       return workspace.storage.statementCount;
     };
 
