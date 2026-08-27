@@ -200,6 +200,15 @@ function fakeAncestorResult(paths: readonly string[]): SparseIndexAncestorResult
   };
 }
 
+function replaceFirstOwnRowWithInherited<T>(rows: T[]): void {
+  const first = rows[0];
+  if (first === undefined) throw new Error("missing row for inherited-property witness");
+  delete rows[0];
+  const prototype: object = Object.create(Array.prototype);
+  Object.defineProperty(prototype, "0", { value: first, enumerable: true });
+  Object.setPrototypeOf(rows, prototype);
+}
+
 describe("add", () => {
   it("stages mixed exact, overlapping directory, conflict, and non-BMP paths like git", () => {
     const fixture = newFixture();
@@ -416,6 +425,12 @@ describe("add", () => {
           delete result.facts[0];
         },
       },
+      {
+        name: "inherited fact",
+        mutate(result) {
+          replaceFirstOwnRowWithInherited(result.facts);
+        },
+      },
       { name: "fact shape", mutate: (result) => void Reflect.set(result.facts, "0", null) },
       {
         name: "fact path",
@@ -501,6 +516,197 @@ describe("add", () => {
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
   });
 
+  it("uses canonical ancestor facts after caller getters mutate earlier rows", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "a\n");
+    writeWorkFile(workspace, "/b.txt", "b\n");
+    const native = createSqliteSelectedPathSource(workspace.database.db);
+    const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
+    let selectedCalls = 0;
+    const first = { path: "a.txt", exact: false, descendant: false };
+    const second = { path: "b.txt", exact: false, descendant: false };
+    Object.defineProperty(second, "descendant", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        first.descendant = true;
+        return false;
+      },
+    });
+    const facts = [first, second];
+    Object.defineProperty(facts, Symbol.iterator, {
+      value() {
+        throw new Error("caller-owned ancestor iterator must not run");
+      },
+    });
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["a.txt", "b.txt"] },
+      {
+        selectedPaths: {
+          select(request) {
+            selectedCalls++;
+            return native.select(request);
+          },
+        },
+        sparseWorkspace: {
+          ...sparseWorkspace,
+          indexAncestorFacts() {
+            return { facts, retainedBytes: 10_000 };
+          },
+        },
+      },
+    );
+
+    expect(first.descendant).toBe(true);
+    expect(selectedCalls).toBe(1);
+    expect(lsFiles(workspace.repo)).toEqual(["a.txt", "b.txt"]);
+  });
+
+  it("rejects both directions of ancestor exact disagreement before mutation", () => {
+    const cases = [
+      { name: "claims a missing exact row", seedIndex: false, claimedExact: true },
+      { name: "denies an existing exact row", seedIndex: true, claimedExact: false },
+    ];
+    for (const testCase of cases) {
+      const workspace = makeRepo("/");
+      writeWorkFile(workspace, "/a.txt", "a\n");
+      if (testCase.seedIndex) {
+        add(workspace.repo, workspace.worktree, { paths: ["a.txt"] });
+      }
+      const beforeIndex = workspace.repo.checkout.indexEntries();
+      const beforeObjects = workspace.repo.store.objectCount();
+      const sparseWorkspace = createSqliteSparseWorkspaceSource(workspace.database.db);
+
+      expect(
+        () =>
+          add(
+            workspace.repo,
+            workspace.worktree,
+            { paths: ["a.txt"] },
+            {
+              selectedPaths: createSqliteSelectedPathSource(workspace.database.db),
+              sparseWorkspace: {
+                ...sparseWorkspace,
+                indexAncestorFacts() {
+                  return {
+                    facts: [{ path: "a.txt", exact: testCase.claimedExact, descendant: false }],
+                    retainedBytes: 10_000,
+                  };
+                },
+              },
+            },
+          ),
+        testCase.name,
+      ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+      expect(workspace.repo.checkout.indexEntries(), testCase.name).toEqual(beforeIndex);
+      expect(workspace.repo.store.objectCount(), testCase.name).toBe(beforeObjects);
+    }
+  });
+
+  it("falls back for selected-path capacity and unavailable results", () => {
+    for (const mode of ["capacity", "unavailable"]) {
+      const workspace = makeRepo("/");
+      writeWorkFile(workspace, "/a.txt", `${mode}\n`);
+
+      add(
+        workspace.repo,
+        workspace.worktree,
+        { paths: ["a.txt"] },
+        {
+          selectedPaths: {
+            select() {
+              if (mode === "capacity") throw new GitError("E2BIG", "injected source capacity");
+              return { available: false };
+            },
+          },
+        },
+      );
+
+      expect(workspace.repo.checkout.indexGet("a.txt")?.oid, mode).toBe(
+        hashObject("blob", utf8.encode(`${mode}\n`)),
+      );
+    }
+  });
+
+  it("stages from canonical selected snapshots without caller iterators or getter rereads", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "old a\n");
+    writeWorkFile(workspace, "/b.txt", "old b\n");
+    add(workspace.repo, workspace.worktree, { paths: [], all: true });
+    workspace.tick(1_000);
+    writeWorkFile(workspace, "/a.txt", "new a\n");
+    writeWorkFile(workspace, "/b.txt", "new b\n");
+    const native = createSqliteSelectedPathSource(workspace.database.db);
+    let selectedCalls = 0;
+    let indexPathReads = 0;
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["a.txt", "b.txt"] },
+      {
+        selectedPaths: {
+          select(request) {
+            selectedCalls++;
+            const result = native.select(request);
+            if (!result.available) return result;
+            const firstIndex = result.index[0];
+            const firstWorktree = result.worktree[0];
+            const secondWorktree = result.worktree[1];
+            if (
+              firstIndex === undefined ||
+              firstWorktree === undefined ||
+              secondWorktree === undefined
+            ) {
+              throw new Error("missing selected snapshot witness rows");
+            }
+            const indexPath = firstIndex.path;
+            Object.defineProperty(firstIndex, "path", {
+              configurable: true,
+              enumerable: true,
+              get() {
+                indexPathReads++;
+                return indexPathReads === 1 ? indexPath : "outside.txt";
+              },
+            });
+            const secondRevision = secondWorktree.stat.rev;
+            Object.defineProperty(secondWorktree.stat, "rev", {
+              configurable: true,
+              enumerable: true,
+              get() {
+                firstWorktree.path = "outside.txt";
+                return secondRevision;
+              },
+            });
+            Object.defineProperty(result.index, Symbol.iterator, {
+              value() {
+                throw new Error("caller-owned index iterator must not run");
+              },
+            });
+            Object.defineProperty(result.worktree, Symbol.iterator, {
+              value() {
+                throw new Error("caller-owned worktree iterator must not run");
+              },
+            });
+            return result;
+          },
+        },
+      },
+    );
+
+    expect(selectedCalls).toBe(1);
+    expect(indexPathReads).toBe(1);
+    expect(workspace.repo.checkout.indexGet("a.txt")?.oid).toBe(
+      hashObject("blob", utf8.encode("new a\n")),
+    );
+    expect(workspace.repo.checkout.indexGet("b.txt")?.oid).toBe(
+      hashObject("blob", utf8.encode("new b\n")),
+    );
+  });
+
   it("rejects malformed selected success facts before index or object mutation", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a/file.txt", "worktree\n");
@@ -512,6 +718,30 @@ describe("add", () => {
       { name: "availability", mutate: (result) => void Reflect.set(result, "available", 1) },
       { name: "index array", mutate: (result) => void Reflect.set(result, "index", null) },
       { name: "worktree array", mutate: (result) => void Reflect.set(result, "worktree", null) },
+      {
+        name: "sparse index",
+        mutate(result) {
+          delete result.index[0];
+        },
+      },
+      {
+        name: "inherited index",
+        mutate(result) {
+          replaceFirstOwnRowWithInherited(result.index);
+        },
+      },
+      {
+        name: "sparse worktree",
+        mutate(result) {
+          delete result.worktree[0];
+        },
+      },
+      {
+        name: "inherited worktree",
+        mutate(result) {
+          replaceFirstOwnRowWithInherited(result.worktree);
+        },
+      },
       {
         name: "index cardinality",
         mutate(result) {

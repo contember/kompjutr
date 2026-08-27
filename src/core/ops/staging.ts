@@ -59,6 +59,10 @@ const SELECTED_ANCESTOR_FACT_FIXED_BYTES = 64;
 const SELECTED_ANCESTOR_SLOT_BYTES = 8;
 const SELECTED_MERGE_FIXED_BYTES = 128;
 const SELECTED_MERGE_SLOT_BYTES = 8;
+const TYPED_ARRAY_BYTE_LENGTH_GETTER: unknown = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  "byteLength",
+)?.get;
 
 type AvailableSelectedPaths = Extract<SelectedPathResult, { available: true }>;
 
@@ -324,8 +328,14 @@ function recursiveAddSpecs(
     if (hasErrorCode(error, "E2BIG")) return null;
     throw error;
   }
-  validateSelectedAncestorResult(result, candidates, exact.index, retainedHeadroom);
-  const facts = result.facts;
+  const validated = validateSelectedAncestorResult(
+    result,
+    candidates,
+    exact.index,
+    retainedHeadroom,
+  );
+  if (validated === null) return null;
+  const facts = validated.facts;
   for (let ordinal = 0; ordinal < candidates.length; ordinal++) {
     const path = candidates[ordinal];
     const fact = facts[ordinal];
@@ -353,15 +363,18 @@ function validateSelectedAncestorResult(
   expected: readonly string[],
   exactIndex: readonly IndexEntry[],
   retainedLimit: number,
-): asserts result is ValidatedSelectedAncestorResult {
+): ValidatedSelectedAncestorResult | null {
   if (typeof result !== "object" || result === null || Array.isArray(result)) {
     throw new GitError("ECORRUPT", "selected add ancestor source returned a malformed result");
   }
   const facts = Reflect.get(result, "facts");
   const retainedBytes = Reflect.get(result, "retainedBytes");
+  const factsLength = Array.isArray(facts) ? Reflect.get(facts, "length") : undefined;
   if (
     !Array.isArray(facts) ||
-    facts.length !== expected.length ||
+    typeof factsLength !== "number" ||
+    !Number.isSafeInteger(factsLength) ||
+    factsLength !== expected.length ||
     typeof retainedBytes !== "number" ||
     !Number.isSafeInteger(retainedBytes) ||
     retainedBytes < 0 ||
@@ -372,11 +385,13 @@ function validateSelectedAncestorResult(
   let minimumRetained = SELECTED_ANCESTOR_RESULT_FIXED_BYTES + SELECTED_ANCESTOR_ARRAY_FIXED_BYTES;
   minimumRetained = addSelectedRetained(
     minimumRetained,
-    facts.length * SELECTED_ANCESTOR_SLOT_BYTES,
+    factsLength * SELECTED_ANCESTOR_SLOT_BYTES,
     retainedBytes,
   );
+  if (retainedBytes > retainedLimit - minimumRetained) return null;
+  const snapshot: ValidatedSelectedAncestorFact[] = [];
   let previous: string | undefined;
-  for (let ordinal = 0; ordinal < facts.length; ordinal++) {
+  for (let ordinal = 0; ordinal < factsLength; ordinal++) {
     if (!Object.hasOwn(facts, ordinal)) {
       throw new GitError("ECORRUPT", "selected add ancestor source returned sparse facts");
     }
@@ -405,8 +420,11 @@ function validateSelectedAncestorResult(
       SELECTED_ANCESTOR_FACT_FIXED_BYTES + path.length * 2,
       retainedBytes,
     );
+    if (retainedBytes > retainedLimit - minimumRetained) return null;
+    snapshot.push({ path, exact, descendant });
     previous = path;
   }
+  return { facts: snapshot, retainedBytes: retainedBytes + minimumRetained };
 }
 
 function validateSelectedAddResult(
@@ -427,9 +445,17 @@ function validateSelectedAddResult(
   const index = Reflect.get(selected, "index");
   const worktree = Reflect.get(selected, "worktree");
   const retainedBytes = Reflect.get(selected, "retainedBytes");
+  const indexLength = Array.isArray(index) ? Reflect.get(index, "length") : undefined;
+  const worktreeLength = Array.isArray(worktree) ? Reflect.get(worktree, "length") : undefined;
   if (
     !Array.isArray(index) ||
     !Array.isArray(worktree) ||
+    typeof indexLength !== "number" ||
+    !Number.isSafeInteger(indexLength) ||
+    indexLength < 0 ||
+    typeof worktreeLength !== "number" ||
+    !Number.isSafeInteger(worktreeLength) ||
+    worktreeLength < 0 ||
     typeof retainedBytes !== "number" ||
     !Number.isSafeInteger(retainedBytes) ||
     retainedBytes < 0 ||
@@ -437,21 +463,27 @@ function validateSelectedAddResult(
   ) {
     throw new GitError("ECORRUPT", "selected add source returned invalid retained state");
   }
-  if (index.length > maxIndexRows || worktree.length > maxWorktreeRows) {
+  if (indexLength > maxIndexRows || worktreeLength > maxWorktreeRows) {
     throw new GitError("ECORRUPT", "selected add source returned excessive facts");
   }
   let minimumRetained = SELECTED_RESULT_FIXED_BYTES + SELECTED_ARRAY_FIXED_BYTES * 2;
   minimumRetained = addSelectedRetained(
     minimumRetained,
-    (index.length + worktree.length) * SELECTED_ARRAY_SLOT_BYTES,
+    (indexLength + worktreeLength) * SELECTED_ARRAY_SLOT_BYTES,
     retainedBytes,
   );
+  if (retainedBytes > maxRetainedBytes - minimumRetained) return null;
+  const snapshotIndex: IndexEntry[] = [];
   let previousIndex: IndexEntry | undefined;
-  for (const candidate of index) {
-    if (!validSelectedIndexEntry(candidate)) {
+  for (let ordinal = 0; ordinal < indexLength; ordinal++) {
+    if (!Object.hasOwn(index, ordinal)) {
+      throw new GitError("ECORRUPT", "selected add index source returned sparse rows");
+    }
+    const candidate: unknown = Reflect.get(index, String(ordinal));
+    const entry = snapshotSelectedIndexEntry(candidate);
+    if (entry === null) {
       throw new GitError("ECORRUPT", "selected add index source returned a malformed row");
     }
-    const entry = candidate;
     if (
       !matches(entry.path) ||
       (previousIndex !== undefined &&
@@ -465,31 +497,46 @@ function validateSelectedAddResult(
       SELECTED_INDEX_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid),
       retainedBytes,
     );
+    if (retainedBytes > maxRetainedBytes - minimumRetained) return null;
+    snapshotIndex.push(entry);
     previousIndex = entry;
   }
+  const snapshotWorktree: SelectedWorktreeFact[] = [];
   let previousWorktree: SelectedWorktreeFact | undefined;
-  for (const candidate of worktree) {
-    if (!validSelectedWorktreeFact(candidate)) {
+  for (let ordinal = 0; ordinal < worktreeLength; ordinal++) {
+    if (!Object.hasOwn(worktree, ordinal)) {
+      throw new GitError("ECORRUPT", "selected add worktree source returned sparse rows");
+    }
+    const candidate: unknown = Reflect.get(worktree, String(ordinal));
+    const fields = validateSelectedWorktreeFields(candidate);
+    if (fields === null) {
       throw new GitError("ECORRUPT", "selected add worktree source returned a malformed row");
     }
-    const entry = candidate;
     if (
-      !matches(entry.path) ||
-      (previousWorktree !== undefined && comparePaths(previousWorktree.path, entry.path) >= 0)
+      !matches(fields.path) ||
+      (previousWorktree !== undefined && comparePaths(previousWorktree.path, fields.path) >= 0)
     ) {
       throw new GitError("ECORRUPT", "selected add worktree source returned an unrelated path");
     }
     minimumRetained = addSelectedRetained(
       minimumRetained,
       SELECTED_WORKTREE_FIXED_BYTES +
-        retainedStringBytes(entry.path) +
-        retainedStringBytes(entry.stat.target ?? "") +
-        (entry.stat.contentId?.byteLength ?? 0),
+        retainedStringBytes(fields.path) +
+        retainedStringBytes(fields.target ?? "") +
+        fields.contentBytes,
       retainedBytes,
     );
+    if (retainedBytes > maxRetainedBytes - minimumRetained) return null;
+    const entry = snapshotSelectedWorktreeFact(fields);
+    snapshotWorktree.push(entry);
     previousWorktree = entry;
   }
-  return { available: true, index, worktree, retainedBytes };
+  return {
+    available: true,
+    index: snapshotIndex,
+    worktree: snapshotWorktree,
+    retainedBytes: retainedBytes + minimumRetained,
+  };
 }
 
 function addSelectedRetained(current: number, added: number, reported: number): number {
@@ -543,34 +590,54 @@ function validNullableIndexNumber(value: unknown, minimum: number): boolean {
   );
 }
 
-function validSelectedIndexEntry(value: unknown): value is IndexEntry {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+function snapshotSelectedIndexEntry(value: unknown): IndexEntry | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const path = Reflect.get(value, "path");
   const stage = Reflect.get(value, "stage");
   const mode = Reflect.get(value, "mode");
   const oid = Reflect.get(value, "oid");
+  const size = Reflect.get(value, "size");
+  const mtime = Reflect.get(value, "mtime");
+  const ino = Reflect.get(value, "ino");
   const rev = Reflect.get(value, "rev");
-  return (
-    typeof path === "string" &&
-    validSelectedPath(path) &&
-    typeof stage === "number" &&
-    Number.isSafeInteger(stage) &&
-    stage >= 0 &&
-    stage <= 3 &&
-    typeof mode === "number" &&
-    Number.isSafeInteger(mode) &&
-    [0o100644, 0o100755, 0o120000, 0o160000].includes(mode) &&
-    typeof oid === "string" &&
-    isOid(oid) &&
-    validNullableIndexNumber(Reflect.get(value, "size"), 0) &&
-    validNullableIndexNumber(Reflect.get(value, "mtime"), Number.MIN_SAFE_INTEGER) &&
-    validNullableIndexNumber(Reflect.get(value, "ino"), 1) &&
-    (rev === undefined || validNullableIndexNumber(rev, 0))
-  );
+  if (
+    typeof path !== "string" ||
+    !validSelectedPath(path) ||
+    typeof stage !== "number" ||
+    !Number.isSafeInteger(stage) ||
+    stage < 0 ||
+    stage > 3 ||
+    typeof mode !== "number" ||
+    !Number.isSafeInteger(mode) ||
+    ![0o100644, 0o100755, 0o120000, 0o160000].includes(mode) ||
+    typeof oid !== "string" ||
+    !isOid(oid) ||
+    !validNullableIndexNumber(size, 0) ||
+    !validNullableIndexNumber(mtime, Number.MIN_SAFE_INTEGER) ||
+    !validNullableIndexNumber(ino, 1) ||
+    (rev !== undefined && !validNullableIndexNumber(rev, 0))
+  ) {
+    return null;
+  }
+  return { path, stage, mode, oid, size, mtime, ino, ...(rev === undefined ? {} : { rev }) };
 }
 
-function validSelectedWorktreeFact(value: unknown): value is SelectedWorktreeFact {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+interface ValidatedSelectedWorktreeFields {
+  path: string;
+  type: "file" | "dir" | "symlink";
+  mode: number;
+  size: number;
+  mtime: number;
+  ino: number;
+  nlink: number;
+  rev: number;
+  target: string | null;
+  contentId: Uint8Array | null;
+  contentBytes: number;
+}
+
+function validateSelectedWorktreeFields(value: unknown): ValidatedSelectedWorktreeFields | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const path = Reflect.get(value, "path");
   const stat = Reflect.get(value, "stat");
   if (
@@ -580,7 +647,7 @@ function validSelectedWorktreeFact(value: unknown): value is SelectedWorktreeFac
     stat === null ||
     Array.isArray(stat)
   ) {
-    return false;
+    return null;
   }
   const type = Reflect.get(stat, "type");
   const mode = Reflect.get(stat, "mode");
@@ -613,13 +680,61 @@ function validSelectedWorktreeFact(value: unknown): value is SelectedWorktreeFac
     rev < 0 ||
     (contentId !== null && !(contentId instanceof Uint8Array))
   ) {
-    return false;
+    return null;
   }
-  if (type === "dir") return size === 0 && target === null && contentId === null;
-  if (type === "file") return target === null;
-  return (
-    typeof target === "string" && selectedUtf8Bytes(target, size) === size && contentId === null
-  );
+  if (type === "dir" && (size !== 0 || target !== null || contentId !== null)) return null;
+  if (type === "file" && target !== null) return null;
+  if (
+    type === "symlink" &&
+    (typeof target !== "string" || selectedUtf8Bytes(target, size) !== size || contentId !== null)
+  ) {
+    return null;
+  }
+  const contentBytes = contentId === null ? 0 : selectedContentIdBytes(contentId);
+  if (contentBytes === null) return null;
+  return {
+    path,
+    type,
+    mode,
+    size,
+    mtime,
+    ino,
+    nlink,
+    rev,
+    target,
+    contentId,
+    contentBytes,
+  };
+}
+
+function selectedContentIdBytes(value: Uint8Array): number | null {
+  if (typeof TYPED_ARRAY_BYTE_LENGTH_GETTER !== "function") return null;
+  let bytes: unknown;
+  try {
+    bytes = Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []);
+  } catch {
+    return null;
+  }
+  return typeof bytes === "number" && Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+}
+
+function snapshotSelectedWorktreeFact(
+  fields: ValidatedSelectedWorktreeFields,
+): SelectedWorktreeFact {
+  return {
+    path: fields.path,
+    stat: {
+      type: fields.type,
+      mode: fields.mode,
+      size: fields.size,
+      mtime: fields.mtime,
+      ino: fields.ino,
+      nlink: fields.nlink,
+      rev: fields.rev,
+      target: fields.target,
+      contentId: fields.contentId === null ? null : new Uint8Array(fields.contentId),
+    },
+  };
 }
 
 function hasExactRequestedPath(requested: readonly SelectedPathSpec[], path: string): boolean {
