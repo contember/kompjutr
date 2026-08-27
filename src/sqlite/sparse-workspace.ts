@@ -36,6 +36,7 @@ const MAX_EDGE_STEPS = 32_768;
 const MAX_INDEX_ANCESTORS = 32_768;
 const MAX_INDEX_ANCESTOR_ROWS = 32_768;
 const MAX_SELECTED_ROWS = 32_768;
+const MAX_SELECTED_EXACT_ANCESTORS = 32_768;
 const MAX_SNAPSHOT_DIRECTORIES = 1_000;
 const MAX_SNAPSHOT_DIRTY_ROWS = 32_000;
 const MAX_SOURCE_ENTRIES = 8_192;
@@ -47,6 +48,10 @@ const INDEX_ENTRY_RETAINED_BYTES = 320;
 const INDEX_ANCESTOR_RETAINED_BYTES = 192;
 const SELECTED_INDEX_RETAINED_BYTES = 320;
 const SELECTED_WORKTREE_RETAINED_BYTES = 512;
+const SELECTED_EXACT_SET_RETAINED_BYTES = 128;
+const SELECTED_EXACT_SET_ENTRY_BYTES = 96;
+const SELECTED_EXACT_ARRAY_RETAINED_BYTES = 64;
+const SELECTED_EXACT_ARRAY_SLOT_BYTES = 8;
 const SNAPSHOT_ARRAY_RETAINED_BYTES = 64;
 const SNAPSHOT_ARRAY_SLOT_BYTES = 8;
 const SNAPSHOT_MAP_RETAINED_BYTES = 128;
@@ -91,6 +96,7 @@ interface ValidatedRequest {
 }
 
 interface ValidatedTreeSource {
+  sourceKey: number;
   storage: "loose" | "pack";
   sourceId: number;
   objectSize: number;
@@ -378,6 +384,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
   ),
   selected AS MATERIALIZED (
     SELECT w.ordinal, w.side, w.segment, w.final, w.validated, w.tree_oid,
+           x.repo_id, x.source_key,
            s.storage, s.source_id, s.object_size, s.entry_count, s.base_cost
       FROM wanted w
       LEFT JOIN git_tree_effective x
@@ -388,20 +395,23 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
        AND s.complete = 1
   ),
   distinct_sources AS MATERIALIZED (
-    SELECT DISTINCT tree_oid, storage, source_id, object_size, entry_count, base_cost
+    SELECT DISTINCT repo_id, tree_oid, source_key, storage, source_id,
+                    object_size, entry_count, base_cost
       FROM selected WHERE validated = 0 AND storage IS NOT NULL
   ),
   metadata_budget AS MATERIALIZED (
     SELECT distinct_sources.*,
            sum(entry_count) OVER (
-             ORDER BY tree_oid, storage, source_id ROWS UNBOUNDED PRECEDING
+             ORDER BY source_key ROWS UNBOUNDED PRECEDING
            ) AS cumulative_entries,
            sum(object_size) OVER (
-             ORDER BY tree_oid, storage, source_id ROWS UNBOUNDED PRECEDING
+             ORDER BY source_key ROWS UNBOUNDED PRECEDING
            ) AS cumulative_object_bytes
       FROM distinct_sources
      WHERE typeof(tree_oid) = 'text' AND length(tree_oid) = 40
        AND tree_oid NOT GLOB '*[^0-9a-f]*'
+       AND typeof(repo_id) = 'integer' AND repo_id >= 1
+       AND typeof(source_key) = 'integer' AND source_key >= 1
        AND storage IN ('loose','pack')
        AND typeof(source_id) = 'integer' AND source_id >= 0
        AND typeof(object_size) = 'integer' AND object_size >= 0
@@ -414,21 +424,18 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
   preflight AS MATERIALIZED (
     SELECT source.*,
            (SELECT count(*) FROM (
-              SELECT 1 FROM git_tree_entries_wide entry
-               WHERE entry.repo_id = ? AND entry.tree_oid = source.tree_oid
-                 AND entry.storage = source.storage AND entry.source_id = source.source_id
+              SELECT 1 FROM git_tree_entries entry
+               WHERE entry.source_key = source.source_key
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
             )) AS bounded_count,
            (SELECT coalesce(sum(length(raw_entry)), 0) FROM (
-              SELECT entry.raw_entry FROM git_tree_entries_wide entry
-               WHERE entry.repo_id = ? AND entry.tree_oid = source.tree_oid
-                 AND entry.storage = source.storage AND entry.source_id = source.source_id
+              SELECT entry.raw_entry FROM git_tree_entries entry
+               WHERE entry.source_key = source.source_key
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
             )) AS raw_bytes,
            (SELECT coalesce(sum(length(raw_entry) + length(name_bytes)), 0) FROM (
-              SELECT entry.raw_entry, entry.name_bytes FROM git_tree_entries_wide entry
-               WHERE entry.repo_id = ? AND entry.tree_oid = source.tree_oid
-                 AND entry.storage = source.storage AND entry.source_id = source.source_id
+              SELECT entry.raw_entry, entry.name_bytes FROM git_tree_entries entry
+               WHERE entry.source_key = source.source_key
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
             )) AS validation_bytes
       FROM metadata_budget source
@@ -437,7 +444,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
   validation_budget AS MATERIALIZED (
     SELECT preflight.*,
            sum(validation_bytes) OVER (
-             ORDER BY tree_oid, storage, source_id ROWS UNBOUNDED PRECEDING
+             ORDER BY source_key ROWS UNBOUNDED PRECEDING
            ) AS cumulative_validation_bytes
       FROM preflight
   ),
@@ -447,7 +454,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
        AND cumulative_validation_bytes <= ?
   ),
   entry_checks AS MATERIALIZED (
-    SELECT source.tree_oid, source.storage, source.source_id,
+    SELECT source.source_key,
            count(entry.ordinal) AS actual_count,
            min(entry.ordinal) AS min_ordinal,
            max(entry.ordinal) AS max_ordinal,
@@ -458,16 +465,14 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                OR entry.ordinal < 0 OR entry.ordinal >= source.entry_count
                OR typeof(entry.mode) <> 'text'
                OR entry.mode NOT IN ('40000','040000','100644','100755','120000','160000')
-               OR typeof(entry.name) <> 'text' OR typeof(entry.name_bytes) <> 'blob'
+               OR typeof(entry.name_bytes) <> 'blob'
                OR length(entry.name_bytes) = 0 OR length(entry.name_bytes) > ${MAX_PATH_BYTES}
                OR instr(entry.name_bytes, X'00') != 0
                OR instr(CAST(entry.name_bytes AS TEXT), '/') != 0
-               OR CAST(entry.name_bytes AS TEXT) != entry.name
+               OR CAST(CAST(entry.name_bytes AS TEXT) AS BLOB) != entry.name_bytes
                OR EXISTS (
-                 SELECT 1 FROM git_tree_entries_wide duplicate
-                  WHERE duplicate.repo_id = ? AND duplicate.tree_oid = entry.tree_oid
-                    AND duplicate.storage = entry.storage
-                    AND duplicate.source_id = entry.source_id
+                 SELECT 1 FROM git_tree_entries duplicate
+                  WHERE duplicate.source_key = entry.source_key
                     AND duplicate.name_bytes = entry.name_bytes
                     AND typeof(duplicate.name_bytes) = 'blob'
                     AND length(duplicate.name_bytes) <= ${MAX_PATH_BYTES}
@@ -490,23 +495,20 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                OR entry.cumulative_base != ${TREE_QUEUE_ROW_FIXED_BYTES}
                     + length(entry.name_bytes) + length(CAST(entry.mode AS BLOB))
                     + length(CAST(entry.oid AS BLOB)) + coalesce((
-                      SELECT previous.cumulative_base FROM git_tree_entries_wide previous
-                       WHERE previous.repo_id = ? AND previous.tree_oid = entry.tree_oid
-                         AND previous.storage = entry.storage
-                         AND previous.source_id = entry.source_id
+                      SELECT previous.cumulative_base FROM git_tree_entries previous
+                       WHERE previous.source_key = entry.source_key
                          AND previous.ordinal = entry.ordinal - 1
                     ), 0)
              THEN 1 ELSE 0 END), 0) AS invalid_entries
       FROM admitted source
-      LEFT JOIN git_tree_entries_wide entry
-        ON entry.repo_id = ? AND entry.tree_oid = source.tree_oid
-       AND entry.storage = source.storage AND entry.source_id = source.source_id
-     GROUP BY source.tree_oid, source.storage, source.source_id
+      LEFT JOIN git_tree_entries entry ON entry.source_key = source.source_key
+     GROUP BY source.source_key
   )
 SELECT selected.ordinal, selected.side, selected.final, selected.validated,
        CASE WHEN selected.tree_oid IS NULL OR length(selected.tree_oid) > 40
             THEN NULL ELSE selected.tree_oid END AS tree_oid,
        CASE WHEN selected.storage IN ('loose','pack') THEN selected.storage END AS storage,
+       CASE WHEN typeof(selected.source_key) = 'integer' THEN selected.source_key END AS source_key,
        CASE WHEN typeof(selected.source_id) = 'integer' THEN selected.source_id END AS source_id,
        CASE WHEN typeof(selected.object_size) = 'integer' THEN selected.object_size END AS object_size,
        CASE WHEN typeof(selected.entry_count) = 'integer' THEN selected.entry_count END AS entry_count,
@@ -531,38 +533,33 @@ SELECT selected.ordinal, selected.side, selected.final, selected.validated,
        CASE WHEN typeof(edge.ordinal) = 'integer' THEN edge.ordinal END AS edge_ordinal,
        CASE WHEN selected.storage = 'loose' THEN EXISTS (
               SELECT 1 FROM git_objects object
-               WHERE object.repo_id = ? AND object.oid = selected.tree_oid
+               WHERE object.repo_id = selected.repo_id AND object.oid = selected.tree_oid
                  AND object.type = 'tree' AND object.size = selected.object_size)
             WHEN selected.storage = 'pack' THEN EXISTS (
               SELECT 1 FROM git_pack_objects object
               JOIN git_pack_meta pack ON pack.repo_id = object.repo_id
                AND pack.pack_id = object.pack_id AND pack.state = 'complete'
-               WHERE object.repo_id = ? AND object.oid = selected.tree_oid
+               WHERE object.repo_id = selected.repo_id AND object.oid = selected.tree_oid
                  AND object.pack_id = selected.source_id AND object.type = 'tree'
                  AND object.size = selected.object_size)
             ELSE 0 END AS authoritative,
        EXISTS (SELECT 1 FROM git_objects loose
-                WHERE loose.repo_id = ? AND loose.oid = selected.tree_oid) AS has_loose
+                WHERE loose.repo_id = selected.repo_id AND loose.oid = selected.tree_oid) AS has_loose
   FROM selected
   LEFT JOIN preflight
-    ON preflight.tree_oid = selected.tree_oid AND preflight.storage = selected.storage
-   AND preflight.source_id = selected.source_id
+    ON preflight.source_key = selected.source_key
   LEFT JOIN admitted
-    ON admitted.tree_oid = selected.tree_oid AND admitted.storage = selected.storage
-   AND admitted.source_id = selected.source_id
+    ON admitted.source_key = selected.source_key
   LEFT JOIN entry_checks checks
-    ON checks.tree_oid = selected.tree_oid AND checks.storage = selected.storage
-   AND checks.source_id = selected.source_id
-  LEFT JOIN git_tree_entries_wide edge
-    ON edge.repo_id = ? AND edge.tree_oid = selected.tree_oid
-   AND edge.storage = selected.storage AND edge.source_id = selected.source_id
+    ON checks.source_key = selected.source_key
+  LEFT JOIN git_tree_entries edge
+    ON edge.source_key = selected.source_key
    AND edge.name_bytes = CAST(selected.segment AS BLOB)
    AND typeof(edge.name_bytes) = 'blob' AND length(edge.name_bytes) <= ${MAX_PATH_BYTES}
    AND edge.ordinal = (
      SELECT min(candidate.ordinal)
-       FROM git_tree_entries_wide candidate
-      WHERE candidate.repo_id = ? AND candidate.tree_oid = selected.tree_oid
-        AND candidate.storage = selected.storage AND candidate.source_id = selected.source_id
+       FROM git_tree_entries candidate
+      WHERE candidate.source_key = selected.source_key
         AND candidate.name_bytes = CAST(selected.segment AS BLOB)
         AND typeof(candidate.name_bytes) = 'blob'
         AND length(candidate.name_bytes) <= ${MAX_PATH_BYTES}
@@ -588,6 +585,7 @@ function validateSourceRow(
   }
   const treeOid = row.tree_oid;
   const storage = row.storage;
+  const sourceKey = numberField(row.source_key);
   const sourceId = numberField(row.source_id);
   const objectSize = numberField(row.object_size);
   const entryCount = numberField(row.entry_count);
@@ -600,6 +598,7 @@ function validateSourceRow(
   if (validated === 1) {
     if (
       cached === undefined ||
+      cached.sourceKey !== sourceKey ||
       cached.storage !== storage ||
       cached.sourceId !== sourceId ||
       cached.objectSize !== objectSize ||
@@ -611,6 +610,8 @@ function validateSourceRow(
     return "available";
   }
   if (
+    sourceKey === null ||
+    sourceKey < 1 ||
     sourceId === null ||
     sourceId < 0 ||
     objectSize === null ||
@@ -669,7 +670,7 @@ function validateSourceRow(
     budget.entries += entryCount;
     budget.bytes += validationBytes;
   }
-  sources.set(treeOid, { storage, sourceId, objectSize, entryCount, baseCost });
+  sources.set(treeOid, { sourceKey, storage, sourceId, objectSize, entryCount, baseCost });
   return "available";
 }
 
@@ -712,20 +713,9 @@ function treeDepth(
     SPARSE_TREE_DEPTH_SQL,
     json,
     repoId,
-    repoId,
-    repoId,
-    repoId,
     MAX_SOURCE_ENTRIES - budget.entries,
     MAX_SOURCE_BYTES - budget.bytes,
     MAX_SOURCE_BYTES - budget.bytes,
-    repoId,
-    repoId,
-    repoId,
-    repoId,
-    repoId,
-    repoId,
-    repoId,
-    repoId,
   )) {
     rows++;
     if (rows > cursors.length) throw new CorruptError("sparse tree lookup returned duplicate rows");
@@ -786,6 +776,8 @@ function resolveTrees(
   const current: Array<SparseTreeLeaf | null> = request.paths.map(() => null);
   const sources = new Map<string, ValidatedTreeSource>();
   const budget: SourceBudget = { entries: 0, bytes: 0 };
+  const sharedTrees =
+    request.baselineTreeOid !== null && request.baselineTreeOid === request.currentTreeOid;
   let cursors: TreeCursor[] = [];
   for (let ordinal = 0; ordinal < segments.length; ordinal++) {
     const first = segments[ordinal]?.[0];
@@ -800,7 +792,7 @@ function resolveTrees(
         validated: sources.has(request.baselineTreeOid),
         ancestry: [request.baselineTreeOid],
       });
-    if (request.currentTreeOid !== null)
+    if (request.currentTreeOid !== null && !sharedTrees)
       cursors.push({
         ordinal,
         side: "c",
@@ -886,6 +878,11 @@ function resolveTrees(
       }
     }
     cursors = next;
+  }
+  if (sharedTrees) {
+    for (let ordinal = 0; ordinal < baseline.length; ordinal++) {
+      current[ordinal] = baseline[ordinal] ?? null;
+    }
   }
   return { available: true, baseline, current };
 }
@@ -1414,6 +1411,227 @@ interface ValidatedSelectedPathRequest {
   retainedLimit: number;
 }
 
+interface SelectedExactAncestors {
+  json: string;
+  retainedBytes: number;
+}
+
+interface SelectedExactAncestorBound {
+  count: number;
+  chars: number;
+  jsonChars: number;
+  jsonBytes: number;
+}
+
+interface JsonCodePointSize {
+  chars: number;
+  bytes: number;
+  units: number;
+}
+
+function jsonCodePointSize(value: string, index: number): JsonCodePointSize {
+  const unit = value.charCodeAt(index);
+  if (
+    unit === 0x22 ||
+    unit === 0x5c ||
+    unit === 0x08 ||
+    unit === 0x09 ||
+    unit === 0x0a ||
+    unit === 0x0c ||
+    unit === 0x0d
+  ) {
+    return { chars: 2, bytes: 2, units: 1 };
+  }
+  if (unit < 0x20) return { chars: 6, bytes: 6, units: 1 };
+  if (unit < 0x80) return { chars: 1, bytes: 1, units: 1 };
+  if (unit < 0x800) return { chars: 1, bytes: 2, units: 1 };
+  if (unit >= 0xd800 && unit <= 0xdbff) return { chars: 2, bytes: 4, units: 2 };
+  return { chars: 1, bytes: 3, units: 1 };
+}
+
+function addExactAncestorBound(
+  bound: SelectedExactAncestorBound,
+  chars: number,
+  quotedChars: number,
+  quotedBytes: number,
+): boolean {
+  const separator = bound.count === 0 ? 0 : 1;
+  if (
+    bound.count === MAX_SELECTED_EXACT_ANCESTORS ||
+    chars < 1 ||
+    quotedChars < 2 ||
+    quotedBytes < 2 ||
+    bound.chars > Number.MAX_SAFE_INTEGER - chars ||
+    bound.jsonChars > Number.MAX_SAFE_INTEGER - quotedChars - separator ||
+    bound.jsonBytes > Number.MAX_SAFE_INTEGER - quotedBytes - separator
+  ) {
+    return false;
+  }
+  bound.count++;
+  bound.chars += chars;
+  bound.jsonChars += quotedChars + separator;
+  bound.jsonBytes += quotedBytes + separator;
+  return true;
+}
+
+function selectedExactAncestorUpperBound(
+  request: SelectedPathRequest,
+  retainedHeadroom: number,
+): SelectedExactAncestorBound | null {
+  const bound = { count: 0, chars: 0, jsonChars: 2, jsonBytes: 2 };
+  let rootJsonChars = 0;
+  let rootJsonBytes = 0;
+  for (let index = 0; index < request.root.length; ) {
+    if (request.root.charCodeAt(index) === 0x2f) {
+      if (index > 0 && !addExactAncestorBound(bound, index, rootJsonChars + 2, rootJsonBytes + 2)) {
+        return null;
+      }
+      rootJsonChars++;
+      rootJsonBytes++;
+      index++;
+      continue;
+    }
+    const encoded = jsonCodePointSize(request.root, index);
+    rootJsonChars += encoded.chars;
+    rootJsonBytes += encoded.bytes;
+    index += encoded.units;
+  }
+  if (request.root !== "/") {
+    if (!addExactAncestorBound(bound, request.root.length, rootJsonChars + 2, rootJsonBytes + 2)) {
+      return null;
+    }
+  }
+
+  const rootChars = request.root === "/" ? 0 : request.root.length;
+  const rootPrefixJsonChars = request.root === "/" ? 1 : rootJsonChars + 1;
+  const rootPrefixJsonBytes = request.root === "/" ? 1 : rootJsonBytes + 1;
+  for (const spec of request.specs) {
+    let relativeJsonChars = 0;
+    let relativeJsonBytes = 0;
+    for (let index = 0; index < spec.path.length; ) {
+      if (spec.path.charCodeAt(index) === 0x2f) {
+        if (
+          !addExactAncestorBound(
+            bound,
+            rootChars + 1 + index,
+            rootPrefixJsonChars + relativeJsonChars + 2,
+            rootPrefixJsonBytes + relativeJsonBytes + 2,
+          )
+        ) {
+          return null;
+        }
+        relativeJsonChars++;
+        relativeJsonBytes++;
+        index++;
+        continue;
+      }
+      const encoded = jsonCodePointSize(spec.path, index);
+      relativeJsonChars += encoded.chars;
+      relativeJsonBytes += encoded.bytes;
+      index += encoded.units;
+    }
+  }
+
+  const retainedBytes =
+    SELECTED_EXACT_SET_RETAINED_BYTES +
+    SELECTED_EXACT_ARRAY_RETAINED_BYTES +
+    bound.count * (SELECTED_EXACT_SET_ENTRY_BYTES + SELECTED_EXACT_ARRAY_SLOT_BYTES) +
+    bound.chars * 2 +
+    bound.jsonChars * 2;
+  if (
+    bound.jsonBytes > MAX_REQUEST_JSON_BYTES ||
+    !Number.isSafeInteger(retainedBytes) ||
+    retainedBytes > retainedHeadroom
+  ) {
+    return null;
+  }
+  return bound;
+}
+
+function jsonQuotedSize(value: string): { chars: number; bytes: number } {
+  let chars = 2;
+  let bytes = 2;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (
+      unit === 0x22 ||
+      unit === 0x5c ||
+      unit === 0x08 ||
+      unit === 0x09 ||
+      unit === 0x0a ||
+      unit === 0x0c ||
+      unit === 0x0d
+    ) {
+      chars += 2;
+      bytes += 2;
+    } else if (unit < 0x20) {
+      chars += 6;
+      bytes += 6;
+    } else if (unit < 0x80) {
+      chars++;
+      bytes++;
+    } else if (unit < 0x800) {
+      chars++;
+      bytes += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      chars += 2;
+      bytes += 4;
+      index++;
+    } else {
+      chars++;
+      bytes += 3;
+    }
+  }
+  return { chars, bytes };
+}
+
+function selectedExactAncestors(
+  validated: ValidatedSelectedPathRequest,
+): SelectedExactAncestors | null {
+  const retainedHeadroom = validated.retainedLimit - validated.retainedBytes;
+  if (selectedExactAncestorUpperBound(validated.request, retainedHeadroom) === null) return null;
+
+  const unique = new Set<string>();
+  const root = validated.request.root;
+  for (let index = 1; index < root.length; index++) {
+    if (root.charCodeAt(index) === 0x2f) unique.add(root.slice(0, index));
+  }
+  if (root !== "/") unique.add(root);
+  for (const spec of validated.request.specs) {
+    for (let index = 1; index < spec.path.length; index++) {
+      if (spec.path.charCodeAt(index) !== 0x2f) continue;
+      const prefix = spec.path.slice(0, index);
+      unique.add(root === "/" ? `/${prefix}` : `${root}/${prefix}`);
+    }
+  }
+
+  const ancestors = [...unique].sort(comparePaths);
+  let ancestorChars = 0;
+  let jsonChars = 2 + Math.max(0, ancestors.length - 1);
+  let jsonBytes = jsonChars;
+  for (const ancestor of ancestors) {
+    ancestorChars += ancestor.length;
+    const quoted = jsonQuotedSize(ancestor);
+    jsonChars += quoted.chars;
+    jsonBytes += quoted.bytes;
+  }
+  const retainedBytes =
+    SELECTED_EXACT_SET_RETAINED_BYTES +
+    SELECTED_EXACT_ARRAY_RETAINED_BYTES +
+    ancestors.length * (SELECTED_EXACT_SET_ENTRY_BYTES + SELECTED_EXACT_ARRAY_SLOT_BYTES) +
+    ancestorChars * 2 +
+    jsonChars * 2;
+  if (
+    !Number.isSafeInteger(jsonBytes) ||
+    jsonBytes > MAX_REQUEST_JSON_BYTES ||
+    !Number.isSafeInteger(retainedBytes) ||
+    retainedBytes > retainedHeadroom
+  ) {
+    return null;
+  }
+  return { json: JSON.stringify(ancestors), retainedBytes };
+}
+
 function validateSelectedPathRequest(input: unknown): ValidatedSelectedPathRequest | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw inputError("selected path request is invalid");
@@ -1519,6 +1737,50 @@ const SELECTED_INDEX_SQL = `WITH wanted(path, recursive) AS MATERIALIZED (
        OR (wanted.recursive = 1
          AND CAST(candidate.path AS BLOB) >= CAST(wanted.path || '/' AS BLOB)
          AND CAST(candidate.path AS BLOB) < CAST(wanted.path || '0' AS BLOB)))
+   LIMIT ${MAX_SELECTED_ROWS + 1}
+), totals AS (SELECT count(*) AS candidate_count FROM candidates)
+SELECT 0 AS kind, checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+       checkout.repo_type, checkout.root_type, checkout.root_bytes, checkout.root_valid,
+       totals.candidate_count,
+       NULL AS path, 'null' AS path_type, NULL AS path_bytes,
+       NULL AS stage, 'null' AS stage_type, NULL AS mode, 'null' AS mode_type,
+       NULL AS oid, 'null' AS oid_type, NULL AS size, NULL AS mtime, NULL AS ino, NULL AS rev,
+       'null' AS size_type, 'null' AS mtime_type, 'null' AS ino_type, 'null' AS rev_type
+  FROM totals LEFT JOIN checkout ON 1 = 1
+UNION ALL
+SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       path, typeof(path), length(CAST(path AS BLOB)),
+       stage, typeof(stage), mode, typeof(mode), oid, typeof(oid),
+       size, mtime, ino, rev, typeof(size), typeof(mtime), typeof(ino), typeof(rev)
+  FROM candidates
+ORDER BY kind, path, stage`;
+
+const SELECTED_EXACT_INDEX_SQL = `WITH wanted(path) AS MATERIALIZED (
+  SELECT json_extract(value, '$.p') FROM json_each(?)
+), wanted_keys(path, key) AS MATERIALIZED (
+  SELECT path, path FROM wanted
+  UNION ALL
+  SELECT path, CAST(path AS BLOB) FROM wanted
+), checkout AS MATERIALIZED (
+  SELECT id, repo_id, root, typeof(repo_id) AS repo_type, typeof(root) AS root_type,
+         length(CAST(root AS BLOB)) AS root_bytes,
+         EXISTS (
+           SELECT 1 FROM fs_paths path JOIN fs_nodes node ON node.inode = path.inode
+            WHERE path.path = git_checkouts.root AND typeof(path.inode) = 'integer'
+              AND typeof(node.inode) = 'integer' AND path.inode = node.inode
+              AND node.type = 'dir' AND typeof(node.mode) = 'integer'
+              AND typeof(node.size) = 'integer' AND node.size = 0
+              AND typeof(node.mtime) = 'integer'
+              AND typeof(node.rev) = 'integer' AND node.rev >= 0
+              AND typeof(node.nlink) = 'integer' AND node.nlink > 0
+              AND node.link_target IS NULL AND node.content_id IS NULL
+         ) AS root_valid
+    FROM git_checkouts WHERE id = ?
+), candidates AS MATERIALIZED (
+  SELECT DISTINCT candidate.path, candidate.stage, candidate.mode, candidate.oid,
+         candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted_keys wanted CROSS JOIN git_index candidate
+   WHERE candidate.checkout_id = ? AND candidate.path = wanted.key
    LIMIT ${MAX_SELECTED_ROWS + 1}
 ), totals AS (SELECT count(*) AS candidate_count FROM candidates)
 SELECT 0 AS kind, checkout.id AS checkout_id, checkout.repo_id, checkout.root,
@@ -1647,6 +1909,120 @@ SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
   FROM charged LEFT JOIN fs_nodes payload ON payload.inode = charged.inode
 ORDER BY kind, path COLLATE BINARY`;
 
+const SELECTED_EXACT_WORKTREE_SQL = `WITH wanted(relative) AS MATERIALIZED (
+  SELECT json_extract(value, '$.p') FROM json_each(?)
+), checkout AS MATERIALIZED (
+  SELECT id, repo_id, root, typeof(repo_id) AS repo_type, typeof(root) AS root_type,
+         length(CAST(root AS BLOB)) AS root_bytes,
+         EXISTS (
+           SELECT 1 FROM fs_paths path JOIN fs_nodes node ON node.inode = path.inode
+            WHERE path.path = git_checkouts.root AND typeof(path.inode) = 'integer'
+              AND typeof(node.inode) = 'integer' AND path.inode = node.inode
+              AND node.type = 'dir' AND typeof(node.mode) = 'integer'
+              AND typeof(node.size) = 'integer' AND node.size = 0
+              AND typeof(node.mtime) = 'integer'
+              AND typeof(node.rev) = 'integer' AND node.rev >= 0
+              AND typeof(node.nlink) = 'integer' AND node.nlink > 0
+              AND node.link_target IS NULL AND node.content_id IS NULL
+         ) AS root_valid
+    FROM git_checkouts WHERE id = ?
+), absolute AS MATERIALIZED (
+  SELECT relative,
+         CASE WHEN ? = '/' THEN '/' || relative ELSE ? || '/' || relative END AS path
+    FROM wanted
+), absolute_keys(relative, path, key) AS MATERIALIZED (
+  SELECT relative, path, path FROM absolute
+  UNION ALL
+  SELECT relative, path, CAST(path AS BLOB) FROM absolute
+), wanted_ancestors(path) AS MATERIALIZED (
+  SELECT value FROM json_each(?)
+), wanted_ancestor_keys(path, key) AS MATERIALIZED (
+  SELECT path, path FROM wanted_ancestors
+  UNION ALL
+  SELECT path, CAST(path AS BLOB) FROM wanted_ancestors
+), ancestor_rows AS MATERIALIZED (
+  SELECT ancestor.path, ancestor.inode AS path_inode, node.inode, node.type,
+         node.mode, node.size, node.mtime, node.rev, node.nlink,
+         typeof(ancestor.path) AS path_type, typeof(ancestor.inode) AS path_inode_type,
+         typeof(node.inode) AS inode_type, typeof(node.type) AS node_type,
+         typeof(node.mode) AS mode_type, typeof(node.size) AS size_type,
+         typeof(node.mtime) AS mtime_type, typeof(node.rev) AS rev_type,
+         typeof(node.nlink) AS nlink_type, typeof(node.link_target) AS target_type,
+         typeof(node.content_id) AS content_type,
+         length(CAST(node.link_target AS BLOB)) AS target_bytes
+    FROM wanted_ancestor_keys wanted
+    CROSS JOIN fs_paths ancestor
+    LEFT JOIN fs_nodes node ON node.inode = ancestor.inode
+   WHERE ancestor.path = wanted.key
+), ancestor_summary AS MATERIALIZED (
+  SELECT coalesce(sum(CASE WHEN type = 'symlink' THEN 1 ELSE 0 END), 0) AS symlinks,
+         coalesce(sum(CASE
+           WHEN path_type <> 'text' OR path_inode_type <> 'integer'
+             OR inode_type <> 'integer' OR path_inode <> inode
+             OR node_type <> 'text' OR type NOT IN ('dir','symlink')
+             OR mode_type <> 'integer' OR mode < 0 OR mode > 4095
+             OR size_type <> 'integer' OR size < 0
+             OR mtime_type <> 'integer'
+             OR rev_type <> 'integer' OR rev < 0
+             OR nlink_type <> 'integer' OR nlink <= 0
+             OR (type = 'dir' AND (size <> 0 OR target_type <> 'null' OR content_type <> 'null'))
+             OR (type = 'symlink' AND (target_type <> 'text' OR target_bytes <> size
+                                       OR content_type <> 'null'))
+           THEN 1 ELSE 0 END), 0) AS invalid
+    FROM ancestor_rows
+), candidates AS MATERIALIZED (
+  SELECT DISTINCT paths.path, paths.inode AS path_inode, wanted_path.relative
+    FROM absolute_keys wanted_path CROSS JOIN fs_paths paths
+   WHERE paths.path = wanted_path.key
+   LIMIT ${MAX_SELECTED_ROWS + 1}
+), totals AS (SELECT count(*) AS candidate_count FROM candidates), metadata AS MATERIALIZED (
+  SELECT candidates.*, nodes.inode, nodes.type, nodes.mode, nodes.size, nodes.mtime,
+         nodes.rev, nodes.nlink,
+         typeof(candidates.path) AS path_type, length(CAST(candidates.path AS BLOB)) AS path_bytes,
+         typeof(candidates.path_inode) AS path_inode_type, typeof(nodes.inode) AS inode_type,
+         typeof(nodes.type) AS node_type, typeof(nodes.mode) AS mode_type,
+         typeof(nodes.size) AS size_type, typeof(nodes.mtime) AS mtime_type,
+         typeof(nodes.rev) AS rev_type, typeof(nodes.nlink) AS nlink_type,
+         typeof(nodes.link_target) AS target_type, typeof(nodes.content_id) AS content_type,
+         length(CAST(nodes.link_target AS BLOB)) AS target_bytes,
+         length(nodes.content_id) AS content_bytes
+    FROM candidates LEFT JOIN fs_nodes nodes ON nodes.inode = candidates.path_inode
+), charged AS MATERIALIZED (
+  SELECT metadata.*,
+         coalesce(target_bytes, 0) * 2 + coalesce(content_bytes, 0) AS payload_bytes,
+         sum(coalesce(target_bytes, 0) * 2 + coalesce(content_bytes, 0)) OVER (
+           ORDER BY path COLLATE BINARY ROWS UNBOUNDED PRECEDING
+         ) AS cumulative_payload_bytes
+    FROM metadata
+)
+SELECT 0 AS kind, checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+       checkout.repo_type, checkout.root_type, checkout.root_bytes, checkout.root_valid,
+       totals.candidate_count, ancestor_summary.symlinks AS symlink_ancestors,
+       ancestor_summary.invalid AS invalid_ancestors,
+       NULL AS path, NULL AS relative, NULL AS path_inode, NULL AS inode,
+       NULL AS type, NULL AS mode,
+       NULL AS size, NULL AS mtime, NULL AS rev, NULL AS nlink,
+       NULL AS path_type, NULL AS path_bytes, NULL AS path_inode_type, NULL AS inode_type,
+       NULL AS node_type, NULL AS mode_type, NULL AS size_type, NULL AS mtime_type,
+       NULL AS rev_type, NULL AS nlink_type, NULL AS target_type, NULL AS content_type,
+       NULL AS target_bytes, NULL AS content_bytes, NULL AS payload_bytes,
+       NULL AS cumulative_payload_bytes, NULL AS target, NULL AS content_id
+  FROM totals CROSS JOIN ancestor_summary LEFT JOIN checkout ON 1 = 1
+UNION ALL
+SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       charged.path, charged.relative, charged.path_inode, charged.inode,
+       charged.type, charged.mode,
+       charged.size, charged.mtime, charged.rev, charged.nlink,
+       charged.path_type, charged.path_bytes, charged.path_inode_type, charged.inode_type,
+       charged.node_type, charged.mode_type, charged.size_type, charged.mtime_type,
+       charged.rev_type, charged.nlink_type, charged.target_type, charged.content_type,
+       charged.target_bytes, charged.content_bytes, charged.payload_bytes,
+       charged.cumulative_payload_bytes,
+       CASE WHEN charged.cumulative_payload_bytes <= ? THEN payload.link_target END,
+       CASE WHEN charged.cumulative_payload_bytes <= ? THEN payload.content_id END
+  FROM charged LEFT JOIN fs_nodes payload ON payload.inode = charged.inode
+ORDER BY kind, path COLLATE BINARY`;
+
 function validateSelectedCheckout(
   row: Record<string, unknown>,
   request: SelectedPathRequest,
@@ -1676,6 +2052,7 @@ function readSelectedIndex(
   db: SqlDatabase,
   validated: ValidatedSelectedPathRequest,
   retainedHeadroom: number,
+  exact: boolean,
   retainEntry?: () => boolean,
 ): { available: boolean; rows: IndexEntry[]; retainedBytes: number } {
   const rows: IndexEntry[] = [];
@@ -1684,7 +2061,7 @@ function readSelectedIndex(
   let retainedBytes = 0;
   let previous: IndexEntry | null = null;
   for (const row of db.iterate(
-    SELECTED_INDEX_SQL,
+    exact ? SELECTED_EXACT_INDEX_SQL : SELECTED_INDEX_SQL,
     validated.json,
     validated.request.checkoutId,
     validated.request.checkoutId,
@@ -1750,6 +2127,7 @@ function readSelectedWorktree(
   db: SqlDatabase,
   validated: ValidatedSelectedPathRequest,
   retainedHeadroom: number,
+  exactAncestors?: SelectedExactAncestors,
 ): { available: boolean; rows: SelectedWorktreeFact[]; retainedBytes: number } {
   const rows: SelectedWorktreeFact[] = [];
   let metadata = false;
@@ -1757,17 +2135,30 @@ function readSelectedWorktree(
   let retainedBytes = 0;
   let payloadCumulative = 0;
   let previous: string | null = null;
-  for (const row of db.iterate(
-    SELECTED_WORKTREE_SQL,
-    validated.json,
-    validated.request.checkoutId,
-    validated.request.root,
-    validated.request.root,
-    validated.request.root,
-    validated.request.root,
-    retainedHeadroom,
-    retainedHeadroom,
-  )) {
+  const cursor =
+    exactAncestors === undefined
+      ? db.iterate(
+          SELECTED_WORKTREE_SQL,
+          validated.json,
+          validated.request.checkoutId,
+          validated.request.root,
+          validated.request.root,
+          validated.request.root,
+          validated.request.root,
+          retainedHeadroom,
+          retainedHeadroom,
+        )
+      : db.iterate(
+          SELECTED_EXACT_WORKTREE_SQL,
+          validated.json,
+          validated.request.checkoutId,
+          validated.request.root,
+          validated.request.root,
+          exactAncestors.json,
+          retainedHeadroom,
+          retainedHeadroom,
+        );
+  for (const row of cursor) {
     if (row.kind === 0) {
       if (metadata) throw new CorruptError("selected worktree lookup duplicated metadata");
       metadata = true;
@@ -1923,9 +2314,24 @@ function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPat
   if (validated.request.specs.length === 0) {
     return { available: true, index: [], worktree: [], retainedBytes: 0 };
   }
-  const index = readSelectedIndex(db, validated, validated.retainedLimit - validated.retainedBytes);
-  const headroom = validated.retainedLimit - validated.retainedBytes - index.retainedBytes;
-  const worktree = readSelectedWorktree(db, validated, Math.max(0, headroom));
+  const exactAncestors = validated.request.specs.every((spec) => !spec.recursive)
+    ? selectedExactAncestors(validated)
+    : null;
+  const exactRetainedBytes = exactAncestors?.retainedBytes ?? 0;
+  const index = readSelectedIndex(
+    db,
+    validated,
+    validated.retainedLimit - validated.retainedBytes - exactRetainedBytes,
+    exactAncestors !== null,
+  );
+  const headroom =
+    validated.retainedLimit - validated.retainedBytes - exactRetainedBytes - index.retainedBytes;
+  const worktree = readSelectedWorktree(
+    db,
+    validated,
+    Math.max(0, headroom),
+    exactAncestors ?? undefined,
+  );
   if (!index.available || !worktree.available || headroom < 0) return { available: false };
   return {
     available: true,
@@ -2449,21 +2855,37 @@ function pathSegmentBounds(
   return null;
 }
 
-const SNAPSHOT_ENTRIES_SQL = `WITH wanted(ordinal, path, tree_oid, storage, source_id) AS MATERIALIZED (
+const SNAPSHOT_ENTRIES_SQL = `WITH
+wanted(ordinal, path, tree_oid, source_key, storage, source_id) AS MATERIALIZED (
   SELECT CAST(json_extract(value, '$.i') AS INTEGER), json_extract(value, '$.p'),
-         json_extract(value, '$.t'), json_extract(value, '$.s'),
+         json_extract(value, '$.t'), CAST(json_extract(value, '$.k') AS INTEGER),
+         json_extract(value, '$.s'),
          CAST(json_extract(value, '$.x') AS INTEGER)
     FROM json_each(?)
+), selected AS MATERIALIZED (
+  SELECT wanted.*, source.repo_id, source.tree_oid AS source_tree_oid,
+         source.source_key AS selected_source_key, source.storage AS source_storage,
+         source.source_id AS selected_source_id, source.complete,
+         effective.source_key AS effective_source_key
+    FROM wanted
+    LEFT JOIN git_tree_sources source ON source.source_key = wanted.source_key
+    LEFT JOIN git_tree_effective effective
+      ON effective.repo_id = source.repo_id AND effective.tree_oid = source.tree_oid
+     AND effective.source_key = source.source_key
 )
-SELECT wanted.ordinal AS wanted_ordinal, wanted.path AS directory_path,
-       wanted.tree_oid AS wanted_tree_oid, wanted.storage AS wanted_storage,
-       wanted.source_id AS wanted_source_id,
+SELECT selected.ordinal AS wanted_ordinal, selected.path AS directory_path,
+       selected.tree_oid AS wanted_tree_oid, selected.source_key AS wanted_source_key,
+       selected.storage AS wanted_storage, selected.source_id AS wanted_source_id,
+       selected.repo_id AS selected_repo_id, selected.source_tree_oid,
+       selected.selected_source_key, selected.source_storage, selected.selected_source_id,
+       selected.complete AS source_complete, selected.effective_source_key,
        entry.ordinal, entry.mode, entry.name, entry.oid
-  FROM wanted
-  LEFT JOIN git_tree_entries_wide entry
-    ON entry.repo_id = ? AND entry.tree_oid = wanted.tree_oid
-   AND entry.storage = wanted.storage AND entry.source_id = wanted.source_id
- ORDER BY wanted.ordinal, entry.ordinal`;
+  FROM selected
+  LEFT JOIN (
+    SELECT source_key, ordinal, mode, CAST(name_bytes AS TEXT) AS name, oid
+      FROM git_tree_entries
+  ) entry ON entry.source_key = selected.source_key
+ ORDER BY selected.ordinal, entry.ordinal`;
 
 function readSnapshotDirectories(
   db: SqlDatabase,
@@ -2504,6 +2926,7 @@ function readSnapshotDirectories(
       i: ordinal,
       p: paths[ordinal],
       t: oid,
+      k: source.sourceKey,
       s: source.storage,
       x: source.sourceId,
     });
@@ -2537,9 +2960,10 @@ function readSnapshotDirectories(
     return { available: false, directories: [] };
   }
   const seen = new Map<number, number>();
-  for (const row of db.iterate(SNAPSHOT_ENTRIES_SQL, json, request.repoId)) {
+  for (const row of db.iterate(SNAPSHOT_ENTRIES_SQL, json)) {
     const ordinal = numberField(row.wanted_ordinal);
     const sourceId = numberField(row.wanted_source_id);
+    const sourceKey = numberField(row.wanted_source_key);
     const expectedOid = ordinal === null ? undefined : oids[ordinal];
     const expectedPath = ordinal === null ? undefined : paths[ordinal];
     const source = typeof expectedOid === "string" ? sources.get(expectedOid) : undefined;
@@ -2550,8 +2974,16 @@ function readSnapshotDirectories(
       source === undefined ||
       row.directory_path !== expectedPath ||
       row.wanted_tree_oid !== expectedOid ||
+      sourceKey !== source.sourceKey ||
       row.wanted_storage !== source.storage ||
-      sourceId !== source.sourceId
+      sourceId !== source.sourceId ||
+      row.selected_repo_id !== request.repoId ||
+      row.source_tree_oid !== expectedOid ||
+      numberField(row.selected_source_key) !== source.sourceKey ||
+      row.source_storage !== source.storage ||
+      numberField(row.selected_source_id) !== source.sourceId ||
+      row.source_complete !== 1 ||
+      numberField(row.effective_source_key) !== source.sourceKey
     ) {
       throw new CorruptError("commit tree snapshot entry source is malformed");
     }
@@ -2640,7 +3072,7 @@ function snapshotCommitTree(
   if (!reserveSnapshot(retained, SNAPSHOT_ARRAY_RETAINED_BYTES)) {
     return { available: false };
   }
-  const index = readSelectedIndex(db, selectedValidated, retained.limit - retained.used, () =>
+  const index = readSelectedIndex(db, selectedValidated, retained.limit - retained.used, true, () =>
     reserveSnapshot(retained, SELECTED_INDEX_RETAINED_BYTES),
   );
   if (!index.available) return { available: false };

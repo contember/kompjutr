@@ -1031,9 +1031,11 @@ describe("sparse eager status", () => {
     expect(
       readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
     ).toEqual({ available: true, baselineTreeOid: workspace.repo.readCommit(oid).tree });
+    workspace.storage.resetCounters();
     expect(
       eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, context),
     ).toEqual([]);
+    expect(workspace.storage.statementCount).toBeLessThan(30);
   });
 
   it("propagates sparse hydration corruption without resealing", () => {

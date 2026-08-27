@@ -879,6 +879,8 @@ describe("bounded commit tree acceleration", () => {
     expect(queries).not.toContain(
       "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id",
     );
+    expect(queries).toContain("WITH wanted(path) AS MATERIALIZED");
+    expect(queries).not.toContain("WITH wanted(path, recursive) AS MATERIALIZED");
     expect(counts).toEqual({ statements: 31, rows: 126 });
     expect([
       ...(workspace.context.sparseWorkspace?.dirtyPaths(workspace.repo.checkout.checkoutId) ?? []),

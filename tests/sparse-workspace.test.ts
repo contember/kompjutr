@@ -5,6 +5,7 @@ import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import { add } from "../src/core/ops/staging.js";
 import { comparePaths } from "../src/core/streams.js";
+import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   INDEX_DIRTY,
   invalidateIndexTracker,
@@ -22,6 +23,120 @@ import {
   SPARSE_TREE_DEPTH_SQL,
 } from "../src/sqlite/sparse-workspace.js";
 import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
+
+class ExplainSelectedDatabase implements SqlDatabase {
+  readonly details: string[] = [];
+  readonly queries: string[] = [];
+
+  constructor(private readonly delegate: SqlDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    if (query.startsWith("WITH wanted(path)") || query.startsWith("WITH wanted(relative)")) {
+      this.queries.push(query);
+      for (const row of this.delegate.all<{ detail: unknown }>(
+        `EXPLAIN QUERY PLAN ${query}`,
+        ...bindings,
+      )) {
+        if (typeof row.detail === "string") this.details.push(row.detail);
+      }
+    }
+    yield* this.delegate.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
+
+class ExplainSnapshotDatabase implements SqlDatabase {
+  readonly details: string[] = [];
+  queries = 0;
+
+  constructor(private readonly delegate: SqlDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    if (query.includes("selected_source_key")) {
+      this.queries++;
+      for (const row of this.delegate.all<{ detail: unknown }>(
+        `EXPLAIN QUERY PLAN ${query}`,
+        ...bindings,
+      )) {
+        if (typeof row.detail === "string") this.details.push(row.detail);
+      }
+    }
+    yield* this.delegate.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
+
+class RecordingTreeDepthDatabase implements SqlDatabase {
+  readonly payloads: string[] = [];
+
+  constructor(private readonly delegate: SqlDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    const payload = bindings[0];
+    if (query === SPARSE_TREE_DEPTH_SQL && typeof payload === "string") {
+      this.payloads.push(payload);
+    }
+    return this.delegate.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
 
 function committedWorkspace() {
   const workspace = makeRepo("/");
@@ -171,6 +286,242 @@ describe("SQLite sparse workspace source", () => {
     expect(result.worktree.map((entry) => entry.path)).toEqual(
       [...result.worktree.map((entry) => entry.path)].sort(comparePaths),
     );
+
+    const exactSpecs = ["a.txt", "dir/b.txt", ...ordered]
+      .sort(comparePaths)
+      .map((path) => ({ path, recursive: false }));
+    workspace.storage.resetCounters();
+    const exact = source.select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: exactSpecs,
+    });
+    expect(workspace.storage.statementCount).toBe(2);
+    workspace.storage.resetCounters();
+    const general = source.select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: exactSpecs.map((spec) => ({ ...spec, recursive: true })),
+    });
+    expect(workspace.storage.statementCount).toBe(2);
+    expect(exact).toEqual(general);
+  });
+
+  it("deduplicates exact ancestors, includes parents above a nested checkout, and retries general selection", () => {
+    const nested = makeRepo("/outer/repo");
+    nested.repo.store.configSet("user.name", "Fixture");
+    nested.repo.store.configSet("user.email", "fixture@example.com");
+    writeWorkFile(nested, "/outer/repo/dir/a.txt", "a\n");
+    add(nested.repo, nested.worktree, { paths: [], all: true });
+    commit(nested.context, nested.repo, { message: "nested" });
+    const source = createSqliteSelectedPathSource(nested.database.db);
+    const request = {
+      repoId: nested.repo.store.repoId,
+      checkoutId: nested.repo.checkout.checkoutId,
+      root: "/outer/repo",
+      specs: [
+        { path: "dir/a.txt", recursive: false },
+        { path: "dir/missing.txt", recursive: false },
+      ],
+    };
+
+    nested.storage.resetCounters();
+    const result = source.select(request);
+    expect(nested.storage.statementCount).toBe(2);
+    expect(result.available).toBe(true);
+    if (result.available) {
+      expect(result.index.map((entry) => entry.path)).toEqual(["dir/a.txt"]);
+      expect(result.worktree.map((entry) => entry.path)).toEqual(["dir/a.txt"]);
+    }
+
+    nested.database.db.run(
+      "DELETE FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/outer')",
+    );
+    expect(() => source.select(request)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    nested.database.db.run("DELETE FROM fs_paths WHERE path = '/outer'");
+    expect(source.select(request)).toMatchObject({ available: true });
+
+    const fallback = committedWorkspace();
+    const fallbackSource = createSqliteSelectedPathSource(fallback.database.db);
+    const histogram = new Map<string, number>();
+    fallback.storage.histogram = histogram;
+    const expectGeneral = (
+      specs: Array<{ path: string; recursive: boolean }>,
+      maxRetainedBytes?: number,
+    ): void => {
+      fallback.storage.resetCounters();
+      expect(
+        fallbackSource.select({
+          repoId: fallback.repo.store.repoId,
+          checkoutId: fallback.repo.checkout.checkoutId,
+          root: "/",
+          specs,
+          ...(maxRetainedBytes === undefined ? {} : { maxRetainedBytes }),
+        }),
+      ).toMatchObject({ available: true, index: [], worktree: [] });
+      expect(fallback.storage.statementCount).toBe(2);
+      expect(
+        [...histogram.keys()].some((query) => query.includes("WITH wanted(relative, recursive)")),
+      ).toBe(true);
+    };
+
+    const deepPrefix = Array.from({ length: 40 }, (_, index) => `d${index}`).join("/");
+    expectGeneral(
+      Array.from({ length: 1_000 }, (_, index) => ({
+        path: `${deepPrefix}/f${index.toString().padStart(4, "0")}`,
+        recursive: false,
+      })).sort((left, right) => comparePaths(left.path, right.path)),
+    );
+
+    const longSegments = ["a", "b", "c", "d"].map((letter) => letter.repeat(200));
+    expectGeneral(
+      Array.from({ length: 1_000 }, (_, index) => ({
+        path: `j${index.toString().padStart(4, "0")}/${longSegments.join("/")}`,
+        recursive: false,
+      })).sort((left, right) => comparePaths(left.path, right.path)),
+    );
+
+    const retainedPrefix = Array.from(
+      { length: 5 },
+      (_, index) => `retained-segment-${index.toString().padStart(2, "0")}`,
+    ).join("/");
+    expectGeneral(
+      Array.from({ length: 1_000 }, (_, index) => ({
+        path: `${retainedPrefix}/f${index.toString().padStart(4, "0")}`,
+        recursive: false,
+      })),
+      2 * 1024 * 1024,
+    );
+  });
+
+  it("plans exact index, worktree, and ancestor facts as primary-key searches", () => {
+    const workspace = committedWorkspace();
+    const explained = new ExplainSelectedDatabase(workspace.database.db);
+    const result = createSqliteSelectedPathSource(explained).select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: [{ path: "dir/b.txt", recursive: false }],
+    });
+
+    expect(result.available).toBe(true);
+    expect(explained.queries).toHaveLength(2);
+    expect(explained.queries[0]).not.toContain("CAST(candidate.path");
+    expect(explained.queries[1]).not.toMatch(/CAST\((paths|ancestor)\.path/);
+    expect(
+      explained.details.some(
+        (detail) =>
+          detail.includes("SEARCH candidate") &&
+          detail.includes("checkout_id=") &&
+          detail.includes("path="),
+      ),
+      explained.details.join("\n"),
+    ).toBe(true);
+    expect(
+      explained.details.some(
+        (detail) => detail.includes("SEARCH paths") && detail.includes("path="),
+      ),
+      explained.details.join("\n"),
+    ).toBe(true);
+    expect(
+      explained.details.some(
+        (detail) => detail.includes("SEARCH ancestor") && detail.includes("path="),
+      ),
+      explained.details.join("\n"),
+    ).toBe(true);
+    expect(
+      explained.details.some((detail) => /SCAN (candidate|paths|ancestor)(?:\s|$)/.test(detail)),
+    ).toBe(false);
+  });
+
+  it("keeps a thousand shared-prefix paths on the exact two-statement branch", () => {
+    const workspace = makeRepo("/");
+    const directory = Array.from(
+      { length: 5 },
+      (_, index) => `shared-segment-${index.toString().padStart(2, "0")}`,
+    ).join("/");
+    const paths = Array.from(
+      { length: 1_000 },
+      (_, index) => `${directory}/f${index.toString().padStart(4, "0")}.txt`,
+    );
+    workspace.worktree.mkdir(`/${directory}`, { recursive: true });
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes: new Uint8Array([0x61]) })),
+    );
+    add(workspace.repo, workspace.worktree, { paths: [], all: true });
+    const histogram = new Map<string, number>();
+    workspace.storage.histogram = histogram;
+    workspace.storage.resetCounters();
+
+    const result = createSqliteSelectedPathSource(workspace.database.db).select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: paths.map((path) => ({ path, recursive: false })),
+    });
+
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.index).toHaveLength(1_000);
+    expect(result.worktree).toHaveLength(1_000);
+    expect(result.retainedBytes).toBeLessThanOrEqual(MAX_SPARSE_WORKSPACE_RETAINED_BYTES);
+    expect(workspace.storage.statementCount).toBe(2);
+    expect(workspace.storage.rowCount).toBe(2_002);
+    expect([...histogram.keys()].some((query) => query.startsWith("WITH wanted(path)"))).toBe(true);
+    expect([...histogram.keys()].some((query) => query.startsWith("WITH wanted(relative)"))).toBe(
+      true,
+    );
+    expect(
+      [...histogram.keys()].some((query) => query.includes("wanted(relative, recursive)")),
+    ).toBe(false);
+  });
+
+  it("surfaces BLOB-backed exact index, worktree, and ancestor paths", () => {
+    const index = committedWorkspace();
+    index.database.db.run("PRAGMA ignore_check_constraints = ON");
+    index.database.db.run(
+      "UPDATE git_index SET path = CAST(path AS BLOB) WHERE checkout_id = ? AND path = 'a.txt'",
+      index.repo.checkout.checkoutId,
+    );
+    index.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      createSqliteSelectedPathSource(index.database.db).select({
+        repoId: index.repo.store.repoId,
+        checkoutId: index.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "a.txt", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    const worktree = committedWorkspace();
+    worktree.database.db.run("PRAGMA ignore_check_constraints = ON");
+    worktree.database.db.run("UPDATE fs_paths SET path = CAST(path AS BLOB) WHERE path = '/a.txt'");
+    worktree.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      createSqliteSelectedPathSource(worktree.database.db).select({
+        repoId: worktree.repo.store.repoId,
+        checkoutId: worktree.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "a.txt", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    const ancestor = committedWorkspace();
+    ancestor.database.db.run("PRAGMA ignore_check_constraints = ON");
+    ancestor.database.db.run("UPDATE fs_paths SET path = CAST(path AS BLOB) WHERE path = '/dir'");
+    ancestor.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      createSqliteSelectedPathSource(ancestor.database.db).select({
+        repoId: ancestor.repo.store.repoId,
+        checkoutId: ancestor.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "dir/b.txt", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
   it("falls back for symlink ancestors and bounds selected request count", () => {
@@ -363,6 +714,48 @@ describe("SQLite sparse workspace source", () => {
         baselineTreeOid: baseline,
       }),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("reads authenticated snapshot entries by active source key", () => {
+    const workspace = committedWorkspace();
+    const baseline = workspace.repo.headTree();
+    if (baseline === null) throw new Error("missing snapshot baseline");
+    expect(
+      resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, baseline, [
+        { path: "dir/b.txt", flags: INDEX_DIRTY },
+      ]),
+    ).toBe(true);
+    const explained = new ExplainSnapshotDatabase(workspace.database.db);
+
+    expect(
+      createSqliteCommitTreeSnapshotSource(explained).snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: baseline,
+      }).available,
+    ).toBe(true);
+
+    expect(explained.queries).toBe(1);
+    expect(
+      explained.details.some((detail) =>
+        detail.includes("SEARCH source USING INTEGER PRIMARY KEY"),
+      ),
+    ).toBe(true);
+    expect(
+      explained.details.some(
+        (detail) =>
+          detail.includes("SEARCH effective USING PRIMARY KEY") && detail.includes("repo_id="),
+      ),
+    ).toBe(true);
+    expect(
+      explained.details.some((detail) =>
+        detail.includes("SEARCH git_tree_entries USING PRIMARY KEY (source_key=?)"),
+      ),
+    ).toBe(true);
+    expect(explained.details.some((detail) => detail.includes("git_tree_entries_wide"))).toBe(
+      false,
+    );
   });
 
   it("authenticates clean, packed, missing, mismatched, incomplete, and unborn baselines", () => {
@@ -638,6 +1031,28 @@ describe("SQLite sparse workspace source", () => {
     });
   });
 
+  it("resolves an equal baseline and current tree only once", () => {
+    const workspace = committedWorkspace();
+    const tree = workspace.repo.headTree();
+    if (tree === null) throw new Error("missing shared tree");
+    const recorded = new RecordingTreeDepthDatabase(workspace.database.db);
+
+    const result = createSqliteSparseWorkspaceSource(recorded).hydrate({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      baselineTreeOid: tree,
+      currentTreeOid: tree,
+      paths: ["dir/b.txt"],
+    });
+
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.rows[0]?.baseline).toEqual(result.rows[0]?.current);
+    expect(recorded.payloads).toHaveLength(2);
+    expect(recorded.payloads.every((payload) => !payload.includes('"s":"c"'))).toBe(true);
+  });
+
   it("delegates bounded tracker state and dirty paths", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
@@ -782,6 +1197,53 @@ describe("SQLite sparse workspace source", () => {
         paths: ["a.txt"],
       }),
     ).toThrowError(/source metadata is inconsistent/);
+  });
+
+  it("does not lose corrupt active source-key and parsed-edge associations", () => {
+    const active = committedWorkspace();
+    const activeTree = active.repo.headTree();
+    active.database.db.run("PRAGMA foreign_keys = OFF");
+    active.database.db.run(
+      `UPDATE git_tree_effective SET source_key = source_key + 1000000
+        WHERE repo_id = ? AND tree_oid = ?`,
+      active.repo.store.repoId,
+      activeTree,
+    );
+    active.database.db.run("PRAGMA foreign_keys = ON");
+    expect(() =>
+      createSqliteSparseWorkspaceSource(active.database.db).hydrate({
+        repoId: active.repo.store.repoId,
+        checkoutId: active.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: activeTree,
+        currentTreeOid: null,
+        paths: ["a.txt"],
+      }),
+    ).toThrowError(/source is missing or invalid/);
+
+    const edge = committedWorkspace();
+    const edgeTree = edge.repo.headTree();
+    edge.database.db.run("PRAGMA foreign_keys = OFF");
+    edge.database.db.run(
+      `UPDATE git_tree_entries SET source_key = source_key + 1000000
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND name_bytes = CAST('link' AS BLOB)`,
+      edge.repo.store.repoId,
+      edgeTree,
+    );
+    edge.database.db.run("PRAGMA foreign_keys = ON");
+    expect(() =>
+      createSqliteSparseWorkspaceSource(edge.database.db).hydrate({
+        repoId: edge.repo.store.repoId,
+        checkoutId: edge.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: edgeTree,
+        currentTreeOid: null,
+        paths: ["a.txt"],
+      }),
+    ).toThrowError(/entries disagree with its marker/);
   });
 
   it("detects a projected tree cycle before depth fallback", () => {
@@ -982,23 +1444,23 @@ describe("SQLite sparse workspace source", () => {
       `EXPLAIN QUERY PLAN ${SPARSE_TREE_DEPTH_SQL}`,
       payload,
       workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
       8_192,
       8 * 1024 * 1024,
       8 * 1024 * 1024,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
-      workspace.repo.store.repoId,
     );
 
+    expect(plan.some((row) => row.detail.includes("SEARCH x USING PRIMARY KEY"))).toBe(true);
+    expect(plan.some((row) => row.detail.includes("SEARCH s USING INTEGER PRIMARY KEY"))).toBe(
+      true,
+    );
+    expect(
+      plan.some((row) => row.detail.includes("SEARCH entry USING PRIMARY KEY (source_key=?)")),
+    ).toBe(true);
     expect(plan.some((row) => row.detail.includes("git_tree_entries_by_name_bytes"))).toBe(true);
+    expect(plan.some((row) => row.detail.includes("git_tree_entries_wide"))).toBe(false);
+    expect(
+      plan.some((row) => /SCAN (x|s|entry|candidate|duplicate|previous)(?:\s|$)/.test(row.detail)),
+    ).toBe(false);
   });
 
   it("rejects invalid caller bounds before issuing SQL", () => {
