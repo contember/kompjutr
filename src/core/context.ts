@@ -3,7 +3,11 @@ import { NotARepositoryError } from "./errors.js";
 import { normalizePath } from "./paths.js";
 import type { GitHttpClient } from "./protocol/transport.js";
 import { Repository } from "./repository.js";
-import type { SparseWorkspaceSource } from "./sparse-workspace.js";
+import type {
+  CommitTreeSnapshotSource,
+  SelectedPathSource,
+  SparseWorkspaceSource,
+} from "./sparse-workspace.js";
 import type { Worktree } from "./worktree.js";
 
 export interface GitIdentity {
@@ -36,6 +40,8 @@ export type InitialWorktreeResult<T> = { kind: "committed"; value: T } | { kind:
 
 /** Optional clone-only bulk writer. Core depends only on this structural seam. */
 export interface InitialWorktreeWriter {
+  /** True only when writes share the supplied native Git database transaction. */
+  supportsDatabase?(database: SqliteGitDatabase): boolean;
   tryRun<T>(
     root: string,
     body: (session: InitialWorktreeSession) => T,
@@ -55,6 +61,8 @@ export interface IndexTrackerWriter {
     baselineTreeOid: string | null,
     entries: Iterable<IndexTrackerSeedEntry>,
   ): boolean;
+  /** Move a sealed baseline without clearing its dirty journal. */
+  advanceBaseline?(checkoutId: number, baselineTreeOid: string | null): boolean;
 }
 
 export type ExactRootState = "present" | "missing";
@@ -72,6 +80,8 @@ export interface GitContext {
   initialWorktree?: InitialWorktreeWriter;
   indexTracker?: IndexTrackerWriter;
   sparseWorkspace?: SparseWorkspaceSource;
+  selectedPaths?: SelectedPathSource;
+  commitTrees?: CommitTreeSnapshotSource;
   http?: GitHttpClient;
   now: () => number;
   /** Minutes west of UTC, for commit timestamps. */

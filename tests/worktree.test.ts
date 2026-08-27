@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { fromHex } from "../src/core/bytes.js";
 import { hashObject } from "../src/core/objects.js";
+import { matchesPaths } from "../src/core/ops/checkout.js";
 import { initRepository } from "../src/core/ops/init.js";
 import {
+  compilePathspecs,
   dirtyPaths,
   hashWorktreePaths,
+  MAX_COMPILED_PATHS,
+  MAX_COMPILED_PATHSPEC_BYTES,
   type WorktreePath,
   walkWorktree,
   walkWorktreeEntriesStream,
@@ -521,6 +525,72 @@ describe("walkWorktreeStream", () => {
     workspace.worktree.writeFile("/real/file.txt", new TextEncoder().encode("contents\n"));
     const repo = initRepository(workspace.context, { dir: "/alias" });
     expect(walkWorktree(workspace.worktree, repo.root)).toEqual(["file.txt"]);
+  });
+
+  it("keeps compiled scalar pathspec results identical across edge cases", () => {
+    const cases: Array<{ paths: string[] | undefined; path: string; expected: boolean }> = [
+      { paths: undefined, path: "anything", expected: true },
+      { paths: [], path: "anything", expected: true },
+      { paths: [""], path: "anything", expected: true },
+      { paths: ["."], path: "anything", expected: true },
+      { paths: ["./"], path: "./child", expected: true },
+      { paths: ["./"], path: "child", expected: false },
+      { paths: ["/"], path: "/child", expected: true },
+      { paths: ["/"], path: "child", expected: false },
+      { paths: ["dir///"], path: "dir", expected: false },
+      { paths: ["dir///"], path: "dir/file", expected: true },
+      { paths: ["same", "same"], path: "same/child", expected: true },
+      { paths: ["\ue000", "\u{10000}"], path: "\u{10000}/child", expected: true },
+    ];
+
+    for (const fixture of cases) {
+      expect(matchesPaths(fixture.path, fixture.paths)).toBe(fixture.expected);
+      expect(compilePathspecs(fixture.paths).matches(fixture.path)).toBe(fixture.expected);
+    }
+    expect(compilePathspecs(["dir///"]).matchesEntry("dir")).toBe(true);
+    expect(compilePathspecs(["/"]).matchesEntry("anything")).toBe(true);
+  });
+
+  it("bounds compiled pathspec count and request bytes before sorting", () => {
+    expect(() =>
+      compilePathspecs(Array.from({ length: MAX_COMPILED_PATHS }, () => "x")),
+    ).not.toThrow();
+    expect(() =>
+      compilePathspecs(Array.from({ length: MAX_COMPILED_PATHS + 1 }, () => "x")),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+
+    expect(() => compilePathspecs(["x".repeat(MAX_COMPILED_PATHSPEC_BYTES - 4)])).not.toThrow();
+    expect(() => compilePathspecs(["x".repeat(MAX_COMPILED_PATHSPEC_BYTES - 3)])).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+  });
+
+  it("prunes later pages after observing only the current scan page", () => {
+    const workspace = makeWorkspace();
+    workspace.worktree.makeDirectories(["/cut", "/kept"]);
+    workspace.worktree.writeFiles([
+      ...Array.from({ length: 2_500 }, (_, index) => ({
+        path: `/cut/${index.toString().padStart(4, "0")}.txt`,
+        bytes: new Uint8Array([1]),
+      })),
+      { path: "/kept/file.txt", bytes: new Uint8Array([2]) },
+    ]);
+    let predicateCalls = 0;
+    workspace.storage.resetCounters();
+
+    const paths = walkWorktree(workspace.worktree, "/", {
+      pruneDirectory: (path) => {
+        predicateCalls++;
+        return path === "cut";
+      },
+    });
+
+    expect(paths).toEqual(["kept/file.txt"]);
+    expect(predicateCalls).toBe(2);
+    // The storage counter aggregates scan and scalar rows, so it cannot isolate
+    // descendant rows. This bound permits one 1,000-row page plus setup/seek rows.
+    expect(workspace.storage.rowCount).toBeLessThanOrEqual(1_005);
+    expect(workspace.storage.statementCount).toBe(4);
   });
 });
 

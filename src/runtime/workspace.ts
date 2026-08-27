@@ -7,8 +7,16 @@ import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory } from "../git/client.js";
 import { Database, type DurableObjectStorageLike } from "../sqlite/db.js";
-import { initializeIndexTracker, resealIndexTracker } from "../sqlite/index-tracker.js";
-import { createSqliteSparseWorkspaceSource } from "../sqlite/sparse-workspace.js";
+import {
+  advanceIndexTrackerBaseline,
+  initializeIndexTracker,
+  resealIndexTracker,
+} from "../sqlite/index-tracker.js";
+import {
+  createSqliteCommitTreeSnapshotSource,
+  createSqliteSelectedPathSource,
+  createSqliteSparseWorkspaceSource,
+} from "../sqlite/sparse-workspace.js";
 import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
 import type { ProcessExecOptions, ProcessHandle, ProcessHost } from "./types.js";
 
@@ -54,14 +62,23 @@ export class Workspace {
       const indexTracker: IndexTrackerWriter = {
         reseal: (checkoutId, baselineTreeOid, entries) =>
           resealIndexTracker(this.db, checkoutId, baselineTreeOid, entries),
+        advanceBaseline: (checkoutId, baselineTreeOid) =>
+          advanceIndexTrackerBaseline(this.db, checkoutId, baselineTreeOid),
       };
+      const initialWorktree = createInitialWorktreeWriter(
+        this.db,
+        now,
+        (database) => database === this.#gitDatabase,
+      );
       const binding = {
         database: this.#gitDatabase,
         worktree: this.filesystem,
         exactRootStates: createExactPathStateSource(this.db),
-        initialWorktree: createInitialWorktreeWriter(this.db, now),
+        initialWorktree,
         indexTracker,
         sparseWorkspace: createSqliteSparseWorkspaceSource(this.db),
+        selectedPaths: createSqliteSelectedPathSource(this.db),
+        commitTrees: createSqliteCommitTreeSnapshotSource(this.db),
         now,
         timezoneOffset: this.#options.timezoneOffset ?? (() => 0),
         defaultIdentity: this.#options.defaultGitIdentity,

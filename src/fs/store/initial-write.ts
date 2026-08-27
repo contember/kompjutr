@@ -675,7 +675,12 @@ export class InitialWorktreeWriter {
   constructor(
     private readonly db: SqlDatabase,
     private readonly clock: () => number = Date.now,
+    private readonly databaseIdentity: (database: unknown) => boolean = () => false,
   ) {}
+
+  supportsDatabase(database: unknown): boolean {
+    return this.databaseIdentity(database);
+  }
 
   tryRun<T>(
     rootInput: string,
@@ -783,6 +788,7 @@ export class InitialWorktreeWriter {
 export function createInitialWorktreeWriter(
   db: SqlDatabase,
   clock: () => number = Date.now,
+  databaseIdentity?: (database: unknown) => boolean,
 ): InitialWorktreeWriter {
-  return new InitialWorktreeWriter(db, clock);
+  return new InitialWorktreeWriter(db, clock, databaseIdentity);
 }

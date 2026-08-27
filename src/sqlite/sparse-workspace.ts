@@ -1,9 +1,19 @@
 import { isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import type {
+  CommitTreeSnapshotDirectory,
+  CommitTreeSnapshotRequest,
+  CommitTreeSnapshotResult,
+  CommitTreeSnapshotSource,
+  SelectedPathRequest,
+  SelectedPathResult,
+  SelectedPathSource,
+  SelectedPathSpec,
+  SelectedWorktreeFact,
   SparseIndexAncestorRequest,
   SparseIndexAncestorResult,
   SparseTreeLeaf,
+  SparseWorkspaceDirty,
   SparseWorkspaceRequest,
   SparseWorkspaceResult,
   SparseWorkspaceRow,
@@ -25,6 +35,9 @@ const MAX_DEPTH = 64;
 const MAX_EDGE_STEPS = 32_768;
 const MAX_INDEX_ANCESTORS = 32_768;
 const MAX_INDEX_ANCESTOR_ROWS = 32_768;
+const MAX_SELECTED_ROWS = 32_768;
+const MAX_SNAPSHOT_DIRECTORIES = 1_000;
+const MAX_SNAPSHOT_DIRTY_ROWS = 32_000;
 const MAX_SOURCE_ENTRIES = 8_192;
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_WORKTREE_RETAINED_BYTES = 4 * 1024 * 1024;
@@ -32,11 +45,28 @@ export const MAX_SPARSE_WORKSPACE_RETAINED_BYTES = 8 * 1024 * 1024;
 const ROW_RETAINED_BYTES = 1_024;
 const INDEX_ENTRY_RETAINED_BYTES = 320;
 const INDEX_ANCESTOR_RETAINED_BYTES = 192;
+const SELECTED_INDEX_RETAINED_BYTES = 320;
+const SELECTED_WORKTREE_RETAINED_BYTES = 512;
+const SNAPSHOT_ARRAY_RETAINED_BYTES = 64;
+const SNAPSHOT_ARRAY_SLOT_BYTES = 8;
+const SNAPSHOT_MAP_RETAINED_BYTES = 128;
+const SNAPSHOT_MAP_ENTRY_BYTES = 96;
+const SNAPSHOT_REQUEST_RETAINED_BYTES = 512;
+const SNAPSHOT_DIRECTORY_RETAINED_BYTES = 256;
+const SNAPSHOT_ENTRY_RETAINED_BYTES = 256;
+const SNAPSHOT_SOURCE_RETAINED_BYTES = 512;
 const SEGMENT_RETAINED_BYTES = 40;
 const CURSOR_RETAINED_BYTES = 256;
 const OID_RETAINED_BYTES = 112;
 const RESOLUTION_RETAINED_BYTES = 192;
 const SOURCE_RETAINED_BYTES = 512;
+const SNAPSHOT_TREE_PART_JSON_CHARS = 96;
+const SNAPSHOT_TREE_RESOLUTION_RETAINED_BYTES =
+  SNAPSHOT_MAP_ENTRY_BYTES +
+  RESOLUTION_RETAINED_BYTES +
+  SNAPSHOT_ENTRY_RETAINED_BYTES +
+  OID_RETAINED_BYTES +
+  64;
 const encoder = new TextEncoder();
 
 interface TreeCursor {
@@ -63,11 +93,36 @@ interface ValidatedRequest {
 interface ValidatedTreeSource {
   storage: "loose" | "pack";
   sourceId: number;
+  objectSize: number;
+  entryCount: number;
+  baseCost: number;
 }
 
 interface SourceBudget {
   entries: number;
   bytes: number;
+}
+
+interface SnapshotRetainedBudget {
+  limit: number;
+  used: number;
+  peak: number;
+}
+
+function reserveSnapshot(budget: SnapshotRetainedBudget, bytes: number): boolean {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > budget.limit - budget.used) {
+    return false;
+  }
+  budget.used += bytes;
+  budget.peak = Math.max(budget.peak, budget.used);
+  return true;
+}
+
+function releaseSnapshot(budget: SnapshotRetainedBudget, bytes: number): void {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > budget.used) {
+    throw new CorruptError("commit tree snapshot retained accounting is invalid");
+  }
+  budget.used -= bytes;
 }
 
 function inputError(message: string): GitError {
@@ -522,6 +577,7 @@ function validateSourceRow(
   row: Record<string, unknown>,
   sources: Map<string, ValidatedTreeSource>,
   budget: SourceBudget,
+  retainSource?: (treeOid: string) => boolean,
 ): "available" | "unavailable" {
   if (
     typeof row.tree_oid !== "string" ||
@@ -542,7 +598,14 @@ function validateSourceRow(
     throw new CorruptError("sparse tree lookup returned invalid validation state");
   }
   if (validated === 1) {
-    if (cached === undefined || cached.storage !== storage || cached.sourceId !== sourceId) {
+    if (
+      cached === undefined ||
+      cached.storage !== storage ||
+      cached.sourceId !== sourceId ||
+      cached.objectSize !== objectSize ||
+      cached.entryCount !== entryCount ||
+      cached.baseCost !== baseCost
+    ) {
       throw new CorruptError("sparse tree source changed during hydration");
     }
     return "available";
@@ -602,10 +665,11 @@ function validateSourceRow(
     ) {
       return "unavailable";
     }
+    if (retainSource !== undefined && !retainSource(treeOid)) return "unavailable";
     budget.entries += entryCount;
     budget.bytes += validationBytes;
   }
-  sources.set(treeOid, { storage, sourceId });
+  sources.set(treeOid, { storage, sourceId, objectSize, entryCount, baseCost });
   return "available";
 }
 
@@ -617,6 +681,7 @@ function treeDepth(
   budget: SourceBudget,
   retainedBytes: number,
   retainedLimit: number,
+  retainSource?: (treeOid: string) => boolean,
 ): { available: boolean; resolutions: Map<string, TreeResolution> } {
   const parts: string[] = [];
   let jsonBytes = 2;
@@ -664,7 +729,7 @@ function treeDepth(
   )) {
     rows++;
     if (rows > cursors.length) throw new CorruptError("sparse tree lookup returned duplicate rows");
-    if (validateSourceRow(row, sources, budget) === "unavailable") {
+    if (validateSourceRow(row, sources, budget, retainSource) === "unavailable") {
       return { available: false, resolutions };
     }
     const ordinal = numberField(row.ordinal);
@@ -699,7 +764,7 @@ function treeDepth(
     const tree = mode === "40000" || mode === "040000";
     resolutions.set(key, {
       leaf: final === 1 && !tree ? { mode, oid } : null,
-      treeOid: final === 0 && tree ? oid : null,
+      treeOid: tree ? oid : null,
     });
   }
   if (rows !== cursors.length) throw new CorruptError("sparse tree lookup lost requested paths");
@@ -790,7 +855,7 @@ function resolveTrees(
         if (cursor.side === "b") baseline[cursor.ordinal] = resolution.leaf;
         else current[cursor.ordinal] = resolution.leaf;
       }
-      if (resolution.treeOid !== null) {
+      if (resolution.treeOid !== null && !cursor.final) {
         if (cursor.ancestry.includes(resolution.treeOid)) {
           throw new CorruptError(`sparse tree cycle at ${resolution.treeOid}`);
         }
@@ -1342,6 +1407,1266 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
   };
 }
 
+interface ValidatedSelectedPathRequest {
+  request: SelectedPathRequest;
+  json: string;
+  retainedBytes: number;
+  retainedLimit: number;
+}
+
+function validateSelectedPathRequest(input: unknown): ValidatedSelectedPathRequest | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw inputError("selected path request is invalid");
+  }
+  const repoId = Reflect.get(input, "repoId");
+  const checkoutId = Reflect.get(input, "checkoutId");
+  const root = Reflect.get(input, "root");
+  const specsInput = Reflect.get(input, "specs");
+  const maxRetainedBytes = Reflect.get(input, "maxRetainedBytes");
+  if (typeof repoId !== "number" || !Number.isSafeInteger(repoId) || repoId <= 0) {
+    throw inputError("selected path repository id is invalid");
+  }
+  if (typeof checkoutId !== "number" || !Number.isSafeInteger(checkoutId) || checkoutId <= 0) {
+    throw inputError("selected path checkout id is invalid");
+  }
+  if (typeof root !== "string") throw inputError("selected path root is invalid");
+  validateRoot(root);
+  if (!Array.isArray(specsInput)) throw inputError("selected path specs are invalid");
+  if (specsInput.length > MAX_PATHS) {
+    throw tooLarge(`selected path request exceeds ${MAX_PATHS} specs`);
+  }
+  if (
+    maxRetainedBytes !== undefined &&
+    (typeof maxRetainedBytes !== "number" || !Number.isSafeInteger(maxRetainedBytes))
+  ) {
+    throw inputError("selected path retained limit is invalid");
+  }
+  const retainedLimit = requestRetainedLimit(maxRetainedBytes);
+  const specs: SelectedPathSpec[] = [];
+  const parts: string[] = [];
+  let retainedBytes = 0;
+  let jsonBytes = 2;
+  let jsonChars = 2;
+  let previous: string | null = null;
+  for (let ordinal = 0; ordinal < specsInput.length; ordinal++) {
+    if (!Object.hasOwn(specsInput, ordinal)) {
+      throw inputError("selected path specs are not dense");
+    }
+    const candidate: unknown = Reflect.get(specsInput, String(ordinal));
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+      throw inputError("selected path spec is invalid");
+    }
+    const path = Reflect.get(candidate, "path");
+    const recursive = Reflect.get(candidate, "recursive");
+    if (typeof path !== "string" || typeof recursive !== "boolean") {
+      throw inputError("selected path spec is invalid");
+    }
+    const parsed = parseRelativePath(path);
+    if (previous !== null && comparePaths(previous, path) >= 0) {
+      throw inputError("selected path specs are not in strict Git order");
+    }
+    const part = JSON.stringify({ p: path, r: recursive ? 1 : 0 });
+    const separator = previous === null ? 0 : 1;
+    jsonBytes += encoder.encode(part).length + separator;
+    jsonChars += part.length + separator;
+    retainedBytes += ROW_RETAINED_BYTES + path.length * 4 + parsed.bytes;
+    if (jsonBytes > MAX_REQUEST_JSON_BYTES) {
+      throw tooLarge(`selected path request exceeds ${MAX_REQUEST_JSON_BYTES} JSON bytes`);
+    }
+    if (retainedBytes > retainedLimit - jsonChars * 2) return null;
+    parts.push(part);
+    specs.push({ path, recursive });
+    previous = path;
+  }
+  const request: SelectedPathRequest = {
+    repoId,
+    checkoutId,
+    root,
+    specs,
+    ...(maxRetainedBytes === undefined ? {} : { maxRetainedBytes }),
+  };
+  return {
+    request,
+    json: `[${parts.join(",")}]`,
+    retainedBytes: retainedBytes + jsonChars * 2,
+    retainedLimit,
+  };
+}
+
+const SELECTED_INDEX_SQL = `WITH wanted(path, recursive) AS MATERIALIZED (
+  SELECT json_extract(value, '$.p'), json_extract(value, '$.r') FROM json_each(?)
+), checkout AS MATERIALIZED (
+  SELECT id, repo_id, root, typeof(repo_id) AS repo_type, typeof(root) AS root_type,
+         length(CAST(root AS BLOB)) AS root_bytes,
+         EXISTS (
+           SELECT 1 FROM fs_paths path JOIN fs_nodes node ON node.inode = path.inode
+            WHERE path.path = git_checkouts.root AND typeof(path.inode) = 'integer'
+              AND typeof(node.inode) = 'integer' AND path.inode = node.inode
+              AND node.type = 'dir' AND typeof(node.mode) = 'integer'
+              AND typeof(node.size) = 'integer' AND node.size = 0
+              AND typeof(node.mtime) = 'integer'
+              AND typeof(node.rev) = 'integer' AND node.rev >= 0
+              AND typeof(node.nlink) = 'integer' AND node.nlink > 0
+              AND node.link_target IS NULL AND node.content_id IS NULL
+         ) AS root_valid
+    FROM git_checkouts WHERE id = ?
+), candidates AS MATERIALIZED (
+  SELECT DISTINCT candidate.path, candidate.stage, candidate.mode, candidate.oid,
+         candidate.size, candidate.mtime, candidate.ino, candidate.rev
+    FROM wanted JOIN git_index candidate
+      ON candidate.checkout_id = ?
+     AND (CAST(candidate.path AS BLOB) = CAST(wanted.path AS BLOB)
+       OR (wanted.recursive = 1
+         AND CAST(candidate.path AS BLOB) >= CAST(wanted.path || '/' AS BLOB)
+         AND CAST(candidate.path AS BLOB) < CAST(wanted.path || '0' AS BLOB)))
+   LIMIT ${MAX_SELECTED_ROWS + 1}
+), totals AS (SELECT count(*) AS candidate_count FROM candidates)
+SELECT 0 AS kind, checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+       checkout.repo_type, checkout.root_type, checkout.root_bytes, checkout.root_valid,
+       totals.candidate_count,
+       NULL AS path, 'null' AS path_type, NULL AS path_bytes,
+       NULL AS stage, 'null' AS stage_type, NULL AS mode, 'null' AS mode_type,
+       NULL AS oid, 'null' AS oid_type, NULL AS size, NULL AS mtime, NULL AS ino, NULL AS rev,
+       'null' AS size_type, 'null' AS mtime_type, 'null' AS ino_type, 'null' AS rev_type
+  FROM totals LEFT JOIN checkout ON 1 = 1
+UNION ALL
+SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       path, typeof(path), length(CAST(path AS BLOB)),
+       stage, typeof(stage), mode, typeof(mode), oid, typeof(oid),
+       size, mtime, ino, rev, typeof(size), typeof(mtime), typeof(ino), typeof(rev)
+  FROM candidates
+ORDER BY kind, path, stage`;
+
+const SELECTED_WORKTREE_SQL = `WITH wanted(relative, recursive) AS MATERIALIZED (
+  SELECT json_extract(value, '$.p'), json_extract(value, '$.r') FROM json_each(?)
+), checkout AS MATERIALIZED (
+  SELECT id, repo_id, root, typeof(repo_id) AS repo_type, typeof(root) AS root_type,
+         length(CAST(root AS BLOB)) AS root_bytes,
+         EXISTS (
+           SELECT 1 FROM fs_paths path JOIN fs_nodes node ON node.inode = path.inode
+            WHERE path.path = git_checkouts.root AND typeof(path.inode) = 'integer'
+              AND typeof(node.inode) = 'integer' AND path.inode = node.inode
+              AND node.type = 'dir' AND typeof(node.mode) = 'integer'
+              AND typeof(node.size) = 'integer' AND node.size = 0
+              AND typeof(node.mtime) = 'integer'
+              AND typeof(node.rev) = 'integer' AND node.rev >= 0
+              AND typeof(node.nlink) = 'integer' AND node.nlink > 0
+              AND node.link_target IS NULL AND node.content_id IS NULL
+         ) AS root_valid
+    FROM git_checkouts WHERE id = ?
+), absolute AS MATERIALIZED (
+  SELECT relative, recursive,
+         CASE WHEN ? = '/' THEN '/' || relative ELSE ? || '/' || relative END AS path
+    FROM wanted
+), ancestor_rows AS MATERIALIZED (
+  SELECT ancestor.path, ancestor.inode AS path_inode, node.inode, node.type,
+         node.mode, node.size, node.mtime, node.rev, node.nlink,
+         typeof(ancestor.path) AS path_type, typeof(ancestor.inode) AS path_inode_type,
+         typeof(node.inode) AS inode_type, typeof(node.type) AS node_type,
+         typeof(node.mode) AS mode_type, typeof(node.size) AS size_type,
+         typeof(node.mtime) AS mtime_type, typeof(node.rev) AS rev_type,
+         typeof(node.nlink) AS nlink_type, typeof(node.link_target) AS target_type,
+         typeof(node.content_id) AS content_type,
+         length(CAST(node.link_target AS BLOB)) AS target_bytes
+    FROM absolute wanted_path
+    JOIN fs_paths ancestor
+      ON length(ancestor.path) < length(wanted_path.path)
+     AND substr(wanted_path.path, 1, length(ancestor.path) + 1) = ancestor.path || '/'
+    LEFT JOIN fs_nodes node ON node.inode = ancestor.inode
+), ancestor_summary AS MATERIALIZED (
+  SELECT coalesce(sum(CASE WHEN type = 'symlink' THEN 1 ELSE 0 END), 0) AS symlinks,
+         coalesce(sum(CASE
+           WHEN path_type <> 'text' OR path_inode_type <> 'integer'
+             OR inode_type <> 'integer' OR path_inode <> inode
+             OR node_type <> 'text' OR type NOT IN ('dir','symlink')
+             OR mode_type <> 'integer' OR mode < 0 OR mode > 4095
+             OR size_type <> 'integer' OR size < 0
+             OR mtime_type <> 'integer'
+             OR rev_type <> 'integer' OR rev < 0
+             OR nlink_type <> 'integer' OR nlink <= 0
+             OR (type = 'dir' AND (size <> 0 OR target_type <> 'null' OR content_type <> 'null'))
+             OR (type = 'symlink' AND (target_type <> 'text' OR target_bytes <> size
+                                       OR content_type <> 'null'))
+           THEN 1 ELSE 0 END), 0) AS invalid
+    FROM ancestor_rows
+), candidates AS MATERIALIZED (
+  SELECT DISTINCT paths.path, paths.inode AS path_inode,
+         CASE WHEN ? = '/' THEN substr(paths.path, 2)
+              ELSE substr(paths.path, length(?) + 2) END AS relative
+    FROM absolute wanted_path JOIN fs_paths paths
+      ON CAST(paths.path AS BLOB) = CAST(wanted_path.path AS BLOB)
+      OR (wanted_path.recursive = 1
+        AND CAST(paths.path AS BLOB) >= CAST(wanted_path.path || '/' AS BLOB)
+        AND CAST(paths.path AS BLOB) < CAST(wanted_path.path || '0' AS BLOB))
+   LIMIT ${MAX_SELECTED_ROWS + 1}
+), totals AS (SELECT count(*) AS candidate_count FROM candidates), metadata AS MATERIALIZED (
+  SELECT candidates.*, nodes.inode, nodes.type, nodes.mode, nodes.size, nodes.mtime,
+         nodes.rev, nodes.nlink,
+         typeof(candidates.path) AS path_type, length(CAST(candidates.path AS BLOB)) AS path_bytes,
+         typeof(candidates.path_inode) AS path_inode_type, typeof(nodes.inode) AS inode_type,
+         typeof(nodes.type) AS node_type, typeof(nodes.mode) AS mode_type,
+         typeof(nodes.size) AS size_type, typeof(nodes.mtime) AS mtime_type,
+         typeof(nodes.rev) AS rev_type, typeof(nodes.nlink) AS nlink_type,
+         typeof(nodes.link_target) AS target_type, typeof(nodes.content_id) AS content_type,
+         length(CAST(nodes.link_target AS BLOB)) AS target_bytes,
+         length(nodes.content_id) AS content_bytes
+    FROM candidates LEFT JOIN fs_nodes nodes ON nodes.inode = candidates.path_inode
+), charged AS MATERIALIZED (
+  SELECT metadata.*,
+         coalesce(target_bytes, 0) * 2 + coalesce(content_bytes, 0) AS payload_bytes,
+         sum(coalesce(target_bytes, 0) * 2 + coalesce(content_bytes, 0)) OVER (
+           ORDER BY path COLLATE BINARY ROWS UNBOUNDED PRECEDING
+         ) AS cumulative_payload_bytes
+    FROM metadata
+)
+SELECT 0 AS kind, checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+       checkout.repo_type, checkout.root_type, checkout.root_bytes, checkout.root_valid,
+       totals.candidate_count, ancestor_summary.symlinks AS symlink_ancestors,
+       ancestor_summary.invalid AS invalid_ancestors,
+       NULL AS path, NULL AS relative, NULL AS path_inode, NULL AS inode,
+       NULL AS type, NULL AS mode,
+       NULL AS size, NULL AS mtime, NULL AS rev, NULL AS nlink,
+       NULL AS path_type, NULL AS path_bytes, NULL AS path_inode_type, NULL AS inode_type,
+       NULL AS node_type, NULL AS mode_type, NULL AS size_type, NULL AS mtime_type,
+       NULL AS rev_type, NULL AS nlink_type, NULL AS target_type, NULL AS content_type,
+       NULL AS target_bytes, NULL AS content_bytes, NULL AS payload_bytes,
+       NULL AS cumulative_payload_bytes, NULL AS target, NULL AS content_id
+  FROM totals CROSS JOIN ancestor_summary LEFT JOIN checkout ON 1 = 1
+UNION ALL
+SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       charged.path, charged.relative, charged.path_inode, charged.inode,
+       charged.type, charged.mode,
+       charged.size, charged.mtime, charged.rev, charged.nlink,
+       charged.path_type, charged.path_bytes, charged.path_inode_type, charged.inode_type,
+       charged.node_type, charged.mode_type, charged.size_type, charged.mtime_type,
+       charged.rev_type, charged.nlink_type, charged.target_type, charged.content_type,
+       charged.target_bytes, charged.content_bytes, charged.payload_bytes,
+       charged.cumulative_payload_bytes,
+       CASE WHEN charged.cumulative_payload_bytes <= ? THEN payload.link_target END,
+       CASE WHEN charged.cumulative_payload_bytes <= ? THEN payload.content_id END
+  FROM charged LEFT JOIN fs_nodes payload ON payload.inode = charged.inode
+ORDER BY kind, path COLLATE BINARY`;
+
+function validateSelectedCheckout(
+  row: Record<string, unknown>,
+  request: SelectedPathRequest,
+): void {
+  if (row.checkout_id === null) {
+    throw inputError("selected path checkout does not exist");
+  }
+  const rootBytes = numberField(row.root_bytes);
+  if (
+    row.checkout_id !== request.checkoutId ||
+    row.repo_type !== "integer" ||
+    row.repo_id !== request.repoId ||
+    row.root_type !== "text" ||
+    row.root !== request.root ||
+    rootBytes === null ||
+    rootBytes < 1 ||
+    rootBytes > MAX_ROOT_BYTES
+  ) {
+    throw new CorruptError("selected path checkout row is malformed or mismatched");
+  }
+  if (row.root_valid !== 1) {
+    throw new CorruptError("selected path checkout root is malformed");
+  }
+}
+
+function readSelectedIndex(
+  db: SqlDatabase,
+  validated: ValidatedSelectedPathRequest,
+  retainedHeadroom: number,
+  retainEntry?: () => boolean,
+): { available: boolean; rows: IndexEntry[]; retainedBytes: number } {
+  const rows: IndexEntry[] = [];
+  let metadata = false;
+  let available = true;
+  let retainedBytes = 0;
+  let previous: IndexEntry | null = null;
+  for (const row of db.iterate(
+    SELECTED_INDEX_SQL,
+    validated.json,
+    validated.request.checkoutId,
+    validated.request.checkoutId,
+  )) {
+    if (row.kind === 0) {
+      if (metadata) throw new CorruptError("selected index lookup duplicated metadata");
+      metadata = true;
+      validateSelectedCheckout(row, validated.request);
+      const count = numberField(row.candidate_count);
+      if (count === null || count < 0) {
+        throw new CorruptError("selected index lookup returned invalid cardinality");
+      }
+      if (count > MAX_SELECTED_ROWS) available = false;
+      continue;
+    }
+    if (row.kind !== 1 || !metadata) {
+      throw new CorruptError("selected index lookup returned invalid row ordering");
+    }
+    const entry = validatedSparseIndexEntry(row);
+    if (
+      previous !== null &&
+      (comparePaths(previous.path, entry.path) > 0 ||
+        (previous.path === entry.path && previous.stage >= entry.stage))
+    ) {
+      throw new CorruptError("selected index lookup returned unordered rows");
+    }
+    previous = entry;
+    if (retainedBytes > retainedHeadroom - SELECTED_INDEX_RETAINED_BYTES) {
+      available = false;
+      continue;
+    }
+    if (retainEntry !== undefined && !retainEntry()) {
+      available = false;
+      continue;
+    }
+    retainedBytes += SELECTED_INDEX_RETAINED_BYTES;
+    rows.push(entry);
+  }
+  if (!metadata) throw new CorruptError("selected index lookup lost metadata");
+  return { available, rows, retainedBytes };
+}
+
+function snapshotSelectedRequestBytes(dirty: readonly SparseWorkspaceDirty[]): number | null {
+  let retainedBytes = SNAPSHOT_REQUEST_RETAINED_BYTES + SNAPSHOT_ARRAY_RETAINED_BYTES * 2;
+  let jsonChars = 2;
+  for (let index = 0; index < dirty.length; index++) {
+    const path = dirty[index]?.path;
+    if (path === undefined) throw new CorruptError("commit tree snapshot lost a dirty path");
+    const parsed = parseRelativePath(path);
+    const part = JSON.stringify({ p: path, r: 0 });
+    const separator = index === 0 ? 0 : 1;
+    const records =
+      ROW_RETAINED_BYTES * 2 + SNAPSHOT_ARRAY_SLOT_BYTES * 2 + path.length * 4 + parsed.bytes;
+    if (records > MAX_SPARSE_WORKSPACE_RETAINED_BYTES - retainedBytes) return null;
+    retainedBytes += records;
+    jsonChars += part.length + separator;
+    if (jsonChars * 2 > MAX_SPARSE_WORKSPACE_RETAINED_BYTES - retainedBytes) return null;
+  }
+  return retainedBytes + jsonChars * 2;
+}
+
+function readSelectedWorktree(
+  db: SqlDatabase,
+  validated: ValidatedSelectedPathRequest,
+  retainedHeadroom: number,
+): { available: boolean; rows: SelectedWorktreeFact[]; retainedBytes: number } {
+  const rows: SelectedWorktreeFact[] = [];
+  let metadata = false;
+  let available = true;
+  let retainedBytes = 0;
+  let payloadCumulative = 0;
+  let previous: string | null = null;
+  for (const row of db.iterate(
+    SELECTED_WORKTREE_SQL,
+    validated.json,
+    validated.request.checkoutId,
+    validated.request.root,
+    validated.request.root,
+    validated.request.root,
+    validated.request.root,
+    retainedHeadroom,
+    retainedHeadroom,
+  )) {
+    if (row.kind === 0) {
+      if (metadata) throw new CorruptError("selected worktree lookup duplicated metadata");
+      metadata = true;
+      validateSelectedCheckout(row, validated.request);
+      const count = numberField(row.candidate_count);
+      const symlinks = numberField(row.symlink_ancestors);
+      const invalidAncestors = numberField(row.invalid_ancestors);
+      if (
+        count === null ||
+        count < 0 ||
+        symlinks === null ||
+        symlinks < 0 ||
+        invalidAncestors === null ||
+        invalidAncestors < 0
+      ) {
+        throw new CorruptError("selected worktree lookup returned invalid cardinality");
+      }
+      if (invalidAncestors > 0) {
+        throw new CorruptError("selected worktree lookup found a malformed ancestor");
+      }
+      if (count > MAX_SELECTED_ROWS || symlinks > 0) available = false;
+      continue;
+    }
+    if (row.kind !== 1 || !metadata) {
+      throw new CorruptError("selected worktree lookup returned invalid row ordering");
+    }
+    const pathBytes = numberField(row.path_bytes);
+    const pathInode = numberField(row.path_inode);
+    const inode = numberField(row.inode);
+    const mode = numberField(row.mode);
+    const size = numberField(row.size);
+    const mtime = numberField(row.mtime);
+    const rev = numberField(row.rev);
+    const nlink = numberField(row.nlink);
+    const targetBytes = numberField(row.target_bytes);
+    const contentBytes = numberField(row.content_bytes);
+    const payloadBytes = numberField(row.payload_bytes);
+    const cumulative = numberField(row.cumulative_payload_bytes);
+    const type = row.type;
+    if (
+      row.path_type !== "text" ||
+      typeof row.path !== "string" ||
+      pathBytes === null ||
+      pathBytes < 1 ||
+      pathBytes > MAX_ROOT_BYTES + MAX_PATH_BYTES + 1 ||
+      encoder.encode(row.path).length !== pathBytes ||
+      typeof row.relative !== "string" ||
+      !validStoredIndexPath(row.relative, encoder.encode(row.relative).length) ||
+      row.path !==
+        (validated.request.root === "/"
+          ? `/${row.relative}`
+          : `${validated.request.root}/${row.relative}`) ||
+      row.path_inode_type !== "integer" ||
+      pathInode === null ||
+      pathInode <= 0 ||
+      row.inode_type !== "integer" ||
+      inode === null ||
+      inode <= 0 ||
+      pathInode !== inode ||
+      row.node_type !== "text" ||
+      (type !== "file" && type !== "dir" && type !== "symlink") ||
+      row.mode_type !== "integer" ||
+      mode === null ||
+      mode < 0 ||
+      mode > 0o7777 ||
+      row.size_type !== "integer" ||
+      size === null ||
+      size < 0 ||
+      row.mtime_type !== "integer" ||
+      mtime === null ||
+      row.rev_type !== "integer" ||
+      rev === null ||
+      rev < 0 ||
+      row.nlink_type !== "integer" ||
+      nlink === null ||
+      nlink <= 0 ||
+      (type === "dir" && size !== 0) ||
+      !["null", "text"].includes(typeof row.target_type === "string" ? row.target_type : "") ||
+      !["null", "blob"].includes(typeof row.content_type === "string" ? row.content_type : "") ||
+      (row.target_type === "text" && targetBytes === null) ||
+      (row.target_type === "null" && targetBytes !== null) ||
+      (row.content_type === "blob" && contentBytes === null) ||
+      (row.content_type === "null" && contentBytes !== null) ||
+      (type === "dir" && (row.target_type !== "null" || row.content_type !== "null")) ||
+      (type === "symlink" && row.content_type !== "null") ||
+      (type === "symlink"
+        ? row.target_type !== "text" || targetBytes !== size
+        : row.target_type !== "null") ||
+      payloadBytes === null ||
+      cumulative === null
+    ) {
+      throw new CorruptError("selected worktree lookup returned malformed row");
+    }
+    const expectedPayload = (targetBytes ?? 0) * 2 + (contentBytes ?? 0);
+    if (
+      !Number.isSafeInteger(expectedPayload) ||
+      expectedPayload < 0 ||
+      payloadBytes !== expectedPayload ||
+      payloadCumulative > Number.MAX_SAFE_INTEGER - payloadBytes
+    ) {
+      throw new CorruptError("selected worktree lookup returned invalid payload accounting");
+    }
+    payloadCumulative += payloadBytes;
+    if (cumulative !== payloadCumulative) {
+      throw new CorruptError("selected worktree lookup returned invalid cumulative payload");
+    }
+    if (previous !== null && comparePaths(previous, row.relative) >= 0) {
+      throw new CorruptError("selected worktree lookup returned unordered rows");
+    }
+    previous = row.relative;
+    if (
+      cumulative > retainedHeadroom ||
+      retainedBytes > retainedHeadroom - SELECTED_WORKTREE_RETAINED_BYTES - payloadBytes
+    ) {
+      available = false;
+      continue;
+    }
+    if (
+      (type === "symlink" && typeof row.target !== "string") ||
+      (type !== "symlink" && row.target !== null) ||
+      (row.content_id !== null && row.content_type !== "blob") ||
+      (typeof row.target === "string" && encoder.encode(row.target).length !== targetBytes)
+    ) {
+      throw new CorruptError("selected worktree lookup returned malformed payload");
+    }
+    const contentId = row.content_id === null ? null : readBlob(row.content_id);
+    if (contentId !== null && contentId.length !== contentBytes) {
+      throw new CorruptError("selected worktree lookup returned malformed content id");
+    }
+    retainedBytes += SELECTED_WORKTREE_RETAINED_BYTES + payloadBytes;
+    rows.push({
+      path: row.relative,
+      stat: {
+        type,
+        mode,
+        size,
+        mtime,
+        ino: inode,
+        nlink,
+        rev,
+        target: type === "symlink" && typeof row.target === "string" ? row.target : null,
+        contentId,
+      },
+    });
+  }
+  if (!metadata) throw new CorruptError("selected worktree lookup lost metadata");
+  return { available, rows, retainedBytes };
+}
+
+function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPathResult {
+  const validated = validateSelectedPathRequest(request);
+  if (validated === null) return { available: false };
+  if (validated.request.specs.length === 0) {
+    return { available: true, index: [], worktree: [], retainedBytes: 0 };
+  }
+  const index = readSelectedIndex(db, validated, validated.retainedLimit - validated.retainedBytes);
+  const headroom = validated.retainedLimit - validated.retainedBytes - index.retainedBytes;
+  const worktree = readSelectedWorktree(db, validated, Math.max(0, headroom));
+  if (!index.available || !worktree.available || headroom < 0) return { available: false };
+  return {
+    available: true,
+    index: index.rows,
+    worktree: worktree.rows,
+    retainedBytes: validated.retainedBytes + index.retainedBytes + worktree.retainedBytes,
+  };
+}
+
+interface ValidatedSnapshotRequest {
+  request: CommitTreeSnapshotRequest;
+  retainedLimit: number;
+  retainedBytes: number;
+}
+
+function validateSnapshotRequest(input: unknown): ValidatedSnapshotRequest | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw inputError("commit tree snapshot request is invalid");
+  }
+  const repoId = Reflect.get(input, "repoId");
+  const checkoutId = Reflect.get(input, "checkoutId");
+  const root = Reflect.get(input, "root");
+  const baselineTreeOid = Reflect.get(input, "baselineTreeOid");
+  const maxRetainedBytes = Reflect.get(input, "maxRetainedBytes");
+  if (typeof repoId !== "number" || !Number.isSafeInteger(repoId) || repoId <= 0) {
+    throw inputError("commit tree snapshot repository id is invalid");
+  }
+  if (typeof checkoutId !== "number" || !Number.isSafeInteger(checkoutId) || checkoutId <= 0) {
+    throw inputError("commit tree snapshot checkout id is invalid");
+  }
+  if (typeof root !== "string") throw inputError("commit tree snapshot root is invalid");
+  validateRoot(root);
+  if (
+    baselineTreeOid !== null &&
+    (typeof baselineTreeOid !== "string" || !isOid(baselineTreeOid))
+  ) {
+    throw inputError("commit tree snapshot baseline is invalid");
+  }
+  if (
+    maxRetainedBytes !== undefined &&
+    (typeof maxRetainedBytes !== "number" || !Number.isSafeInteger(maxRetainedBytes))
+  ) {
+    throw inputError("commit tree snapshot retained limit is invalid");
+  }
+  const retainedLimit = requestRetainedLimit(maxRetainedBytes);
+  const retainedBytes =
+    SNAPSHOT_REQUEST_RETAINED_BYTES + root.length * 4 + (baselineTreeOid === null ? 0 : 160);
+  if (retainedBytes > retainedLimit) return null;
+  return {
+    request: {
+      repoId,
+      checkoutId,
+      root,
+      baselineTreeOid,
+      ...(maxRetainedBytes === undefined ? {} : { maxRetainedBytes }),
+    },
+    retainedLimit,
+    retainedBytes,
+  };
+}
+
+const SNAPSHOT_DIRTY_SQL = `WITH state AS MATERIALIZED (
+  SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+         typeof(checkout.repo_id) AS repo_type, typeof(checkout.root) AS root_type,
+         length(CAST(checkout.root AS BLOB)) AS root_bytes,
+         tracker.baseline_tree_oid, typeof(tracker.baseline_tree_oid) AS baseline_type,
+         length(CAST(tracker.baseline_tree_oid AS BLOB)) AS baseline_bytes,
+         tracker.format, typeof(tracker.format) AS format_type,
+         tracker.complete, typeof(tracker.complete) AS complete_type
+    FROM git_checkouts checkout
+    LEFT JOIN git_index_state tracker ON tracker.checkout_id = checkout.id
+   WHERE checkout.id = ?
+), dirty AS MATERIALIZED (
+  SELECT path, flags FROM git_index_dirty WHERE checkout_id = ?
+   ORDER BY path COLLATE BINARY LIMIT ${MAX_SNAPSHOT_DIRTY_ROWS + 1}
+), totals AS (SELECT count(*) AS dirty_count FROM dirty)
+SELECT 0 AS kind, state.*, totals.dirty_count,
+       NULL AS path, 'null' AS path_type, NULL AS path_bytes,
+       NULL AS flags, 'null' AS flags_type
+  FROM totals LEFT JOIN state ON 1 = 1
+UNION ALL
+SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       NULL, dirty.path, typeof(dirty.path), length(CAST(dirty.path AS BLOB)),
+       dirty.flags, typeof(dirty.flags)
+  FROM dirty
+ORDER BY kind, path COLLATE BINARY`;
+
+function readSnapshotDirty(
+  db: SqlDatabase,
+  validated: ValidatedSnapshotRequest,
+  budget: SnapshotRetainedBudget,
+): { available: boolean; dirty: SparseWorkspaceDirty[] } {
+  if (!reserveSnapshot(budget, SNAPSHOT_ARRAY_RETAINED_BYTES)) {
+    return { available: false, dirty: [] };
+  }
+  const dirty: SparseWorkspaceDirty[] = [];
+  let metadata = false;
+  let available = true;
+  let previous: string | null = null;
+  for (const row of db.iterate(
+    SNAPSHOT_DIRTY_SQL,
+    validated.request.checkoutId,
+    validated.request.checkoutId,
+  )) {
+    if (row.kind === 0) {
+      if (metadata) throw new CorruptError("commit tree snapshot duplicated tracker state");
+      metadata = true;
+      if (row.checkout_id === null) return { available: false, dirty: [] };
+      const rootBytes = numberField(row.root_bytes);
+      if (
+        row.checkout_id !== validated.request.checkoutId ||
+        row.repo_type !== "integer" ||
+        row.repo_id !== validated.request.repoId ||
+        row.root_type !== "text" ||
+        row.root !== validated.request.root ||
+        rootBytes === null ||
+        rootBytes < 1 ||
+        rootBytes > MAX_ROOT_BYTES
+      ) {
+        throw new CorruptError("commit tree snapshot checkout is malformed");
+      }
+      if (row.complete === null) return { available: false, dirty: [] };
+      if (row.complete_type !== "integer" || row.format_type !== "integer") {
+        throw new CorruptError("commit tree snapshot tracker state is malformed");
+      }
+      if (row.complete !== 0 && row.complete !== 1) {
+        throw new CorruptError("commit tree snapshot tracker completion is invalid");
+      }
+      if (row.complete === 0) return { available: false, dirty: [] };
+      const baselineBytes = numberField(row.baseline_bytes);
+      if (
+        row.format !== 1 ||
+        (row.baseline_type !== "null" && row.baseline_type !== "text") ||
+        (row.baseline_tree_oid !== null &&
+          (typeof row.baseline_tree_oid !== "string" ||
+            baselineBytes !== 40 ||
+            !isOid(row.baseline_tree_oid)))
+      ) {
+        throw new CorruptError("commit tree snapshot tracker baseline is malformed");
+      }
+      if (row.baseline_tree_oid !== validated.request.baselineTreeOid) available = false;
+      const count = numberField(row.dirty_count);
+      if (count === null || count < 0) {
+        throw new CorruptError("commit tree snapshot dirty count is invalid");
+      }
+      if (count > MAX_SNAPSHOT_DIRTY_ROWS) available = false;
+      continue;
+    }
+    if (row.kind !== 1 || !metadata) {
+      throw new CorruptError("commit tree snapshot dirty rows are unordered");
+    }
+    const pathBytes = numberField(row.path_bytes);
+    const flags = numberField(row.flags);
+    if (
+      row.path_type !== "text" ||
+      typeof row.path !== "string" ||
+      pathBytes === null ||
+      pathBytes < 1 ||
+      pathBytes > MAX_PATH_BYTES ||
+      !validStoredIndexPath(row.path, pathBytes) ||
+      row.flags_type !== "integer" ||
+      flags === null ||
+      (flags !== 1 && flags !== 2 && flags !== 3) ||
+      (previous !== null && comparePaths(previous, row.path) >= 0)
+    ) {
+      throw new CorruptError("commit tree snapshot dirty row is malformed");
+    }
+    previous = row.path;
+    const bytes = ROW_RETAINED_BYTES + SNAPSHOT_ARRAY_SLOT_BYTES + row.path.length * 4 + pathBytes;
+    if (!reserveSnapshot(budget, bytes)) {
+      available = false;
+      continue;
+    }
+    dirty.push({ path: row.path, flags });
+  }
+  if (!metadata) throw new CorruptError("commit tree snapshot lost tracker state");
+  return { available, dirty };
+}
+
+function snapshotDirectoryPaths(
+  dirty: readonly SparseWorkspaceDirty[],
+  budget: SnapshotRetainedBudget,
+): string[] | null {
+  if (
+    !reserveSnapshot(
+      budget,
+      SNAPSHOT_MAP_RETAINED_BYTES + SNAPSHOT_MAP_ENTRY_BYTES + SNAPSHOT_DIRECTORY_RETAINED_BYTES,
+    )
+  ) {
+    return null;
+  }
+  const paths = new Set<string>([""]);
+  for (const entry of dirty) {
+    let slash = entry.path.indexOf("/");
+    while (slash >= 0) {
+      const retained =
+        SNAPSHOT_MAP_ENTRY_BYTES +
+        SNAPSHOT_DIRECTORY_RETAINED_BYTES +
+        slash * 4 +
+        utf8PrefixLength(entry.path, slash);
+      if (!reserveSnapshot(budget, retained)) return null;
+      const directory = entry.path.slice(0, slash);
+      if (paths.has(directory)) {
+        releaseSnapshot(budget, retained);
+      } else {
+        if (paths.size === MAX_SNAPSHOT_DIRECTORIES) return null;
+        paths.add(directory);
+      }
+      slash = entry.path.indexOf("/", slash + 1);
+    }
+  }
+  if (
+    !reserveSnapshot(budget, SNAPSHOT_ARRAY_RETAINED_BYTES + paths.size * SNAPSHOT_ARRAY_SLOT_BYTES)
+  ) {
+    return null;
+  }
+  return [...paths].sort(comparePaths);
+}
+
+function utf8PrefixLength(value: string, end: number): number {
+  let bytes = 0;
+  for (let index = 0; index < end; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit < 0x80) bytes++;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      bytes += 4;
+      index++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+interface SnapshotTreeDepthReservation {
+  requestBytes: number;
+  resolutionBytes: number;
+}
+
+function reserveSnapshotTreeDepth(
+  retained: SnapshotRetainedBudget,
+  cursors: readonly TreeCursor[],
+): SnapshotTreeDepthReservation | null {
+  if (cursors.length > MAX_PATHS) return null;
+  let jsonChars = 2;
+  for (const cursor of cursors) {
+    const partChars = SNAPSHOT_TREE_PART_JSON_CHARS + cursor.segment.length * 6;
+    if (
+      !Number.isSafeInteger(partChars) ||
+      partChars > MAX_REQUEST_JSON_BYTES - jsonChars - (jsonChars === 2 ? 0 : 1)
+    ) {
+      return null;
+    }
+    jsonChars += partChars + (jsonChars === 2 ? 0 : 1);
+  }
+  const requestBytes =
+    SNAPSHOT_ARRAY_RETAINED_BYTES + cursors.length * SNAPSHOT_ARRAY_SLOT_BYTES + jsonChars * 6;
+  const resolutionBytes =
+    SNAPSHOT_MAP_RETAINED_BYTES + cursors.length * SNAPSHOT_TREE_RESOLUTION_RETAINED_BYTES;
+  if (
+    !Number.isSafeInteger(requestBytes) ||
+    !Number.isSafeInteger(resolutionBytes) ||
+    requestBytes > retained.limit - resolutionBytes ||
+    !reserveSnapshot(retained, requestBytes + resolutionBytes)
+  ) {
+    return null;
+  }
+  return { requestBytes, resolutionBytes };
+}
+
+function snapshotTreeDepth(
+  db: SqlDatabase,
+  repoId: number,
+  cursors: TreeCursor[],
+  sources: Map<string, ValidatedTreeSource>,
+  budget: SourceBudget,
+  retained: SnapshotRetainedBudget,
+  retainSource: (treeOid: string) => boolean,
+): {
+  available: boolean;
+  resolutions: Map<string, TreeResolution>;
+  resolutionBytes: number;
+} {
+  const reservation = reserveSnapshotTreeDepth(retained, cursors);
+  if (reservation === null) {
+    return { available: false, resolutions: new Map(), resolutionBytes: 0 };
+  }
+  const result = treeDepth(
+    db,
+    repoId,
+    cursors,
+    sources,
+    budget,
+    retained.used - reservation.requestBytes,
+    retained.limit,
+    retainSource,
+  );
+  releaseSnapshot(retained, reservation.requestBytes);
+  return { ...result, resolutionBytes: reservation.resolutionBytes };
+}
+
+function resolveSnapshotDirectoryOids(
+  db: SqlDatabase,
+  request: CommitTreeSnapshotRequest,
+  paths: readonly string[],
+  retained: SnapshotRetainedBudget,
+): {
+  available: boolean;
+  oids: Array<string | null>;
+  sources: Map<string, ValidatedTreeSource>;
+} {
+  if (
+    !reserveSnapshot(
+      retained,
+      SNAPSHOT_ARRAY_RETAINED_BYTES +
+        paths.length * SNAPSHOT_ARRAY_SLOT_BYTES +
+        SNAPSHOT_MAP_RETAINED_BYTES,
+    )
+  ) {
+    return { available: false, oids: [], sources: new Map() };
+  }
+  const oids: Array<string | null> = paths.map(() => null);
+  const sources = new Map<string, ValidatedTreeSource>();
+  if (request.baselineTreeOid === null) return { available: true, oids, sources };
+  const retainSource = (treeOid: string): boolean =>
+    reserveSnapshot(
+      retained,
+      SNAPSHOT_MAP_ENTRY_BYTES + SNAPSHOT_SOURCE_RETAINED_BYTES + treeOid.length * 4,
+    );
+  const sourcePresent = db.scalar<unknown>(
+    `SELECT EXISTS (
+       SELECT 1 FROM git_tree_effective WHERE repo_id = ? AND tree_oid = ?
+     )`,
+    request.repoId,
+    request.baselineTreeOid,
+  );
+  if (sourcePresent !== 0 && sourcePresent !== 1) {
+    throw new CorruptError("commit tree source presence is malformed");
+  }
+  if (sourcePresent === 0) return { available: false, oids, sources };
+  oids[0] = request.baselineTreeOid;
+  const budget: SourceBudget = { entries: 0, bytes: 0 };
+  const rootCursorBytes =
+    SNAPSHOT_ARRAY_RETAINED_BYTES + SNAPSHOT_ARRAY_SLOT_BYTES + snapshotCursorRetainedBytes(1, 1);
+  if (!reserveSnapshot(retained, rootCursorBytes)) {
+    return { available: false, oids, sources };
+  }
+  const rootCursors: TreeCursor[] = [
+    {
+      ordinal: 0,
+      side: "b",
+      treeOid: request.baselineTreeOid,
+      segment: "/",
+      final: true,
+      validated: false,
+      ancestry: [request.baselineTreeOid],
+    },
+  ];
+  const rootValidation = snapshotTreeDepth(
+    db,
+    request.repoId,
+    rootCursors,
+    sources,
+    budget,
+    retained,
+    retainSource,
+  );
+  releaseSnapshot(retained, rootValidation.resolutionBytes);
+  releaseSnapshot(retained, rootCursorBytes);
+  if (!rootValidation.available) return { available: false, oids, sources };
+
+  if (!reserveSnapshot(retained, SNAPSHOT_ARRAY_RETAINED_BYTES)) {
+    return { available: false, oids, sources };
+  }
+  let cursors: TreeCursor[] = [];
+  let cursorRetainedBytes = SNAPSHOT_ARRAY_RETAINED_BYTES;
+  for (let ordinal = 1; ordinal < paths.length; ordinal++) {
+    const path = paths[ordinal];
+    if (path === undefined) continue;
+    const bounds = pathSegmentBounds(path, 0);
+    if (bounds === null) throw new CorruptError("commit tree directory path is malformed");
+    const cursorBytes =
+      SNAPSHOT_ARRAY_SLOT_BYTES + snapshotCursorRetainedBytes(bounds.end - bounds.start, 1);
+    if (!reserveSnapshot(retained, cursorBytes)) {
+      return { available: false, oids, sources };
+    }
+    cursorRetainedBytes += cursorBytes;
+    const first = path.slice(bounds.start, bounds.end);
+    cursors.push({
+      ordinal: ordinal - 1,
+      side: "b",
+      treeOid: request.baselineTreeOid,
+      segment: first,
+      final: bounds.final,
+      validated: true,
+      ancestry: [request.baselineTreeOid],
+    });
+  }
+  for (let depth = 0; cursors.length > 0; depth++) {
+    if (depth >= MAX_DEPTH) return { available: false, oids, sources };
+    for (const cursor of cursors) cursor.validated = sources.has(cursor.treeOid);
+    const resolved = snapshotTreeDepth(
+      db,
+      request.repoId,
+      cursors,
+      sources,
+      budget,
+      retained,
+      retainSource,
+    );
+    if (!resolved.available) {
+      releaseSnapshot(retained, resolved.resolutionBytes);
+      return { available: false, oids, sources };
+    }
+    if (!reserveSnapshot(retained, SNAPSHOT_ARRAY_RETAINED_BYTES)) {
+      return { available: false, oids, sources };
+    }
+    const next: TreeCursor[] = [];
+    let nextRetainedBytes = SNAPSHOT_ARRAY_RETAINED_BYTES;
+    for (const cursor of cursors) {
+      const directoryOrdinal = cursor.ordinal + 1;
+      const resolution = resolved.resolutions.get(`b:${cursor.ordinal}`);
+      if (resolution === undefined)
+        throw new CorruptError("commit tree directory lookup is incomplete");
+      if (cursor.final) {
+        oids[directoryOrdinal] = resolution.treeOid;
+        continue;
+      }
+      if (resolution.treeOid === null) continue;
+      const path = paths[directoryOrdinal];
+      if (path === undefined) {
+        throw new CorruptError("commit tree directory path is malformed");
+      }
+      const bounds = pathSegmentBounds(path, depth + 1);
+      if (bounds === null) throw new CorruptError("commit tree directory path is malformed");
+      const cursorBytes =
+        SNAPSHOT_ARRAY_SLOT_BYTES +
+        snapshotCursorRetainedBytes(bounds.end - bounds.start, cursor.ancestry.length + 1);
+      if (!reserveSnapshot(retained, cursorBytes)) {
+        return { available: false, oids, sources };
+      }
+      nextRetainedBytes += cursorBytes;
+      const segment = path.slice(bounds.start, bounds.end);
+      next.push({
+        ordinal: cursor.ordinal,
+        side: "b",
+        treeOid: resolution.treeOid,
+        segment,
+        final: bounds.final,
+        validated: sources.has(resolution.treeOid),
+        ancestry: [...cursor.ancestry, resolution.treeOid],
+      });
+    }
+    releaseSnapshot(retained, cursorRetainedBytes);
+    releaseSnapshot(retained, resolved.resolutionBytes);
+    cursors = next;
+    cursorRetainedBytes = nextRetainedBytes;
+  }
+  releaseSnapshot(retained, cursorRetainedBytes);
+  if (!reserveSnapshot(retained, SNAPSHOT_ARRAY_RETAINED_BYTES)) {
+    return { available: false, oids, sources };
+  }
+  const unvalidated: string[] = [];
+  let unvalidatedRetainedBytes = SNAPSHOT_ARRAY_RETAINED_BYTES;
+  for (const oid of oids) {
+    if (oid === null || sources.has(oid) || unvalidated.includes(oid)) continue;
+    const bytes = SNAPSHOT_ARRAY_SLOT_BYTES + OID_RETAINED_BYTES;
+    if (!reserveSnapshot(retained, bytes)) return { available: false, oids, sources };
+    unvalidatedRetainedBytes += bytes;
+    unvalidated.push(oid);
+  }
+  if (unvalidated.length > 0) {
+    let validationCursorBytes = SNAPSHOT_ARRAY_RETAINED_BYTES;
+    for (const oid of unvalidated) {
+      validationCursorBytes +=
+        SNAPSHOT_ARRAY_SLOT_BYTES + snapshotCursorRetainedBytes(1, 1) + oid.length * 4;
+    }
+    if (!reserveSnapshot(retained, validationCursorBytes)) {
+      return { available: false, oids, sources };
+    }
+    const validation = snapshotTreeDepth(
+      db,
+      request.repoId,
+      unvalidated.map((oid, ordinal) => ({
+        ordinal,
+        side: "b",
+        treeOid: oid,
+        segment: "/",
+        final: true,
+        validated: false,
+        ancestry: [oid],
+      })),
+      sources,
+      budget,
+      retained,
+      retainSource,
+    );
+    releaseSnapshot(retained, validationCursorBytes);
+    releaseSnapshot(retained, validation.resolutionBytes);
+    if (!validation.available) return { available: false, oids, sources };
+  }
+  releaseSnapshot(retained, unvalidatedRetainedBytes);
+  return { available: true, oids, sources };
+}
+
+function snapshotCursorRetainedBytes(segmentLength: number, ancestryLength: number): number {
+  return CURSOR_RETAINED_BYTES + segmentLength * 4 + ancestryLength * OID_RETAINED_BYTES;
+}
+
+function pathSegmentBounds(
+  path: string,
+  wanted: number,
+): { start: number; end: number; final: boolean } | null {
+  let segment = 0;
+  let start = 0;
+  for (let index = 0; index <= path.length; index++) {
+    if (index !== path.length && path.charCodeAt(index) !== 0x2f) continue;
+    if (segment === wanted) return { start, end: index, final: index === path.length };
+    segment++;
+    start = index + 1;
+  }
+  return null;
+}
+
+const SNAPSHOT_ENTRIES_SQL = `WITH wanted(ordinal, path, tree_oid, storage, source_id) AS MATERIALIZED (
+  SELECT CAST(json_extract(value, '$.i') AS INTEGER), json_extract(value, '$.p'),
+         json_extract(value, '$.t'), json_extract(value, '$.s'),
+         CAST(json_extract(value, '$.x') AS INTEGER)
+    FROM json_each(?)
+)
+SELECT wanted.ordinal AS wanted_ordinal, wanted.path AS directory_path,
+       wanted.tree_oid AS wanted_tree_oid, wanted.storage AS wanted_storage,
+       wanted.source_id AS wanted_source_id,
+       entry.ordinal, entry.mode, entry.name, entry.oid
+  FROM wanted
+  LEFT JOIN git_tree_entries_wide entry
+    ON entry.repo_id = ? AND entry.tree_oid = wanted.tree_oid
+   AND entry.storage = wanted.storage AND entry.source_id = wanted.source_id
+ ORDER BY wanted.ordinal, entry.ordinal`;
+
+function readSnapshotDirectories(
+  db: SqlDatabase,
+  request: CommitTreeSnapshotRequest,
+  paths: readonly string[],
+  oids: readonly (string | null)[],
+  sources: Map<string, ValidatedTreeSource>,
+  retained: SnapshotRetainedBudget,
+): { available: boolean; directories: CommitTreeSnapshotDirectory[] } {
+  const directoryBytes =
+    SNAPSHOT_ARRAY_RETAINED_BYTES +
+    paths.length *
+      (SNAPSHOT_ARRAY_SLOT_BYTES +
+        SNAPSHOT_DIRECTORY_RETAINED_BYTES +
+        SNAPSHOT_ARRAY_RETAINED_BYTES);
+  if (!reserveSnapshot(retained, directoryBytes)) {
+    return { available: false, directories: [] };
+  }
+  const directories: CommitTreeSnapshotDirectory[] = paths.map((path, ordinal) => ({
+    path,
+    oid: oids[ordinal] ?? null,
+    entries: [],
+  }));
+  if (!reserveSnapshot(retained, SNAPSHOT_ARRAY_RETAINED_BYTES + SNAPSHOT_MAP_RETAINED_BYTES)) {
+    return { available: false, directories: [] };
+  }
+  const parts: string[] = [];
+  const expectedCounts = new Map<number, number>();
+  let requestJsonChars = 2;
+  let requestJsonBytes = 2;
+  for (let ordinal = 0; ordinal < paths.length; ordinal++) {
+    const oid = oids[ordinal];
+    if (oid === null || oid === undefined) continue;
+    const source = sources.get(oid);
+    if (source === undefined)
+      throw new CorruptError("commit tree snapshot source is unauthenticated");
+    const part = JSON.stringify({
+      i: ordinal,
+      p: paths[ordinal],
+      t: oid,
+      s: source.storage,
+      x: source.sourceId,
+    });
+    const partBytes = SNAPSHOT_ARRAY_SLOT_BYTES + part.length * 2 + SNAPSHOT_MAP_ENTRY_BYTES;
+    if (!reserveSnapshot(retained, partBytes)) {
+      return { available: false, directories: [] };
+    }
+    const separator = parts.length === 0 ? 0 : 1;
+    requestJsonChars += part.length + separator;
+    requestJsonBytes += encoder.encode(part).length + separator;
+    if (requestJsonBytes > MAX_REQUEST_JSON_BYTES) {
+      return { available: false, directories: [] };
+    }
+    parts.push(part);
+    expectedCounts.set(ordinal, source.entryCount);
+  }
+  if (parts.length === 0) return { available: true, directories };
+  if (!reserveSnapshot(retained, requestJsonChars * 2)) {
+    return { available: false, directories: [] };
+  }
+  const json = `[${parts.join(",")}]`;
+  if (encoder.encode(json).length > MAX_REQUEST_JSON_BYTES) {
+    return { available: false, directories: [] };
+  }
+  if (
+    !reserveSnapshot(
+      retained,
+      SNAPSHOT_MAP_RETAINED_BYTES + expectedCounts.size * SNAPSHOT_MAP_ENTRY_BYTES,
+    )
+  ) {
+    return { available: false, directories: [] };
+  }
+  const seen = new Map<number, number>();
+  for (const row of db.iterate(SNAPSHOT_ENTRIES_SQL, json, request.repoId)) {
+    const ordinal = numberField(row.wanted_ordinal);
+    const sourceId = numberField(row.wanted_source_id);
+    const expectedOid = ordinal === null ? undefined : oids[ordinal];
+    const expectedPath = ordinal === null ? undefined : paths[ordinal];
+    const source = typeof expectedOid === "string" ? sources.get(expectedOid) : undefined;
+    if (
+      ordinal === null ||
+      expectedPath === undefined ||
+      typeof expectedOid !== "string" ||
+      source === undefined ||
+      row.directory_path !== expectedPath ||
+      row.wanted_tree_oid !== expectedOid ||
+      row.wanted_storage !== source.storage ||
+      sourceId !== source.sourceId
+    ) {
+      throw new CorruptError("commit tree snapshot entry source is malformed");
+    }
+    if (row.ordinal === null) {
+      if (source.entryCount !== 0 || (seen.get(ordinal) ?? 0) !== 0) {
+        throw new CorruptError("commit tree snapshot lost source entries");
+      }
+      seen.set(ordinal, 0);
+      continue;
+    }
+    const entryOrdinal = numberField(row.ordinal);
+    if (
+      entryOrdinal === null ||
+      entryOrdinal !== (seen.get(ordinal) ?? 0) ||
+      typeof row.mode !== "string" ||
+      !["40000", "040000", "100644", "100755", "120000", "160000"].includes(row.mode) ||
+      typeof row.name !== "string" ||
+      row.name === "" ||
+      row.name.includes("/") ||
+      row.name.includes("\0") ||
+      typeof row.oid !== "string" ||
+      !isOid(row.oid)
+    ) {
+      throw new CorruptError("commit tree snapshot entry is malformed");
+    }
+    seen.set(ordinal, entryOrdinal + 1);
+    const bytes =
+      SNAPSHOT_ARRAY_SLOT_BYTES +
+      SNAPSHOT_ENTRY_RETAINED_BYTES +
+      row.name.length * 4 +
+      row.oid.length * 4;
+    if (!reserveSnapshot(retained, bytes)) {
+      return { available: false, directories: [] };
+    }
+    directories[ordinal]?.entries.push({ mode: row.mode, name: row.name, oid: row.oid });
+  }
+  for (const [ordinal, expected] of expectedCounts) {
+    if ((seen.get(ordinal) ?? -1) !== expected) {
+      throw new CorruptError("commit tree snapshot entry cardinality is inconsistent");
+    }
+  }
+  return { available: true, directories };
+}
+
+function snapshotCommitTree(
+  db: SqlDatabase,
+  request: CommitTreeSnapshotRequest,
+): CommitTreeSnapshotResult {
+  const validated = validateSnapshotRequest(request);
+  if (validated === null) return { available: false };
+  const retained: SnapshotRetainedBudget = {
+    limit: validated.retainedLimit,
+    used: validated.retainedBytes,
+    peak: validated.retainedBytes,
+  };
+  const dirty = readSnapshotDirty(db, validated, retained);
+  if (!dirty.available) return { available: false };
+  if (dirty.dirty.length === 0) {
+    const rootPathsBytes = SNAPSHOT_ARRAY_RETAINED_BYTES + SNAPSHOT_ARRAY_SLOT_BYTES;
+    if (!reserveSnapshot(retained, rootPathsBytes)) return { available: false };
+    const rootPaths = [""];
+    const authenticated = resolveSnapshotDirectoryOids(db, validated.request, rootPaths, retained);
+    if (!authenticated.available) return { available: false };
+    return {
+      available: true,
+      baselineTreeOid: validated.request.baselineTreeOid,
+      dirty: [],
+      index: [],
+      directories: [],
+      retainedBytes: retained.peak,
+    };
+  }
+  if (dirty.dirty.length > MAX_PATHS) return { available: false };
+  const selectedRequestBytes = snapshotSelectedRequestBytes(dirty.dirty);
+  if (selectedRequestBytes === null || !reserveSnapshot(retained, selectedRequestBytes)) {
+    return { available: false };
+  }
+  const selectedRequest: SelectedPathRequest = {
+    repoId: validated.request.repoId,
+    checkoutId: validated.request.checkoutId,
+    root: validated.request.root,
+    specs: dirty.dirty.map((entry) => ({ path: entry.path, recursive: false })),
+  };
+  const selectedValidated = validateSelectedPathRequest(selectedRequest);
+  if (selectedValidated === null) return { available: false };
+  if (!reserveSnapshot(retained, SNAPSHOT_ARRAY_RETAINED_BYTES)) {
+    return { available: false };
+  }
+  const index = readSelectedIndex(db, selectedValidated, retained.limit - retained.used, () =>
+    reserveSnapshot(retained, SELECTED_INDEX_RETAINED_BYTES),
+  );
+  if (!index.available) return { available: false };
+  const paths = snapshotDirectoryPaths(dirty.dirty, retained);
+  if (paths === null) return { available: false };
+  const resolved = resolveSnapshotDirectoryOids(db, validated.request, paths, retained);
+  if (!resolved.available) return { available: false };
+  const directories = readSnapshotDirectories(
+    db,
+    validated.request,
+    paths,
+    resolved.oids,
+    resolved.sources,
+    retained,
+  );
+  if (!directories.available) return { available: false };
+  return {
+    available: true,
+    baselineTreeOid: validated.request.baselineTreeOid,
+    dirty: dirty.dirty,
+    index: index.rows,
+    directories: directories.directories,
+    retainedBytes: retained.peak,
+  };
+}
+
 export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorkspaceSource {
   return {
     readState: (checkoutId) => readIndexTrackerState(db, checkoutId),
@@ -1349,4 +2674,12 @@ export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorksp
     hydrate: (request) => hydrate(db, request),
     indexAncestorFacts: (request) => indexAncestorFacts(db, request),
   };
+}
+
+export function createSqliteSelectedPathSource(db: SqlDatabase): SelectedPathSource {
+  return { select: (request) => selectPaths(db, request) };
+}
+
+export function createSqliteCommitTreeSnapshotSource(db: SqlDatabase): CommitTreeSnapshotSource {
+  return { snapshot: (request) => snapshotCommitTree(db, request) };
 }

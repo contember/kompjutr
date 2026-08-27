@@ -4,12 +4,19 @@ import { fromHex } from "../src/core/bytes.js";
 import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import { add } from "../src/core/ops/staging.js";
-import { INDEX_DIRTY, resealIndexTracker } from "../src/sqlite/index-tracker.js";
+import { comparePaths } from "../src/core/streams.js";
+import {
+  INDEX_DIRTY,
+  invalidateIndexTracker,
+  resealIndexTracker,
+} from "../src/sqlite/index-tracker.js";
 import {
   PACK_BLOB_CALLER_HEADROOM_BYTES,
   PACK_BLOB_MEMORY_MODEL_BYTES,
 } from "../src/sqlite/packs.js";
 import {
+  createSqliteCommitTreeSnapshotSource,
+  createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
   MAX_SPARSE_WORKSPACE_RETAINED_BYTES,
   SPARSE_TREE_DEPTH_SQL,
@@ -93,6 +100,454 @@ describe("SQLite sparse workspace source", () => {
     expect(PACK_BLOB_CALLER_HEADROOM_BYTES).toBe(8 * 1024 * 1024);
     expect(MAX_SPARSE_WORKSPACE_RETAINED_BYTES).toBe(PACK_BLOB_CALLER_HEADROOM_BYTES);
     expect(PACK_BLOB_MEMORY_MODEL_BYTES).toBeLessThan(100 * 1024 * 1024);
+  });
+
+  it("selects exact and recursive facts in two bounded ordered statements", () => {
+    const workspace = committedWorkspace();
+    const source = createSqliteSelectedPathSource(workspace.database.db);
+    workspace.storage.resetCounters();
+
+    const result = source.select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: [
+        { path: "a.txt", recursive: false },
+        { path: "dir", recursive: true },
+      ],
+    });
+
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(workspace.storage.statementCount).toBe(2);
+    expect(result.index.map((entry) => entry.path)).toEqual(["a.txt", "dir/b.txt"]);
+    expect(result.worktree.map((entry) => entry.path)).toEqual(["a.txt", "dir", "dir/b.txt"]);
+  });
+
+  it("deduplicates overlaps, preserves conflict stages, and keeps Git byte order", () => {
+    const workspace = committedWorkspace();
+    const source = createSqliteSelectedPathSource(workspace.database.db);
+    const index = workspace.database.db.one<{ mode: number; oid: string }>(
+      "SELECT mode, oid FROM git_index WHERE checkout_id = ? AND path = 'a.txt' AND stage = 0",
+      workspace.repo.checkout.checkoutId,
+    );
+    if (index === undefined) throw new Error("missing fixture index row");
+    workspace.database.db.run(
+      "DELETE FROM git_index WHERE checkout_id = ? AND path = 'a.txt'",
+      workspace.repo.checkout.checkoutId,
+    );
+    for (const stage of [1, 2, 3]) {
+      workspace.database.db.run(
+        `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
+         VALUES (?, 'a.txt', ?, ?, ?)`,
+        workspace.repo.checkout.checkoutId,
+        stage,
+        index.mode,
+        index.oid,
+      );
+    }
+    const ordered = ["\u{10000}.txt", "\ue000.txt"].sort(comparePaths);
+    for (const path of ordered) writeWorkFile(workspace, `/${path}`, path);
+    add(workspace.repo, workspace.worktree, { paths: ordered });
+
+    const result = source.select({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: [
+        { path: "a.txt", recursive: false },
+        { path: "dir", recursive: true },
+        { path: "dir/b.txt", recursive: false },
+        ...ordered.map((path) => ({ path, recursive: false })),
+      ].sort((left, right) => comparePaths(left.path, right.path)),
+    });
+
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(
+      result.index.filter((entry) => entry.path === "a.txt").map((entry) => entry.stage),
+    ).toEqual([1, 2, 3]);
+    expect(result.index.filter((entry) => entry.path === "dir/b.txt")).toHaveLength(1);
+    expect(result.worktree.map((entry) => entry.path)).toEqual(
+      [...result.worktree.map((entry) => entry.path)].sort(comparePaths),
+    );
+  });
+
+  it("falls back for symlink ancestors and bounds selected request count", () => {
+    const workspace = committedWorkspace();
+    const source = createSqliteSelectedPathSource(workspace.database.db);
+    expect(
+      source.select({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "link/child", recursive: false }],
+      }),
+    ).toEqual({ available: false });
+
+    const exact = Array.from({ length: 1_000 }, (_, index) => ({
+      path: `missing-${index.toString().padStart(4, "0")}`,
+      recursive: false,
+    }));
+    expect(
+      source.select({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        specs: exact,
+      }).available,
+    ).toBe(true);
+    workspace.storage.resetCounters();
+    expect(() =>
+      source.select({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        specs: [...exact, { path: "missing-last", recursive: false }].sort((left, right) =>
+          comparePaths(left.path, right.path),
+        ),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(workspace.storage.statementCount).toBe(0);
+  });
+
+  it("fails closed on selected node, ancestor, and symlink payload corruption", () => {
+    const missingNode = committedWorkspace();
+    const missingNodeSource = createSqliteSelectedPathSource(missingNode.database.db);
+    missingNode.database.db.run(
+      "DELETE FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/a.txt')",
+    );
+    expect(() =>
+      missingNodeSource.select({
+        repoId: missingNode.repo.store.repoId,
+        checkoutId: missingNode.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "a.txt", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    const missingAncestor = committedWorkspace();
+    const missingAncestorSource = createSqliteSelectedPathSource(missingAncestor.database.db);
+    missingAncestor.database.db.run(
+      "DELETE FROM fs_nodes WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/dir')",
+    );
+    expect(() =>
+      missingAncestorSource.select({
+        repoId: missingAncestor.repo.store.repoId,
+        checkoutId: missingAncestor.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "dir/b.txt", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+
+    const symlink = committedWorkspace();
+    const symlinkSource = createSqliteSelectedPathSource(symlink.database.db);
+    symlink.database.db.run(
+      "UPDATE fs_nodes SET content_id = x'01' WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/link')",
+    );
+    expect(() =>
+      symlinkSource.select({
+        repoId: symlink.repo.store.repoId,
+        checkoutId: symlink.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "link", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("distinguishes selected-path capacity refusal from relevant corruption", () => {
+    const workspace = committedWorkspace();
+    const source = createSqliteSelectedPathSource(workspace.database.db);
+    workspace.storage.resetCounters();
+    expect(
+      source.select({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "a.txt", recursive: false }],
+        maxRetainedBytes: 1,
+      }),
+    ).toEqual({ available: false });
+    expect(workspace.storage.statementCount).toBe(0);
+
+    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
+    workspace.database.db.run(
+      "UPDATE git_index SET mode = zeroblob(8) WHERE checkout_id = ? AND path = 'a.txt'",
+      workspace.repo.checkout.checkoutId,
+    );
+    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      source.select({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        specs: [{ path: "a.txt", recursive: false }],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("authenticates dirty index and baseline directories for commit reuse", () => {
+    const workspace = committedWorkspace();
+    const baseline = workspace.repo.headTree();
+    expect(
+      resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, baseline, []),
+    ).toBe(true);
+    writeWorkFile(workspace, "/a.txt", "changed\n");
+    writeWorkFile(workspace, "/dir/b.txt", "changed\n");
+    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+
+    expect(
+      source.snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: baseline,
+        maxRetainedBytes: 1,
+      }),
+    ).toEqual({ available: false });
+
+    const result = source.snapshot({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      baselineTreeOid: baseline,
+    });
+
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.dirty.map((entry) => entry.path)).toEqual(["a.txt", "dir/b.txt"]);
+    expect(result.index.map((entry) => entry.path)).toEqual(["a.txt", "dir/b.txt"]);
+    expect(result.directories.map((directory) => directory.path)).toEqual(["", "dir"]);
+    expect(result.directories[0]?.oid).toBe(baseline);
+    expect(result.directories[0]?.entries.map((entry) => entry.name)).toEqual([
+      "a.txt",
+      "dir",
+      "link",
+    ]);
+    expect(result.directories[1]?.entries.map((entry) => entry.name)).toEqual(["b.txt"]);
+
+    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
+    workspace.database.db.run(
+      "UPDATE git_index_dirty SET flags = zeroblob(8) WHERE checkout_id = ? AND path = 'a.txt'",
+      workspace.repo.checkout.checkoutId,
+    );
+    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      source.snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: baseline,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
+    workspace.database.db.run(
+      "UPDATE git_index_dirty SET flags = 2 WHERE checkout_id = ? AND path = 'a.txt'",
+      workspace.repo.checkout.checkoutId,
+    );
+    workspace.database.db.run(
+      `UPDATE git_tree_entries SET mode = 'bad'
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose'
+        ) AND ordinal = 0`,
+      workspace.repo.store.repoId,
+      baseline,
+    );
+    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      source.snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: baseline,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("authenticates clean, packed, missing, mismatched, incomplete, and unborn baselines", () => {
+    const workspace = committedWorkspace();
+    const baseline = workspace.repo.headTree();
+    if (baseline === null) throw new Error("missing fixture baseline");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    expect(resealIndexTracker(workspace.database.db, checkoutId, baseline, [])).toBe(true);
+    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+    const request = {
+      repoId: workspace.repo.store.repoId,
+      checkoutId,
+      root: "/",
+      baselineTreeOid: baseline,
+    };
+    const clean = source.snapshot(request);
+    expect(clean.available).toBe(true);
+    if (!clean.available) return;
+    expect(source.snapshot({ ...request, maxRetainedBytes: clean.retainedBytes }).available).toBe(
+      true,
+    );
+    expect(source.snapshot({ ...request, maxRetainedBytes: clean.retainedBytes - 1 })).toEqual({
+      available: false,
+    });
+    expect(source.snapshot({ ...request, baselineTreeOid: "9".repeat(40) })).toEqual({
+      available: false,
+    });
+
+    invalidateIndexTracker(workspace.database.db, checkoutId);
+    expect(source.snapshot(request)).toEqual({ available: false });
+    expect(resealIndexTracker(workspace.database.db, checkoutId, "8".repeat(40), [])).toBe(true);
+    expect(source.snapshot({ ...request, baselineTreeOid: "8".repeat(40) })).toEqual({
+      available: false,
+    });
+
+    const packed = committedWorkspace();
+    const packedBaseline = packed.repo.headTree();
+    if (packedBaseline === null) throw new Error("missing packed fixture baseline");
+    installPackCopy(packed, packedBaseline, 19);
+    expect(
+      resealIndexTracker(packed.database.db, packed.repo.checkout.checkoutId, packedBaseline, []),
+    ).toBe(true);
+    expect(
+      createSqliteCommitTreeSnapshotSource(packed.database.db).snapshot({
+        repoId: packed.repo.store.repoId,
+        checkoutId: packed.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: packedBaseline,
+      }).available,
+    ).toBe(true);
+
+    const unborn = makeRepo("/");
+    expect(resealIndexTracker(unborn.database.db, unborn.repo.checkout.checkoutId, null, [])).toBe(
+      true,
+    );
+    expect(
+      createSqliteCommitTreeSnapshotSource(unborn.database.db).snapshot({
+        repoId: unborn.repo.store.repoId,
+        checkoutId: unborn.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: null,
+      }).available,
+    ).toBe(true);
+  });
+
+  it("bounds authenticated wide-tree resolution at its simultaneous peak", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Fixture");
+    workspace.repo.store.configSet("user.email", "fixture@example.com");
+    const directories = Array.from(
+      { length: 999 },
+      (_, index) => `d${index.toString().padStart(3, "0")}`,
+    );
+    workspace.worktree.makeDirectories(directories.map((directory) => `/${directory}`));
+    workspace.worktree.writeFiles(
+      directories.map((directory) => ({
+        path: `/${directory}/file.txt`,
+        bytes: new Uint8Array([1]),
+      })),
+    );
+    add(workspace.repo, workspace.worktree, { paths: [], all: true });
+    commit(workspace.context, workspace.repo, { message: "wide tree" });
+    const baseline = workspace.repo.headTree();
+    if (baseline === null) throw new Error("missing wide-tree baseline");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    expect(
+      resealIndexTracker(
+        workspace.database.db,
+        checkoutId,
+        baseline,
+        directories.map((directory) => ({
+          path: `${directory}/file.txt`,
+          flags: INDEX_DIRTY,
+        })),
+      ),
+    ).toBe(true);
+    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+    const request = {
+      repoId: workspace.repo.store.repoId,
+      checkoutId,
+      root: "/",
+      baselineTreeOid: baseline,
+    };
+
+    const result = source.snapshot(request);
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.directories).toHaveLength(1_000);
+    expect(source.snapshot({ ...request, maxRetainedBytes: result.retainedBytes }).available).toBe(
+      true,
+    );
+    expect(source.snapshot({ ...request, maxRetainedBytes: result.retainedBytes - 1 })).toEqual({
+      available: false,
+    });
+  });
+
+  it("bounds request-heavy snapshots at the selected-path cap before mapping", () => {
+    const workspace = committedWorkspace();
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+    const exact = Array.from({ length: 1_000 }, (_, index) => ({
+      path: `request-${index.toString().padStart(4, "0")}`,
+      flags: INDEX_DIRTY,
+    }));
+    expect(resealIndexTracker(workspace.database.db, checkoutId, null, exact)).toBe(true);
+    const request = {
+      repoId: workspace.repo.store.repoId,
+      checkoutId,
+      root: "/",
+      baselineTreeOid: null,
+    };
+    const result = source.snapshot(request);
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.dirty).toHaveLength(1_000);
+    expect(source.snapshot({ ...request, maxRetainedBytes: result.retainedBytes }).available).toBe(
+      true,
+    );
+    expect(source.snapshot({ ...request, maxRetainedBytes: result.retainedBytes - 1 })).toEqual({
+      available: false,
+    });
+
+    expect(
+      resealIndexTracker(workspace.database.db, checkoutId, null, [
+        ...exact,
+        { path: "request-last", flags: INDEX_DIRTY },
+      ]),
+    ).toBe(true);
+    expect(source.snapshot(request)).toEqual({ available: false });
+  });
+
+  it("bounds directory-heavy snapshots at the first excess ancestor", () => {
+    const workspace = committedWorkspace();
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    const source = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+    const exactPath = Array.from({ length: 1_000 }, () => "d").join("/");
+    expect(
+      resealIndexTracker(workspace.database.db, checkoutId, null, [
+        { path: exactPath, flags: INDEX_DIRTY },
+      ]),
+    ).toBe(true);
+    const request = {
+      repoId: workspace.repo.store.repoId,
+      checkoutId,
+      root: "/",
+      baselineTreeOid: null,
+    };
+    const result = source.snapshot(request);
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.directories).toHaveLength(1_000);
+    expect(source.snapshot({ ...request, maxRetainedBytes: result.retainedBytes }).available).toBe(
+      true,
+    );
+    expect(source.snapshot({ ...request, maxRetainedBytes: result.retainedBytes - 1 })).toEqual({
+      available: false,
+    });
+
+    const excessPath = `${exactPath}/d`;
+    expect(
+      resealIndexTracker(workspace.database.db, checkoutId, null, [
+        { path: excessPath, flags: INDEX_DIRTY },
+      ]),
+    ).toBe(true);
+    expect(source.snapshot(request)).toEqual({ available: false });
   });
 
   it("validates caller retained limits before issuing SQL", () => {

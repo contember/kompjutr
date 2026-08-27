@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { initializeFsSchema } from "../src/fs/schema.js";
 import {
+  advanceIndexTrackerBaseline,
   INDEX_DIRTY,
   initializeIndexTracker,
   invalidateIndexTracker,
@@ -440,5 +441,33 @@ describe("index tracker", () => {
         "WHEN EXISTS (SELECT 1 FROM git_index_state WHERE complete = 1)",
       );
     }
+  });
+
+  it("advances only sealed baselines, retains dirty rows, and joins an outer rollback", () => {
+    const db = setup();
+    addRepository(db, 1, "/repo");
+    expect(resealIndexTracker(db, 1, TREE, [{ path: "kept", flags: INDEX_DIRTY }])).toBe(true);
+
+    expect(advanceIndexTrackerBaseline(db, 1, OTHER_TREE)).toBe(true);
+    expect(readIndexTrackerState(db, 1)).toEqual({
+      available: true,
+      baselineTreeOid: OTHER_TREE,
+    });
+    expect(dirty(db, 1)).toEqual([{ path: "kept", flags: INDEX_DIRTY }]);
+
+    expect(() =>
+      db.transactionSync(() => {
+        expect(advanceIndexTrackerBaseline(db, 1, TREE)).toBe(true);
+        throw new Error("rollback");
+      }),
+    ).toThrow("rollback");
+    expect(readIndexTrackerState(db, 1)).toEqual({
+      available: true,
+      baselineTreeOid: OTHER_TREE,
+    });
+
+    invalidateIndexTracker(db, 1);
+    expect(advanceIndexTrackerBaseline(db, 1, TREE)).toBe(false);
+    expect(dirty(db, 1)).toEqual([{ path: "kept", flags: INDEX_DIRTY }]);
   });
 });

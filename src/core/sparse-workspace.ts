@@ -68,6 +68,76 @@ export interface SparseIndexAncestorResult {
   retainedBytes: number;
 }
 
+export interface SelectedPathSpec {
+  path: string;
+  /** Include descendants as well as the exact path. */
+  recursive: boolean;
+}
+
+export interface SelectedPathRequest {
+  repoId: number;
+  checkoutId: number;
+  root: string;
+  specs: SelectedPathSpec[];
+  maxRetainedBytes?: number;
+}
+
+export interface SelectedWorktreeFact {
+  path: string;
+  stat: SparseWorktreeLeaf;
+}
+
+export type SelectedPathResult =
+  | { available: false }
+  | {
+      available: true;
+      index: IndexEntry[];
+      worktree: SelectedWorktreeFact[];
+      retainedBytes: number;
+    };
+
+/** Optional same-database selected-subtree projection. */
+export interface SelectedPathSource {
+  select(request: SelectedPathRequest): SelectedPathResult;
+}
+
+export interface CommitTreeSnapshotRequest {
+  repoId: number;
+  checkoutId: number;
+  root: string;
+  baselineTreeOid: string | null;
+  maxRetainedBytes?: number;
+}
+
+export interface CommitTreeSnapshotEntry {
+  mode: string;
+  name: string;
+  oid: string;
+}
+
+export interface CommitTreeSnapshotDirectory {
+  /** Empty for the repository root. */
+  path: string;
+  oid: string | null;
+  entries: CommitTreeSnapshotEntry[];
+}
+
+export type CommitTreeSnapshotResult =
+  | { available: false }
+  | {
+      available: true;
+      baselineTreeOid: string | null;
+      dirty: SparseWorkspaceDirty[];
+      index: IndexEntry[];
+      directories: CommitTreeSnapshotDirectory[];
+      retainedBytes: number;
+    };
+
+/** Optional authenticated baseline projection for narrow tree rebuilds. */
+export interface CommitTreeSnapshotSource {
+  snapshot(request: CommitTreeSnapshotRequest): CommitTreeSnapshotResult;
+}
+
 /** Optional same-database fast path. Generic clients omit this capability. */
 export interface SparseWorkspaceSource {
   readState(checkoutId: number): SparseWorkspaceState;

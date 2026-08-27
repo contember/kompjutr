@@ -34,6 +34,9 @@ const SCAN_PAGE = 1000;
 /** Files held while one bulk hash pass is assembled. */
 const HASH_BATCH = 1000;
 
+export const MAX_COMPILED_PATHS = 32_768;
+export const MAX_COMPILED_PATHSPEC_BYTES = 1024 * 1024;
+
 export interface WalkOptions {
   /**
    * Absolute paths that are the root of a *different* registered
@@ -42,6 +45,8 @@ export interface WalkOptions {
   excludeRoots?: string[];
   /** Restrict the walk to these repo-relative path prefixes. */
   paths?: string[];
+  /** A caller-owned compiled form of `paths`. */
+  pathspec?: CompiledPathspecMatcher;
   /** Skip ignored paths, and do not descend into ignored directories. */
   ignores?: IgnoreMatcher;
   /** Return ignored paths too, marked, instead of skipping them. */
@@ -50,6 +55,175 @@ export interface WalkOptions {
   filesOnly?: boolean;
   /** Yield directory metadata after using it to prune the walk. */
   includeDirectories?: boolean;
+  /** Skip a directory and every descendant after its scan row is observed. */
+  pruneDirectory?: (path: string) => boolean;
+}
+
+/** One immutable exact/prefix pathspec projection in Git byte order. */
+export interface CompiledPathspecMatcher {
+  /** Preserve checkout's historical raw-exact and trailing-slash prefix semantics. */
+  matches(path: string): boolean;
+  /** Preserve the walker's normalized exact semantics for files and symlinks. */
+  matchesEntry(path: string): boolean;
+  /** Whether the directory itself or any possible descendant can match. */
+  includesDirectory(path: string): boolean;
+}
+
+class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
+  readonly #checkoutAll: boolean;
+  readonly #walkAll: boolean;
+  readonly #exact: string[];
+  readonly #checkoutPrefixes: string[];
+  readonly #walkPrefixes: string[];
+
+  constructor(paths: readonly string[] | undefined) {
+    this.#checkoutAll =
+      paths === undefined || paths.length === 0 || paths.includes("") || paths.includes(".");
+    this.#walkAll =
+      this.#checkoutAll ||
+      paths?.some((path) => {
+        const normalized = path.replace(/\/+$/, "");
+        return normalized === "" || normalized === ".";
+      }) === true;
+    this.#exact = uniqueByteOrdered(paths ?? []);
+    this.#checkoutPrefixes = uniqueByteOrdered(
+      (paths ?? []).map((path) => path.replace(/\/+$/, "")),
+    );
+    this.#walkPrefixes = this.#checkoutPrefixes.filter((path) => path !== "" && path !== ".");
+  }
+
+  matches(path: string): boolean {
+    return (
+      this.#checkoutAll ||
+      containsByteOrdered(this.#exact, path) ||
+      this.#hasPrefix(this.#checkoutPrefixes, path)
+    );
+  }
+
+  matchesEntry(path: string): boolean {
+    return (
+      this.#walkAll ||
+      containsByteOrdered(this.#walkPrefixes, path) ||
+      this.#hasPrefix(this.#walkPrefixes, path)
+    );
+  }
+
+  includesDirectory(path: string): boolean {
+    if (this.#walkAll || this.matchesEntry(path)) return true;
+    const prefix = `${path}/`;
+    const at = lowerBound(this.#walkPrefixes, prefix);
+    return this.#walkPrefixes[at]?.startsWith(prefix) === true;
+  }
+
+  #hasPrefix(prefixes: readonly string[], path: string): boolean {
+    let slash = path.indexOf("/");
+    while (slash >= 0) {
+      if (containsByteOrdered(prefixes, path.slice(0, slash))) return true;
+      slash = path.indexOf("/", slash + 1);
+    }
+    return false;
+  }
+}
+
+/** Compile once when one pathspec list is reused across joins or walks. */
+export function compilePathspecs(paths: readonly string[] | undefined): CompiledPathspecMatcher {
+  validateCompiledPathspecs(paths);
+  return new ByteOrderedPathspecMatcher(paths);
+}
+
+function validateCompiledPathspecs(paths: readonly string[] | undefined): void {
+  if (paths === undefined) return;
+  if (paths.length > MAX_COMPILED_PATHS) {
+    throw new GitError("E2BIG", `compiled pathspec exceeds ${MAX_COMPILED_PATHS} paths`);
+  }
+  let inputBytes = 0;
+  let requestBytes = 2;
+  for (let index = 0; index < paths.length; index++) {
+    const path = paths[index];
+    if (path === undefined) throw new GitError("EINVAL", "compiled pathspec is not dense");
+    const sizes = pathspecBytes(path);
+    const separator = index === 0 ? 0 : 1;
+    if (
+      sizes.input > MAX_COMPILED_PATHSPEC_BYTES - inputBytes ||
+      sizes.request + separator > MAX_COMPILED_PATHSPEC_BYTES - requestBytes
+    ) {
+      throw new GitError("E2BIG", `compiled pathspec exceeds ${MAX_COMPILED_PATHSPEC_BYTES} bytes`);
+    }
+    inputBytes += sizes.input;
+    requestBytes += sizes.request + separator;
+  }
+}
+
+function pathspecBytes(value: string): { input: number; request: number } {
+  let input = 0;
+  let request = 2;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (
+      unit === 0x22 ||
+      unit === 0x5c ||
+      unit === 0x08 ||
+      unit === 0x09 ||
+      unit === 0x0a ||
+      unit === 0x0c ||
+      unit === 0x0d
+    ) {
+      input++;
+      request += 2;
+    } else if (unit < 0x20) {
+      input++;
+      request += 6;
+    } else if (unit < 0x80) {
+      input++;
+      request++;
+    } else if (unit < 0x800) {
+      input += 2;
+      request += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        input += 4;
+        request += 4;
+        index++;
+      } else {
+        input += 3;
+        request += 6;
+      }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      input += 3;
+      request += 6;
+    } else {
+      input += 3;
+      request += 3;
+    }
+    if (input > MAX_COMPILED_PATHSPEC_BYTES || request > MAX_COMPILED_PATHSPEC_BYTES) break;
+  }
+  return { input, request };
+}
+
+function uniqueByteOrdered(values: readonly string[]): string[] {
+  const ordered = [...values].sort(comparePaths);
+  const unique: string[] = [];
+  for (const value of ordered) {
+    if (unique[unique.length - 1] !== value) unique.push(value);
+  }
+  return unique;
+}
+
+function lowerBound(values: readonly string[], wanted: string): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const value = values[middle];
+    if (value !== undefined && comparePaths(value, wanted) < 0) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function containsByteOrdered(values: readonly string[], wanted: string): boolean {
+  return values[lowerBound(values, wanted)] === wanted;
 }
 
 /** A repo-relative path and the metadata carried by its scan row. */
@@ -112,11 +286,14 @@ export function* walkWorktreeEntriesStream(
     options.filesOnly === true &&
     ((options.excludeRoots?.length ?? 0) > 0 ||
       (options.paths?.length ?? 0) > 0 ||
-      options.ignores !== undefined)
+      options.pathspec !== undefined ||
+      options.ignores !== undefined ||
+      options.pruneDirectory !== undefined)
   ) {
     throw new Error("files-only worktree walks cannot prune directories");
   }
   const lexicalRoot = root.replace(/\/+$/, "") || "/";
+  const pathspec = options.pathspec ?? compilePathspecs(options.paths);
   const base = worktree.realpath(lexicalRoot);
   const excluded = new Set(
     (options.excludeRoots ?? []).map((path) => {
@@ -165,12 +342,12 @@ export function* walkWorktreeEntriesStream(
       }
 
       if (entry.type === "dir") {
-        const outsidePathspec = !withinPathspec(relative, options.paths, true);
+        const outsidePathspec = !pathspec.includesDirectory(relative);
         // git never descends into an ignored directory, which is also why a
         // re-include below one cannot take effect.
         const ignored =
           options.includeIgnored !== true && options.ignores?.ignores(relative, true) === true;
-        if (outsidePathspec || ignored) {
+        if (outsidePathspec || ignored || options.pruneDirectory?.(relative) === true) {
           pruned.push(prunedRange(entry.path));
           continue;
         }
@@ -180,7 +357,7 @@ export function* walkWorktreeEntriesStream(
         continue;
       }
 
-      if (!withinPathspec(relative, options.paths, false)) continue;
+      if (!pathspec.matchesEntry(relative)) continue;
       if (options.includeIgnored !== true && options.ignores?.ignores(relative, false) === true) {
         continue;
       }
@@ -224,26 +401,6 @@ function prunedRange(directory: string): { directory: string; lower: string; upp
     lower: `${directory}/`,
     upper: subtreeSuccessor(directory),
   };
-}
-
-/**
- * Pathspec matching for the walk. A directory is kept when it could still
- * contain a match; a file only when it matches outright.
- */
-function withinPathspec(
-  relative: string,
-  paths: string[] | undefined,
-  isDirectory: boolean,
-): boolean {
-  if (paths === undefined || paths.length === 0) return true;
-  for (const raw of paths) {
-    const spec = raw.replace(/\/+$/, "");
-    if (spec === "" || spec === ".") return true;
-    if (relative === spec) return true;
-    if (relative.startsWith(`${spec}/`)) return true;
-    if (isDirectory && spec.startsWith(`${relative}/`)) return true;
-  }
-  return false;
 }
 
 /** The bytes git would hash for a working-tree path: a symlink hashes its target. */
@@ -474,6 +631,7 @@ export function* dirtyPathStream(
   paths?: string[],
   limits?: DirtyPathLimits,
 ): Generator<string> {
+  const pathspec = compilePathspecs(paths);
   let root: string | null = null;
   let scanned: Generator<ScanEntry> | null = null;
   let current: IteratorResult<ScanEntry, void> | null = null;
@@ -559,7 +717,7 @@ export function* dirtyPathStream(
       limits.indexRows++;
     }
     if (entry.stage !== 0) continue;
-    if (paths !== undefined && !withinPathspec(entry.path, paths, false)) continue;
+    if (!pathspec.matchesEntry(entry.path)) continue;
 
     if (scanned === null) {
       const canonical = worktree.realpath(repo.root);

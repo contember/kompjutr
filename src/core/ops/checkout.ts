@@ -15,6 +15,7 @@ import { indexMatchesStat, type WorktreePath, walkWorktreeEntriesStream } from "
 
 export { checkoutSparseChanges, type SparseCheckoutChange } from "./sparse-checkout.js";
 export type { TargetEntry } from "./tree-stream.js";
+export { type CompiledPathspecMatcher, compilePathspecs } from "./worktree-io.js";
 
 /**
  * Every blob, symlink and gitlink under a tree, keyed by repo-relative path.

@@ -493,6 +493,37 @@ export function invalidateIndexTracker(db: SqlDatabase, checkoutId: number): voi
   );
 }
 
+/** Move only a complete tracker's baseline; the caller owns any outer transaction. */
+export function advanceIndexTrackerBaseline(
+  db: SqlDatabase,
+  checkoutId: number,
+  baselineTreeOid: string | null,
+): boolean {
+  validateCheckoutId(checkoutId);
+  if (baselineTreeOid !== null && !isOid(baselineTreeOid)) {
+    throw new CorruptError("invalid index tracker baseline tree");
+  }
+  const row = db.one<Record<string, unknown>>(
+    `UPDATE git_index_state
+        SET baseline_tree_oid = ?
+      WHERE checkout_id = ? AND format = ? AND complete = 1
+      RETURNING checkout_id, baseline_tree_oid, format, complete`,
+    baselineTreeOid,
+    checkoutId,
+    TRACKER_FORMAT,
+  );
+  if (row === undefined) return false;
+  if (
+    row.checkout_id !== checkoutId ||
+    row.baseline_tree_oid !== baselineTreeOid ||
+    row.format !== TRACKER_FORMAT ||
+    row.complete !== 1
+  ) {
+    throw new CorruptError("index tracker baseline update returned malformed state");
+  }
+  return true;
+}
+
 export function resealIndexTracker(
   db: SqlDatabase,
   checkoutId: number,

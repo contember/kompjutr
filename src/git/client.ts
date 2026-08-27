@@ -155,7 +155,11 @@ import {
 } from "../core/ops/worktrees.js";
 import type { GitHttpClient } from "../core/protocol/transport.js";
 import type { Repository } from "../core/repository.js";
-import type { SparseWorkspaceSource } from "../core/sparse-workspace.js";
+import type {
+  CommitTreeSnapshotSource,
+  SelectedPathSource,
+  SparseWorkspaceSource,
+} from "../core/sparse-workspace.js";
 import type { Worktree } from "../core/worktree.js";
 import type { SqliteGitDatabase } from "../sqlite/store.js";
 
@@ -287,6 +291,8 @@ export interface GitWorkspaceBinding {
   initialWorktree?: InitialWorktreeWriter;
   indexTracker?: IndexTrackerWriter;
   sparseWorkspace?: SparseWorkspaceSource;
+  selectedPaths?: SelectedPathSource;
+  commitTrees?: CommitTreeSnapshotSource;
   now: () => number;
   timezoneOffset: () => number;
   defaultIdentity?: GitIdentity;
@@ -320,6 +326,8 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.initialWorktree !== undefined) context.initialWorktree = binding.initialWorktree;
   if (binding.indexTracker !== undefined) context.indexTracker = binding.indexTracker;
   if (binding.sparseWorkspace !== undefined) context.sparseWorkspace = binding.sparseWorkspace;
+  if (binding.selectedPaths !== undefined) context.selectedPaths = binding.selectedPaths;
+  if (binding.commitTrees !== undefined) context.commitTrees = binding.commitTrees;
   const yieldNow = options.yieldNow ?? binding.yieldNow;
   if (yieldNow !== undefined) context.yieldNow = yieldNow;
 

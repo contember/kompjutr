@@ -4,12 +4,17 @@ import { utf8Decoder } from "../src/core/bytes.js";
 import { nestedRoots, openRepository } from "../src/core/context.js";
 import { initRepository } from "../src/core/ops/init.js";
 import { walkWorktree } from "../src/core/ops/worktree-io.js";
+import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
+import { createGit, type GitWorkspaceBinding } from "../src/git/client.js";
+import { Workspace as RuntimeWorkspace } from "../src/runtime/workspace.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
 } from "../src/sqlite/index-tracker.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, makeWorkspace, writeWorkFile } from "./helpers/workspace.js";
 
 const TREE = "1".repeat(40);
@@ -60,6 +65,40 @@ describe("workspace fixture", () => {
     workspace.storage.resetCounters();
     workspace.repo.store.getRef("refs/heads/main");
     expect(workspace.storage.statementCount).toBe(1);
+  });
+
+  it("authenticates only the composed native database for initial writes", () => {
+    const workspace = makeWorkspace();
+    const native = workspace.database;
+    const writer = createInitialWorktreeWriter(
+      workspace.database.db,
+      Date.now,
+      (database) => database === native,
+    );
+    const sameRawDatabase = new SqliteGitDatabase(workspace.database.db);
+
+    expect(writer.supportsDatabase(native)).toBe(true);
+    expect(writer.supportsDatabase(sameRawDatabase)).toBe(false);
+  });
+
+  it("publishes the exact runtime database identity through the native binding", () => {
+    const storage = new SqliteTestStorage();
+    let captured: GitWorkspaceBinding | undefined;
+    const workspace = new RuntimeWorkspace({
+      storage,
+      git: (binding) => {
+        captured = binding;
+        return createGit()(binding);
+      },
+    });
+
+    void workspace.git;
+    if (captured === undefined) throw new Error("runtime did not bind Git");
+    const otherWrapper = new SqliteGitDatabase(captured.database.db);
+    expect(captured.initialWorktree?.supportsDatabase?.(captured.database)).toBe(true);
+    expect(captured.initialWorktree?.supportsDatabase?.(otherWrapper)).toBe(false);
+    expect(captured.selectedPaths).toBeDefined();
+    expect(captured.commitTrees).toBeDefined();
   });
 
   it("opens one checkout-bound view from one routing lookup", () => {
