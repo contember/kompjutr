@@ -26,7 +26,15 @@ its bounded path; the
 [Git boundary sprint](../archive/sprint-2026-08-26-git-boundary-correctness.md#wu2--framing-safe-and-sparse-truthful-status-45-50-55-effort-l)
 closed that separate contributor.
 
-The checkout half is not yet attributed.
+The checkout half has a lead, not an attribution. The two 500 ms rows —
+`git.status — clean commit` and `git.checkout main` — share exactly one step:
+`walkTreeDiff` between the two 24,252-entry trees
+(`src/core/ops/status-sparse.ts:297`, `src/core/ops/sparse-checkout.ts:144`).
+The recursive CTE prunes identical subtrees (`src/sqlite/tree-walk.ts:478-480`),
+so what remains is the per-entry validation of every expanded directory on
+both sides (the `edge` CTE). Profile that first. The `(force)` rows are not
+evidence either way — they measure a no-op
+([60](60-force-checkout-benchmark-measures-a-no-op.md)).
 
 ## Approach / acceptance
 
