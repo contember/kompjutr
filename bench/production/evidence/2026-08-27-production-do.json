@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "worker": "kompjutr-git-probe",
+  "runId": "probe-20260827162435732-6f26df18",
+  "storageRunId": "probe-20260827162435732-6f26df18-storage",
+  "startedAt": "2026-08-27T16:24:35.732Z",
+  "finishedAt": "2026-08-27T16:24:41.074Z",
+  "sourceCommit": "b821b1c8e23a4170b788eb996c56905aed983144",
+  "sourceDirty": true,
+  "probeSourceSha256": "e65f5b390753eca49d70bd4c313b4bc254a99b17aea35a1326f25aa8c653ca4b",
+  "wranglerVersion": "4.127.0",
+  "deploymentVersion": "89c21685-4f39-4f62-98fe-3c6426081c96",
+  "location": { "colo": "PRG", "country": "CZ" },
+  "fixture": {
+    "url": "https://github.com/octocat/Hello-World.git",
+    "head": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+    "fetchHead": "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf"
+  },
+  "authentication": { "unauthenticatedStatus": 401 },
+  "operationColumns": [
+    "action",
+    "scope",
+    "wallMs",
+    "statements",
+    "rows",
+    "databaseBytes",
+    "constructorOrdinal",
+    "foreignKeysBefore",
+    "foreignKeysAfter"
+  ],
+  "operations": [
+    ["meta", "main", 623.9632419999999, 0, 0, 364544, 1, 1, 1],
+    ["clone", "main", 557.2840050000001, 93, 41, 364544, 1, 1, 1],
+    ["fetch", "main", 421.177909, 41, 26, 364544, 1, 1, 1],
+    ["mutate", "main", 46.15602200000012, 12, 12, 364544, 1, 1, 1],
+    ["add", "main", 63.06656500000008, 46, 42, 364544, 1, 1, 1],
+    ["commit", "main", 60.64255000000003, 58, 47, 364544, 1, 1, 1],
+    ["push", "main", 40.06724800000006, 22, 32, 364544, 1, 1, 1],
+    ["rebase-clean", "main", 173.58468700000003, 296, 350, 364544, 1, 1, 1],
+    ["rebase-continue-setup", "main", 111.32012899999972, 223, 242, 364544, 1, 1, 1],
+    ["meta", "main", 471.15981699999975, 0, 0, 364544, 2, 1, 1],
+    ["rebase-continue-status", "main", 47.32304199999999, 33, 34, 364544, 2, 1, 1],
+    ["rebase-continue-resolve", "main", 50.575550999999905, 49, 56, 364544, 2, 1, 1],
+    ["rebase-continue-finish", "main", 84.49021799999991, 192, 197, 364544, 2, 1, 1],
+    ["rebase-abort-setup", "main", 133.4559549999999, 223, 243, 372736, 2, 1, 1],
+    ["meta", "main", 696.0231899999999, 0, 0, 372736, 3, 1, 1],
+    ["rebase-abort-status", "main", 68.0286030000002, 33, 35, 372736, 3, 1, 1],
+    ["rebase-abort-finish", "main", 97.83312099999966, 138, 140, 372736, 3, 1, 1],
+    ["meta", "main", 14.131744999999682, 0, 0, 372736, 3, 1, 1],
+    ["meta", "main", 19.807056999999986, 0, 0, 372736, 3, 1, 1],
+    ["audit", "main", 31.304180000000088, 61, 65, 372736, 3, 1, 1],
+    ["meta", "storage", 557.3192310000004, 0, 0, 364544, 1, 1, 1],
+    ["marker-set", "storage", 48.30550000000039, 0, 0, 364544, 1, 1, 1],
+    ["storage-reset", "storage", 56.66385300000002, 0, 0, 4096, 1, 1, 1],
+    ["meta", "storage", 625.1033429999998, 0, 0, 364544, 1, 1, 1],
+    ["marker-state", "storage", 31.577274000000216, 0, 0, 364544, 1, 1, 1]
+  ],
+  "expectedFailureColumns": ["action", "scope", "wallMs", "status", "kind"],
+  "expectedFailures": [
+    ["isolate-reset", "main", 15.91749400000026, 500, "workerThrewException"],
+    ["isolate-reset", "main", 15.484756999999718, 500, "workerThrewException"],
+    ["application-failure", "main", 16.075886000000082, 500, "applicationError"],
+    ["isolate-reset", "storage", 32.07973899999979, 500, "workerThrewException"]
+  ],
+  "correctness": {
+    "clone": {
+      "head": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+      "files": ["README"]
+    },
+    "fetch": {
+      "head": "b3cbd5bbd7e81436d2eee04537ea2b4c0cad4cdf",
+      "publishedRemoteRef": true
+    },
+    "commit": {
+      "parent": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+      "head": "3e6dabc8c50693c4f4c1f8586cb651787695e894",
+      "clean": true
+    },
+    "push": {
+      "ok": true,
+      "head": "3e6dabc8c50693c4f4c1f8586cb651787695e894",
+      "receivedBytes": 419,
+      "packOffset": 122
+    },
+    "cleanRebase": { "outcome": "completed", "replayed": 1, "clean": true },
+    "continuedRebase": {
+      "outcome": "completed",
+      "replayed": 1,
+      "clean": true,
+      "resolvedContent": "resolved\n"
+    },
+    "abortedRebase": {
+      "headRestored": true,
+      "clean": true,
+      "restoredContent": "current\n"
+    },
+    "applicationFailureKeptInstance": true,
+    "audit": {
+      "quickCheck": "ok",
+      "foreignKeyViolations": 0,
+      "foreignKeys": 1,
+      "pendingPacks": 0,
+      "operationStates": 0,
+      "allRepositoriesClean": true,
+      "databaseBytes": 372736
+    },
+    "storageReset": {
+      "bytesAfterDelete": 4096,
+      "instanceChanged": true,
+      "markerAfterReopen": null
+    }
+  },
+  "analytics": {
+    "dataset": "workersInvocationsAdaptive",
+    "queriedAt": "2026-08-27T16:25:57.692Z",
+    "window": {
+      "datetimeStart": "2026-08-27T16:24:35.000Z",
+      "datetimeEnd": "2026-08-27T16:24:42.000Z"
+    },
+    "bucketColumns": [
+      "datetime",
+      "status",
+      "requests",
+      "errors",
+      "subrequests",
+      "cpuTimeP50Us",
+      "cpuTimeP99Us",
+      "memoryUsageBytesP50",
+      "memoryUsageBytesP99"
+    ],
+    "buckets": [
+      ["2026-08-27T16:24:35Z", "success", 2, 0, 1, 338, 895, 7893402, 7934362],
+      ["2026-08-27T16:24:36Z", "success", 1, 0, 1, 642, 642, 7934362, 7934362],
+      ["2026-08-27T16:24:37Z", "success", 8, 0, 8, 487, 609, 7934362, 7934362],
+      ["2026-08-27T16:24:37Z", "scriptThrewException", 1, 1, 1, 502, 502, 7926170, 7926170],
+      ["2026-08-27T16:24:38Z", "success", 4, 0, 4, 502, 546, 7934362, 7934362],
+      ["2026-08-27T16:24:38Z", "scriptThrewException", 1, 1, 1, 547, 547, 7926170, 7926170],
+      ["2026-08-27T16:24:39Z", "success", 5, 0, 5, 462, 553, 7934362, 7934362],
+      ["2026-08-27T16:24:40Z", "success", 3, 0, 3, 469, 608, 7934362, 7934362],
+      ["2026-08-27T16:24:40Z", "scriptThrewException", 1, 1, 1, 431, 431, 7926170, 7926170]
+    ],
+    "summary": {
+      "successfulRequests": 23,
+      "expectedErrors": 3,
+      "unexpectedErrors": 0,
+      "peakCpuTimeP99Us": 895,
+      "peakMemoryUsageBytesP99": 7934362
+    }
+  },
+  "sanitization": {
+    "removed": ["account identifier", "worker URL", "reset response bodies", "client IP"]
+  }
+}

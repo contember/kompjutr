@@ -19,4 +19,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-No sprint is active.
+None.

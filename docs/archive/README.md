@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Production Durable Object probe](sprint-2026-08-27-production-do-probe.md)
+  — retained authenticated Worker, bounded Git lifecycle, real isolate and
+  storage resets, physical audit, external wall time, and platform analytics.
 - [Worktree performance and budget closure](sprint-2026-08-27-worktree-performance-and-budget.md)
   — bounded selected-path add, subtree-reusing commit, sparse status and
   checkout acceleration, truthful checkout measurement, and a repeated local

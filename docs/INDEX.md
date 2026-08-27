@@ -15,15 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-No sprint is active.
+None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Next qualification work is the production Durable Object probe and the
-  concurrent/restart conformance matrix. Storage maintenance and integrity
-  tooling remain separate backlog tracks.
+- The production Durable Object probe is deployed and repeatable. Repack and
+  garbage collection is the next planned sprint; concurrency/restart conformance
+  follows it.
 
 ## Key reference
 
@@ -31,6 +31,7 @@ No sprint is active.
 - [`reference/benchmark-current.md`](reference/benchmark-current.md) — current native benchmark snapshot.
 - [`reference/git-support.md`](reference/git-support.md) — what of Git is supported, command by command.
 - [`reference/oid-encoding-measurement.md`](reference/oid-encoding-measurement.md) — measured TEXT-versus-BLOB OID evidence.
+- [`reference/production-probe.md`](reference/production-probe.md) — production Durable Object probe runbook and current witness.
 - [`reference/release.md`](reference/release.md) — CI gates and the tag-driven release process.
 - [`reference/shell.md`](reference/shell.md) — current shell surface and deliberate limits.
 
@@ -49,6 +50,9 @@ No sprint is active.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-27-production-do-probe.md`](archive/sprint-2026-08-27-production-do-probe.md)
+  — authenticated production Git lifecycle with isolate and storage resets,
+  physical audit, wall time, and platform analytics.
 - [`archive/sprint-2026-08-27-worktree-performance-and-budget.md`](archive/sprint-2026-08-27-worktree-performance-and-budget.md)
   — bounded selected-path add, subtree-reusing commit, sparse status and
   checkout acceleration, truthful checkout measurement, and a repeated local
