@@ -1,0 +1,972 @@
+import { describe, expect, it } from "vitest";
+
+import { concat, utf8 } from "../src/core/bytes.js";
+import {
+  hashObject,
+  MODE_FILE,
+  type ObjectType,
+  serializeCommit,
+  serializeTree,
+} from "../src/core/objects.js";
+import { PackWriter } from "../src/core/pack/writer.js";
+import { blob, type SqlDatabase } from "../src/sqlite/db.js";
+import {
+  advanceMaintenanceSweep,
+  GC_GRACE_MS,
+  type MaintenanceSweepProgress,
+} from "../src/sqlite/maintenance/sweep.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { TestDatabase } from "./helpers/db.js";
+import { slices } from "./helpers/git.js";
+
+const PERSON = {
+  name: "Sweep Fixture",
+  email: "sweep@example.com",
+  timestamp: 1_700_000_000,
+  timezoneOffset: 0,
+};
+
+type SweepPhase = "classify-loose" | "classify-packs" | "sweep-loose" | "sweep-packs";
+
+interface MarkInput {
+  oid: string;
+  physicalOnly?: boolean;
+}
+
+function open(db: SqlDatabase = new TestDatabase()) {
+  const database = new SqliteGitDatabase(db, { objectCacheBytes: 8 * 1024 * 1024 });
+  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+  const store = database.openCheckout(checkout);
+  return { database, checkout, store };
+}
+
+function seedRun(
+  db: SqlDatabase,
+  repoId: number,
+  phase: SweepPhase,
+  marks: readonly MarkInput[] = [],
+): void {
+  db.run(
+    `INSERT OR IGNORE INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+     VALUES (?, 0, 2)`,
+    repoId,
+  );
+  db.run(
+    `INSERT INTO git_maintenance_runs
+       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
+        reachable_objects, queued_objects)
+     VALUES (?, 1, 0, ?, 1, 'done', ?, 0)`,
+    repoId,
+    phase,
+    marks.filter((mark) => mark.physicalOnly !== true).length,
+  );
+  for (const mark of marks) {
+    db.run(
+      `INSERT INTO git_maintenance_objects
+         (repo_id, run_id, oid, source_mask, expanded, shallow_boundary,
+          physical_only, edge_cursor)
+       VALUES (?, 1, ?, 1, 1, 0, ?, 0)`,
+      repoId,
+      mark.oid,
+      mark.physicalOnly === true ? 1 : 0,
+    );
+  }
+}
+
+function candidateAge(db: SqlDatabase, table: string, repoId: number, key: string | number) {
+  const column = typeof key === "string" ? "oid" : "pack_id";
+  return db.scalar<number>(
+    `SELECT unreachable_since_ms FROM ${table} WHERE repo_id = ? AND ${column} = ?`,
+    repoId,
+    key,
+  );
+}
+
+function seedBlobId(db: SqlDatabase, repoId: number, contentId: Uint8Array, oid: string): void {
+  db.run("INSERT OR IGNORE INTO git_blob_id_state (repo_id, generation) VALUES (?, 1)", repoId);
+  db.run(
+    `INSERT INTO git_blob_ids (repo_id, content_id, oid, generation)
+     VALUES (?, ?, ?, 1)`,
+    repoId,
+    blob(contentId),
+    oid,
+  );
+}
+
+function advance(
+  db: TestDatabase,
+  shared: ReturnType<typeof open>["store"]["shared"],
+  nowMs: number,
+  pageRows = 8,
+): MaintenanceSweepProgress {
+  db.storage.resetCounters();
+  const result = advanceMaintenanceSweep(shared, { nowMs, pageRows });
+  expect(db.storage.statementCount).toBeLessThan(100);
+  expect(db.storage.rowCount).toBeLessThan(300);
+  return result;
+}
+
+function advanceToPhase(
+  db: TestDatabase,
+  shared: ReturnType<typeof open>["store"]["shared"],
+  nowMs: number,
+  phase: MaintenanceSweepProgress["phase"],
+  pageRows = 8,
+): MaintenanceSweepProgress {
+  for (let call = 0; call < 1_000; call++) {
+    const result = advance(db, shared, nowMs, pageRows);
+    if (result.phase === phase) return result;
+  }
+  throw new Error(`maintenance sweep did not reach ${phase}`);
+}
+
+function fullPack(objects: readonly { type: ObjectType; data: Uint8Array }[]): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(objects.length);
+  for (const object of objects) writer.object(object.type, object.data);
+  writer.finish();
+  return concat(chunks);
+}
+
+class FailingCounterDatabase implements SqlDatabase {
+  failCounterUpdate = false;
+
+  constructor(readonly inner: TestDatabase) {}
+
+  get storage() {
+    return this.inner.storage;
+  }
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    if (this.failCounterUpdate && query.includes("SET reclaimed_objects")) {
+      throw new Error("simulated counter publication crash");
+    }
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+class CorruptAvailabilityDatabase implements SqlDatabase {
+  corruptAvailability = false;
+
+  constructor(readonly inner: TestDatabase) {}
+
+  get storage() {
+    return this.inner.storage;
+  }
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    for (const row of this.inner.iterate(query, ...bindings)) {
+      if (this.corruptAvailability && query.includes("loose-storage-availability")) {
+        yield { ...row, has_loose: 2 };
+      } else {
+        yield row;
+      }
+    }
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+describe("maintenance sweep", () => {
+  it("converges loose candidates without cursors, preserves first age, and resumes cold", () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const retained = store.write("blob", utf8.encode("retained\n"));
+    const aged = store.write("blob", utf8.encode("aged unreachable\n"));
+    const fresh = store.write("blob", utf8.encode("fresh unreachable\n"));
+    seedRun(db, checkout.repoId, "classify-loose", [{ oid: retained }]);
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       VALUES (?, ?, 3), (?, ?, 7)`,
+      checkout.repoId,
+      retained,
+      checkout.repoId,
+      aged,
+    );
+
+    expect(advance(db, store.shared, 100, 1)).toMatchObject({
+      phase: "classify-loose",
+      status: "progress",
+    });
+    const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 8 * 1024 * 1024 });
+    const cold = reopened.openCheckout(checkout.id);
+    advanceToPhase(db, cold.shared, 100, "repack", 1);
+
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, retained)).toBeUndefined();
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, aged)).toBe(7);
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, fresh)).toBe(100);
+    expect(
+      db.one<{ cursor_checkout_id: null; cursor_text: null; cursor_ordinal: null }>(
+        `SELECT cursor_checkout_id, cursor_text, cursor_ordinal
+           FROM git_maintenance_runs WHERE repo_id = ?`,
+        checkout.repoId,
+      ),
+    ).toEqual({ cursor_checkout_id: null, cursor_text: null, cursor_ordinal: null });
+  });
+
+  it("returns root-changed without changing candidates or downstream state", () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const oid = store.write("blob", utf8.encode("root drift\n"));
+    seedRun(db, checkout.repoId, "classify-loose");
+    db.run(
+      "INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms) VALUES (?, ?, 4)",
+      checkout.repoId,
+      oid,
+    );
+    db.run("UPDATE git_maintenance_control SET root_epoch = 1 WHERE repo_id = ?", checkout.repoId);
+
+    expect(advance(db, store.shared, 100)).toMatchObject({
+      phase: "classify-loose",
+      status: "root-changed",
+    });
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, oid)).toBe(4);
+    expect(
+      db.one<{ phase: string; reclaimed_objects: number }>(
+        "SELECT phase, reclaimed_objects FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toEqual({ phase: "classify-loose", reclaimed_objects: 0 });
+  });
+
+  it("deletes loose storage at the exact boundary and clears derived rows and warmed caches", () => {
+    const beforeDb = new TestDatabase();
+    const before = open(beforeDb);
+    const beforeData = utf8.encode("not eligible yet\n");
+    const beforeOid = before.store.write("blob", beforeData);
+    seedRun(beforeDb, before.checkout.repoId, "sweep-loose");
+    beforeDb.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       VALUES (?, ?, 100)`,
+      before.checkout.repoId,
+      beforeOid,
+    );
+    expect(advance(beforeDb, before.store.shared, 100 + GC_GRACE_MS - 1)).toMatchObject({
+      phase: "sweep-packs",
+      status: "phase-complete",
+      nextEligibleMs: 100 + GC_GRACE_MS,
+    });
+    expect(before.store.read(beforeOid)?.data).toEqual(beforeData);
+
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const blobData = utf8.encode("doomed blob\n");
+    const blobOid = store.write("blob", blobData);
+    const treeData = serializeTree([{ mode: MODE_FILE, name: "file", oid: blobOid }]);
+    const treeOid = store.write("tree", treeData);
+    const commitData = serializeCommit({
+      tree: treeOid,
+      parent: [],
+      author: PERSON,
+      committer: PERSON,
+      message: "doomed commit\n",
+    });
+    const commitOid = store.write("commit", commitData);
+    const survivorData = utf8.encode("retained loose object\n");
+    const survivorOid = store.write("blob", survivorData);
+    seedRun(db, checkout.repoId, "sweep-loose", [{ oid: survivorOid }]);
+    for (const oid of [blobOid, treeOid, commitOid]) {
+      db.run(
+        `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+         VALUES (?, ?, 100)`,
+        checkout.repoId,
+        oid,
+      );
+    }
+    seedBlobId(db, checkout.repoId, new Uint8Array([1, 2, 3]), blobOid);
+    expect(store.read(blobOid)?.data).toEqual(blobData);
+    expect(store.read(treeOid)?.data).toEqual(treeData);
+    expect(store.cachedCommit(commitOid)?.commit.message).toBe("doomed commit\n");
+
+    advanceToPhase(db, store.shared, 100 + GC_GRACE_MS, "sweep-packs");
+
+    expect(store.read(blobOid)).toBeNull();
+    expect(store.read(treeOid)).toBeNull();
+    expect(store.read(commitOid)).toBeNull();
+    expect(store.read(survivorOid)?.data).toEqual(survivorData);
+    expect(store.shared.hasLoose).toBe(true);
+    expect(store.cachedCommit(commitOid)).toBeNull();
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_blob_ids WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_commits WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_tree_sources WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_loose_object_lifecycle WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(1);
+    expect(
+      db.one<{ reclaimed_objects: number; reclaimed_bytes: number }>(
+        "SELECT reclaimed_objects, reclaimed_bytes FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toEqual({
+      reclaimed_objects: 3,
+      reclaimed_bytes: blobData.length + treeData.length + commitData.length,
+    });
+  });
+
+  it("retains mixed packs and sweeps a wholly unreachable pack at the exact boundary", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const liveData = utf8.encode("packed live\n");
+    const incidentalData = utf8.encode("packed incidental\n");
+    const deadData = utf8.encode("packed dead\n");
+    const liveOid = store.write("blob", liveData);
+    const incidentalOid = store.write("blob", incidentalData);
+    const deadOid = store.write("blob", deadData);
+    const mixed = await store.packs.ingest(
+      slices(
+        fullPack([
+          { type: "blob", data: liveData },
+          { type: "blob", data: incidentalData },
+        ]),
+        17,
+      ),
+      { reclaimPending: false },
+    );
+    const dead = await store.packs.ingest(
+      slices(fullPack([{ type: "blob", data: deadData }]), 13),
+      {
+        reclaimPending: false,
+      },
+    );
+    for (const oid of [liveOid, incidentalOid, deadOid]) {
+      db.run("DELETE FROM git_objects WHERE repo_id = ? AND oid = ?", checkout.repoId, oid);
+    }
+    seedBlobId(db, checkout.repoId, new Uint8Array([9, 9, 9]), deadOid);
+    seedRun(db, checkout.repoId, "classify-packs", [{ oid: liveOid, physicalOnly: true }]);
+    db.run(
+      `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, ?, 3)`,
+      checkout.repoId,
+      mixed.packId,
+    );
+
+    advanceToPhase(db, store.shared, 100, "sweep-loose");
+    expect(
+      candidateAge(db, "git_pack_gc_candidates", checkout.repoId, mixed.packId),
+    ).toBeUndefined();
+    expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, dead.packId)).toBe(100);
+    advanceToPhase(db, store.shared, 100, "sweep-packs");
+    expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
+      reclaimedObjects: 1,
+      reclaimedPacks: 1,
+      reclaimedBytes: dead.bytes,
+    });
+    expect(store.read(liveOid)?.data).toEqual(liveData);
+    expect(store.read(incidentalOid)?.data).toEqual(incidentalData);
+    expect(store.read(deadOid)).toBeNull();
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_blob_ids WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = ?", checkout.repoId),
+    ).toBe(1);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_pack_data WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        dead.packId,
+      ),
+    ).toBe(0);
+    expect(advance(db, store.shared, 100 + GC_GRACE_MS)).toMatchObject({
+      phase: "finish",
+      status: "complete",
+    });
+  });
+
+  it("preserves an existing pack age and retains it one millisecond before eligibility", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const result = await store.packs.ingest(
+      slices(fullPack([{ type: "blob", data: utf8.encode("aged pack\n") }]), 11),
+      { reclaimPending: false },
+    );
+    seedRun(db, checkout.repoId, "classify-packs");
+    db.run(
+      `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, ?, 7)`,
+      checkout.repoId,
+      result.packId,
+    );
+
+    expect(advance(db, store.shared, 100)).toMatchObject({
+      phase: "sweep-loose",
+      status: "phase-complete",
+    });
+    expect(candidateAge(db, "git_pack_gc_candidates", checkout.repoId, result.packId)).toBe(7);
+    expect(advance(db, store.shared, 100)).toMatchObject({ phase: "sweep-packs" });
+    expect(advance(db, store.shared, 7 + GC_GRACE_MS - 1)).toMatchObject({
+      phase: "finish",
+      status: "complete",
+      nextEligibleMs: 7 + GC_GRACE_MS,
+      reclaimedPacks: 0,
+    });
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        result.packId,
+      ),
+    ).toBe(1);
+  });
+
+  it.each([
+    { label: "logical", physicalOnly: false },
+    { label: "physical", physicalOnly: true },
+  ])(
+    "removes a candidate that becomes $label marked during pack sweep",
+    async ({ physicalOnly }) => {
+      const db = new TestDatabase();
+      const { checkout, store } = open(db);
+      const data = utf8.encode(`marked ${physicalOnly}\n`);
+      const result = await store.packs.ingest(slices(fullPack([{ type: "blob", data }]), 11), {
+        reclaimPending: false,
+      });
+      const oid = db.scalar<string>(
+        "SELECT oid FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        result.packId,
+      );
+      if (oid === undefined) throw new Error("pack fixture did not publish its object");
+      seedRun(db, checkout.repoId, "sweep-packs", [{ oid, physicalOnly }]);
+      db.run(
+        `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, ?, 0)`,
+        checkout.repoId,
+        result.packId,
+      );
+
+      expect(advance(db, store.shared, GC_GRACE_MS)).toMatchObject({
+        phase: "sweep-packs",
+        reclaimedObjects: 0,
+        reclaimedPacks: 0,
+        reclaimedBytes: 0,
+      });
+      expect(
+        candidateAge(db, "git_pack_gc_candidates", checkout.repoId, result.packId),
+      ).toBeUndefined();
+      expect(store.read(oid)?.data).toEqual(data);
+    },
+  );
+
+  it("publishes the minimum next eligibility across loose and packed candidates", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const looseOid = store.write("blob", utf8.encode("future loose\n"));
+    const packed = await store.packs.ingest(
+      slices(fullPack([{ type: "blob", data: utf8.encode("future packed\n") }]), 13),
+      { reclaimPending: false },
+    );
+    seedRun(db, checkout.repoId, "sweep-loose");
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       VALUES (?, ?, 200)`,
+      checkout.repoId,
+      looseOid,
+    );
+    db.run(
+      `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, ?, 100)`,
+      checkout.repoId,
+      packed.packId,
+    );
+
+    expect(advance(db, store.shared, 1)).toMatchObject({
+      phase: "sweep-packs",
+      nextEligibleMs: 200 + GC_GRACE_MS,
+    });
+    expect(advance(db, store.shared, 1)).toMatchObject({
+      phase: "finish",
+      status: "complete",
+      nextEligibleMs: 100 + GC_GRACE_MS,
+    });
+  });
+
+  it("removes stale pending and maintenance-owned candidates directly during pack sweep", async () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const owned = await store.packs.ingest(
+      slices(fullPack([{ type: "blob", data: utf8.encode("owned\n") }]), 11),
+      { reclaimPending: false },
+    );
+    seedRun(db, checkout.repoId, "sweep-packs");
+    db.run(
+      `INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created)
+       VALUES (?, 99, 0, 0, 'pending', 1)`,
+      checkout.repoId,
+    );
+    db.run(
+      `INSERT INTO git_maintenance_repack_batches
+         (repo_id, run_id, batch_id, state, pack_id, object_count, inflated_bytes, stored_bytes)
+       VALUES (?, 1, 1, 'published', ?, 0, 0, 0)`,
+      checkout.repoId,
+      owned.packId,
+    );
+    db.run(
+      `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, 99, 1), (?, ?, 1)`,
+      checkout.repoId,
+      checkout.repoId,
+      owned.packId,
+    );
+
+    expect(advance(db, store.shared, 100)).toMatchObject({
+      phase: "sweep-packs",
+      reclaimedObjects: 0,
+      reclaimedPacks: 0,
+    });
+    expect(advance(db, store.shared, 100)).toMatchObject({
+      phase: "sweep-packs",
+      reclaimedObjects: 0,
+      reclaimedPacks: 0,
+    });
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_pack_gc_candidates WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(0);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = ?", checkout.repoId),
+    ).toBe(2);
+    expect(advance(db, store.shared, 100)).toMatchObject({ phase: "finish", status: "complete" });
+  });
+
+  it("rolls back loose deletion and counters when publication fails", () => {
+    const inner = new TestDatabase();
+    const db = new FailingCounterDatabase(inner);
+    const { checkout, store } = open(db);
+    const data = utf8.encode("rollback object\n");
+    const oid = store.write("blob", data);
+    seedRun(db, checkout.repoId, "sweep-loose");
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       VALUES (?, ?, 0)`,
+      checkout.repoId,
+      oid,
+    );
+    db.failCounterUpdate = true;
+
+    expect(() => advanceMaintenanceSweep(store.shared, { nowMs: GC_GRACE_MS })).toThrow(
+      "simulated counter publication crash",
+    );
+    expect(store.read(oid)?.data).toEqual(data);
+    expect(candidateAge(inner, "git_loose_gc_candidates", checkout.repoId, oid)).toBe(0);
+    expect(
+      inner.scalar<number>(
+        "SELECT reclaimed_objects FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(0);
+  });
+
+  it("rolls back every packed row and projection when counter publication fails", async () => {
+    const inner = new TestDatabase();
+    const db = new FailingCounterDatabase(inner);
+    const { checkout, store } = open(db);
+    const blobData = utf8.encode("packed rollback blob\n");
+    const blobOid = hashObject("blob", blobData);
+    const treeData = serializeTree([{ mode: MODE_FILE, name: "file", oid: blobOid }]);
+    const treeOid = hashObject("tree", treeData);
+    const commitData = serializeCommit({
+      tree: treeOid,
+      parent: [],
+      author: PERSON,
+      committer: PERSON,
+      message: "packed rollback commit\n",
+    });
+    const commitOid = hashObject("commit", commitData);
+    const packed = await store.packs.ingest(
+      slices(
+        fullPack([
+          { type: "blob", data: blobData },
+          { type: "tree", data: treeData },
+          { type: "commit", data: commitData },
+        ]),
+        17,
+      ),
+      { reclaimPending: false },
+    );
+    seedRun(db, checkout.repoId, "sweep-packs");
+    db.run(
+      `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, ?, 0)`,
+      checkout.repoId,
+      packed.packId,
+    );
+    seedBlobId(db, checkout.repoId, new Uint8Array([4, 5, 6]), blobOid);
+    expect(store.read(blobOid)?.data).toEqual(blobData);
+    expect(store.read(treeOid)?.data).toEqual(treeData);
+    expect(store.cachedCommit(commitOid)?.commit.message).toBe("packed rollback commit\n");
+    const dataRows = inner.scalar<number>(
+      "SELECT count(*) FROM git_pack_data WHERE repo_id = ? AND pack_id = ?",
+      checkout.repoId,
+      packed.packId,
+    );
+    if (dataRows === undefined || dataRows < 1) throw new Error("pack fixture has no data rows");
+    db.failCounterUpdate = true;
+
+    expect(() => advanceMaintenanceSweep(store.shared, { nowMs: GC_GRACE_MS })).toThrow(
+      "simulated counter publication crash",
+    );
+    expect(
+      inner.scalar<number>(
+        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        packed.packId,
+      ),
+    ).toBe(1);
+    expect(
+      inner.scalar<number>(
+        "SELECT count(*) FROM git_pack_data WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        packed.packId,
+      ),
+    ).toBe(dataRows);
+    expect(
+      inner.scalar<number>(
+        "SELECT count(*) FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        packed.packId,
+      ),
+    ).toBe(3);
+    expect(candidateAge(inner, "git_pack_gc_candidates", checkout.repoId, packed.packId)).toBe(0);
+    expect(
+      inner.scalar<number>("SELECT count(*) FROM git_blob_ids WHERE repo_id = ?", checkout.repoId),
+    ).toBe(1);
+    expect(
+      inner.scalar<number>(
+        "SELECT count(*) FROM git_tree_sources WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(1);
+    expect(
+      inner.scalar<number>(
+        "SELECT count(*) FROM git_tree_effective WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(1);
+    expect(
+      inner.scalar<number>("SELECT count(*) FROM git_commits WHERE repo_id = ?", checkout.repoId),
+    ).toBe(1);
+    expect(
+      inner.one<{ reclaimed_objects: number; reclaimed_packs: number; reclaimed_bytes: number }>(
+        `SELECT reclaimed_objects, reclaimed_packs, reclaimed_bytes
+           FROM git_maintenance_runs WHERE repo_id = ?`,
+        checkout.repoId,
+      ),
+    ).toEqual({ reclaimed_objects: 0, reclaimed_packs: 0, reclaimed_bytes: 0 });
+    expect(store.read(blobOid)?.data).toEqual(blobData);
+    expect(store.read(treeOid)?.data).toEqual(treeData);
+    expect(store.read(commitOid)?.data).toEqual(commitData);
+    expect(store.cachedCommit(commitOid)?.commit.message).toBe("packed rollback commit\n");
+  });
+
+  it("recovers exactly after cache revalidation fails following committed pack deletion", async () => {
+    const inner = new TestDatabase();
+    const db = new CorruptAvailabilityDatabase(inner);
+    const { checkout, store } = open(db);
+    const survivorData = utf8.encode("authoritative survivor\n");
+    const survivorOid = store.write("blob", survivorData);
+    const deadData = utf8.encode("deleted despite probe failure\n");
+    const deadOid = hashObject("blob", deadData);
+    const packed = await store.packs.ingest(
+      slices(fullPack([{ type: "blob", data: deadData }]), 13),
+      { reclaimPending: false },
+    );
+    seedRun(db, checkout.repoId, "sweep-packs", [{ oid: survivorOid }]);
+    db.run(
+      `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+       VALUES (?, ?, 0)`,
+      checkout.repoId,
+      packed.packId,
+    );
+    expect(store.read(deadOid)?.data).toEqual(deadData);
+    expect(store.read(survivorOid)?.data).toEqual(survivorData);
+    db.corruptAvailability = true;
+
+    expect(() => advanceMaintenanceSweep(store.shared, { nowMs: GC_GRACE_MS })).toThrow(
+      /availability probe/,
+    );
+    expect(
+      inner.scalar<number>(
+        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        packed.packId,
+      ),
+    ).toBe(0);
+    expect(
+      candidateAge(inner, "git_pack_gc_candidates", checkout.repoId, packed.packId),
+    ).toBeUndefined();
+    expect(
+      inner.one<{ reclaimed_objects: number; reclaimed_packs: number; reclaimed_bytes: number }>(
+        `SELECT reclaimed_objects, reclaimed_packs, reclaimed_bytes
+           FROM git_maintenance_runs WHERE repo_id = ?`,
+        checkout.repoId,
+      ),
+    ).toEqual({ reclaimed_objects: 1, reclaimed_packs: 1, reclaimed_bytes: packed.bytes });
+    expect(store.read(deadOid)).toBeNull();
+    expect(store.read(survivorOid)?.data).toEqual(survivorData);
+
+    db.corruptAvailability = false;
+    const coldDatabase = new SqliteGitDatabase(inner, { objectCacheBytes: 8 * 1024 * 1024 });
+    const cold = coldDatabase.openCheckout(checkout.id);
+    expect(advanceMaintenanceSweep(cold.shared, { nowMs: GC_GRACE_MS })).toMatchObject({
+      phase: "finish",
+      status: "complete",
+      reclaimedObjects: 1,
+      reclaimedPacks: 1,
+      reclaimedBytes: packed.bytes,
+    });
+    expect(cold.read(deadOid)).toBeNull();
+    expect(cold.read(survivorOid)?.data).toEqual(survivorData);
+  });
+
+  it("fails counter exhaustion closed and preserves eligible storage", () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    const data = utf8.encode("counter overflow\n");
+    const oid = store.write("blob", data);
+    seedRun(db, checkout.repoId, "sweep-loose");
+    db.run(
+      `UPDATE git_maintenance_runs SET reclaimed_objects = ? WHERE repo_id = ?`,
+      Number.MAX_SAFE_INTEGER,
+      checkout.repoId,
+    );
+    db.run(
+      `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+       VALUES (?, ?, 0)`,
+      checkout.repoId,
+      oid,
+    );
+
+    expect(() => advanceMaintenanceSweep(store.shared, { nowMs: GC_GRACE_MS })).toThrow(
+      /counters are exhausted/,
+    );
+    expect(store.read(oid)?.data).toEqual(data);
+    expect(candidateAge(db, "git_loose_gc_candidates", checkout.repoId, oid)).toBe(0);
+  });
+
+  it("fails closed on corrupt storage and bounded inputs", async () => {
+    const looseDb = new TestDatabase();
+    const loose = open(looseDb);
+    const oid = loose.store.write("blob", utf8.encode("corrupt loose\n"));
+    seedRun(looseDb, loose.checkout.repoId, "classify-loose");
+    looseDb.run(
+      "DELETE FROM git_loose_object_lifecycle WHERE repo_id = ? AND oid = ?",
+      loose.checkout.repoId,
+      oid,
+    );
+    expect(() => advanceMaintenanceSweep(loose.store.shared, { nowMs: 1 })).toThrow(/lifecycle/);
+
+    const packDb = new TestDatabase();
+    const packed = open(packDb);
+    const result = await packed.store.packs.ingest(
+      slices(fullPack([{ type: "blob", data: utf8.encode("corrupt pack\n") }]), 11),
+      { reclaimPending: false },
+    );
+    seedRun(packDb, packed.checkout.repoId, "classify-packs");
+    packDb.run(
+      "UPDATE git_pack_meta SET count = count + 1 WHERE repo_id = ? AND pack_id = ?",
+      packed.checkout.repoId,
+      result.packId,
+    );
+    expect(() => advanceMaintenanceSweep(packed.store.shared, { nowMs: 1 })).toThrow(/membership/);
+    expect(() => advanceMaintenanceSweep(packed.store.shared, { nowMs: -1 })).toThrow(/clock/);
+    expect(() => advanceMaintenanceSweep(packed.store.shared, { nowMs: 1, pageRows: 129 })).toThrow(
+      /page size/,
+    );
+  });
+
+  it("rejects corrupt loose chunks before classification or deletion", () => {
+    for (const corruption of ["text-data", "unsafe-seq"]) {
+      const db = new TestDatabase();
+      const { checkout, store } = open(db);
+      const oid = store.write("blob", utf8.encode(`corrupt chunk ${corruption}\n`));
+      seedRun(db, checkout.repoId, "classify-loose");
+      if (corruption === "text-data") {
+        db.run(
+          "UPDATE git_object_chunks SET data = 'not-a-blob' WHERE repo_id = ? AND oid = ?",
+          checkout.repoId,
+          oid,
+        );
+      } else {
+        db.run(
+          "UPDATE git_object_chunks SET seq = ? WHERE repo_id = ? AND oid = ?",
+          Number.MAX_SAFE_INTEGER + 1,
+          checkout.repoId,
+          oid,
+        );
+        db.run(
+          `INSERT INTO git_loose_gc_candidates (repo_id, oid, unreachable_since_ms)
+           VALUES (?, ?, 0)`,
+          checkout.repoId,
+          oid,
+        );
+      }
+
+      expect(() => advanceMaintenanceSweep(store.shared, { nowMs: 1 })).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(
+        db.scalar<number>(
+          "SELECT count(*) FROM git_loose_gc_candidates WHERE repo_id = ?",
+          checkout.repoId,
+        ),
+      ).toBe(corruption === "unsafe-seq" ? 1 : 0);
+    }
+  });
+
+  it("rejects unsafe packed members, pack-data ordinals, and complete pending rows", async () => {
+    const corruptions = [
+      "offset",
+      "data_off",
+      "data_len",
+      "size",
+      "entry_size",
+      "addition",
+      "data-seq",
+      "data-text",
+      "pending-row",
+    ];
+    for (const corruption of corruptions) {
+      const db = new TestDatabase();
+      const { checkout, store } = open(db);
+      const packed = await store.packs.ingest(
+        slices(fullPack([{ type: "blob", data: utf8.encode(`corrupt ${corruption}\n`) }]), 11),
+        { reclaimPending: false },
+      );
+      seedRun(db, checkout.repoId, "classify-packs");
+      db.run(
+        `INSERT INTO git_pack_gc_candidates (repo_id, pack_id, unreachable_since_ms)
+         VALUES (?, ?, 0)`,
+        checkout.repoId,
+        packed.packId,
+      );
+      if (corruption === "data-seq") {
+        db.run(
+          "UPDATE git_pack_data SET seq = ? WHERE repo_id = ? AND pack_id = ?",
+          Number.MAX_SAFE_INTEGER + 1,
+          checkout.repoId,
+          packed.packId,
+        );
+      } else if (corruption === "data-text") {
+        db.run(
+          "UPDATE git_pack_data SET data = 'not-a-blob' WHERE repo_id = ? AND pack_id = ?",
+          checkout.repoId,
+          packed.packId,
+        );
+      } else if (corruption === "pending-row") {
+        db.run(
+          `INSERT INTO git_pack_pending
+             (repo_id, pack_id, offset, data_off, data_len, entry_size, base_oid, base_offset)
+           VALUES (?, ?, 0, 0, 0, 0, NULL, NULL)`,
+          checkout.repoId,
+          packed.packId,
+        );
+      } else if (corruption === "addition") {
+        db.run("PRAGMA ignore_check_constraints = ON");
+        db.run(
+          `UPDATE git_pack_objects SET data_off = ?, data_len = 1
+            WHERE repo_id = ? AND pack_id = ?`,
+          Number.MAX_SAFE_INTEGER,
+          checkout.repoId,
+          packed.packId,
+        );
+        db.run("PRAGMA ignore_check_constraints = OFF");
+      } else {
+        db.run("PRAGMA ignore_check_constraints = ON");
+        db.run(
+          `UPDATE git_pack_objects SET ${corruption} = ? WHERE repo_id = ? AND pack_id = ?`,
+          Number.MAX_SAFE_INTEGER + 1,
+          checkout.repoId,
+          packed.packId,
+        );
+        db.run("PRAGMA ignore_check_constraints = OFF");
+      }
+
+      expect(() => advanceMaintenanceSweep(store.shared, { nowMs: 1 })).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(
+        db.scalar<number>(
+          "SELECT count(*) FROM git_pack_gc_candidates WHERE repo_id = ?",
+          checkout.repoId,
+        ),
+      ).toBe(1);
+    }
+  });
+
+  it("keeps every stateless loose page within a fixed statement and memory envelope", () => {
+    const db = new TestDatabase();
+    const { checkout, store } = open(db);
+    for (let index = 0; index < 257; index++) {
+      store.write("blob", utf8.encode(`bounded ${index}\n`));
+    }
+    seedRun(db, checkout.repoId, "classify-loose");
+
+    for (let call = 0; call < 20; call++) {
+      const result = advance(db, store.shared, 10, 32);
+      if (result.phase === "repack") break;
+    }
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_loose_gc_candidates WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(257);
+    expect(
+      db.scalar<string>(
+        "SELECT phase FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe("repack");
+  });
+});
