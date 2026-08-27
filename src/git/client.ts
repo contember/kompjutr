@@ -380,7 +380,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async add(input) {
       const repo = at(input.dir);
-      addOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) });
+      addOp(repo, context.worktree, { ...input, excludeRoots: excludeRoots(repo) }, context);
     },
     async rm(input) {
       const repo = at(input.dir);

@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { utf8, utf8Decoder } from "../src/core/bytes.js";
+import type { GitContext } from "../src/core/context.js";
 import { PathspecNotFoundError } from "../src/core/errors.js";
 import { IGNORE_LIMITS } from "../src/core/ignore/index.js";
 import { hashObject } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { add, lsFiles, reset, rm } from "../src/core/ops/staging.js";
 import type { Repository } from "../src/core/repository.js";
+import { createSqliteSelectedPathSource } from "../src/sqlite/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -71,7 +73,141 @@ function removeBoth(workspace: TestRepository, fixture: GitFixture, path: string
   fixture.remove(path);
 }
 
+function nativeAddContext(
+  workspace: TestRepository,
+  statementCounts?: number[],
+): Pick<GitContext, "selectedPaths"> {
+  const source = createSqliteSelectedPathSource(workspace.database.db);
+  return {
+    selectedPaths: {
+      select(request) {
+        const before = workspace.storage.statementCount;
+        const result = source.select(request);
+        statementCounts?.push(workspace.storage.statementCount - before);
+        return result;
+      },
+    },
+  };
+}
+
 describe("add", () => {
+  it("stages mixed exact, overlapping directory, conflict, and non-BMP paths like git", () => {
+    const fixture = newFixture();
+    fixture.git("config", "core.quotePath", "false");
+    const workspace = makeRepo("/");
+    const astral = "\u{10000}.txt";
+    const bmp = "\ue000.txt";
+    const files: ReadonlyArray<readonly [string, string]> = [
+      ["exact.txt", "exact\n"],
+      ["dir/a.txt", "a\n"],
+      ["dir/nested/b.txt", "b\n"],
+      [astral, "astral\n"],
+      [bmp, "bmp\n"],
+      ["conflict.txt", "resolved\n"],
+      ["unrelated.txt", "unrelated\n"],
+    ];
+    for (const [path, content] of files) {
+      writeBoth(workspace, fixture, path, content);
+    }
+    const conflictRows: string[] = [];
+    for (const stage of [1, 2, 3]) {
+      const content = `stage ${stage}\n`;
+      const oid = hashObject("blob", utf8.encode(content));
+      workspace.repo.checkout.indexPut({
+        path: "conflict.txt",
+        stage,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+      expect(fixture.gitInput(content, "hash-object", "-w", "--stdin")).toBe(oid);
+      conflictRows.push(`100644 ${oid} ${stage}\tconflict.txt`);
+    }
+    fixture.gitInput(`${conflictRows.join("\n")}\n`, "update-index", "--index-info");
+    const specs = [bmp, "dir/nested", "exact.txt", "dir", astral, "conflict.txt"];
+
+    add(workspace.repo, workspace.worktree, { paths: specs }, nativeAddContext(workspace));
+    fixture.git("add", "--", ...specs);
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+    expect(lsFiles(workspace.repo)).not.toContain("unrelated.txt");
+  });
+
+  it("stages both file-directory replacement directions like git", async () => {
+    const fixture = newFixture();
+    fixture.write("to-dir", "old file\n");
+    fixture.write("to-file/old.txt", "old child\n");
+    fixture.commit("base");
+    const workspace = await clonedFrom(fixture);
+
+    workspace.worktree.unlink("/to-dir");
+    fixture.remove("to-dir");
+    writeBoth(workspace, fixture, "to-dir/new.txt", "new child\n");
+    workspace.worktree.removeFiles(["/to-file"], { recursive: true, force: true });
+    fixture.remove("to-file");
+    writeBoth(workspace, fixture, "to-file", "new file\n");
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["to-file", "to-dir"] },
+      nativeAddContext(workspace),
+    );
+    fixture.git("add", "--", "to-file", "to-dir");
+
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+  });
+
+  it("keeps native ignored and unmatched semantics without publishing partial index changes", () => {
+    const fixture = newFixture();
+    const workspace = makeRepo("/");
+    writeBoth(workspace, fixture, ".gitignore", "*.log\n");
+    writeBoth(workspace, fixture, "ignored.log", "ignored\n");
+    writeBoth(workspace, fixture, "kept.txt", "kept\n");
+    const context = nativeAddContext(workspace);
+
+    add(workspace.repo, workspace.worktree, { paths: [".gitignore"] }, context);
+    fixture.git("add", ".gitignore");
+    add(workspace.repo, workspace.worktree, { paths: ["ignored.log"] }, context);
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+
+    expect(() =>
+      add(workspace.repo, workspace.worktree, { paths: ["kept.txt", "missing.txt"] }, context),
+    ).toThrow(PathspecNotFoundError);
+    expect(lsFiles(workspace.repo)).toEqual([".gitignore"]);
+
+    add(workspace.repo, workspace.worktree, { paths: ["ignored.log"], force: true }, context);
+    fixture.git("add", "-f", "ignored.log");
+    expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
+  });
+
+  it("falls back after a selected source finds a symlink ancestor", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.checkout.indexPut({
+      path: "link/child.txt",
+      stage: 0,
+      mode: 0o100644,
+      oid: workspace.repo.store.write("blob", utf8.encode("old\n")),
+      size: null,
+      mtime: null,
+      ino: null,
+    });
+    workspace.worktree.symlink("target", "/link");
+    const sourceStatements: number[] = [];
+
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: ["link/child.txt"] },
+      nativeAddContext(workspace, sourceStatements),
+    );
+
+    expect(sourceStatements).toEqual([2]);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+  });
+
   it("stages a single new file the way git does", () => {
     const fixture = newFixture();
     const workspace = makeRepo("/");
@@ -754,6 +890,48 @@ describe("cost", () => {
     ).toBe(true);
     expect(workspace.repo.checkout.indexGet(paths[100] ?? "")?.oid).toBe(originalOid);
   });
+
+  it.each([1, 100, 1_000])(
+    "selects and stages %i explicit paths with flat source and bounded batch cost",
+    (count) => {
+      const workspace = makeRepo("/");
+      const paths = Array.from(
+        { length: count },
+        (_, index) => `selected-${index.toString().padStart(4, "0")}.txt`,
+      );
+      workspace.worktree.writeFiles(
+        paths.map((path) => ({ path: `/${path}`, bytes: utf8.encode("selected\n") })),
+      );
+      const unrelatedOid = workspace.repo.store.write("blob", utf8.encode("unrelated old\n"));
+      workspace.repo.checkout.indexPut({
+        path: "unrelated.txt",
+        stage: 0,
+        mode: 0o100644,
+        oid: unrelatedOid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+      writeWorkFile(workspace, "/unrelated.txt", "unrelated changed\n");
+      const worktree = new BulkOnlyWorktree(workspace.worktree);
+      const sourceStatements: number[] = [];
+      const batches = Math.ceil(count / 1_000);
+
+      workspace.storage.resetCounters();
+      add(workspace.repo, worktree, { paths }, nativeAddContext(workspace, sourceStatements));
+      const statements = workspace.storage.statementCount;
+
+      expect(sourceStatements).toEqual([2]);
+      expect(statements).toBeLessThanOrEqual(20 + batches * 8);
+      expect(statements).toBeLessThan(1_000);
+      expect(worktree.bulkReadPaths).toHaveLength(count);
+      expect(workspace.repo.checkout.indexGet("unrelated.txt")?.oid).toBe(unrelatedOid);
+      const selectedOid = hashObject("blob", utf8.encode("selected\n"));
+      expect(
+        paths.every((path) => workspace.repo.checkout.indexGet(path)?.oid === selectedOid),
+      ).toBe(true);
+    },
+  );
 
   it("fails rm before mutation when retained state exceeds 16 MiB", () => {
     const workspace = makeRepo("/");

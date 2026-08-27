@@ -12,9 +12,20 @@ import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
+import type {
+  SelectedPathResult,
+  SelectedPathSpec,
+  SelectedWorktreeFact,
+} from "../sparse-workspace.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
-import { checkoutTree, indexFromTree, matchesPaths } from "./checkout.js";
+import {
+  type CompiledPathspecMatcher,
+  checkoutTree,
+  compilePathspecs,
+  indexFromTree,
+  matchesPaths,
+} from "./checkout.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
@@ -29,6 +40,7 @@ import {
 
 const ADD_WINDOW_ROWS = 1000;
 const ADD_RETAINED_BYTES = 16 * 1024 * 1024;
+const ADD_SELECTED_PATHS = 1_000;
 const INDEX_ROW_FIXED_BYTES = 256;
 const PATH_ENTRY_FIXED_BYTES = 96;
 
@@ -60,7 +72,7 @@ export interface AddOptions {
   force?: boolean;
   /**
    * Roots of nested repositories, from `nestedRoots(context, repo.root)`.
-   * The ops layer has no `GitContext`, so the caller resolves them.
+   * The caller resolves these before entering the staging operation.
    */
   excludeRoots?: string[];
 }
@@ -71,16 +83,56 @@ export interface AddOptions {
  * A pathspec stages removals under it too, the way `git add <dir>` has
  * since git 2.0; `all` does the same across the whole repository.
  */
-export function add(repo: Repository, worktree: Worktree, options: AddOptions): void {
+export function add(
+  repo: Repository,
+  worktree: Worktree,
+  options: AddOptions,
+  context?: Pick<GitContext, "selectedPaths">,
+): void {
   const all = options.all === true;
   const specs = normalizeSpecs(options.paths);
   if (!all && specs.length === 0) return;
 
   const force = options.force === true;
   const trackedOnly = all && options.trackedOnly === true;
-  if (!all) assertPathspecsMatch(repo, worktree, specs);
+  const pathspec = all ? undefined : compilePathspecs(specs);
+  if (!all && pathspec !== undefined) {
+    const selected = selectAddPaths(repo, specs, pathspec, context?.selectedPaths);
+    if (selected !== null) {
+      assertSelectedPathspecsMatch(specs, selected);
+      applyAdd(
+        repo,
+        worktree,
+        options,
+        snapshotAddIndexRows(selected.index, pathspec, selected.retainedBytes),
+        selectedWorktreeFiles(selected.worktree, pathspec),
+        pathspec,
+        force,
+        false,
+      );
+      return;
+    }
+    assertPathspecsMatch(repo, worktree, specs);
+  }
 
-  const snapshot = snapshotAddIndex(repo, all ? undefined : specs);
+  const snapshot = snapshotAddIndex(repo, pathspec);
+  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
+    pathspec,
+    includeIgnored: true,
+  });
+  applyAdd(repo, worktree, options, snapshot, walked, pathspec, force, trackedOnly);
+}
+
+function applyAdd(
+  repo: Repository,
+  worktree: Worktree,
+  options: AddOptions,
+  snapshot: AddIndexSnapshot,
+  walked: Iterable<WorktreePath>,
+  pathspec: CompiledPathspecMatcher | undefined,
+  force: boolean,
+  trackedOnly: boolean,
+): void {
   let ignores: IgnoreMatcher | undefined;
   const isIgnored = (path: string): boolean => {
     if (force) return false;
@@ -88,10 +140,6 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
     return ignores.ignores(path, false);
   };
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
-  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
-    paths: all ? undefined : specs,
-    includeIgnored: true,
-  });
   // `commit -a` never adds a path HEAD does not already have.
   const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
 
@@ -120,20 +168,102 @@ export function add(repo: Repository, worktree: Worktree, options: AddOptions): 
 
       // A conflict-only path has no stage-zero row but still needs removal.
       if (row.b === undefined) continue;
-      if (!all && !matchesPaths(row.path, specs)) continue;
+      if (pathspec !== undefined && !pathspec.matches(row.path)) continue;
       sink.remove(row.path);
     }
     flush();
   });
 }
 
-function snapshotAddIndex(repo: Repository, specs: string[] | undefined): AddIndexSnapshot {
+function selectAddPaths(
+  repo: Repository,
+  specs: readonly string[],
+  pathspec: CompiledPathspecMatcher,
+  source: GitContext["selectedPaths"],
+): Extract<SelectedPathResult, { available: true }> | null {
+  if (source === undefined || specs.length > ADD_SELECTED_PATHS || specs.includes("")) return null;
+  const requested: SelectedPathSpec[] = specs
+    .map((path) => ({ path, recursive: true }))
+    .sort((left, right) => comparePaths(left.path, right.path));
+  const selected = source.select({
+    repoId: repo.store.repoId,
+    checkoutId: repo.checkout.checkoutId,
+    root: repo.root,
+    specs: requested,
+  });
+  if (!selected.available) return null;
+  for (const entry of selected.index) {
+    if (!pathspec.matches(entry.path)) {
+      throw new GitError("ECORRUPT", "selected add index source returned an unrelated path");
+    }
+  }
+  for (const entry of selected.worktree) {
+    if (!pathspec.matches(entry.path)) {
+      throw new GitError("ECORRUPT", "selected add worktree source returned an unrelated path");
+    }
+  }
+  return selected;
+}
+
+function* selectedWorktreeFiles(
+  rows: readonly SelectedWorktreeFact[],
+  pathspec: CompiledPathspecMatcher,
+): Generator<WorktreePath> {
+  for (const row of rows) {
+    if (row.stat.type !== "dir" && pathspec.matches(row.path)) yield row;
+  }
+}
+
+function assertSelectedPathspecsMatch(
+  specs: readonly string[],
+  selected: Extract<SelectedPathResult, { available: true }>,
+): void {
+  for (const spec of specs) {
+    if (hasExactSelectedPath(selected.worktree, spec)) continue;
+    const at = lowerBoundSelectedPath(selected.index, spec);
+    const path = selected.index[at]?.path;
+    if (path === spec || path?.startsWith(`${spec}/`) === true) continue;
+    throw new PathspecNotFoundError(spec);
+  }
+}
+
+function hasExactSelectedPath(rows: readonly SelectedWorktreeFact[], path: string): boolean {
+  return rows[lowerBoundSelectedPath(rows, path)]?.path === path;
+}
+
+function lowerBoundSelectedPath<T extends { path: string }>(
+  rows: readonly T[],
+  path: string,
+): number {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const candidate = rows[middle];
+    if (candidate !== undefined && comparePaths(candidate.path, path) < 0) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function snapshotAddIndex(
+  repo: Repository,
+  pathspec: CompiledPathspecMatcher | undefined,
+): AddIndexSnapshot {
+  return snapshotAddIndexRows(repo.checkout.indexScan(), pathspec, 0);
+}
+
+function snapshotAddIndexRows(
+  entries: Iterable<IndexEntry>,
+  pathspec: CompiledPathspecMatcher | undefined,
+  initialRetained: number,
+): AddIndexSnapshot {
   const paths: AddIndexPath[] = [];
   const conflicted = new Set<string>();
-  let retained = 0;
+  let retained = initialRetained;
   let current: AddIndexPath | null = null;
-  for (const entry of repo.checkout.indexScan()) {
-    if (specs !== undefined && !matchesPaths(entry.path, specs)) continue;
+  for (const entry of entries) {
+    if (pathspec !== undefined && !pathspec.matches(entry.path)) continue;
     retained +=
       INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid);
     if (retained > ADD_RETAINED_BYTES) {
