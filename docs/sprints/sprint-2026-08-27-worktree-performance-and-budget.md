@@ -357,3 +357,40 @@ territories; CPU-heavy gates and every reported benchmark run use `cpu-lease`.
   spread witnesses, exact 1,000/1,001 boundaries, malformed/unavailable source
   behavior, structural fallback parity, and repeated leased Next.js checkout
   rows below 100 ms in both real directions.
+- The first WU6 implementation and its consolidated review fix passed 21 checkout,
+  35 selected-source, 20 tree-diff, and 80 staging/ref assertions, typecheck,
+  Biome, and two independent post-fix reviews. A leased integrated run still
+  rejected the unit: `add — 100` was 2,233.0 ms, `commit — 100` 1,278.6 ms,
+  clean post-commit status 962.8 ms, and the real checkout directions 553.2 ms
+  and 519.8 ms. The implementation remains uncommitted because those are sprint
+  acceptance failures, not publishable results.
+- Read-only leased triage found three repo-wide query plans hidden behind low
+  statement and returned-row counts. `WALK_TREE_DIFF_SQL` materialised 13,079
+  effective sources and 43,011 parsed edges; it cost 472.8 ms inside the
+  integrated checkout and 622 ms in a separate isolated diagnostic. A one-cursor
+  parsed-edge prototype visited 725 active-frontier rows,
+  returned the same 100 changes, and took 18.9–20.2 ms. Add always requested
+  recursive selected facts, spending about 2,198 ms in the general index and
+  worktree queries. Commit and clean status spent about 994 ms and 972 ms in
+  `SPARSE_TREE_DEPTH_SQL`. The 1,000-path exact preflight also rejected a real
+  30,483-byte deduplicated ancestor JSON through a 1,199,308-byte conservative
+  estimate, sending two bounded result cursors through tens of millions of
+  internal row pairs; the existing exact statements took about 51 ms together.
+- The user approved an exceptional second performance-fix wave after that
+  evidence. Its write territory is frozen to three disjoint units:
+  `src/sqlite/tree-walk.ts` with `tests/tree-diff.test.ts` and the integration-only
+  `tests/checkout-sparse.test.ts` for active-frontier leaf diff;
+  `src/sqlite/sparse-workspace.ts` with
+  `tests/sparse-workspace.test.ts`, `tests/commit.test.ts`, and
+  `tests/status-sparse.test.ts` for exact preflight, exact snapshot index, and
+  active-frontier tree-depth/entry resolution; and `src/core/ops/staging.ts`
+  with `tests/staging.test.ts` for exact-first explicit add classification.
+  Existing WU6 production checkout code remains frozen.
+- The second wave preserves one recursive parsed-edge cursor, effective-source
+  qualification, loose shadowing, complete-pack authority, every marker,
+  ordinal, cumulative-cost, raw-edge, path, cycle, queue, retained-memory, and
+  statement bound, plus all generic fallbacks. It adds no raw-object traversal,
+  public capability, schema, migration, or module-boundary change. Each SQL
+  rewrite needs an active-frontier `EXPLAIN` witness and corruption-before-yield
+  coverage. The unit is green only after focused tests, two independent reviews,
+  and a leased integrated run put all five required rows below 100 ms.
