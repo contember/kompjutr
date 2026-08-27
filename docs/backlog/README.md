@@ -51,53 +51,44 @@ not effort: a wrong answer outranks a missing one.
   and are tracked in [44](44-patch-interchange.md) and
   [42](42-remote-ref-discovery-and-refspec-fetch.md).
 
-## Recommended Git implementation order
+## Sprint plan
 
-This is the default priority at the current HEAD, not scheduling state. Items in
-the same phase may run in parallel, but a blocked item must not move ahead of its
-blocker. Re-evaluate the order after each phase as production evidence arrives.
+The default sequencing at the current HEAD, not scheduling state — a sprint
+exists once its file lands in [`../sprints/`](../sprints/). Every item belongs to
+exactly one sprint. A sprint is *normal* (roughly four to six work units) or
+*long* (roughly seven to ten); an item whose acceptance scope exceeds one work
+unit is split at the WU level inside its own sprint, never across two. A blocked
+item must not move ahead of its blocker. Re-evaluate after each sprint as
+production evidence arrives.
 
-1. **Harden destructive maintenance:**
-   [04](04-repack-and-garbage-collection.md), which consumes the bounded recovery
-   and active-root contracts.
-2. **Qualify the production runtime:** [10](10-worktree-wall-time.md),
-   [11](11-production-do-regression-probe.md), and
-   [16](16-concurrent-and-restart-conformance.md). Treat each as its own large
-   work unit; the production probe is now unblocked by the verified CI/release
-   seam. The status half of 10 now has attributed causes with their own
-   witnesses: [54](54-prune-ignored-directories-in-status-walk.md) and
-   [56](56-reseal-index-tracker-on-commit.md) are small and independent; take
-   them first, then [57](57-single-prepass-in-full-status.md).
-   [61](61-bounded-add-for-explicit-pathspecs.md) and
-   [62](62-reuse-head-subtrees-on-commit.md) are the `add` and `commit`
-   counterparts. [60](60-force-checkout-benchmark-measures-a-no-op.md) fixes
-   the benchmark and goes before any of them is re-measured.
-3. **Close the reference-workload gaps.** These come from the only production
-   workload documented end to end
-   ([coverage](../reference/git-support.md#reference-workload-coverage)), so they
-   are evidence rather than guesswork: [43](43-index-and-object-write-plumbing.md)
-   and [44](44-patch-interchange.md), then
-   [42](42-remote-ref-discovery-and-refspec-fetch.md) with
-   [08](08-extend-push-refspecs.md) (shared refspec type),
-   [41](41-partial-clone.md) alongside [38](38-clone-depth-and-deepening.md)
-   (both touch the clone contract).
-4. **Add the highest-return daily workflows:**
-   [28](28-pull-rebase.md),
-   [35](35-staged-diff.md), [36](36-glob-pathspecs.md),
-   [37](37-history-reads-patch-and-paths.md), [13](13-force-with-lease.md),
-   [15](15-abortable-network-operations.md), and [06](06-stash-operations.md).
-5. **Broaden management and diagnostic surfaces:**
-   [18](18-branch-and-remote-management.md),
-   [25](25-rebase-targets-and-roots.md),
-   [39](39-plumbing-read-surface.md), [46](46-rev-parse-revision-syntax.md), and
-   [17](17-integrity-audit-and-snapshots.md).
-6. **Defer until a concrete workload justifies them:**
-   [09](09-outbound-delta-compression.md), [26](26-interactive-rebase.md),
-   [27](27-rebase-merges.md), and [29](29-rebase-update-refs.md).
+| # | Sprint | Items | Length | Why here |
+|---|---|---|---|---|
+| — | Worktree performance and budget — **active** | 10, 54, 56, 57, 60, 61, 62 | — | Produces the release-candidate baseline sprint 2 measures, and the compiled matcher seam sprint 8 reuses. |
+| 1 | Repack and garbage collection | [04](04-repack-and-garbage-collection.md) | long | Storage growth is unbounded in a long-lived repository. Destructive maintenance wants its own gate before anything builds on it. |
+| 2 | Production Durable Object probe | [11](11-production-do-regression-probe.md) | normal | Consumes the active sprint's baseline while it is still current, and proves the performance claim in the real runtime rather than in Node. |
+| 3 | Concurrency and restart conformance | [16](16-concurrent-and-restart-conformance.md) | long | Last piece of production qualification. Protects every later sprint and may introduce an operation epoch or lock. |
+| 4 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | First reference-workload gap: a scratch index plus `readTree`, `writeTree` and `commitTree` over the existing bounded tree builder. |
+| 5 | Patch interchange | [44](44-patch-interchange.md) | long | Two halves — `--binary` and `--full-index` in the writer, then a new parser and `apply --3way` over the existing three-way engine. |
+| 6 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Fetch and push share the refspec type and its validation, so one sprint defines it in a seam unit first. |
+| 7 | Clone shape | [38](38-clone-depth-and-deepening.md), [41](41-partial-clone.md) | long | Both change the clone contract and both need an ADR. 41 additionally introduces a promisor object state every read path must honour. |
+| 8 | Everyday reads and pathspecs | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [36](36-glob-pathspecs.md) | normal | 36 reuses the compiled matcher seam from the active sprint. 35 and 37 are read-only and add no storage. |
+| 9 | Network safety and stash | [13](13-force-with-lease.md), [15](15-abortable-network-operations.md), [06](06-stash-operations.md) | long | 13 and 15 are both network-operation safety. 06 joins them because it reuses the same merge engine and operation journal. |
+| 10 | Rebase extensions I | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | All three write to the planner and the lifecycle, so they cannot run in parallel. Sequential work units in one sprint is the correct shape. |
+| 11 | Management and plumbing reads | [18](18-branch-and-remote-management.md), [46](46-rev-parse-revision-syntax.md), [39](39-plumbing-read-surface.md) | long | 39 decomposes into about seven small units; 18 and 46 fill the sprint. Nothing here adds storage. |
+| 12 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Two units of work — a bounded audit and a versioned snapshot format. Follows 04 and 16, which settle what counts as authoritative. |
+| 13 | Interactive rebase | [26](26-interactive-rebase.md) | long | Builds on the explicit targets from sprint 10. Bounded todo model plus the autosquash transform. |
+| 14 | Rebase merge topology | [27](27-rebase-merges.md) | long | Hardest of the rebase family; last, because it needs the journal settled by sprints 10 and 13. |
+| 15 | Gitlink conflicts | [58](58-materialize-gitlink-conflicts.md) | normal | No dependencies. Can move earlier into any slot that opens up. |
+| 16 | Byte-preserving paths | [59](59-byte-preserving-git-paths.md) | long | Touches every path-bearing surface. Any earlier position would force each later sprint to migrate underneath it. |
+| — | Unscheduled | [09](09-outbound-delta-compression.md) | — | Deferred until a concrete workload justifies it. |
 
-Before scheduling them, split 04, 16, 17, and 39 into smaller work units
-with independent witnesses. Their current acceptance scopes are larger than one
-focused sprint.
+Sprints 1 to 3 add no new Git capability; they are three sprints of runtime
+investment. The one defensible reordering is to move sprint 4 ahead of sprint 1
+— it is evidence-backed from the reference workload and touches nothing sprints
+1 to 3 change.
+
+Do not merge 26 and 27 into one sprint. They are two independent extra-large
+units over the same files, and a long sprint does not make that safe.
 
 ## Items
 
