@@ -375,121 +375,115 @@ SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_
     OR instr(ancestry, '/' || oid || '/') != 0
     OR (mode IN ('40000', '040000') AND descend != 1)`;
 
+function diffSourceValidSql(effective: string, source: string, oid: string): string {
+  return `((${effective}.source_key IS NOT NULL
+    AND length(${effective}.tree_oid) = 40
+    AND ${effective}.tree_oid NOT GLOB '*[^0-9a-f]*'
+    AND ${source}.source_key = ${effective}.source_key
+    AND ${source}.repo_id = ${effective}.repo_id
+    AND ${source}.tree_oid = ${effective}.tree_oid
+    AND ${source}.complete = 1
+    AND ${source}.entry_count >= 0
+    AND ${source}.object_size >= 0
+    AND ${source}.base_cost = ${source}.object_size
+      + (p.queue_fixed + 18) * ${source}.entry_count
+    AND (
+      (${source}.storage = 'loose' AND ${source}.source_id = 0 AND EXISTS (
+        SELECT 1 FROM git_objects object
+         WHERE object.repo_id = p.repo_id AND object.oid = ${oid}
+           AND object.type = 'tree' AND object.size = ${source}.object_size
+      ))
+      OR
+      (${source}.storage = 'pack' AND EXISTS (
+        SELECT 1 FROM git_pack_objects object
+          JOIN git_pack_meta pack
+            ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+           AND pack.state = 'complete'
+         WHERE object.repo_id = p.repo_id AND object.oid = ${oid}
+           AND object.pack_id = ${source}.source_id AND object.type = 'tree'
+           AND object.size = ${source}.object_size
+      ))
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM git_tree_entries marker
+       WHERE marker.source_key = ${source}.source_key
+         AND marker.ordinal IN (-1, ${source}.entry_count)
+    )
+    AND (
+      (${source}.entry_count = 0 AND ${source}.base_cost = 0)
+      OR EXISTS (
+        SELECT 1 FROM git_tree_entries marker
+         WHERE marker.source_key = ${source}.source_key
+           AND marker.ordinal = ${source}.entry_count - 1
+           AND marker.cumulative_base = ${source}.base_cost
+      )
+    )) IS TRUE)`;
+}
+
+function diffEntryNameSql(entry: string): string {
+  return `CASE WHEN length(${entry}.name_bytes) <= p.path_cap
+                  AND length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) <= p.path_cap
+                THEN CAST(${entry}.name_bytes AS TEXT) ELSE NULL END`;
+}
+
+function diffEntryModeSql(entry: string): string {
+  return `CASE WHEN length(${entry}.mode) <= 6 THEN ${entry}.mode ELSE NULL END`;
+}
+
+function diffEntryOidSql(entry: string): string {
+  return `CASE WHEN length(${entry}.oid) <= 40 THEN ${entry}.oid ELSE NULL END`;
+}
+
+function diffEntryErrorSql(entry: string, previous: string, source: string): string {
+  return `CASE
+    WHEN ${entry}.ordinal < 0 OR ${entry}.ordinal >= ${source}.entry_count
+      THEN 'tree entries do not match the parsed source marker'
+    WHEN ${entry}.ordinal > 0 AND ${previous}.ordinal IS NULL
+      THEN 'tree entries contain an ordinal gap'
+    WHEN ${entry}.cumulative_base != p.queue_fixed + length(${entry}.name_bytes)
+           + length(CAST(${entry}.mode AS BLOB)) + length(CAST(${entry}.oid AS BLOB))
+           + COALESCE(${previous}.cumulative_base, 0)
+      THEN 'tree queue metadata is inconsistent'
+    WHEN length(${entry}.name_bytes) > p.path_cap
+      OR length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) > p.path_cap
+      THEN 'tree entry name exceeds the path limit'
+    WHEN length(${entry}.raw_entry) > p.path_cap + 64
+      THEN 'tree entry integrity payload is too large'
+    WHEN ${entry}.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
+      THEN 'tree entry has an invalid mode'
+    WHEN length(${entry}.name_bytes) = 0
+      OR instr(CAST(${entry}.name_bytes AS TEXT), '/') != 0
+      THEN 'tree entry has an invalid name'
+    WHEN length(${entry}.oid) != 40 OR ${entry}.oid GLOB '*[^0-9a-f]*'
+      THEN 'tree entry has an invalid oid'
+    WHEN length(${entry}.raw_entry) != length(CAST(${entry}.mode AS BLOB))
+           + length(${entry}.name_bytes) + 22
+      OR CAST(substr(${entry}.raw_entry, 1, length(CAST(${entry}.mode AS BLOB))) AS BLOB)
+           != CAST(${entry}.mode AS BLOB)
+      OR hex(substr(${entry}.raw_entry, length(CAST(${entry}.mode AS BLOB)) + 1, 1)) != '20'
+      OR CAST(substr(
+           ${entry}.raw_entry, length(CAST(${entry}.mode AS BLOB)) + 2,
+           length(${entry}.name_bytes)
+         ) AS BLOB) != ${entry}.name_bytes
+      OR hex(substr(
+           ${entry}.raw_entry,
+           length(CAST(${entry}.mode AS BLOB)) + length(${entry}.name_bytes) + 2, 1
+         )) != '00'
+      OR lower(hex(substr(${entry}.raw_entry, -20))) != ${entry}.oid
+      THEN 'tree entry integrity check failed'
+    ELSE NULL
+  END`;
+}
+
+function diffEntryTooBigSql(entry: string): string {
+  return `(length(${entry}.name_bytes) > p.path_cap
+    OR length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) > p.path_cap)`;
+}
+
 const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
   params(repo_id, before_root, after_root, path_cap, state_cap, queue_cap, queue_fixed,
          emit_objects)
     AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
-  source_valid(repo_id, tree_oid, storage, source_id, object_size,
-               entry_count, base_cost) AS NOT MATERIALIZED (
-    SELECT x.repo_id, x.tree_oid, s.storage, s.source_id, s.object_size,
-           s.entry_count, s.base_cost
-      FROM git_tree_effective x
-      CROSS JOIN params p
-      CROSS JOIN git_tree_sources s
-     WHERE x.repo_id = p.repo_id
-       AND length(x.tree_oid) = 40 AND x.tree_oid NOT GLOB '*[^0-9a-f]*'
-       AND s.source_key = x.source_key
-       AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
-       AND s.complete = 1
-       AND s.entry_count >= 0 AND s.object_size >= 0
-       AND s.base_cost = s.object_size + (p.queue_fixed + 18) * s.entry_count
-       AND (
-         (s.storage = 'loose' AND s.source_id = 0 AND EXISTS (
-           SELECT 1 FROM git_objects o
-            WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
-              AND o.type = 'tree' AND o.size = s.object_size
-         ))
-         OR
-         (s.storage = 'pack' AND EXISTS (
-           SELECT 1 FROM git_pack_objects o
-             JOIN git_pack_meta m
-               ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
-              AND m.state = 'complete'
-            WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
-              AND o.pack_id = s.source_id AND o.type = 'tree'
-              AND o.size = s.object_size
-         ))
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM git_tree_entries_wide e
-          WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-            AND e.storage = s.storage AND e.source_id = s.source_id
-            AND e.ordinal IN (-1, s.entry_count)
-       )
-       AND (
-         (s.entry_count = 0 AND s.base_cost = 0)
-         OR EXISTS (
-           SELECT 1 FROM git_tree_entries_wide e
-            WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-              AND e.storage = s.storage AND e.source_id = s.source_id
-              AND e.ordinal = s.entry_count - 1
-              AND e.cumulative_base = s.base_cost
-         )
-       )
-  ),
-  edge(repo_id, tree_oid, storage, source_id, ordinal, cumulative_base, name, name_bytes,
-       mode, oid, error, error_code) AS NOT MATERIALIZED (
-    SELECT e.repo_id, e.tree_oid, e.storage, e.source_id, e.ordinal, e.cumulative_base,
-           CASE WHEN length(e.name_bytes) <= p.path_cap
-                  AND length(CAST(e.name AS BLOB)) <= p.path_cap THEN e.name ELSE NULL END,
-           e.name_bytes,
-           CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
-           CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
-           CASE
-             WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
-               THEN 'tree entries do not match the parsed source marker'
-             WHEN e.ordinal > 0 AND NOT EXISTS (
-               SELECT 1 FROM git_tree_entries_wide previous
-                WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
-                  AND previous.storage = e.storage AND previous.source_id = e.source_id
-                  AND previous.ordinal = e.ordinal - 1
-             ) THEN 'tree entries contain an ordinal gap'
-             WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
-                    + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
-                    + COALESCE((
-                        SELECT previous.cumulative_base FROM git_tree_entries_wide previous
-                         WHERE previous.repo_id = e.repo_id
-                           AND previous.tree_oid = e.tree_oid
-                           AND previous.storage = e.storage
-                           AND previous.source_id = e.source_id
-                           AND previous.ordinal = e.ordinal - 1
-                      ), 0)
-               THEN 'tree queue metadata is inconsistent'
-             WHEN length(e.name_bytes) > p.path_cap
-               OR length(CAST(e.name AS BLOB)) > p.path_cap
-               THEN 'tree entry name exceeds the path limit'
-             WHEN length(e.raw_entry) > p.path_cap + 64
-               THEN 'tree entry integrity payload is too large'
-             WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
-               THEN 'tree entry has an invalid mode'
-             WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
-               OR CAST(e.name_bytes AS TEXT) != e.name
-               THEN 'tree entry has an invalid name'
-             WHEN length(e.oid) != 40 OR e.oid GLOB '*[^0-9a-f]*'
-               THEN 'tree entry has an invalid oid'
-             WHEN length(e.raw_entry) != length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 22
-               OR CAST(substr(e.raw_entry, 1, length(CAST(e.mode AS BLOB))) AS BLOB)
-                    != CAST(e.mode AS BLOB)
-               OR hex(substr(e.raw_entry, length(CAST(e.mode AS BLOB)) + 1, 1)) != '20'
-               OR CAST(substr(
-                    e.raw_entry, length(CAST(e.mode AS BLOB)) + 2, length(e.name_bytes)
-                  ) AS BLOB) != e.name_bytes
-               OR hex(substr(
-                    e.raw_entry, length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 2, 1
-                  )) != '00'
-               OR lower(hex(substr(e.raw_entry, -20))) != e.oid
-               THEN 'tree entry integrity check failed'
-             ELSE NULL
-           END,
-           CASE WHEN length(e.name_bytes) > p.path_cap
-                  OR length(CAST(e.name AS BLOB)) > p.path_cap
-                THEN 'E2BIG' ELSE 'ECORRUPT' END
-      FROM params p
-      CROSS JOIN source_valid s
-      CROSS JOIN git_tree_entries_wide e
-     WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-       AND e.storage = s.storage AND e.source_id = s.source_id
-  ),
   walk(path, raw_path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
        before_ancestry, after_ancestry, state_bytes, reserved_bytes, error, error_code) AS (
     SELECT '', CAST('' AS BLOB), 0, CAST('' AS BLOB),
@@ -505,33 +499,52 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
              WHEN p.after_root IS NOT NULL AND
                   (length(p.after_root) != 40 OR p.after_root GLOB '*[^0-9a-f]*')
                THEN 'tree oid is invalid'
-             WHEN p.before_root IS NOT NULL AND p.before_root IS NOT p.after_root AND NOT EXISTS (
-               SELECT 1 FROM source_valid s
-                WHERE s.repo_id = p.repo_id AND s.tree_oid = p.before_root
-             ) THEN 'tree source is invalid; reimport or reclone'
-             WHEN p.after_root IS NOT NULL AND p.before_root IS NOT p.after_root AND NOT EXISTS (
-               SELECT 1 FROM source_valid s
-                WHERE s.repo_id = p.repo_id AND s.tree_oid = p.after_root
-             ) THEN 'tree source is invalid; reimport or reclone'
-             WHEN COALESCE((SELECT s.base_cost + s.object_size + s.entry_count * 51
-                              FROM source_valid s
-                             WHERE s.repo_id = p.repo_id AND s.tree_oid = p.before_root), 0)
-                    + COALESCE((SELECT s.base_cost + s.object_size + s.entry_count * 51
-                                  FROM source_valid s
-                                 WHERE s.repo_id = p.repo_id AND s.tree_oid = p.after_root), 0)
-                    > p.queue_cap
-               THEN 'tree traversal queue exceeds 16 MiB'
              ELSE NULL
            END,
-           CASE WHEN COALESCE((SELECT s.base_cost + s.object_size + s.entry_count * 51
-                                 FROM source_valid s
-                                WHERE s.repo_id = p.repo_id AND s.tree_oid = p.before_root), 0)
-                           + COALESCE((SELECT s.base_cost + s.object_size + s.entry_count * 51
-                                       FROM source_valid s
-                                      WHERE s.repo_id = p.repo_id AND s.tree_oid = p.after_root), 0)
-                           > p.queue_cap THEN 'E2BIG' ELSE 'ECORRUPT' END
+           CASE
+             WHEN p.before_root IS NOT NULL AND
+                  (length(p.before_root) != 40 OR p.before_root GLOB '*[^0-9a-f]*')
+               THEN 'ECORRUPT'
+             WHEN p.after_root IS NOT NULL AND
+                  (length(p.after_root) != 40 OR p.after_root GLOB '*[^0-9a-f]*')
+               THEN 'ECORRUPT'
+             ELSE 'PENDING'
+           END
       FROM params p
      WHERE p.before_root IS NOT p.after_root
+    UNION ALL
+    SELECT w.path, w.raw_path, w.path_bytes, w.sort_key,
+           w.before_mode, w.before_oid, w.after_mode, w.after_oid,
+           w.before_ancestry, w.after_ancestry, w.state_bytes, w.reserved_bytes,
+           CASE
+             WHEN w.before_mode IN ('40000', '040000')
+                  AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
+                           AND w.before_oid = w.after_oid)
+                  AND NOT ${diffSourceValidSql("bx", "bps", "w.before_oid")}
+               THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
+                         ELSE 'tree ' || w.before_oid
+                           || ' has no valid v3 parsed source; reimport or reclone' END
+             WHEN w.after_mode IN ('40000', '040000')
+                  AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
+                           AND w.before_oid = w.after_oid)
+                  AND NOT ${diffSourceValidSql("ax", "aps", "w.after_oid")}
+               THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
+                         ELSE 'tree ' || w.after_oid
+                           || ' has no valid v3 parsed source; reimport or reclone' END
+             ELSE NULL
+           END,
+           'ECORRUPT'
+      FROM walk w
+      CROSS JOIN params p
+      LEFT JOIN git_tree_effective bx
+        ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
+      LEFT JOIN git_tree_sources bps
+        ON bps.source_key = bx.source_key
+      LEFT JOIN git_tree_effective ax
+        ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+      LEFT JOIN git_tree_sources aps
+        ON aps.source_key = ax.source_key
+     WHERE w.error IS NULL AND w.error_code = 'PENDING'
     UNION ALL
     SELECT w.path, w.raw_path, w.path_bytes, w.sort_key,
            w.before_mode, w.before_oid, w.after_mode, w.after_oid,
@@ -539,17 +552,20 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
            'tree traversal queue exceeds 16 MiB', 'E2BIG'
       FROM walk w
       CROSS JOIN params p
-      LEFT JOIN source_valid bps
-        ON bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
+      LEFT JOIN git_tree_effective bx
+        ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
        AND w.before_mode IN ('40000', '040000')
        AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-      LEFT JOIN source_valid aps
-        ON aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
+      LEFT JOIN git_tree_sources bps ON bps.source_key = bx.source_key
+      LEFT JOIN git_tree_effective ax
+        ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
        AND w.after_mode IN ('40000', '040000')
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
+      LEFT JOIN git_tree_sources aps ON aps.source_key = ax.source_key
      WHERE w.error IS NULL
+       AND w.error_code = 'ECORRUPT'
        AND (w.before_mode IN ('40000', '040000') OR w.after_mode IN ('40000', '040000'))
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND COALESCE(w.after_mode IN ('40000', '040000'), 0)
@@ -561,17 +577,21 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                           + aps.entry_count * (w.state_bytes + 51), 0)
            > p.queue_cap
     UNION ALL
-    SELECT CASE WHEN w.path = '' THEN be.name ELSE w.path || '/' || be.name END,
+    SELECT CASE WHEN w.path = '' THEN ${diffEntryNameSql("be")}
+                ELSE w.path || '/' || ${diffEntryNameSql("be")} END,
            CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                           + length(be.name_bytes) <= p.path_cap
                   THEN CASE WHEN w.path = '' THEN be.name_bytes
                             ELSE CAST(w.raw_path || x'2f' || be.name_bytes AS BLOB) END
                 ELSE NULL END,
            w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END + length(be.name_bytes),
-           CAST(CAST(CASE WHEN w.path = '' THEN be.name ELSE w.path || '/' || be.name END AS BLOB)
+           CAST(CAST(CASE WHEN w.path = '' THEN ${diffEntryNameSql("be")}
+                          ELSE w.path || '/' || ${diffEntryNameSql("be")} END AS BLOB)
                 || CASE WHEN be.mode NOT IN ('40000', '040000')
-                          OR ae.mode NOT IN ('40000', '040000') THEN x'00' ELSE x'2f' END AS BLOB),
-           be.mode, be.oid, ae.mode, ae.oid,
+                          OR ae.mode NOT IN ('40000', '040000')
+                        THEN x'00' ELSE x'2f' END AS BLOB),
+           ${diffEntryModeSql("be")}, ${diffEntryOidSql("be")},
+           ${diffEntryModeSql("ae")}, ${diffEntryOidSql("ae")},
            CASE WHEN w.path = '' THEN w.before_ancestry
                 ELSE w.before_ancestry || w.before_oid || '/' END,
            CASE WHEN w.path = '' THEN w.after_ancestry
@@ -599,7 +619,9 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                    + (aps.entry_count - ae.ordinal - 1)
                        * (w.state_bytes + 51 - p.queue_fixed - 18)
                END,
-           COALESCE(be.error, ae.error,
+           COALESCE(${diffEntryErrorSql("be", "bp", "bps")},
+             CASE WHEN ae.ordinal IS NULL THEN NULL
+                  ELSE ${diffEntryErrorSql("ae", "ap", "aps")} END,
              CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                                 + length(be.name_bytes) > p.path_cap
                     THEN 'tree path exceeds 2200 bytes'
@@ -609,68 +631,73 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                   WHEN be.mode IN ('40000', '040000')
                        AND instr(CASE WHEN w.path = '' THEN w.before_ancestry
                                       ELSE w.before_ancestry || w.before_oid || '/' END,
-                                 '/' || be.oid || '/') != 0
-                    THEN 'tree cycle at ' || be.oid
+                                 '/' || ${diffEntryOidSql("be")} || '/') != 0
+                    THEN 'tree cycle at ' || ${diffEntryOidSql("be")}
                   WHEN ae.mode IN ('40000', '040000')
                        AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
                                       WHEN w.after_mode IN ('40000', '040000')
                                         THEN w.after_ancestry || w.after_oid || '/'
                                       ELSE w.after_ancestry END,
-                                 '/' || ae.oid || '/') != 0
-                    THEN 'tree cycle at ' || ae.oid
-                  WHEN be.mode IN ('40000', '040000')
-                       AND NOT (COALESCE(ae.mode IN ('40000', '040000'), 0) AND be.oid = ae.oid)
-                       AND bs.tree_oid IS NULL
-                    THEN 'tree ' || be.oid || ' has no valid v3 parsed source; reimport or reclone'
-                  WHEN ae.mode IN ('40000', '040000')
-                       AND NOT (COALESCE(be.mode IN ('40000', '040000'), 0) AND be.oid = ae.oid)
-                       AND ats.tree_oid IS NULL
-                    THEN 'tree ' || ae.oid || ' has no valid v3 parsed source; reimport or reclone'
+                                 '/' || ${diffEntryOidSql("ae")} || '/') != 0
+                    THEN 'tree cycle at ' || ${diffEntryOidSql("ae")}
                   ELSE NULL END),
-           CASE WHEN be.error_code = 'E2BIG' OR ae.error_code = 'E2BIG'
+           CASE WHEN ${diffEntryTooBigSql("be")}
+                       OR (ae.ordinal IS NOT NULL AND ${diffEntryTooBigSql("ae")})
                        OR w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                             + length(be.name_bytes) > p.path_cap
-                  THEN 'E2BIG' ELSE 'ECORRUPT' END
+                  THEN 'E2BIG'
+                WHEN (be.mode IN ('40000', '040000') OR ae.mode IN ('40000', '040000'))
+                     AND NOT (
+                       COALESCE(be.mode IN ('40000', '040000'), 0)
+                       AND COALESCE(ae.mode IN ('40000', '040000'), 0)
+                       AND be.oid = ae.oid
+                     )
+                  THEN 'PENDING'
+                ELSE 'ECORRUPT' END
       FROM walk w
       CROSS JOIN params p
-      CROSS JOIN edge be
-      LEFT JOIN edge ae
-        ON ae.repo_id = p.repo_id AND ae.tree_oid = w.after_oid
-       AND ae.name_bytes = be.name_bytes
-      LEFT JOIN source_valid bs
-        ON bs.repo_id = p.repo_id AND bs.tree_oid = be.oid
-       AND be.mode IN ('40000', '040000')
-       AND NOT (COALESCE(ae.mode IN ('40000', '040000'), 0) AND be.oid = ae.oid)
-      LEFT JOIN source_valid ats
-        ON ats.repo_id = p.repo_id AND ats.tree_oid = ae.oid
-       AND ae.mode IN ('40000', '040000')
-       AND NOT (COALESCE(be.mode IN ('40000', '040000'), 0) AND be.oid = ae.oid)
-      CROSS JOIN source_valid bps
-      LEFT JOIN source_valid aps
-        ON aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
+      CROSS JOIN git_tree_effective bx
+      CROSS JOIN git_tree_sources bps
+      CROSS JOIN git_tree_entries be
+      LEFT JOIN git_tree_entries bp
+        ON bp.source_key = be.source_key AND bp.ordinal = be.ordinal - 1
+      LEFT JOIN git_tree_effective ax
+        ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
        AND w.after_mode IN ('40000', '040000')
+      LEFT JOIN git_tree_sources aps ON aps.source_key = ax.source_key
+      LEFT JOIN git_tree_entries ae
+        ON ae.source_key = aps.source_key AND ae.name_bytes = be.name_bytes
+       AND typeof(ae.name_bytes) = 'blob'
+       AND length(ae.name_bytes) <= ${TREE_WALK_PATH_BYTES}
+      LEFT JOIN git_tree_entries ap
+        ON ap.source_key = ae.source_key AND ap.ordinal = ae.ordinal - 1
      WHERE w.error IS NULL
+       AND w.error_code = 'ECORRUPT'
        AND (w.before_mode IN ('40000', '040000'))
        AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-       AND be.repo_id = p.repo_id AND be.tree_oid = w.before_oid
-       AND bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
+       AND bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
+       AND bps.source_key = bx.source_key
+       AND be.source_key = bps.source_key
        AND w.reserved_bytes
              + bps.base_cost + bps.object_size + bps.entry_count * (w.state_bytes + 51)
              + COALESCE(aps.base_cost + aps.object_size
                           + aps.entry_count * (w.state_bytes + 51), 0)
            <= p.queue_cap
     UNION ALL
-    SELECT CASE WHEN w.path = '' THEN ae.name ELSE w.path || '/' || ae.name END,
+    SELECT CASE WHEN w.path = '' THEN ${diffEntryNameSql("ae")}
+                ELSE w.path || '/' || ${diffEntryNameSql("ae")} END,
            CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                           + length(ae.name_bytes) <= p.path_cap
                   THEN CASE WHEN w.path = '' THEN ae.name_bytes
                             ELSE CAST(w.raw_path || x'2f' || ae.name_bytes AS BLOB) END
                 ELSE NULL END,
            w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END + length(ae.name_bytes),
-           CAST(CAST(CASE WHEN w.path = '' THEN ae.name ELSE w.path || '/' || ae.name END AS BLOB)
-                || CASE WHEN ae.mode NOT IN ('40000', '040000') THEN x'00' ELSE x'2f' END AS BLOB),
-           NULL, NULL, ae.mode, ae.oid,
+           CAST(CAST(CASE WHEN w.path = '' THEN ${diffEntryNameSql("ae")}
+                          ELSE w.path || '/' || ${diffEntryNameSql("ae")} END AS BLOB)
+                || CASE WHEN ae.mode NOT IN ('40000', '040000')
+                        THEN x'00' ELSE x'2f' END AS BLOB),
+           NULL, NULL, ${diffEntryModeSql("ae")}, ${diffEntryOidSql("ae")},
            w.before_ancestry,
            CASE WHEN w.path = '' THEN w.after_ancestry
                 ELSE w.after_ancestry || w.after_oid || '/' END,
@@ -682,7 +709,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                  * (w.state_bytes + 51 - p.queue_fixed - 18)
              + COALESCE(bps.base_cost + bps.object_size
                           + bps.entry_count * (w.state_bytes + 51), 0),
-           COALESCE(ae.error,
+           COALESCE(${diffEntryErrorSql("ae", "ap", "aps")},
              CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                                 + length(ae.name_bytes) > p.path_cap
                     THEN 'tree path exceeds 2200 bytes'
@@ -692,34 +719,38 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                   WHEN ae.mode IN ('40000', '040000')
                        AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
                                       ELSE w.after_ancestry || w.after_oid || '/' END,
-                                 '/' || ae.oid || '/') != 0
-                    THEN 'tree cycle at ' || ae.oid
-                  WHEN ae.mode IN ('40000', '040000') AND ats.tree_oid IS NULL
-                    THEN 'tree ' || ae.oid || ' has no valid v3 parsed source; reimport or reclone'
+                                 '/' || ${diffEntryOidSql("ae")} || '/') != 0
+                    THEN 'tree cycle at ' || ${diffEntryOidSql("ae")}
                   ELSE NULL END),
-           CASE WHEN ae.error_code = 'E2BIG'
+           CASE WHEN ${diffEntryTooBigSql("ae")}
                        OR w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                             + length(ae.name_bytes) > p.path_cap
-                  THEN 'E2BIG' ELSE 'ECORRUPT' END
+                  THEN 'E2BIG'
+                WHEN ae.mode IN ('40000', '040000') THEN 'PENDING'
+                ELSE 'ECORRUPT' END
       FROM walk w
       CROSS JOIN params p
-      CROSS JOIN edge ae
-      LEFT JOIN edge be
-        ON be.repo_id = p.repo_id AND be.tree_oid = w.before_oid
-       AND be.name_bytes = ae.name_bytes
-      LEFT JOIN source_valid ats
-       ON ats.repo_id = p.repo_id AND ats.tree_oid = ae.oid
-       AND ae.mode IN ('40000', '040000')
-      CROSS JOIN source_valid aps
-      LEFT JOIN source_valid bps
-        ON bps.repo_id = p.repo_id AND bps.tree_oid = w.before_oid
+      CROSS JOIN git_tree_effective ax
+      CROSS JOIN git_tree_sources aps
+      CROSS JOIN git_tree_entries ae
+      LEFT JOIN git_tree_entries ap
+        ON ap.source_key = ae.source_key AND ap.ordinal = ae.ordinal - 1
+      LEFT JOIN git_tree_effective bx
+        ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
        AND w.before_mode IN ('40000', '040000')
+      LEFT JOIN git_tree_sources bps ON bps.source_key = bx.source_key
+      LEFT JOIN git_tree_entries be
+        ON be.source_key = bps.source_key AND be.name_bytes = ae.name_bytes
+       AND typeof(be.name_bytes) = 'blob'
+       AND length(be.name_bytes) <= ${TREE_WALK_PATH_BYTES}
      WHERE w.error IS NULL
+       AND w.error_code = 'ECORRUPT'
        AND w.after_mode IN ('40000', '040000')
        AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                 AND w.before_oid = w.after_oid)
-       AND ae.repo_id = p.repo_id AND ae.tree_oid = w.after_oid
-       AND aps.repo_id = p.repo_id AND aps.tree_oid = w.after_oid
+       AND ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
+       AND aps.source_key = ax.source_key
+       AND ae.source_key = aps.source_key
        AND be.ordinal IS NULL
        AND w.reserved_bytes
              + aps.base_cost + aps.object_size + aps.entry_count * (w.state_bytes + 51)
@@ -734,15 +765,18 @@ SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_mode END AS after_mode,
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_oid END AS after_oid,
        after_mode AS object_mode, after_oid AS object_oid,
-       error, error_code
+       error, CASE WHEN error_code = 'PENDING' THEN 'ECORRUPT'
+                   ELSE error_code END AS error_code
   FROM walk
   CROSS JOIN params p
  WHERE error IS NOT NULL
-    OR ((before_mode NOT IN ('40000', '040000') OR after_mode NOT IN ('40000', '040000'))
+    OR error_code != 'PENDING' AND (
+       ((before_mode NOT IN ('40000', '040000') OR after_mode NOT IN ('40000', '040000'))
         AND NOT (before_mode IS after_mode AND before_oid IS after_oid))
     OR (p.emit_objects != 0 AND after_mode IN ('40000', '040000')
         AND NOT (COALESCE(before_mode IN ('40000', '040000'), 0)
-                 AND before_oid = after_oid))`;
+                 AND before_oid = after_oid)))
+ ORDER BY CASE WHEN error IS NULL THEN 1 ELSE 0 END, sort_key`;
 
 /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
 export function* iterateTree(

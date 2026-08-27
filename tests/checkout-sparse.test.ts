@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import { fromHex, utf8, utf8Decoder } from "../src/core/bytes.js";
+import { fromHex, toHex, utf8, utf8Decoder } from "../src/core/bytes.js";
 import type { GitContext, IndexTrackerSeedEntry } from "../src/core/context.js";
 import { CorruptError } from "../src/core/errors.js";
 import { checkoutSparseChanges, type SparseCheckoutChange } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import { checkout } from "../src/core/ops/refs.js";
 import { hashWorktreePath } from "../src/core/ops/worktree-io.js";
-import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
+import type {
+  SelectedPathRequest,
+  SelectedPathResult,
+  SparseWorkspaceSource,
+} from "../src/core/sparse-workspace.js";
+import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type {
   RemoveOptions,
@@ -17,7 +22,10 @@ import type {
   WriteOptions,
 } from "../src/fs/types.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
-import { createSqliteSparseWorkspaceSource } from "../src/sqlite/sparse-workspace.js";
+import {
+  createSqliteSelectedPathSource,
+  createSqliteSparseWorkspaceSource,
+} from "../src/sqlite/sparse-workspace.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import {
   configureFixtureIdentity,
@@ -155,31 +163,82 @@ function expectFile(workspace: TestRepository, path: string, content: string): v
   expect(utf8Decoder.decode(workspace.worktree.readFile(path))).toBe(content);
 }
 
-function makeChangedFiles(
-  totalFiles: number,
-  changedFiles: number,
-): { workspace: TestRepository; base: string; target: string; paths: string[] } {
+interface SelectedCheckoutCalls {
+  requests: SelectedPathRequest[];
+  statements: number[];
+  hydrates: number;
+}
+
+function selectedCheckoutContext(
+  workspace: TestRepository,
+  calls: SelectedCheckoutCalls,
+): GitContext {
+  const sparse = requireSparseWorkspace(workspace);
+  const selected = createSqliteSelectedPathSource(workspace.database.db);
+  return {
+    ...sparseTrackerContext(workspace),
+    sparseWorkspace: {
+      readState: (checkoutId) => sparse.readState(checkoutId),
+      dirtyPaths: (checkoutId) => sparse.dirtyPaths(checkoutId),
+      hydrate(request) {
+        calls.hydrates++;
+        return sparse.hydrate(request);
+      },
+    },
+    selectedPaths: {
+      select(request) {
+        calls.requests.push(request);
+        const before = workspace.storage.statementCount;
+        const result = selected.select(request);
+        calls.statements.push(workspace.storage.statementCount - before);
+        return result;
+      },
+    },
+  };
+}
+
+function selectedResultContext(
+  workspace: TestRepository,
+  transform: (
+    result: Extract<SelectedPathResult, { available: true }>,
+  ) => Extract<SelectedPathResult, { available: true }> | { available: false },
+): GitContext {
+  const native = createSqliteSelectedPathSource(workspace.database.db);
+  return {
+    ...sparseTrackerContext(workspace),
+    selectedPaths: {
+      select(request) {
+        const result = native.select(request);
+        return result.available ? transform(result) : result;
+      },
+    },
+  };
+}
+
+function makeChangedPathSet(
+  paths: string[],
+  changedPaths: readonly string[],
+): {
+  workspace: TestRepository;
+  base: string;
+  target: string;
+  paths: string[];
+  changedPaths: string[];
+} {
+  const changed = new Set(changedPaths);
   const workspace = makeRepo("/");
   configureFixtureIdentity(workspace);
   const before = utf8.encode("before\n");
   const after = utf8.encode("after\n");
   const beforeOid = workspace.repo.store.write("blob", before);
   const afterOid = workspace.repo.store.write("blob", after);
-  const directories = Math.min(totalFiles, 3_346);
-  const paths = Array.from({ length: totalFiles }, (_, index) => {
-    const directory = index % directories;
-    const generation = Math.floor(index / directories);
-    return `src/d${directory.toString().padStart(4, "0")}/f${generation
-      .toString()
-      .padStart(4, "0")}.txt`;
-  });
   workspace.worktree.writeFiles(
     paths.map((path) => ({ path: `/${path}`, bytes: before, contentId: fromHex(beforeOid) })),
   );
   workspace.repo.store.upsertBlobIds([{ contentId: fromHex(beforeOid), oid: beforeOid }]);
   const stats = new Map(
     workspace.worktree
-      .scan("/", { filesOnly: true, limit: totalFiles + 1 })
+      .scan("/", { filesOnly: true, limit: paths.length + 1 })
       .map((entry) => [entry.path.slice(1), entry]),
   );
   const original = paths.map((path): IndexEntry => {
@@ -199,17 +258,17 @@ function makeChangedFiles(
   workspace.repo.checkout.indexReplace(original);
   const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
   workspace.repo.checkout.indexReplace(
-    original.map((entry, index) =>
-      index < changedFiles ? { ...entry, oid: afterOid, size: after.length } : entry,
+    original.map((entry) =>
+      changed.has(entry.path) ? { ...entry, oid: afterOid, size: after.length } : entry,
     ),
   );
   const target = commit(workspace.context, workspace.repo, {
     message: "target",
-    ...(changedFiles === 0 ? { allowEmpty: true } : {}),
+    ...(changed.size === 0 ? { allowEmpty: true } : {}),
   }).oid;
 
   workspace.worktree.writeFiles(
-    paths.slice(0, changedFiles).map((path) => ({
+    changedPaths.map((path) => ({
       path: `/${path}`,
       bytes: before,
       contentId: fromHex(beforeOid),
@@ -218,7 +277,74 @@ function makeChangedFiles(
   workspace.repo.checkout.indexReplace(original);
   workspace.repo.checkout.setHead(base);
   sealIndexTracker(workspace);
-  return { workspace, base, target, paths };
+  return { workspace, base, target, paths, changedPaths: [...changedPaths] };
+}
+
+function makeChangedFiles(
+  totalFiles: number,
+  changedFiles: number,
+): { workspace: TestRepository; base: string; target: string; paths: string[] } {
+  const directories = Math.min(totalFiles, 3_346);
+  const paths = Array.from({ length: totalFiles }, (_, index) => {
+    const directory = index % directories;
+    const generation = Math.floor(index / directories);
+    return `src/d${directory.toString().padStart(4, "0")}/f${generation
+      .toString()
+      .padStart(4, "0")}.txt`;
+  });
+  return makeChangedPathSet(paths, paths.slice(0, changedFiles));
+}
+
+type ScaleShape = "concentrated" | "spread";
+const scaleCases: ReadonlyArray<readonly [number, ScaleShape]> = [
+  [100, "concentrated"],
+  [100, "spread"],
+  [1_000, "concentrated"],
+  [1_000, "spread"],
+];
+
+function makeScaleChangedFiles(changedFiles: number, shape: ScaleShape) {
+  const concentrated = Array.from(
+    { length: 1_000 },
+    (_, index) => `src/hot/f${index.toString().padStart(4, "0")}.txt`,
+  );
+  const spread = Array.from(
+    { length: 1_000 },
+    (_, index) => `src/spread/d${index.toString().padStart(4, "0")}/file.txt`,
+  );
+  const cold = Array.from(
+    { length: 24_252 - concentrated.length - spread.length },
+    (_, index) =>
+      `src/cold/d${(index % 3_346).toString().padStart(4, "0")}/f${Math.floor(index / 3_346)
+        .toString()
+        .padStart(4, "0")}.txt`,
+  );
+  const paths = [...concentrated, ...spread, ...cold].sort(comparePaths);
+  const selected = shape === "concentrated" ? concentrated : spread;
+  return makeChangedPathSet(paths, selected.slice(0, changedFiles).sort(comparePaths));
+}
+
+function checkoutState(workspace: TestRepository) {
+  return {
+    head: workspace.repo.head(),
+    tree: workspace.repo.headTree(),
+    index: [...workspace.repo.checkout.indexScan()].map(({ path, stage, mode, oid, size }) => ({
+      path,
+      stage,
+      mode,
+      oid,
+      size,
+    })),
+    worktree: workspace.worktree
+      .scan("/", { filesOnly: true, limit: 24_253 })
+      .map(({ path, type, mode, size, contentId }) => ({
+        path,
+        type,
+        mode: mode & 0o777,
+        size,
+        contentId: contentId === null ? null : toHex(contentId),
+      })),
+  };
 }
 
 describe("sparse checkout", () => {
@@ -359,10 +485,11 @@ describe("sparse checkout", () => {
     const { workspace, base } = makeChangedFiles(2, 0);
     const worktree = new NoScanWorktree(workspace.worktree);
     const before = [...workspace.repo.checkout.indexScan()];
+    const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
     workspace.storage.histogram = new Map();
 
     workspace.storage.resetCounters();
-    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+    checkout(selectedCheckoutContext(workspace, calls), workspace.repo, worktree, {
       ref: base,
       force: true,
     });
@@ -380,6 +507,181 @@ describe("sparse checkout", () => {
     ).toEqual([]);
     expect(workspace.repo.head().oid).toBe(base);
     expect(workspace.storage.statementCount).toBeLessThan(40);
+    expect(calls).toEqual({ requests: [], statements: [], hydrates: 0 });
+  });
+
+  it("uses current hydration when exact selected facts are unavailable or over capacity", () => {
+    const { workspace, target } = makeChangedFiles(2, 1);
+    const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+    const context = selectedCheckoutContext(workspace, calls);
+    context.selectedPaths = { select: () => ({ available: false }) };
+    const worktree = new NoScanWorktree(workspace.worktree);
+
+    checkout(context, workspace.repo, worktree, { ref: target });
+
+    expect(calls.hydrates).toBe(1);
+    expect(worktree.writes).toHaveLength(1);
+    expect(workspace.repo.head().oid).toBe(target);
+
+    const capacity = makeChangedFiles(2, 1);
+    const capacityCalls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+    const capacityContext = selectedCheckoutContext(capacity.workspace, capacityCalls);
+    const native = createSqliteSelectedPathSource(capacity.workspace.database.db);
+    capacityContext.selectedPaths = {
+      select: (request) => native.select({ ...request, maxRetainedBytes: 1 }),
+    };
+    checkout(capacityContext, capacity.workspace.repo, capacity.workspace.worktree, {
+      ref: capacity.target,
+    });
+    expect(capacityCalls.hydrates).toBe(1);
+    expect(capacity.workspace.repo.head().oid).toBe(capacity.target);
+  });
+
+  it("accepts the selected mapping retained boundary and hydrates at first excess", () => {
+    const run = (excess: number): SelectedCheckoutCalls => {
+      const fixture = makeChangedFiles(2, 1);
+      const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+      const context = selectedCheckoutContext(fixture.workspace, calls);
+      const native = createSqliteSelectedPathSource(fixture.workspace.database.db);
+      context.selectedPaths = {
+        select(request) {
+          const result = native.select(request);
+          if (!result.available) return result;
+          const limit = request.maxRetainedBytes;
+          if (limit === undefined) throw new Error("missing selected mapping retained limit");
+          // Result + rows vector + one row/index array + their reference slots.
+          const mappingBytes = 64 + 64 + 256 + 64 + 8 + 8;
+          return { ...result, retainedBytes: limit - mappingBytes + excess };
+        },
+      };
+
+      checkout(context, fixture.workspace.repo, fixture.workspace.worktree, {
+        ref: fixture.target,
+      });
+      expect(fixture.workspace.repo.head().oid).toBe(fixture.target);
+      return calls;
+    };
+
+    expect(run(0).hydrates).toBe(0);
+    expect(run(1).hydrates).toBe(1);
+  });
+
+  it("rejects malformed, duplicate, unordered, and extraneous selected facts before mutation", () => {
+    const assertRejected = (
+      transform: (
+        result: Extract<SelectedPathResult, { available: true }>,
+      ) => Extract<SelectedPathResult, { available: true }>,
+    ): void => {
+      const { workspace, base, target, paths } = makeChangedFiles(3, 2);
+      const worktree = new NoScanWorktree(workspace.worktree);
+      const before = paths.map((path) =>
+        utf8Decoder.decode(workspace.worktree.readFile(`/${path}`)),
+      );
+
+      expect(() =>
+        checkout(selectedResultContext(workspace, transform), workspace.repo, worktree, {
+          ref: target,
+        }),
+      ).toThrow(CorruptError);
+      expect(workspace.repo.head().oid).toBe(base);
+      expect(worktree.writes).toEqual([]);
+      expect(worktree.removals).toEqual([]);
+      expect(
+        paths.map((path) => utf8Decoder.decode(workspace.worktree.readFile(`/${path}`))),
+      ).toEqual(before);
+    };
+
+    assertRejected((result) => ({ ...result, retainedBytes: Number.MAX_SAFE_INTEGER }));
+    assertRejected((result) => ({
+      ...result,
+      index: result.index.map((entry, index) => (index === 0 ? { ...entry, stage: 5 } : entry)),
+    }));
+    assertRejected((result) => ({
+      ...result,
+      index: result.index.map((entry, index) =>
+        index === 0 ? { ...entry, path: "invalid\ud800path" } : entry,
+      ),
+    }));
+    assertRejected((result) => ({ ...result, index: [...result.index, ...result.index] }));
+    assertRejected((result) => ({ ...result, worktree: [...result.worktree].reverse() }));
+    assertRejected((result) => ({
+      ...result,
+      worktree: result.worktree.map((entry, index) =>
+        index === 0
+          ? { ...entry, stat: { ...entry.stat, contentId: new Uint8Array(16_384) } }
+          : entry,
+      ),
+    }));
+    assertRejected((result) => ({
+      ...result,
+      retainedBytes: result.retainedBytes + 512,
+      worktree: [
+        ...result.worktree,
+        {
+          path: "unrelated.txt",
+          stat: {
+            type: "file",
+            mode: 0o100644,
+            size: 0,
+            mtime: 0,
+            ino: 1,
+            nlink: 1,
+            rev: 0,
+            target: null,
+            contentId: null,
+          },
+        },
+      ],
+    }));
+  });
+
+  it("uses exact selected facts for non-structural additions and deletions", () => {
+    const workspace = makeRepo("/");
+    configureFixtureIdentity(workspace);
+    writeWorkFile(workspace, "/deleted.txt", "deleted\n");
+    writeWorkFile(workspace, "/kept.txt", "kept\n");
+    stageWorktreePaths(workspace, ["deleted.txt", "kept.txt"]);
+    const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
+
+    workspace.worktree.unlink("/deleted.txt");
+    workspace.repo.checkout.indexRemove("deleted.txt");
+    writeWorkFile(workspace, "/added.txt", "added\n");
+    stageWorktreePaths(workspace, ["added.txt"]);
+    const target = commit(workspace.context, workspace.repo, { message: "target" }).oid;
+    checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
+    sealIndexTracker(workspace);
+
+    const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+    const worktree = new NoScanWorktree(workspace.worktree);
+    checkout(selectedCheckoutContext(workspace, calls), workspace.repo, worktree, { ref: target });
+    expectFile(workspace, "/added.txt", "added\n");
+    expect(workspace.worktree.stat("/deleted.txt")).toBeNull();
+    expectFile(workspace, "/kept.txt", "kept\n");
+
+    checkout(selectedCheckoutContext(workspace, calls), workspace.repo, worktree, {
+      ref: base,
+      force: true,
+    });
+    expect(workspace.worktree.stat("/added.txt")).toBeNull();
+    expectFile(workspace, "/deleted.txt", "deleted\n");
+    expect(calls).toMatchObject({ statements: [2, 2], hydrates: 0 });
+  });
+
+  it("uses the exact selected path across a shallow commit boundary", () => {
+    const fixture = makeChangedFiles(2, 1);
+    fixture.workspace.repo.store.setShallow([fixture.base]);
+    const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+
+    checkout(
+      selectedCheckoutContext(fixture.workspace, calls),
+      fixture.workspace.repo,
+      fixture.workspace.worktree,
+      { ref: fixture.target },
+    );
+
+    expect(fixture.workspace.repo.head().oid).toBe(fixture.target);
+    expect(fixture.workspace.repo.shallow()).toEqual(new Set([fixture.base]));
+    expect(calls).toMatchObject({ statements: [2], hydrates: 0 });
   });
 
   it("uses legacy force to restore a dirty tracked path outside the tree diff", () => {
@@ -405,31 +707,87 @@ describe("sparse checkout", () => {
     }
   });
 
-  it("rewrites one hundred paths in a 24,252-file workspace without a full scan", () => {
-    const { workspace, target, paths } = makeChangedFiles(24_252, 100);
-    const worktree = new NoScanWorktree(workspace.worktree);
+  it.each(scaleCases)(
+    "matches legacy for %i %s changes in both directions through exact selected facts",
+    (changedFiles, shape) => {
+      const sparse = makeScaleChangedFiles(changedFiles, shape);
+      const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+      const worktree = new NoScanWorktree(sparse.workspace.worktree);
+      const baseTree = sparse.workspace.repo.readCommit(sparse.base).tree;
+      const targetTree = sparse.workspace.repo.readCommit(sparse.target).tree;
 
-    workspace.storage.resetCounters();
-    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, { ref: target });
+      sparse.workspace.storage.resetCounters();
+      const forwardDiff = [...sparse.workspace.repo.walkTreeDiff(baseTree, targetTree)];
+      expect(forwardDiff.map((entry) => entry.path)).toEqual(sparse.changedPaths);
+      expect(sparse.workspace.storage.statementCount).toBe(1);
 
-    expect(worktree.writes).toEqual(paths.slice(0, 100).map((path) => `/${path}`));
-    expect(worktree.removals).toEqual([]);
-    expect(worktree.reads).toBe(0);
-    expect(worktree.rangeReads).toBe(0);
-    expect(worktree.bulkReadPaths).toEqual([]);
-    expect(workspace.storage.statementCount).toBe(61);
-    expect(workspace.storage.rowCount).toBeLessThan(10_000);
-    expect(workspace.repo.head().oid).toBe(target);
-    expect(
-      workspace.context.sparseWorkspace?.readState(workspace.repo.checkout.checkoutId),
-    ).toEqual({
-      available: true,
-      baselineTreeOid: workspace.repo.headTree(),
-    });
-    expect([
-      ...workspace.context.sparseWorkspace!.dirtyPaths(workspace.repo.checkout.checkoutId),
-    ]).toEqual([]);
-  });
+      sparse.workspace.storage.resetCounters();
+      const reverseDiff = [...sparse.workspace.repo.walkTreeDiff(targetTree, baseTree)];
+      expect(reverseDiff.map((entry) => entry.path)).toEqual(sparse.changedPaths);
+      expect(sparse.workspace.storage.statementCount).toBe(1);
+
+      sparse.workspace.storage.resetCounters();
+      checkout(selectedCheckoutContext(sparse.workspace, calls), sparse.workspace.repo, worktree, {
+        ref: sparse.target,
+      });
+      const forwardStatements = sparse.workspace.storage.statementCount;
+
+      expect(worktree.writes).toEqual(sparse.changedPaths.map((path) => `/${path}`));
+      expect(worktree.removals).toEqual([]);
+      expect(worktree.reads).toBe(0);
+      expect(worktree.rangeReads).toBe(0);
+      expect(worktree.bulkReadPaths).toEqual([]);
+      expect(forwardStatements).toBeLessThan(1_000);
+      const selectedForward = checkoutState(sparse.workspace);
+
+      worktree.writes.length = 0;
+      sparse.workspace.storage.resetCounters();
+      checkout(selectedCheckoutContext(sparse.workspace, calls), sparse.workspace.repo, worktree, {
+        ref: sparse.base,
+        force: true,
+      });
+      const reverseStatements = sparse.workspace.storage.statementCount;
+
+      expect(worktree.writes).toEqual(sparse.changedPaths.map((path) => `/${path}`));
+      expect(reverseStatements).toBeLessThan(1_000);
+      const selectedReverse = checkoutState(sparse.workspace);
+      expect(calls.hydrates).toBe(0);
+      expect(calls.statements).toEqual([2, 2]);
+      expect(calls.requests).toHaveLength(2);
+      for (const request of calls.requests) {
+        expect(request.specs).toHaveLength(changedFiles);
+        expect(request.specs.every((spec) => !spec.recursive)).toBe(true);
+        expect(request.specs.map((spec) => spec.path)).toEqual(
+          [...request.specs.map((spec) => spec.path)].sort(comparePaths),
+        );
+      }
+      expect(
+        sparse.workspace.context.sparseWorkspace?.readState(
+          sparse.workspace.repo.checkout.checkoutId,
+        ),
+      ).toEqual({ available: true, baselineTreeOid: sparse.workspace.repo.headTree() });
+      expect([
+        ...sparse.workspace.context.sparseWorkspace!.dirtyPaths(
+          sparse.workspace.repo.checkout.checkoutId,
+        ),
+      ]).toEqual([]);
+
+      checkout(
+        withoutSparseCheckout(sparse.workspace.context),
+        sparse.workspace.repo,
+        sparse.workspace.worktree,
+        { ref: sparse.target, force: true },
+      );
+      expect(checkoutState(sparse.workspace)).toEqual(selectedForward);
+      checkout(
+        withoutSparseCheckout(sparse.workspace.context),
+        sparse.workspace.repo,
+        sparse.workspace.worktree,
+        { ref: sparse.base, force: true },
+      );
+      expect(checkoutState(sparse.workspace)).toEqual(selectedReverse);
+    },
+  );
 
   it("matches structural checkout semantics for clean force", () => {
     const workspace = makeRepo("/");
@@ -458,7 +816,8 @@ describe("sparse checkout", () => {
     checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
     sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree);
-    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+    const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+    checkout(selectedCheckoutContext(workspace, calls), workspace.repo, worktree, {
       ref: target,
       force: true,
     });
@@ -472,7 +831,7 @@ describe("sparse checkout", () => {
 
     worktree.writes.length = 0;
     worktree.removals.length = 0;
-    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, {
+    checkout(selectedCheckoutContext(workspace, calls), workspace.repo, worktree, {
       ref: base,
       force: true,
     });
@@ -482,6 +841,8 @@ describe("sparse checkout", () => {
     expect(workspace.worktree.stat("/added")).toBeNull();
     expect((workspace.worktree.stat("/mode.txt")?.mode ?? 0) & 0o777).toBe(0o644);
     expect(workspace.worktree.readlink("/link")).toBe("before");
+    expect(calls.requests).toEqual([]);
+    expect(calls.hydrates).toBe(2);
   });
 
   it("falls back before mutation for dirty, unavailable, oversized, conflict, and gitlink state", () => {
@@ -517,15 +878,17 @@ describe("sparse checkout", () => {
 
     const oversized = makeChangedFiles(1_001, 1_001);
     const oversizedWorktree = new NoScanWorktree(oversized.workspace.worktree);
+    const oversizedCalls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
     expect(() =>
       checkout(
-        sparseTrackerContext(oversized.workspace),
+        selectedCheckoutContext(oversized.workspace, oversizedCalls),
         oversized.workspace.repo,
         oversizedWorktree,
         { ref: oversized.target },
       ),
     ).toThrow(/must not scan/);
     expect(oversizedWorktree.writes).toEqual([]);
+    expect(oversizedCalls).toEqual({ requests: [], statements: [], hydrates: 0 });
 
     const conflicted = makeChangedFiles(2, 1);
     const oid = conflicted.workspace.repo.store.write("blob", utf8.encode("stage\n"));

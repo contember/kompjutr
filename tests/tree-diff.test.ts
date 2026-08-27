@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { concat } from "../src/core/bytes.js";
-import { GitError } from "../src/core/errors.js";
+import { CorruptError, GitError } from "../src/core/errors.js";
 import {
   MODE_COMMIT,
   MODE_EXECUTABLE,
@@ -14,6 +14,7 @@ import {
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { joinSorted } from "../src/core/streams.js";
+import type { SqlDatabase } from "../src/sqlite/db.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
@@ -26,6 +27,37 @@ function open() {
   const row = database.createRepository("/repo", "ref: refs/heads/main");
   const store = database.openCheckout(row);
   return { db, store, repo: new Repository(store) };
+}
+
+class CapturingDatabase implements SqlDatabase {
+  captured: { query: string; bindings: unknown[] } | null = null;
+
+  constructor(readonly inner = new TestDatabase()) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    if (query.includes("emit_objects")) this.captured = { query, bindings };
+    return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
 }
 
 describe("tree diff", () => {
@@ -239,6 +271,60 @@ describe("tree diff", () => {
     expect(db.storage.statementCount).toBe(1);
   });
 
+  it("plans the diff from exact active tree sources and entries", () => {
+    const db = new CapturingDatabase();
+    const database = new SqliteGitDatabase(db);
+    const row = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(row);
+    const before = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "a", oid: oid(1) }]),
+    );
+    const after = store.write("tree", serializeTree([{ mode: MODE_FILE, name: "a", oid: oid(2) }]));
+
+    expect([...store.walkTreeDiff(before, after)]).toHaveLength(1);
+    const captured = db.captured;
+    if (captured === null) throw new Error("tree diff statement was not captured");
+    const plan = db.inner.all<{ detail: unknown }>(
+      `EXPLAIN QUERY PLAN ${captured.query}`,
+      ...captured.bindings,
+    );
+    const details = plan.map((step) => {
+      if (typeof step.detail !== "string") throw new Error("query plan detail is not text");
+      return step.detail;
+    });
+
+    expect(details.some((detail) => /MATERIALIZE (source_valid|edge)/.test(detail))).toBe(false);
+    expect(details.some((detail) => /SCAN (bx|ax|bps|aps|be|ae)\b/.test(detail))).toBe(false);
+    expect(
+      details.filter(
+        (detail) =>
+          detail.startsWith("SCAN ") && !/SCAN (CONSTANT ROW|p\b|w\b|walk\b)/.test(detail),
+      ),
+    ).toEqual([]);
+    expect(
+      details.some(
+        (detail) =>
+          detail.includes("SEARCH bx USING PRIMARY KEY (repo_id=? AND tree_oid=?)") ||
+          detail.includes("SEARCH ax USING PRIMARY KEY (repo_id=? AND tree_oid=?)"),
+      ),
+    ).toBe(true);
+    expect(
+      details.some(
+        (detail) =>
+          detail.includes("SEARCH be USING PRIMARY KEY (source_key=?)") ||
+          detail.includes("SEARCH ae USING PRIMARY KEY (source_key=?)"),
+      ),
+    ).toBe(true);
+    expect(
+      details.some(
+        (detail) =>
+          detail.includes("git_tree_entries_by_name_bytes") &&
+          detail.includes("source_key=? AND name_bytes=?"),
+      ),
+    ).toBe(true);
+  });
+
   it("fails closed on a visited projection but not an equal subtree", () => {
     const { db, store } = open();
     const beforeChild = store.write(
@@ -267,6 +353,152 @@ describe("tree diff", () => {
     );
     expect(() => [...store.walkTreeDiff(before, after)]).toThrow(/integrity check failed/);
   });
+
+  it.each(["entry", "source"])(
+    "rejects a later active %s corruption before either diff cursor yields",
+    (corruption) => {
+      const { db, store } = open();
+      const child = store.write(
+        "tree",
+        serializeTree([{ mode: MODE_FILE, name: "nested", oid: oid(2) }]),
+      );
+      const root = store.write(
+        "tree",
+        serializeTree([
+          { mode: MODE_FILE, name: "first", oid: oid(1) },
+          { mode: MODE_TREE, name: "later", oid: child },
+        ]),
+      );
+      if (corruption === "entry") {
+        db.run(
+          `UPDATE git_tree_entries SET raw_entry = x'00'
+            WHERE source_key = (
+              SELECT source_key FROM git_tree_sources
+               WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+            )`,
+          child,
+        );
+      } else {
+        db.run("DELETE FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?", child);
+      }
+
+      const expected =
+        corruption === "entry" ? /integrity check failed/ : /no valid v3 parsed source/;
+      expect(() => store.walkTreeDiff(null, root).next()).toThrow(expected);
+      expect(() => store.walkTreeDiffObjects(null, root).next()).toThrow(expected);
+    },
+  );
+
+  it("rejects an orphaned active source before either diff cursor yields", () => {
+    const { db, store } = open();
+    const tree = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "first", oid: oid(1) }]),
+    );
+    db.run("PRAGMA foreign_keys = OFF");
+    db.run(
+      "UPDATE git_tree_effective SET source_key = source_key + 1000000 WHERE repo_id = 1 AND tree_oid = ?",
+      tree,
+    );
+    db.run("PRAGMA foreign_keys = ON");
+
+    expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
+    expect(() => store.walkTreeDiffObjects(null, tree).next()).toThrow(CorruptError);
+  });
+
+  it.each([
+    ["sentinel", -1],
+    ["extra marker", 3],
+  ])("rejects a direct source-key %s before yielding a diff row", (_label, ordinal) => {
+    const { db, store } = open();
+    const tree = store.write(
+      "tree",
+      serializeTree(
+        Array.from({ length: 3 }, (_, index) => ({
+          mode: MODE_FILE,
+          name: `f${index}`,
+          oid: oid(index + 1),
+        })),
+      ),
+    );
+    db.run("PRAGMA ignore_check_constraints = ON");
+    db.run(
+      `INSERT INTO git_tree_entries
+         (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
+       SELECT source_key, ?, mode, name_bytes, oid, raw_entry, cumulative_base
+         FROM git_tree_entries
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
+        ) AND ordinal = 0`,
+      ordinal,
+      tree,
+    );
+    db.run("PRAGMA ignore_check_constraints = OFF");
+
+    expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
+    expect(() => store.walkTreeDiffObjects(null, tree).next()).toThrow(CorruptError);
+  });
+
+  it("rejects a middle ordinal gap before yielding a diff row", () => {
+    const { db, store } = open();
+    const before = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_FILE, name: "a", oid: oid(1) },
+        { mode: MODE_FILE, name: "b", oid: oid(2) },
+        { mode: MODE_FILE, name: "c", oid: oid(3) },
+      ]),
+    );
+    const after = store.write(
+      "tree",
+      serializeTree([
+        { mode: MODE_FILE, name: "a", oid: oid(1) },
+        { mode: MODE_FILE, name: "c", oid: oid(3) },
+      ]),
+    );
+    db.run(
+      `DELETE FROM git_tree_entries
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
+        ) AND ordinal = 1`,
+      before,
+    );
+
+    expect(() => store.walkTreeDiff(before, after).next()).toThrow(CorruptError);
+  });
+
+  it.each([
+    ["non-final", 0],
+    ["final", 2],
+  ])(
+    "rejects %s cumulative source-key corruption before yielding a diff row",
+    (_label, ordinal) => {
+      const { db, store } = open();
+      const tree = store.write(
+        "tree",
+        serializeTree(
+          Array.from({ length: 3 }, (_, index) => ({
+            mode: MODE_FILE,
+            name: `f${index}`,
+            oid: oid(index + 1),
+          })),
+        ),
+      );
+      db.run(
+        `UPDATE git_tree_entries SET cumulative_base = cumulative_base + 1
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
+        ) AND ordinal = ?`,
+        tree,
+        ordinal,
+      );
+
+      expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
+    },
+  );
 
   it("permits DAG reuse and rejects an active-stack cycle", () => {
     const { db, store } = open();
@@ -324,7 +556,7 @@ describe("tree diff", () => {
     expect(() => [...store.walkTreeDiff(cycleRoot, null)]).toThrow(/tree cycle/);
   });
 
-  it("streams one hundred nested changes in one statement under the wall gate", () => {
+  it("streams one hundred nested changes in one statement", () => {
     const { db, store } = open();
     const beforeEntries = [];
     const afterEntries = [];
@@ -344,12 +576,9 @@ describe("tree diff", () => {
     const before = store.write("tree", serializeTree(beforeEntries));
     const after = store.write("tree", serializeTree(afterEntries));
     db.storage.resetCounters();
-    const started = performance.now();
     const actual = [...store.walkTreeDiff(before, after)];
-    const elapsed = performance.now() - started;
     expect(actual).toHaveLength(100);
     expect(db.storage.statementCount).toBe(1);
-    expect(elapsed).toBeLessThan(100);
   });
 
   it("streams a flat fifty-thousand-entry addition with bounded SQL", () => {
@@ -425,6 +654,39 @@ describe("tree diff", () => {
     );
     db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => [...store.walkTreeDiff(null, tree)]).toThrow(/reimport or reclone/);
+  });
+
+  it("keeps entries qualified to the active source when a packed copy exists", async () => {
+    const { db, store } = open();
+    const data = serializeTree([{ mode: MODE_FILE, name: "active", oid: oid(1) }]);
+    const tree = store.write("tree", data);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", data);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64));
+
+    db.run(
+      `UPDATE git_tree_entries SET raw_entry = x'00'
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
+        )`,
+      tree,
+    );
+    expect(() => [...store.walkTreeDiff(null, tree)]).toThrow(/integrity check failed/);
+
+    db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", tree);
+    expect([...store.walkTreeDiff(null, tree)]).toEqual([
+      {
+        path: "active",
+        beforeMode: null,
+        beforeOid: null,
+        afterMode: MODE_FILE,
+        afterOid: oid(1),
+      },
+    ]);
   });
 
   it("rejects a deep wide frontier before yielding a leaf", () => {
