@@ -15,13 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None. The next sprint has not started.
+- [`sprints/sprint-2026-08-28-agent-git-and-file-selection.md`](sprints/sprint-2026-08-28-agent-git-and-file-selection.md)
+  — synchronous local Git for agent pipelines and bounded tracked/untracked/
+  non-ignored file selection for the builder.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Next: agent-side synchronous Git commands plus bounded tracked/untracked/
+- Active: agent-side synchronous Git commands plus bounded tracked/untracked/
   non-ignored file selection for the builder.
 - Phase 1 then ends at a real consumer-adapter integration gate before later
   work is re-planned — [`backlog/README.md`](backlog/README.md#consumer-demand).

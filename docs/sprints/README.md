@@ -20,4 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None. The next sprint is selected in [`../backlog/README.md`](../backlog/README.md).
+- [`sprint-2026-08-28-agent-git-and-file-selection.md`](sprint-2026-08-28-agent-git-and-file-selection.md)
+  — synchronous local Git for agent pipelines and bounded tracked/untracked/
+  non-ignored file selection for the builder.
