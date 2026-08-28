@@ -8,12 +8,24 @@ const rootExcludes = [
   "--exclude=tests/fs/**",
   "--exclude=tests/shell/**",
   "--exclude=tests/e2e/**",
+  "--exclude=tests/pack.test.ts",
 ];
 const rootShardCount = 8;
+const packSlices = [
+  "full-object pack stream|delta|real git packs",
+  "synthetic pack ingest",
+  "pack fallback preservation",
+  "pack deferred resolution",
+  "pack publication and deletion",
+];
 const slices = [
   ...Array.from({ length: rootShardCount }, (_, index) => ({
     name: `root ${index + 1}/${rootShardCount}`,
     args: [...rootExcludes, `--shard=${index + 1}/${rootShardCount}`],
+  })),
+  ...packSlices.map((pattern, index) => ({
+    name: `pack ${index + 1}/${packSlices.length}`,
+    args: ["tests/pack.test.ts", `--testNamePattern=^(${pattern})`],
   })),
   { name: "filesystem", args: ["tests/fs"] },
   { name: "shell", args: ["tests/shell"] },

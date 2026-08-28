@@ -1355,7 +1355,9 @@ describe("synthetic pack ingest", () => {
     expect(store.cachedCommit(firstOid)).toBeNull();
     expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_pack_data")).toBe(0);
   });
+});
 
+describe("pack fallback preservation", () => {
   it("promotes a complete duplicate when its canonical pack is reclaimed", async () => {
     const store = open();
     const data = syntheticCommit(1);
@@ -2034,7 +2036,9 @@ describe("synthetic pack ingest", () => {
       ),
     ).toEqual({ storage: "pack", source_id: fallback.packId });
   });
+});
 
+describe("pack deferred resolution", () => {
   it("batches 500 parsed trees below the operation statement ceiling", async () => {
     const measure = async (count: number) => {
       const db = new TestDatabase();
@@ -2903,7 +2907,9 @@ describe("synthetic pack ingest", () => {
       expect(() => openWithLimit(invalid)).toThrow(/finite non-negative integer/);
     }
   });
+});
 
+describe("pack publication and deletion", () => {
   it("keeps pending trees invisible and selects them only on completion", () => {
     const store = open();
     const oid = "1".repeat(40);
