@@ -335,3 +335,7 @@ resolved before implementation.
   initial bare-ref BLOB read regressed the indexed log cost witness, so bare
   refs now verify bounded object metadata only and payload reads remain
   suffix/path-driven.
+- WU2 shipped raw guarded update/delete with `null` absence and preserved the
+  legacy Computer surface. All 101 focused tests passed; the slowest slice was
+  `refs.test.ts` at 35.56 s. Typecheck and Biome passed, and Singer's independent
+  T3 review found no material issues.

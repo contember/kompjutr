@@ -3,7 +3,7 @@
 
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
 import type { IndexEntry, IndexStore } from "../../sqlite/store.js";
-import { utf8 } from "../bytes.js";
+import { isOid, utf8 } from "../bytes.js";
 import { type GitContext, type GitIdentity, openRepository } from "../context.js";
 import { CorruptError, GitError, ObjectNotFoundError } from "../errors.js";
 import { hashObject as hashRaw, type Person } from "../objects.js";
@@ -419,7 +419,7 @@ function requireCommitTreeInputBytes(left: number, right: number): number {
   return bytes;
 }
 
-export interface UpdateRefOptions {
+export interface UpdateRefWriteOptions {
   /** Ref to write, e.g. "refs/heads/main" or "HEAD". */
   ref: string;
   /** Oid, or the ref name a symbolic ref should point at. */
@@ -427,7 +427,37 @@ export interface UpdateRefOptions {
   /** Overwrite a ref that already exists. */
   force?: boolean;
   symbolic?: boolean;
+  delete?: never;
+  expected?: never;
 }
+
+export interface UpdateRefGuardedOptions {
+  /** Full direct `refs/...` name; guarded HEAD and symref writes are invalid. */
+  ref: string;
+  /** Full oid to store. */
+  value: string;
+  /** Full raw oid to compare, or null when the ref must be absent. */
+  expected: string | null;
+  force?: never;
+  symbolic?: never;
+  delete?: never;
+}
+
+export interface UpdateRefDeleteOptions {
+  /** Full direct `refs/...` name to delete. */
+  ref: string;
+  delete: true;
+  /** Full raw oid to compare, or null when the ref must be absent. */
+  expected?: string | null;
+  value?: never;
+  force?: never;
+  symbolic?: never;
+}
+
+export type UpdateRefOptions =
+  | UpdateRefWriteOptions
+  | UpdateRefGuardedOptions
+  | UpdateRefDeleteOptions;
 
 export interface ReadRefOptions {
   /** Exact `HEAD` or full `refs/...` name to read without following it. */
@@ -461,13 +491,71 @@ export function readRef(repo: Repository, options: ReadRefOptions): RawRefTarget
  * performs.
  */
 export function updateRef(context: GitContext, repo: Repository, options: UpdateRefOptions): void {
-  if (options.force !== true && repo.store.getRef(options.ref) !== null) {
+  const deletion: unknown = Reflect.get(options, "delete");
+  const expected: unknown = Reflect.get(options, "expected");
+  const force: unknown = Reflect.get(options, "force");
+  const symbolic: unknown = Reflect.get(options, "symbolic");
+  const value: unknown = Reflect.get(options, "value");
+  if (deletion !== undefined && deletion !== true) {
+    throw new GitError("EINVAL", "update-ref delete must be true when present");
+  }
+  if (expected !== undefined || deletion === true) {
+    const ref = requireDirectUpdateRef(options.ref);
+    if (force !== undefined || symbolic !== undefined) {
+      throw new GitError("EINVAL", "guarded and delete ref updates reject force and symbolic");
+    }
+    const checkedExpected =
+      expected === undefined ? undefined : expected === null ? null : requireDirectOid(expected);
+    const metadata = operationRefLogMetadata(context, repo, "update-ref");
+    if (deletion === true) {
+      if (value !== undefined) throw new GitError("EINVAL", "delete ref update rejects value");
+      repo.mutateRefs(
+        {
+          deletes: [ref],
+          expected:
+            checkedExpected === undefined ? undefined : { name: ref, target: checkedExpected },
+        },
+        metadata,
+      );
+      return;
+    }
+    const target = requireDirectOid(value);
+    repo.typeOf(target);
+    repo.mutateRefs(
+      { puts: [{ name: ref, target }], expected: { name: ref, target: checkedExpected ?? null } },
+      metadata,
+    );
+    return;
+  }
+  if (typeof value !== "string") throw new GitError("EINVAL", "update-ref value is required");
+  if (force !== undefined && typeof force !== "boolean") {
+    throw new GitError("EINVAL", "update-ref force must be boolean");
+  }
+  if (symbolic !== undefined && typeof symbolic !== "boolean") {
+    throw new GitError("EINVAL", "update-ref symbolic must be boolean");
+  }
+  if (force !== true && repo.store.getRef(options.ref) !== null) {
     throw new GitError("EUPDATEREFFAIL", `ref ${options.ref} already exists`);
   }
-  const target = options.symbolic === true ? `ref: ${options.value}` : repo.revParse(options.value);
+  const target = symbolic === true ? `ref: ${value}` : repo.revParse(value);
+  if (symbolic !== true) repo.typeOf(target);
   const mutation =
     options.ref === "HEAD" ? { head: target } : { puts: [{ name: options.ref, target }] };
   repo.mutateRefs(mutation, operationRefLogMetadata(context, repo, "update-ref"));
+}
+
+function requireDirectUpdateRef(value: unknown): string {
+  if (typeof value !== "string" || !value.startsWith("refs/") || value.length === "refs/".length) {
+    throw new GitError("EINVAL", "guarded and delete ref updates require a full refs/... name");
+  }
+  return value;
+}
+
+function requireDirectOid(value: unknown): string {
+  if (typeof value !== "string" || !isOid(value) || value === "0".repeat(40)) {
+    throw new GitError("EINVAL", "guarded ref updates require a non-zero full oid");
+  }
+  return value;
 }
 
 export interface RepoRootOptions {

@@ -8,6 +8,33 @@ import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 describe("Computer client operation interlocks", () => {
+  it("preserves legacy direct and symbolic update-ref behavior", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({
+      storage,
+      git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
+      defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
+    });
+    await workspace.git.init({});
+    await workspace.fs.writeFile("/file.txt", "first\n");
+    await workspace.git.add({ paths: ["file.txt"] });
+    const first = await workspace.git.commit({ message: "first" });
+    await workspace.fs.writeFile("/file.txt", "second\n");
+    await workspace.git.add({ paths: ["file.txt"] });
+    const second = await workspace.git.commit({ message: "second" });
+
+    await workspace.git.updateRef({ ref: "refs/heads/copy", value: first.oid });
+    await expect(workspace.git.revParse({ ref: "copy" })).resolves.toBe(first.oid);
+    await workspace.git.updateRef({ ref: "refs/heads/copy", value: second.oid, force: true });
+    await expect(workspace.git.revParse({ ref: "copy" })).resolves.toBe(second.oid);
+    await workspace.git.updateRef({
+      ref: "refs/heads/alias",
+      value: "refs/heads/copy",
+      symbolic: true,
+    });
+    await expect(workspace.git.revParse({ ref: "alias" })).resolves.toBe(second.oid);
+  });
+
   it("keeps Computer rm cached-only, recursive, and unconditional", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({

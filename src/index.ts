@@ -42,6 +42,11 @@ export {
   type ReadTreeOptions,
   readRef,
   readTree,
+  type UpdateRefDeleteOptions,
+  type UpdateRefGuardedOptions,
+  type UpdateRefOptions,
+  type UpdateRefWriteOptions,
+  updateRef,
   writeTree,
 } from "./core/ops/plumbing.js";
 export type { CommitView, TreeEntryView } from "./core/ops/reads.js";
@@ -136,6 +141,7 @@ export {
   type GitStatusOptions,
   type GitStatusReport,
   type GitStatusReportOptions,
+  type GitUpdateRefOptions,
   type GitWorktreeAddOptions,
   type GitWorktreeRemoveOptions,
   type GitWriteTreeOptions,

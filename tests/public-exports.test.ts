@@ -9,6 +9,10 @@ import type {
   ReadRefOptions as GitCoreReadRefOptions,
   ReadTreeOptions as GitCoreReadTreeOptions,
   StatusReport as GitCoreStatusReport,
+  UpdateRefDeleteOptions as GitCoreUpdateRefDeleteOptions,
+  UpdateRefGuardedOptions as GitCoreUpdateRefGuardedOptions,
+  UpdateRefOptions as GitCoreUpdateRefOptions,
+  UpdateRefWriteOptions as GitCoreUpdateRefWriteOptions,
   WorktreeAddOptions as GitCoreWorktreeAddOptions,
   WorktreeRemoveOptions as GitCoreWorktreeRemoveOptions,
   GitDivergenceOptions,
@@ -42,6 +46,7 @@ import type {
   GitScratchIndexOptions,
   GitScratchReadTreeOptions,
   StatusFormatOptions as GitStatusFormatOptions,
+  GitUpdateRefOptions,
   GitWorktreeAddOptions,
   WorktreeAddTarget as GitWorktreeAddTarget,
   WorktreeInfo as GitWorktreeInfo,
@@ -54,6 +59,7 @@ import {
   readRef as gitReadRef,
   readTree as gitReadTree,
   statusFormatOptions as gitStatusFormatOptions,
+  updateRef as gitUpdateRef,
   worktreeAdd as gitWorktreeAdd,
   worktreeList as gitWorktreeList,
   worktreePrune as gitWorktreePrune,
@@ -70,6 +76,10 @@ import type {
   ReadRefOptions as RootCoreReadRefOptions,
   ReadTreeOptions as RootCoreReadTreeOptions,
   StatusReport as RootCoreStatusReport,
+  UpdateRefDeleteOptions as RootCoreUpdateRefDeleteOptions,
+  UpdateRefGuardedOptions as RootCoreUpdateRefGuardedOptions,
+  UpdateRefOptions as RootCoreUpdateRefOptions,
+  UpdateRefWriteOptions as RootCoreUpdateRefWriteOptions,
   WorktreeAddOptions as RootCoreWorktreeAddOptions,
   WorktreeRemoveOptions as RootCoreWorktreeRemoveOptions,
   DivergenceRelationship as RootDivergenceRelationship,
@@ -78,6 +88,7 @@ import type {
   GitDivergenceOptions as RootGitDivergenceOptions,
   GitReadRefOptions as RootGitReadRefOptions,
   GitRevParseOptions as RootGitRevParseOptions,
+  GitUpdateRefOptions as RootGitUpdateRefOptions,
   GitWorktreeAddOptions as RootGitWorktreeAddOptions,
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
   RawRefTarget as RootRawRefTarget,
@@ -115,6 +126,7 @@ import {
   readRef as rootReadRef,
   readTree as rootReadTree,
   statusFormatOptions as rootStatusFormatOptions,
+  updateRef as rootUpdateRef,
   worktreeAdd as rootWorktreeAdd,
   worktreeList as rootWorktreeList,
   worktreePrune as rootWorktreePrune,
@@ -263,6 +275,54 @@ describe("public bounded read exports", () => {
       rootDivergence,
       gitReadRef,
       rootReadRef,
+    ]);
+  });
+});
+
+describe("public guarded ref exports", () => {
+  it("exposes matching write, guarded, delete, and facade unions", () => {
+    const write: RootCoreUpdateRefWriteOptions = {
+      ref: "HEAD",
+      value: "refs/heads/main",
+      force: true,
+      symbolic: true,
+    };
+    const gitWrite: GitCoreUpdateRefWriteOptions = write;
+    const guarded: RootCoreUpdateRefGuardedOptions = {
+      ref: "refs/heads/main",
+      value: "2".repeat(40),
+      expected: "1".repeat(40),
+    };
+    const gitGuarded: GitCoreUpdateRefGuardedOptions = guarded;
+    const deletion: RootCoreUpdateRefDeleteOptions = {
+      ref: "refs/heads/checkpoint",
+      delete: true,
+      expected: null,
+    };
+    const gitDeletion: GitCoreUpdateRefDeleteOptions = deletion;
+    const core: RootCoreUpdateRefOptions = guarded;
+    const gitCore: GitCoreUpdateRefOptions = core;
+    const facade: RootGitUpdateRefOptions = { ...deletion, dir: "/repo" };
+    const gitFacade: GitUpdateRefOptions = facade;
+    const rootMethods: readonly (keyof RootGit)[] = ["updateRef"];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
+
+    expect([
+      gitWrite.symbolic,
+      gitGuarded.expected,
+      gitDeletion.delete,
+      gitCore.ref,
+      gitFacade.dir,
+      gitMethods,
+      gitUpdateRef,
+    ]).toEqual([
+      true,
+      "1".repeat(40),
+      true,
+      "refs/heads/main",
+      "/repo",
+      rootMethods,
+      rootUpdateRef,
     ]);
   });
 });

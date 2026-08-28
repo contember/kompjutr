@@ -351,6 +351,25 @@ describe("createSqliteGitClient", () => {
     });
   });
 
+  it("exposes guarded direct-ref update and deletion", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/guarded-ref";
+    await git.init({ dir });
+    const first = await commitFile(git, workspace, dir, "file.txt", "first\n", "first");
+    const second = await commitFile(git, workspace, dir, "file.txt", "second\n", "second");
+    const ref = "refs/heads/checkpoint";
+
+    await git.updateRef({ dir, ref, value: first, expected: null });
+    await expect(git.readRef({ dir, ref })).resolves.toEqual({ kind: "direct", oid: first });
+    await expect(git.updateRef({ dir, ref, value: second, expected: null })).rejects.toMatchObject({
+      code: "ESTALEHEAD",
+    });
+    await git.updateRef({ dir, ref, value: second, expected: first });
+    await expect(git.readRef({ dir, ref })).resolves.toEqual({ kind: "direct", oid: second });
+    await git.updateRef({ dir, ref, delete: true, expected: second });
+    await expect(git.readRef({ dir, ref })).resolves.toEqual({ kind: "absent" });
+  });
+
   it("selects checkout-local HEAD while sharing refs across an unequal-id cold reopen", async () => {
     const { git, workspace } = makeNativeGit();
     await git.init({ dir: "/primary" });

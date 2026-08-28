@@ -525,6 +525,51 @@ describe("local ref operations", () => {
     ).toBe(count);
   });
 
+  it("logs guarded ref endpoints and emits nothing for stale or absent no-ops", () => {
+    const workspace = repository();
+    stage(workspace, "one\n");
+    const first = commit(workspace.context, workspace.repo, { message: "first" }).oid;
+    stage(workspace, "two\n");
+    const second = commit(workspace.context, workspace.repo, { message: "second" }).oid;
+    const ref = "refs/heads/guarded";
+
+    updateRef(workspace.context, workspace.repo, { ref, value: first, expected: null });
+    updateRef(workspace.context, workspace.repo, { ref, value: second, expected: first });
+    const beforeStale = workspace.repo.store.reflog(ref);
+    expect(() =>
+      updateRef(workspace.context, workspace.repo, { ref, value: first, expected: first }),
+    ).toThrow(expect.objectContaining({ code: "ESTALEHEAD" }));
+    expect(workspace.repo.store.reflog(ref)).toEqual(beforeStale);
+
+    updateRef(workspace.context, workspace.repo, { ref, delete: true, expected: second });
+    expect(workspace.repo.store.reflog(ref)).toEqual([
+      expect.objectContaining({
+        oldRaw: second,
+        newRaw: null,
+        oldOid: second,
+        newOid: null,
+        reason: "update-ref",
+      }),
+      expect.objectContaining({
+        oldRaw: first,
+        newRaw: second,
+        oldOid: first,
+        newOid: second,
+        reason: "update-ref",
+      }),
+      expect.objectContaining({
+        oldRaw: null,
+        newRaw: first,
+        oldOid: null,
+        newOid: first,
+        reason: "update-ref",
+      }),
+    ]);
+    const afterDelete = workspace.repo.store.reflog(ref);
+    updateRef(workspace.context, workspace.repo, { ref, delete: true, expected: null });
+    expect(workspace.repo.store.reflog(ref)).toEqual(afterDelete);
+  });
+
   it("routes a shared branch publication to its owning checkout and rolls every event back", () => {
     const workspace = repository();
     const first = workspace.repo.store.write("blob", new TextEncoder().encode("first\n"));

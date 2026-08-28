@@ -1266,6 +1266,103 @@ describe("plumbing", () => {
     expect(symbolicRef(ws.repo)).toBe(fixture.git("symbolic-ref", "HEAD"));
   });
 
+  it("updates and deletes direct refs only when the raw expected oid matches", () => {
+    const side = fixture.git("rev-parse", "side");
+    const main = fixture.git("rev-parse", "main");
+    const ref = "refs/heads/guarded";
+
+    updateRef(ws.context, ws.repo, { ref, value: side, expected: null });
+    fixture.git("update-ref", ref, side, "0".repeat(40));
+    expect(readRef(ws.repo, { ref })).toEqual({ kind: "direct", oid: side });
+
+    expect(() => updateRef(ws.context, ws.repo, { ref, value: main, expected: null })).toThrow(
+      expect.objectContaining({ code: "ESTALEHEAD" }),
+    );
+    expect(fixture.gitResult("update-ref", ref, main, "0".repeat(40)).status).not.toBe(0);
+    expect(readRef(ws.repo, { ref })).toEqual({ kind: "direct", oid: side });
+
+    updateRef(ws.context, ws.repo, { ref, value: main, expected: side });
+    fixture.git("update-ref", ref, main, side);
+    expect(readRef(ws.repo, { ref })).toEqual({ kind: "direct", oid: main });
+
+    expect(() => updateRef(ws.context, ws.repo, { ref, delete: true, expected: side })).toThrow(
+      expect.objectContaining({ code: "ESTALEHEAD" }),
+    );
+    expect(fixture.gitResult("update-ref", "-d", ref, side).status).not.toBe(0);
+    expect(readRef(ws.repo, { ref })).toEqual({ kind: "direct", oid: main });
+
+    updateRef(ws.context, ws.repo, { ref, delete: true, expected: main });
+    fixture.git("update-ref", "-d", ref, main);
+    expect(readRef(ws.repo, { ref })).toEqual({ kind: "absent" });
+    updateRef(ws.context, ws.repo, { ref, delete: true });
+    fixture.git("update-ref", "-d", ref);
+    updateRef(ws.context, ws.repo, { ref, delete: true, expected: null });
+    expect(readRef(ws.repo, { ref })).toEqual({ kind: "absent" });
+
+    const coldRef = "refs/heads/cold-guarded";
+    updateRef(ws.context, ws.repo, { ref: coldRef, value: side, expected: null });
+    const checkout = ws.database.findCheckout("/");
+    if (checkout === null) throw new Error("checkout disappeared before reopen");
+    const reopened = new Repository(ws.database.openCheckout(checkout));
+    updateRef(ws.context, reopened, { ref: coldRef, value: main, expected: side });
+    expect(readRef(reopened, { ref: coldRef })).toEqual({ kind: "direct", oid: main });
+
+    const checkoutB = ws.database.createCheckout(
+      ws.repo.store.repoId,
+      "/linked",
+      "ref: refs/heads/side",
+    );
+    const linked = new Repository(ws.database.openCheckout(checkoutB));
+    updateRef(ws.context, linked, { ref: coldRef, delete: true, expected: main });
+    expect(readRef(ws.repo, { ref: coldRef })).toEqual({ kind: "absent" });
+  });
+
+  it("rejects guarded HEAD, symbolic, force, zero-oid, and missing-target forms", () => {
+    const side = fixture.git("rev-parse", "side");
+    const main = fixture.git("rev-parse", "main");
+    const symbolic = "refs/heads/guarded-alias";
+    ws.repo.store.setRef(symbolic, "ref: refs/heads/side");
+
+    expect(() =>
+      updateRef(ws.context, ws.repo, { ref: "HEAD", value: main, expected: side }),
+    ).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      Reflect.apply(updateRef, undefined, [
+        ws.context,
+        ws.repo,
+        { ref: "refs/heads/invalid", value: main, expected: null, symbolic: false },
+      ]),
+    ).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      Reflect.apply(updateRef, undefined, [
+        ws.context,
+        ws.repo,
+        { ref: "refs/heads/invalid", value: main, expected: null, force: false },
+      ]),
+    ).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      updateRef(ws.context, ws.repo, {
+        ref: "refs/heads/invalid",
+        value: main,
+        expected: "0".repeat(40),
+      }),
+    ).toThrow(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      updateRef(ws.context, ws.repo, {
+        ref: "refs/heads/missing-target",
+        value: "f".repeat(40),
+        expected: null,
+      }),
+    ).toThrow(expect.objectContaining({ code: "ENOTFOUND" }));
+    expect(() =>
+      updateRef(ws.context, ws.repo, { ref: symbolic, value: main, expected: side }),
+    ).toThrow(expect.objectContaining({ code: "ESTALEHEAD" }));
+    expect(readRef(ws.repo, { ref: symbolic })).toEqual({
+      kind: "symbolic",
+      target: "refs/heads/side",
+    });
+  });
+
   it("reads direct, absent, dangling, and chained refs like real Git without following", () => {
     const mainOid = fixture.git("rev-parse", "main");
     fixture.git("update-ref", "refs/remotes/origin/main", mainOid);
