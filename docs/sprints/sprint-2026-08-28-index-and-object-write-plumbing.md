@@ -255,3 +255,11 @@ git diff --check
   tree-object shape remains below 1,000 statements; independent review is clean,
   all 24 focused tests pass, and 126 commit/integration lifecycle tests remain
   green.
+- 2026-08-28: WU4 added detached `commitTree` with exact-message serialization,
+  authenticated tree and parent sources, two ordered parents, duplicate
+  suppression, and a cumulative eight-traversal revision bound. Identity
+  resolution bounds only the source selected by precedence. Review found and
+  closed scratch-preflight rollback, cumulative revision-cost, and packed tree
+  authentication gaps; a 4.2 MiB tree now authenticates identically loose or
+  packed. Independent review is clean, all 166 focused pack, commit, and
+  plumbing tests pass, and typecheck and Biome remain green.

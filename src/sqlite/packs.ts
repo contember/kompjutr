@@ -1368,7 +1368,7 @@ export class PackStore {
     const available: string[] = [];
     let outputBytes = 0;
     const outputLimit =
-      pendingPackId !== null && wanted.length === 1
+      wanted.length === 1 && (pendingPackId !== null || bypassCache)
         ? MAX_PACK_DELTA_WORKING_BYTES
         : MAX_PACK_BLOB_BATCH_BYTES;
     for (const oid of wanted) {

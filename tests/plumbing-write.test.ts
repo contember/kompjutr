@@ -8,7 +8,15 @@ import type { GitContext } from "../src/core/context.js";
 import { GitError } from "../src/core/errors.js";
 import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
-import { readTree, writeTree } from "../src/core/ops/plumbing.js";
+import {
+  commitTree,
+  MAX_COMMIT_TREE_INPUT_BYTES,
+  MAX_COMMIT_TREE_MESSAGE_BYTES,
+  MAX_COMMIT_TREE_PARENTS,
+  MAX_COMMIT_TREE_REVISION_TRAVERSALS,
+  readTree,
+  writeTree,
+} from "../src/core/ops/plumbing.js";
 import { add } from "../src/core/ops/staging.js";
 import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
@@ -25,6 +33,7 @@ import {
   resealIndexTracker,
   WORKTREE_DIRTY,
 } from "../src/sqlite/index-tracker.js";
+import { MAX_PACK_BLOB_BATCH_BYTES } from "../src/sqlite/packs.js";
 import type { IndexEntry, IndexStore } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -216,6 +225,28 @@ function readOnlyIndex(open: () => IterableIterator<IndexEntry>): IndexStore {
   };
 }
 
+function corruptLooseObject(workspace: TestRepository, oid: string): void {
+  workspace.database.db.run(
+    "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
+    workspace.repo.store.repoId,
+    oid,
+  );
+  workspace.database.db.run(
+    `UPDATE git_object_chunks SET data = zeroblob((
+       SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
+     )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
+    workspace.repo.store.repoId,
+    oid,
+    workspace.repo.store.repoId,
+    oid,
+  );
+  workspace.database.db.run(
+    "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq > 0",
+    workspace.repo.store.repoId,
+    oid,
+  );
+}
+
 describe("tree and index write plumbing", () => {
   it("matches Git write-tree for checkout, scratch, empty, mixed-mode, and non-BMP indexes", async () => {
     const fixture = newFixture();
@@ -385,6 +416,365 @@ describe("tree and index write plumbing", () => {
     expect(statements).toBeLessThan(1_000);
     expect(controlState(workspace)).toEqual(beforeControl);
     expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("matches Git commit-tree for exact messages and zero, one, and two parents", async () => {
+    const fixture = newFixture();
+    fixture.write("tracked.txt", "base\n");
+    const base = fixture.commit("base");
+    const tree = fixture.git("rev-parse", `${base}^{tree}`);
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.checkout);
+    const identity = { name: "Fixture", email: "fixture@example.com" };
+    const exactMessage = "  leading\n\ntrailing  ";
+    const expectedRoot = fixture.gitInput(exactMessage, "commit-tree", tree);
+    const expectedChild = fixture.gitInput("child\n", "commit-tree", tree, "-p", expectedRoot);
+    const expectedMerge = fixture.gitInput(
+      "merge\n",
+      "commit-tree",
+      tree,
+      "-p",
+      expectedRoot,
+      "-p",
+      expectedChild,
+    );
+    const expectedDuplicate = fixture.gitInput(
+      "duplicate\n",
+      "commit-tree",
+      tree,
+      "-p",
+      expectedRoot,
+      "-p",
+      expectedRoot,
+    );
+    const beforeControl = controlState(workspace);
+    const beforeWorktree = worktreeState(workspace);
+
+    const root = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: exactMessage,
+      author: identity,
+      committer: identity,
+    });
+    const child = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "child\n",
+      parent: [root],
+      author: identity,
+      committer: identity,
+    });
+    const merge = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "merge\n",
+      parent: [root, child],
+      author: identity,
+      committer: identity,
+    });
+    const duplicate = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "duplicate\n",
+      parent: [root, root],
+      author: identity,
+      committer: identity,
+    });
+
+    expect(root).toBe(expectedRoot);
+    expect(child).toBe(expectedChild);
+    expect(merge).toBe(expectedMerge);
+    expect(duplicate).toBe(expectedDuplicate);
+    expect(workspace.repo.readCommit(root).message).toBe(exactMessage);
+    expect(workspace.repo.readCommit(merge).parent).toEqual([root, child]);
+    expect(workspace.repo.readCommit(duplicate).parent).toEqual([root]);
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual(beforeWorktree);
+  });
+
+  it("bounds only the identity source selected by precedence", () => {
+    const workspace = makeRepo("/");
+    const tree = workspace.repo.store.write("tree", new Uint8Array(0));
+    const oversized = "x".repeat(1_025);
+    workspace.context.defaultIdentity = { name: oversized, email: "default@example.com" };
+    workspace.repo.store.configSet("user.name", oversized);
+    workspace.repo.store.configSet("user.email", "configured@example.com");
+    const beforeControl = controlState(workspace);
+
+    const explicit = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "explicit\n",
+      author: { name: "Explicit Author", email: "author@example.com" },
+      committer: { name: "Explicit Committer", email: "committer@example.com" },
+      env: {
+        GIT_AUTHOR_NAME: oversized,
+        GIT_AUTHOR_EMAIL: "ignored-author@example.com",
+        GIT_COMMITTER_NAME: "ignored\ncommitter",
+        GIT_COMMITTER_EMAIL: "ignored-committer@example.com",
+      },
+    });
+    const environment = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "environment\n",
+      env: {
+        GIT_AUTHOR_NAME: "Environment Author",
+        GIT_AUTHOR_EMAIL: "environment-author@example.com",
+        GIT_COMMITTER_NAME: "Environment Committer",
+        GIT_COMMITTER_EMAIL: "environment-committer@example.com",
+      },
+    });
+
+    expect(workspace.repo.readCommit(explicit)).toMatchObject({
+      author: { name: "Explicit Author" },
+      committer: { name: "Explicit Committer" },
+    });
+    expect(workspace.repo.readCommit(environment)).toMatchObject({
+      author: { name: "Environment Author" },
+      committer: { name: "Environment Committer" },
+    });
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("authenticates tree and parent sources before writing a commit", () => {
+    const workspace = makeRepo("/");
+    workspace.context.defaultIdentity = { name: "Fixture", email: "fixture@example.com" };
+    const blob = workspace.repo.store.write("blob", utf8.encode("content\n"));
+    const tree = workspace.repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "tracked.txt", oid: blob }]),
+    );
+    const parent = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "parent\n",
+    });
+    const corruptTree = workspace.repo.store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "corrupt.txt", oid: blob }]),
+    );
+    const corruptParent = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "corrupt parent\n",
+    });
+    corruptLooseObject(workspace, corruptTree);
+    corruptLooseObject(workspace, corruptParent);
+    const missing = "f".repeat(40);
+    const beforeObjects = workspace.repo.store.objectCount();
+    const beforeControl = controlState(workspace);
+    const beforeWorktree = worktreeState(workspace);
+    const failures = [
+      () => commitTree(workspace.context, workspace.repo, { tree: missing, message: "missing" }),
+      () => commitTree(workspace.context, workspace.repo, { tree: blob, message: "blob tree" }),
+      () => commitTree(workspace.context, workspace.repo, { tree: parent, message: "commit tree" }),
+      () =>
+        commitTree(workspace.context, workspace.repo, {
+          tree,
+          message: "missing parent",
+          parent: [missing],
+        }),
+      () =>
+        commitTree(workspace.context, workspace.repo, {
+          tree,
+          message: "blob parent",
+          parent: [blob],
+        }),
+      () =>
+        commitTree(workspace.context, workspace.repo, {
+          tree: corruptTree,
+          message: "corrupt tree",
+        }),
+      () =>
+        commitTree(workspace.context, workspace.repo, {
+          tree,
+          message: "corrupt parent",
+          parent: [parent, corruptParent],
+        }),
+    ];
+
+    for (const fail of failures) {
+      expect(fail).toThrow();
+      expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    }
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual(beforeWorktree);
+  });
+
+  it("authenticates the same large tree from a complete pack", async () => {
+    const fixture = newFixture();
+    const blob = fixture.writeObject("blob", new Uint8Array(0));
+    const suffix = "x".repeat(385);
+    const treeBytes = serializeTree(
+      Array.from({ length: 10_000 }, (_, index) => ({
+        mode: MODE_FILE,
+        name: `f${index.toString().padStart(5, "0")}-${suffix}`,
+        oid: blob,
+      })),
+    );
+    expect(treeBytes.length).toBeGreaterThan(MAX_PACK_BLOB_BATCH_BYTES);
+    const tree = fixture.writeObject("tree", treeBytes);
+    fixture.git("update-ref", "refs/tags/large-tree", tree);
+    const expected = fixture.gitInput("large tree\n", "commit-tree", tree);
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.checkout);
+    const identity = { name: "Fixture", email: "fixture@example.com" };
+    const beforeControl = controlState(workspace);
+
+    const oid = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "large tree\n",
+      author: identity,
+      committer: identity,
+    });
+
+    expect(oid).toBe(expected);
+    expect(workspace.repo.readCommit(oid).tree).toBe(tree);
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("fails closed at commit-tree count, text, identity, and aggregate input limits", () => {
+    const workspace = makeRepo("/");
+    workspace.context.defaultIdentity = { name: "Fixture", email: "fixture@example.com" };
+    const tree = workspace.repo.store.write("tree", new Uint8Array(0));
+    const parent = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "parent\n",
+    });
+    const beforeObjects = workspace.repo.store.objectCount();
+    const beforeControl = controlState(workspace);
+
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, {
+        tree,
+        message: "too many parents",
+        parent: Array.from({ length: MAX_COMMIT_TREE_PARENTS + 1 }, () => parent),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, {
+        tree,
+        message: "too many traversals",
+        parent: [`${parent}~${MAX_COMMIT_TREE_REVISION_TRAVERSALS + 1}`],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, {
+        tree,
+        message: "x".repeat(MAX_COMMIT_TREE_MESSAGE_BYTES + 1),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, {
+        tree,
+        message: "x".repeat(MAX_COMMIT_TREE_INPUT_BYTES - tree.length + 1),
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, {
+        tree,
+        message: "large identity",
+        author: { name: "x".repeat(1_025), email: "author@example.com" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, {
+        tree,
+        message: "header injection",
+        author: { name: "bad\nname", email: "author@example.com" },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+
+    workspace.context.defaultIdentity = undefined;
+    workspace.repo.store.configSet("user.name", "x".repeat(1_025));
+    workspace.repo.store.configSet("user.email", "configured@example.com");
+    expect(() =>
+      commitTree(workspace.context, workspace.repo, { tree, message: "large config" }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("resolves the maximal packed parent list below the SQL gate", async () => {
+    const fixture = newFixture();
+    const tree = fixture.writeObject("tree", new Uint8Array(0));
+    const roots: string[] = [];
+    const parent: string[] = [];
+    const depth = MAX_COMMIT_TREE_REVISION_TRAVERSALS / MAX_COMMIT_TREE_PARENTS;
+    for (let index = 0; index < MAX_COMMIT_TREE_PARENTS; index++) {
+      let current = fixture.gitInput(`root ${index}\n`, "commit-tree", tree);
+      roots.push(current);
+      for (let ordinal = 0; ordinal < depth; ordinal++) {
+        current = fixture.gitInput(
+          `chain ${index}/${ordinal}\n`,
+          "commit-tree",
+          tree,
+          "-p",
+          current,
+        );
+      }
+      fixture.git("update-ref", `refs/remotes/chain-${index}/HEAD`, current);
+      parent.push(`chain-${index}~${depth}`);
+    }
+    const expected = fixture.gitInput(
+      "wide merge\n",
+      "commit-tree",
+      tree,
+      ...roots.flatMap((oid) => ["-p", oid]),
+    );
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.checkout);
+    workspace.context.defaultIdentity = { name: "Fixture", email: "fixture@example.com" };
+    workspace.repo.store.write("blob", utf8.encode("loose lookup probe\n"));
+    const beforeControl = controlState(workspace);
+    const beforeStatements = workspace.storage.statementCount;
+
+    const oid = commitTree(workspace.context, workspace.repo, {
+      tree,
+      parent,
+      message: "wide merge\n",
+    });
+
+    expect(oid).toBe(expected);
+    expect(workspace.repo.readCommit(oid).parent).toEqual(roots);
+    expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("poisons a scratch session after a caught commit-tree preflight failure", () => {
+    const workspace = makeRepo("/");
+    workspace.context.defaultIdentity = { name: "Fixture", email: "fixture@example.com" };
+    const tree = workspace.repo.store.write("tree", new Uint8Array(0));
+    const blob = workspace.repo.store.write("blob", utf8.encode("tracked\n"));
+    const beforeObjects = workspace.repo.store.objectCount();
+    const beforeControl = controlState(workspace);
+    let caughtCode = "";
+
+    expect(() =>
+      workspace.repo.store.withScratchIndex("commit-preflight", (scratch) => {
+        scratch.indexReplace([indexed("tracked.txt", blob)]);
+        try {
+          commitTree(workspace.context, workspace.repo, {
+            tree,
+            message: "x".repeat(MAX_COMMIT_TREE_MESSAGE_BYTES + 1),
+          });
+        } catch (error) {
+          if (!(error instanceof GitError)) throw error;
+          caughtCode = error.code;
+        }
+        workspace.repo.store.write("blob", utf8.encode("must roll back\n"));
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+
+    expect(caughtCode).toBe("E2BIG");
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual([]);
+    expect(workspace.database.db.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(
+      0,
+    );
+    expect(
+      workspace.database.db.scalar<number>("SELECT count(*) FROM git_scratch_index_entries"),
+    ).toBe(0);
   });
 
   it("matches a Git alternate-index snapshot without changing checkout state", async () => {

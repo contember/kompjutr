@@ -1,6 +1,7 @@
 // Recording a commit: the index becomes trees, the trees become a commit,
 // and the ref HEAD points at moves to it.
 
+import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
 import { MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, hasErrorCode, MissingIdentityError } from "../errors.js";
@@ -157,6 +158,19 @@ export function writeUnpublishedCommit(
   return writeCommitObjects(repo, options, { mode: "exact", value: options.message });
 }
 
+/** Caller owns the transaction and has authenticated the explicit tree and parents. */
+export function writeUnpublishedCommitFromTree(
+  repo: Repository,
+  tree: string,
+  options: UnpublishedCommitOptions,
+): string {
+  const data = serializedCommit(options, { mode: "exact", value: options.message }, tree);
+  if (data.length > MAX_INDEXED_COMMIT_BYTES) {
+    throw new GitError("E2BIG", `commit exceeds ${MAX_INDEXED_COMMIT_BYTES} bytes`);
+  }
+  return repo.store.writeObjects((batch) => batch.write("commit", data));
+}
+
 /** Materialize the stage-zero index through one shared object encoder. */
 function writeCommitObjects(
   repo: Repository,
@@ -280,28 +294,36 @@ export function resolveIdentity(
   repo: Repository,
   options: Pick<CommitOptions, "author" | "committer" | "env">,
   amended?: Commit,
+  maxIdentityBytes?: number,
 ): CommitIdentities {
   const env = options.env ?? {};
-  const config = identityOf(repo.store.configGet("user.name"), repo.store.configGet("user.email"));
+  const explicitAuthor = identityOf(options.author?.name, options.author?.email);
+  const amendedAuthor = identityOf(amended?.author.name, amended?.author.email);
+  const environmentAuthor = identityOf(env.GIT_AUTHOR_NAME, env.GIT_AUTHOR_EMAIL);
+  const explicitCommitter = identityOf(options.committer?.name, options.committer?.email);
+  const environmentCommitter = identityOf(
+    env.GIT_COMMITTER_NAME ?? env.GIT_AUTHOR_NAME,
+    env.GIT_COMMITTER_EMAIL ?? env.GIT_AUTHOR_EMAIL,
+  );
+  const authorBeforeConfig = explicitAuthor ?? amendedAuthor ?? environmentAuthor;
+  const committerBeforeConfig = explicitCommitter ?? environmentCommitter;
+  const config =
+    maxIdentityBytes !== undefined && authorBeforeConfig !== null && committerBeforeConfig !== null
+      ? null
+      : identityOf(
+          maxIdentityBytes === undefined
+            ? repo.store.configGet("user.name")
+            : repo.store.configGetBounded("user.name", maxIdentityBytes),
+          maxIdentityBytes === undefined
+            ? repo.store.configGet("user.email")
+            : repo.store.configGetBounded("user.email", maxIdentityBytes),
+        );
   const fallback = identityOf(context.defaultIdentity?.name, context.defaultIdentity?.email);
 
-  const author =
-    identityOf(options.author?.name, options.author?.email) ??
-    identityOf(amended?.author.name, amended?.author.email) ??
-    identityOf(env.GIT_AUTHOR_NAME, env.GIT_AUTHOR_EMAIL) ??
-    config ??
-    fallback;
+  const author = authorBeforeConfig ?? config ?? fallback;
   if (author === null) throw new MissingIdentityError();
 
-  const committer =
-    identityOf(options.committer?.name, options.committer?.email) ??
-    identityOf(
-      env.GIT_COMMITTER_NAME ?? env.GIT_AUTHOR_NAME,
-      env.GIT_COMMITTER_EMAIL ?? env.GIT_AUTHOR_EMAIL,
-    ) ??
-    config ??
-    fallback ??
-    author;
+  const committer = committerBeforeConfig ?? config ?? fallback ?? author;
 
   const now = stamp(context);
   return {

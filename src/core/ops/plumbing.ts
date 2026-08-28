@@ -1,14 +1,21 @@
 // Plumbing: hashing bytes, reading raw objects, writing refs, and finding
 // the repository a directory belongs to.
 
+import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
 import type { IndexEntry, IndexStore } from "../../sqlite/store.js";
 import { utf8 } from "../bytes.js";
-import { type GitContext, openRepository } from "../context.js";
-import { GitError, ObjectNotFoundError } from "../errors.js";
-import { hashObject as hashRaw } from "../objects.js";
+import { type GitContext, type GitIdentity, openRepository } from "../context.js";
+import { CorruptError, GitError, ObjectNotFoundError } from "../errors.js";
+import { hashObject as hashRaw, type Person } from "../objects.js";
 import type { Repository } from "../repository.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree } from "./checkout.js";
+import {
+  type CommitIdentities,
+  resolveIdentity,
+  writeUnpublishedCommitFromTree,
+} from "./commit.js";
+import { MAX_MERGE_IDENTITY_BYTES, MAX_MERGE_MESSAGE_BYTES } from "./merge-state.js";
 import { type CatFileResult, catFile as readObject, treeOf } from "./reads.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import {
@@ -24,6 +31,11 @@ import {
 const READ_TREE_MAX_ROWS_PER_STREAM = 50_000;
 const READ_TREE_MAX_WRITE_BYTES = 64 * 1024 * 1024;
 const WRITE_TREE_INDEX_PAGE = 2_048;
+export const MAX_COMMIT_TREE_PARENTS = 2;
+export const MAX_COMMIT_TREE_REVISION_TRAVERSALS = 8;
+export const MAX_COMMIT_TREE_MESSAGE_BYTES = MAX_MERGE_MESSAGE_BYTES;
+export const MAX_COMMIT_TREE_INPUT_BYTES = MAX_INDEXED_COMMIT_BYTES;
+const COMMIT_TREE_EXECUTION_MEMORY_BYTES = 24 * 1024 * 1024;
 
 export interface HashObjectOptions {
   content: Uint8Array | string;
@@ -152,6 +164,259 @@ export function writeTree(repo: Repository, index: IndexStore = repo.checkout): 
       }
     }),
   );
+}
+
+export interface CommitTreeOptions {
+  /** Exact tree revision; commit and tag objects are not peeled. */
+  tree: string;
+  /** Exact commit message, without porcelain cleanup. */
+  message: string;
+  /** Ordered commit revisions; duplicates keep their first occurrence. */
+  parent?: readonly string[];
+  author?: GitIdentity;
+  committer?: GitIdentity;
+  /** Read for GIT_AUTHOR_* / GIT_COMMITTER_* identity fields. */
+  env?: Record<string, string>;
+}
+
+interface CheckedCommitTreeInput {
+  tree: string;
+  message: string;
+  parent: readonly string[];
+  bytes: number;
+}
+
+/** Write one detached commit object without changing refs, indexes, or the worktree. */
+export function commitTree(
+  context: GitContext,
+  repo: Repository,
+  options: CommitTreeOptions,
+): string {
+  return repo.store.runScratchAwareOperation(() => {
+    const input = checkCommitTreeInput(options);
+    return repo.store.db.transactionSync(() => {
+      const reservation = repo.store.reserveMemory();
+      try {
+        reservation.set("commit", COMMIT_TREE_EXECUTION_MEMORY_BYTES);
+        const tree = repo.revParse(input.tree);
+        authenticateCommitTreeObject(repo, tree, "tree", MAX_TREE_BUILD_SERIALIZED_BYTES);
+
+        const parent: string[] = [];
+        const seen = new Set<string>();
+        for (const expression of input.parent) {
+          const oid = repo.revParse(expression);
+          if (seen.has(oid)) continue;
+          seen.add(oid);
+          authenticateCommitTreeObject(repo, oid, "commit", MAX_INDEXED_COMMIT_BYTES);
+          parent.push(oid);
+        }
+
+        const identities = resolveIdentity(
+          context,
+          repo,
+          options,
+          undefined,
+          MAX_MERGE_IDENTITY_BYTES,
+        );
+        const identityBytes = validateCommitIdentities(identities);
+        requireCommitTreeInputBytes(input.bytes, identityBytes);
+        return writeUnpublishedCommitFromTree(repo, tree, {
+          message: input.message,
+          parent,
+          identities,
+        });
+      } finally {
+        reservation.dispose();
+      }
+    });
+  });
+}
+
+function authenticateCommitTreeObject(
+  repo: Repository,
+  oid: string,
+  expectedType: "tree" | "commit",
+  maxBytes: number,
+): void {
+  const info = repo.store.typeAndSize(oid);
+  if (info === null) throw new ObjectNotFoundError(oid);
+  if (info.type !== expectedType) {
+    throw new CorruptError(`${oid} is a ${info.type}, not a ${expectedType}`);
+  }
+  if (info.size > maxBytes) {
+    throw new GitError("E2BIG", `${expectedType} ${oid} exceeds ${maxBytes} bytes`);
+  }
+  if (expectedType === "commit") {
+    repo.readAuthenticatedCommit(oid);
+    return;
+  }
+  if (repo.store.readAuthenticatedObject(oid, expectedType) === null) {
+    throw new ObjectNotFoundError(oid);
+  }
+}
+
+function checkCommitTreeInput(options: CommitTreeOptions): CheckedCommitTreeInput {
+  const tree: unknown = Reflect.get(options, "tree");
+  const message: unknown = Reflect.get(options, "message");
+  const rawParent: unknown = Reflect.get(options, "parent");
+  if (typeof tree !== "string" || tree === "") {
+    throw new GitError("EINVAL", "commit-tree requires a tree revision");
+  }
+  if (typeof message !== "string") {
+    throw new GitError("EINVAL", "commit-tree requires a message");
+  }
+  if (rawParent !== undefined && !Array.isArray(rawParent)) {
+    throw new GitError("EINVAL", "commit-tree parent must be an array of revisions");
+  }
+  const candidates: readonly unknown[] = rawParent === undefined ? [] : rawParent;
+  if (candidates.length > MAX_COMMIT_TREE_PARENTS) {
+    throw new GitError("E2BIG", `commit-tree exceeds ${MAX_COMMIT_TREE_PARENTS} parent revisions`);
+  }
+
+  let bytes = boundedCommitTreeText(tree, "tree revision", MAX_COMMIT_TREE_INPUT_BYTES);
+  let traversals = commitTreeRevisionTraversals(tree);
+  bytes = requireCommitTreeInputBytes(
+    bytes,
+    boundedCommitTreeText(message, "message", MAX_COMMIT_TREE_MESSAGE_BYTES),
+  );
+  const parent: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string" || candidate === "") {
+      throw new GitError("EINVAL", "commit-tree parent revisions must be non-empty strings");
+    }
+    bytes = requireCommitTreeInputBytes(
+      bytes,
+      boundedCommitTreeText(candidate, "parent revision", MAX_COMMIT_TREE_INPUT_BYTES),
+    );
+    traversals += commitTreeRevisionTraversals(candidate);
+    if (traversals > MAX_COMMIT_TREE_REVISION_TRAVERSALS) {
+      throw new GitError(
+        "E2BIG",
+        `commit-tree revisions exceed ${MAX_COMMIT_TREE_REVISION_TRAVERSALS} traversal operations`,
+      );
+    }
+    parent.push(candidate);
+  }
+  if (traversals > MAX_COMMIT_TREE_REVISION_TRAVERSALS) {
+    throw new GitError(
+      "E2BIG",
+      `commit-tree revisions exceed ${MAX_COMMIT_TREE_REVISION_TRAVERSALS} traversal operations`,
+    );
+  }
+  return { tree, message, parent, bytes };
+}
+
+function commitTreeRevisionTraversals(expression: string): number {
+  let position = expression.length;
+  for (let index = 0; index < expression.length; index++) {
+    const unit = expression.charCodeAt(index);
+    if (unit === 0x5e || unit === 0x7e) {
+      position = index;
+      break;
+    }
+  }
+  let traversals = 0;
+  while (position < expression.length) {
+    const operator = expression.charCodeAt(position++);
+    if (operator !== 0x5e && operator !== 0x7e) return traversals;
+    const digitsStart = position;
+    let value = 0;
+    while (position < expression.length) {
+      const digit = expression.charCodeAt(position) - 0x30;
+      if (digit < 0 || digit > 9) break;
+      if (value <= MAX_COMMIT_TREE_REVISION_TRAVERSALS) {
+        value = value * 10 + digit;
+      }
+      position++;
+    }
+    if (operator === 0x5e) traversals++;
+    else traversals += digitsStart === position ? 1 : value;
+    if (traversals > MAX_COMMIT_TREE_REVISION_TRAVERSALS) return traversals;
+  }
+  return traversals;
+}
+
+function validateCommitIdentities(identities: CommitIdentities): number {
+  return requireCommitTreeInputBytes(
+    validateCommitPerson(identities.author, "author"),
+    validateCommitPerson(identities.committer, "committer"),
+  );
+}
+
+function validateCommitPerson(person: Person, label: string): number {
+  if (typeof person.name !== "string" || typeof person.email !== "string") {
+    throw new GitError("EINVAL", `commit-tree ${label} identity is invalid`);
+  }
+  const name = validateIdentityText(person.name, `${label} name`);
+  const email = validateIdentityText(person.email, `${label} email`);
+  if (name === 0 || email === 0) {
+    throw new GitError("EINVAL", `commit-tree ${label} identity is incomplete`);
+  }
+  if (!Number.isSafeInteger(person.timestamp) || person.timestamp < 0) {
+    throw new GitError("EINVAL", `commit-tree ${label} timestamp is invalid`);
+  }
+  if (
+    !Number.isSafeInteger(person.timezoneOffset) ||
+    person.timezoneOffset < -24 * 60 ||
+    person.timezoneOffset > 24 * 60
+  ) {
+    throw new GitError("EINVAL", `commit-tree ${label} timezone is invalid`);
+  }
+  return requireCommitTreeInputBytes(name, email);
+}
+
+function validateIdentityText(value: string, label: string): number {
+  return boundedCommitTreeText(
+    value,
+    label,
+    MAX_MERGE_IDENTITY_BYTES,
+    (unit) => unit === 0 || unit === 0x0a || unit === 0x0d || unit === 0x3c || unit === 0x3e,
+  );
+}
+
+function boundedCommitTreeText(
+  value: string,
+  label: string,
+  limit: number,
+  forbidden: (unit: number) => boolean = () => false,
+): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (forbidden(unit)) {
+      throw new GitError("EINVAL", `commit-tree ${label} contains an invalid character`);
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) {
+        throw new GitError("EINVAL", `commit-tree ${label} is not canonical UTF-16`);
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new GitError("EINVAL", `commit-tree ${label} is not canonical UTF-16`);
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+    if (bytes > limit) {
+      throw new GitError("E2BIG", `commit-tree ${label} exceeds ${limit} UTF-8 bytes`);
+    }
+  }
+  return bytes;
+}
+
+function requireCommitTreeInputBytes(left: number, right: number): number {
+  if (!Number.isSafeInteger(left) || !Number.isSafeInteger(right)) {
+    throw new GitError("E2BIG", "commit-tree input byte accounting overflow");
+  }
+  const bytes = left + right;
+  if (!Number.isSafeInteger(bytes) || bytes > MAX_COMMIT_TREE_INPUT_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `commit-tree input exceeds ${MAX_COMMIT_TREE_INPUT_BYTES} UTF-8 bytes`,
+    );
+  }
+  return bytes;
 }
 
 export interface UpdateRefOptions {
