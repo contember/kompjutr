@@ -45,6 +45,15 @@ export class GitFixture {
     }).trimEnd();
   }
 
+  gitWithEnv(extraEnv: Readonly<Record<string, string>>, ...args: string[]): string {
+    return execFileSync("git", args, {
+      cwd: this.dir,
+      env: { ...ENV, ...extraEnv },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trimEnd();
+  }
+
   gitBinary(...args: string[]): Buffer {
     return execFileSync("git", args, {
       cwd: this.dir,
@@ -58,6 +67,20 @@ export class GitFixture {
     return execFileSync("git", args, {
       cwd: this.dir,
       env: ENV,
+      input,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trimEnd();
+  }
+
+  gitInputWithEnv(
+    input: string,
+    extraEnv: Readonly<Record<string, string>>,
+    ...args: string[]
+  ): string {
+    return execFileSync("git", args, {
+      cwd: this.dir,
+      env: { ...ENV, ...extraEnv },
       input,
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],

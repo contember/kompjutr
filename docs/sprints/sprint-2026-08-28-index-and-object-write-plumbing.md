@@ -224,3 +224,6 @@ git diff --check
 - 2026-08-28: A synchronous scoped callback avoids a persistent alternate-index
   lifecycle and a new maintenance root source. The verify-first Git probes must
   confirm the remaining command semantics before WU1 changes production code.
+- 2026-08-28: WU0 pinned real Git behavior for missing and populated alternate
+  indexes, empty and mixed-mode trees, unmerged stages, reset-with-update, exact
+  commit messages, parent order and deduplication, and wrong-type objects.
