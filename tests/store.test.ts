@@ -1793,6 +1793,24 @@ describe("refs, config and index", () => {
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     assertMemoryCoordinatorIdle(exhaustedGeneration.store);
 
+    const corruptNamespaceControl = open();
+    const tracking = "refs/remotes/origin/main";
+    corruptNamespaceControl.store.setRef(tracking, "1".repeat(40));
+    const corruptNamespaceToken =
+      corruptNamespaceControl.store.beginFetchPublication("refs/remotes/origin/");
+    try {
+      corruptNamespaceControl.db.run(
+        "UPDATE git_repositories SET fetch_generation = 0 WHERE id = 1",
+      );
+      expect(() => corruptNamespaceControl.store.setRef(tracking, "2".repeat(40))).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(corruptNamespaceControl.store.getRef(tracking)).toBe("1".repeat(40));
+    } finally {
+      corruptNamespaceToken.dispose();
+    }
+    assertMemoryCoordinatorIdle(corruptNamespaceControl.store);
+
     const corruptRevision = open();
     const corruptToken = corruptRevision.store.beginFetchPublication("refs/remotes/origin/");
     try {

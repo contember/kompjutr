@@ -5225,8 +5225,7 @@ export class CheckoutStore {
     return created;
   }
 
-  #advanceTrackingRefObservations(trackingPrefix: string): void {
-    const count = this.#trackingRefRevisionCount();
+  #advanceTrackingRefObservations(trackingPrefix: string, count: number): void {
     if (count === 0) return;
     let matched = 0;
     let previousName: string | null = null;
@@ -5456,9 +5455,15 @@ export class CheckoutStore {
           repo_id: unknown;
           fetch_generation: unknown;
           shallow_revision: unknown;
+          tracking_ref_revision_rows: unknown;
         }>(
-          `SELECT id AS repo_id, fetch_generation, shallow_revision
+          `SELECT id AS repo_id, fetch_generation, shallow_revision,
+                  (SELECT count(*) FROM (
+                     SELECT 1 FROM git_tracking_ref_revisions
+                      WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
+                   )) AS tracking_ref_revision_rows
              FROM git_repositories WHERE id = ?`,
+          this.#repoId,
           this.#repoId,
         );
         if (repository === undefined) throw new CorruptError("fetch repository is missing");
@@ -5478,8 +5483,16 @@ export class CheckoutStore {
         if (currentGeneration === Number.MAX_SAFE_INTEGER) {
           throw new GitError("E2BIG", "fetch publication generation is exhausted");
         }
+        const trackingRefRevisionCount = requireFetchGeneration(
+          repository.tracking_ref_revision_rows,
+          "stored tracking ref revision count",
+          0,
+        );
+        if (trackingRefRevisionCount > MAX_TRACKING_REF_REVISIONS) {
+          throw new CorruptError("tracking ref revision count exceeds its bound");
+        }
 
-        this.#advanceTrackingRefObservations(prefix);
+        this.#advanceTrackingRefObservations(prefix, trackingRefRevisionCount);
 
         const namespaces = this.#readFetchNamespaces(budget);
         for (const namespace of namespaces) {
@@ -5954,8 +5967,15 @@ export class CheckoutStore {
         next_ordinal: unknown;
         latest_ordinal: unknown;
         tracking_ref_revision_rows: unknown;
+        fetch_generation: unknown;
+        fetch_namespace_present: unknown;
       }>(
         `SELECT repository.id AS repo_id, checkout.id AS checkout_id, state.next_ordinal,
+                repository.fetch_generation,
+                EXISTS(
+                  SELECT 1 FROM git_fetch_namespaces namespace
+                   WHERE namespace.repo_id = ? LIMIT 1
+                ) AS fetch_namespace_present,
                 (SELECT count(*) FROM (
                    SELECT 1 FROM git_tracking_ref_revisions
                     WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
@@ -5971,6 +5991,7 @@ export class CheckoutStore {
            JOIN git_reflog_state state ON state.repo_id = repository.id
            JOIN git_checkouts checkout ON checkout.repo_id = repository.id
           WHERE repository.id = ? AND checkout.id = ?`,
+        this.#repoId,
         this.#repoId,
         this.#repoId,
         this.#checkoutId,
@@ -6009,6 +6030,23 @@ export class CheckoutStore {
       );
       if (trackingRefRevisionCount > MAX_TRACKING_REF_REVISIONS) {
         throw new CorruptError("tracking ref revision count exceeds its bound");
+      }
+      const fetchGeneration = requireFetchGeneration(
+        header.fetch_generation,
+        "stored fetch generation",
+        0,
+      );
+      const fetchNamespacePresent =
+        header.fetch_namespace_present === 1
+          ? true
+          : header.fetch_namespace_present === 0
+            ? false
+            : null;
+      if (
+        fetchNamespacePresent === null ||
+        (fetchGeneration === 0) !== (fetchNamespacePresent === false)
+      ) {
+        throw new CorruptError("fetch generation and namespace state disagree");
       }
 
       const checkouts: CheckoutRow[] = [];
@@ -6362,7 +6400,9 @@ export class CheckoutStore {
       if (trackingRefRevisionCount > 0) {
         this.#bumpTrackingRefRevisions(changedNames, normalized.budget);
       }
-      this.#bumpFetchNamespaceRevisions(changedNames, normalized.budget);
+      if (fetchNamespacePresent) {
+        this.#bumpFetchNamespaceRevisions(changedNames, normalized.budget);
+      }
       bumpMaintenanceRootEpoch(this.#db, this.#repoId);
       return true;
     });
