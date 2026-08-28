@@ -33,6 +33,7 @@ import {
   indexFromTree,
   matchesPaths,
 } from "./checkout.js";
+import { compileReadPathspec, LS_FILES_INDEX_PAGE, type LsFilesOptions } from "./pathspec.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
@@ -1667,18 +1668,23 @@ export function reset(
   });
 }
 
-/** Paths in the index, sorted. The `--ref` form is `lsFilesAtRef`. */
-export function lsFiles(repo: Repository): string[] {
-  const out: string[] = [];
-  let previous: string | null = null;
-  for (const entry of repo.checkout.indexScan()) {
-    // Conflict stages repeat the path; callers want it once.
-    if (entry.path === previous) continue;
-    out.push(entry.path);
-    previous = entry.path;
+/** Paths in the index, sorted. Literal selectors stay on indexed prefix scans. */
+export function lsFiles(repo: Repository, options: LsFilesOptions = {}): string[] {
+  const pathspec = compileReadPathspec(options);
+  return pathspec.collect(indexPaths(repo, pathspec.scanPrefixes));
+}
+
+function* indexPaths(repo: Repository, prefixes: readonly string[] | null): Generator<string> {
+  if (prefixes === null) {
+    for (const entry of repo.checkout.indexScan({ pageSize: LS_FILES_INDEX_PAGE }))
+      yield entry.path;
+    return;
   }
-  // The scan already returns them in order.
-  return out;
+  for (const prefix of prefixes) {
+    for (const entry of repo.checkout.indexScan({ prefix, pageSize: LS_FILES_INDEX_PAGE })) {
+      yield entry.path;
+    }
+  }
 }
 
 /** Restore index and working tree to `ref`, dragging the current branch along. */

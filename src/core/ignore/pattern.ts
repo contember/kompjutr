@@ -148,7 +148,7 @@ function classByte(bytes: Uint8Array, at: number): { byte: number; end: number }
   return { byte, end: at + 1 };
 }
 
-function parseClass(bytes: Uint8Array, start: number): ParsedClass | null {
+function parseClass(bytes: Uint8Array, start: number, slashSensitive = true): ParsedClass | null {
   let index = start + 1;
   let negated = false;
   if (bytes[index] === 0x21 || bytes[index] === 0x5e) {
@@ -163,7 +163,9 @@ function parseClass(bytes: Uint8Array, start: number): ParsedClass | null {
       if (negated) {
         for (let word = 0; word < bits.length; word++) bits[word] = ~(bits[word] ?? 0);
       }
-      bits[SLASH >>> 5] = (bits[SLASH >>> 5] ?? 0) & ~(1 << (SLASH & 31));
+      if (slashSensitive) {
+        bits[SLASH >>> 5] = (bits[SLASH >>> 5] ?? 0) & ~(1 << (SLASH & 31));
+      }
       return { bits, end: index + 1 };
     }
     if (bytes[index] === OPEN_CLASS && bytes[index + 1] === 0x3a) {
@@ -211,7 +213,10 @@ function escaped(bytes: Uint8Array, index: number): boolean {
   return count % 2 === 1;
 }
 
-function tokensOf(bytes: Uint8Array): { tokens: Token[]; valid: boolean; hasStar: boolean } {
+function tokensOf(
+  bytes: Uint8Array,
+  options: { slashSensitive?: boolean; unmatchedClassLiteral?: boolean } = {},
+): { tokens: Token[]; valid: boolean; hasStar: boolean } {
   const tokens: Token[] = [];
   let hasStar = false;
   for (let index = 0; index < bytes.length; ) {
@@ -231,10 +236,15 @@ function tokensOf(bytes: Uint8Array): { tokens: Token[]; valid: boolean; hasStar
       tokens.push({ kind: "any", byte: 0, bits: null });
       index++;
     } else if (byte === OPEN_CLASS) {
-      const parsed = parseClass(bytes, index);
-      if (parsed === null) return { tokens, valid: false, hasStar };
-      tokens.push({ kind: "class", byte: 0, bits: parsed.bits });
-      index = parsed.end;
+      const parsed = parseClass(bytes, index, options.slashSensitive ?? true);
+      if (parsed === null) {
+        if (options.unmatchedClassLiteral !== true) return { tokens, valid: false, hasStar };
+        tokens.push({ kind: "literal", byte, bits: null });
+        index++;
+      } else {
+        tokens.push({ kind: "class", byte: 0, bits: parsed.bits });
+        index = parsed.end;
+      }
     } else {
       tokens.push({ kind: "literal", byte, bits: null });
       index++;
@@ -358,9 +368,9 @@ function nfaLiteralPrefix(states: readonly NfaState[]): Uint8Array {
   return prefix;
 }
 
-function matchToken(token: Token, byte: number): boolean {
+function matchToken(token: Token, byte: number, slashSensitive = true): boolean {
   if (token.kind === "literal") return token.byte === byte;
-  if (token.kind === "any") return byte !== SLASH;
+  if (token.kind === "any") return !slashSensitive || byte !== SLASH;
   if (token.kind === "class") return token.bits !== null && bitHas(token.bits, byte);
   return false;
 }
@@ -371,6 +381,7 @@ function matchDeterministic(
   start: number,
   end: number,
   maxWork = Number.MAX_SAFE_INTEGER,
+  slashSensitive = true,
 ): { matched: boolean; work: number } {
   let tokenIndex = 0;
   let byteIndex = start;
@@ -386,14 +397,14 @@ function matchDeterministic(
       token !== undefined &&
       byte !== undefined &&
       token.kind !== "star" &&
-      matchToken(token, byte)
+      matchToken(token, byte, slashSensitive)
     ) {
       tokenIndex++;
       byteIndex++;
     } else if (token?.kind === "star") {
       starIndex = tokenIndex++;
       retry = byteIndex;
-    } else if (starIndex >= 0 && retry < end && bytes[retry] !== SLASH) {
+    } else if (starIndex >= 0 && retry < end && (!slashSensitive || bytes[retry] !== SLASH)) {
       tokenIndex = starIndex + 1;
       byteIndex = ++retry;
     } else {
@@ -545,6 +556,7 @@ function deterministicMatch(
   start: number,
   end: number,
   maxWork = Number.MAX_SAFE_INTEGER,
+  slashSensitive = true,
 ): { matched: boolean; work: number } {
   let work = 0;
   if (compiled.literalPrefix.byteLength > 0) {
@@ -557,8 +569,69 @@ function deterministicMatch(
     work += suffix.work;
     if (!suffix.matched || work > maxWork) return { matched: false, work };
   }
-  const result = matchDeterministic(compiled.tokens, bytes, start, end, maxWork - work);
+  const result = matchDeterministic(
+    compiled.tokens,
+    bytes,
+    start,
+    end,
+    maxWork - work,
+    slashSensitive,
+  );
   return { matched: result.matched, work: work + result.work };
+}
+
+export interface ByteGlobPattern {
+  /** Literal bytes after pathspec escaping, or null when the program has a wildcard. */
+  readonly literal: Uint8Array | null;
+  readonly literalPrefix: Uint8Array;
+  readonly tokenCount: number;
+  readonly wildcardTokens: number;
+  match(bytes: Uint8Array, maxWork?: number): { matched: boolean; work: number };
+}
+
+/** Compile one whole-path glob while sharing the ignore engine's byte evaluator. */
+export function compileByteGlob(
+  bytes: Uint8Array,
+  options: { slashSensitive?: boolean; unmatchedClassLiteral?: boolean } = {},
+): ByteGlobPattern | null {
+  const slashSensitive = options.slashSensitive ?? true;
+  const parsed = tokensOf(bytes, {
+    slashSensitive,
+    unmatchedClassLiteral: options.unmatchedClassLiteral,
+  });
+  if (!parsed.valid) return null;
+  const literal = literalOf(parsed.tokens);
+  const literalPrefix = literalEdge(parsed.tokens, true);
+  const compiled: Extract<Compiled, { kind: "deterministic" }> = {
+    kind: "deterministic",
+    anchored: true,
+    tokens: parsed.tokens,
+    literalPrefix,
+    literalSuffix: literalEdge(parsed.tokens, false),
+    wildcardSegments: 0,
+    nfaStates: 0,
+    hasStar: parsed.hasStar,
+    targetSegments: 1,
+  };
+  let wildcardTokens = 0;
+  for (const token of parsed.tokens) {
+    if (token.kind !== "literal") wildcardTokens++;
+  }
+  return {
+    literal,
+    literalPrefix,
+    tokenCount: parsed.tokens.length,
+    wildcardTokens,
+    match(
+      path: Uint8Array,
+      maxWork = Number.MAX_SAFE_INTEGER,
+    ): {
+      matched: boolean;
+      work: number;
+    } {
+      return deterministicMatch(compiled, path, 0, path.byteLength, maxWork, slashSensitive);
+    },
+  };
 }
 
 export function encodePath(path: string, maxSegments = 128): EncodedPath {

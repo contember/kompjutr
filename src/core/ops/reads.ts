@@ -12,6 +12,7 @@ import {
   typeForMode,
 } from "../objects.js";
 import type { Repository } from "../repository.js";
+import { compileReadPathspec, type LsFilesOptions } from "./pathspec.js";
 
 /** Matches `CommitView` on Computer's GitClient surface. */
 export interface CommitView {
@@ -153,11 +154,19 @@ export function treeOf(repo: Repository, oid: string): string {
   throw new ObjectNotFoundError(oid);
 }
 
-export function lsFilesAtRef(repo: Repository, ref: string): string[] {
-  const tree = treeOf(repo, repo.revParse(ref));
-  const out: string[] = [];
-  for (const { path } of repo.walkTree(tree)) out.push(path);
-  return out;
+export function lsFilesAtRef(
+  repo: Repository,
+  ref: string,
+  options: LsFilesOptions = {},
+): string[] {
+  const pathspec = compileReadPathspec(options);
+  const tree = repo.resolveTreeRevision(ref);
+  return pathspec.collect(treePaths(repo, tree));
+}
+
+/** Derived tree rows are one authenticated, allocation-bounded SQL traversal. */
+function* treePaths(repo: Repository, tree: string): Generator<string> {
+  for (const { path } of repo.walkTree(tree)) yield path;
 }
 
 export interface CatFileResult {
