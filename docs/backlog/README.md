@@ -32,6 +32,7 @@ not effort: a wrong answer outranks a missing one.
   [43](43-index-and-object-write-plumbing.md) ·
   [44](44-patch-interchange.md) ·
   [46](46-rev-parse-revision-syntax.md) ·
+  [61](61-git-shell-command-and-argv-entry.md) ·
   [06](06-stash-operations.md) ·
   [08](08-extend-push-refspecs.md) ·
   [18](18-branch-and-remote-management.md) ·
@@ -86,17 +87,17 @@ What they issue that the surface still lacks, and the item that closes it:
 | `branch -m`, `remote set-url` | both | [18](18-branch-and-remote-management.md) — required subset |
 | `ls-files -- '<dir>/*-<hash>.svg'` | builder | [36](36-glob-pathspecs.md) |
 | `clone --filter=blob:none` | both | [41](41-partial-clone.md) — scale, not a correctness gate; `depth: 0` serves the workflow today |
+| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | [61](61-git-shell-command-and-argv-entry.md) — git as a synchronous shell command plus `cli()` |
 
 Everything else both consumers issue is served, or routes through another
 spelling listed under
 [reference workload coverage](../reference/git-support.md#reference-workload-coverage).
 
-**Open decision, not filed.** Inside the sandbox the agent runs `git` as a
-shell command — `status --short`, `add`, `commit -m`, `log`, `diff`,
-`rebase --continue`. `cli()` throws `EUNSUPPORTED` and `kompjutr/shell` has no
-Git command. Someone owns an argv-to-typed adapter for that subset — this
-package or the consumer — before an agent can work inside a Durable Object
-checkout. Decide before the integration gate; file it where it lands.
+**Decided 2026-08-28: kompjutr owns the agent's `git`.** Inside the sandbox the
+agent runs `git` as a shell command, often in a pipeline. `kompjutr/shell` is
+synchronous and the public `Git` façade is async, so only this package can
+build the command over the synchronous ops. [61](61-git-shell-command-and-argv-entry.md)
+delivers it together with the declared `cli()` entry point.
 
 ## Sprint plan
 
@@ -120,13 +121,14 @@ unscheduled until a caller appears.
 | 2 | Snapshot replay and guarded refs | [44](44-patch-interchange.md), [39](39-plumbing-read-surface.md) (required subset), [46](46-rev-parse-revision-syntax.md) | normal | The rest of the checkpoint cycle: replay the snapshot tree onto the rebased tip through the scratch index from 43, publish the result with compare-and-swap, and resolve the peel and path spellings the probes use. |
 | 3 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Checkpoint refs out (atomic multi-ref push, batch delete) and back in (`ls-remote`, wildcard fetch). One seam unit defines the refspec type for both. |
 | 4 | First-contact defaults | [38](38-clone-depth-and-deepening.md) (default + ADR), [18](18-branch-and-remote-management.md) (required subset), [36](36-glob-pathspecs.md) | normal | Small items both consumers hit on first use: a full clone by default, `branch -m`, a glob pathspec for `lsFiles`. |
+| 5 | Agent shell git | [61](61-git-shell-command-and-argv-entry.md) | normal | The agent's side of both workloads: git as a synchronous shell command and the argv entry point over the existing ops and formatters. Independent of sprints 2–4; may run in parallel with them. |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 5 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
+| 6 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
 | **Phase 2 — production scale** | | | | |
-| 6 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
-| 7 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
-| 8 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| 7 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
+| 8 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 9 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
 | **Phase 3 — parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
@@ -166,3 +168,4 @@ units over the same files, and a long sprint does not make that safe.
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [60 — Consolidate operation limits and split the store](60-consolidate-limits-and-split-store.md)
+- [61 — Provide git as a synchronous shell command and the argv entry point](61-git-shell-command-and-argv-entry.md)
