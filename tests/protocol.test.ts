@@ -152,9 +152,7 @@ describe("receive-pack", () => {
     const result = await receivePack(
       {
         url: "http://host/repo",
-        oldOid,
-        newOid,
-        ref,
+        commands: [{ oldOid, newOid, ref }],
         advertised: new Set(["report-status"]),
         pack: () => {
           opens++;
@@ -175,7 +173,11 @@ describe("receive-pack", () => {
     const rejected = concat([pkt("unpack ok\n"), pkt(`ng ${ref} non-fast-forward\n`), FLUSH]);
     await expect(
       receivePack(
-        { url: "http://host/repo", oldOid, newOid, ref, advertised: new Set(["report-status"]) },
+        {
+          url: "http://host/repo",
+          commands: [{ oldOid, newOid, ref }],
+          advertised: new Set(["report-status"]),
+        },
         { http: canned(() => respond(rejected, "application/x-git-receive-pack-result")) },
       ),
     ).resolves.toEqual({
@@ -187,7 +189,7 @@ describe("receive-pack", () => {
   it("rejects missing report-status support and malformed status", async () => {
     await expect(
       receivePack(
-        { url: "http://host/repo", oldOid, newOid, ref, advertised: new Set() },
+        { url: "http://host/repo", commands: [{ oldOid, newOid, ref }], advertised: new Set() },
         { http: canned(() => respond(ok, "application/x-git-receive-pack-result")) },
       ),
     ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
@@ -195,10 +197,14 @@ describe("receive-pack", () => {
     const duplicate = concat([pkt("unpack ok\n"), pkt(`ok ${ref}\n`), pkt(`ok ${ref}\n`), FLUSH]);
     await expect(
       receivePack(
-        { url: "http://host/repo", oldOid, newOid, ref, advertised: new Set(["report-status"]) },
+        {
+          url: "http://host/repo",
+          commands: [{ oldOid, newOid, ref }],
+          advertised: new Set(["report-status"]),
+        },
         { http: canned(() => respond(duplicate, "application/x-git-receive-pack-result")) },
       ),
-    ).rejects.toMatchObject({ code: "ECORRUPT" });
+    ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN", cause: { code: "ECORRUPT" } });
   });
 });
 
@@ -293,6 +299,18 @@ describe("discovery", () => {
         http: canned(() => respond(body, "application/x-git-upload-pack-advertisement")),
       }),
     ).rejects.toMatchObject({ code: "EFETCHFAIL", message: "access denied" });
+
+    const receiveBody = concat([
+      pkt("# service=git-receive-pack\n"),
+      FLUSH,
+      pkt("ERR hooks unavailable\n"),
+      FLUSH,
+    ]);
+    await expect(
+      discover("http://host/repo", "git-receive-pack", {
+        http: canned(() => respond(receiveBody, "application/x-git-receive-pack-advertisement")),
+      }),
+    ).rejects.toMatchObject({ code: "EPUSHREJECTED", message: "hooks unavailable" });
   });
 
   it("rejects an advertisement truncated before its terminating flush", async () => {

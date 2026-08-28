@@ -1,223 +1,755 @@
-// Smart HTTP receive-pack: one ref command, an optional streamed pack,
-// and a strict report-status result.
+// Smart HTTP receive-pack: a bounded ordered command set, one replayable
+// request body, and a complete report-status result.
 
-import { isOid, utf8Decoder } from "../bytes.js";
-import { CorruptError, GitError } from "../errors.js";
+import { isOid, utf8, ZERO_OID } from "../bytes.js";
+import { CorruptError, GitError, hasErrorCode } from "../errors.js";
+import type { TransportOperationBudget } from "../ops/transport-budget.js";
+import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
+import { retainedStringBytes } from "../retained.js";
 import { FLUSH, pkt } from "./pktline.js";
 import {
   baseHeaders,
-  drain,
   normalizeRemoteUrl,
+  type ProtocolMemoryLimits,
   type ProtocolRequestOptions,
-  readErrorPrefix,
 } from "./remote.js";
-import { ByteReader, pktText } from "./stream.js";
-import { HttpError, requestWithAuth } from "./transport.js";
+import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt } from "./stream.js";
+import { type GitAuth, type GitHttpResponse, HttpError, requestWithAuth } from "./transport.js";
 
-const ZERO = "0".repeat(40);
-const MAX_STATUS_PACKETS = 16_384;
-const MAX_STATUS_INPUT_BYTES = 16 * 1024 * 1024;
+export const MAX_RECEIVE_PACK_COMMANDS = 1_024;
+export const MAX_PUSH_OPTIONS = 64;
+export const MAX_PUSH_OPTION_BYTES = 1_024;
+export const MAX_PUSH_OPTIONS_BYTES = 64 * 1_024;
+export const MAX_RECEIVE_PACK_STATUS_PACKETS = 16_384;
+export const MAX_RECEIVE_PACK_STATUS_INPUT_BYTES = 16 * 1024 * 1024;
+export const MAX_RECEIVE_PACK_RESULT_BYTES = 8 * 1024 * 1024;
+
+const REQUEST_MEMORY_PART = "receive-pack-request";
+const RESULT_MEMORY_PART = "receive-pack-result";
+const ERROR_RESPONSE_MEMORY_PART = "receive-pack-error-response";
+const REQUEST_FIXED_BYTES = 256;
+const COMMAND_FIXED_BYTES = 96;
+const OPTION_FIXED_BYTES = 64;
+const RESULT_FIXED_BYTES = 192;
+const STATUS_FIXED_BYTES = 96;
+const ERROR_PREFIX_BYTES = 800;
+const ERROR_PREFIX_CHARACTERS = 200;
+const ERROR_RESPONSE_RETAINED_BYTES =
+  ERROR_PREFIX_BYTES + 48 + ERROR_PREFIX_BYTES * 2 + 48 + ERROR_PREFIX_CHARACTERS * 2;
+const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const lossyUtf8Decoder = new TextDecoder();
+
+export interface ReceivePackCommand {
+  readonly oldOid: string;
+  readonly newOid: string;
+  readonly ref: string;
+}
 
 export interface ReceivePackRequest {
-  url: string;
-  oldOid: string;
-  newOid: string;
-  ref: string;
-  advertised: Set<string>;
-  pack?: () => AsyncIterable<Uint8Array>;
-  onProgress?: (message: string) => void;
-  onMessage?: (message: string) => void;
+  readonly url: string;
+  readonly commands: readonly ReceivePackCommand[];
+  readonly advertised: Set<string>;
+  readonly atomic?: boolean;
+  readonly pushOptions?: readonly string[];
+  readonly pack?: () => AsyncIterable<Uint8Array>;
+  readonly onProgress?: (message: string) => void;
+  readonly onMessage?: (message: string) => void;
+}
+
+export interface ReceivePackRefStatus {
+  readonly ok: boolean;
+  readonly error?: string;
 }
 
 export interface ReceivePackStatus {
-  unpack: string | null;
-  refs: Map<string, { ok: boolean; error?: string }>;
+  readonly unpack: string;
+  readonly refs: Map<string, ReceivePackRefStatus>;
 }
 
-function hasInvalidRefCharacter(ref: string): boolean {
-  for (const character of ref) {
-    const code = character.charCodeAt(0);
-    if (code <= 0x20 || code === 0x7f || "~^:?*[".includes(character)) return true;
+export interface ReceivePackOptions extends ProtocolRequestOptions {
+  readonly operationBudget?: TransportOperationBudget;
+}
+
+interface PreparedRequest {
+  readonly commands: readonly ReceivePackCommand[];
+  readonly commandFrames: readonly Uint8Array[];
+  readonly optionFrames: readonly Uint8Array[];
+  readonly hasNonDeletion: boolean;
+  readonly sideband: boolean;
+  readonly atomic: boolean;
+  readonly pack?: () => AsyncIterable<Uint8Array>;
+  readonly onProgress?: (message: string) => void;
+  readonly onMessage?: (message: string) => void;
+}
+
+interface ResolvedStatusLimits {
+  readonly retainedBytes: number;
+  readonly inputBytes: number;
+  readonly entries: number;
+  readonly lineBytes: number;
+}
+
+interface LocalPackFailure {
+  readonly cause: unknown;
+}
+
+type ParsedStatusLine =
+  | { readonly kind: "unpack"; readonly text: string }
+  | { readonly kind: "ok"; readonly ref: string }
+  | { readonly kind: "ng"; readonly ref: string; readonly text: string };
+
+const localPackBodyErrors = new WeakSet<object>();
+
+class LocalPackBodyError extends Error {
+  constructor(cause: unknown) {
+    super("local pack generation failed", { cause });
+    localPackBodyErrors.add(this);
   }
-  return false;
 }
 
-/** The branch-only ref subset accepted by the first push implementation. */
+class StatusWireBudget {
+  #entries = 0;
+  #inputBytes = 0;
+
+  constructor(private readonly limits: ResolvedStatusLimits) {}
+
+  packet(packet: Pkt): void {
+    if (packet.kind !== "line") return;
+    if (packet.payload.length > this.limits.lineBytes) this.#tooLarge("pkt-line text");
+    if (this.#entries >= this.limits.entries) this.#tooLarge("packet count");
+    const bytes = packet.payload.length + 4;
+    if (bytes > this.limits.inputBytes - this.#inputBytes) this.#tooLarge("input");
+    this.#entries++;
+    this.#inputBytes += bytes;
+  }
+
+  #tooLarge(part: string): never {
+    throw new GitError("E2BIG", `receive-pack ${part} exceeds its bounded limit`);
+  }
+}
+
+class ResultBudget {
+  #bytes = RESULT_FIXED_BYTES;
+
+  constructor(
+    private readonly limit: number,
+    private readonly operationBudget: TransportOperationBudget | undefined,
+  ) {
+    if (this.#bytes > limit) this.#tooLarge();
+    operationBudget?.setMemory(RESULT_MEMORY_PART, this.#bytes);
+  }
+
+  add(bytes: number): void {
+    if (bytes > this.limit - this.#bytes) this.#tooLarge();
+    this.operationBudget?.setMemory(RESULT_MEMORY_PART, this.#bytes + bytes);
+    this.#bytes += bytes;
+  }
+
+  #tooLarge(): never {
+    throw new GitError("E2BIG", "receive-pack result exceeds its bounded retained-state limit");
+  }
+}
+
+/** The branch-only ref subset accepted by the legacy push operation. */
 export function requireBranchRef(ref: string): string {
+  const checked = checkRefText(ref, MAX_REF_NAME_BYTES);
   if (
+    checked.problem !== null ||
     !ref.startsWith("refs/heads/") ||
     ref.length === "refs/heads/".length ||
-    ref.endsWith("/") ||
-    ref.endsWith(".") ||
-    ref.includes("//") ||
-    ref.includes("..") ||
-    ref.includes("@{") ||
-    ref.includes("\\") ||
-    hasInvalidRefCharacter(ref)
+    !hasCanonicalRefSyntax(ref)
   ) {
     throw new GitError("EINVALIDREF", `invalid branch ref ${ref}`);
-  }
-  for (const component of ref.split("/")) {
-    if (
-      component === "" ||
-      component === "." ||
-      component === ".." ||
-      component.startsWith(".") ||
-      component.endsWith(".lock")
-    ) {
-      throw new GitError("EINVALIDREF", `invalid branch ref ${ref}`);
-    }
   }
   return ref;
 }
 
-function requestedCapabilities(advertised: Set<string>): string[] {
-  if (!advertised.has("report-status")) {
-    throw new GitError("EUNSUPPORTED", "remote does not support receive-pack report-status");
+function resolvedStatusLimits(overrides: ProtocolMemoryLimits | undefined): ResolvedStatusLimits {
+  return {
+    retainedBytes: boundedLimit(overrides?.retainedBytes, MAX_RECEIVE_PACK_RESULT_BYTES),
+    inputBytes: boundedLimit(overrides?.inputBytes, MAX_RECEIVE_PACK_STATUS_INPUT_BYTES),
+    entries: boundedLimit(overrides?.entries, MAX_RECEIVE_PACK_STATUS_PACKETS),
+    lineBytes: boundedLimit(overrides?.lineBytes, MAX_PKT_FRAME_BYTES - 4),
+  };
+}
+
+function boundedLimit(value: number | undefined, ceiling: number): number {
+  if (value === undefined) return ceiling;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError("receive-pack protocol limits must be positive safe integers");
   }
-  return ["report-status", ...(advertised.has("side-band-64k") ? ["side-band-64k"] : [])];
+  return Math.min(value, ceiling);
+}
+
+function addRequestMemory(
+  budget: TransportOperationBudget | undefined,
+  current: number,
+  bytes: number,
+): number {
+  const next = current + bytes;
+  budget?.setMemory(REQUEST_MEMORY_PART, next);
+  return next;
+}
+
+function validateCommand(command: ReceivePackCommand, index: number): ReceivePackCommand {
+  if (typeof command !== "object" || command === null || Array.isArray(command)) {
+    throw new GitError("EINVAL", `receive-pack command ${index} must be an object`);
+  }
+  if (typeof command.oldOid !== "string" || typeof command.newOid !== "string") {
+    throw new GitError("EINVAL", `receive-pack command ${index} object ids must be strings`);
+  }
+  if (!isOid(command.oldOid) || !isOid(command.newOid)) {
+    throw new GitError("EINVAL", `receive-pack command ${index} has an invalid object id`);
+  }
+  if (typeof command.ref !== "string") {
+    throw new GitError("EINVALIDREF", `receive-pack command ${index} ref must be a string`);
+  }
+  const checked = checkRefText(command.ref, MAX_REF_NAME_BYTES);
+  if (checked.problem === "too-long") {
+    throw new GitError("E2BIG", `receive-pack destination exceeds ${MAX_REF_NAME_BYTES} bytes`);
+  }
+  if (
+    checked.problem !== null ||
+    !command.ref.startsWith("refs/") ||
+    command.ref.length === "refs/".length ||
+    !hasCanonicalRefSyntax(command.ref)
+  ) {
+    throw new GitError("EINVALIDREF", `invalid receive-pack destination ${command.ref}`);
+  }
+  return { oldOid: command.oldOid, newOid: command.newOid, ref: command.ref };
+}
+
+function pushOptionBytes(option: string): number {
+  let bytes = 0;
+  for (let index = 0; index < option.length; index++) {
+    const unit = option.charCodeAt(index);
+    if (unit === 0 || unit === 0x0a) {
+      throw new GitError("EINVAL", "push option contains invalid text");
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = option.charCodeAt(index + 1);
+      if (index + 1 >= option.length || low < 0xdc00 || low > 0xdfff) {
+        throw new GitError("EINVAL", "push option contains malformed UTF-16");
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new GitError("EINVAL", "push option contains malformed UTF-16");
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+    if (bytes > MAX_PUSH_OPTION_BYTES) {
+      throw new GitError("E2BIG", `push option exceeds ${MAX_PUSH_OPTION_BYTES} bytes`);
+    }
+  }
+  return bytes;
+}
+
+function validatePushOption(option: string, index: number): number {
+  if (typeof option !== "string") {
+    throw new GitError("EINVAL", `push option ${index} must be a string`);
+  }
+  try {
+    return pushOptionBytes(option);
+  } catch (cause) {
+    if (hasErrorCode(cause, "E2BIG")) {
+      throw new GitError("E2BIG", `push option ${index} exceeds ${MAX_PUSH_OPTION_BYTES} bytes`, {
+        cause,
+      });
+    }
+    throw new GitError("EINVAL", `push option ${index} contains invalid text`, { cause });
+  }
+}
+
+function requireCapability(advertised: Set<string>, capability: string): void {
+  if (!advertised.has(capability)) {
+    throw new GitError("EUNSUPPORTED", `remote does not support receive-pack ${capability}`);
+  }
+}
+
+function prepareRequest(
+  request: ReceivePackRequest,
+  operationBudget: TransportOperationBudget | undefined,
+): PreparedRequest {
+  if (!Array.isArray(request.commands) || request.commands.length === 0) {
+    throw new GitError("EINVAL", "receive-pack requires at least one command");
+  }
+  if (request.commands.length > MAX_RECEIVE_PACK_COMMANDS) {
+    throw new GitError("E2BIG", `receive-pack command count exceeds ${MAX_RECEIVE_PACK_COMMANDS}`);
+  }
+  if (request.pushOptions !== undefined && !Array.isArray(request.pushOptions)) {
+    throw new GitError("EINVAL", "receive-pack push options must be an array");
+  }
+  if (request.atomic !== undefined && typeof request.atomic !== "boolean") {
+    throw new GitError("EINVAL", "receive-pack atomic must be a boolean");
+  }
+  if (request.pack !== undefined && typeof request.pack !== "function") {
+    throw new GitError("EINVAL", "receive-pack pack must be a function");
+  }
+  if (request.onProgress !== undefined && typeof request.onProgress !== "function") {
+    throw new GitError("EINVAL", "receive-pack progress callback must be a function");
+  }
+  if (request.onMessage !== undefined && typeof request.onMessage !== "function") {
+    throw new GitError("EINVAL", "receive-pack message callback must be a function");
+  }
+  const pushOptions = request.pushOptions ?? [];
+  if (pushOptions.length > MAX_PUSH_OPTIONS) {
+    throw new GitError("E2BIG", `push option count exceeds ${MAX_PUSH_OPTIONS}`);
+  }
+
+  const commands: ReceivePackCommand[] = [];
+  const destinations = new Set<string>();
+  let requestBytes = addRequestMemory(operationBudget, 0, REQUEST_FIXED_BYTES);
+  let deleting = false;
+  let hasNonDeletion = false;
+  for (const [index, input] of request.commands.entries()) {
+    const command = validateCommand(input, index);
+    if (destinations.has(command.ref)) {
+      throw new GitError("EINVAL", `duplicate receive-pack destination ${command.ref}`);
+    }
+    requestBytes = addRequestMemory(
+      operationBudget,
+      requestBytes,
+      COMMAND_FIXED_BYTES +
+        retainedStringBytes(command.oldOid) +
+        retainedStringBytes(command.newOid) +
+        retainedStringBytes(command.ref),
+    );
+    destinations.add(command.ref);
+    commands.push(command);
+    if (command.newOid === ZERO_OID) deleting = true;
+    else hasNonDeletion = true;
+  }
+
+  const optionBytes: number[] = [];
+  let totalOptionBytes = 0;
+  for (const [index, option] of pushOptions.entries()) {
+    const bytes = validatePushOption(option, index);
+    if (bytes > MAX_PUSH_OPTIONS_BYTES - totalOptionBytes) {
+      throw new GitError("E2BIG", `push options exceed ${MAX_PUSH_OPTIONS_BYTES} bytes`);
+    }
+    requestBytes = addRequestMemory(
+      operationBudget,
+      requestBytes,
+      OPTION_FIXED_BYTES + retainedStringBytes(option),
+    );
+    optionBytes.push(bytes);
+    totalOptionBytes += bytes;
+  }
+
+  requireCapability(request.advertised, "report-status");
+  if (deleting) requireCapability(request.advertised, "delete-refs");
+  if (request.atomic === true) requireCapability(request.advertised, "atomic");
+  if (pushOptions.length > 0) requireCapability(request.advertised, "push-options");
+
+  const capabilities = [
+    "report-status",
+    ...(request.advertised.has("side-band-64k") ? ["side-band-64k"] : []),
+    ...(request.atomic === true ? ["atomic"] : []),
+    ...(pushOptions.length > 0 ? ["push-options"] : []),
+  ];
+  const commandFrames: Uint8Array[] = [];
+  for (const [index, command] of commands.entries()) {
+    const suffix = index === 0 ? `\0${capabilities.join(" ")}` : "";
+    const text = `${command.oldOid} ${command.newOid} ${command.ref}${suffix}\n`;
+    requestBytes = addRequestMemory(operationBudget, requestBytes, utf8.encode(text).length + 4);
+    commandFrames.push(pkt(text));
+  }
+  const optionFrames: Uint8Array[] = [];
+  for (const [index, option] of pushOptions.entries()) {
+    const bytes = optionBytes[index];
+    if (bytes === undefined) throw new Error("receive-pack option accounting is incomplete");
+    requestBytes = addRequestMemory(operationBudget, requestBytes, bytes + 4);
+    optionFrames.push(pkt(option));
+  }
+  return {
+    commands,
+    commandFrames,
+    optionFrames,
+    hasNonDeletion,
+    sideband: capabilities.includes("side-band-64k"),
+    atomic: request.atomic === true,
+    ...(request.pack === undefined ? {} : { pack: request.pack }),
+    ...(request.onProgress === undefined ? {} : { onProgress: request.onProgress }),
+    ...(request.onMessage === undefined ? {} : { onMessage: request.onMessage }),
+  };
 }
 
 async function* requestBody(
-  command: Uint8Array,
+  prepared: PreparedRequest,
   pack: (() => AsyncIterable<Uint8Array>) | undefined,
 ): AsyncGenerator<Uint8Array> {
-  yield command;
+  for (const frame of prepared.commandFrames) yield frame;
   yield FLUSH;
-  if (pack !== undefined) yield* pack();
+  if (prepared.optionFrames.length > 0) {
+    for (const frame of prepared.optionFrames) yield frame;
+    yield FLUSH;
+  }
+  if (!prepared.hasNonDeletion || pack === undefined) return;
+  try {
+    yield* pack();
+  } catch (cause) {
+    throw new LocalPackBodyError(cause);
+  }
+}
+
+function decodeLine(packet: Pkt, context: string): string {
+  if (packet.kind !== "line" || packet.payload.length === 0) {
+    throw new CorruptError(`receive-pack ${context} contains an unexpected pkt-line control`);
+  }
+  if (packet.payload[packet.payload.length - 1] !== 0x0a) {
+    throw new CorruptError(`receive-pack ${context} line is missing its newline`);
+  }
+  let text: string;
+  try {
+    text = strictUtf8Decoder.decode(packet.payload.subarray(0, -1));
+  } catch (cause) {
+    throw new CorruptError(`receive-pack ${context} contains malformed UTF-8`, { cause });
+  }
+  if (text.includes("\0") || text.includes("\r") || text.includes("\n")) {
+    throw new CorruptError(`receive-pack ${context} contains invalid text`);
+  }
+  return text;
+}
+
+function parseStatusLine(text: string): ParsedStatusLine {
+  if (text.startsWith("unpack ")) {
+    const result = text.slice("unpack ".length);
+    if (result === "") throw new CorruptError("malformed receive-pack unpack status");
+    return { kind: "unpack", text: result };
+  }
+  if (text.startsWith("ok ")) {
+    const ref = text.slice(3);
+    if (ref === "" || ref.includes(" ")) {
+      throw new CorruptError("malformed receive-pack ref status");
+    }
+    return { kind: "ok", ref };
+  }
+  if (text.startsWith("ng ")) {
+    const separator = text.indexOf(" ", 3);
+    if (separator < 4 || separator === text.length - 1) {
+      throw new CorruptError("malformed receive-pack rejection");
+    }
+    return { kind: "ng", ref: text.slice(3, separator), text: text.slice(separator + 1) };
+  }
+  throw new CorruptError(`unexpected receive-pack status: ${text.slice(0, 64)}`);
+}
+
+async function requireStreamEnd(reader: ByteReader, context: string): Promise<void> {
+  const trailing = await reader.readPkt();
+  if (trailing !== null) throw new CorruptError(`receive-pack ${context} has trailing packets`);
 }
 
 async function* sidebandBody(
   source: AsyncIterable<Uint8Array>,
+  limits: ResolvedStatusLimits,
   onProgress: ((message: string) => void) | undefined,
   onMessage: ((message: string) => void) | undefined,
 ): AsyncGenerator<Uint8Array> {
   const reader = new ByteReader(source);
-  let packets = 0;
-  let inputBytes = 0;
+  const budget = new StatusWireBudget(limits);
+  let flushed = false;
   for (;;) {
     const frame = await reader.readPkt();
-    if (frame === null || frame.kind === "flush") return;
-    if (++packets > MAX_STATUS_PACKETS) {
-      throw new GitError("E2BIG", "receive-pack sideband exceeds the bounded packet limit");
+    if (frame === null) break;
+    if (frame.kind === "flush") {
+      flushed = true;
+      break;
     }
-    inputBytes += frame.payload.length + 4;
-    if (inputBytes > MAX_STATUS_INPUT_BYTES) {
-      throw new GitError("E2BIG", "receive-pack sideband exceeds the bounded input limit");
+    budget.packet(frame);
+    if (frame.kind !== "line" || frame.payload.length === 0) {
+      throw new CorruptError("receive-pack returned an invalid sideband frame");
     }
-    if (frame.kind !== "line" || frame.payload.length === 0) continue;
     const band = frame.payload[0];
     const payload = frame.payload.subarray(1);
     if (band === 1) {
       if (payload.length > 0) yield payload;
     } else if (band === 2) {
-      const message = utf8Decoder.decode(payload);
+      let message: string;
+      try {
+        message = strictUtf8Decoder.decode(payload);
+      } catch (cause) {
+        throw new CorruptError("receive-pack progress contains malformed UTF-8", { cause });
+      }
       onProgress?.(message);
       onMessage?.(message);
     } else if (band === 3) {
-      throw new GitError("EPUSHREJECTED", utf8Decoder.decode(payload).trim());
+      let message: string;
+      try {
+        message = strictUtf8Decoder.decode(payload).trim();
+      } catch (cause) {
+        throw new CorruptError("receive-pack fatal message contains malformed UTF-8", { cause });
+      }
+      throw new GitError("EPUSHREJECTED", message === "" ? "receive-pack fatal error" : message);
     } else {
       throw new CorruptError("receive-pack returned an invalid sideband");
     }
   }
+  if (!flushed) throw new CorruptError("truncated receive-pack sideband");
+  await requireStreamEnd(reader, "sideband");
 }
 
 async function parseStatus(
   body: AsyncIterable<Uint8Array>,
-  expectedRef: string,
+  commands: readonly ReceivePackCommand[],
+  atomic: boolean,
+  limits: ResolvedStatusLimits,
+  operationBudget: TransportOperationBudget | undefined,
 ): Promise<ReceivePackStatus> {
   const reader = new ByteReader(body);
+  const wireBudget = new StatusWireBudget(limits);
+  const resultBudget = new ResultBudget(limits.retainedBytes, operationBudget);
+  const expected = new Set(commands.map((command) => command.ref));
+  const received = new Map<string, ReceivePackRefStatus>();
   let unpack: string | null = null;
-  const refs = new Map<string, { ok: boolean; error?: string }>();
-  let packets = 0;
-  let inputBytes = 0;
+  let flushed = false;
   for (;;) {
     const packet = await reader.readPkt();
-    if (packet === null || packet.kind === "flush") break;
-    if (++packets > MAX_STATUS_PACKETS) {
-      throw new GitError("E2BIG", "receive-pack status exceeds the bounded packet limit");
+    if (packet === null) break;
+    if (packet.kind === "flush") {
+      flushed = true;
+      break;
     }
-    inputBytes += packet.payload.length + 4;
-    if (inputBytes > MAX_STATUS_INPUT_BYTES) {
-      throw new GitError("E2BIG", "receive-pack status exceeds the bounded input limit");
-    }
-    if (packet.kind !== "line") throw new CorruptError("unexpected receive-pack delimiter");
-    const text = pktText(packet);
-    if (text.startsWith("unpack ")) {
+    wireBudget.packet(packet);
+    const status = parseStatusLine(decodeLine(packet, "status"));
+    if (status.kind === "unpack") {
       if (unpack !== null) throw new CorruptError("duplicate receive-pack unpack status");
-      unpack = text.slice("unpack ".length);
+      if (received.size > 0) throw new CorruptError("receive-pack unpack status is out of order");
+      unpack = status.text;
+      resultBudget.add(retainedStringBytes(unpack));
       continue;
     }
-    if (text.startsWith("ok ")) {
-      const ref = text.slice(3);
-      if (refs.has(ref)) throw new CorruptError(`duplicate receive-pack status for ${ref}`);
-      refs.set(ref, { ok: true });
-      continue;
+    if (unpack === null) throw new CorruptError("receive-pack ref status precedes unpack status");
+    const ref = status.ref;
+    if (!expected.has(ref)) throw new CorruptError(`unexpected receive-pack status for ${ref}`);
+    if (received.has(ref)) throw new CorruptError(`duplicate receive-pack status for ${ref}`);
+    if (status.kind === "ok") {
+      resultBudget.add(STATUS_FIXED_BYTES + retainedStringBytes(ref));
+      received.set(ref, { ok: true });
+    } else {
+      const error = status.text;
+      resultBudget.add(STATUS_FIXED_BYTES + retainedStringBytes(ref) + retainedStringBytes(error));
+      received.set(ref, { ok: false, error });
     }
-    if (text.startsWith("ng ")) {
-      const space = text.indexOf(" ", 3);
-      if (space < 0) throw new CorruptError("malformed receive-pack rejection");
-      const ref = text.slice(3, space);
-      if (refs.has(ref)) throw new CorruptError(`duplicate receive-pack status for ${ref}`);
-      refs.set(ref, { ok: false, error: text.slice(space + 1) });
-      continue;
-    }
-    throw new CorruptError(`unexpected receive-pack status: ${text.slice(0, 64)}`);
   }
+  if (!flushed) throw new CorruptError("truncated receive-pack status");
+  await requireStreamEnd(reader, "status");
   if (unpack === null) throw new CorruptError("receive-pack omitted unpack status");
-  if (refs.size !== 1 || !refs.has(expectedRef)) {
-    throw new CorruptError(`receive-pack omitted status for ${expectedRef}`);
+  if (received.size !== commands.length) {
+    const missing = commands.find((command) => !received.has(command.ref));
+    throw new CorruptError(
+      missing === undefined
+        ? "receive-pack returned an invalid status count"
+        : `receive-pack omitted status for ${missing.ref}`,
+    );
+  }
+
+  const refs = new Map<string, ReceivePackRefStatus>();
+  let successes = 0;
+  let failures = 0;
+  for (const command of commands) {
+    const status = received.get(command.ref);
+    if (status === undefined)
+      throw new CorruptError(`receive-pack omitted status for ${command.ref}`);
+    refs.set(command.ref, status);
+    if (status.ok) successes++;
+    else failures++;
+  }
+  if (unpack !== "ok" && successes > 0) {
+    throw new CorruptError("receive-pack reported successful refs after unpack failure");
+  }
+  if (atomic && successes > 0 && failures > 0) {
+    throw new CorruptError("atomic receive-pack returned mixed ref statuses");
   }
   return { unpack, refs };
 }
 
-export async function receivePack(
-  request: ReceivePackRequest,
-  options: ProtocolRequestOptions = {},
-): Promise<ReceivePackStatus> {
-  if (!isOid(request.oldOid) || !isOid(request.newOid)) {
-    throw new CorruptError("invalid receive-pack object id");
+function validCredentials(credentials: GitAuth | undefined): void {
+  if (credentials === undefined) return;
+  if (typeof credentials !== "object" || credentials === null || Array.isArray(credentials)) {
+    throw new GitError("EAUTH", "remote authentication callback returned invalid credentials");
   }
-  const ref = requireBranchRef(request.ref);
-  const capabilities = requestedCapabilities(request.advertised);
-  if (request.newOid === ZERO && !request.advertised.has("delete-refs")) {
-    throw new GitError("EUNSUPPORTED", "remote does not support deleting refs");
+  if (credentials.username !== undefined && typeof credentials.username !== "string") {
+    throw new GitError("EAUTH", "remote authentication username must be a string");
   }
-  const command = pkt(`${request.oldOid} ${request.newOid} ${ref}\0${capabilities.join(" ")}\n`);
-  const base = normalizeRemoteUrl(request.url);
-  const response = await requestWithAuth(
-    () => ({
-      url: `${base}/git-receive-pack`,
-      method: "POST",
-      headers: {
-        ...baseHeaders(),
-        "Content-Type": "application/x-git-receive-pack-request",
-        Accept: "application/x-git-receive-pack-result",
-      },
-      body: requestBody(command, request.pack),
-    }),
-    options,
-    options.authSession,
-  );
-  if (response.status !== 200) {
-    const text = await readErrorPrefix(response.body);
-    throw new HttpError(
-      response.status,
-      `git-receive-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
-    );
+  if (credentials.password !== undefined && typeof credentials.password !== "string") {
+    throw new GitError("EAUTH", "remote authentication password must be a string");
   }
-  const contentType = response.headers["content-type"] ?? "";
-  const mediaType = contentType.split(";")[0]?.trim() ?? "";
-  if (mediaType !== "application/x-git-receive-pack-result") {
-    await drain(response.body);
-    throw new CorruptError(
-      `invalid receive-pack content-type: ${contentType === "" ? "none" : contentType}`,
-    );
+  if (
+    credentials.headers !== undefined &&
+    (typeof credentials.headers !== "object" ||
+      credentials.headers === null ||
+      Array.isArray(credentials.headers))
+  ) {
+    throw new GitError("EAUTH", "remote authentication headers must be a string record");
   }
-  const statusBody = capabilities.includes("side-band-64k")
-    ? sidebandBody(response.body, request.onProgress, request.onMessage)
-    : response.body;
-  return parseStatus(statusBody, ref);
+  for (const value of Object.values(credentials.headers ?? {})) {
+    if (typeof value !== "string") {
+      throw new GitError("EAUTH", "remote authentication headers must contain strings");
+    }
+  }
 }
 
-export const ZERO_OID = ZERO;
+function authOptions(options: ReceivePackOptions): ReceivePackOptions {
+  const onAuth = options.onAuth;
+  if (onAuth === undefined) return options;
+  return {
+    ...options,
+    onAuth: async (...input: Parameters<typeof onAuth>) => {
+      let credentials: GitAuth | undefined;
+      try {
+        credentials = await onAuth(...input);
+      } catch (cause) {
+        throw new GitError("EAUTH", "remote authentication callback failed", { cause });
+      }
+      validCredentials(credentials);
+      return credentials;
+    },
+  };
+}
+
+function findLocalPackFailure(error: unknown): LocalPackFailure | null {
+  const seen = new Set<object>();
+  let current = error;
+  for (let depth = 0; depth < 16; depth++) {
+    if (typeof current !== "object" || current === null || seen.has(current)) return null;
+    if (localPackBodyErrors.has(current)) {
+      return { cause: "cause" in current ? current.cause : current };
+    }
+    seen.add(current);
+    try {
+      if (!("cause" in current)) return null;
+      current = current.cause;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function uncertain(message: string, cause: unknown): GitError {
+  return new GitError("EPUSHUNCERTAIN", message, { cause });
+}
+
+async function readResponsePrefix(
+  body: AsyncIterable<Uint8Array>,
+  operationBudget: TransportOperationBudget | undefined,
+): Promise<string> {
+  operationBudget?.setMemory(ERROR_RESPONSE_MEMORY_PART, ERROR_RESPONSE_RETAINED_BYTES);
+  const prefix = new Uint8Array(ERROR_PREFIX_BYTES);
+  let retained = 0;
+  let input = 0;
+  for await (const chunk of body) {
+    if (chunk.length > MAX_RECEIVE_PACK_STATUS_INPUT_BYTES - input) {
+      throw new GitError("E2BIG", "receive-pack error response exceeds its bounded input limit");
+    }
+    input += chunk.length;
+    if (retained >= prefix.length) continue;
+    const take = Math.min(chunk.length, prefix.length - retained);
+    prefix.set(chunk.subarray(0, take), retained);
+    retained += take;
+  }
+  return lossyUtf8Decoder.decode(prefix.subarray(0, retained)).slice(0, ERROR_PREFIX_CHARACTERS);
+}
+
+export async function receivePack(
+  request: ReceivePackRequest,
+  options: ReceivePackOptions = {},
+): Promise<ReceivePackStatus> {
+  const operationBudget = options.operationBudget;
+  let succeeded = false;
+  try {
+    const limits = resolvedStatusLimits(options.protocolLimits);
+    const prepared = prepareRequest(request, operationBudget);
+    const base = normalizeRemoteUrl(request.url);
+    let response: GitHttpResponse;
+    try {
+      response = await requestWithAuth(
+        () => ({
+          url: `${base}/git-receive-pack`,
+          method: "POST",
+          headers: {
+            ...baseHeaders(),
+            "Content-Type": "application/x-git-receive-pack-request",
+            Accept: "application/x-git-receive-pack-result",
+          },
+          body: requestBody(prepared, prepared.pack),
+        }),
+        authOptions(options),
+        options.authSession,
+      );
+    } catch (error) {
+      const localPackFailure = findLocalPackFailure(error);
+      if (localPackFailure !== null) {
+        const cause = localPackFailure.cause;
+        if (hasErrorCode(cause, "E2BIG") || hasErrorCode(cause, "EPUSHLOCAL")) throw cause;
+        throw new GitError("EPUSHLOCAL", "local receive-pack body generation failed", { cause });
+      }
+      if (hasErrorCode(error, "EAUTH")) throw error;
+      throw uncertain("receive-pack POST failed after the request may have been consumed", error);
+    }
+
+    if (response.status === 401) {
+      let text = "";
+      try {
+        text = await readResponsePrefix(response.body, operationBudget);
+      } catch (cause) {
+        throw new GitError("EHTTP", "git-receive-pack authentication failed", { cause });
+      }
+      throw new HttpError(
+        response.status,
+        `git-receive-pack failed: 401 ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
+      );
+    }
+    if (response.status !== 200) {
+      let text: string;
+      try {
+        text = await readResponsePrefix(response.body, operationBudget);
+      } catch (cause) {
+        throw uncertain("receive-pack returned an uncertain HTTP response", cause);
+      }
+      const cause = new HttpError(
+        response.status,
+        `git-receive-pack failed: ${response.status} ${response.statusText}${text === "" ? "" : ` — ${text}`}`,
+      );
+      throw uncertain("receive-pack returned an uncertain HTTP response", cause);
+    }
+    const contentType = response.headers["content-type"] ?? "";
+    const mediaType = contentType.split(";")[0]?.trim() ?? "";
+    if (mediaType !== "application/x-git-receive-pack-result") {
+      try {
+        await readResponsePrefix(response.body, operationBudget);
+      } catch (cause) {
+        throw uncertain("receive-pack returned an uncertain malformed response", cause);
+      }
+      throw uncertain(
+        "receive-pack returned an uncertain malformed response",
+        new CorruptError(
+          `invalid receive-pack content-type: ${contentType === "" ? "none" : contentType}`,
+        ),
+      );
+    }
+    const statusBody = prepared.sideband
+      ? sidebandBody(response.body, limits, prepared.onProgress, prepared.onMessage)
+      : response.body;
+    try {
+      const status = await parseStatus(
+        statusBody,
+        prepared.commands,
+        prepared.atomic,
+        limits,
+        operationBudget,
+      );
+      succeeded = true;
+      return status;
+    } catch (cause) {
+      throw uncertain("receive-pack returned an incomplete or invalid status", cause);
+    }
+  } finally {
+    operationBudget?.clearMemory(REQUEST_MEMORY_PART);
+    operationBudget?.clearMemory(ERROR_RESPONSE_MEMORY_PART);
+    if (!succeeded) operationBudget?.clearMemory(RESULT_MEMORY_PART);
+  }
+}
+
+export { ZERO_OID };

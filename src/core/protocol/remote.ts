@@ -244,7 +244,7 @@ export async function discover(
     if (first === null) throw new CorruptError("empty ref advertisement");
     budget.packet(first);
     const header = first.kind === "line" ? pktText(first) : "";
-    if (header.startsWith("ERR ")) throw new GitError("EFETCHFAIL", header.slice(4));
+    if (header.startsWith("ERR ")) throw serviceError(service, header.slice(4));
     if (!header.startsWith("# service=")) {
       throw new CorruptError("not a smart HTTP ref advertisement");
     }
@@ -253,7 +253,7 @@ export async function discover(
       throw new CorruptError("malformed ref advertisement header");
     }
     budget.packet(afterHeader);
-    return await parseAdvertisement(reader, budget);
+    return await parseAdvertisement(reader, budget, service);
   } finally {
     // The advertisement is the whole response; leaving its tail unread
     // would hold the connection open.
@@ -274,6 +274,7 @@ export async function drain(body: AsyncIterable<Uint8Array>): Promise<void> {
 async function parseAdvertisement(
   reader: ByteReader,
   budget: NegotiationBudget,
+  service: Service,
 ): Promise<Advertisement> {
   const refs: RemoteRef[] = [];
   const capabilities = new Set<string>();
@@ -348,7 +349,7 @@ async function parseAdvertisement(
         text = text.slice(0, nul);
       }
     }
-    if (text.startsWith("ERR ")) throw new GitError("EFETCHFAIL", text.slice(4));
+    if (text.startsWith("ERR ")) throw serviceError(service, text.slice(4));
     const space = text.indexOf(" ");
     if (space < 0) throw new CorruptError("ref advertisement has a malformed row");
     const oid = text.slice(0, space);
@@ -374,6 +375,10 @@ async function parseAdvertisement(
     }
   }
   return { refs, capabilities, headRef };
+}
+
+function serviceError(service: Service, message: string): GitError {
+  return new GitError(service === "git-receive-pack" ? "EPUSHREJECTED" : "EFETCHFAIL", message);
 }
 
 function advertisedRefName(name: string): boolean {

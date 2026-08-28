@@ -807,3 +807,12 @@ findings are resolved before implementation.
   and diff-check passed. Independent review approved candidate authority,
   races, rollback/reopen durability, legacy behavior, memory ownership, and
   SQL admission after the affected witness review returned clean.
+- 2026-08-28: WU5 replaced the scalar receive-pack request with a bounded,
+  ordered command set, exact command/options/pack framing, one byte-identical
+  401 replay, complete ordered status parsing, and explicit safe-versus-
+  uncertain POST outcomes. Request, status, and error-response retention share
+  the caller-owned memory reservation; real Git witnesses cover atomic commands,
+  push options, deletion-only requests, and wrapped local stream failures. The
+  final focused gate passed 64 tests in 1.62 seconds; typecheck, targeted Biome,
+  and diff-check passed. Independent review approved the affected certainty,
+  option-validation, and aggregate high-water fixes without remaining findings.

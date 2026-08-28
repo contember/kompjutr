@@ -212,9 +212,7 @@ export async function push(
       status = await receivePack(
         {
           url,
-          oldOid,
-          newOid,
-          ref: remoteRef,
+          commands: [{ oldOid, newOid, ref: remoteRef }],
           advertised: advertisement.capabilities,
           ...(plan === undefined ? {} : { pack: () => openPushPack(repo, plan) }),
           ...(say === undefined ? {} : { onProgress: say }),
@@ -224,9 +222,12 @@ export async function push(
     } catch (error) {
       if (
         hasErrorCode(error, "EHTTP") ||
+        hasErrorCode(error, "EAUTH") ||
+        hasErrorCode(error, "E2BIG") ||
         hasErrorCode(error, "EUNSUPPORTED") ||
         hasErrorCode(error, "EPUSHREJECTED") ||
-        hasErrorCode(error, "EPUSHLOCAL")
+        hasErrorCode(error, "EPUSHLOCAL") ||
+        hasErrorCode(error, "EPUSHUNCERTAIN")
       ) {
         throw error;
       }
@@ -236,7 +237,10 @@ export async function push(
         { cause: error },
       );
     }
-    const refStatus = status.refs.get(remoteRef)!;
+    const refStatus = status.refs.get(remoteRef);
+    if (refStatus === undefined) {
+      throw new GitError("EPUSHUNCERTAIN", `receive-pack omitted status for ${remoteRef}`);
+    }
     const unpackError = status.unpack === "ok" ? null : `unpack ${status.unpack}`;
     const result = resultFor(remoteRef, refStatus, unpackError);
     if (!result.ok) {
