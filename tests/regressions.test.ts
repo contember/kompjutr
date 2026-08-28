@@ -41,9 +41,9 @@ describe("regressions", () => {
     storeA.write("blob", new TextEncoder().encode("gone"));
     storeA.destroy();
 
-    // A failed clone frees the id; the next create reuses it.
+    // Repository identities remain monotonic after destruction.
     const second = ws.database.createRepository("/", "ref: refs/heads/other");
-    expect(second.repoId).toBe(first.repoId);
+    expect(second.repoId).toBeGreaterThan(first.repoId);
     const storeB = ws.database.openCheckout(second);
     expect(storeB).not.toBe(storeA);
     expect(storeB.objectCount()).toBe(0);
