@@ -15,14 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- None.
+- [`sprints/sprint-2026-08-28-refspec-transport.md`](sprints/sprint-2026-08-28-refspec-transport.md)
+  — bounded remote discovery, wildcard fetch, and atomic multi-ref push.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Refspec transport is next: atomic multi-ref push, batch ref deletion, remote
-  ref discovery, and wildcard fetch for checkpoint refs.
+- Refspec transport is active: atomic multi-ref push, batch ref deletion,
+  remote ref discovery, and wildcard fetch for checkpoint refs.
 - The backlog plan is gated on a consumer: Phase 1 closes the calls two internal
   consumers issue, then one adapter runs end to end before anything else is
   scheduled — [`backlog/README.md`](backlog/README.md#consumer-demand).
