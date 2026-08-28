@@ -148,6 +148,7 @@ export {
   type GitCommitTreeOptions,
   type GitDivergenceOptions,
   type GitFactory,
+  type GitFetchOptions,
   type GitLsRemoteOptions,
   type GitLsTreeOptions,
   type GitMaintenanceOptions,

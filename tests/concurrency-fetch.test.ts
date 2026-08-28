@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { openRepository } from "../src/core/context.js";
 import type { MergeStateMetadata } from "../src/core/ops/merge-state.js";
 import { clone, fetchInto } from "../src/core/ops/network.js";
+import { worktreeAdd } from "../src/core/ops/worktrees.js";
 import { fetchHttpClient } from "../src/core/protocol/transport.js";
 import type { Repository } from "../src/core/repository.js";
 import { GitFixture } from "./helpers/git.js";
@@ -665,5 +666,46 @@ describe("fetch publication concurrency", () => {
         right.fixture.dispose();
       }
     });
+  });
+
+  it("fences a linked checkout that attaches after mapped branch preflight", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("tracked.txt", "tracked\n");
+    const tip = fixture.commit("mapped checkout fence");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    const mapping = {
+      source: "refs/heads/main",
+      destination: "refs/heads/topic",
+    };
+    const paused = pauseAfterDiscovery("mapped checkout ABA");
+    try {
+      await fetchInto(workspace.context, workspace.repo, {
+        url: server.url,
+        refspecs: [mapping],
+      });
+      const pending = fetchInto(
+        workspace.context,
+        workspace.repo,
+        { url: server.url, refspecs: [mapping] },
+        "fetch",
+        { checkpoint: paused.checkpoint },
+      );
+      await awaitBarrierEntry(paused.barrier, pending);
+      worktreeAdd(workspace.context, workspace.repo, {
+        root: "/linked",
+        target: { kind: "existing-branch", name: "topic" },
+      });
+      paused.barrier.release();
+
+      await expect(pending).rejects.toMatchObject({ code: "ESTALEFETCH" });
+      expect(workspace.repo.store.getRef(mapping.destination)).toBe(tip);
+      expect(workspace.repo.store.memory.totalBytes).toBe(0);
+      expect(workspace.repo.store.memory.activeCount).toBe(0);
+    } finally {
+      paused.barrier.release();
+      await server.close();
+      fixture.dispose();
+    }
   });
 });

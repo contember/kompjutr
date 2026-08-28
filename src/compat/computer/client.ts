@@ -30,7 +30,7 @@ import {
 import { diff as diffOp, diffSummary as diffSummaryOp } from "../../core/ops/diff.js";
 import { initRepository } from "../../core/ops/init.js";
 import { merge as mergeOp } from "../../core/ops/merge.js";
-import { clone as cloneOp, fetchInto } from "../../core/ops/network.js";
+import { clone as cloneOp, fetchInto, validateFetchOptions } from "../../core/ops/network.js";
 import {
   catFile as catFileOp,
   hashObject as hashObjectOp,
@@ -110,9 +110,11 @@ export function createSqliteGitClient(
         await cloneOp(ctx(), input);
       },
       async fetch(input = {}) {
+        validateFetchOptions(input);
         const repo = at(input.dir);
         repo.checkout.requireNoOperationState();
-        return fetchInto(ctx(), repo, input);
+        const result = await fetchInto(ctx(), repo, input);
+        return { defaultBranch: result.defaultBranch, fetchHead: result.fetchHead };
       },
       async init(input = {}) {
         initRepository(ctx(), input);

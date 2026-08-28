@@ -30,10 +30,53 @@ import {
   MAX_PACK_DELETE_BATCH,
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_CHUNK,
+  type PackIngestSqlBudget,
 } from "../src/sqlite/packs.js";
 import { CheckoutStore, SharedRepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
+
+class TestPackIngestSqlBudget implements PackIngestSqlBudget {
+  charged = 0;
+  readonly #reservations = new Map<string, number>();
+
+  constructor(readonly limit = Number.MAX_SAFE_INTEGER) {}
+
+  get reserved(): number {
+    let statements = 0;
+    for (const reserved of this.#reservations.values()) statements += reserved;
+    return statements;
+  }
+
+  chargeSql(statements = 1): void {
+    if (statements > this.limit - this.charged - this.reserved) {
+      throw new GitError("E2BIG", "test pack SQL budget exceeded");
+    }
+    this.charged += statements;
+  }
+
+  reserveSql(part: string, statements: number): void {
+    const previous = this.#reservations.get(part) ?? 0;
+    if (statements > this.limit - this.charged - (this.reserved - previous)) {
+      throw new GitError("E2BIG", "test pack SQL budget exceeded");
+    }
+    if (statements === 0) this.#reservations.delete(part);
+    else this.#reservations.set(part, statements);
+  }
+
+  chargeReservedSql(part: string, statements = 1): void {
+    const reserved = this.#reservations.get(part) ?? 0;
+    if (statements > reserved) throw new GitError("E2BIG", "test pack SQL budget exceeded");
+    const remaining = reserved - statements;
+    if (remaining === 0) this.#reservations.delete(part);
+    else this.#reservations.set(part, remaining);
+    this.charged += statements;
+  }
+
+  releaseSql(part: string): void {
+    this.#reservations.delete(part);
+  }
+}
 
 class ReorderedRangeDatabase implements SqlDatabase {
   constructor(readonly inner: TestDatabase) {}
@@ -551,6 +594,114 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
+  it("charges every pack ingest SQL statement before execution", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const data = utf8.encode("pack SQL accounting\n");
+
+    db.storage.resetCounters();
+    const success = new TestPackIngestSqlBudget();
+    await store.packs.ingest(slices(singleBlobPack(data), 7), { sqlBudget: success });
+    expect(success.charged).toBe(db.storage.statementCount);
+
+    const corrupt = singleBlobPack(utf8.encode("pack SQL cleanup accounting\n"));
+    corrupt[corrupt.length - 1] = (corrupt.at(-1) ?? 0) ^ 0xff;
+    db.storage.resetCounters();
+    const failure = new TestPackIngestSqlBudget();
+    await expect(store.packs.ingest(slices(corrupt, 7), { sqlBudget: failure })).rejects.toThrow(
+      /checksum/,
+    );
+    expect(failure.charged).toBe(db.storage.statementCount);
+    const beforeReclaim = failure.charged;
+    db.storage.resetCounters();
+    await store.packs.ingest(slices(singleBlobPack(utf8.encode("after pending reclaim\n")), 7), {
+      sqlBudget: failure,
+    });
+    expect(failure.charged - beforeReclaim).toBe(db.storage.statementCount);
+    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(0);
+
+    const twoExchangeDb = new TestDatabase();
+    const twoExchangeDatabase = new SqliteGitDatabase(twoExchangeDb);
+    const twoExchange = twoExchangeDatabase.openCheckout(
+      twoExchangeDatabase.createRepository("/repo", "ref: refs/heads/main"),
+    );
+    const shared = new TestPackIngestSqlBudget();
+    twoExchangeDb.storage.resetCounters();
+    await twoExchange.packs.ingest(slices(singleBlobPack(data), 7), { sqlBudget: shared });
+    await twoExchange.packs.ingest(
+      slices(singleBlobPack(utf8.encode("legacy fallback exchange\n")), 7),
+      { sqlBudget: shared },
+    );
+    expect(shared.charged).toBe(twoExchangeDb.storage.statementCount);
+
+    const admittedDb = new TestDatabase();
+    const admittedDatabase = new SqliteGitDatabase(admittedDb);
+    const admitted = admittedDatabase.openCheckout(
+      admittedDatabase.createRepository("/repo", "ref: refs/heads/main"),
+    );
+    admittedDb.storage.resetCounters();
+    const exact = new TestPackIngestSqlBudget(success.charged);
+    await admitted.packs.ingest(slices(singleBlobPack(data), 7), { sqlBudget: exact });
+    expect(exact.charged).toBe(success.charged);
+    expect(admittedDb.storage.statementCount).toBe(exact.charged);
+    expect(exact.reserved).toBe(0);
+
+    const rejectedDb = new TestDatabase();
+    const rejectedDatabase = new SqliteGitDatabase(rejectedDb);
+    const rejected = rejectedDatabase.openCheckout(
+      rejectedDatabase.createRepository("/repo", "ref: refs/heads/main"),
+    );
+    const rejectedReservation = rejected.reserveMemory();
+    rejectedDb.storage.resetCounters();
+    const firstExcess = new TestPackIngestSqlBudget(success.charged - 1);
+    await expect(
+      rejected.packs.ingest(slices(singleBlobPack(data), 7), {
+        reservation: rejectedReservation,
+        sqlBudget: firstExcess,
+      }),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    expect(firstExcess.charged).toBe(success.charged - 1);
+    expect(rejectedDb.storage.statementCount).toBe(firstExcess.charged);
+    expect(firstExcess.reserved).toBe(0);
+    expect(rejectedReservation.currentBytes).toBe(0);
+    expect(
+      rejectedDb.one<{ active_pack_id: number | null; expires_ms: number | null }>(
+        "SELECT active_pack_id, expires_ms FROM git_pack_ingest_control WHERE repo_id = ?",
+        rejected.repoId,
+      ),
+    ).toEqual({ active_pack_id: null, expires_ms: null });
+    expect(
+      rejectedDb.scalar<number>(
+        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'pending'",
+        rejected.repoId,
+      ),
+    ).toBe(1);
+
+    rejectedDb.storage.resetCounters();
+    const afterExcess = new TestPackIngestSqlBudget();
+    await rejected.packs.ingest(
+      slices(singleBlobPack(utf8.encode("after exhausted cleanup\n")), 7),
+      { reservation: rejectedReservation, sqlBudget: afterExcess },
+    );
+    expect(afterExcess.charged).toBe(rejectedDb.storage.statementCount);
+    expect(afterExcess.reserved).toBe(0);
+    expect(rejectedReservation.currentBytes).toBe(0);
+    expect(
+      rejectedDb.scalar<number>(
+        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'pending'",
+        rejected.repoId,
+      ),
+    ).toBe(0);
+    rejectedReservation.dispose();
+    const rejectedProbe = rejected.reserveMemory();
+    try {
+      rejectedProbe.set("other", MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      rejectedProbe.dispose();
+    }
+  });
+
   it("composes ingest memory under one repository-owned operation reservation", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);

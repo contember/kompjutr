@@ -66,9 +66,12 @@ import {
   clone as cloneOp,
   type FetchOptions,
   fetchInto,
-  type FetchResult as LegacyFetchResult,
+  validateFetchOptions,
 } from "../core/ops/network.js";
-import type { LsRemoteResult as StructuredLsRemoteResult } from "../core/ops/refspec.js";
+import type {
+  FetchResult as StructuredFetchResult,
+  LsRemoteResult as StructuredLsRemoteResult,
+} from "../core/ops/refspec.js";
 
 export type {
   FetchRefspec,
@@ -199,7 +202,7 @@ export interface GitDirOptions {
 }
 
 export type GitCloneOptions = CloneOptions;
-export type GitFetchOptions = FetchOptions;
+export type GitFetchOptions = GitDirOptions & FetchOptions;
 export type GitLsRemoteOptions = GitDirOptions & LsRemoteOptions;
 export type GitInitOptions = InitOptions;
 export type GitDiffOptions = DiffOptions & GitDirOptions;
@@ -280,7 +283,7 @@ export type GitScratchIndexCallback<T> = (index: GitScratchIndex) => T;
 
 export interface Git {
   clone(input: GitCloneOptions): Promise<void>;
-  fetch(input?: GitFetchOptions): Promise<LegacyFetchResult>;
+  fetch(input?: GitFetchOptions): Promise<StructuredFetchResult>;
   lsRemote(input?: GitLsRemoteOptions): Promise<StructuredLsRemoteResult>;
   init(input?: GitInitOptions): Promise<void>;
   status(input?: GitStatusOptions): Promise<StatusEntry[]>;
@@ -407,6 +410,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       await cloneOp(context, input);
     },
     async fetch(input = {}) {
+      validateFetchOptions(input);
       const repo = at(input.dir);
       repo.checkout.requireNoOperationState();
       return fetchInto(context, repo, input);

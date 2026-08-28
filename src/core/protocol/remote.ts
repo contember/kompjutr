@@ -13,6 +13,7 @@ import { retainedStringBytes } from "../retained.js";
 import { FLUSH, pkt } from "./pktline.js";
 import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt, pktText } from "./stream.js";
 import {
+  type GitHttpResponse,
   HttpError,
   type RemoteAuthSession,
   type RemoteRequestOptions,
@@ -45,6 +46,8 @@ export const MAX_PROTOCOL_TEXT_BYTES = MAX_PKT_FRAME_BYTES - 4;
 
 const ADVERTISEMENT_FIXED_BYTES = 256;
 const UPLOAD_RESULT_FIXED_BYTES = 192;
+const UPLOAD_REQUEST_FIXED_BYTES = 256;
+const UPLOAD_REQUEST_FRAME_BYTES = 32;
 const REF_FIXED_BYTES = 96;
 const CAPABILITY_FIXED_BYTES = 64;
 const HEAD_REF_FIXED_BYTES = 16;
@@ -71,16 +74,16 @@ interface ResolvedProtocolMemoryLimits {
 export interface ProtocolRequestOptions extends RemoteRequestOptions {
   protocolLimits?: ProtocolMemoryLimits;
   authSession?: RemoteAuthSession;
-}
-
-interface DiscoveryRequestOptions extends ProtocolRequestOptions {
   operationBudget?: TransportOperationBudget;
 }
+
+type DiscoveryRequestOptions = ProtocolRequestOptions;
 
 class NegotiationBudget {
   #retained: number;
   #input = 0;
   #entries = 0;
+  readonly #operationBase: number;
 
   constructor(
     private readonly limits: ResolvedProtocolMemoryLimits,
@@ -89,7 +92,8 @@ class NegotiationBudget {
     private readonly memoryPart = "protocol-negotiation",
   ) {
     if (fixedBytes > limits.retainedBytes) this.#tooLarge("retained state");
-    operationBudget?.setMemory(memoryPart, fixedBytes);
+    this.#operationBase = operationBudget?.memory(memoryPart) ?? 0;
+    operationBudget?.setMemory(memoryPart, this.#operationBase + fixedBytes);
     this.#retained = fixedBytes;
   }
 
@@ -103,7 +107,7 @@ class NegotiationBudget {
   reserve(bytes: number, entries = 1): void {
     if (entries > this.limits.entries - this.#entries) this.#tooLarge("entry count");
     if (bytes > this.limits.retainedBytes - this.#retained) this.#tooLarge("retained state");
-    this.operationBudget?.setMemory(this.memoryPart, this.#retained + bytes);
+    this.operationBudget?.setMemory(this.memoryPart, this.#operationBase + this.#retained + bytes);
     this.#entries += entries;
     this.#retained += bytes;
   }
@@ -115,8 +119,14 @@ class NegotiationBudget {
 
 class UploadRequestBudget {
   #bytes = 0;
+  #frames = 0;
 
-  constructor(private readonly limits: ResolvedProtocolMemoryLimits) {}
+  constructor(
+    private readonly limits: ResolvedProtocolMemoryLimits,
+    private readonly operationBudget?: TransportOperationBudget,
+  ) {
+    operationBudget?.setMemory("protocol-upload-request", UPLOAD_REQUEST_FIXED_BYTES);
+  }
 
   line(text: string): void {
     if (text.length > this.limits.lineBytes) this.#tooLarge("pkt-line text");
@@ -125,11 +135,29 @@ class UploadRequestBudget {
 
   frame(bytes: number): void {
     if (bytes > this.limits.inputBytes - this.#bytes) this.#tooLarge("negotiation input");
-    this.#bytes += bytes;
+    const nextBytes = this.#bytes + bytes;
+    const nextFrames = this.#frames + 1;
+    this.operationBudget?.setMemory(
+      "protocol-upload-request",
+      UPLOAD_REQUEST_FIXED_BYTES + nextBytes + nextFrames * UPLOAD_REQUEST_FRAME_BYTES,
+    );
+    this.#bytes = nextBytes;
+    this.#frames = nextFrames;
   }
 
   entries(entries: number): void {
     if (entries > this.limits.entries) this.#tooLarge("entry count");
+  }
+
+  concatenate(): void {
+    this.operationBudget?.setMemory(
+      "protocol-upload-request",
+      UPLOAD_REQUEST_FIXED_BYTES + 2 * this.#bytes + this.#frames * UPLOAD_REQUEST_FRAME_BYTES,
+    );
+  }
+
+  clear(): void {
+    this.operationBudget?.clearMemory("protocol-upload-request");
   }
 
   #tooLarge(part: string): never {
@@ -432,8 +460,10 @@ export async function uploadPack(
 
   if (request.wants.length === 0) throw new GitError("ENOWANT", "nothing to fetch");
   const haves = request.haves ?? [];
-  const requestBudget = new UploadRequestBudget(limits);
-  requestBudget.entries(request.wants.length + shallows.length + haves.length);
+  const entries = request.wants.length + shallows.length + haves.length;
+  if (entries > limits.entries) {
+    throw new GitError("E2BIG", "protocol entry count exceeds its bounded limit");
+  }
   for (const oid of [...request.wants, ...shallows, ...haves]) {
     if (!isOid(oid)) throw new CorruptError(`invalid upload-pack object id ${oid}`);
   }
@@ -441,36 +471,51 @@ export async function uploadPack(
     throw new RangeError("upload-pack depth must be a positive safe integer");
   }
 
-  const body: Uint8Array[] = [];
-  const pushLine = (text: string): void => {
-    requestBudget.line(text);
-    body.push(pkt(text));
-  };
-  request.wants.forEach((oid, index) => {
-    pushLine(index === 0 ? `want ${oid} ${capabilities.join(" ")}\n` : `want ${oid}\n`);
-  });
-  for (const oid of shallows) pushLine(`shallow ${oid}\n`);
-  if (request.depth !== undefined) pushLine(`deepen ${request.depth}\n`);
-  requestBudget.frame(FLUSH.length);
-  body.push(FLUSH);
-  for (const oid of haves) pushLine(`have ${oid}\n`);
-  pushLine("done\n");
-
-  const response = await requestWithAuth(
-    {
-      url: `${base}/git-upload-pack`,
-      method: "POST",
-      headers: {
-        ...baseHeaders(),
-        "Content-Type": "application/x-git-upload-pack-request",
-        Accept: "application/x-git-upload-pack-result",
+  const requestBudget = new UploadRequestBudget(limits, options.operationBudget);
+  let response: GitHttpResponse;
+  try {
+    requestBudget.entries(entries);
+    const body: Uint8Array[] = [];
+    const pushLine = (text: string): void => {
+      requestBudget.line(text);
+      body.push(pkt(text));
+    };
+    request.wants.forEach((oid, index) => {
+      pushLine(index === 0 ? `want ${oid} ${capabilities.join(" ")}\n` : `want ${oid}\n`);
+    });
+    for (const oid of shallows) pushLine(`shallow ${oid}\n`);
+    if (request.depth !== undefined) pushLine(`deepen ${request.depth}\n`);
+    requestBudget.frame(FLUSH.length);
+    body.push(FLUSH);
+    for (const oid of haves) pushLine(`have ${oid}\n`);
+    pushLine("done\n");
+    requestBudget.concatenate();
+    const requestBody = concatBody(body);
+    response = await requestWithAuth(
+      {
+        url: `${base}/git-upload-pack`,
+        method: "POST",
+        headers: {
+          ...baseHeaders(),
+          "Content-Type": "application/x-git-upload-pack-request",
+          Accept: "application/x-git-upload-pack-result",
+        },
+        body: requestBody,
       },
-      body: concatBody(body),
-    },
-    options,
-    options.authSession,
+      options,
+      options.authSession,
+    );
+  } finally {
+    requestBudget.clear();
+  }
+  const budget = new NegotiationBudget(
+    limits,
+    UPLOAD_RESULT_FIXED_BYTES,
+    options.operationBudget,
+    "protocol-upload-result",
   );
   if (response.status !== 200) {
+    budget.reserve(ERROR_PREFIX_BYTES + 2 * ERROR_PREFIX_CHARACTERS, 0);
     const text = await readErrorPrefix(response.body);
     throw new HttpError(
       response.status,
@@ -481,7 +526,6 @@ export async function uploadPack(
   const reader = new ByteReader(response.body);
   const shallow: string[] = [];
   const unshallow: string[] = [];
-  const budget = new NegotiationBudget(limits, UPLOAD_RESULT_FIXED_BYTES);
   const useSideband = capabilities.includes("side-band-64k");
 
   // Acknowledgement and shallow sections, then the pack. `done` was sent,

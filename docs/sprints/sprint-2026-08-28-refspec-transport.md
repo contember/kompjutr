@@ -816,3 +816,13 @@ findings are resolved before implementation.
   final focused gate passed 64 tests in 1.62 seconds; typecheck, targeted Biome,
   and diff-check passed. Independent review approved the affected certainty,
   option-validation, and aggregate high-water fixes without remaining findings.
+- 2026-08-28: WU4 added explicit and wildcard mapped fetch over one validated
+  advertisement and one atomic exact-ref publication, while preserving the
+  legacy auto-tag fallback. Pack ingest now charges each executed SQL statement
+  to the shared operation budget and reserves its lease-release cleanup; upload
+  request/result memory and authenticated tag chains use the same root budget.
+  Exact publication, linked-checkout fencing, namespace force rules, reflogs,
+  corrupt loose shadows, 1,024 mappings, two legacy exchanges, failure reclaim,
+  and cold reopen are covered. The final focused gate passed 67 tests in 14.59
+  seconds; typecheck, targeted Biome, and diff-check passed. Independent
+  re-review returned clean after the SQL-cleanup and peeled-target witnesses.

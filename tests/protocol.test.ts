@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
+import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
 import { FLUSH, pkt, pktLines } from "../src/core/protocol/pktline.js";
 import { receivePack } from "../src/core/protocol/receive-pack.js";
 import {
@@ -16,6 +17,7 @@ import {
   pktText,
 } from "../src/core/protocol/stream.js";
 import type { GitHttpClient, GitHttpResponse } from "../src/core/protocol/transport.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 
@@ -820,6 +822,106 @@ describe("upload-pack", () => {
       ),
     ).rejects.toMatchObject({ code: "E2BIG" });
     expect(calls).toBe(2);
+  });
+
+  it("accounts replayable requests and additive results in the caller operation", async () => {
+    const body = concat([
+      pkt(`shallow ${OID}\n`),
+      pkt("NAK\n"),
+      pkt(concat([new Uint8Array([1]), PACK])),
+      FLUSH,
+    ]);
+    const request = {
+      url: "http://host/repo",
+      wants: [OID],
+      advertised: new Set(["side-band-64k"]),
+    };
+    const response = () => respond(body, "application/x-git-upload-pack-result");
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const operationBudget = new TransportOperationBudget(reservation);
+    try {
+      const first = await uploadPack(request, { http: canned(response), operationBudget });
+      expect(first.shallow).toEqual([OID]);
+      expect(operationBudget.memory("protocol-upload-request")).toBe(0);
+      const firstResultBytes = operationBudget.memory("protocol-upload-result");
+      expect(firstResultBytes).toBeGreaterThan(0);
+
+      const second = await uploadPack(request, { http: canned(response), operationBudget });
+      expect(second.shallow).toEqual([OID]);
+      expect(operationBudget.memory("protocol-upload-request")).toBe(0);
+      expect(operationBudget.memory("protocol-upload-result")).toBe(2 * firstResultBytes);
+    } finally {
+      operationBudget.clearAllMemory();
+      expect(reservation.currentBytes).toBe(0);
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
+
+    const measuredCoordinator = new MemoryCoordinator();
+    const measuredReservation = measuredCoordinator.reserve();
+    const measuredBudget = new TransportOperationBudget(measuredReservation);
+    await uploadPack(request, { http: canned(response), operationBudget: measuredBudget });
+    const requestPeak = measuredReservation.highWaterBytes;
+    measuredBudget.clearAllMemory();
+    measuredReservation.dispose();
+
+    const exactCoordinator = new MemoryCoordinator();
+    const exactReservation = exactCoordinator.reserve();
+    const exactBudget = new TransportOperationBudget(exactReservation);
+    exactBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - requestPeak);
+    await expect(
+      uploadPack(request, { http: canned(response), operationBudget: exactBudget }),
+    ).resolves.toBeDefined();
+    exactBudget.clearAllMemory();
+    exactReservation.dispose();
+
+    let calls = 0;
+    const excessCoordinator = new MemoryCoordinator();
+    const excessReservation = excessCoordinator.reserve();
+    const excessBudget = new TransportOperationBudget(excessReservation);
+    excessBudget.setMemory("test-pressure", MAX_OPERATION_MEMORY_BYTES - requestPeak + 1);
+    await expect(
+      uploadPack(request, {
+        http: (input) => {
+          calls++;
+          return canned(response)(input);
+        },
+        operationBudget: excessBudget,
+      }),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    expect(calls).toBe(0);
+    expect(excessBudget.memory("protocol-upload-request")).toBe(0);
+    excessBudget.clearAllMemory();
+    excessReservation.dispose();
+    excessCoordinator.assertIdle();
+  });
+
+  it("clears request memory while retaining a bounded HTTP error result", async () => {
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const operationBudget = new TransportOperationBudget(reservation);
+    await expect(
+      uploadPack(
+        { url: "http://host/repo", wants: [OID], advertised: new Set() },
+        {
+          http: () =>
+            Promise.resolve({
+              status: 500,
+              statusText: "Internal Server Error",
+              headers: {},
+              body: once(utf8.encode("boom")),
+            }),
+          operationBudget,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "EHTTP" });
+    expect(operationBudget.memory("protocol-upload-request")).toBe(0);
+    expect(operationBudget.memory("protocol-upload-result")).toBeGreaterThan(0);
+    operationBudget.clearAllMemory();
+    expect(reservation.currentBytes).toBe(0);
+    reservation.dispose();
+    coordinator.assertIdle();
   });
 
   it("refuses to ask for nothing", async () => {

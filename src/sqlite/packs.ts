@@ -454,6 +454,8 @@ export interface PackIngestOptions {
   maxBytes?: number;
   /** Caller-owned operation budget; ingest uses and disposes one additive child scope. */
   reservation?: MemoryReservation;
+  /** Caller-owned SQL budget shared with the surrounding transport operation. */
+  sqlBudget?: PackIngestSqlBudget;
   onProgress?: (message: string) => void;
   /** Awaited periodically so the runtime can flush its write buffer. */
   yieldNow?: () => Promise<void>;
@@ -462,6 +464,52 @@ export interface PackIngestOptions {
   lifecycle?: PackIngestLifecycle;
   /** Ordinary ingest reclaims abandoned packs; owned maintenance retries skip that broad scan. */
   reclaimPending?: boolean;
+}
+
+/** Layer-safe SQL accounting seam for one pack ingest. */
+export interface PackIngestSqlBudget {
+  chargeSql(statements?: number): void;
+  reserveSql(part: string, statements: number): void;
+  chargeReservedSql(part: string, statements?: number): void;
+  releaseSql(part: string): void;
+}
+
+const PACK_INGEST_CLEANUP_SQL_PART = "pack-ingest-cleanup";
+
+class PackIngestDatabase implements SqlDatabase {
+  constructor(
+    private readonly db: SqlDatabase,
+    private readonly budget: PackIngestSqlBudget,
+  ) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.budget.chargeSql();
+    this.db.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    this.budget.chargeSql();
+    return this.db.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    this.budget.chargeSql();
+    return this.db.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    this.budget.chargeSql();
+    return this.db.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.budget.chargeSql();
+    return this.db.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.db.transactionSync(closure);
+  }
 }
 
 export interface PackIngestResult {
@@ -798,12 +846,16 @@ export class PackStore {
   readonly #scopeMemory: (reservation: MemoryReservation) => MemoryReservation;
   readonly #cacheNamespace: string;
   readonly #now: () => number;
-  #cacheGeneration = 0;
+  #sharedState = {
+    cacheGeneration: 0,
+    activePending: new Set<number>(),
+    lastIngestMemoryHighWater: 0,
+  };
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
   readonly #maxDeltaDepth: number;
-  readonly #activePending = new Set<number>();
-  #lastIngestMemoryHighWater = 0;
+  #ingestSqlBudget: PackIngestSqlBudget | undefined;
+  #ingestCleanupDb: SqlDatabase | undefined;
 
   constructor(
     db: SqlDatabase,
@@ -850,7 +902,7 @@ export class PackStore {
   }
 
   get lastIngestMemoryHighWater(): number {
-    return this.#lastIngestMemoryHighWater;
+    return this.#sharedState.lastIngestMemoryHighWater;
   }
 
   lookup(oid: string): PackedEntry | null {
@@ -1678,11 +1730,11 @@ export class PackStore {
   }
 
   #objectCacheKey(packId: number, oid: string): string {
-    return `${this.#cacheNamespace}:${this.#cacheGeneration}:pack:${packId}:${oid}`;
+    return `${this.#cacheNamespace}:${this.#sharedState.cacheGeneration}:pack:${packId}:${oid}`;
   }
 
   #chunkCacheKey(packId: number, seq: number): string {
-    return `${this.#cacheNamespace}:${this.#cacheGeneration}:row:${packId}:${seq}`;
+    return `${this.#cacheNamespace}:${this.#sharedState.cacheGeneration}:row:${packId}:${seq}`;
   }
 
   /** Inflate one indexed entry, whose compressed length is already known. */
@@ -1957,7 +2009,7 @@ export class PackStore {
   }
 
   clearCaches(): void {
-    this.#cacheGeneration++;
+    this.#sharedState.cacheGeneration++;
   }
 
   #withMemoryReservation<T>(closure: (reservation: MemoryReservation) => T): T {
@@ -2066,7 +2118,7 @@ export class PackStore {
         this.#repoId,
         livePackId,
         livePackId,
-        JSON.stringify([...this.#activePending]),
+        JSON.stringify([...this.#sharedState.activePending]),
         MAX_PACK_DELETE_BATCH + 1,
       ),
       true,
@@ -2122,7 +2174,7 @@ export class PackStore {
     requirePackId(packId);
     const removed = this.#withMemoryReservation((memory) =>
       this.#db.transactionSync(() => {
-        if (this.#activePending.has(packId)) {
+        if (this.#sharedState.activePending.has(packId)) {
           throw new GitError("EBUSY", `pack ${packId} is active`);
         }
         this.#assertNotDurablyActive(packId);
@@ -2165,7 +2217,7 @@ export class PackStore {
     }
     const removed = this.#withMemoryReservation((memory) =>
       this.#db.transactionSync(() => {
-        if (this.#activePending.has(packId)) {
+        if (this.#sharedState.activePending.has(packId)) {
           throw new GitError("EBUSY", `pack ${packId} is active`);
         }
         this.#assertNotDurablyActive(packId);
@@ -3236,6 +3288,21 @@ export class PackStore {
     source: AsyncIterable<Uint8Array>,
     options: PackIngestOptions = {},
   ): Promise<PackIngestResult> {
+    if (options.sqlBudget !== undefined && this.#ingestSqlBudget === undefined) {
+      options.sqlBudget.reserveSql(PACK_INGEST_CLEANUP_SQL_PART, 1);
+      try {
+        return await this.#sqlBudgeted(options.sqlBudget).#ingest(source, options);
+      } finally {
+        options.sqlBudget.releaseSql(PACK_INGEST_CLEANUP_SQL_PART);
+      }
+    }
+    return this.#ingest(source, options);
+  }
+
+  async #ingest(
+    source: AsyncIterable<Uint8Array>,
+    options: PackIngestOptions,
+  ): Promise<PackIngestResult> {
     const reclaimPending = options.reclaimPending ?? true;
     if (typeof reclaimPending !== "boolean") {
       throw new RangeError("reclaimPending must be a boolean");
@@ -3288,9 +3355,10 @@ export class PackStore {
       );
       heartbeat();
       const result = { packId: reservation.packId, count, bytes: total };
+      const publishingLease = lease;
 
       this.#db.transactionSync(() => {
-        if (lease !== null) this.#renewIngestLease(lease, now);
+        if (publishingLease !== null) this.#renewIngestLease(publishingLease, now);
         const published = this.#db.one<Record<string, unknown>>(
           `UPDATE git_pack_meta SET size = ?, count = ?, state = 'complete'
             WHERE repo_id = ? AND pack_id = ? AND state = 'pending'
@@ -3314,36 +3382,65 @@ export class PackStore {
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }
-        if (lease !== null) this.#releaseIngestLease(lease, true);
+        if (publishingLease !== null) this.#releaseReservedIngestLease(publishingLease, true);
       });
+      if (publishingLease !== null) lease = null;
       memoryReservation.clear("other");
       memoryReservation.clear("commit");
       return result;
     } finally {
-      if (activePackId !== undefined) this.#activePending.delete(activePackId);
-      if (lease !== null) this.#releaseIngestLease(lease, false);
-      if (memory !== undefined) {
-        const { reservation, pool } = memory;
-        this.#lastIngestMemoryHighWater = reservation.highWaterBytes;
-        if (!reservation.disposed) {
-          try {
-            pool.assertIdle();
-            pool.dispose();
-            reservation.clear("flat");
-            reservation.clear("compressed");
-            reservation.clear("metadata");
-            reservation.clear("tree");
-            reservation.clear("commit");
-            reservation.clear("base");
-            reservation.clear("pool");
-            reservation.clear("other");
-            reservation.assertEmpty();
-          } finally {
-            reservation.dispose();
+      if (activePackId !== undefined) this.#sharedState.activePending.delete(activePackId);
+      try {
+        if (lease !== null) this.#releaseReservedIngestLease(lease, false);
+      } finally {
+        if (memory !== undefined) {
+          const { reservation, pool } = memory;
+          this.#sharedState.lastIngestMemoryHighWater = reservation.highWaterBytes;
+          if (!reservation.disposed) {
+            try {
+              pool.assertIdle();
+              pool.dispose();
+              reservation.clear("flat");
+              reservation.clear("compressed");
+              reservation.clear("metadata");
+              reservation.clear("tree");
+              reservation.clear("commit");
+              reservation.clear("base");
+              reservation.clear("pool");
+              reservation.clear("other");
+              reservation.assertEmpty();
+            } finally {
+              reservation.dispose();
+            }
           }
         }
       }
     }
+  }
+
+  #sqlBudgeted(sqlBudget: PackIngestSqlBudget): PackStore {
+    const store = new PackStore(
+      new PackIngestDatabase(this.#db, sqlBudget),
+      this.#repoId,
+      this.#objects,
+      this.#chunks,
+      this.#memory,
+      this.#scopeMemory,
+      this.#cacheNamespace,
+      this.#external,
+      this.#externalBatch,
+      this.#externalMetadata,
+      {
+        now: this.#now,
+        maxBufferedEntry: this.#maxBufferedEntry,
+        cacheEntryLimit: this.#cacheEntryLimit,
+        maxDeltaDepth: this.#maxDeltaDepth,
+      },
+    );
+    store.#sharedState = this.#sharedState;
+    store.#ingestSqlBudget = sqlBudget;
+    store.#ingestCleanupDb = this.#db;
+    return store;
   }
 
   #reservePending(
@@ -3405,7 +3502,7 @@ export class PackStore {
         ) {
           throw new CorruptError("pack ingest allocation was not recorded");
         }
-        this.#activePending.add(packId);
+        this.#sharedState.activePending.add(packId);
         activePackId = packId;
         if (lifecycle !== undefined) {
           requireLifecycleResult(lifecycle.reserved(packId), "reserved");
@@ -3413,7 +3510,7 @@ export class PackStore {
         return { packId, lease, reclaimed };
       });
     } catch (error) {
-      if (activePackId !== undefined) this.#activePending.delete(activePackId);
+      if (activePackId !== undefined) this.#sharedState.activePending.delete(activePackId);
       throw error;
     }
   }
@@ -3445,8 +3542,15 @@ export class PackStore {
     lease.expiresMs = control.expiresMs;
   }
 
-  #releaseIngestLease(lease: PackIngestLease, required: boolean): void {
-    const row = this.#db.one<Record<string, unknown>>(
+  #releaseReservedIngestLease(lease: PackIngestLease, required: boolean): void {
+    const budget = this.#ingestSqlBudget;
+    const db = this.#ingestCleanupDb ?? this.#db;
+    budget?.chargeReservedSql(PACK_INGEST_CLEANUP_SQL_PART);
+    this.#releaseIngestLease(lease, required, db);
+  }
+
+  #releaseIngestLease(lease: PackIngestLease, required: boolean, db: SqlDatabase = this.#db): void {
+    const row = db.one<Record<string, unknown>>(
       `UPDATE git_pack_ingest_control
           SET active_pack_id = NULL, expires_ms = NULL
         WHERE repo_id = ? AND owner_generation = ? AND active_pack_id = ?
@@ -4074,6 +4178,7 @@ export class PackStore {
         const baseOids = [...baseOidSet];
         const packedMetadata = this.#packedBaseMetadata(baseOids, packId);
         const externalOids = baseOids.filter((oid) => !packedMetadata.has(oid));
+        if (externalOids.length > 0) this.#ingestSqlBudget?.chargeSql();
         const externalMetadata = this.#externalMetadata(externalOids);
         this.#checkBaseAdmission(packedMetadata, externalMetadata);
         let admittedBaseBytes = 0;
@@ -4095,6 +4200,7 @@ export class PackStore {
             throw new CorruptError("materialized pack base disagrees with its admitted metadata");
           }
         }
+        if (externalMetadata.size > 0) this.#ingestSqlBudget?.chargeSql(3);
         for (const [oid, object] of this.#externalBatch([...externalMetadata.keys()])) {
           const metadata = externalMetadata.get(oid);
           if (

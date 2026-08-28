@@ -29,6 +29,7 @@ import type {
   GitStatusOptions as GitEntrypointStatusOptions,
   GitStatusReport as GitEntrypointStatusReport,
   GitStatusReportOptions as GitEntrypointStatusReportOptions,
+  GitFetchOptions,
   FetchRefspec as GitFetchRefspec,
   FetchRefUpdate as GitFetchRefUpdate,
   GitLsRemoteOptions,
@@ -124,6 +125,7 @@ import type {
   FetchRefUpdate as RootFetchRefUpdate,
   Git as RootGit,
   GitDivergenceOptions as RootGitDivergenceOptions,
+  GitFetchOptions as RootGitFetchOptions,
   GitLsRemoteOptions as RootGitLsRemoteOptions,
   GitLsTreeOptions as RootGitLsTreeOptions,
   GitMergeBaseOptions as RootGitMergeBaseOptions,
@@ -725,6 +727,12 @@ describe("public structured refspec exports", () => {
       force: true,
     };
     const gitFetch: GitFetchRefspec = fetch;
+    const gitFetchOptions: GitFetchOptions = {
+      dir: "/repo",
+      url: "https://example.test/repo.git",
+      refspecs: [fetch],
+    };
+    const fetchOptions: RootGitFetchOptions = gitFetchOptions;
     const push: RootPushRefspec = {
       source: null,
       destination: "refs/checkpoints/old",
@@ -778,6 +786,7 @@ describe("public structured refspec exports", () => {
 
     expect([
       gitFetch.destination,
+      fetchOptions.url,
       gitPush.destination,
       gitNamedTarget.remote,
       rootUrlTarget.url,
@@ -805,6 +814,7 @@ describe("public structured refspec exports", () => {
       ROOT_MAX_LS_REMOTE_REFS,
     ]).toEqual([
       "refs/remotes/origin/*",
+      "https://example.test/repo.git",
       "refs/checkpoints/old",
       "origin",
       "https://example.test/repo.git",

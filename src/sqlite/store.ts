@@ -210,6 +210,7 @@ export const REF_MUTATION_FIXED_RETAINED_BYTES =
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
 export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 12;
 export const MAX_FETCH_PUBLICATION_SQL_STATEMENTS = 1_000;
+export const FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS = 32;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
@@ -340,6 +341,11 @@ export interface FetchPublicationPlan {
   shallowRemove?: Iterable<string>;
 }
 
+export interface FetchPublicationSqlBudget {
+  chargeSql(statements?: number): void;
+  chargeReservedSql(part: string, statements?: number): void;
+}
+
 export interface RefLogEntry {
   refName: string;
   ordinal: number;
@@ -396,6 +402,8 @@ interface FetchPublicationState {
   readonly checkoutRevision: number;
   readonly budget: RefMutationBudget;
   readonly reservation: MemoryReservation;
+  readonly operationBudget: FetchPublicationSqlBudget | undefined;
+  readonly publicationSqlReservation: string | undefined;
   disposed: boolean;
 }
 
@@ -1393,7 +1401,7 @@ function admitFetchPublicationSql(
   state: FetchPublicationState,
   publication: NormalizedFetchPublication,
   metadata: RefLogMetadata,
-): void {
+): number {
   const changes = () => fetchPublicationChanges(state, publication.refs);
   const deletes = function* (): Generator<string> {
     for (const change of changes()) {
@@ -1437,6 +1445,7 @@ function admitFetchPublicationSql(
   if (statements > MAX_FETCH_PUBLICATION_SQL_STATEMENTS) {
     throw new GitError("E2BIG", `fetch publication requires up to ${statements} SQL statements`);
   }
+  return statements;
 }
 
 function resolveRawRef(raw: string | null, lookup: (name: string) => string | null): string | null {
@@ -2777,8 +2786,16 @@ export class SharedRepoStore {
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
     reservation?: MemoryReservation,
+    operationBudget?: FetchPublicationSqlBudget,
+    publicationSqlReservation?: string,
   ): FetchPublicationToken {
-    return this.#ops().beginFetchPublication(trackingPrefix, candidateExactRefs, reservation);
+    return this.#ops().beginFetchPublication(
+      trackingPrefix,
+      candidateExactRefs,
+      reservation,
+      operationBudget,
+      publicationSqlReservation,
+    );
   }
 
   publishFetchRefs(
@@ -6064,8 +6081,16 @@ export class CheckoutStore implements IndexStore {
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
     owningReservation?: MemoryReservation,
+    operationBudget?: FetchPublicationSqlBudget,
+    publicationSqlReservation?: string,
   ): FetchPublicationToken {
     const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
+    if (
+      publicationSqlReservation !== undefined &&
+      (publicationSqlReservation === "" || operationBudget === undefined)
+    ) {
+      throw new GitError("EINVAL", "fetch publication SQL reservation is invalid");
+    }
     if (owningReservation !== undefined) {
       if (owningReservation.disposed) {
         throw new GitError("EINVAL", "fetch publication reservation is disposed");
@@ -6104,6 +6129,8 @@ export class CheckoutStore implements IndexStore {
         );
         candidates.set(name, null);
       }
+
+      operationBudget?.chargeSql(FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS);
 
       const snapshot = this.#db.transactionSync(() => {
         const repository = this.#db.one<{
@@ -6329,6 +6356,8 @@ export class CheckoutStore implements IndexStore {
           checkoutRevision,
           budget,
           reservation,
+          operationBudget,
+          publicationSqlReservation,
           disposed: false,
         };
         return {
@@ -6384,7 +6413,17 @@ export class CheckoutStore implements IndexStore {
     state.budget.requireSqlHeadroom();
     const normalized = normalizeFetchPublication(state, plan);
     const checkedMetadata = validateRefLogMetadata(metadata);
-    admitFetchPublicationSql(state, normalized, checkedMetadata);
+    const publicationStatements = admitFetchPublicationSql(state, normalized, checkedMetadata);
+    if (state.operationBudget !== undefined) {
+      if (state.publicationSqlReservation === undefined) {
+        state.operationBudget.chargeSql(publicationStatements);
+      } else {
+        state.operationBudget.chargeReservedSql(
+          state.publicationSqlReservation,
+          publicationStatements,
+        );
+      }
+    }
     const shallowTouched = normalized.shallowAdd.length > 0 || normalized.shallowRemove.length > 0;
     const refChanged = this.#db.transactionSync(() => {
       this.#preflightFetchPublication(state, normalized.refs, shallowTouched);
