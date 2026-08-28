@@ -308,3 +308,41 @@ git diff --check
   scheduling, cold reopen, and a bounded static readability oracle. The
   transport helper payload ceiling is 960 KiB with 64 KiB reserved headroom;
   the oracle reads payloads in at most 512 KiB windows.
+- 2026-08-28: WU1 replaced instance-local ordinary pack ownership with a
+  five-minute durable generation lease and monotonic pack IDs. Deterministic
+  same-store and separate-store witnesses prove `EBUSY` before expiry,
+  `ESTALE` at takeover, no ID reuse, pending invisibility, and cold cleanup.
+- 2026-08-28: WU1 added exact per-pack physical membership alongside the
+  canonical OID read index. Publication rejects a dependency on another
+  pending owner, sequential duplicate OIDs remain valid, and deletion promotes
+  a complete fallback before reclaiming the canonical pack.
+- 2026-08-28: Independent review found and closed four additional schedules:
+  delta fallback deletion now requires a surviving base closure; fallback SQL
+  rows and their pack bytes are authenticated before promotion; tree projection
+  repair touches only promoted OIDs; and a reentrant progress callback is fenced
+  with `ESTALE`. Maintenance also finalizes against an ordinary complete winner
+  and discards a fully redundant owned pack in the same transaction.
+- 2026-08-28: WU1 directly covers lease renewal, exact-expiry takeover, all
+  1,024 overlapping payloads, two-owner batch deletion in both orders, and the
+  statement and memory ceilings. Final review also added fail-closed witnesses
+  for a missing control row, invalid cleanup state, duplicate-OID row mutation,
+  warm-cache pack corruption, loose-only delta bases, and excessive fallback
+  fanout. Exact expected membership now authenticates publication, while
+  fallback deletion revalidates uncached pack bytes and promoted object hashes
+  under explicit SQL and memory budgets.
+- 2026-08-28: A second independent review found two additional deletion edges.
+  The closure audit now includes non-canonical physical delta children, and
+  exact full entries whose compressed bytes exceed the 4 MiB bulk boundary use
+  bounded uncached inflate-and-hash authentication. Direct tests cover all
+  deletion orders, valid and corrupt loose bases, fallback promotion, and all
+  three maintenance finalization paths both before and after loose deletion.
+- 2026-08-28: Final cost review closed repeated oversized dependencies across
+  pages. Authentication requires unique OIDs, admits at most 48 MiB of output
+  and 64 MiB of compressed data, and shares a 180-row uncached-read budget
+  across each pass and its recursive delta graph. Maintenance's two validation
+  passes therefore leave 639 statements for fixed work. Direct maintenance and
+  fallback witnesses reject before the next page read and roll back exactly.
+- 2026-08-28: The final affected WU1 gate passed all 242 tests with two Vitest
+  workers. Typecheck, build, diff validation, and Biome checks pass apart from
+  the existing Biome schema-version notices. The docs linter reports only its
+  known false positive for the managed `docs/AGENTS.md` symlink.

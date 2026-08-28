@@ -826,7 +826,7 @@ function verifyCompletePack(
   for (const row of db.iterate(
     `SELECT object.repo_id, object.pack_id, object.oid, object.type, object.size,
             object.base_oid, pack.state, pack.count, pack.size AS stored_bytes
-       FROM git_pack_objects object
+       FROM git_pack_entries object
        JOIN git_pack_meta pack
          ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
       WHERE object.repo_id = ? AND object.pack_id = ?
@@ -855,6 +855,89 @@ function verifyCompletePack(
   if (ordinal !== batch.objectCount) {
     throw new CorruptError("maintenance complete pack membership is incomplete");
   }
+}
+
+function finalizedPackedSources(
+  db: SqlDatabase,
+  repoId: number,
+  objects: readonly FullObjectPackInput[],
+): FinalizedObject[] {
+  const finalized: FinalizedObject[] = [];
+  let ordinal = 0;
+  for (const row of db.iterate(
+    `SELECT CAST(input.key AS INTEGER) AS ordinal,
+            json_extract(input.value, '$.oid') AS expected_oid,
+            json_extract(input.value, '$.type') AS expected_type,
+            json_extract(input.value, '$.size') AS expected_size,
+            packed.oid, packed.pack_id, packed.offset, packed.data_off, packed.data_len,
+            packed.type, packed.size, packed.entry_size, packed.base_oid,
+            pack.state, pack.size AS stored_bytes,
+            EXISTS (
+              SELECT 1 FROM git_pack_entries entry
+               WHERE entry.repo_id = packed.repo_id AND entry.pack_id = packed.pack_id
+                 AND entry.oid = packed.oid AND entry.offset = packed.offset
+                 AND entry.data_off = packed.data_off AND entry.data_len = packed.data_len
+                 AND entry.type = packed.type AND entry.size = packed.size
+                 AND entry.entry_size = packed.entry_size
+                 AND entry.base_oid IS packed.base_oid
+            ) AS exact_source
+       FROM json_each(?) input
+       LEFT JOIN git_pack_objects packed
+         ON packed.repo_id = ? AND packed.oid = json_extract(input.value, '$.oid')
+       LEFT JOIN git_pack_meta pack
+         ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
+      ORDER BY CAST(input.key AS INTEGER)`,
+    JSON.stringify(objects),
+    repoId,
+  )) {
+    const expected = objects[ordinal];
+    const packId = row.pack_id;
+    const offset = row.offset;
+    const dataOff = row.data_off;
+    const dataLen = row.data_len;
+    const entrySize = row.entry_size;
+    const storedBytes = row.stored_bytes;
+    if (
+      expected === undefined ||
+      row.ordinal !== ordinal ||
+      row.expected_oid !== expected.oid ||
+      row.expected_type !== expected.type ||
+      row.expected_size !== expected.size ||
+      row.oid !== expected.oid ||
+      typeof packId !== "number" ||
+      !Number.isSafeInteger(packId) ||
+      packId < 0 ||
+      typeof offset !== "number" ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      typeof dataOff !== "number" ||
+      !Number.isSafeInteger(dataOff) ||
+      dataOff < offset ||
+      typeof dataLen !== "number" ||
+      !Number.isSafeInteger(dataLen) ||
+      dataLen < 0 ||
+      typeof storedBytes !== "number" ||
+      !Number.isSafeInteger(storedBytes) ||
+      storedBytes < 0 ||
+      dataOff > storedBytes - dataLen ||
+      row.type !== expected.type ||
+      row.size !== expected.size ||
+      typeof entrySize !== "number" ||
+      !Number.isSafeInteger(entrySize) ||
+      entrySize < 0 ||
+      (row.base_oid !== null && (typeof row.base_oid !== "string" || !isOid(row.base_oid))) ||
+      row.state !== "complete" ||
+      row.exact_source !== 1
+    ) {
+      throw new CorruptError("maintenance finalized object has no authenticated packed source");
+    }
+    finalized.push({ ...expected, packId });
+    ordinal++;
+  }
+  if (ordinal !== objects.length) {
+    throw new CorruptError("maintenance finalized packed source validation is incomplete");
+  }
+  return finalized;
 }
 
 function verifyFinalizedSources(
@@ -1071,28 +1154,29 @@ function finalizePublished(
 ): MaintenanceRepackProgress {
   const packId = batch.packId;
   if (packId === null) throw new CorruptError("published repack batch has no pack id");
-  const finalized = batch.objects.map((object) => ({ ...object, packId }));
   store.db.transactionSync(() => {
     requireRepackedCapacity(run, batch.objectCount);
     if (!store.packs.completePackMatches(packId, batch.objects)) {
       throw new CorruptError("maintenance published pack does not match its batch");
     }
     verifyCompletePack(store.db, store.repoId, batch, packId);
+    const finalized = finalizedPackedSources(store.db, store.repoId, batch.objects);
+    store.packs.authenticateCompleteSources(finalized);
     deleteExactLooseObjects(store.db, store.repoId, batch.objects);
+    store.packs.authenticateCompleteSources(finalized);
     verifyFinalizedSources(store.db, store.repoId, finalized);
     incrementRepacked(store.db, store.repoId, run, batch.objectCount);
-    const removed = store.db.one<Record<string, unknown>>(
-      `DELETE FROM git_maintenance_repack_batches
-        WHERE repo_id = ? AND run_id = ? AND batch_id = ?
-          AND state = 'published' AND pack_id = ?
-        RETURNING batch_id`,
-      store.repoId,
-      run.runId,
-      batch.batchId,
-      packId,
-    );
-    if (removed?.batch_id !== batch.batchId) {
-      throw new CorruptError("maintenance published batch was not finalized atomically");
+    if (finalized.every((object) => object.packId !== packId)) {
+      const discarded = store.packs.discardOwnedComplete(packId, (ownedPackId) => {
+        if (ownedPackId !== packId) {
+          throw new CorruptError("maintenance finalization received another complete pack");
+        }
+        releaseBatchRow(store.db, store.repoId, run.runId, batch, "published", packId);
+      });
+      if (!discarded) throw new CorruptError("redundant maintenance pack is missing");
+      verifyFinalizedSources(store.db, store.repoId, finalized);
+    } else {
+      releaseBatchRow(store.db, store.repoId, run.runId, batch, "published", packId);
     }
   });
   store.revalidateStorageCaches();
@@ -1122,7 +1206,9 @@ function finalizeShadows(
   });
   store.db.transactionSync(() => {
     requireRepackedCapacity(run, finalized.length);
+    store.packs.authenticateCompleteSources(finalized);
     deleteExactLooseObjects(store.db, store.repoId, finalized);
+    store.packs.authenticateCompleteSources(finalized);
     verifyFinalizedSources(store.db, store.repoId, finalized);
     incrementRepacked(store.db, store.repoId, run, finalized.length);
   });
@@ -1145,7 +1231,9 @@ function finalizeSelectedShadows(
 ): MaintenanceRepackProgress {
   store.db.transactionSync(() => {
     requireRepackedCapacity(run, shadows.length);
+    store.packs.authenticateCompleteSources(shadows);
     deleteExactLooseObjects(store.db, store.repoId, shadows);
+    store.packs.authenticateCompleteSources(shadows);
     verifyFinalizedSources(store.db, store.repoId, shadows);
     incrementRepacked(store.db, store.repoId, run, shadows.length);
     releaseBatchRow(store.db, store.repoId, run.runId, batch, "selected", null);

@@ -522,8 +522,8 @@ const PACK_AUDIT_COLUMNS = `pack.repo_id, pack.pack_id, pack.size, pack.count, p
     THEN 1 ELSE 0 END AS invalid_candidate,
   EXISTS (SELECT 1 FROM git_maintenance_repack_batches batch
     WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id) AS owned,
-  (SELECT count(*) FROM git_pack_objects object
-    WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id) AS members,
+  (SELECT count(*) FROM git_pack_entries entry
+    WHERE entry.repo_id = pack.repo_id AND entry.pack_id = pack.pack_id) AS members,
   EXISTS (
     SELECT 1 FROM git_pack_objects object
     JOIN git_maintenance_objects mark
@@ -535,7 +535,7 @@ const PACK_AUDIT_COLUMNS = `pack.repo_id, pack.pack_id, pack.size, pack.count, p
       ON mark.repo_id = object.repo_id AND mark.run_id = ? AND mark.oid = object.oid
     WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id
       AND (mark.expanded != 1 OR mark.physical_only NOT IN (0, 1))) AS invalid_marks,
-  (SELECT count(*) FROM git_pack_objects object
+  ((SELECT count(*) FROM git_pack_entries object
     WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id
       AND CASE
         WHEN typeof(object.oid) != 'text' THEN 1
@@ -559,7 +559,42 @@ const PACK_AUDIT_COLUMNS = `pack.repo_id, pack.pack_id, pack.size, pack.count, p
           OR object.base_oid GLOB '*[^0-9a-f]*') THEN 1
         ELSE 0
       END != 0
-  ) AS invalid_members,
+  ) + (SELECT count(*) FROM git_pack_objects object
+    WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id
+      AND (
+        CASE
+          WHEN typeof(object.oid) != 'text' THEN 1
+          WHEN length(CAST(object.oid AS BLOB)) != 40 OR object.oid GLOB '*[^0-9a-f]*' THEN 1
+          WHEN typeof(object.offset) != 'integer' OR object.offset < 0
+            OR object.offset > ${Number.MAX_SAFE_INTEGER} THEN 1
+          WHEN typeof(object.data_off) != 'integer' OR object.data_off < object.offset
+            OR object.data_off > ${Number.MAX_SAFE_INTEGER} THEN 1
+          WHEN typeof(object.data_len) != 'integer' OR object.data_len < 0
+            OR object.data_len > ${Number.MAX_SAFE_INTEGER} THEN 1
+          WHEN typeof(object.size) != 'integer' OR object.size < 0
+            OR object.size > ${Number.MAX_SAFE_INTEGER} THEN 1
+          WHEN typeof(object.entry_size) != 'integer' OR object.entry_size < 0
+            OR object.entry_size > ${Number.MAX_SAFE_INTEGER} THEN 1
+          WHEN object.data_off > ${Number.MAX_SAFE_INTEGER} - object.data_len
+            OR object.data_off + object.data_len > pack.size THEN 1
+          WHEN typeof(object.type) != 'text'
+            OR object.type NOT IN ('blob','tree','commit','tag') THEN 1
+          WHEN object.base_oid IS NOT NULL AND typeof(object.base_oid) != 'text' THEN 1
+          WHEN object.base_oid IS NOT NULL AND (length(CAST(object.base_oid AS BLOB)) != 40
+            OR object.base_oid GLOB '*[^0-9a-f]*') THEN 1
+          ELSE 0
+        END != 0
+        OR NOT EXISTS (
+          SELECT 1 FROM git_pack_entries entry
+           WHERE entry.repo_id = object.repo_id AND entry.pack_id = object.pack_id
+             AND entry.oid = object.oid AND entry.offset = object.offset
+             AND entry.data_off = object.data_off AND entry.data_len = object.data_len
+             AND entry.type = object.type AND entry.size = object.size
+             AND entry.entry_size = object.entry_size
+             AND entry.base_oid IS object.base_oid
+        )
+      )
+  )) AS invalid_members,
   (SELECT count(*) FROM git_pack_data data
     WHERE data.repo_id = pack.repo_id AND data.pack_id = pack.pack_id) AS data_rows,
   (SELECT min(CASE WHEN typeof(seq) = 'integer' AND seq BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
@@ -1017,8 +1052,8 @@ function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudi
     `SELECT pack.state, pack.size, pack.count, candidate.unreachable_since_ms,
             EXISTS (SELECT 1 FROM git_maintenance_repack_batches batch
               WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id) AS owned,
-            (SELECT count(*) FROM git_pack_objects object
-              WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id) AS members,
+            (SELECT count(*) FROM git_pack_entries entry
+              WHERE entry.repo_id = pack.repo_id AND entry.pack_id = pack.pack_id) AS members,
             (SELECT count(*) FROM git_pack_pending pending
               WHERE pending.repo_id = pack.repo_id AND pending.pack_id = pack.pack_id) AS pending_rows,
             EXISTS (
@@ -1084,6 +1119,7 @@ function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudi
     `SELECT EXISTS(
        SELECT 1 FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?
        UNION ALL SELECT 1 FROM git_pack_data WHERE repo_id = ? AND pack_id = ?
+       UNION ALL SELECT 1 FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
        UNION ALL SELECT 1 FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?
        UNION ALL SELECT 1 FROM git_pack_pending WHERE repo_id = ? AND pack_id = ?
        UNION ALL SELECT 1 FROM git_pack_gc_candidates WHERE repo_id = ? AND pack_id = ?
@@ -1123,6 +1159,8 @@ function deletePackStorage(store: SharedRepoStore, run: RunState, pack: PackAudi
     store.repoId,
     pack.packId,
     store.repoId,
+    pack.packId,
+    store.repoId,
     store.repoId,
   );
   if (remains !== 0) throw new CorruptError("pack reclamation left storage rows");
@@ -1144,8 +1182,8 @@ function nextPackEligibility(db: SqlDatabase, repoId: number, run: RunState): nu
                   JOIN git_maintenance_objects mark
                     ON mark.repo_id = object.repo_id AND mark.run_id = ? AND mark.oid = object.oid
                   WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id
-                ) OR pack.count != (SELECT count(*) FROM git_pack_objects object
-                  WHERE object.repo_id = pack.repo_id AND object.pack_id = pack.pack_id)
+                ) OR pack.count != (SELECT count(*) FROM git_pack_entries entry
+                  WHERE entry.repo_id = pack.repo_id AND entry.pack_id = pack.pack_id)
               )
             ) AS actionable
        FROM git_pack_gc_candidates candidate WHERE candidate.repo_id = ?`,

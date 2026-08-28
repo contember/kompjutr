@@ -2189,6 +2189,12 @@ export class SqliteGitDatabase {
       }
       this.#db.run("INSERT INTO git_repositories (id) VALUES (?)", repoId);
       this.#db.run(
+        `INSERT INTO git_pack_ingest_control
+           (repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms)
+         VALUES (?, 0, 0, NULL, NULL)`,
+        repoId,
+      );
+      this.#db.run(
         `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
          VALUES (?, ?, ?, ?, 1)`,
         checkoutId,

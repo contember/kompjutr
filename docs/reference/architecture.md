@@ -61,10 +61,11 @@ Repository state is relational rather than a fake `.git` tree:
 - Global `git_meta` stores the schema version.
 - Shared-store-owned tables are `git_repositories`, `git_refs`, `git_config`,
   `git_shallow`, `git_objects`, `git_object_chunks`, `git_pack_meta`,
-  `git_pack_data`, `git_pack_objects`, `git_pack_pending`, `git_blob_id_state`,
-  `git_blob_ids`, `git_tree_sources`, `git_tree_entries`, `git_tree_effective`,
-  `git_commits`, `git_reflog_state`, and `git_reflog_entries`. They use
-  `repo_id`, except that `git_tree_entries` is owned through its source surrogate.
+  `git_pack_ingest_control`, `git_pack_data`, `git_pack_entries`,
+  `git_pack_objects`, `git_pack_pending`, `git_blob_id_state`, `git_blob_ids`,
+  `git_tree_sources`, `git_tree_entries`, `git_tree_effective`, `git_commits`,
+  `git_reflog_state`, and `git_reflog_entries`. They use `repo_id`, except that
+  `git_tree_entries` is owned through its source surrogate.
 - Checkout-owned tables are `git_checkouts`, `git_index`, `git_index_state`,
   `git_index_dirty`, `git_operation_state`, `git_operation_steps`,
   `git_operation_touched`, and `git_checkout_reflog_entries`. Rows below
@@ -158,6 +159,27 @@ Only complete packs are readable. Interrupted or rejected ingest cannot move a
 ref. Packed object reads schedule compressed ranges in physical order, resolve
 delta chains iteratively, preserve packed-base precedence, and use
 provenance-qualified cache keys.
+
+Ordinary ingest holds one durable five-minute generation lease per repository.
+An unexpired concurrent claimant gets `EBUSY`; exact expiry permits takeover and
+the fenced owner gets `ESTALE` before another write. Pack IDs never repeat.
+Maintenance keeps its separate exact batch ownership and does not use the
+ordinary lease.
+
+`git_pack_entries` records every physical entry per pack. `git_pack_objects`
+selects one canonical readable owner per OID. A pack publishes only when all of
+its entries have a complete canonical owner and exactly match the in-memory
+digest produced while parsing the pack. Duplicate complete packs remain
+authenticated. Deleting a canonical owner revalidates uncached fallback bytes,
+promotes a complete source, and hashes each promoted object before old rows
+disappear. The deletion audit includes delta children in every surviving
+physical pack entry, not only canonical owners, and authenticates an exact loose
+base when that is the surviving source. Full entries whose compressed form is
+larger than the bulk-read limit are inflated and hashed through bounded uncached
+windows. One authentication pass admits at most 48 MiB of output, 64 MiB of
+compressed source, and 180 uncached pack-row reads across all pages and recursive
+delta dependencies. Deletion rejects if the fallback's full delta-base closure
+would not survive or the bounded audit cannot finish below the operation limits.
 
 The modeled packed-read peak is below 100 MiB. It includes delta inputs and
 result, compressed rows, chunk and object caches, parser batches, and inflater

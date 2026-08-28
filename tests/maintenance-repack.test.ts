@@ -1,17 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
-import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
+import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
+import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
+import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import {
   advanceMaintenanceRepack,
   type MaintenanceRepackOptions,
   settleMaintenanceRepackForRestart,
 } from "../src/sqlite/maintenance/repack.js";
+import { type CompletePackObject, MAX_PACK_BLOB_BATCH_BYTES } from "../src/sqlite/packs.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
+import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";
 
 const PERSON = {
   name: "Repack Fixture",
@@ -111,6 +114,72 @@ function fullObjectPack(type: "blob" | "tree" | "commit" | "tag", data: Uint8Arr
   return concat(chunks);
 }
 
+function deterministicBytes(length: number): Uint8Array {
+  const out = new Uint8Array(length);
+  let state = 0x6d2b79f5;
+  for (let index = 0; index < out.length; index++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    out[index] = state & 0xff;
+  }
+  return out;
+}
+
+function copyDelta(baseSize: number, offset: number, size: number): Uint8Array {
+  return concat([
+    encodeDeltaHeader(baseSize, size),
+    new Uint8Array([
+      0xff,
+      offset & 0xff,
+      (offset >>> 8) & 0xff,
+      (offset >>> 16) & 0xff,
+      (offset >>> 24) & 0xff,
+      size & 0xff,
+      (size >>> 8) & 0xff,
+      (size >>> 16) & 0xff,
+    ]),
+  ]);
+}
+
+interface SharedOversizedDeltaFixture {
+  basePackId: number;
+  deltaPackId: number;
+  targets: CompletePackObject[];
+}
+
+async function sharedOversizedDeltaFixture(
+  store: ReturnType<typeof open>["store"],
+): Promise<SharedOversizedDeltaFixture> {
+  const base = deterministicBytes(MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024);
+  const baseOid = hashObject("blob", base);
+  const basePack = await store.packs.ingest(slices(fullObjectPack("blob", base), 64 * 1024));
+  const targetSize = 2 * 1024 * 1024 + 64 * 1024;
+  const count = 22;
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(count);
+  const targets: CompletePackObject[] = [];
+  for (let index = 0; index < count; index++) {
+    const offset = index * 4096;
+    const data = base.subarray(offset, offset + targetSize);
+    writer.refDelta(baseOid, copyDelta(base.length, offset, targetSize));
+    targets.push({ oid: hashObject("blob", data), type: "blob", size: data.length });
+  }
+  writer.finish();
+  const deltaPack = await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+  const compressedBase = store.db.scalar<number>(
+    "SELECT data_len FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+    store.repoId,
+    basePack.packId,
+    baseOid,
+  );
+  if (compressedBase === undefined || compressedBase <= MAX_PACK_BLOB_BATCH_BYTES) {
+    throw new Error("maintenance shared delta base is not oversized");
+  }
+  return { basePackId: basePack.packId, deltaPackId: deltaPack.packId, targets };
+}
+
 function commit(tree: string, message = "repacked\n"): Uint8Array {
   return serializeCommit({
     tree,
@@ -119,6 +188,35 @@ function commit(tree: string, message = "repacked\n"): Uint8Array {
     committer: PERSON,
     message,
   });
+}
+
+function corruptPackEntryBytes(
+  db: TestDatabase,
+  repoId: number,
+  packId: number,
+  oid: string,
+): void {
+  const entry = db.one<{ data_off: number }>(
+    "SELECT data_off FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+    repoId,
+    packId,
+    oid,
+  );
+  const row = db.one<{ data: unknown }>(
+    "SELECT data FROM git_pack_data WHERE repo_id = ? AND pack_id = ? AND seq = 0",
+    repoId,
+    packId,
+  );
+  if (entry === undefined || row === undefined)
+    throw new Error("pack corruption fixture is missing");
+  const data = readBlob(row.data).slice();
+  data[entry.data_off]! ^= 0xff;
+  db.run(
+    "UPDATE git_pack_data SET data = ? WHERE repo_id = ? AND pack_id = ? AND seq = 0",
+    blob(data),
+    repoId,
+    packId,
+  );
 }
 
 async function advanceBelowStatementLimit(
@@ -261,11 +359,11 @@ describe("maintenance repack", () => {
     ).toBe(0);
     expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
       boundary: "published",
-      packId: 1,
+      packId: 2,
     });
     expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
       boundary: "finalized",
-      packId: 1,
+      packId: 2,
     });
     expect(cold.read(oid)?.data).toEqual(data);
   });
@@ -316,6 +414,65 @@ describe("maintenance repack", () => {
       interleaved.db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches"),
     ).toBe(0);
     expect(interleaved.store.read(interleavedOid)?.data).toEqual(interleavedData);
+  });
+
+  it("finalizes against an ordinary owner that publishes during maintenance ingest", async () => {
+    const { db, checkout, store } = open();
+    const data = utf8.encode("ordinary owner during maintenance publication\n");
+    const oid = store.write("blob", data);
+    seedRepack(db, checkout.repoId, [{ oid }]);
+    expect(await advanceBelowStatementLimit(db, store.shared)).toMatchObject({
+      boundary: "selected",
+      objectCount: 1,
+    });
+
+    let yields = 0;
+    const barrier = checkpointBarrier<number>("maintenance pack reserved", (value) => value === 1);
+    const publishing = advanceMaintenanceRepack(store.shared, {
+      nowMs: 1,
+      yieldNow: () => barrier.checkpoint(++yields),
+    });
+    await awaitBarrierEntry(barrier, publishing);
+    const pendingPackId = db.scalar<number>(
+      "SELECT pack_id FROM git_maintenance_repack_batches WHERE repo_id = ?",
+      checkout.repoId,
+    );
+    expect(pendingPackId).toBe(1);
+
+    const competingDatabase = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const competingCheckout = competingDatabase.findCheckout("/repo");
+    if (competingCheckout === null) throw new Error("maintenance checkout disappeared");
+    const competing = competingDatabase.openCheckout(competingCheckout);
+    const ordinary = await competing.packs.ingest(slices(fullObjectPack("blob", data), 11));
+    expect(ordinary.packId).toBe(2);
+    barrier.release();
+    expect(await publishing).toMatchObject({
+      boundary: "published",
+      packId: pendingPackId,
+      objectCount: 1,
+    });
+
+    const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
+    const reopenedCheckout = reopened.findCheckout("/repo");
+    if (reopenedCheckout === null) throw new Error("maintenance checkout disappeared on restart");
+    const cold = reopened.openCheckout(reopenedCheckout);
+    expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
+      boundary: "finalized",
+      packId: pendingPackId,
+      objectCount: 1,
+    });
+    expect(
+      db.all<{ pack_id: number; state: string }>(
+        "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = ? ORDER BY pack_id",
+        checkout.repoId,
+      ),
+    ).toEqual([{ pack_id: ordinary.packId, state: "complete" }]);
+    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_objects WHERE repo_id = ?", checkout.repoId),
+    ).toBe(0);
+    expect(cold.packs.completePackedEntry(oid)?.packId).toBe(ordinary.packId);
+    expect(cold.read(oid)?.data).toEqual(data);
   });
 
   it("fails closed on corrupt complete-shadow metadata", async () => {
@@ -427,6 +584,13 @@ describe("maintenance repack", () => {
       db.run(
         `INSERT INTO git_pack_data (repo_id, pack_id, seq, data)
          SELECT repo_id, 0, seq, data FROM git_pack_data WHERE repo_id = ? AND pack_id = 1`,
+        checkout.repoId,
+      );
+      db.run(
+        `INSERT INTO git_pack_entries
+           (repo_id, pack_id, oid, offset, data_off, data_len, type, size, entry_size, base_oid)
+         SELECT repo_id, 0, oid, offset, data_off, data_len, type, size, entry_size, base_oid
+           FROM git_pack_entries WHERE repo_id = ? AND pack_id = 1`,
         checkout.repoId,
       );
       db.run(
@@ -721,7 +885,7 @@ describe("maintenance repack", () => {
     );
 
     await expect(advanceMaintenanceRepack(store.shared, REPACK_OPTIONS)).rejects.toThrow(
-      /membership is invalid/,
+      /membership/,
     );
 
     expect(store.read(oid)?.data).toEqual(data);
@@ -737,6 +901,200 @@ describe("maintenance repack", () => {
         checkout.repoId,
       ),
     ).toEqual({ state: "published", repacked_objects: 0 });
+  });
+
+  it("cold-authenticates packed bytes before and after every loose finalization path", async () => {
+    for (const timing of ["before-delete", "after-delete"]) {
+      for (const path of ["published", "immediate-shadow", "selected-shadow"]) {
+        const { db, checkout, store } = open();
+        const data = utf8.encode(`corrupt ${timing} ${path} packed source\n`);
+        const oid = store.write("blob", data);
+        let packId: number;
+        if (path === "published") {
+          seedRepack(db, checkout.repoId, [{ oid }]);
+          await advanceMaintenanceRepack(store.shared, REPACK_OPTIONS);
+          const published = await advanceMaintenanceRepack(store.shared, REPACK_OPTIONS);
+          if (published.packId === null)
+            throw new Error("published corruption fixture has no pack");
+          packId = published.packId;
+        } else if (path === "immediate-shadow") {
+          const packed = await store.packs.ingest(slices(fullObjectPack("blob", data), 11));
+          packId = packed.packId;
+          seedRepack(db, checkout.repoId, [{ oid }]);
+        } else {
+          seedRepack(db, checkout.repoId, [{ oid }]);
+          await advanceMaintenanceRepack(store.shared, REPACK_OPTIONS);
+          const packed = await store.packs.ingest(slices(fullObjectPack("blob", data), 11));
+          packId = packed.packId;
+        }
+        expect(store.packs.read(oid)?.data).toEqual(data);
+        if (timing === "before-delete") {
+          corruptPackEntryBytes(db, checkout.repoId, packId, oid);
+        } else {
+          db.run(
+            `CREATE TRIGGER test_post_delete_pack_corruption
+           AFTER DELETE ON git_objects
+           WHEN OLD.repo_id = ${checkout.repoId} AND OLD.oid = '${oid}'
+           BEGIN
+             DELETE FROM git_pack_data
+              WHERE repo_id = ${checkout.repoId} AND pack_id = ${packId} AND seq = 0;
+           END`,
+          );
+        }
+
+        await expect(advanceMaintenanceRepack(store.shared, REPACK_OPTIONS)).rejects.toMatchObject({
+          code: "ECORRUPT",
+        });
+        expect(
+          db.scalar<number>(
+            "SELECT count(*) FROM git_objects WHERE repo_id = ? AND oid = ?",
+            checkout.repoId,
+            oid,
+          ),
+        ).toBe(1);
+        expect(
+          db.scalar<number>(
+            "SELECT count(*) FROM git_loose_object_lifecycle WHERE repo_id = ? AND oid = ?",
+            checkout.repoId,
+            oid,
+          ),
+        ).toBe(1);
+        expect(
+          db.scalar<number>(
+            "SELECT repacked_objects FROM git_maintenance_runs WHERE repo_id = ?",
+            checkout.repoId,
+          ),
+        ).toBe(0);
+        if (path === "immediate-shadow") {
+          expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
+        } else {
+          expect(
+            db.scalar<string>(
+              "SELECT state FROM git_maintenance_repack_batches WHERE repo_id = ?",
+              checkout.repoId,
+            ),
+          ).toBe(path === "published" ? "published" : "selected");
+        }
+        expect(
+          db.scalar<string>(
+            "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+            checkout.repoId,
+            packId,
+          ),
+        ).toBe("complete");
+        expect(
+          db.scalar<number>(
+            "SELECT count(*) FROM git_pack_data WHERE repo_id = ? AND pack_id = ? AND seq = 0",
+            checkout.repoId,
+            packId,
+          ),
+        ).toBe(1);
+      }
+    }
+  });
+
+  it("finalizes an incompressible packed source beyond the bulk read boundary", async () => {
+    const { db, checkout, store } = open();
+    const data = deterministicBytes(MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024);
+    const oid = store.write("blob", data);
+    seedRepack(db, checkout.repoId, [{ oid }]);
+    await advanceBelowStatementLimit(db, store.shared);
+    const published = await advanceBelowStatementLimit(db, store.shared);
+    if (published.packId === null) throw new Error("oversized maintenance pack was not published");
+    expect(
+      db.scalar<number>(
+        "SELECT data_len FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+        checkout.repoId,
+        published.packId,
+        oid,
+      ),
+    ).toBeGreaterThan(MAX_PACK_BLOB_BATCH_BYTES);
+
+    const reopened = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
+    const cold = reopened.openCheckout(checkout.id);
+    const finalized = await advanceBelowStatementLimit(db, cold.shared);
+    expect(finalized).toMatchObject({ boundary: "finalized", packId: published.packId });
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_objects WHERE repo_id = ? AND oid = ?",
+        checkout.repoId,
+        oid,
+      ),
+    ).toBe(0);
+    expect(cold.packs.read(oid)?.data).toEqual(data);
+  });
+
+  it("shares the cold dependency-read budget across maintenance shadow pages", async () => {
+    const { db, checkout, store } = open();
+    const fixture = await sharedOversizedDeltaFixture(store);
+    for (const target of fixture.targets) {
+      db.run(
+        `INSERT INTO git_objects (repo_id, oid, type, size, stored)
+         VALUES (?, ?, 'blob', ?, 'raw')`,
+        checkout.repoId,
+        target.oid,
+        target.size,
+      );
+      db.run(
+        `WITH RECURSIVE chunks(seq, remaining) AS (
+           VALUES (0, ?)
+           UNION ALL
+           SELECT seq + 1, remaining - 1048576 FROM chunks WHERE remaining > 1048576
+         )
+         INSERT INTO git_object_chunks (repo_id, oid, seq, data)
+         SELECT ?, ?, seq, zeroblob(min(remaining, 1048576)) FROM chunks`,
+        target.size,
+        checkout.repoId,
+        target.oid,
+      );
+      db.run(
+        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+         VALUES (?, ?, 1)`,
+        checkout.repoId,
+        target.oid,
+      );
+    }
+    seedRepack(
+      db,
+      checkout.repoId,
+      fixture.targets.map((target) => ({ oid: target.oid })),
+    );
+    db.storage.resetCounters();
+
+    await expect(advanceMaintenanceRepack(store.shared, REPACK_OPTIONS)).rejects.toMatchObject({
+      code: "E2BIG",
+    });
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_objects WHERE repo_id = ?", checkout.repoId),
+    ).toBe(fixture.targets.length);
+    expect(
+      db.scalar<number>(
+        "SELECT count(*) FROM git_loose_object_lifecycle WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(fixture.targets.length);
+    expect(
+      db.scalar<number>(
+        "SELECT repacked_objects FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
+    expect(
+      db.scalar<string>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        fixture.basePackId,
+      ),
+    ).toBe("complete");
+    expect(
+      db.scalar<string>(
+        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+        checkout.repoId,
+        fixture.deltaPackId,
+      ),
+    ).toBe("complete");
   });
 
   it("returns root-changed without touching selected, pending, or published state", async () => {
@@ -889,14 +1247,12 @@ describe("maintenance repack", () => {
     const published = await advanceMaintenanceRepack(store.shared, REPACK_OPTIONS);
     if (published.packId === null) throw new Error("settlement corruption has no pack id");
     db.run(
-      "UPDATE git_pack_objects SET size = size + 1 WHERE repo_id = ? AND pack_id = ?",
+      "UPDATE git_pack_entries SET size = size + 1 WHERE repo_id = ? AND pack_id = ?",
       checkout.repoId,
       published.packId,
     );
 
-    expect(() => settleMaintenanceRepackForRestart(store.shared, 1)).toThrow(
-      /does not match its batch/,
-    );
+    expect(() => settleMaintenanceRepackForRestart(store.shared, 1)).toThrow(/membership/);
 
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(1);
     expect(

@@ -37,10 +37,12 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_maintenance_repack_objects", "shared"],
   ["git_loose_gc_candidates", "shared"],
   ["git_pack_gc_candidates", "shared"],
+  ["git_pack_ingest_control", "shared"],
   ["git_commits", "shared"],
   ["git_object_chunks", "shared"],
   ["git_pack_meta", "shared"],
   ["git_pack_data", "shared"],
+  ["git_pack_entries", "shared"],
   ["git_pack_objects", "shared"],
   ["git_pack_pending", "shared"],
   ["git_tree_sources", "shared"],
@@ -93,7 +95,10 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_operation_steps" },
   { type: "table", name: "git_operation_touched" },
   { type: "table", name: "git_pack_data" },
+  { type: "table", name: "git_pack_entries" },
+  { type: "index", name: "git_pack_entries_by_oid" },
   { type: "table", name: "git_pack_gc_candidates" },
+  { type: "table", name: "git_pack_ingest_control" },
   { type: "table", name: "git_pack_meta" },
   { type: "table", name: "git_pack_objects" },
   { type: "index", name: "git_pack_objects_loc" },
@@ -227,6 +232,25 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ["git_blob_id_state", ["repo_id", "generation"]],
   ["git_shallow", ["repo_id", "oid"]],
   ["git_objects", ["repo_id", "oid", "type", "size", "stored"]],
+  [
+    "git_pack_ingest_control",
+    ["repo_id", "owner_generation", "last_pack_id", "active_pack_id", "expires_ms"],
+  ],
+  [
+    "git_pack_entries",
+    [
+      "repo_id",
+      "pack_id",
+      "oid",
+      "offset",
+      "data_off",
+      "data_len",
+      "type",
+      "size",
+      "entry_size",
+      "base_oid",
+    ],
+  ],
   ["git_loose_object_lifecycle", ["repo_id", "oid", "created_ms"]],
   ["git_maintenance_control", ["repo_id", "root_epoch", "next_run_id"]],
   [
@@ -466,6 +490,8 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_operation_steps")).toEqual(["checkout_id", "ordinal"]);
     expect(primaryKeyOf(db, "git_operation_touched")).toEqual(["checkout_id", "ordinal"]);
     expect(primaryKeyOf(db, "git_checkout_reflog_entries")).toEqual(["checkout_id", "ordinal"]);
+    expect(primaryKeyOf(db, "git_pack_ingest_control")).toEqual(["repo_id"]);
+    expect(primaryKeyOf(db, "git_pack_entries")).toEqual(["repo_id", "pack_id", "offset"]);
 
     expect(cascadeForeignKeysOf(db, "git_checkouts")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },
@@ -487,6 +513,13 @@ describe("git schema", () => {
       { table: "git_reflog_state", from: "repo_id", to: "repo_id" },
       { table: "git_checkouts", from: "checkout_id", to: "id" },
       { table: "git_checkouts", from: "repo_id", to: "repo_id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_pack_ingest_control")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_pack_entries")).toEqual([
+      { table: "git_pack_meta", from: "repo_id", to: "repo_id" },
+      { table: "git_pack_meta", from: "pack_id", to: "pack_id" },
     ]);
   });
 

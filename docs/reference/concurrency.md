@@ -43,6 +43,27 @@ Pack data and index checkpoints are durable but invisible to object reads until
 the pack becomes complete. Ref, HEAD, reflog, checkout, journal, and individual
 maintenance transitions publish through synchronous database transactions.
 
+Ordinary pack leases last five minutes and renew only near half-life, so source
+chunking does not add one SQL statement per chunk. Every async resumption checks
+the local expiry before its next durable write; after takeover, the old owner
+cannot write or publish. Pack IDs are monotonic across reclaim and deletion, so
+a stale cache key cannot refer to replacement bytes.
+
+`git_pack_entries` authenticates every physical entry of each pack, including
+duplicate OIDs. `git_pack_objects` remains the single canonical read location
+for each OID. Publication compares the exact ordered rows with the digest made
+while parsing and requires every entry's canonical owner to be complete.
+Deleting that owner bypasses warm caches, validates the selected pack bytes,
+promotes one complete fallback entry atomically, and hashes the promoted object
+before the old pack disappears. The closure check covers canonical and
+non-canonical physical delta entries and hashes any surviving loose base.
+Oversized full entries are authenticated through bounded uncached inflate
+windows instead of the bulk compressed-byte buffer. The uncached-row budget is
+shared across pages and recursively discovered delta bases, so repeated access
+to one oversized dependency cannot cross the statement ceiling. Deletion
+rejects when any surviving delta chain would lose its base or when the bounded
+pack, page, statement, or memory budget is exhausted.
+
 ## Current compatibility matrix
 
 This matrix is organized by shared durable seam. It avoids duplicating every
@@ -51,8 +72,8 @@ public method that reaches the same synchronous transaction.
 | Durable seam | Owners | Current behavior |
 |---|---|---|
 | Repository route and readiness | `clone` × clone/public calls | A live clone removes its repository on caught failure. A cold interrupted clone has no provisional owner, so same-root retry and observation are `unfenced`. Different roots `coexist`. |
-| Ordinary pack ownership | `clone`/`fetch` × `clone`/`fetch` | Pending packs remain invisible. Same-instance active packs survive broad cleanup. Cross-instance ingests with overlapping OIDs are `unfenced`. |
-| Maintenance pack ownership | `maintenance` × pack owners | Selected, pending, published, and finalized maintenance packs have exact durable ownership. An unrelated ordinary pending pack `coexist`s with maintenance. |
+| Ordinary pack ownership | `clone`/`fetch` × `clone`/`fetch` | One durable generation lease fences ordinary ingest per repository. An unexpired competitor gets `EBUSY`; expiry fences the old owner with `ESTALE`, reclaims only its pending pack, and allocates a never-reused pack ID. Unrelated local work still `coexist`s. |
+| Maintenance pack ownership | `maintenance` × pack owners | Selected, pending, published, and finalized maintenance packs keep exact durable ownership and bypass the ordinary lease. Disjoint packs `coexist`; a publication whose canonical OID is still owned by another pending pack gets `stale-reject` and remains pending for exact recovery. If an ordinary complete owner wins first, maintenance finalizes against it and atomically discards its fully redundant pack. |
 | Tracking refs, tags, and prune | `fetch`/`pull` × fetch | One fetch publishes its complete ref set atomically. Competing publications for the same tracking namespace or global tag are currently `unfenced`; disjoint refs `coexist`. |
 | Remote push CAS | `push` × push/remote writer | The remote receive-pack expected OID produces `stale-reject` for a losing writer. A lost response is reported as `EPUSHUNCERTAIN`. |
 | Local push tracking ref | configured `push` × fetch/push | Publication follows the remote side effect. Competing newer local tracking publication is currently `unfenced`. Explicit-URL push does not publish a local tracking ref. |

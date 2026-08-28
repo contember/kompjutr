@@ -44,7 +44,14 @@ import {
 /** Bytes per `git_pack_data` row. Comfortably under the DO row limit. */
 export const PACK_CHUNK = 1024 * 1024;
 export const MAX_PACK_MEMBERSHIP_OBJECTS = 2_048;
-export const MAX_PACK_DELETE_BATCH = 128;
+export const MAX_PACK_DELETE_BATCH = 48;
+export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
+const MAX_PACK_FALLBACK_AUDIT_BYTES = 48 * 1024 * 1024;
+const MAX_PACK_FALLBACK_AUDIT_PACKS = 128;
+const MAX_PACK_FALLBACK_AUDIT_PAGES = 32;
+const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
+const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
+const PACK_FALLBACK_AUDIT_METADATA_BYTES = 2 * 1024 * 1024;
 
 /**
  * Git's default pack depth is 50, but a pack from another implementation can
@@ -71,6 +78,8 @@ export interface PackCacheOptions {
   cacheEntryLimit?: number;
   /** Test seam; production uses `MAX_DELTA_DEPTH`. */
   maxDeltaDepth?: number;
+  /** Test seam for durable ingest lease expiry. */
+  now?: () => number;
 }
 
 const DEFAULT_CHUNK_BYTES = 4 * PACK_CHUNK;
@@ -84,6 +93,10 @@ const PACK_RANGE_BATCH_BYTES = 1024 * 1024;
 // Four conservative JSON copies plus request, map, result and view wrappers.
 const PACK_RANGE_REQUEST_MEMORY_BYTES = 832;
 const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
+const MAX_PACK_AUTH_COMPRESSED_BYTES = MAX_PACK_DELTA_WORKING_BYTES + PACK_INFLATE_HEADROOM_BYTES;
+// Two maintenance auth passes can spend 360 reads, leaving 639 statements for fixed work.
+const MAX_PACK_AUTH_UNCACHED_ROW_READS = 180;
+const MAX_PACK_GENERIC_UNCACHED_ROW_READS = 900;
 const PACK_SHARED_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const PACK_INFLATE_OUTPUT_CHUNK_BYTES = 16 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
@@ -175,6 +188,40 @@ function packRangeFragmentMask(request: PackRangeRequest): number {
   return 2 ** fragments - 1;
 }
 
+function uncachedPackRowReads(offset: number, length: number): number {
+  let reads = 0;
+  for (let consumed = 0; consumed < length; consumed += PACK_READ_BYTES) {
+    const window = Math.min(PACK_READ_BYTES, length - consumed);
+    const first = Math.floor((offset + consumed) / PACK_CHUNK);
+    const last = Math.floor((offset + consumed + window - 1) / PACK_CHUNK);
+    reads += last - first + 1;
+  }
+  return reads;
+}
+
+interface UncachedReadBudget {
+  uncachedReads: number;
+  readonly uncachedReadLimit: number;
+}
+
+function reserveUncachedPackRowReads(
+  budget: UncachedReadBudget,
+  entries: Iterable<{ dataOff: number; dataLen: number }>,
+  message: string,
+): void {
+  let additional = 0;
+  for (const entry of entries) {
+    if (entry.dataLen <= MAX_PACK_BLOB_BATCH_BYTES) continue;
+    additional += uncachedPackRowReads(entry.dataOff, entry.dataLen);
+    if (!Number.isSafeInteger(additional)) throw new GitError("E2BIG", message);
+  }
+  const next = budget.uncachedReads + additional;
+  if (!Number.isSafeInteger(next) || next > budget.uncachedReadLimit) {
+    throw new GitError("E2BIG", message);
+  }
+  budget.uncachedReads = next;
+}
+
 class FlatByteSource implements ByteSource {
   constructor(readonly bytes: Uint8Array) {}
 
@@ -235,6 +282,173 @@ interface PackObjectRow {
   base_oid: string | null;
 }
 
+interface PackIngestControl {
+  ownerGeneration: number;
+  lastPackId: number;
+  activePackId: number | null;
+  expiresMs: number | null;
+}
+
+interface PackIngestLease {
+  generation: number;
+  packId: number;
+  expiresMs: number;
+}
+
+interface FallbackPackAudit {
+  packId: number;
+  size: number;
+  count: number;
+}
+
+interface FallbackAuditBudget extends UncachedReadBudget {
+  readonly packIds: Set<number>;
+  bytes: number;
+  entries: number;
+  pages: number;
+}
+
+function fallbackAuditBudget(): FallbackAuditBudget {
+  return {
+    packIds: new Set(),
+    bytes: 0,
+    entries: 0,
+    pages: 0,
+    uncachedReads: 0,
+    uncachedReadLimit: MAX_PACK_AUTH_UNCACHED_ROW_READS,
+  };
+}
+
+const PACK_MEMBERSHIP_ENCODER = new TextEncoder();
+
+function packMembershipDigest(row: PackObjectInput): Uint8Array {
+  return new Sha1().update(PACK_MEMBERSHIP_ENCODER.encode(JSON.stringify(row))).digest();
+}
+
+function expectedPackMembershipBytes(count: number): number {
+  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_PACK_INGEST_OBJECTS) {
+    throw new GitError("E2BIG", `pack exceeds ${MAX_PACK_INGEST_OBJECTS} objects`);
+  }
+  return count * (Float64Array.BYTES_PER_ELEMENT + 2 * PACK_MEMBERSHIP_DIGEST_BYTES + 1);
+}
+
+interface PackByteMembership {
+  offset: number;
+  dataOff: number;
+  dataLen: number;
+  entrySize: number;
+  kind: "ofs" | "ref" | null;
+  baseDelta: number | null;
+  baseOid: string | null;
+  type: ObjectType | null;
+  size: number;
+  oid: string | null;
+  compressedDigest: string;
+}
+
+function packByteMembershipDigest(row: PackByteMembership): Uint8Array {
+  return new Sha1().update(PACK_MEMBERSHIP_ENCODER.encode(JSON.stringify(row))).digest();
+}
+
+class ExpectedPackMembership {
+  readonly #offsets: Float64Array;
+  readonly #digests: Uint8Array;
+  readonly #byteDigests: Uint8Array;
+  readonly #completed: Uint8Array;
+  #offsetCount = 0;
+
+  constructor(readonly count: number) {
+    expectedPackMembershipBytes(count);
+    this.#offsets = new Float64Array(count);
+    this.#digests = new Uint8Array(count * PACK_MEMBERSHIP_DIGEST_BYTES);
+    this.#byteDigests = new Uint8Array(count * PACK_MEMBERSHIP_DIGEST_BYTES);
+    this.#completed = new Uint8Array(count);
+  }
+
+  addOffset(ordinal: number, offset: number): void {
+    if (
+      ordinal !== this.#offsetCount ||
+      ordinal < 0 ||
+      ordinal >= this.count ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      (ordinal > 0 && offset <= this.#offsets[ordinal - 1]!)
+    ) {
+      throw new CorruptError("pack physical offsets are not strictly ordered");
+    }
+    this.#offsets[ordinal] = offset;
+    this.#offsetCount++;
+  }
+
+  record(row: PackObjectInput): void {
+    const offset = row[2];
+    let low = 0;
+    let high = this.#offsetCount - 1;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = this.#offsets[middle]!;
+      if (candidate < offset) low = middle + 1;
+      else if (candidate > offset) high = middle - 1;
+      else {
+        if (this.#completed[middle] !== 0) {
+          throw new CorruptError(`pack entry at ${offset} was indexed more than once`);
+        }
+        this.#digests.set(packMembershipDigest(row), middle * PACK_MEMBERSHIP_DIGEST_BYTES);
+        this.#completed[middle] = 1;
+        return;
+      }
+    }
+    throw new CorruptError(`pack entry at ${offset} has no physical ordinal`);
+  }
+
+  recordBytes(ordinal: number, row: PackByteMembership): void {
+    if (ordinal < 0 || ordinal >= this.count || row.offset !== this.#offsets[ordinal]) {
+      throw new CorruptError("pack byte membership order disagrees");
+    }
+    this.#byteDigests.set(packByteMembershipDigest(row), ordinal * PACK_MEMBERSHIP_DIGEST_BYTES);
+  }
+
+  verifyBytes(ordinal: number, row: PackByteMembership): void {
+    if (ordinal < 0 || ordinal >= this.count || row.offset !== this.#offsets[ordinal]) {
+      throw new CorruptError("pack publication bytes disagree with indexed entries");
+    }
+    const actual = packByteMembershipDigest(row);
+    const start = ordinal * PACK_MEMBERSHIP_DIGEST_BYTES;
+    for (let index = 0; index < PACK_MEMBERSHIP_DIGEST_BYTES; index++) {
+      if (actual[index] !== this.#byteDigests[start + index]) {
+        throw new CorruptError("pack publication bytes disagree with indexed entries");
+      }
+    }
+  }
+
+  verify(ordinal: number, row: PackObjectInput): void {
+    if (
+      ordinal < 0 ||
+      ordinal >= this.count ||
+      this.#completed[ordinal] !== 1 ||
+      row[2] !== this.#offsets[ordinal]
+    ) {
+      throw new CorruptError("pack publication membership order disagrees");
+    }
+    const actual = packMembershipDigest(row);
+    const start = ordinal * PACK_MEMBERSHIP_DIGEST_BYTES;
+    for (let index = 0; index < PACK_MEMBERSHIP_DIGEST_BYTES; index++) {
+      if (actual[index] !== this.#digests[start + index]) {
+        throw new CorruptError("pack publication membership disagrees with indexed entries");
+      }
+    }
+  }
+
+  assertComplete(): void {
+    if (this.#offsetCount !== this.count) {
+      throw new CorruptError("pack physical membership is incomplete");
+    }
+    for (const completed of this.#completed) {
+      if (completed !== 1) throw new CorruptError("pack indexed membership is incomplete");
+    }
+  }
+}
+
 export interface PackIngestOptions {
   /** Refuse a pack larger than this. */
   maxBytes?: number;
@@ -272,10 +486,61 @@ export interface CompletePackedEntry {
   baseOid: string | null;
 }
 
+interface AuthenticatedPackSource {
+  oid: string;
+  type: ObjectType;
+  size: number;
+  packId: number;
+  dataOff: number;
+  dataLen: number;
+  entrySize: number;
+  baseOid: string | null;
+}
+
 function requirePackId(packId: number): void {
   if (!Number.isSafeInteger(packId) || packId < 0) {
     throw new RangeError("pack id must be a non-negative safe integer");
   }
+}
+
+function requireIngestTime(now: () => number): number {
+  const value = now();
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > Number.MAX_SAFE_INTEGER - PACK_INGEST_LEASE_MS
+  ) {
+    throw new RangeError("pack ingest time must be a bounded non-negative integer");
+  }
+  return value;
+}
+
+function requireIngestControl(row: Record<string, unknown>, repoId: number): PackIngestControl {
+  const ownerGeneration = row.owner_generation;
+  const lastPackId = row.last_pack_id;
+  const activePackId = row.active_pack_id;
+  const expiresMs = row.expires_ms;
+  if (
+    row.repo_id !== repoId ||
+    typeof ownerGeneration !== "number" ||
+    !Number.isSafeInteger(ownerGeneration) ||
+    ownerGeneration < 0 ||
+    typeof lastPackId !== "number" ||
+    !Number.isSafeInteger(lastPackId) ||
+    lastPackId < 0 ||
+    (activePackId !== null &&
+      (typeof activePackId !== "number" ||
+        !Number.isSafeInteger(activePackId) ||
+        activePackId < 0 ||
+        activePackId > lastPackId)) ||
+    (expiresMs !== null &&
+      (typeof expiresMs !== "number" || !Number.isSafeInteger(expiresMs) || expiresMs < 0)) ||
+    (activePackId === null) !== (expiresMs === null) ||
+    (activePackId !== null && ownerGeneration < 1)
+  ) {
+    throw new CorruptError("pack ingest control is invalid");
+  }
+  return { ownerGeneration, lastPackId, activePackId, expiresMs };
 }
 
 function uniquePackIds(packIds: readonly number[], limit: number): number[] {
@@ -374,6 +639,151 @@ function checkDeltaInflateBudget(base: Uint8Array, deltaSize: number): void {
   }
 }
 
+class DeltaHeaderProbe {
+  #value = 0;
+  #shift = 0;
+  #field = 0;
+  #sourceSize: number | null = null;
+  #targetSize: number | null = null;
+
+  update(bytes: Uint8Array): void {
+    if (this.#targetSize !== null) return;
+    for (const byte of bytes) {
+      this.#value += (byte & 0x7f) * 2 ** this.#shift;
+      this.#shift += 7;
+      if (this.#shift > 56 || !Number.isSafeInteger(this.#value)) {
+        throw new CorruptError("delta size is invalid");
+      }
+      if ((byte & 0x80) !== 0) continue;
+      if (this.#field === 0) this.#sourceSize = this.#value;
+      else this.#targetSize = this.#value;
+      this.#field++;
+      this.#value = 0;
+      this.#shift = 0;
+      if (this.#targetSize !== null) return;
+    }
+  }
+
+  finish(): { sourceSize: number; targetSize: number } {
+    if (this.#sourceSize === null || this.#targetSize === null) {
+      throw new CorruptError("delta header is truncated");
+    }
+    return { sourceSize: this.#sourceSize, targetSize: this.#targetSize };
+  }
+}
+
+class SequentialPackBytes {
+  readonly #rows: Iterator<Record<string, unknown>>;
+  readonly #expectedRows: number;
+  readonly #sha = new Sha1();
+  #tail: Uint8Array = new Uint8Array(0);
+  #chunk: Uint8Array = new Uint8Array(0);
+  #chunkSeq = -1;
+  #loadedRows = 0;
+  #loadedBytes = 0;
+  #finished = false;
+
+  constructor(
+    db: SqlDatabase,
+    repoId: number,
+    readonly packId: number,
+    readonly limit: number,
+  ) {
+    if (!Number.isSafeInteger(limit) || limit < 32) {
+      throw new CorruptError(`pack ${packId}: stored byte length is invalid`);
+    }
+    this.#expectedRows = Math.ceil(limit / PACK_CHUNK);
+    this.#rows = db
+      .iterate(
+        `SELECT pack_id, seq, data FROM git_pack_data
+          WHERE repo_id = ? AND pack_id = ? ORDER BY seq LIMIT ?`,
+        repoId,
+        packId,
+        this.#expectedRows + 1,
+      )
+      [Symbol.iterator]();
+  }
+
+  read(offset: number, length: number): Uint8Array {
+    if (
+      this.#finished ||
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(length) ||
+      offset < 0 ||
+      length < 0 ||
+      length > PACK_READ_BYTES ||
+      offset > this.limit - length
+    ) {
+      throw new CorruptError(`pack ${this.packId}: uncached read exceeds stored bytes`);
+    }
+    if (length === 0) return new Uint8Array(0);
+    const first = Math.floor(offset / PACK_CHUNK);
+    const last = Math.floor((offset + length - 1) / PACK_CHUNK);
+    if (first === last) {
+      const chunk = this.#load(first);
+      const start = offset - first * PACK_CHUNK;
+      return chunk.subarray(start, start + length);
+    }
+    const out = new Uint8Array(length);
+    for (let seq = first; seq <= last; seq++) {
+      const chunk = this.#load(seq);
+      const chunkStart = seq * PACK_CHUNK;
+      const from = Math.max(offset, chunkStart);
+      const to = Math.min(offset + length, chunkStart + chunk.length);
+      if (to > from) out.set(chunk.subarray(from - chunkStart, to - chunkStart), from - offset);
+    }
+    return out;
+  }
+
+  finish(): void {
+    if (this.#finished) throw new CorruptError(`pack ${this.packId}: byte audit was reused`);
+    this.#finished = true;
+    const extra = this.#rows.next();
+    if (
+      !extra.done ||
+      this.#loadedRows !== this.#expectedRows ||
+      this.#loadedBytes !== this.limit ||
+      this.#tail.length !== 20 ||
+      toHex(this.#tail) !== toHex(this.#sha.digest())
+    ) {
+      throw new CorruptError(`pack ${this.packId}: stored checksum or chunk layout is invalid`);
+    }
+  }
+
+  #load(seq: number): Uint8Array {
+    if (seq === this.#chunkSeq) return this.#chunk;
+    if (seq !== this.#chunkSeq + 1) {
+      throw new CorruptError(`pack ${this.packId}: uncached traversal is not sequential`);
+    }
+    const next = this.#rows.next();
+    if (next.done) throw new CorruptError(`pack ${this.packId}: missing chunk ${seq}`);
+    const row = next.value;
+    const data = readBlob(row.data);
+    const expected = Math.min(PACK_CHUNK, this.limit - seq * PACK_CHUNK);
+    if (row.pack_id !== this.packId || row.seq !== seq || data.length !== expected) {
+      throw new CorruptError(`pack ${this.packId}: stored chunk layout is invalid`);
+    }
+    this.#updateChecksum(data);
+    this.#chunk = data;
+    this.#chunkSeq = seq;
+    this.#loadedRows++;
+    this.#loadedBytes += data.length;
+    return data;
+  }
+
+  #updateChecksum(data: Uint8Array): void {
+    if (data.length >= 20) {
+      if (this.#tail.length > 0) this.#sha.update(this.#tail);
+      this.#sha.update(data.subarray(0, data.length - 20));
+      this.#tail = data.slice(data.length - 20);
+      return;
+    }
+    const joined = concat([this.#tail, data]);
+    if (joined.length > 20) this.#sha.update(joined.subarray(0, joined.length - 20));
+    this.#tail = joined.slice(Math.max(0, joined.length - 20));
+  }
+}
+
 export class PackStore {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
@@ -384,6 +794,7 @@ export class PackStore {
   readonly #chunks: ByteLru<string, Uint8Array>;
   readonly #memory: MemoryCoordinator;
   readonly #cacheNamespace: string;
+  readonly #now: () => number;
   #cacheGeneration = 0;
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
@@ -412,6 +823,7 @@ export class PackStore {
     this.#chunks = chunks;
     this.#memory = memory;
     this.#cacheNamespace = cacheNamespace;
+    this.#now = options.now ?? Date.now;
     this.#maxBufferedEntry = Math.min(
       options.maxBufferedEntry ?? DEFAULT_MAX_BUFFERED_ENTRY,
       DEFAULT_MAX_BUFFERED_ENTRY,
@@ -601,6 +1013,245 @@ export class PackStore {
     return this.#readObjects(oids, null, expectedType, false);
   }
 
+  /** Cold-read and hash exact canonical complete-pack sources. */
+  authenticateCompleteSources(
+    objects: readonly { oid: string; type: ObjectType; size: number; packId: number }[],
+  ): void {
+    if (objects.length < 1 || objects.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
+      throw new GitError(
+        "E2BIG",
+        `packed source authentication exceeds ${MAX_PACK_MEMBERSHIP_OBJECTS} objects`,
+      );
+    }
+    const requested = new Set<string>();
+    let requestedBytes = 0;
+    for (const object of objects) {
+      if (
+        !isOid(object.oid) ||
+        !isObjectType(object.type) ||
+        !Number.isSafeInteger(object.size) ||
+        object.size < 0 ||
+        object.size > MAX_PACK_DELTA_WORKING_BYTES ||
+        !Number.isSafeInteger(object.packId) ||
+        object.packId < 0
+      ) {
+        throw new CorruptError("canonical packed source request is invalid");
+      }
+      if (requested.has(object.oid)) {
+        throw new CorruptError("canonical packed source request contains a duplicate object id");
+      }
+      requested.add(object.oid);
+      requestedBytes += object.size;
+      if (!Number.isSafeInteger(requestedBytes) || requestedBytes > MAX_PACK_DELTA_WORKING_BYTES) {
+        throw new GitError("E2BIG", "packed source authentication exceeds its output byte limit");
+      }
+    }
+    const encoded = JSON.stringify(objects);
+    let sources = 0;
+    const authenticated: AuthenticatedPackSource[] = [];
+    for (const row of this.#db.iterate(
+      `SELECT CAST(input.key AS INTEGER) AS ordinal,
+              json_extract(input.value, '$.oid') AS expected_oid,
+              json_extract(input.value, '$.type') AS expected_type,
+              json_extract(input.value, '$.size') AS expected_size,
+              json_extract(input.value, '$.packId') AS expected_pack_id,
+              canonical.oid, canonical.type, canonical.size, canonical.pack_id,
+              canonical.data_off, canonical.data_len, canonical.entry_size,
+              canonical.base_oid, pack.state, pack.size AS pack_size,
+              EXISTS (
+                SELECT 1 FROM git_pack_entries physical
+                 WHERE physical.repo_id = canonical.repo_id
+                   AND physical.oid = canonical.oid
+                   AND physical.pack_id = canonical.pack_id
+                   AND physical.offset IS canonical.offset
+                   AND physical.data_off IS canonical.data_off
+                   AND physical.data_len IS canonical.data_len
+                   AND physical.type IS canonical.type
+                   AND physical.size IS canonical.size
+                   AND physical.entry_size IS canonical.entry_size
+                   AND physical.base_oid IS canonical.base_oid
+              ) AS exact_source
+         FROM json_each(?) input
+         LEFT JOIN git_pack_objects canonical
+           ON canonical.repo_id = ? AND canonical.oid = json_extract(input.value, '$.oid')
+         LEFT JOIN git_pack_meta pack
+           ON pack.repo_id = canonical.repo_id AND pack.pack_id = canonical.pack_id
+        ORDER BY CAST(input.key AS INTEGER)`,
+      encoded,
+      this.#repoId,
+    )) {
+      const expected = objects[sources];
+      if (
+        expected === undefined ||
+        row.ordinal !== sources ||
+        row.expected_oid !== expected.oid ||
+        row.expected_type !== expected.type ||
+        row.expected_size !== expected.size ||
+        row.expected_pack_id !== expected.packId ||
+        row.oid !== expected.oid ||
+        row.type !== expected.type ||
+        row.size !== expected.size ||
+        row.pack_id !== expected.packId ||
+        row.state !== "complete" ||
+        row.exact_source !== 1 ||
+        typeof row.data_off !== "number" ||
+        !Number.isSafeInteger(row.data_off) ||
+        row.data_off < 0 ||
+        typeof row.data_len !== "number" ||
+        !Number.isSafeInteger(row.data_len) ||
+        row.data_len < 1 ||
+        typeof row.entry_size !== "number" ||
+        !Number.isSafeInteger(row.entry_size) ||
+        row.entry_size < 0 ||
+        row.entry_size > MAX_PACK_DELTA_WORKING_BYTES ||
+        (row.base_oid !== null && (typeof row.base_oid !== "string" || !isOid(row.base_oid))) ||
+        typeof row.pack_size !== "number" ||
+        !Number.isSafeInteger(row.pack_size) ||
+        row.pack_size < 32 ||
+        !Number.isSafeInteger(row.data_off + row.data_len) ||
+        row.data_off + row.data_len > row.pack_size - 20 ||
+        (row.base_oid === null && row.entry_size !== expected.size)
+      ) {
+        throw new CorruptError("canonical packed source changed before authentication");
+      }
+      authenticated.push({
+        oid: expected.oid,
+        type: expected.type,
+        size: expected.size,
+        packId: expected.packId,
+        dataOff: row.data_off,
+        dataLen: row.data_len,
+        entrySize: row.entry_size,
+        baseOid: row.base_oid,
+      });
+      sources++;
+    }
+    if (sources !== objects.length) {
+      throw new CorruptError("canonical packed source authentication is incomplete");
+    }
+
+    let compressedBytes = 0;
+    for (const source of authenticated) {
+      compressedBytes += source.dataLen;
+      if (
+        !Number.isSafeInteger(compressedBytes) ||
+        compressedBytes > MAX_PACK_AUTH_COMPRESSED_BYTES
+      ) {
+        throw new GitError(
+          "E2BIG",
+          "packed source authentication exceeds its compressed byte limit",
+        );
+      }
+    }
+
+    const uncachedBudget: UncachedReadBudget = {
+      uncachedReads: 0,
+      uncachedReadLimit: MAX_PACK_AUTH_UNCACHED_ROW_READS,
+    };
+    let page: AuthenticatedPackSource[] = [];
+    let pageBytes = 0;
+    const authenticatePage = (): void => {
+      if (page.length === 0) return;
+      const only = page.length === 1 ? page[0] : undefined;
+      if (only !== undefined && only.dataLen > MAX_PACK_BLOB_BATCH_BYTES && only.baseOid === null) {
+        this.#authenticateFullPackSourceStreaming(
+          only,
+          "canonical packed source bytes disagree with their object id",
+          uncachedBudget,
+        );
+        page = [];
+        pageBytes = 0;
+        return;
+      }
+      const read = this.#readObjects(
+        page.map((object) => object.oid),
+        only?.packId ?? null,
+        null,
+        false,
+        new Map(),
+        true,
+        uncachedBudget,
+      );
+      if (read.size !== page.length) {
+        throw new CorruptError("canonical packed source authentication is incomplete");
+      }
+      for (const expected of page) {
+        const object = read.get(expected.oid);
+        if (
+          object === undefined ||
+          object.type !== expected.type ||
+          object.data.length !== expected.size ||
+          hashObject(object.type, object.data) !== expected.oid
+        ) {
+          throw new CorruptError("canonical packed source bytes disagree with their object id");
+        }
+      }
+      page = [];
+      pageBytes = 0;
+    };
+    for (const object of authenticated) {
+      if (
+        page.length > 0 &&
+        (object.size > MAX_PACK_BLOB_BATCH_BYTES - pageBytes ||
+          object.dataLen > MAX_PACK_BLOB_BATCH_BYTES)
+      ) {
+        authenticatePage();
+      }
+      page.push(object);
+      pageBytes += object.size;
+      if (object.size > MAX_PACK_BLOB_BATCH_BYTES || object.dataLen > MAX_PACK_BLOB_BATCH_BYTES) {
+        authenticatePage();
+      }
+    }
+    authenticatePage();
+  }
+
+  #authenticateFullPackSourceStreaming(
+    source: AuthenticatedPackSource,
+    message: string,
+    uncachedBudget: UncachedReadBudget,
+  ): void {
+    if (source.baseOid !== null || source.entrySize !== source.size || source.dataLen < 1) {
+      throw new CorruptError(message);
+    }
+    if (source.dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
+      throw new GitError("E2BIG", "packed source compressed bytes exceed the streaming limit");
+    }
+    reserveUncachedPackRowReads(
+      uncachedBudget,
+      [source],
+      "packed source authentication exceeds its uncached row-read limit",
+    );
+    const sha = new Sha1().update(objectHeader(source.type, source.size));
+    let produced = 0;
+    const stream = new InflateStream((chunk) => {
+      produced += chunk.length;
+      if (produced > source.size) throw new CorruptError(message);
+      sha.update(chunk);
+    });
+    let consumed = 0;
+    try {
+      while (!stream.ended && consumed < source.dataLen) {
+        const length = Math.min(PACK_READ_BYTES, source.dataLen - consumed);
+        const input = this.#readRawUncached(source.packId, source.dataOff + consumed, length);
+        const used = stream.push(input);
+        consumed += used;
+        if (!stream.ended && used !== input.length) throw new CorruptError(message);
+      }
+    } catch (error) {
+      if (error instanceof CorruptError) throw error;
+      throw new CorruptError(message, { cause: error });
+    }
+    if (
+      !stream.ended ||
+      consumed !== source.dataLen ||
+      produced !== source.size ||
+      toHex(sha.digest()) !== source.oid
+    ) {
+      throw new CorruptError(message);
+    }
+  }
+
   /** Resolve ingest bases in bounded graph and physical pack order. */
   #readObjects(
     oids: readonly string[],
@@ -608,6 +1259,11 @@ export class PackStore {
     expectedType: ObjectType | null,
     allowMissing: boolean,
     seeds: ReadonlyMap<string, RawObject> = new Map(),
+    bypassCache = false,
+    uncachedBudget: UncachedReadBudget = {
+      uncachedReads: 0,
+      uncachedReadLimit: MAX_PACK_GENERIC_UNCACHED_ROW_READS,
+    },
   ): Map<string, RawObject> {
     const wanted = [...new Set(oids)];
     if (wanted.length === 0) return new Map();
@@ -724,7 +1380,12 @@ export class PackStore {
     const externalOids = new Set<string>();
     for (const oid of available) {
       let current = entries.get(oid)!;
-      if (this.#objects.get(this.#objectCacheKey(current.packId, oid)) !== undefined) continue;
+      if (
+        !bypassCache &&
+        this.#objects.get(this.#objectCacheKey(current.packId, oid)) !== undefined
+      ) {
+        continue;
+      }
       const seen = new Set<string>();
       let depth = 0;
       for (;;) {
@@ -742,15 +1403,42 @@ export class PackStore {
           externalOids.add(current.baseOid);
           break;
         }
-        if (this.#objects.get(this.#objectCacheKey(next.packId, next.oid)) !== undefined) break;
+        if (
+          !bypassCache &&
+          this.#objects.get(this.#objectCacheKey(next.packId, next.oid)) !== undefined
+        ) {
+          break;
+        }
         current = next;
       }
     }
 
+    let oversizedEntries = 0;
+    for (const entry of needed.values()) {
+      if (entry.dataLen <= MAX_PACK_BLOB_BATCH_BYTES) continue;
+      if (entry.dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
+        throw new GitError("E2BIG", "packed entry compressed bytes exceed the streaming limit");
+      }
+      oversizedEntries++;
+    }
+    if (oversizedEntries > 0 && (wanted.length !== 1 || oversizedEntries !== 1)) {
+      throw new GitError("E2BIG", "packed blob compressed graph exceeds the 4 MiB batch limit");
+    }
+    reserveUncachedPackRowReads(
+      uncachedBudget,
+      needed.values(),
+      "packed object read exceeds its uncached row-read limit",
+    );
+
     let compressedBytes = 0;
+    const streamedCompressed = new Set<string>();
     const compressed = new Map<string, CompressedEntry>();
     const consumers = new Map<string, { entry: PackedEntry; output: CompressedEntry }[]>();
     for (const entry of needed.values()) {
+      if (entry.dataLen > MAX_PACK_BLOB_BATCH_BYTES) {
+        streamedCompressed.add(entry.oid);
+        continue;
+      }
       compressedBytes += entry.dataLen;
       if (!Number.isSafeInteger(compressedBytes) || compressedBytes > MAX_PACK_BLOB_BATCH_BYTES) {
         throw new GitError("E2BIG", "packed blob compressed graph exceeds the 4 MiB batch limit");
@@ -786,7 +1474,7 @@ export class PackStore {
       const separator = key.indexOf(":");
       const packId = Number(key.slice(0, separator));
       const seq = Number(key.slice(separator + 1));
-      const hit = this.#chunks.get(this.#chunkCacheKey(packId, seq));
+      const hit = bypassCache ? undefined : this.#chunks.get(this.#chunkCacheKey(packId, seq));
       if (hit === undefined) missingChunks.push({ p: packId, q: seq });
       else copyChunk(packId, seq, hit);
     }
@@ -814,7 +1502,7 @@ export class PackStore {
         const data = readBlob(row.data);
         const key = `${packId}:${seq}`;
         returned.add(key);
-        this.#chunks.set(this.#chunkCacheKey(packId, seq), data);
+        if (!bypassCache) this.#chunks.set(this.#chunkCacheKey(packId, seq), data);
         copyChunk(packId, seq, data);
       }
     }
@@ -833,7 +1521,9 @@ export class PackStore {
     const result = new Map<string, RawObject>();
     for (const oid of available) {
       const first = entries.get(oid)!;
-      const cached = this.#objects.get(this.#objectCacheKey(first.packId, oid));
+      const cached = bypassCache
+        ? undefined
+        : this.#objects.get(this.#objectCacheKey(first.packId, oid));
       if (cached !== undefined) {
         result.set(oid, cached);
         continue;
@@ -853,9 +1543,15 @@ export class PackStore {
           }
           object = {
             type: current.type,
-            data: this.#inflateCompressed(current, compressed.get(current.oid)?.bytes),
+            data: this.#inflateCompressed(
+              current,
+              compressed.get(current.oid)?.bytes,
+              streamedCompressed.has(current.oid),
+              bypassCache,
+              uncachedBudget,
+            ),
           };
-          this.#cacheObject(current.packId, current.oid, object);
+          if (!bypassCache) this.#cacheObject(current.packId, current.oid, object);
           break;
         }
         if (chain.length >= this.#maxDeltaDepth) {
@@ -870,7 +1566,9 @@ export class PackStore {
           }
           break;
         }
-        const cachedBase = this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
+        const cachedBase = bypassCache
+          ? undefined
+          : this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
         if (cachedBase !== undefined) {
           object = cachedBase;
           break;
@@ -880,13 +1578,19 @@ export class PackStore {
       for (let index = chain.length - 1; index >= 0; index--) {
         const entry = chain[index]!;
         checkDeltaInflateBudget(object.data, entry.entrySize);
-        const delta = this.#inflateCompressed(entry, compressed.get(entry.oid)?.bytes);
+        const delta = this.#inflateCompressed(
+          entry,
+          compressed.get(entry.oid)?.bytes,
+          streamedCompressed.has(entry.oid),
+          bypassCache,
+          uncachedBudget,
+        );
         checkDeltaWorkingSet(object.data, delta);
         object = { type: object.type, data: applyDelta(object.data, delta) };
         if (object.data.length !== entry.size || object.type !== entry.type) {
           throw new CorruptError(`pack entry at ${entry.offset} has inconsistent type or size`);
         }
-        this.#cacheObject(entry.packId, entry.oid, object);
+        if (!bypassCache) this.#cacheObject(entry.packId, entry.oid, object);
       }
       if (object.type !== first.type || object.data.length !== first.size) {
         throw new CorruptError(`packed object ${oid} has inconsistent type or size`);
@@ -896,9 +1600,25 @@ export class PackStore {
     return result;
   }
 
-  #inflateCompressed(entry: PackedEntry, compressed: Uint8Array | undefined): Uint8Array {
+  #inflateCompressed(
+    entry: PackedEntry,
+    compressed: Uint8Array | undefined,
+    streamed: boolean,
+    bypassCache: boolean,
+    uncachedBudget: UncachedReadBudget,
+  ): Uint8Array {
     if (compressed === undefined) {
-      throw new CorruptError(`packed blob entry ${entry.oid} was not loaded`);
+      if (!streamed) throw new CorruptError(`packed blob entry ${entry.oid} was not loaded`);
+      return this.#inflateStoredEntry(
+        entry.packId,
+        entry.dataOff,
+        entry.dataLen,
+        entry.entrySize,
+        `pack entry at ${entry.offset}`,
+        bypassCache,
+        uncachedBudget,
+        true,
+      );
     }
     return this.#inflateBytes(compressed, entry.entrySize, `pack entry at ${entry.offset}`);
   }
@@ -966,6 +1686,12 @@ export class PackStore {
     dataLen: number,
     expectedSize: number,
     label: string,
+    bypassCache = false,
+    uncachedBudget: UncachedReadBudget = {
+      uncachedReads: 0,
+      uncachedReadLimit: MAX_PACK_GENERIC_UNCACHED_ROW_READS,
+    },
+    uncachedReadsReserved = false,
   ): Uint8Array {
     if (
       !Number.isSafeInteger(dataLen) ||
@@ -976,11 +1702,23 @@ export class PackStore {
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
     }
+    if (dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
+      throw new GitError("E2BIG", `${label} compressed bytes exceed the streaming limit`);
+    }
+    if (!uncachedReadsReserved) {
+      reserveUncachedPackRowReads(
+        uncachedBudget,
+        [{ dataOff, dataLen }],
+        `${label} exceeds its uncached row-read limit`,
+      );
+    }
     const stream = new InflateInto(expectedSize);
     let consumed = 0;
     while (!stream.ended && consumed < dataLen) {
       const length = Math.min(PACK_READ_BYTES, dataLen - consumed);
-      const input = this.readRaw(packId, dataOff + consumed, length);
+      const input = bypassCache
+        ? this.#readRawUncached(packId, dataOff + consumed, length)
+        : this.readRaw(packId, dataOff + consumed, length);
       const used = pushExactInflate(stream, input, label);
       consumed += used;
       if (!stream.ended && used !== input.length) {
@@ -1140,6 +1878,47 @@ export class PackStore {
     return out;
   }
 
+  #readRawUncached(packId: number, offset: number, length: number): Uint8Array {
+    requirePackId(packId);
+    if (
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(length) ||
+      offset < 0 ||
+      length < 0 ||
+      length > PACK_READ_BYTES ||
+      !Number.isSafeInteger(offset + length)
+    ) {
+      throw new CorruptError("uncached pack read exceeds the bounded region limit");
+    }
+    if (length === 0) return new Uint8Array(0);
+    const first = Math.floor(offset / PACK_CHUNK);
+    const last = Math.floor((offset + length - 1) / PACK_CHUNK);
+    const out = new Uint8Array(length);
+    for (let seq = first; seq <= last; seq++) {
+      const row = this.#db.one<Record<string, unknown>>(
+        "SELECT pack_id, seq, data FROM git_pack_data WHERE repo_id = ? AND pack_id = ? AND seq = ?",
+        this.#repoId,
+        packId,
+        seq,
+      );
+      if (row === undefined || row.pack_id !== packId || row.seq !== seq) {
+        throw new CorruptError(`pack ${packId}: missing chunk ${seq}`);
+      }
+      const chunk = readBlob(row.data);
+      if (chunk.length < 1 || chunk.length > PACK_CHUNK) {
+        throw new CorruptError(`pack ${packId}: chunk ${seq} has an invalid size`);
+      }
+      const chunkStart = seq * PACK_CHUNK;
+      const from = Math.max(offset, chunkStart);
+      const to = Math.min(offset + length, chunkStart + PACK_CHUNK);
+      if (to - chunkStart > chunk.length) {
+        throw new CorruptError(`pack ${packId}: chunk ${seq} is truncated`);
+      }
+      out.set(chunk.subarray(from - chunkStart, to - chunkStart), from - offset);
+    }
+    return out;
+  }
+
   /**
    * One decoded `git_pack_data` row through the database-wide LRU. The key
    * includes both store and invalidation generations, so deleted rows can
@@ -1165,23 +1944,103 @@ export class PackStore {
     this.#cacheGeneration++;
   }
 
-  /** Drop unowned packs left half-written by interrupted ordinary ingest. */
-  reclaimPending(): number {
+  #withMemoryReservation<T>(closure: (reservation: MemoryReservation) => T): T {
+    const reservation = this.#memory.reserve();
+    try {
+      return closure(reservation);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  #ensureIngestControl(): PackIngestControl {
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms
+         FROM git_pack_ingest_control WHERE repo_id = ?`,
+      this.#repoId,
+    );
+    if (row === undefined) throw new CorruptError("pack ingest control is missing");
+    return requireIngestControl(row, this.#repoId);
+  }
+
+  #nextPackId(control: PackIngestControl): number {
+    const latest = this.#db.scalar<number | null>(
+      "SELECT MAX(pack_id) FROM git_pack_meta WHERE repo_id = ?",
+      this.#repoId,
+    );
+    if (latest !== undefined && latest !== null && (!Number.isSafeInteger(latest) || latest < 0)) {
+      throw new CorruptError("pack id allocation state is invalid");
+    }
+    const last = Math.max(control.lastPackId, latest ?? 0);
+    if (last === Number.MAX_SAFE_INTEGER) {
+      throw new GitError("E2BIG", "pack id allocation is exhausted");
+    }
+    return last + 1;
+  }
+
+  #reclaimPendingRows(
+    control: PackIngestControl,
+    nowMs: number,
+    memory: MemoryReservation,
+  ): {
+    control: PackIngestControl;
+    removed: number;
+  } {
     const ids = new Set<number>();
-    const collect = (rows: Iterable<Record<string, unknown>>): void => {
+    let current = control;
+    let livePackId: number | null = null;
+    if (control.activePackId !== null) {
+      if (control.expiresMs === null) throw new CorruptError("pack ingest lease expiry is missing");
+      const owner = this.#db.one<Record<string, unknown>>(
+        `SELECT pack.state AS state,
+                EXISTS(
+                  SELECT 1 FROM git_maintenance_repack_batches batch
+                   WHERE batch.repo_id = pack.repo_id AND batch.pack_id = pack.pack_id
+                ) AS maintenance_owned
+           FROM git_pack_meta pack
+          WHERE pack.repo_id = ? AND pack.pack_id = ?`,
+        this.#repoId,
+        control.activePackId,
+      );
+      if (owner === undefined) throw new CorruptError("active pack ingest identity is missing");
+      if (owner.state !== "pending" || owner.maintenance_owned !== 0) {
+        throw new CorruptError("active ordinary pack ingest ownership is invalid");
+      }
+      if (nowMs < control.expiresMs) {
+        livePackId = control.activePackId;
+      } else {
+        const cleared = this.#db.one<Record<string, unknown>>(
+          `UPDATE git_pack_ingest_control
+              SET active_pack_id = NULL, expires_ms = NULL
+            WHERE repo_id = ? AND owner_generation = ? AND active_pack_id = ?
+          RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
+          this.#repoId,
+          control.ownerGeneration,
+          control.activePackId,
+        );
+        if (cleared === undefined) throw new CorruptError("expired pack ingest lease changed");
+        current = requireIngestControl(cleared, this.#repoId);
+        ids.add(control.activePackId);
+      }
+    }
+    const collect = (rows: Iterable<Record<string, unknown>>, requirePending: boolean): void => {
       for (const row of rows) {
         const packId = row.pack_id;
         if (typeof packId !== "number" || !Number.isSafeInteger(packId) || packId < 0) {
           throw new CorruptError("pending pack query returned an invalid pack id");
+        }
+        if (requirePending && row.state !== "pending") {
+          throw new CorruptError(`pack ${packId}: invalid pending cleanup state`);
         }
         ids.add(packId);
       }
     };
     collect(
       this.#db.iterate(
-        `SELECT pack.pack_id AS pack_id
+        `SELECT pack.pack_id AS pack_id, pack.state AS state
            FROM git_pack_meta pack
-          WHERE pack.repo_id = ? AND pack.state != 'complete'
+          WHERE pack.repo_id = ? AND pack.state IS NOT 'complete'
+            AND (? IS NULL OR pack.pack_id != ?)
             AND pack.pack_id NOT IN (SELECT value FROM json_each(?))
             AND NOT EXISTS (
               SELECT 1 FROM git_maintenance_repack_batches batch
@@ -1189,9 +2048,12 @@ export class PackStore {
             )
           ORDER BY pack.pack_id LIMIT ?`,
         this.#repoId,
+        livePackId,
+        livePackId,
         JSON.stringify([...this.#activePending]),
         MAX_PACK_DELETE_BATCH + 1,
       ),
+      true,
     );
     collect(
       this.#db.iterate(
@@ -1204,51 +2066,77 @@ export class PackStore {
         this.#repoId,
         MAX_PACK_DELETE_BATCH + 1,
       ),
+      false,
     );
     if (ids.size > MAX_PACK_DELETE_BATCH) {
       throw new GitError("E2BIG", `pending pack cleanup exceeds ${MAX_PACK_DELETE_BATCH} packs`);
     }
-    if (ids.size === 0) return 0;
-    this.#db.transactionSync(() => {
-      for (const packId of ids) this.#deletePack(packId);
-    });
-    this.clearCaches();
-    return ids.size;
+    const audit = fallbackAuditBudget();
+    for (const packId of ids) this.#deletePack(packId, [packId], audit, memory);
+    return { control: current, removed: ids.size };
+  }
+
+  /** Drop only unowned or expired ordinary packs. */
+  reclaimPending(now: () => number = this.#now): number {
+    const nowMs = requireIngestTime(now);
+    const removed = this.#withMemoryReservation((memory) =>
+      this.#db.transactionSync(() => {
+        const control = this.#ensureIngestControl();
+        return this.#reclaimPendingRows(control, nowMs, memory).removed;
+      }),
+    );
+    if (removed > 0) this.clearCaches();
+    return removed;
+  }
+
+  #assertNotDurablyActive(packId: number): void {
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms
+         FROM git_pack_ingest_control WHERE repo_id = ?`,
+      this.#repoId,
+    );
+    if (row === undefined) throw new CorruptError("pack ingest control is missing");
+    if (requireIngestControl(row, this.#repoId).activePackId === packId) {
+      throw new GitError("EBUSY", `pack ${packId} is active`);
+    }
   }
 
   /** Delete exactly one pending pack after its owner releases the durable reference. */
   discardPending(packId: number, releaseOwnership?: (packId: number) => unknown): boolean {
     requirePackId(packId);
-    const removed = this.#db.transactionSync(() => {
-      if (this.#activePending.has(packId)) {
-        throw new GitError("EBUSY", `pack ${packId} is active`);
-      }
-      const row = this.#db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.#repoId,
-        packId,
-      );
-      if (row === undefined) return false;
-      if (row.state !== "pending" && row.state !== "complete") {
-        throw new CorruptError(`pack ${packId}: invalid state`);
-      }
-      if (row.state !== "pending") {
-        throw new GitError("EBUSY", `pack ${packId} is already complete`);
-      }
-      if (releaseOwnership !== undefined) {
-        requireLifecycleResult(releaseOwnership(packId), "ownership release");
-      }
-      const current = this.#db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.#repoId,
-        packId,
-      );
-      if (current?.state !== "pending") {
-        throw new CorruptError(`pack ${packId}: ownership release changed pending pack state`);
-      }
-      this.#deletePack(packId);
-      return true;
-    });
+    const removed = this.#withMemoryReservation((memory) =>
+      this.#db.transactionSync(() => {
+        if (this.#activePending.has(packId)) {
+          throw new GitError("EBUSY", `pack ${packId} is active`);
+        }
+        this.#assertNotDurablyActive(packId);
+        const row = this.#db.one<{ state: unknown }>(
+          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+          this.#repoId,
+          packId,
+        );
+        if (row === undefined) return false;
+        if (row.state !== "pending" && row.state !== "complete") {
+          throw new CorruptError(`pack ${packId}: invalid state`);
+        }
+        if (row.state !== "pending") {
+          throw new GitError("EBUSY", `pack ${packId} is already complete`);
+        }
+        if (releaseOwnership !== undefined) {
+          requireLifecycleResult(releaseOwnership(packId), "ownership release");
+        }
+        const current = this.#db.one<{ state: unknown }>(
+          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+          this.#repoId,
+          packId,
+        );
+        if (current?.state !== "pending") {
+          throw new CorruptError(`pack ${packId}: ownership release changed pending pack state`);
+        }
+        this.#deletePack(packId, [packId], fallbackAuditBudget(), memory);
+        return true;
+      }),
+    );
     if (removed) this.clearCaches();
     return removed;
   }
@@ -1259,65 +2147,71 @@ export class PackStore {
     if (typeof releaseOwnership !== "function") {
       throw new RangeError("complete pack ownership release must be a function");
     }
-    const removed = this.#db.transactionSync(() => {
-      if (this.#activePending.has(packId)) {
-        throw new GitError("EBUSY", `pack ${packId} is active`);
-      }
-      const row = this.#db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.#repoId,
-        packId,
-      );
-      if (row === undefined) return false;
-      if (row.state !== "pending" && row.state !== "complete") {
-        throw new CorruptError(`pack ${packId}: invalid state`);
-      }
-      if (row.state !== "complete") {
-        throw new GitError("EBUSY", `pack ${packId} is still pending`);
-      }
-      requireLifecycleResult(releaseOwnership(packId), "ownership release");
-      const current = this.#db.one<{ state: unknown }>(
-        "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
-        this.#repoId,
-        packId,
-      );
-      if (current?.state !== "complete") {
-        throw new CorruptError(`pack ${packId}: ownership release changed complete pack state`);
-      }
-      this.#deletePack(packId);
-      let rows = 0;
-      for (const validation of this.#db.iterate(
-        `SELECT /* owned-complete-discard-validation */ EXISTS(
+    const removed = this.#withMemoryReservation((memory) =>
+      this.#db.transactionSync(() => {
+        if (this.#activePending.has(packId)) {
+          throw new GitError("EBUSY", `pack ${packId} is active`);
+        }
+        this.#assertNotDurablyActive(packId);
+        const row = this.#db.one<{ state: unknown }>(
+          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+          this.#repoId,
+          packId,
+        );
+        if (row === undefined) return false;
+        if (row.state !== "pending" && row.state !== "complete") {
+          throw new CorruptError(`pack ${packId}: invalid state`);
+        }
+        if (row.state !== "complete") {
+          throw new GitError("EBUSY", `pack ${packId} is still pending`);
+        }
+        requireLifecycleResult(releaseOwnership(packId), "ownership release");
+        const current = this.#db.one<{ state: unknown }>(
+          "SELECT state FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+          this.#repoId,
+          packId,
+        );
+        if (current?.state !== "complete") {
+          throw new CorruptError(`pack ${packId}: ownership release changed complete pack state`);
+        }
+        this.#deletePack(packId, [packId], fallbackAuditBudget(), memory);
+        let rows = 0;
+        for (const validation of this.#db.iterate(
+          `SELECT /* owned-complete-discard-validation */ EXISTS(
            SELECT 1 FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?
            UNION ALL SELECT 1 FROM git_pack_data WHERE repo_id = ? AND pack_id = ?
+           UNION ALL SELECT 1 FROM git_pack_entries WHERE repo_id = ? AND pack_id = ?
            UNION ALL SELECT 1 FROM git_pack_objects WHERE repo_id = ? AND pack_id = ?
            UNION ALL SELECT 1 FROM git_pack_pending WHERE repo_id = ? AND pack_id = ?
            UNION ALL SELECT 1 FROM git_tree_sources
              WHERE repo_id = ? AND storage = 'pack' AND source_id = ?
          ) AS remains`,
-        this.#repoId,
-        packId,
-        this.#repoId,
-        packId,
-        this.#repoId,
-        packId,
-        this.#repoId,
-        packId,
-        this.#repoId,
-        packId,
-      )) {
-        if (validation.remains !== 0 || rows !== 0) {
-          throw new CorruptError(
-            `pack ${packId}: complete discard did not remove exactly one pack`,
-          );
+          this.#repoId,
+          packId,
+          this.#repoId,
+          packId,
+          this.#repoId,
+          packId,
+          this.#repoId,
+          packId,
+          this.#repoId,
+          packId,
+          this.#repoId,
+          packId,
+        )) {
+          if (validation.remains !== 0 || rows !== 0) {
+            throw new CorruptError(
+              `pack ${packId}: complete discard did not remove exactly one pack`,
+            );
+          }
+          rows++;
         }
-        rows++;
-      }
-      if (rows !== 1) {
-        throw new CorruptError(`pack ${packId}: complete discard validation returned no row`);
-      }
-      return true;
-    });
+        if (rows !== 1) {
+          throw new CorruptError(`pack ${packId}: complete discard validation returned no row`);
+        }
+        return true;
+      }),
+    );
     if (removed) this.clearCaches();
     return removed;
   }
@@ -1341,8 +2235,8 @@ export class PackStore {
       if (expected.has(object.oid)) throw new RangeError(`duplicate pack object ${object.oid}`);
       expected.set(object.oid, { type: object.type, size: object.size });
     }
-    const meta = this.#db.one<{ state: unknown; count: unknown }>(
-      "SELECT state, count FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
+    const meta = this.#db.one<{ state: unknown; count: unknown; size: unknown }>(
+      "SELECT state, count, size FROM git_pack_meta WHERE repo_id = ? AND pack_id = ?",
       this.#repoId,
       packId,
     );
@@ -1351,7 +2245,10 @@ export class PackStore {
       (meta.state !== "pending" && meta.state !== "complete") ||
       typeof meta.count !== "number" ||
       !Number.isSafeInteger(meta.count) ||
-      meta.count < 0
+      meta.count < 0 ||
+      typeof meta.size !== "number" ||
+      !Number.isSafeInteger(meta.size) ||
+      meta.size < 0
     ) {
       throw new CorruptError(`pack ${packId}: invalid metadata`);
     }
@@ -1360,9 +2257,20 @@ export class PackStore {
     let found = 0;
     let previousOid: string | null = null;
     for (const row of this.#db.iterate(
-      `SELECT /* complete-pack-membership */ oid, pack_id, offset, type, size FROM git_pack_objects
-        WHERE repo_id = ? AND pack_id = ?
-        ORDER BY oid COLLATE BINARY LIMIT ?`,
+      `SELECT /* complete-pack-membership */ entry.oid, entry.pack_id, entry.offset,
+              entry.data_off, entry.data_len, entry.type, entry.size, entry.entry_size,
+              entry.base_oid, object.pack_id AS owner_pack_id, owner.state AS owner_state,
+              object.offset AS owner_offset, object.data_off AS owner_data_off,
+              object.data_len AS owner_data_len, object.type AS owner_type,
+              object.size AS owner_size, object.entry_size AS owner_entry_size,
+              object.base_oid AS owner_base_oid
+         FROM git_pack_entries entry
+         LEFT JOIN git_pack_objects object
+           ON object.repo_id = entry.repo_id AND object.oid = entry.oid
+         LEFT JOIN git_pack_meta owner
+           ON owner.repo_id = object.repo_id AND owner.pack_id = object.pack_id
+        WHERE entry.repo_id = ? AND entry.pack_id = ?
+        ORDER BY entry.oid COLLATE BINARY LIMIT ?`,
       this.#repoId,
       packId,
       expected.size + 1,
@@ -1370,8 +2278,12 @@ export class PackStore {
       const oid = row.oid;
       const rowPackId = row.pack_id;
       const offset = row.offset;
+      const dataOff = row.data_off;
+      const dataLen = row.data_len;
       const type = row.type;
       const size = row.size;
+      const entrySize = row.entry_size;
+      const baseOid = row.base_oid;
       if (
         typeof oid !== "string" ||
         !isOid(oid) ||
@@ -1381,11 +2293,35 @@ export class PackStore {
         typeof offset !== "number" ||
         !Number.isSafeInteger(offset) ||
         offset < 0 ||
+        typeof dataOff !== "number" ||
+        !Number.isSafeInteger(dataOff) ||
+        dataOff < offset ||
+        typeof dataLen !== "number" ||
+        !Number.isSafeInteger(dataLen) ||
+        dataLen < 0 ||
+        !Number.isSafeInteger(dataOff + dataLen) ||
+        dataOff + dataLen > meta.size ||
         typeof type !== "string" ||
         !isObjectType(type) ||
         typeof size !== "number" ||
         !Number.isSafeInteger(size) ||
         size < 0 ||
+        typeof entrySize !== "number" ||
+        !Number.isSafeInteger(entrySize) ||
+        entrySize < 0 ||
+        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
+        typeof row.owner_pack_id !== "number" ||
+        !Number.isSafeInteger(row.owner_pack_id) ||
+        row.owner_pack_id < 0 ||
+        row.owner_state !== "complete" ||
+        row.owner_type !== type ||
+        row.owner_size !== size ||
+        (row.owner_pack_id === packId &&
+          (row.owner_offset !== offset ||
+            row.owner_data_off !== dataOff ||
+            row.owner_data_len !== dataLen ||
+            row.owner_entry_size !== entrySize ||
+            row.owner_base_oid !== baseOid)) ||
         (previousOid !== null && oid <= previousOid)
       ) {
         throw new CorruptError(`pack ${packId}: invalid object membership`);
@@ -1474,14 +2410,736 @@ export class PackStore {
       if (state !== "complete") throw new GitError("EBUSY", `pack ${packId} is still pending`);
     }
     if (states.size === 0) return 0;
-    this.#db.transactionSync(() => {
-      for (const packId of states.keys()) this.#deletePack(packId);
-    });
+    this.#withMemoryReservation((memory) =>
+      this.#db.transactionSync(() => {
+        const deletingPackIds = [...states.keys()];
+        const audit = fallbackAuditBudget();
+        for (const packId of deletingPackIds) {
+          this.#deletePack(packId, deletingPackIds, audit, memory);
+        }
+      }),
+    );
     this.clearCaches();
     return states.size;
   }
 
-  #deletePack(packId: number): void {
+  #auditFallbackPacks(
+    deletingPackId: number,
+    deletingPackIds: readonly number[],
+    budget: FallbackAuditBudget,
+  ): void {
+    const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
+    const packs: FallbackPackAudit[] = [];
+    for (const row of this.#db.iterate(
+      `SELECT DISTINCT candidate.pack_id, candidate_meta.size, candidate_meta.count
+         FROM git_pack_entries candidate
+         JOIN git_pack_meta candidate_meta
+           ON candidate_meta.repo_id = candidate.repo_id
+          AND candidate_meta.pack_id = candidate.pack_id
+          AND candidate_meta.state = 'complete'
+        WHERE candidate.repo_id = ?
+          AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
+          AND EXISTS (
+            SELECT 1 FROM git_pack_objects current
+             WHERE current.repo_id = candidate.repo_id AND current.oid = candidate.oid
+               AND current.pack_id = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_pack_entries earlier
+            JOIN git_pack_meta earlier_meta
+              ON earlier_meta.repo_id = earlier.repo_id
+             AND earlier_meta.pack_id = earlier.pack_id
+             AND earlier_meta.state = 'complete'
+             WHERE earlier.repo_id = candidate.repo_id AND earlier.oid = candidate.oid
+               AND earlier.pack_id NOT IN (SELECT value FROM json_each(?))
+               AND earlier.pack_id < candidate.pack_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_pack_entries same_pack
+             WHERE same_pack.repo_id = candidate.repo_id
+               AND same_pack.pack_id = candidate.pack_id
+               AND same_pack.oid = candidate.oid
+               AND same_pack.offset < candidate.offset
+          )
+        ORDER BY candidate.pack_id LIMIT ?`,
+      this.#repoId,
+      encodedDeletingPackIds,
+      deletingPackId,
+      encodedDeletingPackIds,
+      MAX_PACK_FALLBACK_AUDIT_PACKS + 1,
+    )) {
+      const candidatePackId = row.pack_id;
+      const size = row.size;
+      const count = row.count;
+      if (
+        typeof candidatePackId !== "number" ||
+        !Number.isSafeInteger(candidatePackId) ||
+        candidatePackId < 0 ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 32 ||
+        typeof count !== "number" ||
+        !Number.isSafeInteger(count) ||
+        count < 1
+      ) {
+        throw new CorruptError(`pack ${deletingPackId}: fallback pack metadata is invalid`);
+      }
+      packs.push({ packId: candidatePackId, size, count });
+    }
+    if (packs.length > MAX_PACK_FALLBACK_AUDIT_PACKS) {
+      throw new GitError("E2BIG", "fallback pack audit exceeds its pack limit");
+    }
+    const pending = packs.filter((pack) => !budget.packIds.has(pack.packId));
+    if (pending.length === 0) return;
+    for (const pack of pending) {
+      if (
+        budget.packIds.size >= MAX_PACK_FALLBACK_AUDIT_PACKS ||
+        budget.bytes > MAX_PACK_FALLBACK_AUDIT_BYTES - pack.size ||
+        budget.entries > MAX_PACK_MEMBERSHIP_OBJECTS - pack.count
+      ) {
+        throw new GitError("E2BIG", "fallback pack audit exceeds its bounded budget");
+      }
+      budget.bytes += pack.size;
+      budget.entries += pack.count;
+      budget.packIds.add(pack.packId);
+    }
+
+    const encodedPackIds = JSON.stringify(pending.map((pack) => pack.packId));
+    const byPackId = new Map<number, FallbackPackAudit>(pending.map((pack) => [pack.packId, pack]));
+    let storageRows = 0;
+    for (const row of this.#db.iterate(
+      `SELECT pack.pack_id,
+              count(data.seq) AS data_rows,
+              min(data.seq) AS first_seq,
+              max(data.seq) AS last_seq,
+              coalesce(sum(CASE WHEN typeof(data.data) = 'blob'
+                                THEN length(data.data) ELSE 0 END), 0) AS stored_bytes,
+              coalesce(sum(CASE
+                WHEN data.pack_id IS NULL THEN 0
+                WHEN typeof(data.seq) != 'integer' OR data.seq < 0
+                  OR data.seq > ${Number.MAX_SAFE_INTEGER} THEN 1
+                WHEN typeof(data.data) != 'blob' OR length(data.data) < 1
+                  OR length(data.data) > ${PACK_CHUNK} THEN 1
+                WHEN data.seq > CAST((pack.size - 1) / ${PACK_CHUNK} AS INTEGER) THEN 1
+                WHEN data.seq < CAST((pack.size - 1) / ${PACK_CHUNK} AS INTEGER)
+                  AND length(data.data) != ${PACK_CHUNK} THEN 1
+                WHEN data.seq = CAST((pack.size - 1) / ${PACK_CHUNK} AS INTEGER)
+                  AND length(data.data) != pack.size - data.seq * ${PACK_CHUNK} THEN 1
+                ELSE 0 END), 0) AS invalid_chunks
+         FROM git_pack_meta pack
+         LEFT JOIN git_pack_data data
+           ON data.repo_id = pack.repo_id AND data.pack_id = pack.pack_id
+        WHERE pack.repo_id = ? AND pack.pack_id IN (SELECT value FROM json_each(?))
+        GROUP BY pack.pack_id ORDER BY pack.pack_id`,
+      this.#repoId,
+      encodedPackIds,
+    )) {
+      const packId = row.pack_id;
+      const pack = typeof packId === "number" ? byPackId.get(packId) : undefined;
+      const dataRows = row.data_rows;
+      if (
+        pack === undefined ||
+        typeof dataRows !== "number" ||
+        !Number.isSafeInteger(dataRows) ||
+        dataRows < 1 ||
+        row.first_seq !== 0 ||
+        row.last_seq !== dataRows - 1 ||
+        row.stored_bytes !== pack.size ||
+        row.invalid_chunks !== 0
+      ) {
+        throw new CorruptError(`pack ${deletingPackId}: fallback pack storage is invalid`);
+      }
+      storageRows++;
+    }
+    if (storageRows !== pending.length) {
+      throw new CorruptError(`pack ${deletingPackId}: fallback pack storage is incomplete`);
+    }
+
+    const entriesByPack = new Map<number, Map<number, PackedEntry>>();
+    for (const pack of pending) entriesByPack.set(pack.packId, new Map());
+    let entryRows = 0;
+    for (const row of this.#db.iterate(
+      `SELECT oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid
+         FROM git_pack_entries
+        WHERE repo_id = ? AND pack_id IN (SELECT value FROM json_each(?))
+        ORDER BY pack_id, offset LIMIT ?`,
+      this.#repoId,
+      encodedPackIds,
+      pending.reduce((total, pack) => total + pack.count, 0) + 1,
+    )) {
+      const oid = row.oid;
+      const packId = row.pack_id;
+      const offset = row.offset;
+      const dataOff = row.data_off;
+      const dataLen = row.data_len;
+      const type = row.type;
+      const size = row.size;
+      const entrySize = row.entry_size;
+      const baseOid = row.base_oid;
+      const pack = typeof packId === "number" ? byPackId.get(packId) : undefined;
+      const entries = typeof packId === "number" ? entriesByPack.get(packId) : undefined;
+      if (
+        pack === undefined ||
+        entries === undefined ||
+        typeof packId !== "number" ||
+        !Number.isSafeInteger(packId) ||
+        packId < 0 ||
+        typeof oid !== "string" ||
+        !isOid(oid) ||
+        typeof offset !== "number" ||
+        !Number.isSafeInteger(offset) ||
+        offset < 12 ||
+        typeof dataOff !== "number" ||
+        !Number.isSafeInteger(dataOff) ||
+        dataOff <= offset ||
+        typeof dataLen !== "number" ||
+        !Number.isSafeInteger(dataLen) ||
+        dataLen < 1 ||
+        dataOff > pack.size - 20 - dataLen ||
+        typeof type !== "string" ||
+        !isObjectType(type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        typeof entrySize !== "number" ||
+        !Number.isSafeInteger(entrySize) ||
+        entrySize < 0 ||
+        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
+        entries.has(offset)
+      ) {
+        throw new CorruptError(`pack ${deletingPackId}: fallback physical index is invalid`);
+      }
+      entries.set(offset, {
+        oid,
+        packId,
+        offset,
+        dataOff,
+        dataLen,
+        type,
+        size,
+        entrySize,
+        baseOid,
+      });
+      entryRows++;
+    }
+    const expectedEntries = pending.reduce((total, pack) => total + pack.count, 0);
+    if (entryRows !== expectedEntries) {
+      throw new CorruptError(`pack ${deletingPackId}: fallback physical index is incomplete`);
+    }
+
+    for (const pack of pending) {
+      const entries = entriesByPack.get(pack.packId);
+      if (entries === undefined || entries.size !== pack.count) {
+        throw new CorruptError(`pack ${pack.packId}: fallback physical index count disagrees`);
+      }
+      const stored = new SequentialPackBytes(this.#db, this.#repoId, pack.packId, pack.size);
+      const reader = new PackReader(
+        (offset, length) => stored.read(offset, length),
+        pack.packId,
+        pack.size,
+      );
+      const magic = reader.take(4);
+      const version = reader.uint32();
+      const count = reader.uint32();
+      if (
+        magic[0] !== 0x50 ||
+        magic[1] !== 0x41 ||
+        magic[2] !== 0x43 ||
+        magic[3] !== 0x4b ||
+        (version !== 2 && version !== 3) ||
+        count !== pack.count
+      ) {
+        throw new CorruptError(`pack ${pack.packId}: fallback header is invalid`);
+      }
+      const offsets = new Map<number, string>();
+      for (let ordinal = 0; ordinal < count; ordinal++) {
+        const header = reader.entryHeader();
+        const indexed = entries.get(header.offset);
+        const fullType = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
+        let decoded: {
+          data: Uint8Array | null;
+          consumed: number;
+          streamedOid: string | null;
+          deltaTargetSize: number | null;
+        };
+        try {
+          decoded = this.#inflateAt(reader, header.dataOff, header.entrySize, fullType ?? null);
+        } catch (error) {
+          throw new CorruptError(`pack ${pack.packId}: fallback pack bytes are invalid`, {
+            cause: error,
+          });
+        }
+        const baseOid =
+          header.kind === null
+            ? null
+            : header.kind === "ref"
+              ? header.baseOid
+              : (offsets.get(header.offset - (header.baseDelta ?? 0)) ?? null);
+        if (header.kind !== null && baseOid === null) {
+          throw new CorruptError(`pack ${pack.packId}: fallback delta base is missing`);
+        }
+        if (
+          indexed === undefined ||
+          indexed.packId !== pack.packId ||
+          indexed.offset !== header.offset ||
+          indexed.dataOff !== header.dataOff ||
+          indexed.dataLen !== decoded.consumed ||
+          indexed.entrySize !== header.entrySize ||
+          indexed.baseOid !== baseOid
+        ) {
+          throw new CorruptError(`pack ${pack.packId}: fallback index disagrees with pack bytes`);
+        }
+        if (header.kind === null) {
+          if (fullType === undefined) {
+            throw new CorruptError(`pack ${pack.packId}: fallback object type is invalid`);
+          }
+          const oid =
+            decoded.data === null
+              ? (decoded.streamedOid ?? "")
+              : hashObject(fullType, decoded.data);
+          if (
+            indexed.oid !== oid ||
+            indexed.type !== fullType ||
+            indexed.size !== header.entrySize
+          ) {
+            throw new CorruptError(`pack ${pack.packId}: fallback index disagrees with pack bytes`);
+          }
+        }
+        offsets.set(header.offset, indexed.oid);
+      }
+      if (reader.position !== pack.size - 20 || offsets.size !== pack.count) {
+        throw new CorruptError(`pack ${pack.packId}: fallback pack traversal is incomplete`);
+      }
+      reader.take(20);
+      try {
+        stored.finish();
+      } catch (error) {
+        throw new CorruptError(`pack ${pack.packId}: fallback checksum mismatch`, { cause: error });
+      }
+    }
+  }
+
+  #auditPromotedFallbacks(
+    deletingPackId: number,
+    rows: readonly AuthenticatedPackSource[],
+    budget: FallbackAuditBudget,
+  ): void {
+    if (rows.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
+      throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
+    }
+
+    let page: AuthenticatedPackSource[] = [];
+    let pageBytes = 0;
+    const auditPage = (): void => {
+      if (page.length === 0) return;
+      if (budget.pages >= MAX_PACK_FALLBACK_AUDIT_PAGES) {
+        throw new GitError("E2BIG", "promoted fallback audit exceeds its SQL page budget");
+      }
+      budget.pages++;
+      const only = page.length === 1 ? page[0] : undefined;
+      if (only !== undefined && only.dataLen > MAX_PACK_BLOB_BATCH_BYTES && only.baseOid === null) {
+        this.#authenticateFullPackSourceStreaming(
+          only,
+          `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
+          budget,
+        );
+        page = [];
+        pageBytes = 0;
+        return;
+      }
+      const objects = this.#readObjects(
+        page.map((entry) => entry.oid),
+        only?.packId ?? null,
+        null,
+        false,
+        new Map(),
+        true,
+        budget,
+      );
+      if (objects.size !== page.length) {
+        throw new CorruptError(`pack ${deletingPackId}: promoted fallback audit is incomplete`);
+      }
+      for (const expected of page) {
+        const object = objects.get(expected.oid);
+        if (
+          object === undefined ||
+          object.type !== expected.type ||
+          object.data.length !== expected.size ||
+          hashObject(object.type, object.data) !== expected.oid
+        ) {
+          throw new CorruptError(
+            `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
+          );
+        }
+      }
+      page = [];
+      pageBytes = 0;
+    };
+    for (const row of rows) {
+      if (
+        page.length > 0 &&
+        (row.size > MAX_PACK_BLOB_BATCH_BYTES - pageBytes ||
+          row.dataLen > MAX_PACK_BLOB_BATCH_BYTES ||
+          page.length >= MAX_PACK_MEMBERSHIP_OBJECTS)
+      ) {
+        auditPage();
+      }
+      page.push(row);
+      pageBytes += row.size;
+      if (row.size > MAX_PACK_BLOB_BATCH_BYTES || row.dataLen > MAX_PACK_BLOB_BATCH_BYTES) {
+        auditPage();
+      }
+    }
+    auditPage();
+  }
+
+  #authenticateLooseDeltaBases(
+    deletingPackId: number,
+    deletingPackIds: readonly number[],
+    budget: FallbackAuditBudget,
+  ): void {
+    const bases: CompletePackObject[] = [];
+    for (const row of this.#db.iterate(
+      `SELECT DISTINCT base.oid, base.type, base.size,
+              loose.oid AS loose_oid, loose.type AS loose_type, loose.size AS loose_size
+         FROM git_pack_entries child
+         JOIN git_pack_meta child_pack
+           ON child_pack.repo_id = child.repo_id AND child_pack.pack_id = child.pack_id
+          AND child_pack.state = 'complete'
+         JOIN git_pack_objects base
+           ON base.repo_id = child.repo_id AND base.oid = child.base_oid
+          AND base.pack_id = ?
+         LEFT JOIN git_objects loose
+           ON loose.repo_id = base.repo_id AND loose.oid = base.oid
+        WHERE child.repo_id = ?
+          AND child.pack_id NOT IN (SELECT value FROM json_each(?))
+        ORDER BY base.oid COLLATE BINARY LIMIT ?`,
+      deletingPackId,
+      this.#repoId,
+      JSON.stringify(deletingPackIds),
+      MAX_PACK_MEMBERSHIP_OBJECTS + 1,
+    )) {
+      if (bases.length >= MAX_PACK_MEMBERSHIP_OBJECTS) {
+        throw new GitError("E2BIG", "surviving loose delta closure exceeds its object limit");
+      }
+      if (
+        typeof row.oid !== "string" ||
+        !isOid(row.oid) ||
+        typeof row.type !== "string" ||
+        !isObjectType(row.type) ||
+        typeof row.size !== "number" ||
+        !Number.isSafeInteger(row.size) ||
+        row.size < 0 ||
+        row.size > MAX_PACK_DELTA_WORKING_BYTES
+      ) {
+        throw new CorruptError(`pack ${deletingPackId}: delta base metadata is invalid`);
+      }
+      if (row.loose_oid === null) {
+        throw new GitError(
+          "EBUSY",
+          `pack ${deletingPackId} is required by a surviving delta chain`,
+        );
+      }
+      if (row.loose_oid !== row.oid || row.loose_type !== row.type || row.loose_size !== row.size) {
+        throw new CorruptError(`pack ${deletingPackId}: surviving loose delta base is invalid`);
+      }
+      bases.push({ oid: row.oid, type: row.type, size: row.size });
+    }
+    if (bases.length === 0) return;
+    const bytes = bases.reduce((total, base) => total + base.size, 0);
+    if (!Number.isSafeInteger(bytes) || bytes > MAX_PACK_FALLBACK_AUDIT_BYTES - budget.bytes) {
+      throw new GitError("E2BIG", "surviving loose delta closure exceeds its byte limit");
+    }
+    budget.bytes += bytes;
+    this.#authenticateLooseObjects(deletingPackId, bases);
+  }
+
+  #authenticateLooseObjects(deletingPackId: number, objects: readonly CompletePackObject[]): void {
+    let ordinal = -1;
+    let expected: CompletePackObject | undefined;
+    let sha: Sha1 | null = null;
+    let inflater: InflateStream | null = null;
+    let stored: "raw" | "zlib" | null = null;
+    let nextSeq = 0;
+    let produced = 0;
+    let rows = 0;
+    const finish = (): void => {
+      if (
+        expected === undefined ||
+        sha === null ||
+        stored === null ||
+        rows < 1 ||
+        produced !== expected.size ||
+        (stored === "zlib" && (inflater === null || !inflater.ended)) ||
+        toHex(sha.digest()) !== expected.oid
+      ) {
+        throw new CorruptError(
+          `pack ${deletingPackId}: surviving loose delta base bytes are invalid`,
+        );
+      }
+    };
+    for (const row of this.#db.iterate(
+      `SELECT CAST(input.key AS INTEGER) AS ordinal,
+              json_extract(input.value, '$.oid') AS expected_oid,
+              json_extract(input.value, '$.type') AS expected_type,
+              json_extract(input.value, '$.size') AS expected_size,
+              loose.oid, loose.type, loose.size, loose.stored,
+              chunk.seq, chunk.data
+         FROM json_each(?) input
+         LEFT JOIN git_objects loose
+           ON loose.repo_id = ? AND loose.oid = json_extract(input.value, '$.oid')
+         LEFT JOIN git_object_chunks chunk
+           ON chunk.repo_id = loose.repo_id AND chunk.oid = loose.oid
+        ORDER BY CAST(input.key AS INTEGER), chunk.seq`,
+      JSON.stringify(objects),
+      this.#repoId,
+    )) {
+      if (row.ordinal !== ordinal) {
+        if (ordinal >= 0) finish();
+        ordinal++;
+        expected = objects[ordinal];
+        if (
+          expected === undefined ||
+          row.ordinal !== ordinal ||
+          row.expected_oid !== expected.oid ||
+          row.expected_type !== expected.type ||
+          row.expected_size !== expected.size ||
+          row.oid !== expected.oid ||
+          row.type !== expected.type ||
+          row.size !== expected.size ||
+          (row.stored !== "raw" && row.stored !== "zlib")
+        ) {
+          throw new CorruptError(
+            `pack ${deletingPackId}: surviving loose delta base metadata changed`,
+          );
+        }
+        sha = new Sha1().update(objectHeader(expected.type, expected.size));
+        stored = row.stored;
+        nextSeq = 0;
+        produced = 0;
+        rows = 0;
+        inflater =
+          stored === "zlib"
+            ? new InflateStream((chunk) => {
+                produced += chunk.length;
+                if (expected === undefined || produced > expected.size) {
+                  throw new CorruptError(
+                    `pack ${deletingPackId}: surviving loose delta base exceeds its size`,
+                  );
+                }
+                sha?.update(chunk);
+              })
+            : null;
+      }
+      if (row.seq !== nextSeq) {
+        throw new CorruptError(
+          `pack ${deletingPackId}: surviving loose delta base chunks are incomplete`,
+        );
+      }
+      const data = readBlob(row.data);
+      if (data.length > PACK_CHUNK) {
+        throw new CorruptError(
+          `pack ${deletingPackId}: surviving loose delta base chunk is too large`,
+        );
+      }
+      if (stored === "raw") {
+        produced += data.length;
+        if (expected === undefined || produced > expected.size) {
+          throw new CorruptError(
+            `pack ${deletingPackId}: surviving loose delta base exceeds its size`,
+          );
+        }
+        sha?.update(data);
+      } else if (inflater !== null) {
+        let consumed = 0;
+        while (consumed < data.length) {
+          const used = inflater.push(data.subarray(consumed));
+          consumed += used;
+          if (inflater.ended && consumed !== data.length) {
+            throw new CorruptError(
+              `pack ${deletingPackId}: surviving loose delta base has trailing bytes`,
+            );
+          }
+          if (!inflater.ended && used === 0) {
+            throw new CorruptError(
+              `pack ${deletingPackId}: surviving loose delta base inflater made no progress`,
+            );
+          }
+        }
+      }
+      nextSeq++;
+      rows++;
+    }
+    if (ordinal >= 0) finish();
+    if (ordinal + 1 !== objects.length) {
+      throw new CorruptError(
+        `pack ${deletingPackId}: surviving loose delta base authentication is incomplete`,
+      );
+    }
+  }
+
+  #deletePack(
+    packId: number,
+    deletingPackIds: readonly number[],
+    auditBudget: FallbackAuditBudget,
+    memory: MemoryReservation,
+  ): void {
+    memory.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
+    memory.set("base", MAX_PACK_BLOB_BATCH_BYTES);
+    memory.set("compressed", MAX_PACK_BLOB_BATCH_BYTES);
+    memory.set("metadata", PACK_FALLBACK_AUDIT_METADATA_BYTES);
+    const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
+    const invalidFallback = this.#db.scalar<unknown>(
+      `SELECT EXISTS(
+         SELECT 1
+           FROM git_pack_entries candidate
+           JOIN git_pack_meta candidate_meta
+             ON candidate_meta.repo_id = candidate.repo_id
+            AND candidate_meta.pack_id = candidate.pack_id
+            AND candidate_meta.state = 'complete'
+           JOIN git_pack_objects current
+             ON current.repo_id = candidate.repo_id AND current.oid = candidate.oid
+            AND current.pack_id = ?
+          WHERE candidate.repo_id = ?
+            AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
+            AND (
+              typeof(candidate_meta.size) != 'integer' OR candidate_meta.size < 0
+              OR candidate_meta.size > ${Number.MAX_SAFE_INTEGER}
+              OR typeof(candidate_meta.count) != 'integer' OR candidate_meta.count < 0
+              OR candidate_meta.count > ${Number.MAX_SAFE_INTEGER}
+              OR typeof(candidate.pack_id) != 'integer' OR candidate.pack_id < 0
+              OR candidate.pack_id > ${Number.MAX_SAFE_INTEGER}
+              OR typeof(candidate.oid) != 'text'
+              OR length(CAST(candidate.oid AS BLOB)) != 40
+              OR candidate.oid GLOB '*[^0-9a-f]*'
+              OR typeof(candidate.offset) != 'integer' OR candidate.offset < 0
+              OR candidate.offset > ${Number.MAX_SAFE_INTEGER}
+              OR typeof(candidate.data_off) != 'integer' OR candidate.data_off < candidate.offset
+              OR candidate.data_off > ${Number.MAX_SAFE_INTEGER}
+              OR typeof(candidate.data_len) != 'integer' OR candidate.data_len < 0
+              OR candidate.data_len > ${Number.MAX_SAFE_INTEGER}
+              OR candidate.data_off > candidate_meta.size - candidate.data_len
+              OR typeof(candidate.type) != 'text'
+              OR candidate.type NOT IN ('blob','tree','commit','tag')
+              OR typeof(candidate.size) != 'integer' OR candidate.size < 0
+              OR candidate.size > ${Number.MAX_SAFE_INTEGER}
+              OR typeof(candidate.entry_size) != 'integer' OR candidate.entry_size < 0
+              OR candidate.entry_size > ${Number.MAX_SAFE_INTEGER}
+              OR (candidate.base_oid IS NOT NULL AND (
+                typeof(candidate.base_oid) != 'text'
+                OR length(CAST(candidate.base_oid AS BLOB)) != 40
+                OR candidate.base_oid GLOB '*[^0-9a-f]*'
+              ))
+              OR candidate.type IS NOT current.type
+              OR candidate.size IS NOT current.size
+            )
+       )`,
+      packId,
+      this.#repoId,
+      encodedDeletingPackIds,
+    );
+    if (invalidFallback !== 0) {
+      throw new CorruptError(`pack ${packId}: fallback membership is invalid`);
+    }
+    this.clearCaches();
+    this.#auditFallbackPacks(packId, deletingPackIds, auditBudget);
+    const promoted: AuthenticatedPackSource[] = [];
+    const promotedOids = new Set<string>();
+    for (const row of this.#db.iterate(
+      `INSERT OR REPLACE INTO git_pack_objects
+         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+       SELECT candidate.repo_id, candidate.oid, candidate.pack_id, candidate.offset,
+              candidate.data_off, candidate.data_len, candidate.type, candidate.size,
+              candidate.entry_size, candidate.base_oid
+         FROM git_pack_entries candidate
+         JOIN git_pack_meta candidate_meta
+           ON candidate_meta.repo_id = candidate.repo_id
+          AND candidate_meta.pack_id = candidate.pack_id
+          AND candidate_meta.state = 'complete'
+        WHERE candidate.repo_id = ?
+          AND candidate.pack_id NOT IN (SELECT value FROM json_each(?))
+          AND EXISTS (
+            SELECT 1 FROM git_pack_objects current
+             WHERE current.repo_id = candidate.repo_id AND current.oid = candidate.oid
+               AND current.pack_id = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_pack_entries earlier
+            JOIN git_pack_meta earlier_meta
+              ON earlier_meta.repo_id = earlier.repo_id
+             AND earlier_meta.pack_id = earlier.pack_id
+             AND earlier_meta.state = 'complete'
+             WHERE earlier.repo_id = candidate.repo_id AND earlier.oid = candidate.oid
+               AND earlier.pack_id NOT IN (SELECT value FROM json_each(?))
+               AND earlier.pack_id < candidate.pack_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_pack_entries same_pack
+             WHERE same_pack.repo_id = candidate.repo_id
+               AND same_pack.pack_id = candidate.pack_id
+               AND same_pack.oid = candidate.oid
+               AND same_pack.offset < candidate.offset
+          )
+       RETURNING oid, pack_id, type, size, data_off, data_len, entry_size, base_oid`,
+      this.#repoId,
+      encodedDeletingPackIds,
+      packId,
+      encodedDeletingPackIds,
+    )) {
+      const oid = row.oid;
+      const promotedPackId = row.pack_id;
+      const type = row.type;
+      const size = row.size;
+      const dataOff = row.data_off;
+      const dataLen = row.data_len;
+      const entrySize = row.entry_size;
+      const baseOid = row.base_oid;
+      if (
+        typeof oid !== "string" ||
+        !isOid(oid) ||
+        promotedOids.has(oid) ||
+        typeof promotedPackId !== "number" ||
+        !Number.isSafeInteger(promotedPackId) ||
+        promotedPackId < 0 ||
+        deletingPackIds.includes(promotedPackId) ||
+        typeof type !== "string" ||
+        !isObjectType(type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        size > MAX_PACK_DELTA_WORKING_BYTES ||
+        typeof dataOff !== "number" ||
+        !Number.isSafeInteger(dataOff) ||
+        dataOff < 0 ||
+        typeof dataLen !== "number" ||
+        !Number.isSafeInteger(dataLen) ||
+        dataLen < 1 ||
+        typeof entrySize !== "number" ||
+        !Number.isSafeInteger(entrySize) ||
+        entrySize < 0 ||
+        entrySize > MAX_PACK_DELTA_WORKING_BYTES ||
+        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
+        (baseOid === null && entrySize !== size)
+      ) {
+        throw new CorruptError(`pack ${packId}: promoted fallback row is invalid`);
+      }
+      promotedOids.add(oid);
+      promoted.push({
+        oid,
+        packId: promotedPackId,
+        type,
+        size,
+        dataOff,
+        dataLen,
+        entrySize,
+        baseOid,
+      });
+      if (promoted.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
+        throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
+      }
+    }
+    this.#auditPromotedFallbacks(packId, promoted, auditBudget);
+    this.#authenticateLooseDeltaBases(packId, deletingPackIds, auditBudget);
     this.#db.run(
       `DELETE FROM git_commits
         WHERE repo_id = ?
@@ -1508,18 +3166,47 @@ export class PackStore {
       packId,
     );
     this.#db.run(
+      `INSERT OR REPLACE INTO git_tree_effective (repo_id, tree_oid, source_key)
+       SELECT object.repo_id, object.oid, source.source_key
+         FROM git_pack_objects object
+         JOIN git_pack_meta pack
+           ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+          AND pack.state = 'complete'
+         JOIN git_tree_sources source
+           ON source.repo_id = object.repo_id AND source.tree_oid = object.oid
+          AND source.storage = 'pack' AND source.source_id = object.pack_id
+        WHERE object.repo_id = ? AND object.type = 'tree'
+          AND EXISTS (
+            SELECT 1 FROM git_tree_sources doomed
+             WHERE doomed.repo_id = object.repo_id AND doomed.tree_oid = object.oid
+               AND doomed.storage = 'pack' AND doomed.source_id = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM git_objects loose
+             WHERE loose.repo_id = object.repo_id AND loose.oid = object.oid
+               AND loose.type = 'tree'
+          )`,
+      this.#repoId,
+      packId,
+    );
+    this.#db.run(
       "DELETE FROM git_tree_sources WHERE repo_id = ? AND storage = 'pack' AND source_id = ?",
       this.#repoId,
       packId,
     );
     for (const table of [
       "git_pack_data",
+      "git_pack_entries",
       "git_pack_objects",
       "git_pack_pending",
       "git_pack_meta",
     ]) {
       this.#db.run(`DELETE FROM ${table} WHERE repo_id = ? AND pack_id = ?`, this.#repoId, packId);
     }
+    memory.clear("pool");
+    memory.clear("base");
+    memory.clear("compressed");
+    memory.clear("metadata");
   }
 
   /**
@@ -1537,93 +3224,458 @@ export class PackStore {
     if (typeof reclaimPending !== "boolean") {
       throw new RangeError("reclaimPending must be a boolean");
     }
-    const reservation = this.#memory.reserve();
-    const pool = new ChunkPool(MAX_PACK_DELTA_WORKING_BYTES);
-    const memory = { reservation, pool };
-    const now = options.now ?? Date.now;
+    const now = options.now ?? this.#now;
     const say = options.onProgress ?? (() => {});
     const maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
     const yieldNow = options.yieldNow ?? (() => Promise.resolve());
+    let memory: PackIngestMemory | undefined;
     let activePackId: number | undefined;
+    let lease: PackIngestLease | null = null;
     try {
-      if (reclaimPending) this.reclaimPending();
-      const packId = this.#reservePending(now, options.lifecycle);
-      activePackId = packId;
+      const memoryReservation = this.#memory.reserve();
+      const pool = new ChunkPool(MAX_PACK_DELTA_WORKING_BYTES);
+      memory = { reservation: memoryReservation, pool };
+      const reservation = this.#reservePending(
+        requireIngestTime(now),
+        options.lifecycle,
+        { ordinary: reclaimPending },
+        memoryReservation,
+      );
+      activePackId = reservation.packId;
+      lease = reservation.lease;
+      if (reservation.reclaimed > 0) this.clearCaches();
+      const activeLease = lease;
+      const heartbeat =
+        activeLease === null ? () => undefined : () => this.#renewIngestLease(activeLease, now);
 
-      const total = await this.#writeChunks(source, packId, maxBytes, say, yieldNow, memory);
-      reservation.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
-      const { count, commits } = await this.#indexPack(packId, total, say, yieldNow, memory);
-      const result = { packId, count, bytes: total };
+      const total = await this.#writeChunks(
+        source,
+        reservation.packId,
+        maxBytes,
+        say,
+        yieldNow,
+        heartbeat,
+        memory,
+      );
+      heartbeat();
+      memoryReservation.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
+      const { count, commits, membership } = await this.#indexPack(
+        reservation.packId,
+        total,
+        say,
+        yieldNow,
+        heartbeat,
+        memory,
+      );
+      heartbeat();
+      const result = { packId: reservation.packId, count, bytes: total };
 
       this.#db.transactionSync(() => {
-        this.#db.run(
-          "UPDATE git_pack_meta SET size = ?, count = ?, state = 'complete' WHERE repo_id = ? AND pack_id = ?",
+        if (lease !== null) this.#renewIngestLease(lease, now);
+        const published = this.#db.one<Record<string, unknown>>(
+          `UPDATE git_pack_meta SET size = ?, count = ?, state = 'complete'
+            WHERE repo_id = ? AND pack_id = ? AND state = 'pending'
+          RETURNING pack_id, size, count, state`,
           total,
           count,
           this.#repoId,
-          packId,
+          reservation.packId,
         );
+        if (
+          published === undefined ||
+          published.pack_id !== reservation.packId ||
+          published.size !== total ||
+          published.count !== count ||
+          published.state !== "complete"
+        ) {
+          throw new GitError("ESTALE", "pack ingest ownership changed before publication");
+        }
         commits.finish();
+        this.#auditPublishedMembership(reservation.packId, count, total, membership);
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }
+        if (lease !== null) this.#releaseIngestLease(lease, true);
       });
-      reservation.clear("commit");
+      memoryReservation.clear("other");
+      memoryReservation.clear("commit");
       return result;
     } finally {
       if (activePackId !== undefined) this.#activePending.delete(activePackId);
-      this.#lastIngestMemoryHighWater = reservation.highWaterBytes;
-      if (!reservation.disposed) {
-        try {
-          pool.assertIdle();
-          pool.dispose();
-          reservation.clear("flat");
-          reservation.clear("compressed");
-          reservation.clear("metadata");
-          reservation.clear("tree");
-          reservation.clear("commit");
-          reservation.clear("base");
-          reservation.clear("pool");
-          reservation.assertEmpty();
-        } finally {
-          reservation.dispose();
+      if (lease !== null) this.#releaseIngestLease(lease, false);
+      if (memory !== undefined) {
+        const { reservation, pool } = memory;
+        this.#lastIngestMemoryHighWater = reservation.highWaterBytes;
+        if (!reservation.disposed) {
+          try {
+            pool.assertIdle();
+            pool.dispose();
+            reservation.clear("flat");
+            reservation.clear("compressed");
+            reservation.clear("metadata");
+            reservation.clear("tree");
+            reservation.clear("commit");
+            reservation.clear("base");
+            reservation.clear("pool");
+            reservation.clear("other");
+            reservation.assertEmpty();
+          } finally {
+            reservation.dispose();
+          }
         }
       }
     }
   }
 
-  #reservePending(now: () => number, lifecycle: PackIngestLifecycle | undefined): number {
+  #reservePending(
+    nowMs: number,
+    lifecycle: PackIngestLifecycle | undefined,
+    ownership: { ordinary: boolean },
+    memory: MemoryReservation,
+  ): { packId: number; lease: PackIngestLease | null; reclaimed: number } {
     let activePackId: number | undefined;
     try {
       return this.#db.transactionSync(() => {
-        const latest = this.#db.scalar<number | null>(
-          "SELECT MAX(pack_id) FROM git_pack_meta WHERE repo_id = ?",
-          this.#repoId,
-        );
-        if (
-          latest !== undefined &&
-          latest !== null &&
-          (!Number.isSafeInteger(latest) || latest < 0 || latest === Number.MAX_SAFE_INTEGER)
-        ) {
-          throw new CorruptError("pack id allocation state is invalid");
+        let control = this.#ensureIngestControl();
+        let reclaimed = 0;
+        if (ownership.ordinary) {
+          const cleanup = this.#reclaimPendingRows(control, nowMs, memory);
+          control = cleanup.control;
+          reclaimed = cleanup.removed;
+          if (control.activePackId !== null) {
+            throw new GitError("EBUSY", "pack ingest is active");
+          }
+          if (control.ownerGeneration === Number.MAX_SAFE_INTEGER) {
+            throw new GitError("E2BIG", "pack ingest generation is exhausted");
+          }
         }
-        const packId = (latest ?? 0) + 1;
+        const packId = this.#nextPackId(control);
         this.#db.run(
           "INSERT INTO git_pack_meta (repo_id, pack_id, size, count, state, created) VALUES (?, ?, 0, 0, 'pending', ?)",
           this.#repoId,
           packId,
-          now(),
+          nowMs,
         );
+        let lease: PackIngestLease | null = null;
+        let updated: Record<string, unknown> | undefined;
+        if (ownership.ordinary) {
+          const generation = control.ownerGeneration + 1;
+          updated = this.#db.one<Record<string, unknown>>(
+            `UPDATE git_pack_ingest_control
+                SET owner_generation = ?, last_pack_id = ?, active_pack_id = ?, expires_ms = ?
+              WHERE repo_id = ?
+            RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
+            generation,
+            packId,
+            packId,
+            nowMs + PACK_INGEST_LEASE_MS,
+            this.#repoId,
+          );
+          lease = { generation, packId, expiresMs: nowMs + PACK_INGEST_LEASE_MS };
+        } else {
+          updated = this.#db.one<Record<string, unknown>>(
+            `UPDATE git_pack_ingest_control SET last_pack_id = ? WHERE repo_id = ?
+            RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
+            packId,
+            this.#repoId,
+          );
+        }
+        if (
+          updated === undefined ||
+          requireIngestControl(updated, this.#repoId).lastPackId !== packId
+        ) {
+          throw new CorruptError("pack ingest allocation was not recorded");
+        }
         this.#activePending.add(packId);
         activePackId = packId;
         if (lifecycle !== undefined) {
           requireLifecycleResult(lifecycle.reserved(packId), "reserved");
         }
-        return packId;
+        return { packId, lease, reclaimed };
       });
     } catch (error) {
       if (activePackId !== undefined) this.#activePending.delete(activePackId);
       throw error;
+    }
+  }
+
+  #renewIngestLease(lease: PackIngestLease, now: () => number): void {
+    const nowMs = requireIngestTime(now);
+    if (nowMs < lease.expiresMs - Math.floor(PACK_INGEST_LEASE_MS / 2)) return;
+    const row = this.#db.one<Record<string, unknown>>(
+      `UPDATE git_pack_ingest_control
+          SET expires_ms = max(expires_ms, ?)
+        WHERE repo_id = ? AND owner_generation = ? AND active_pack_id = ? AND expires_ms > ?
+      RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
+      nowMs + PACK_INGEST_LEASE_MS,
+      this.#repoId,
+      lease.generation,
+      lease.packId,
+      nowMs,
+    );
+    if (row === undefined) throw new GitError("ESTALE", "pack ingest ownership expired");
+    const control = requireIngestControl(row, this.#repoId);
+    if (
+      control.ownerGeneration !== lease.generation ||
+      control.activePackId !== lease.packId ||
+      control.expiresMs === null ||
+      control.expiresMs <= nowMs
+    ) {
+      throw new CorruptError("pack ingest lease renewal returned an invalid owner");
+    }
+    lease.expiresMs = control.expiresMs;
+  }
+
+  #releaseIngestLease(lease: PackIngestLease, required: boolean): void {
+    const row = this.#db.one<Record<string, unknown>>(
+      `UPDATE git_pack_ingest_control
+          SET active_pack_id = NULL, expires_ms = NULL
+        WHERE repo_id = ? AND owner_generation = ? AND active_pack_id = ?
+      RETURNING repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms`,
+      this.#repoId,
+      lease.generation,
+      lease.packId,
+    );
+    if (row === undefined) {
+      if (required) throw new GitError("ESTALE", "pack ingest ownership changed");
+      return;
+    }
+    requireIngestControl(row, this.#repoId);
+  }
+
+  #auditPublishedMembership(
+    packId: number,
+    expectedCount: number,
+    expectedBytes: number,
+    expected: ExpectedPackMembership,
+  ): void {
+    const stored = new SequentialPackBytes(this.#db, this.#repoId, packId, expectedBytes);
+    const reader = new PackReader(
+      (offset, length) => stored.read(offset, length),
+      packId,
+      expectedBytes,
+    );
+    const magic = reader.take(4);
+    const version = reader.uint32();
+    const storedCount = reader.uint32();
+    if (
+      magic[0] !== 0x50 ||
+      magic[1] !== 0x41 ||
+      magic[2] !== 0x43 ||
+      magic[3] !== 0x4b ||
+      (version !== 2 && version !== 3) ||
+      storedCount !== expectedCount
+    ) {
+      throw new CorruptError(`pack ${packId}: publication bytes have an invalid header`);
+    }
+    for (let byteOrdinal = 0; byteOrdinal < storedCount; byteOrdinal++) {
+      const header = reader.entryHeader();
+      const type = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
+      if (header.kind === null && type === undefined) {
+        throw new CorruptError(`pack ${packId}: publication bytes have an invalid object type`);
+      }
+      const inflated = this.#inflateAt(reader, header.dataOff, header.entrySize, type ?? null);
+      const oid =
+        type === undefined
+          ? null
+          : inflated.data === null
+            ? inflated.streamedOid
+            : hashObject(type, inflated.data);
+      expected.verifyBytes(byteOrdinal, {
+        offset: header.offset,
+        dataOff: header.dataOff,
+        dataLen: inflated.consumed,
+        entrySize: header.entrySize,
+        kind: header.kind,
+        baseDelta: header.baseDelta,
+        baseOid: header.baseOid,
+        type: type ?? null,
+        size: type === undefined ? (inflated.deltaTargetSize ?? -1) : header.entrySize,
+        oid,
+        compressedDigest: inflated.compressedDigest,
+      });
+    }
+    if (reader.position !== expectedBytes - 20) {
+      throw new CorruptError(`pack ${packId}: publication byte traversal is incomplete`);
+    }
+    reader.take(20);
+    stored.finish();
+
+    let ordinal = 0;
+    for (const row of this.#db.iterate(
+      `SELECT /* exact-pack-publication-membership */ oid,
+              CASE WHEN typeof(pack_id) = 'integer'
+                     AND pack_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                   THEN pack_id END AS pack_id,
+              CASE WHEN typeof(offset) = 'integer'
+                     AND offset BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                   THEN offset END AS offset,
+              CASE WHEN typeof(data_off) = 'integer'
+                     AND data_off BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                   THEN data_off END AS data_off,
+              CASE WHEN typeof(data_len) = 'integer'
+                     AND data_len BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                   THEN data_len END AS data_len,
+              type,
+              CASE WHEN typeof(size) = 'integer'
+                     AND size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                   THEN size END AS size,
+              CASE WHEN typeof(entry_size) = 'integer'
+                     AND entry_size BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+                   THEN entry_size END AS entry_size,
+              base_oid
+         FROM git_pack_entries
+        WHERE repo_id = ? AND pack_id = ?
+        ORDER BY offset LIMIT ?`,
+      this.#repoId,
+      packId,
+      expectedCount + 1,
+    )) {
+      const oid = row.oid;
+      const rowPackId = row.pack_id;
+      const offset = row.offset;
+      const dataOff = row.data_off;
+      const dataLen = row.data_len;
+      const type = row.type;
+      const size = row.size;
+      const entrySize = row.entry_size;
+      const baseOid = row.base_oid;
+      if (
+        typeof oid !== "string" ||
+        !isOid(oid) ||
+        rowPackId !== packId ||
+        typeof offset !== "number" ||
+        !Number.isSafeInteger(offset) ||
+        offset < 0 ||
+        typeof dataOff !== "number" ||
+        !Number.isSafeInteger(dataOff) ||
+        dataOff <= offset ||
+        typeof dataLen !== "number" ||
+        !Number.isSafeInteger(dataLen) ||
+        dataLen < 1 ||
+        dataOff > expectedBytes - dataLen ||
+        typeof type !== "string" ||
+        !isObjectType(type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        size < 0 ||
+        typeof entrySize !== "number" ||
+        !Number.isSafeInteger(entrySize) ||
+        entrySize < 0 ||
+        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid)))
+      ) {
+        throw new CorruptError(`pack ${packId}: publication membership metadata disagrees`);
+      }
+      const physical: PackObjectInput = [
+        oid,
+        packId,
+        offset,
+        dataOff,
+        dataLen,
+        type,
+        size,
+        entrySize,
+        baseOid,
+      ];
+      expected.verify(ordinal, physical);
+      ordinal++;
+    }
+    if (ordinal !== expectedCount) {
+      throw new CorruptError(`pack ${packId}: publication membership metadata disagrees`);
+    }
+
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT count(*) AS entry_count,
+              (SELECT count(*) FROM git_pack_pending
+                WHERE repo_id = ? AND pack_id = ?) AS pending_count,
+              (SELECT count(*) FROM git_pack_entries published
+                JOIN git_pack_objects canonical
+                  ON canonical.repo_id = published.repo_id AND canonical.oid = published.oid
+               WHERE published.repo_id = ? AND published.pack_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM git_pack_entries physical
+                     WHERE physical.repo_id = canonical.repo_id
+                       AND physical.oid = canonical.oid
+                       AND physical.pack_id = canonical.pack_id
+                       AND physical.offset IS canonical.offset
+                       AND physical.data_off IS canonical.data_off
+                       AND physical.data_len IS canonical.data_len
+                       AND physical.type IS canonical.type
+                       AND physical.size IS canonical.size
+                       AND physical.entry_size IS canonical.entry_size
+                       AND physical.base_oid IS canonical.base_oid
+                  )) AS canonical_mismatch_count,
+              coalesce(sum(CASE WHEN object.oid IS NULL OR owner.state IS NOT 'complete'
+                                THEN 1 ELSE 0 END), 0) AS unavailable_count,
+              coalesce(sum(CASE
+                WHEN typeof(entry.oid) != 'text'
+                  OR length(CAST(entry.oid AS BLOB)) != 40
+                  OR entry.oid GLOB '*[^0-9a-f]*'
+                  OR typeof(entry.offset) != 'integer' OR entry.offset < 0
+                  OR entry.offset > ${Number.MAX_SAFE_INTEGER}
+                  OR typeof(entry.data_off) != 'integer' OR entry.data_off < entry.offset
+                  OR entry.data_off > ${Number.MAX_SAFE_INTEGER}
+                  OR typeof(entry.data_len) != 'integer' OR entry.data_len < 0
+                  OR entry.data_len > ${Number.MAX_SAFE_INTEGER}
+                  OR entry.data_off > ? - entry.data_len
+                  OR entry.data_off + entry.data_len > ?
+                  OR typeof(entry.type) != 'text'
+                  OR entry.type NOT IN ('blob','tree','commit','tag')
+                  OR typeof(entry.size) != 'integer' OR entry.size < 0
+                  OR entry.size > ${Number.MAX_SAFE_INTEGER}
+                  OR typeof(entry.entry_size) != 'integer' OR entry.entry_size < 0
+                  OR entry.entry_size > ${Number.MAX_SAFE_INTEGER}
+                  OR (entry.base_oid IS NOT NULL AND (
+                    typeof(entry.base_oid) != 'text'
+                    OR length(CAST(entry.base_oid AS BLOB)) != 40
+                    OR entry.base_oid GLOB '*[^0-9a-f]*'
+                  )) THEN 1
+                WHEN object.oid IS NOT NULL
+                  AND (object.type IS NOT entry.type OR object.size IS NOT entry.size)
+                                THEN 1 ELSE 0 END), 0) AS mismatched_count
+         FROM git_pack_entries entry
+         LEFT JOIN git_pack_objects object
+           ON object.repo_id = entry.repo_id AND object.oid = entry.oid
+         LEFT JOIN git_pack_meta owner
+           ON owner.repo_id = object.repo_id AND owner.pack_id = object.pack_id
+        WHERE entry.repo_id = ? AND entry.pack_id = ?`,
+      this.#repoId,
+      packId,
+      this.#repoId,
+      packId,
+      expectedBytes,
+      expectedBytes,
+      this.#repoId,
+      packId,
+    );
+    if (
+      row === undefined ||
+      typeof row.entry_count !== "number" ||
+      !Number.isSafeInteger(row.entry_count) ||
+      row.entry_count < 0 ||
+      typeof row.pending_count !== "number" ||
+      !Number.isSafeInteger(row.pending_count) ||
+      row.pending_count < 0 ||
+      typeof row.canonical_mismatch_count !== "number" ||
+      !Number.isSafeInteger(row.canonical_mismatch_count) ||
+      row.canonical_mismatch_count < 0 ||
+      typeof row.unavailable_count !== "number" ||
+      !Number.isSafeInteger(row.unavailable_count) ||
+      row.unavailable_count < 0 ||
+      typeof row.mismatched_count !== "number" ||
+      !Number.isSafeInteger(row.mismatched_count) ||
+      row.mismatched_count < 0
+    ) {
+      throw new CorruptError(`pack ${packId}: publication audit is invalid`);
+    }
+    if (row.pending_count !== 0) {
+      throw new CorruptError(`pack ${packId}: publication retained unresolved deltas`);
+    }
+    if (row.canonical_mismatch_count !== 0 || row.mismatched_count !== 0) {
+      throw new CorruptError(`pack ${packId}: publication membership metadata disagrees`);
+    }
+    if (row.entry_count !== expectedCount || row.unavailable_count !== 0) {
+      throw new GitError("ESTALE", "pack membership was claimed by another ingest");
     }
   }
 
@@ -1638,6 +3690,7 @@ export class PackStore {
     maxBytes: number,
     say: (message: string) => void,
     yieldNow: () => Promise<void>,
+    heartbeat: () => void,
     memory: PackIngestMemory,
   ): Promise<number> {
     const sha = new Sha1();
@@ -1680,13 +3733,16 @@ export class PackStore {
 
     const SLICE = 4 * 1024 * 1024;
     for await (const data of source) {
+      heartbeat();
       if (data.length === 0) continue;
       for (let offset = 0; offset < data.length; offset += SLICE) {
         feed(data.subarray(offset, offset + SLICE));
         memory.pool.assertIdle();
         await yieldNow();
+        heartbeat();
       }
     }
+    heartbeat();
     if (filled > 0) this.#writeChunk(packId, seq++, buffer.slice(0, filled));
 
     if (total < 32) throw new CorruptError("pack is too small to be valid");
@@ -1711,10 +3767,19 @@ export class PackStore {
     total: number,
     say: (message: string) => void,
     yieldNow: () => Promise<void>,
+    heartbeat: () => void,
     memory: PackIngestMemory,
-  ): Promise<{ count: number; commits: PackCommitIndex }> {
+  ): Promise<{
+    count: number;
+    commits: PackCommitIndex;
+    membership: ExpectedPackMembership;
+  }> {
     memory.reservation.set("metadata", PACK_INGEST_METADATA_BYTES);
-    const reader = new PackReader(this, packId, total);
+    const reader = new PackReader(
+      (offset, length) => this.readRaw(packId, offset, length),
+      packId,
+      total,
+    );
     const magic = reader.take(4);
     if (magic[0] !== 0x50 || magic[1] !== 0x41 || magic[2] !== 0x43 || magic[3] !== 0x4b) {
       throw new CorruptError("bad pack signature");
@@ -1723,9 +3788,13 @@ export class PackStore {
     const count = reader.uint32();
     if (version !== 2 && version !== 3)
       throw new CorruptError(`unsupported pack version ${version}`);
+    memory.reservation.set("other", expectedPackMembershipBytes(count));
+    const membership = new ExpectedPackMembership(count);
 
     const offsets = new OffsetWindow();
-    const objectIndex = new PackObjectBatch(this.#db, this.#repoId);
+    const objectIndex = new PackObjectBatch(this.#db, this.#repoId, (row) =>
+      membership.record(row),
+    );
     const pendingIndex = new PackPendingBatch(this.#db, this.#repoId, packId);
     const treeIndex = new PackTreeIndex(this.#db, memory.reservation);
     const commitIndex = new PackCommitIndex(
@@ -1743,13 +3812,33 @@ export class PackStore {
     let deferred = 0;
     for (let i = 0; i < count; i++) {
       const header = reader.entryHeader();
+      membership.addOffset(i, header.offset);
       const entryType = header.kind === null ? NUMBER_TYPE[header.type]! : null;
       this.#reserveFlat(header.entrySize, treeIndex, commitIndex, memory.reservation);
       const entry = this.#inflateAt(reader, header.dataOff, header.entrySize, entryType);
+      const fullOid =
+        entryType === null
+          ? null
+          : entry.data === null
+            ? entry.streamedOid
+            : hashObject(entryType, entry.data);
+      membership.recordBytes(i, {
+        offset: header.offset,
+        dataOff: header.dataOff,
+        dataLen: entry.consumed,
+        entrySize: header.entrySize,
+        kind: header.kind,
+        baseDelta: header.baseDelta,
+        baseOid: header.baseOid,
+        type: entryType,
+        size: entryType === null ? (entry.deltaTargetSize ?? -1) : header.entrySize,
+        oid: fullOid,
+        compressedDigest: entry.compressedDigest,
+      });
 
       if (header.kind === null) {
         const type = entryType!;
-        const oid = entry.data === null ? entry.streamedOid! : hashObject(type, entry.data);
+        const oid = fullOid!;
         const row: PackObjectInput = [
           oid,
           packId,
@@ -1868,7 +3957,11 @@ export class PackStore {
         pendingIndex.flush();
         memory.pool.assertIdle();
         await yieldNow();
-        if ((i & 65535) === 65535) say(`Resolving deltas: ${i + 1}/${count}\n`);
+        heartbeat();
+        if ((i & 65535) === 65535) {
+          say(`Resolving deltas: ${i + 1}/${count}\n`);
+          heartbeat();
+        }
       }
     }
 
@@ -1885,14 +3978,17 @@ export class PackStore {
       treeIndex,
       commitIndex,
       yieldNow,
+      heartbeat,
       memory,
     );
+    heartbeat();
     objectIndex.flush();
     treeIndex.flush();
     memory.reservation.clear("tree");
     memory.reservation.clear("metadata");
     if (deferred > 0) say(`Resolved ${deferred} deferred delta(s)\n`);
-    return { count, commits: commitIndex };
+    membership.assertComplete();
+    return { count, commits: commitIndex, membership };
   }
 
   async #drainPending(
@@ -1902,6 +3998,7 @@ export class PackStore {
     treeIndex: PackTreeIndex,
     commitIndex: PackCommitIndex,
     yieldNow: () => Promise<void>,
+    heartbeat: () => void,
     memory: PackIngestMemory,
   ): Promise<void> {
     let remaining =
@@ -2176,6 +4273,7 @@ export class PackStore {
         memory.pool.assertIdle();
         memory.pool.dispose();
         await yieldNow();
+        heartbeat();
       }
       objectIndex.flush();
       remaining -= progressed;
@@ -2588,8 +4686,16 @@ export class PackStore {
     dataOff: number,
     entrySize: number,
     type: ObjectType | null,
-  ): { data: Uint8Array | null; consumed: number; streamedOid: string | null } {
+  ): {
+    data: Uint8Array | null;
+    consumed: number;
+    streamedOid: string | null;
+    deltaTargetSize: number | null;
+    compressedDigest: string;
+  } {
     const buffered = entrySize <= this.#maxBufferedEntry;
+    const deltaHeader = type === null ? new DeltaHeaderProbe() : null;
+    const compressedSha = new Sha1();
     reader.seek(dataOff);
     if (buffered) {
       const window = reader.window();
@@ -2609,8 +4715,16 @@ export class PackStore {
         ) {
           throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
         }
+        deltaHeader?.update(exact.data);
+        compressedSha.update(window.subarray(0, exact.consumed));
         reader.seek(dataOff + exact.consumed);
-        return { data: exact.data, consumed: exact.consumed, streamedOid: null };
+        return {
+          data: exact.data,
+          consumed: exact.consumed,
+          streamedOid: null,
+          deltaTargetSize: deltaHeader?.finish().targetSize ?? null,
+          compressedDigest: toHex(compressedSha.digest()),
+        };
       }
     }
     const exactInflater = buffered ? new InflateInto(entrySize) : null;
@@ -2623,6 +4737,7 @@ export class PackStore {
         if (produced > entrySize) {
           throw new CorruptError(`pack entry exceeds its declared size at ${dataOff}`);
         }
+        deltaHeader?.update(chunk);
         sha?.update(chunk);
       });
     reader.seek(dataOff);
@@ -2635,15 +4750,23 @@ export class PackStore {
           ? stream.push(window)
           : pushExactInflate(exactInflater, window, `pack entry at ${dataOff}`);
       consumed += used;
+      if (!stream.ended && used !== window.length) {
+        throw new CorruptError(`pack entry inflater stopped before the stream ended at ${dataOff}`);
+      }
+      compressedSha.update(window.subarray(0, used));
       reader.seek(reader.position + (stream.ended ? used : window.length));
     }
     if (stream.inflated !== entrySize) {
       throw new CorruptError(`pack entry size mismatch at ${dataOff}`);
     }
+    const data = exactInflater?.finish() ?? null;
+    if (data !== null) deltaHeader?.update(data);
     return {
-      data: exactInflater?.finish() ?? null,
+      data,
       consumed,
       streamedOid: buffered || sha === null ? null : toHex(sha.digest()),
+      deltaTargetSize: deltaHeader?.finish().targetSize ?? null,
+      compressedDigest: toHex(compressedSha.digest()),
     };
   }
 }
@@ -2681,7 +4804,7 @@ class PackReader {
   #position = 0;
 
   constructor(
-    private readonly store: PackStore,
+    private readonly readRaw: (offset: number, length: number) => Uint8Array,
     readonly packId: number,
     readonly limit: number,
   ) {}
@@ -2696,13 +4819,13 @@ class PackReader {
 
   byte(): number {
     if (this.#position >= this.limit) throw new CorruptError("pack truncated");
-    const value = this.store.readRaw(this.packId, this.#position, 1)[0]!;
+    const value = this.readRaw(this.#position, 1)[0]!;
     this.#position += 1;
     return value;
   }
 
   take(length: number): Uint8Array {
-    const bytes = this.store.readRaw(this.packId, this.#position, length);
+    const bytes = this.readRaw(this.#position, length);
     this.#position += length;
     return bytes;
   }
@@ -2717,7 +4840,7 @@ class PackReader {
     if (this.#position >= this.limit) return new Uint8Array(0);
     const chunkStart = Math.floor(this.#position / PACK_CHUNK) * PACK_CHUNK;
     const end = Math.min(chunkStart + PACK_CHUNK, this.limit);
-    return this.store.readRaw(this.packId, this.#position, end - this.#position);
+    return this.readRaw(this.#position, end - this.#position);
   }
 
   entryHeader(): EntryHeader {

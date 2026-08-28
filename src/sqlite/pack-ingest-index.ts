@@ -287,9 +287,11 @@ export class PackObjectBatch {
   constructor(
     private readonly db: SqlDatabase,
     private readonly repoId: number,
+    private readonly onAdd: ((row: PackObjectInput) => void) | undefined = undefined,
   ) {}
 
   add(row: PackObjectInput): void {
+    this.onAdd?.(row);
     const json = JSON.stringify(row);
     const bytes = PACK_JSON_ENCODER.encode(json).length;
     if (
@@ -308,18 +310,33 @@ export class PackObjectBatch {
 
   flush(): void {
     if (this.#rows.length === 0) return;
-    this.db.run(
-      `INSERT OR IGNORE INTO git_pack_objects
-         (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
-       SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
-              json_extract(value, '$[2]'), json_extract(value, '$[3]'),
-              json_extract(value, '$[4]'), json_extract(value, '$[5]'),
-              json_extract(value, '$[6]'), json_extract(value, '$[7]'),
-              json_extract(value, '$[8]')
-         FROM json_each(?)`,
-      this.repoId,
-      `[${this.#rows.join(",")}]`,
-    );
+    const rows = `[${this.#rows.join(",")}]`;
+    this.db.transactionSync(() => {
+      this.db.run(
+        `INSERT OR IGNORE INTO git_pack_entries
+           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+         SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'), json_extract(value, '$[5]'),
+                json_extract(value, '$[6]'), json_extract(value, '$[7]'),
+                json_extract(value, '$[8]')
+           FROM json_each(?)`,
+        this.repoId,
+        rows,
+      );
+      this.db.run(
+        `INSERT OR IGNORE INTO git_pack_objects
+           (repo_id, oid, pack_id, offset, data_off, data_len, type, size, entry_size, base_oid)
+         SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'), json_extract(value, '$[5]'),
+                json_extract(value, '$[6]'), json_extract(value, '$[7]'),
+                json_extract(value, '$[8]')
+           FROM json_each(?)`,
+        this.repoId,
+        rows,
+      );
+    });
     this.#rows.length = 0;
     this.#bytes = 2;
   }
