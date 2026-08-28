@@ -346,3 +346,12 @@ git diff --check
   workers. Typecheck, build, diff validation, and Biome checks pass apart from
   the existing Biome schema-version notices. The docs linter reports only its
   known false positive for the managed `docs/AGENTS.md` symlink.
+- 2026-08-28: WU5 completed the 11 missing directed active-operation cells.
+  Merge, cherry-pick, and revert retain their exact journal, refs, index,
+  worktree, and reflogs when another operation or stale branch CAS rejects.
+  Cold abort and hard reset restore the complete clean pre-operation snapshot.
+- 2026-08-28: WU5 also interrupts public add, path reset, and full index
+  replacement after the first committed 512-row page of a 513-path mutation.
+  Each cold partial state remains readable and retry converges without duplicate
+  objects. Immediate post-checkout reopen preserves HEAD, index, worktree,
+  status, and reflog. Independent review is clean; all 262 affected tests pass.
