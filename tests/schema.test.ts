@@ -147,6 +147,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
       "clone_expires_ms",
       "fetch_generation",
       "shallow_revision",
+      "checkout_revision",
     ],
   ],
   ["git_checkouts", ["id", "repo_id", "root", "head", "is_primary"]],
@@ -651,6 +652,24 @@ describe("git schema", () => {
     expect(() => database.openShared(43)).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
+  });
+
+  it("bounds the repository checkout-state revision", () => {
+    const db = new TestDatabase();
+    initializeGitSchema(db);
+    db.run(
+      "INSERT INTO git_repositories (id, checkout_revision) VALUES (1, ?)",
+      Number.MAX_SAFE_INTEGER,
+    );
+    expect(db.scalar<number>("SELECT checkout_revision FROM git_repositories WHERE id = 1")).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
+    expect(() =>
+      db.run("INSERT INTO git_repositories (id, checkout_revision) VALUES (2, -1)"),
+    ).toThrow(/CHECK/);
+    expect(() =>
+      db.run("INSERT INTO git_repositories (id, checkout_revision) VALUES (3, zeroblob(1))"),
+    ).toThrow(/CHECK/);
   });
 
   it("enforces current reflog lifecycle foreign keys", () => {

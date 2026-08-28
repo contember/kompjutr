@@ -119,6 +119,10 @@ const STATEMENTS = [
        typeof(shallow_revision) = 'integer'
        AND shallow_revision BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
      ),
+     checkout_revision INTEGER NOT NULL DEFAULT 0 CHECK (
+       typeof(checkout_revision) = 'integer'
+       AND checkout_revision BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
      CHECK (
        (lifecycle = 'ready' AND clone_generation IS NULL AND clone_expires_ms IS NULL)
        OR

@@ -136,7 +136,7 @@ describe("repository registry", () => {
     ).toBe(0);
   });
 
-  it("creates one primary checkout atomically in eight statements", () => {
+  it("creates one primary checkout atomically with its checkout revision", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     db.storage.resetCounters();
@@ -150,7 +150,7 @@ describe("repository registry", () => {
       head: "ref: refs/heads/main",
       isPrimary: true,
     });
-    expect(db.storage.statementCount).toBe(8);
+    expect(db.storage.statementCount).toBe(10);
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(db.one("SELECT repo_id, is_primary FROM git_checkouts")).toEqual({
       repo_id: 1,
@@ -159,10 +159,89 @@ describe("repository registry", () => {
     expect(db.one("SELECT complete FROM git_index_state WHERE checkout_id = 1")).toEqual({
       complete: 0,
     });
+    expect(db.scalar<number>("SELECT checkout_revision FROM git_repositories WHERE id = 1")).toBe(
+      1,
+    );
 
     expect(() => database.createRepository("/canonical", "ref: refs/heads/other")).toThrow();
     expect(db.scalar<number>("SELECT count(*) FROM git_repositories")).toBe(1);
     expect(db.scalar<number>("SELECT count(*) FROM git_checkouts")).toBe(1);
+  });
+
+  it("advances checkout revision for create, HEAD change, and removal", () => {
+    const { db, database, store } = open();
+    const revision = (): number => {
+      const stored = db.scalar<number>(
+        "SELECT checkout_revision FROM git_repositories WHERE id = 1",
+      );
+      if (stored === undefined) throw new Error("checkout revision is missing");
+      return stored;
+    };
+    expect(revision()).toBe(1);
+
+    const linked = database.createCheckout(1, "/linked", "ref: refs/heads/linked");
+    expect(revision()).toBe(2);
+    const linkedStore = database.openCheckout(linked);
+    linkedStore.setHead("1".repeat(40));
+    expect(revision()).toBe(3);
+    linkedStore.setHead("1".repeat(40));
+    expect(revision()).toBe(3);
+    expect(() =>
+      database.removeCheckout(linked.id, () => {
+        throw new Error("injected checkout root removal failure");
+      }),
+    ).toThrow(/injected checkout root removal failure/);
+    expect(revision()).toBe(3);
+    expect(database.checkoutAt("/linked")).not.toBeNull();
+    database.removeCheckout(linked.id, () => undefined);
+    expect(revision()).toBe(4);
+    expect(store.head()).toBe("ref: refs/heads/main");
+  });
+
+  it("rolls checkout mutations back on corrupt or exhausted checkout revision", () => {
+    const exhausted = open();
+    const linked = exhausted.database.createCheckout(1, "/linked", "ref: refs/heads/linked");
+    exhausted.db.run(
+      "UPDATE git_repositories SET checkout_revision = ? WHERE id = 1",
+      Number.MAX_SAFE_INTEGER,
+    );
+    let removalCalled = false;
+    expect(() =>
+      exhausted.database.removeCheckout(linked.id, () => {
+        removalCalled = true;
+        return undefined;
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(removalCalled).toBe(false);
+    expect(exhausted.database.checkoutAt("/linked")).not.toBeNull();
+    const originalHead = exhausted.store.head();
+    const originalOrdinal = exhausted.db.scalar<number>(
+      "SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1",
+    );
+    expect(() => exhausted.store.setHead("1".repeat(40))).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(exhausted.store.head()).toBe(originalHead);
+    expect(
+      exhausted.db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1"),
+    ).toBe(originalOrdinal);
+    expect(() =>
+      exhausted.database.createCheckout(1, "/must-roll-back", "ref: refs/heads/other"),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(exhausted.database.checkoutAt("/must-roll-back")).toBeNull();
+
+    const corrupt = open();
+    corrupt.db.run("PRAGMA ignore_check_constraints = ON");
+    corrupt.db.run("UPDATE git_repositories SET checkout_revision = zeroblob(1) WHERE id = 1");
+    corrupt.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      corrupt.store.beginFetchPublication("refs/remotes/origin/", ["refs/heads/next"]),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(() =>
+      corrupt.database.createCheckout(1, "/corrupt", "ref: refs/heads/corrupt"),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(corrupt.database.checkoutAt("/corrupt")).toBeNull();
+    assertMemoryCoordinatorIdle(corrupt.store);
   });
 
   it("caps checkout listing per store and keeps branch attachment unique", () => {
@@ -1928,7 +2007,9 @@ describe("refs, config and index", () => {
 
     const inputBound = open();
     const candidates = function* (): Generator<string> {
-      for (let index = 0; index <= 100_000; index++) yield "refs/tags/repeated";
+      for (let index = 0; index <= 100_000; index++) {
+        yield `refs/tags/${index.toString(36)}`;
+      }
     };
     expect(() =>
       inputBound.store.beginFetchPublication("refs/remotes/origin/", candidates()),

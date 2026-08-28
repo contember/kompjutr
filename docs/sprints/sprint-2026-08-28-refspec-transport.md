@@ -798,3 +798,12 @@ findings are resolved before implementation.
   stable auth/transport errors, and no durable mutation or caching. Real Smart
   HTTP parity and request-count witnesses passed 20 tests in 2.39 seconds;
   typecheck, Biome, and diff-check passed.
+- 2026-08-28: WU3 generalized the fetch publication token to exact refs while
+  retaining legacy tag capacity, one atomic ref/shallow/reflog transaction, and
+  the 1,000-statement ceiling. A monotonic checkout-state revision closes
+  create/remove and retained-reflog ABA gaps; additive repository-owned memory
+  scopes compose publication state with the caller's 64 MiB operation budget.
+  The final focused gate passed 122 tests in 20.66 seconds; typecheck, Biome,
+  and diff-check passed. Independent review approved candidate authority,
+  races, rollback/reopen durability, legacy behavior, memory ownership, and
+  SQL admission after the affected witness review returned clean.

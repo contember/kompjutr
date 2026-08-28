@@ -148,4 +148,60 @@ describe("MemoryCoordinator", () => {
     expect(coordinator.highWaterBytes).toBe(16);
     coordinator.assertIdle();
   });
+
+  it("accounts additive child scopes without overwriting sibling or parent categories", () => {
+    const coordinator = new MemoryCoordinator();
+    const owner = {};
+    const root = coordinator.reserve(owner);
+    root.set("other", 10);
+    root.set("protocol", 20);
+    const first = root.scope();
+    const second = root.scope();
+    first.set("other", 30);
+    second.set("other", 40);
+
+    expect(root.currentBytes).toBe(100);
+    expect(first.currentBytes).toBe(30);
+    expect(second.currentBytes).toBe(40);
+    expect(coordinator.totalBytes).toBe(100);
+    expect(coordinator.activeCount).toBe(1);
+
+    first.dispose();
+    expect(root.currentBytes).toBe(70);
+    expect(second.currentBytes).toBe(40);
+    expect(coordinator.totalBytes).toBe(70);
+    root.clear("other");
+    expect(root.currentBytes).toBe(60);
+    root.clear("protocol");
+    expect(root.currentBytes).toBe(40);
+
+    root.dispose();
+    expect(second.disposed).toBe(true);
+    expect(() => second.set("other", 1)).toThrow(/disposed/);
+    coordinator.assertIdle();
+  });
+
+  it("enforces the aggregate cap and coordinator provenance through child scopes", () => {
+    const firstCoordinator = new MemoryCoordinator();
+    const secondCoordinator = new MemoryCoordinator();
+    const firstOwner = {};
+    const secondOwner = {};
+    const root = firstCoordinator.reserve(firstOwner);
+    const child = root.scope();
+    child.set("other", MAX_OPERATION_MEMORY_BYTES);
+
+    expect(firstCoordinator.owns(root, firstOwner)).toBe(true);
+    expect(firstCoordinator.owns(child, firstOwner)).toBe(true);
+    expect(firstCoordinator.owns(child, secondOwner)).toBe(false);
+    expect(secondCoordinator.owns(child, firstOwner)).toBe(false);
+    expect(() => root.set("protocol", 1)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(root.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(child.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+
+    child.dispose();
+    expect(root.currentBytes).toBe(0);
+    root.dispose();
+    firstCoordinator.assertIdle();
+    secondCoordinator.assertIdle();
+  });
 });

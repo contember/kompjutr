@@ -47,13 +47,19 @@ export class MemoryCoordinator {
     return this.#activeCount;
   }
 
-  reserve(): MemoryReservation {
+  reserve(owner?: object): MemoryReservation {
     this.#activeCount++;
     return new MemoryReservation(
       RESERVATION_TOKEN,
+      this,
       (previous, next) => this.#resize(previous, next),
       (bytes) => this.#release(bytes),
+      owner ?? null,
     );
+  }
+
+  owns(reservation: MemoryReservation, owner?: object): boolean {
+    return reservation.belongsTo(this, owner);
   }
 
   assertIdle(): void {
@@ -84,6 +90,10 @@ export class MemoryCoordinator {
 export class MemoryReservation {
   #resize: Resize | null;
   #release: Release | null;
+  readonly #coordinator: MemoryCoordinator;
+  readonly #owner: object | null;
+  readonly #parent: MemoryReservation | null;
+  readonly #children = new Set<MemoryReservation>();
   #currentBytes = 0;
   #highWaterBytes = 0;
   #pool = 0;
@@ -97,10 +107,20 @@ export class MemoryReservation {
   #protocol = 0;
   #other = 0;
 
-  constructor(token: typeof RESERVATION_TOKEN, resize: Resize, release: Release) {
+  constructor(
+    token: typeof RESERVATION_TOKEN,
+    coordinator: MemoryCoordinator,
+    resize: Resize,
+    release: Release | null,
+    owner: object | null,
+    parent: MemoryReservation | null = null,
+  ) {
     if (token !== RESERVATION_TOKEN) throw new Error("memory reservation must use a coordinator");
+    this.#coordinator = coordinator;
     this.#resize = resize;
     this.#release = release;
+    this.#owner = owner;
+    this.#parent = parent;
   }
 
   get currentBytes(): number {
@@ -115,19 +135,46 @@ export class MemoryReservation {
     return this.#resize === null;
   }
 
-  set(category: MemoryCategory, bytes: number): void {
+  belongsTo(coordinator: MemoryCoordinator, owner?: object): boolean {
+    return this.#coordinator === coordinator && (owner === undefined || this.#owner === owner);
+  }
+
+  /** Create an independently disposable additive scope under this operation. */
+  scope(): MemoryReservation {
     const resize = this.#resize;
     if (resize === null) throw new Error("memory reservation is disposed");
+    const child = new MemoryReservation(
+      RESERVATION_TOKEN,
+      this.#coordinator,
+      resize,
+      null,
+      this.#owner,
+      this,
+    );
+    this.#children.add(child);
+    return child;
+  }
+
+  set(category: MemoryCategory, bytes: number): void {
+    if (this.#resize === null) throw new Error("memory reservation is disposed");
     if (!Number.isSafeInteger(bytes) || bytes < 0) throw invalidBytes();
     const previous = this.#read(category);
     if (previous === bytes) return;
-    const withoutPrevious = this.#currentBytes - previous;
-    if (bytes > Number.MAX_SAFE_INTEGER - withoutPrevious) throw memoryLimit();
-    const current = withoutPrevious + bytes;
-    resize(previous, bytes);
+    const delta = bytes - previous;
+    const root = this.#root();
+    const resize = root.#resize;
+    if (resize === null) throw new Error("memory reservation is disposed");
+    const rootBytes = root.#currentBytes;
+    if (delta > Number.MAX_SAFE_INTEGER - rootBytes) throw memoryLimit();
+    const rootNext = rootBytes + delta;
+    resize(rootBytes, rootNext);
     this.#write(category, bytes);
-    this.#currentBytes = current;
-    this.#highWaterBytes = Math.max(this.#highWaterBytes, current);
+    let current: MemoryReservation | null = this;
+    while (current !== null) {
+      current.#currentBytes += delta;
+      current.#highWaterBytes = Math.max(current.#highWaterBytes, current.#currentBytes);
+      current = current.#parent;
+    }
   }
 
   clear(category: MemoryCategory): void {
@@ -139,10 +186,49 @@ export class MemoryReservation {
   }
 
   dispose(): void {
-    const release = this.#release;
-    if (release === null) return;
-    const bytes = this.#currentBytes;
-    release(bytes);
+    if (this.#resize === null) return;
+    const parent = this.#parent;
+    if (parent === null) {
+      const release = this.#release;
+      if (release === null) throw new Error("root memory reservation has no release callback");
+      release(this.#currentBytes);
+    } else {
+      const root = this.#root();
+      const resize = root.#resize;
+      if (resize === null) throw new Error("memory reservation is disposed");
+      const bytes = this.#currentBytes;
+      resize(root.#currentBytes, root.#currentBytes - bytes);
+      let current: MemoryReservation | null = parent;
+      while (current !== null) {
+        current.#currentBytes -= bytes;
+        current = current.#parent;
+      }
+      parent.#children.delete(this);
+    }
+    this.#invalidateTree();
+  }
+
+  #root(): MemoryReservation {
+    let root: MemoryReservation = this;
+    while (root.#parent !== null) root = root.#parent;
+    return root;
+  }
+
+  #invalidateTree(): void {
+    const pending: MemoryReservation[] = [this];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (current === undefined) continue;
+      for (const child of current.#children) pending.push(child);
+      current.#children.clear();
+      current.#clearCategories();
+      current.#currentBytes = 0;
+      current.#resize = null;
+      current.#release = null;
+    }
+  }
+
+  #clearCategories(): void {
     this.#pool = 0;
     this.#base = 0;
     this.#flat = 0;
@@ -153,9 +239,6 @@ export class MemoryReservation {
     this.#commit = 0;
     this.#protocol = 0;
     this.#other = 0;
-    this.#currentBytes = 0;
-    this.#resize = null;
-    this.#release = null;
   }
 
   #read(category: MemoryCategory): number {

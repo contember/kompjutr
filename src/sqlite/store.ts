@@ -208,7 +208,8 @@ const REF_MUTATION_STATE_FIXED_RETAINED_BYTES =
 export const REF_MUTATION_FIXED_RETAINED_BYTES =
   REF_MUTATION_SQL_HEADROOM_BYTES + REF_MUTATION_STATE_FIXED_RETAINED_BYTES;
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
-export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 11;
+export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 12;
+export const MAX_FETCH_PUBLICATION_SQL_STATEMENTS = 1_000;
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
@@ -278,12 +279,17 @@ export class FetchPublicationToken {
     readonly shallowRevision: number,
     readonly shallow: readonly string[],
     readonly trackingRefs: readonly Readonly<RefRow>[],
-    readonly globalRefs: readonly FetchPublicationExpectedRef[],
+    readonly exactRefs: readonly FetchPublicationExpectedRef[],
     isDisposed: () => boolean,
     dispose: () => void,
   ) {
     this.#isDisposed = isDisposed;
     this.#dispose = dispose;
+  }
+
+  /** Legacy tag-publication snapshot. */
+  get globalRefs(): readonly FetchPublicationExpectedRef[] {
+    return this.exactRefs;
   }
 
   get disposed(): boolean {
@@ -328,6 +334,8 @@ export interface FetchPublicationPlan {
   remoteHead?: string | null;
   /** Global tags selected from the candidates supplied when the token was issued. */
   globalTagPuts?: Iterable<RefRow>;
+  /** Exact direct refs selected from the candidates supplied when the token was issued. */
+  exactPuts?: Iterable<RefRow>;
   shallowAdd?: Iterable<string>;
   shallowRemove?: Iterable<string>;
 }
@@ -384,7 +392,8 @@ interface FetchPublicationState {
   readonly namespaceRevision: number;
   readonly shallowRevision: number;
   readonly trackingRefs: ReadonlyMap<string, string>;
-  readonly globalRefs: ReadonlyMap<string, string | null>;
+  readonly exactRefs: ReadonlyMap<string, string | null>;
+  readonly checkoutRevision: number;
   readonly budget: RefMutationBudget;
   readonly reservation: MemoryReservation;
   disposed: boolean;
@@ -403,6 +412,12 @@ interface NormalizedFetchPublication {
   readonly refs: NormalizedRefMutation;
   readonly shallowAdd: readonly string[];
   readonly shallowRemove: readonly string[];
+}
+
+interface FetchPublicationChange {
+  readonly name: string;
+  readonly oldRaw: string | null;
+  readonly newRaw: string | null;
 }
 
 export interface IndexEntry {
@@ -1040,6 +1055,55 @@ function requireFetchGeneration(value: unknown, label: string, minimum: number):
   return value;
 }
 
+function readCheckoutRevision(db: SqlDatabase, repoId: number): number {
+  if (!Number.isSafeInteger(repoId) || repoId < 1) {
+    throw new CorruptError("checkout revision repository id is invalid");
+  }
+  const stored = db.one<{ repo_id: unknown; checkout_revision: unknown }>(
+    "SELECT id AS repo_id, checkout_revision FROM git_repositories WHERE id = ?",
+    repoId,
+  );
+  if (stored === undefined) throw new CorruptError("checkout revision repository is missing");
+  if (requireSafeId(stored.repo_id, "checkout revision repository id") !== repoId) {
+    throw new CorruptError("checkout revision crossed repository boundaries");
+  }
+  return requireFetchGeneration(stored.checkout_revision, "stored checkout revision", 0);
+}
+
+function advanceCheckoutRevision(
+  db: SqlDatabase,
+  repoId: number,
+  amount = 1,
+  expectedRevision?: number,
+): number {
+  if (!Number.isSafeInteger(amount) || amount < 1) {
+    throw new CorruptError("checkout revision increment is invalid");
+  }
+  const current =
+    expectedRevision === undefined
+      ? readCheckoutRevision(db, repoId)
+      : requireFetchGeneration(expectedRevision, "expected checkout revision", 0);
+  if (amount > Number.MAX_SAFE_INTEGER - current) {
+    throw new GitError("E2BIG", "checkout revision is exhausted");
+  }
+  const next = current + amount;
+  const updated = db.one<{ checkout_revision: unknown }>(
+    `UPDATE git_repositories SET checkout_revision = ?
+      WHERE id = ? AND checkout_revision = ?
+      RETURNING checkout_revision`,
+    next,
+    repoId,
+    current,
+  );
+  if (
+    updated === undefined ||
+    requireFetchGeneration(updated.checkout_revision, "updated checkout revision", 1) !== next
+  ) {
+    throw new CorruptError("checkout revision changed during atomic advancement");
+  }
+  return next;
+}
+
 function staleFetch(message: string): GitError {
   return new GitError("ESTALEFETCH", message);
 }
@@ -1236,17 +1300,32 @@ function normalizeFetchPublication(
     }
   }
 
-  for (const row of plan.globalTagPuts ?? []) {
+  const exactPut = (row: RefRow, label: string, requireTag: boolean): void => {
     if (typeof row !== "object" || row === null) {
-      throw new GitError("EINVAL", "fetch global tag update row is invalid");
+      throw new GitError("EINVAL", `${label} update row is invalid`);
     }
-    const name = requireRefName(row.name, "fetch global tag name", "input");
-    if (!name.startsWith("refs/tags/") || !state.globalRefs.has(name)) {
-      throw new GitError("EINVAL", `global tag ${name} was not included in the issued snapshot`);
+    const name = requireRefName(row.name, `${label} name`, "input");
+    if (requireTag && !name.startsWith("refs/tags/")) {
+      throw new GitError("EINVAL", `${label} ${name} is not a tag ref`);
     }
     const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
-    charge(name, "fetch global tag name", target);
+    if (!isOid(target)) {
+      throw new GitError("EINVAL", `${label} ${name} must target an object id`);
+    }
+    if (!state.exactRefs.has(name)) {
+      throw new GitError("EINVAL", `${label} ${name} was not included in the issued snapshot`);
+    }
+    if (puts.has(name) || deletes.has(name)) {
+      throw new GitError("EINVAL", `fetch publication contains duplicate destination ${name}`);
+    }
+    charge(name, `${label} name`, target);
     puts.set(name, target);
+  };
+  for (const row of plan.globalTagPuts ?? []) {
+    exactPut(row, "fetch global tag", true);
+  }
+  for (const row of plan.exactPuts ?? []) {
+    exactPut(row, "fetch exact ref", false);
   }
 
   const shallowAdd = new Set<string>();
@@ -1277,6 +1356,87 @@ function normalizeFetchPublication(
     shallowAdd: [...shallowAdd],
     shallowRemove: [...shallowRemove],
   };
+}
+
+function fetchPublicationExpectedTarget(state: FetchPublicationState, name: string): string | null {
+  const tracking = state.trackingRefs.get(name);
+  if (tracking !== undefined) return tracking;
+  return state.exactRefs.get(name) ?? null;
+}
+
+function* fetchPublicationChanges(
+  state: FetchPublicationState,
+  publication: NormalizedRefMutation,
+): Generator<FetchPublicationChange> {
+  for (const name of publication.deletes) {
+    const oldRaw = fetchPublicationExpectedTarget(state, name);
+    if (oldRaw !== null) yield { name, oldRaw, newRaw: null };
+  }
+  for (const [name, newRaw] of publication.puts) {
+    const oldRaw = fetchPublicationExpectedTarget(state, name);
+    if (oldRaw !== newRaw) yield { name, oldRaw, newRaw };
+  }
+}
+
+function jsonPageCount<T>(items: Iterable<T>, label: string): number {
+  let pages = 0;
+  for (const _page of jsonPages(items, label)) pages++;
+  return pages;
+}
+
+function publicationEndpointOid(raw: string | null): string | null {
+  if (raw === null) return null;
+  return isOid(raw) ? raw : "0".repeat(40);
+}
+
+function admitFetchPublicationSql(
+  state: FetchPublicationState,
+  publication: NormalizedFetchPublication,
+  metadata: RefLogMetadata,
+): void {
+  const changes = () => fetchPublicationChanges(state, publication.refs);
+  const deletes = function* (): Generator<string> {
+    for (const change of changes()) {
+      if (change.newRaw === null) yield change.name;
+    }
+  };
+  const puts = function* (): Generator<RefRow> {
+    for (const change of changes()) {
+      if (change.newRaw !== null) yield { name: change.name, target: change.newRaw };
+    }
+  };
+  const events = function* (): Generator<Omit<RefLogEvent, "ordinal"> & { ordinal: number }> {
+    for (const change of changes()) {
+      yield {
+        refName: change.name,
+        ordinal: MAX_REFLOG_ORDINAL,
+        oldRaw: change.oldRaw,
+        newRaw: change.newRaw,
+        oldOid: publicationEndpointOid(change.oldRaw),
+        newOid: publicationEndpointOid(change.newRaw),
+        actorName: metadata.actor?.name ?? null,
+        actorEmail: metadata.actor?.email ?? null,
+        timestamp: metadata.timestamp,
+        timezoneOffset: metadata.timezoneOffset,
+        reason: metadata.reason,
+      };
+    }
+  };
+  const names = function* (): Generator<string> {
+    for (const change of changes()) yield change.name;
+  };
+
+  let statements = 48;
+  statements += jsonPageCount(deletes(), "fetch SQL deletion admission");
+  statements += jsonPageCount(puts(), "fetch SQL update admission");
+  statements += jsonPageCount(events(), "fetch SQL reflog admission");
+  const namePages = jsonPageCount(names(), "fetch SQL ref-name admission");
+  statements += 3 * namePages;
+  statements += jsonPageCount(publication.shallowAdd, "fetch SQL shallow-add admission");
+  statements += jsonPageCount(publication.shallowRemove, "fetch SQL shallow-remove admission");
+  if (statements > MAX_FETCH_PUBLICATION_SQL_STATEMENTS) {
+    throw new GitError("E2BIG", `fetch publication requires up to ${statements} SQL statements`);
+  }
 }
 
 function resolveRawRef(raw: string | null, lookup: (name: string) => string | null): string | null {
@@ -2249,6 +2409,7 @@ export class SharedRepoStore {
   readonly objects: ByteLru<string, RawObject>;
   readonly packRows: ByteLru<string, Uint8Array>;
   readonly memory: MemoryCoordinator;
+  readonly #memoryOwner = {};
   readonly cacheNamespace: string;
   readonly #scratchTransactions: ScratchTransactionCoordinator;
   #packs: PackStore | null = null;
@@ -2458,7 +2619,11 @@ export class SharedRepoStore {
   }
 
   reserveMemory(): MemoryReservation {
-    return this.memory.reserve();
+    return this.memory.reserve(this.#memoryOwner);
+  }
+
+  ownsMemoryReservation(reservation: MemoryReservation): boolean {
+    return this.memory.owns(reservation, this.#memoryOwner);
   }
 
   lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
@@ -2600,9 +2765,10 @@ export class SharedRepoStore {
 
   beginFetchPublication(
     trackingPrefix: string,
-    candidateGlobalRefs: Iterable<string> = [],
+    candidateExactRefs: Iterable<string> = [],
+    reservation?: MemoryReservation,
   ): FetchPublicationToken {
-    return this.#ops().beginFetchPublication(trackingPrefix, candidateGlobalRefs);
+    return this.#ops().beginFetchPublication(trackingPrefix, candidateExactRefs, reservation);
   }
 
   publishFetchRefs(
@@ -3235,6 +3401,7 @@ export class SqliteGitDatabase {
           normalized,
           checkedHead,
         );
+        advanceCheckoutRevision(this.#db, identity.repoId);
         this.#db.run(
           "INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)",
           identity.repoId,
@@ -3454,6 +3621,7 @@ export class SqliteGitDatabase {
         normalized,
         checkedHead,
       );
+      advanceCheckoutRevision(this.#db, repoId);
       this.#db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)", repoId);
       this.#db.run(
         `INSERT OR IGNORE INTO git_index_state
@@ -3574,6 +3742,7 @@ export class SqliteGitDatabase {
           }
           throw error;
         }
+        advanceCheckoutRevision(this.#db, repoId);
         this.#db.run(
           `INSERT OR IGNORE INTO git_index_state
            (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
@@ -3652,6 +3821,7 @@ export class SqliteGitDatabase {
         throw new GitError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
       }
       this.#requireCheckoutsIdle(row.repoId, [row.id]);
+      advanceCheckoutRevision(this.#db, row.repoId);
       const result = removeRoot(Object.freeze(row));
       if (isThenableResult(result)) {
         void Promise.resolve(result).catch(() => {});
@@ -3753,6 +3923,7 @@ export class SqliteGitDatabase {
       if (deletedIds.size !== rows.length || rows.some((row) => !deletedIds.has(row.id))) {
         throw new CorruptError("bulk checkout removal deleted an unexpected set");
       }
+      advanceCheckoutRevision(this.#db, repoId, rows.length);
       bumpMaintenanceRootEpoch(this.#db, repoId);
       return Object.freeze(rows.map((row) => Object.freeze(row)));
     });
@@ -4333,7 +4504,7 @@ export class CheckoutStore implements IndexStore {
 
   /** Reserve operation state against this database's shared memory budget. */
   reserveMemory(): MemoryReservation {
-    return this.#memory.reserve();
+    return this.#sharedStore.reserveMemory();
   }
 
   // -- objects --------------------------------------------------------
@@ -5764,7 +5935,7 @@ export class CheckoutStore implements IndexStore {
     if (!name.startsWith(prefix) || name === `${prefix}HEAD`) {
       throw new GitError("EINVAL", "tracking publication ref is outside its branch namespace");
     }
-    const reservation = this.#memory.reserve();
+    const reservation = this.#sharedStore.reserveMemory();
     try {
       const budget = new RefMutationBudget(reservation, true);
       budget.charge(
@@ -5880,26 +6051,45 @@ export class CheckoutStore implements IndexStore {
   /** Fence one remote-tracking namespace and retain its exact publication snapshot. */
   beginFetchPublication(
     trackingPrefix: string,
-    candidateGlobalRefs: Iterable<string> = [],
+    candidateExactRefs: Iterable<string> = [],
+    owningReservation?: MemoryReservation,
   ): FetchPublicationToken {
     const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
-    const reservation = this.#memory.reserve();
+    if (owningReservation !== undefined) {
+      if (owningReservation.disposed) {
+        throw new GitError("EINVAL", "fetch publication reservation is disposed");
+      }
+      if (!this.#sharedStore.ownsMemoryReservation(owningReservation)) {
+        throw new GitError("EINVAL", "fetch publication reservation belongs to another repository");
+      }
+    }
+    const reservation = owningReservation?.scope() ?? this.#sharedStore.reserveMemory();
+    const budget = (() => {
+      try {
+        return new RefMutationBudget(reservation, true);
+      } catch (error) {
+        reservation.dispose();
+        throw error;
+      }
+    })();
     try {
-      const budget = new RefMutationBudget(reservation, true);
       const candidates = new Map<string, string | null>();
       let candidateInputs = 0;
-      for (const value of candidateGlobalRefs) {
+      for (const value of candidateExactRefs) {
         candidateInputs++;
         if (candidateInputs > MAX_FETCH_PUBLICATION_INPUTS) {
-          throw new GitError("E2BIG", "fetch snapshot exceeds its retained input count bound");
+          throw new GitError("E2BIG", "fetch exact candidate count exceeds 100,000");
         }
-        const name = requireRefName(value, "fetch global ref candidate", "input");
-        if (!name.startsWith("refs/tags/")) {
-          throw new GitError("EINVAL", "fetch global ref candidates must be tag refs");
+        const name = requireRefName(value, "fetch exact ref candidate", "input");
+        if (!name.startsWith("refs/")) {
+          throw new GitError("EINVAL", "fetch exact ref candidates must be full refs");
+        }
+        if (candidates.has(name)) {
+          throw new GitError("EINVAL", `duplicate fetch exact ref candidate ${name}`);
         }
         budget.charge(
           REF_MUTATION_ITEM_RETAINED_BYTES +
-            2 * boundedRefText(name, "fetch global ref candidate", MAX_REFLOG_REF_BYTES, "input"),
+            2 * boundedRefText(name, "fetch exact ref candidate", MAX_REFLOG_REF_BYTES, "input"),
         );
         candidates.set(name, null);
       }
@@ -5909,9 +6099,10 @@ export class CheckoutStore implements IndexStore {
           repo_id: unknown;
           fetch_generation: unknown;
           shallow_revision: unknown;
+          checkout_revision: unknown;
           tracking_ref_revision_rows: unknown;
         }>(
-          `SELECT id AS repo_id, fetch_generation, shallow_revision,
+          `SELECT id AS repo_id, fetch_generation, shallow_revision, checkout_revision,
                   (SELECT count(*) FROM (
                      SELECT 1 FROM git_tracking_ref_revisions
                       WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
@@ -5932,6 +6123,11 @@ export class CheckoutStore implements IndexStore {
         const shallowRevision = requireFetchGeneration(
           repository.shallow_revision,
           "stored shallow revision",
+          0,
+        );
+        const checkoutRevision = requireFetchGeneration(
+          repository.checkout_revision,
+          "stored checkout revision",
           0,
         );
         if (currentGeneration === Number.MAX_SAFE_INTEGER) {
@@ -6004,6 +6200,9 @@ export class CheckoutStore implements IndexStore {
             trackingRows.push(Object.freeze({ name, target }));
           }
           if (candidates.has(name)) {
+            if (!isOid(target)) {
+              throw new GitError("EINVAL", `fetch exact ref candidate ${name} is symbolic`);
+            }
             candidates.set(name, target);
             budget.charge(
               2 *
@@ -6108,14 +6307,15 @@ export class CheckoutStore implements IndexStore {
           "issued fetch namespace revision",
           0,
         );
-        const globalRows = [...candidates].map(([name, target]) => Object.freeze({ name, target }));
+        const exactRows = [...candidates].map(([name, target]) => Object.freeze({ name, target }));
         const state: FetchPublicationState = {
           generation,
           trackingPrefix: prefix,
           namespaceRevision,
           shallowRevision,
           trackingRefs: tracking,
-          globalRefs: candidates,
+          exactRefs: candidates,
+          checkoutRevision,
           budget,
           reservation,
           disposed: false,
@@ -6124,7 +6324,7 @@ export class CheckoutStore implements IndexStore {
           state,
           shallowRows: Object.freeze(shallowRows),
           trackingRows: Object.freeze(trackingRows),
-          globalRows: Object.freeze(globalRows),
+          exactRows: Object.freeze(exactRows),
         };
       });
       let issuedToken: FetchPublicationToken | null = null;
@@ -6135,8 +6335,8 @@ export class CheckoutStore implements IndexStore {
         snapshot.state.shallowRevision,
         snapshot.shallowRows,
         snapshot.trackingRows,
-        snapshot.globalRows,
-        () => snapshot.state.disposed,
+        snapshot.exactRows,
+        () => snapshot.state.disposed || snapshot.state.reservation.disposed,
         () => {
           if (snapshot.state.disposed) return;
           snapshot.state.disposed = true;
@@ -6167,12 +6367,13 @@ export class CheckoutStore implements IndexStore {
       throw staleFetch("fetch publication token was not issued by this repository");
     }
     const state = this.#fetchPublicationStates.get(token);
-    if (state === undefined || state.disposed) {
+    if (state === undefined || state.disposed || state.reservation.disposed) {
       throw staleFetch("fetch publication token is no longer active");
     }
     state.budget.requireSqlHeadroom();
     const normalized = normalizeFetchPublication(state, plan);
     const checkedMetadata = validateRefLogMetadata(metadata);
+    admitFetchPublicationSql(state, normalized, checkedMetadata);
     const shallowTouched = normalized.shallowAdd.length > 0 || normalized.shallowRemove.length > 0;
     const refChanged = this.#db.transactionSync(() => {
       this.#preflightFetchPublication(state, normalized.refs, shallowTouched);
@@ -6297,13 +6498,58 @@ export class CheckoutStore implements IndexStore {
       }
     }
 
-    const selectedGlobalRefs = new Set<string>();
+    const selectedExactRefs = new Set<string>();
     for (const name of publication.puts.keys()) {
-      if (name.startsWith("refs/tags/") && state.globalRefs.has(name)) {
-        selectedGlobalRefs.add(name);
+      if (state.exactRefs.has(name)) selectedExactRefs.add(name);
+    }
+    const selectedBranches = new Set(
+      [...selectedExactRefs].filter((name) => name.startsWith("refs/heads/")),
+    );
+    if (selectedBranches.size > 0) {
+      const repository = this.#db.one<{ repo_id: unknown; checkout_revision: unknown }>(
+        "SELECT id AS repo_id, checkout_revision FROM git_repositories WHERE id = ?",
+        this.#repoId,
+      );
+      if (repository === undefined) {
+        throw new CorruptError("fetch checkout revision repository is missing");
+      }
+      if (
+        requireSafeId(repository.repo_id, "fetch checkout revision repository id") !== this.#repoId
+      ) {
+        throw new CorruptError("fetch checkout revision crossed repository boundaries");
+      }
+      const checkoutRevision = requireFetchGeneration(
+        repository.checkout_revision,
+        "stored checkout revision",
+        0,
+      );
+      if (checkoutRevision !== state.checkoutRevision) {
+        throw staleFetch("the repository checkout state changed after fetch preflight");
+      }
+      let checkoutRows = 0;
+      let previousCheckoutId = 0;
+      for (const row of this.#db.iterate(
+        `SELECT id AS checkout_id, repo_id, root, head, is_primary
+           FROM git_checkouts WHERE repo_id = ? ORDER BY id
+           LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+        this.#repoId,
+      )) {
+        const checkout = requireStoredCheckoutRow(row);
+        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
+          throw new CorruptError("fetch checkout scan crossed or reordered repositories");
+        }
+        previousCheckoutId = checkout.id;
+        checkoutRows++;
+        if (checkoutRows > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
+        }
+        const attached = rawSymbolicTarget(checkout.head);
+        if (attached !== null && selectedBranches.has(attached)) {
+          throw staleFetch(`branch ${attached} became attached after fetch preflight`);
+        }
       }
     }
-    const presentGlobalRefs = new Set<string>();
+    const presentExactRefs = new Set<string>();
     let rows = 0;
     let trackingRows = 0;
     let previousName: string | null = null;
@@ -6330,20 +6576,20 @@ export class CheckoutStore implements IndexStore {
           throw staleFetch(`tracking ref ${name} changed after fetch discovery`);
         }
       }
-      if (selectedGlobalRefs.has(name)) {
-        const expected = state.globalRefs.get(name);
+      if (selectedExactRefs.has(name)) {
+        const expected = state.exactRefs.get(name);
         if (expected !== target && publication.puts.get(name) !== target) {
-          throw staleFetch(`global ref ${name} changed after fetch discovery`);
+          throw staleFetch(`exact ref ${name} changed after fetch discovery`);
         }
-        presentGlobalRefs.add(name);
+        presentExactRefs.add(name);
       }
     }
     if (trackingRows !== state.trackingRefs.size) {
       throw staleFetch("the tracking ref set changed after fetch discovery");
     }
-    for (const name of selectedGlobalRefs) {
-      if (state.globalRefs.get(name) !== null && !presentGlobalRefs.has(name)) {
-        throw staleFetch(`global ref ${name} changed after fetch discovery`);
+    for (const name of selectedExactRefs) {
+      if (state.exactRefs.get(name) !== null && !presentExactRefs.has(name)) {
+        throw staleFetch(`exact ref ${name} changed after fetch discovery`);
       }
     }
   }
@@ -6402,7 +6648,7 @@ export class CheckoutStore implements IndexStore {
 
   /** Apply current ref state and its bounded history through one atomic seam. */
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
-    const reservation = this.#memory.reserve();
+    const reservation = this.#sharedStore.reserveMemory();
     try {
       const budget = new RefMutationBudget(reservation);
       const normalized = normalizeRefMutation(mutation, budget);
@@ -6423,9 +6669,10 @@ export class CheckoutStore implements IndexStore {
         tracking_ref_revision_rows: unknown;
         fetch_generation: unknown;
         fetch_namespace_present: unknown;
+        checkout_revision: unknown;
       }>(
         `SELECT repository.id AS repo_id, checkout.id AS checkout_id, state.next_ordinal,
-                repository.fetch_generation,
+                repository.fetch_generation, repository.checkout_revision,
                 EXISTS(
                   SELECT 1 FROM git_fetch_namespaces namespace
                    WHERE namespace.repo_id = ? LIMIT 1
@@ -6488,6 +6735,11 @@ export class CheckoutStore implements IndexStore {
       const fetchGeneration = requireFetchGeneration(
         header.fetch_generation,
         "stored fetch generation",
+        0,
+      );
+      const checkoutRevision = requireFetchGeneration(
+        header.checkout_revision,
+        "stored checkout revision",
         0,
       );
       const fetchNamespacePresent =
@@ -6748,6 +7000,7 @@ export class CheckoutStore implements IndexStore {
         if (checked.id !== this.#checkoutId || checked.repoId !== this.#repoId) {
           throw new CorruptError("HEAD update crossed a checkout boundary");
         }
+        advanceCheckoutRevision(this.#db, this.#repoId, 1, checkoutRevision);
       }
       for (const page of jsonPages(events, "reflog entry")) {
         this.#db.run(

@@ -8,6 +8,7 @@ import {
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
 } from "../sqlite/commits.js";
+import type { MemoryReservation } from "../sqlite/memory.js";
 import type {
   BlobReadBatch,
   CheckoutStore,
@@ -341,9 +342,10 @@ export class Repository {
 
   beginFetchPublication(
     trackingPrefix: string,
-    candidateGlobalRefs: Iterable<string> = [],
+    candidateExactRefs: Iterable<string> = [],
+    reservation?: MemoryReservation,
   ): FetchPublicationToken {
-    return this.store.beginFetchPublication(trackingPrefix, candidateGlobalRefs);
+    return this.store.beginFetchPublication(trackingPrefix, candidateExactRefs, reservation);
   }
 
   publishFetchRefs(
