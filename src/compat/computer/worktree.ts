@@ -17,7 +17,11 @@ import type {
 import { comparePaths, normalize, subtreeSuccessor } from "../../fs/path.js";
 import { CHUNK_SIZE } from "../../fs/schema.js";
 import { MAX_HANDLE_MATERIALIZE_BYTES } from "../../fs/store/read.js";
-import { DISCOVERY_PAGE_MAX, GLOB_PATTERN_MAX_BYTES } from "../../fs/store/scan.js";
+import {
+  DISCOVERY_PAGE_MAX,
+  GLOB_PATTERN_MAX_BYTES,
+  validateDiscoveryExcludeRoots,
+} from "../../fs/store/scan.js";
 import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -83,6 +87,10 @@ function validateHandleInputs(handles: readonly RegularFileHandle[]): void {
       throw new Error(`readFileHandles: handle ${index} has invalid metadata`);
     }
   }
+}
+
+function isExcluded(path: string, roots: readonly string[]): boolean {
+  return roots.some((root) => root === "/" || path === root || path.startsWith(`${root}/`));
 }
 
 function appendRemaining(
@@ -332,28 +340,32 @@ export class ComputerWorktree implements Worktree {
         `discoverFiles: pattern is ${patternBytes} bytes; the platform caps a GLOB pattern at ${GLOB_PATTERN_MAX_BYTES}`,
       );
     }
-    const match = globMatcher(pattern);
     const limit = options.limit ?? DISCOVERY_PAGE_MAX;
     if (!Number.isInteger(limit) || limit < 1 || limit > DISCOVERY_PAGE_MAX) {
       throw new Error(
         `discoverFiles: limit must be an integer from 1 to ${DISCOVERY_PAGE_MAX}, got ${limit}`,
       );
     }
+    const match = globMatcher(pattern);
+    const canonicalRoot = this.#realpath(root);
+    const excluded = validateDiscoveryExcludeRoots(canonicalRoot, options.excludeRoots);
+    const frontier: ScanCandidate[] = [];
+    for (const candidate of this.#children(canonicalRoot)) pushCandidate(frontier, candidate);
     const out: RegularFileHandle[] = [];
-    let after: string | undefined = options.after;
-    while (out.length <= limit) {
-      const page = this.scan(root, { after, filesOnly: true, limit: 1_000 });
-      if (page.length === 0) break;
-      for (const entry of page) {
-        if (entry.type === "file" && match.test(entry.path)) {
-          const path = this.#canonicalResult(entry.path);
-          out.push({ path, ino: entry.ino, size: entry.size, rev: entry.mtime });
-        }
-        if (out.length > limit) break;
+    while (frontier.length > 0 && out.length <= limit) {
+      const candidate = popCandidate(frontier);
+      if (candidate === undefined || isExcluded(candidate.path, excluded)) continue;
+      const stat = this.stat(candidate.path);
+      if (stat === null) continue;
+      if (stat.type === "dir") {
+        for (const child of this.#children(candidate.path)) pushCandidate(frontier, child);
+        continue;
       }
-      if (out.length > limit) break;
-      after = page[page.length - 1]?.path;
-      if (page.length < 1_000) break;
+      if (options.after !== undefined && comparePaths(candidate.path, options.after) <= 0) continue;
+      if (stat.type === "file" && match.test(candidate.path)) {
+        const path = this.#canonicalResult(candidate.path);
+        out.push({ path, ino: stat.ino, size: stat.size, rev: stat.mtime });
+      }
     }
     const handles = out.slice(0, limit);
     return {

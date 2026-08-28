@@ -31,6 +31,8 @@ import {
 /** The DO SQLite ceiling on a GLOB/LIKE pattern. */
 export const GLOB_PATTERN_MAX_BYTES = 50;
 export const DISCOVERY_PAGE_MAX = 1_000;
+export const DISCOVERY_EXCLUDE_ROOTS_MAX = 64;
+const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
 
 const PERMISSION_BITS = 0o7777;
 
@@ -122,7 +124,7 @@ const LIST_RECURSIVE_SQL = `WITH groups(directory) AS (
 ${LIST_SELECT}
 ${LIST_AFTER}`;
 
-const DISCOVER_FILES_SQL = `WITH candidates AS MATERIALIZED (
+const DISCOVER_FILES_PREFIX = `WITH candidates AS MATERIALIZED (
        SELECT fs_paths.path AS path,
               fs_paths.inode AS inode,
               fs_nodes.size AS size,
@@ -131,7 +133,9 @@ const DISCOVER_FILES_SQL = `WITH candidates AS MATERIALIZED (
          JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode
         WHERE fs_paths.path > ? AND fs_paths.path < ?
           AND fs_paths.path GLOB ?
-          AND fs_nodes.type = 'file'
+          AND fs_nodes.type = 'file'`;
+
+const DISCOVER_FILES_SUFFIX = `
         ORDER BY fs_paths.path
         LIMIT ?
      )
@@ -161,6 +165,48 @@ SELECT candidates.path AS path,
   LEFT JOIN fs_chunks ON fs_chunks.inode = candidates.inode
  GROUP BY candidates.path, candidates.inode, candidates.size, candidates.rev
  ORDER BY candidates.path`;
+
+function discoverFilesSql(excludeRoots: number): string {
+  let excluded = "";
+  for (let index = 0; index < excludeRoots; index++) {
+    excluded += "\n          AND NOT (fs_paths.path >= ? AND fs_paths.path < ?)";
+  }
+  return `${DISCOVER_FILES_PREFIX}${excluded}${DISCOVER_FILES_SUFFIX}`;
+}
+
+export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): string[] {
+  if (input === undefined) return [];
+  if (!Array.isArray(input)) throw new Error("discoverFiles: excludeRoots must be an array");
+  if (input.length > DISCOVERY_EXCLUDE_ROOTS_MAX) {
+    throw new Error(
+      `discoverFiles: at most ${DISCOVERY_EXCLUDE_ROOTS_MAX} excluded roots may be supplied`,
+    );
+  }
+  const prefix = root === "/" ? "/" : `${root}/`;
+  const ordered: string[] = [];
+  for (let index = 0; index < input.length; index++) {
+    const path = Reflect.get(input, index);
+    if (
+      typeof path !== "string" ||
+      !path.startsWith("/") ||
+      path.length > DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX ||
+      path.includes("\0") ||
+      normalize(path) !== path ||
+      (path !== root && !path.startsWith(prefix))
+    ) {
+      throw new Error(`discoverFiles: excluded root ${index} is not canonical under '${root}'`);
+    }
+    ordered.push(path);
+  }
+  ordered.sort(comparePaths);
+  const coalesced: string[] = [];
+  for (const path of ordered) {
+    const parent = coalesced[coalesced.length - 1];
+    if (parent !== undefined && (path === parent || path.startsWith(`${parent}/`))) continue;
+    coalesced.push(path);
+  }
+  return coalesced;
+}
 
 interface ScanRow {
   path: string;
@@ -391,12 +437,18 @@ export function discoverFiles(
   }
   const after =
     options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
+  const excludeRoots = validateDiscoveryExcludeRoots(root, options.excludeRoots);
+  const excludeBindings: string[] = [];
+  for (const excluded of excludeRoots) {
+    excludeBindings.push(excluded === "/" ? "/" : `${excluded}/`, subtreeSuccessor(excluded));
+  }
   const found = db
     .all<FileHandleRow>(
-      DISCOVER_FILES_SQL,
+      discoverFilesSql(excludeRoots.length),
       after,
       upper,
       pattern,
+      ...excludeBindings,
       limit + 1,
       CHUNK_SIZE,
       CHUNK_SIZE,

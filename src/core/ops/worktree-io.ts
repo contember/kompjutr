@@ -29,7 +29,7 @@ const READ_CHUNK = 64 * 1024;
 const STREAM_ABOVE = 512 * 1024;
 
 /** Rows per working-tree scan. This is also the metadata memory bound. */
-const SCAN_PAGE = 1000;
+export const WORKTREE_SCAN_PAGE = 1000;
 
 /** Files held while one bulk hash pass is assembled. */
 const HASH_BATCH = 1000;
@@ -317,11 +317,11 @@ export function* walkWorktreeEntriesStream(
   while (true) {
     const entries =
       afterSubtree === undefined
-        ? worktree.scan(base, { after, filesOnly: options.filesOnly, limit: SCAN_PAGE })
+        ? worktree.scan(base, { after, filesOnly: options.filesOnly, limit: WORKTREE_SCAN_PAGE })
         : worktree.scan(base, {
             afterSubtree,
             filesOnly: options.filesOnly,
-            limit: SCAN_PAGE,
+            limit: WORKTREE_SCAN_PAGE,
           });
     afterSubtree = undefined;
     if (entries.length === 0) return;
@@ -377,7 +377,7 @@ export function* walkWorktreeEntriesStream(
       yield { path: relative, stat: statFromScan(entry) };
     }
 
-    if (entries.length < SCAN_PAGE) return;
+    if (entries.length < WORKTREE_SCAN_PAGE) return;
 
     const active = pruned[pruned.length - 1];
     const last = entries[entries.length - 1];
@@ -775,7 +775,11 @@ function* scanWorktreeEntries(
 ): Generator<ScanEntry> {
   let after: string | undefined;
   while (true) {
-    const page = worktree.scan(root, { after, filesOnly: true, limit: SCAN_PAGE });
+    const page = worktree.scan(root, {
+      after,
+      filesOnly: true,
+      limit: WORKTREE_SCAN_PAGE,
+    });
     if (page.length === 0) return;
     for (const entry of page) {
       if (limits !== undefined) {
@@ -789,7 +793,7 @@ function* scanWorktreeEntries(
       }
       yield entry;
     }
-    if (page.length < SCAN_PAGE) return;
+    if (page.length < WORKTREE_SCAN_PAGE) return;
     after = page[page.length - 1]?.path;
   }
 }

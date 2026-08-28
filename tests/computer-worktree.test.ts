@@ -5,7 +5,7 @@ import { ComputerWorktree } from "../src/compat/computer/worktree.js";
 import { initializeFsSchema } from "../src/fs/schema.js";
 import { MAX_HANDLE_MATERIALIZE_BYTES } from "../src/fs/store/read.js";
 import { realpath } from "../src/fs/store/resolve.js";
-import { glob as sqliteGlob } from "../src/fs/store/scan.js";
+import { discoverFiles as sqliteDiscoverFiles, glob as sqliteGlob } from "../src/fs/store/scan.js";
 import { writeFiles } from "../src/fs/store/write.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
@@ -142,6 +142,65 @@ describe("ComputerWorktree compatibility", () => {
     expect(second.next).toBeNull();
     expect(() => worktree.discoverFiles(root, "*", { limit: 1001 })).toThrow(/1 to 1000/);
     expect(() => worktree.discoverFiles(root, "x".repeat(51))).toThrow(/51 bytes/);
+  });
+
+  it("prunes excluded discovery roots before the result limit", () => {
+    const workspace = new Workspace({ storage: new SqliteTestStorage() });
+    const provider = workspace.provider();
+    for (let index = 0; index < 1_025; index++) {
+      const directory = `/repo/nested/d${index.toString().padStart(4, "0")}`;
+      provider.mkdirSync(directory, { recursive: true });
+      provider.writeFileSync(`${directory}/.gitignore`, "");
+    }
+    provider.mkdirSync("/repo/z", { recursive: true });
+    provider.writeFileSync("/repo/z/.gitignore", "*.log\n");
+
+    class CountingWorktree extends ComputerWorktree {
+      stats = 0;
+
+      override stat(path: string) {
+        this.stats++;
+        return super.stat(path);
+      }
+    }
+
+    const worktree = new CountingWorktree(provider);
+    const root = worktree.realpath("/repo");
+    const page = worktree.discoverFiles(root, "*/.gitignore", {
+      excludeRoots: ["/repo/nested"],
+      limit: 128,
+    });
+
+    expect(page.handles.map((handle) => handle.path)).toEqual(["/repo/z/.gitignore"]);
+    expect(page.next).toBeNull();
+    expect(worktree.stats).toBeLessThan(10);
+  });
+
+  it("matches native discovery when the excluded root is the filesystem root", () => {
+    const workspace = new Workspace({ storage: new SqliteTestStorage() });
+    const provider = workspace.provider();
+    provider.writeFileSync("/.gitignore", "root\n");
+    provider.mkdirSync("/nested", { recursive: true });
+    provider.writeFileSync("/nested/.gitignore", "nested\n");
+    const worktree = new ComputerWorktree(provider);
+    const computerRoot = worktree.realpath("/");
+
+    const db = new TestDatabase();
+    initializeFsSchema(db, () => 0);
+    writeFiles(db, [
+      { path: "/.gitignore", bytes: new TextEncoder().encode("root\n") },
+      { path: "/nested/.gitignore", bytes: new TextEncoder().encode("nested\n") },
+    ]);
+    const nativeRoot = realpath(db, "/");
+
+    const computer = worktree.discoverFiles(computerRoot, "*/.gitignore", {
+      excludeRoots: [computerRoot],
+    });
+    const native = sqliteDiscoverFiles(db, nativeRoot, "*/.gitignore", {
+      excludeRoots: [nativeRoot],
+    });
+    expect(computer).toEqual(native);
+    expect(computer).toEqual({ handles: [], next: null });
   });
 
   it("matches standalone SQLite GLOB character-class semantics", () => {

@@ -124,6 +124,8 @@ export interface DiscoverFilesOptions {
   after?: RealPath;
   /** Defaults to 1,000 and cannot exceed 1,000. */
   limit?: number;
+  /** Absolute canonical roots whose complete subtrees are excluded before the SQL page limit. */
+  excludeRoots?: readonly string[];
 }
 
 export interface DiscoverFilesPage {

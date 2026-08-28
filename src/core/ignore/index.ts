@@ -1,7 +1,7 @@
 // `.gitignore` handling. Rules are loaded in bounded pages and evaluated in JS.
 
 import type { RealPath, RegularFileHandle } from "../../fs/types.js";
-import { relativeTo } from "../paths.js";
+import { joinPath, relativeTo } from "../paths.js";
 import type { Worktree } from "../worktree.js";
 import {
   compareLiteralBytes,
@@ -184,6 +184,8 @@ export const includeEverything: IgnoreMatcher = {
 export interface IgnoreOptions {
   /** Extra patterns applied at the repository root, lowest precedence. */
   extra?: string[];
+  /** Absolute roots owned by other repositories, excluded from discovery. */
+  excludeRoots?: readonly string[];
 }
 
 const ENCODER = new TextEncoder();
@@ -631,10 +633,15 @@ function loadRules(
   worktree: Worktree,
   root: string,
   extraSources: readonly string[],
+  excludeRoots: readonly string[],
 ): { rules: Map<string, IgnorePattern[]>; extra: IgnorePattern[] } {
   const budget = new IgnoreBudget();
   const extra = compileExtra(extraSources, budget);
   const canonicalRoot = worktree.realpath(root);
+  const excluded = excludeRoots.map((path) => {
+    const relative = relativeTo(root, path);
+    return relative === null ? path.replace(/\/+$/, "") : joinPath(canonicalRoot, relative);
+  });
   const rules = new Map<string, IgnorePattern[]>();
   const cursors = new Set<RealPath>();
   let after: RealPath | undefined;
@@ -644,6 +651,7 @@ function loadRules(
     const page = worktree.discoverFiles(canonicalRoot, "*/.gitignore", {
       after,
       limit: IGNORE_LIMITS.discoveryPage,
+      excludeRoots: excluded,
     });
     for (const handle of page.handles) budget.addFile(handle);
     if (page.next !== null && budget.files === IGNORE_LIMITS.files) {
@@ -665,6 +673,6 @@ export function loadIgnoreMatcher(
   root: string,
   options: IgnoreOptions = {},
 ): IgnoreMatcher {
-  const loaded = loadRules(worktree, root, options.extra ?? []);
+  const loaded = loadRules(worktree, root, options.extra ?? [], options.excludeRoots ?? []);
   return new WorktreeIgnoreMatcher(loaded.rules, loaded.extra);
 }

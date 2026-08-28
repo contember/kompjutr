@@ -15,7 +15,7 @@ import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { GitError, hasErrorCode, PathspecNotFoundError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
-import { joinPath, relativeTo } from "../paths.js";
+import { joinPath, normalizePath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import type {
@@ -33,7 +33,15 @@ import {
   indexFromTree,
   matchesPaths,
 } from "./checkout.js";
-import { compileReadPathspec, LS_FILES_INDEX_PAGE, type LsFilesOptions } from "./pathspec.js";
+import {
+  compileReadPathspec,
+  LS_FILES_INDEX_PAGE,
+  type LsFilesOptions,
+  MAX_LS_FILES_COMBINED_PATTERNS,
+  MAX_LS_FILES_COMBINED_SCAN_PREFIXES,
+  MAX_LS_FILES_SCAN_PREFIXES,
+  MAX_LS_FILES_SCAN_ROWS,
+} from "./pathspec.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
@@ -41,6 +49,7 @@ import {
   hashWorktreePaths,
   indexEntryFor,
   indexMatchesStat,
+  WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktreeEntriesStream,
   worktreeHashRangeReads,
@@ -73,6 +82,30 @@ const TYPED_ARRAY_BYTE_LENGTH_GETTER: unknown = Object.getOwnPropertyDescriptor(
   Object.getPrototypeOf(Uint8Array.prototype),
   "byteLength",
 )?.get;
+
+export const MAX_LS_FILES_CACHED_SQL_STATEMENTS =
+  Math.ceil(MAX_LS_FILES_SCAN_ROWS / LS_FILES_INDEX_PAGE) + MAX_LS_FILES_SCAN_PREFIXES;
+/** Row pages plus a terminal probe per compiled prefix; deliberately one over the measured mix. */
+export const MAX_LS_FILES_COMBINED_INDEX_STATEMENTS =
+  Math.ceil(MAX_LS_FILES_SCAN_ROWS / LS_FILES_INDEX_PAGE) + MAX_LS_FILES_COMBINED_SCAN_PREFIXES;
+export const MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS =
+  Math.ceil(MAX_LS_FILES_SCAN_ROWS / WORKTREE_SCAN_PAGE) + 1;
+export const MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS = 16;
+/** Conservative allowance for root resolution and caller/backend helper statements. */
+export const MAX_LS_FILES_COMBINED_FIXED_STATEMENTS = 64;
+export const MAX_LS_FILES_COMBINED_SQL_STATEMENTS =
+  MAX_LS_FILES_COMBINED_INDEX_STATEMENTS +
+  MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS +
+  MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS +
+  MAX_LS_FILES_COMBINED_FIXED_STATEMENTS;
+const MAX_LS_FILES_EXCLUDE_ROOTS = 64;
+
+if (MAX_LS_FILES_CACHED_SQL_STATEMENTS !== 903) {
+  throw new Error("cached ls-files SQL bound changed");
+}
+if (MAX_LS_FILES_COMBINED_SQL_STATEMENTS !== 700) {
+  throw new Error("combined ls-files SQL bound changed");
+}
 
 type AvailableSelectedPaths = Extract<SelectedPathResult, { available: true }>;
 
@@ -1668,10 +1701,163 @@ export function reset(
   });
 }
 
-/** Paths in the index, sorted. Literal selectors stay on indexed prefix scans. */
+export interface LsFilesWorktreeOptions extends LsFilesOptions {
+  /** Include unique index paths. Defaults to true unless `others` is explicit. */
+  cached?: boolean;
+  /** Include files and symlinks absent from every index stage. */
+  others?: boolean;
+  /** Apply the repository `.gitignore` hierarchy to `others`. */
+  excludeStandard?: boolean;
+  /** Absolute roots of other repositories that the caller resolved before the operation. */
+  excludeRoots?: readonly string[];
+}
+
+interface LsFilesSelection {
+  cached: boolean;
+  others: boolean;
+  excludeStandard: boolean;
+}
+
+/** Unique cached paths. Literal selectors stay on indexed prefix scans. */
 export function lsFiles(repo: Repository, options: LsFilesOptions = {}): string[] {
   const pathspec = compileReadPathspec(options);
   return pathspec.collect(indexPaths(repo, pathspec.scanPrefixes));
+}
+
+/** A bounded cached/untracked worktree selection. */
+export function lsFilesWithWorktree(
+  repo: Repository,
+  worktree: Worktree,
+  options: LsFilesWorktreeOptions = {},
+): string[] {
+  const selection = lsFilesSelection(options);
+  if (!selection.others) {
+    const pathspec = compileReadPathspec(lsFilesPathspecOptions(options));
+    return selection.cached
+      ? pathspec.collect(indexPaths(repo, pathspec.scanPrefixes))
+      : pathspec.collect([]);
+  }
+  const excludeRoots = lsFilesExcludeRoots(repo.root, Reflect.get(options, "excludeRoots"));
+  const pathspec = compileReadPathspec(
+    lsFilesPathspecOptions(options),
+    MAX_LS_FILES_COMBINED_PATTERNS,
+  );
+  if (
+    pathspec.scanPrefixes !== null &&
+    pathspec.scanPrefixes.length > MAX_LS_FILES_COMBINED_SCAN_PREFIXES
+  ) {
+    throw new GitError(
+      "E2BIG",
+      `ls-files compiled scan prefixes exceeds ${MAX_LS_FILES_COMBINED_SCAN_PREFIXES}`,
+    );
+  }
+  const ignores = selection.excludeStandard
+    ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
+    : undefined;
+  const index = uniqueBoundedIndexPaths(repo, pathspec.scanPrefixes, pathspec.maxScanRows);
+  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
+    excludeRoots,
+    ignores,
+    maxScanRows: pathspec.maxScanRows,
+  });
+  return pathspec.collect(
+    selectedLsFilesPaths(index, walked, selection.cached, pathspec.maxScanRows),
+  );
+}
+
+function lsFilesPathspecOptions(options: LsFilesWorktreeOptions): LsFilesOptions {
+  return { paths: options.paths, limits: options.limits };
+}
+
+function lsFilesSelection(options: unknown): LsFilesSelection {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new GitError("EINVAL", "ls-files options must be an object");
+  }
+  const cached = optionalLsFilesBoolean(options, "cached");
+  const others = optionalLsFilesBoolean(options, "others") === true;
+  const excludeStandard = optionalLsFilesBoolean(options, "excludeStandard") === true;
+  if (excludeStandard && !others) {
+    throw new GitError("EINVAL", "ls-files excludeStandard requires others");
+  }
+  return { cached: cached ?? !others, others, excludeStandard };
+}
+
+function optionalLsFilesBoolean(
+  options: object,
+  key: "cached" | "others" | "excludeStandard",
+): boolean | undefined {
+  const value = Reflect.get(options, key);
+  if (value !== undefined && typeof value !== "boolean") {
+    throw new GitError("EINVAL", `ls-files ${key} must be a boolean`);
+  }
+  return value;
+}
+
+function lsFilesExcludeRoots(root: string, paths: unknown): string[] {
+  if (paths === undefined) return [];
+  if (!Array.isArray(paths)) throw new GitError("EINVAL", "ls-files excludeRoots must be an array");
+  if (paths.length > MAX_LS_FILES_EXCLUDE_ROOTS) {
+    throw new GitError("E2BIG", `ls-files exclude roots exceeds ${MAX_LS_FILES_EXCLUDE_ROOTS}`);
+  }
+  const roots: string[] = [];
+  for (let index = 0; index < paths.length; index++) {
+    const path = Reflect.get(paths, index);
+    if (typeof path !== "string") {
+      throw new GitError("EINVAL", "ls-files exclude roots must be strings");
+    }
+    const relative = relativeTo(root, path);
+    if (
+      !path.startsWith("/") ||
+      normalizePath(path) !== path ||
+      relative === null ||
+      relative === ""
+    ) {
+      throw new GitError("EINVAL", "ls-files exclude roots must be canonical nested paths");
+    }
+    roots.push(path);
+  }
+  return roots;
+}
+
+function* uniqueBoundedIndexPaths(
+  repo: Repository,
+  prefixes: readonly string[] | null,
+  maxRows: number,
+): Generator<string> {
+  let rows = 0;
+  let previous: string | undefined;
+  for (const path of indexPaths(repo, prefixes)) {
+    rows++;
+    if (rows > maxRows) {
+      throw new GitError("E2BIG", `ls-files index scan exceeds ${maxRows} rows`);
+    }
+    if (path === previous) continue;
+    previous = path;
+    yield path;
+  }
+}
+
+function* selectedLsFilesPaths(
+  index: Iterable<string>,
+  worktree: Iterable<WorktreePath>,
+  cached: boolean,
+  maxRows: number,
+): Generator<string> {
+  let rows = 0;
+  for (const row of joinSorted(index, worktree, {
+    left: (path) => path,
+    right: (entry) => entry.path,
+  })) {
+    rows++;
+    if (rows > maxRows) {
+      throw new GitError("E2BIG", `ls-files merged scan exceeds ${maxRows} rows`);
+    }
+    if (row.left !== undefined) {
+      if (cached) yield row.path;
+    } else if (row.right !== undefined) {
+      yield row.path;
+    }
+  }
 }
 
 function* indexPaths(repo: Repository, prefixes: readonly string[] | null): Generator<string> {

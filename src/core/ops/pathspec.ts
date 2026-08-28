@@ -5,6 +5,7 @@ import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 
 export const MAX_LS_FILES_PATTERNS = 256;
+export const MAX_LS_FILES_COMBINED_PATTERNS = 64;
 export const MAX_LS_FILES_PATTERN_BYTES = 2_200;
 export const MAX_LS_FILES_INPUT_BYTES = 64 * 1024;
 export const MAX_LS_FILES_WILDCARD_TOKENS = 4_096;
@@ -14,6 +15,7 @@ export const MAX_LS_FILES_RETAINED_BYTES = 16 * 1024 * 1024;
 export const LS_FILES_RESULT_FIXED_BYTES = 128;
 export const LS_FILES_INDEX_PAGE = 256;
 export const MAX_LS_FILES_SCAN_PREFIXES = MAX_LS_FILES_PATTERNS * 2;
+export const MAX_LS_FILES_COMBINED_SCAN_PREFIXES = MAX_LS_FILES_COMBINED_PATTERNS * 2;
 export const MAX_LS_FILES_SQL_STATEMENTS = 1_000;
 
 // Source pages plus one terminal probe per literal prefix stay below the SQL budget.
@@ -66,6 +68,7 @@ type ReadPathspec = LiteralPathspec | GlobPathspec;
 /** A compiled read-only pathspec and the indexed prefixes that can cover it. */
 export class CompiledReadPathspec {
   readonly scanPrefixes: readonly string[] | null;
+  readonly maxScanRows: number;
   readonly #all: boolean;
   readonly #patterns: readonly ReadPathspec[];
   readonly #limits: ResolvedLimits;
@@ -79,6 +82,7 @@ export class CompiledReadPathspec {
     this.#all = all;
     this.#patterns = patterns;
     this.scanPrefixes = scanPrefixes;
+    this.maxScanRows = limits.maxScanRows;
     this.#limits = limits;
   }
 
@@ -131,9 +135,19 @@ export class CompiledReadPathspec {
   }
 }
 
-export function compileReadPathspec(options?: LsFilesOptions): CompiledReadPathspec {
+export function compileReadPathspec(
+  options?: LsFilesOptions,
+  maxPatterns = MAX_LS_FILES_PATTERNS,
+): CompiledReadPathspec {
   const input = runtimeOptions(options);
-  const limits = resolveLimits(input.limits);
+  if (
+    !Number.isSafeInteger(maxPatterns) ||
+    maxPatterns < 0 ||
+    maxPatterns > MAX_LS_FILES_PATTERNS
+  ) {
+    throw new GitError("EINVAL", "ls-files pattern ceiling is invalid");
+  }
+  const limits = resolveLimits(input.limits, maxPatterns);
   const paths = input.paths;
   if (paths === undefined || paths.length === 0) {
     return new CompiledReadPathspec(true, [], null, limits);
@@ -201,8 +215,9 @@ export function compileReadPathspec(options?: LsFilesOptions): CompiledReadPaths
     all || hasGlob
       ? null
       : coalescedPaths(patterns.map((pattern) => (pattern.kind === "literal" ? pattern.path : "")));
-  if (scanPrefixes !== null && scanPrefixes.length > MAX_LS_FILES_SCAN_PREFIXES) {
-    throw tooBig("compiled scan prefixes", MAX_LS_FILES_SCAN_PREFIXES);
+  const maxScanPrefixes = maxPatterns * 2;
+  if (scanPrefixes !== null && scanPrefixes.length > maxScanPrefixes) {
+    throw tooBig("compiled scan prefixes", maxScanPrefixes);
   }
   return new CompiledReadPathspec(all, patterns, scanPrefixes, limits);
 }
@@ -241,6 +256,11 @@ function runtimeOptions(options: unknown): {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new GitError("EINVAL", "ls-files options must be an object");
   }
+  for (const key of ["cached", "others", "excludeStandard", "excludeRoots"]) {
+    if (Reflect.has(options, key)) {
+      throw new GitError("EINVAL", "ls-files worktree selection requires a worktree");
+    }
+  }
   const paths = Reflect.get(options, "paths");
   if (paths !== undefined && !Array.isArray(paths)) {
     throw new GitError("EINVAL", "ls-files paths must be an array");
@@ -248,7 +268,7 @@ function runtimeOptions(options: unknown): {
   return { paths, limits: Reflect.get(options, "limits") };
 }
 
-function resolveLimits(limits: unknown): ResolvedLimits {
+function resolveLimits(limits: unknown, maxPatterns: number): ResolvedLimits {
   if (
     limits !== undefined &&
     (typeof limits !== "object" || limits === null || Array.isArray(limits))
@@ -256,7 +276,7 @@ function resolveLimits(limits: unknown): ResolvedLimits {
     throw new GitError("EINVAL", "ls-files limits must be an object");
   }
   return {
-    maxPatterns: boundedLimit(limitValue(limits, "maxPatterns"), MAX_LS_FILES_PATTERNS, "pattern"),
+    maxPatterns: boundedLimit(limitValue(limits, "maxPatterns"), maxPatterns, "pattern"),
     maxPatternBytes: boundedLimit(
       limitValue(limits, "maxPatternBytes"),
       MAX_LS_FILES_PATTERN_BYTES,
