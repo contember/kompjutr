@@ -74,9 +74,12 @@ missing contract found during planning.
   `^{commit}`, `^{tree}`, `^{blob}`, `^{tag}`, and one trailing `:<path>` while
   retaining the 1,024-unit and 32-traversal caps. Keep `revParse()` returning
   the oid. Add `tryRevParse()` with the same string result and `undefined` only
-  for semantic absence. Semantic absence is an unknown input ref/name/full or
-  abbreviated oid, or a missing `:<path>` entry including a non-tree
-  intermediate component. Malformed syntax, typed-peel mismatch, and every
+  for semantic absence. Semantic absence is an unknown input ref/name or
+  abbreviated oid, an absent object when a directly supplied full oid must be
+  read, or a missing `:<path>` entry including a non-tree intermediate
+  component. Match Git by returning a bare, syntactically valid full oid
+  unchanged even when no object exists; typed peel, parent, or path syntax then
+  requires the object. Malformed syntax, typed-peel mismatch, and every
   structural-limit failure still throw. A dangling ref, missing tag target,
   missing traversed parent or commit tree, missing final tree-entry object, or
   malformed authoritative/derived object data also throws because stored state
@@ -322,3 +325,8 @@ resolved before implementation.
 
 <!-- Append discoveries, deviations, and blockers. Graduate durable entries to
      decisions or backlog; leave transient evidence here for the archive. -->
+
+- WU0 found that `git rev-parse --verify --quiet <full-oid>` succeeds without
+  object membership; object existence is required only by a suffix/path that
+  reads it. The WU1 quiet matrix now preserves that external contract; Singer
+  independently approved the plan correction before WU1.

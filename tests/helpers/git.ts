@@ -2,7 +2,7 @@
 // about pack layout, tree hashing or the wire protocol is checked against
 // git itself rather than against another implementation of our own.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -28,6 +28,12 @@ const ENV = {
   GIT_EDITOR: "true",
   GIT_SEQUENCE_EDITOR: "true",
 };
+
+export interface GitCommandResult {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
 
 export class GitFixture {
   readonly dir: string;
@@ -85,6 +91,18 @@ export class GitFixture {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     }).trimEnd();
+  }
+
+  gitResult(...args: string[]): GitCommandResult {
+    return this.#gitResult(undefined, {}, args);
+  }
+
+  gitInputResultWithEnv(
+    input: string,
+    extraEnv: Readonly<Record<string, string>>,
+    ...args: string[]
+  ): GitCommandResult {
+    return this.#gitResult(input, extraEnv, args);
   }
 
   init(defaultBranch = "main"): this {
@@ -172,6 +190,27 @@ export class GitFixture {
 
   dispose(): void {
     rmSync(this.dir, { recursive: true, force: true });
+  }
+
+  #gitResult(
+    input: string | undefined,
+    extraEnv: Readonly<Record<string, string>>,
+    args: readonly string[],
+  ): GitCommandResult {
+    const result = spawnSync("git", args, {
+      cwd: this.dir,
+      env: { ...ENV, ...extraEnv },
+      input,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (result.error !== undefined) throw result.error;
+    if (result.status === null) throw new Error(`git terminated by signal ${result.signal}`);
+    return {
+      status: result.status,
+      stdout: result.stdout.trimEnd(),
+      stderr: result.stderr.trimEnd(),
+    };
   }
 }
 
