@@ -133,8 +133,8 @@ credentials.
   pinned public origin; push uses the real pack writer and receive-pack parser
   against a deterministic bounded probe transport, avoiding writes to an
   external repository.
-- Systematic pairwise concurrency remains
-  [16](../backlog/16-concurrent-and-restart-conformance.md).
+- Systematic pairwise concurrency shipped later in the
+  [concurrency and restart sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md).
 - The probe is an operator tool, not a normal CI gate. Automating it on every
   release requires a separate decision about Cloudflare credentials and spend.
 

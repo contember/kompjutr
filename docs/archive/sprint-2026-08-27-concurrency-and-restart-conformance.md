@@ -1,3 +1,20 @@
+> **OUTCOME — shipped 2026-08-28.** Qualified every real asynchronous owner
+> against the shared repository, ref, index, worktree, journal, pack, and
+> maintenance seams with deterministic schedules and cold-reopen witnesses.
+> Added durable pack and clone ownership, monotonic identities, stale fetch
+> publication fencing, exact push tracking observations, and same-runtime
+> maintenance admission without a repository-wide lock. Commit map: plan →
+> `e764ebb`; WU0 → `081a6d0`; WU1 → `7247a81`; WU5 → `389f8c1`; WU2
+> → `bec9adb`; WU3 → `6dd386d`; WU6 → `85644bd`; WU4 and final cost
+> corrections → `51d4850`, `6fa00a3`, `a1acb10`; WU7 and closure → this
+> archived record. Verification: all 137 test files and 2,477 assertions passed,
+> with 5 expected skips; the two wall-time witnesses passed under a two-core
+> no-SMT lease. Typecheck, build, Biome, and diff validation pass. Vitest 3.2.7
+> can still report an internal `onTaskUpdate` timeout after a monolithic fork run,
+> so the same suite was also qualified in bounded fork batches. Backlog closed:
+> 16. Deferred: cancellation (15), force-with-lease (13), clone shape (38 and
+> 41), and repository integrity snapshots (17).
+
 # Sprint — Concurrency and restart conformance (2026-08-27)
 
 **Goal.** Define and prove deterministic repository behavior for every real
@@ -393,3 +410,41 @@ git diff --check
   depth-one proof. The final affected gate passes all 180 tests across six
   files. Typecheck, build, Biome, and diff validation pass; the docs linter
   reports only its known managed-`docs/AGENTS.md` symlink false positive.
+- 2026-08-28: WU4 gives configured push an exact durable tracking-ref
+  observation before POST. Fetch discovery advances only exact observations
+  inside its own tracking prefix; successful and idempotent tracking publication
+  advances both exact revisions and affected fetch namespaces. This preserves
+  later fetch or push observations, catches same-OID ABA, and lets historical
+  broad namespaces coexist with disjoint narrow fetches.
+- 2026-08-28: Push now cold-reads, hashes, and parses its input and any
+  post-success tracking candidate from authoritative loose or complete-pack
+  bytes. An unreadable rediscovered tip falls back to the confirmed target; an
+  unreadable confirmed target skips local tracking without changing confirmed
+  remote success. No-op push re-authenticates after discovery, response loss
+  remains `EPUSHUNCERTAIN`, and explicit URLs never publish local tracking.
+- 2026-08-28: Two independent WU4 reviews found and closed cached physical
+  commit trust, no-op re-authentication, exact SQL headroom, same-target ABA,
+  buffered refresh ordering, token disposal, historical broad/narrow false
+  fencing, and unauthenticated revision cardinality. Cardinality reads stop at
+  100,001 stored rows and missing repository state fails with `ECORRUPT`.
+  Final review is clean; the 82-test store suite and typecheck pass.
+- 2026-08-28: WU6 gives concurrent maintenance exact same-runtime ownership.
+  A second live call gets `EBUSY`; a cold replacement reclaims abandoned
+  `selected`, `pending`, or `published` state and settles counters once. Direct
+  schedules cover fetch, push, read-only work, root drift, and all durable
+  maintenance phases without introducing a repository-wide lock.
+- 2026-08-28: Independent WU6 review is clean. All 51 affected maintenance
+  tests pass, including repeated deterministic runs of the new eight-schedule
+  suite. Typecheck and Biome pass. The contract deliberately models one live
+  `Workspace` per Durable Object isolate; a second facade is only a cold
+  replacement after eviction.
+- 2026-08-28: WU7 maps every supported durable seam to named direct evidence in
+  `docs/reference/concurrency.md`. Cold witnesses cover every asynchronous
+  owner; exact store-scale tests cover the SQL and retained-memory ceilings.
+- 2026-08-28: All 137 files and 2,477 assertions pass, with 5 expected skips.
+  Vitest 3.2.7 intermittently times out its own fork `onTaskUpdate` RPC after a
+  monolithic run has completed, so the same files were also run in bounded fork
+  batches. Two load-sensitive wall-time witnesses pass under the required
+  two-core no-SMT lease. Typecheck, build, Biome, and diff validation pass. The
+  docs linter retains only its known managed-`docs/AGENTS.md` symlink false
+  positive.

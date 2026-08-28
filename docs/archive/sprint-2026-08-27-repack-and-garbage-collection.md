@@ -187,9 +187,9 @@ Planning was grounded at `4a95725`.
 - Live-object evacuation and compaction of mixed packs is deferred. This sprint
   deletes only packs with no marked object, matching backlog 04's explicit
   loose-repack scope.
-- The systematic pairwise operation matrix and restart harness remain
-  [`16`](../backlog/16-concurrent-and-restart-conformance.md); this sprint covers
-  maintenance-specific interleavings only.
+- The systematic pairwise operation matrix and restart harness shipped later in
+  the [concurrency sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md);
+  this sprint covers maintenance-specific interleavings only.
 - Integrity reports and reproducible snapshots remain
   [`17`](../backlog/17-integrity-audit-and-snapshots.md).
 - No deploy, production probe, release, or push is part of this sprint.

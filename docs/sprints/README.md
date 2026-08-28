@@ -19,5 +19,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-08-27-concurrency-and-restart-conformance.md`](sprint-2026-08-27-concurrency-and-restart-conformance.md)
-  — deterministic async operation pairs and cold restart boundaries.
+- None.

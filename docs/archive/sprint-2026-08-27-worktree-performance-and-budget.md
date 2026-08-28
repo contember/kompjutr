@@ -283,8 +283,8 @@ seams, then closes each hot path against the same 24,252-file fixture.
 - Production Durable Object execution remains
   [11](sprint-2026-08-27-production-do-probe.md); this sprint produces the
   local release-candidate baseline it should test but does not deploy.
-- Systematic async interleaving and restart conformance remains
-  [16](../backlog/16-concurrent-and-restart-conformance.md).
+- Systematic async interleaving and restart conformance shipped later in the
+  [concurrency sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md).
 - Repack/garbage collection and public audit/snapshot formats remain
   [04](sprint-2026-08-27-repack-and-garbage-collection.md) and
   [17](../backlog/17-integrity-audit-and-snapshots.md); no object deletion or new

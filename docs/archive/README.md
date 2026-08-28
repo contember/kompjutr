@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Concurrency and restart conformance](sprint-2026-08-27-concurrency-and-restart-conformance.md)
+  — deterministic async-owner schedules, cold restart qualification, and
+  bounded ownership and publication fences.
 - [Repack and garbage collection](sprint-2026-08-27-repack-and-garbage-collection.md)
   — resumable root marking, bounded loose-object repacking, grace-period
   collection, and crash/concurrency/cost qualification.

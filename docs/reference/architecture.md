@@ -58,24 +58,25 @@ excluded from parent working-tree scans.
 
 Repository state is relational rather than a fake `.git` tree:
 
-- Global `git_meta` stores the schema version.
-- Shared-store-owned tables are `git_repositories`, `git_refs`, `git_config`,
-  `git_shallow`, `git_objects`, `git_object_chunks`, `git_pack_meta`,
-  `git_pack_ingest_control`, `git_pack_data`, `git_pack_entries`,
-  `git_pack_objects`, `git_pack_pending`, `git_blob_id_state`, `git_blob_ids`,
-  `git_tree_sources`, `git_tree_entries`, `git_tree_effective`, `git_commits`,
-  `git_reflog_state`, and `git_reflog_entries`. They use `repo_id`, except that
-  `git_tree_entries` is owned through its source surrogate.
+- Global `git_meta` stores the schema version. `git_identity_control` allocates
+  monotonic repository, checkout, and provisional-clone identities.
+- Shared-store-owned tables cover repository lifecycle, fetch generations, and
+  exact tracking-ref revisions (`git_repositories`, `git_fetch_namespaces`,
+  `git_tracking_ref_revisions`), refs/config/shallow state, reflogs, loose
+  objects and lifecycle, packs and ingest ownership, disposable blob/tree/commit
+  projections, and resumable maintenance state and GC candidates. They use
+  `repo_id`, except that `git_tree_entries` is owned through its source surrogate.
 - Checkout-owned tables are `git_checkouts`, `git_index`, `git_index_state`,
   `git_index_dirty`, `git_operation_state`, `git_operation_steps`,
   `git_operation_touched`, and `git_checkout_reflog_entries`. Rows below
   `git_checkouts` use `checkout_id`.
 
-`git_repositories` is only the shared identity. `git_checkouts` owns the
-immutable canonical root, raw `HEAD`, and primary marker. Checkout views of the
-same store use one shared object, pack, ref, config, shallow, and cache namespace.
-Their working trees, indexes, tracker state, operation journals, and raw `HEAD`
-remain independent.
+`git_repositories` owns the shared identity, provisional-clone lifecycle, fetch
+generation, and shallow revision. `git_checkouts` owns the immutable canonical
+root, raw `HEAD`, and primary marker. Checkout views of the same store use one
+shared object, pack, ref, config, shallow, fetch, maintenance, and cache
+namespace. Their working trees, indexes, tracker state, operation journals, and
+raw `HEAD` remain independent.
 
 No operation depends on a `.git` directory.
 

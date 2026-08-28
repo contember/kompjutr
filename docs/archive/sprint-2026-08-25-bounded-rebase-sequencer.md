@@ -244,9 +244,10 @@ not a parallel follow-up.
   `src/core/ops/pull.ts`; enabling it needs its own network/config parity scope.
 - Reflogs and recovery of a branch after a completed rebase — backlog
   [12](sprint-2026-08-26-reflogs-and-ref-recovery.md).
-- A repository-wide async operation epoch and full concurrent/restart matrix —
-  backlog [16](../backlog/16-concurrent-and-restart-conformance.md). This sprint
-  still owns stale-ref checks and restart safety for its journal transitions.
+- The full concurrent/restart matrix shipped later in the
+  [concurrency and restart sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md).
+  This sprint still owns stale-ref checks and restart safety for its journal
+  transitions.
 - Stash operations. Backlog [06](../backlog/06-stash-operations.md) depends on the
   step journal but keeps its own commit shape and conflict parity sprint.
 - Pulling CI/release work into the feature sprint — backlog 05 remained the next

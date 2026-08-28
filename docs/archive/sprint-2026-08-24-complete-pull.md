@@ -227,9 +227,10 @@ Consumed backlog items 01 and 03, which were deleted on ship.
   the configuration clone already writes and callers can set through `configSet`.
 - Cancellation of fetch or integration remains in
   [backlog item 15](../backlog/15-abortable-network-operations.md).
-- The systematic all-operation interleaving matrix remains in
-  [backlog item 16](../backlog/16-concurrent-and-restart-conformance.md). This
-  sprint covers the pull-specific await boundary and stale-HEAD/upstream races.
+- The systematic all-operation interleaving matrix shipped later in the
+  [concurrency sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md).
+  This sprint covers the pull-specific await boundary and stale-HEAD/upstream
+  races.
 - Reflogs, ref recovery, and garbage-collection roots remain in
   [backlog item 12](sprint-2026-08-26-reflogs-and-ref-recovery.md) and
   [backlog item 04](sprint-2026-08-27-repack-and-garbage-collection.md).

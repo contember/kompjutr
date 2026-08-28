@@ -294,9 +294,10 @@ models overlap.
   safety work in [33](sprint-2026-08-26-git-boundary-correctness.md#wu1--safe-branch-deletion-33-effort-m) and
   [04](sprint-2026-08-27-repack-and-garbage-collection.md).
 - The actual Durable Object release-candidate probe and systematic interleaving
-  suite remain [11](sprint-2026-08-27-production-do-probe.md) and
-  [16](../backlog/16-concurrent-and-restart-conformance.md). This sprint supplies
-  the multi-checkout state they must exercise; it does not deploy from localhost.
+  suite shipped later in the [production probe](sprint-2026-08-27-production-do-probe.md)
+  and [concurrency sprint](sprint-2026-08-27-concurrency-and-restart-conformance.md).
+  This sprint supplies the multi-checkout state they exercise; it does not
+  deploy from localhost.
 - No compatibility path is provided for the previous undeployed version-1 schema.
   There will be one current init baseline, no intermediate migrations, and no
   stale generated migration artifacts.

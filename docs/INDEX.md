@@ -15,16 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-27-concurrency-and-restart-conformance.md`](sprints/sprint-2026-08-27-concurrency-and-restart-conformance.md)
-  — deterministic async operation pairs and cold restart boundaries.
+- None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Concurrency/restart conformance is active. It qualifies the five real async
-  operations against shared refs, index, worktree, journals, packs, and
-  maintenance state.
+- Index and object write plumbing is next. It adds bounded scratch indexes and
+  tree/commit construction for the reference snapshot workload.
 
 ## Key reference
 
@@ -54,6 +52,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-27-concurrency-and-restart-conformance.md`](archive/sprint-2026-08-27-concurrency-and-restart-conformance.md)
+  — deterministic async-owner schedules, cold restart qualification, and
+  bounded ownership and publication fences.
 - [`archive/sprint-2026-08-27-repack-and-garbage-collection.md`](archive/sprint-2026-08-27-repack-and-garbage-collection.md)
   — resumable root marking, bounded loose-object repacking, grace-period
   collection, and crash/concurrency/cost qualification.
