@@ -9,8 +9,9 @@ is just a sprint with no human watching — same file, same rules.
 
 Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
-1. **Create** — copy the template; re-verify load-bearing facts at HEAD before
-   planning on them.
+1. **Create** — copy the template; re-verify load-bearing facts at HEAD, declare
+   a concrete review gate for the sprint integration and every WU, then get an
+   independent review of the full proposal and those gates before implementation.
 2. **Run** — work the WUs; append discoveries/blockers to `## Run log`; graduate
    entries to a `../decisions/` ADR or a `../backlog/` item.
 3. **Close** — stamp the `OUTCOME` header, `git mv` to `../archive/`, delete/rescope

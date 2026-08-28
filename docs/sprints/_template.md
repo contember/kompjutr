@@ -38,6 +38,19 @@ Re-read the load-bearing facts in the actual code before planning on them.
 - **Acceptance / witness.**
 - **Touch points.**
 
+## Review strategy
+
+Declare the integration gate and the gate for every WU. Base them on actual
+scope and blast radius; do not rely on a tier name alone. Easy work may use only
+its direct witness. Fundamental work may require independent review, fixes, and
+repeat review until clean.
+
+| Scope | Risk / rationale | Required gate and review | Escalate when |
+|---|---|---|---|
+| Sprint integration | <cross-WU risk> | <integration witness; review policy> | <conditions> |
+| WU1 | <why this is easy/normal/fundamental> | <exact test; review policy> | <conditions> |
+| WU2 | <why this is easy/normal/fundamental> | <exact test; review policy> | <conditions> |
+
 ## Out of scope (explicit)
 
 <What's deliberately deferred + why; link follow-up backlog items.>
@@ -50,6 +63,16 @@ real alternative, also write a ../decisions/ ADR and link it here.>
 ## Sequencing
 
 <Order + what can run in parallel. A short table if it helps.>
+
+## Plan review
+
+An independent reviewer checks the complete proposal against HEAD, including
+whether the review strategy is proportionate to each WU and the integrated
+sprint risk. Resolve blocking findings before implementation.
+
+- **Reviewer:** <name or agent>
+- **Verdict:** pending / approved / blocked
+- **Material findings:** <none, or finding + disposition>
 
 ## Run log
 

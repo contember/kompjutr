@@ -193,6 +193,45 @@ missing contract found during planning.
   existing guarded `updateRef` operation.
 - Schema changes edit the development-only v1 baseline directly.
 
+## Review strategy
+
+The sprint is fundamental at the integration boundary because it adds durable
+schema, transaction-scoped state, object authentication, and public plumbing.
+That does not make every WU fundamental. Each row defines its own gate; a tier
+name is only a summary.
+
+| Scope | Tier and rationale | Required gate and review | Escalate when |
+|---|---|---|---|
+| Sprint integration | T3 — storage and object-writing seams compose inside one transaction | At WU5 completion, one independent review receives the complete WU5 diff and composed snapshot contract and returns separate WU5 and integration verdicts. The integration scope is cross-WU state isolation and atomicity; fix material findings and repeat that focused portion until clean. Settled WU internals are not reviewed again. Then run the full sprint gates. | The composed call changes a schema, transaction boundary, object encoding, ref, worktree, or checkout-index contract. |
+| WU0 | T1 — tests pin an external Git contract without production changes | Run the exact WU0 witness below; no independent implementation review. | A probe requires choosing new product semantics rather than recording Git behavior. |
+| WU1 | T3 — new schema and rollback-sensitive scratch state | Run the exact WU1 witness below, then independently review lifecycle, rollback, bounds, and maintenance roots. Fix and re-review until clean. | Any scratch state can survive the owning transaction or affect another repository. |
+| WU2 | T3 — worktree and two index implementations share mutation paths | Run the exact WU2 witness below, then independently review index selection, tracker/journal state, rollback, and bounds. Fix and re-review until clean. | The default checkout behavior, worktree mutation semantics, or shared index contract changes. |
+| WU3 | T3 — authenticated rows produce durable Git tree objects | Run the exact WU3 witness below, then independently review preflight, object trust, atomicity, and bounds. Fix and re-review until clean. | Encoding changes, untrusted rows bypass validation, or an object can survive a failed operation. |
+| WU4 | T3 — authenticated revisions and identities produce durable commit objects | Run the exact WU4 witness below, then independently review authentication, identity precedence, atomicity, and cumulative bounds. Fix and re-review until clean. | Parent/tree resolution, identity precedence, serialization, or object-source trust changes. |
+| WU5 | T2 — public facade and exports over settled T3 seams | Run the exact WU5 witness below. The same independent pass used by the sprint integration gate reviews the public facade, exports, and reference docs once. Root verifies material facade fixes; repeat the WU5 portion only if a fix changes the public contract. Cross-WU isolation findings belong solely to the sprint integration verdict. | The implementation changes a settled seam, mutates control state, or cannot prove the workload through the public API. |
+
+Exact focused witnesses:
+
+```bash
+# WU0
+npx vitest run tests/plumbing-git-contract.test.ts
+
+# WU1
+npx vitest run tests/schema.test.ts tests/store.test.ts tests/store-stream.test.ts tests/commit.test.ts
+
+# WU2
+npx vitest run tests/plumbing-write.test.ts tests/staging.test.ts tests/worktree.test.ts tests/checkout-sparse.test.ts
+
+# WU3
+npx vitest run tests/plumbing-git-contract.test.ts tests/plumbing-write.test.ts tests/tree-build-preflight.test.ts tests/commit.test.ts tests/integration.test.ts
+
+# WU4
+npx vitest run tests/plumbing-git-contract.test.ts tests/plumbing-write.test.ts tests/commit.test.ts tests/pack.test.ts
+
+# WU5
+npx vitest run tests/client.test.ts tests/public-exports.test.ts tests/plumbing-write.test.ts
+```
+
 ## Sequencing
 
 | Wave | Units | Contract |
@@ -216,6 +255,20 @@ npm run check
 cpu-lease run -n 2 -- npm run build
 git diff --check
 ```
+
+## Plan review
+
+This review policy was adopted after WU0–WU4 had shipped under the original
+strict per-WU review process. Approval of the amended plan gates WU5 and sprint
+closure; it is not represented as pre-implementation approval of completed work.
+
+- **Reviewer:** Singer (`/root/wu2_index_review`)
+- **Verdict:** approved
+- **Material findings:** the first pass found overlapping WU5/integration
+  review scopes, non-exact WU witnesses, and the missing mid-sprint adoption
+  note. The amended strategy separates the two verdicts inside one pass, lists
+  exact commands, and states the temporal boundary explicitly. The second pass
+  found no remaining material issue.
 
 ## Run log
 
@@ -263,3 +316,6 @@ git diff --check
   authentication gaps; a 4.2 MiB tree now authenticates identically loose or
   packed. Independent review is clean, all 166 focused pack, commit, and
   plumbing tests pass, and typecheck and Biome remain green.
+- 2026-08-28: Risk-proportionate review gates were adopted mid-sprint. WU0–WU4
+  retain their completed strict reviews; the independently reviewed amendment
+  governs WU5 and sprint closure.
