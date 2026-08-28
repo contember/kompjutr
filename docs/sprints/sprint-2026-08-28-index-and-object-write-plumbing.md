@@ -319,3 +319,24 @@ closure; it is not represented as pre-implementation approval of completed work.
 - 2026-08-28: Risk-proportionate review gates were adopted mid-sprint. WU0–WU4
   retain their completed strict reviews; the independently reviewed amendment
   governs WU5 and sprint closure.
+- 2026-08-28: WU5 exposed checkout `readTree`, `writeTree`, and detached
+  `commitTree` plus a synchronous, revoked-on-return `withScratchIndex` handle.
+  The public snapshot sequence matches Git's raw commit and reachable root tree,
+  preserves a staged checkout and active operation journal across success,
+  failure, thenable rejection, and cold reopen, and rolls back transient objects.
+  The maximal 10,000-leaf public sequence remains below 1,000 statements and
+  64 MiB. Both the T2 facade and T3 integration reviews are approved; all 51
+  focused client, export, and plumbing tests plus typecheck pass.
+- 2026-08-28: Full-suite integration exposed four corruption fixtures that now
+  conflict with WU1's index-path `CHECK`; those fixtures explicitly suspend
+  checks only while injecting malformed rows, and all 111 affected tracker and
+  sparse-workspace tests pass. The protocol timing witness now measures five
+  independent production-sized 10,000-ref advertisements instead of dividing
+  two short and noisy timings; five isolated 36-test runs and a 228-test
+  four-worker contention run pass without relaxing the 100 ms cap.
+- 2026-08-28: The final fork-pool JSON report records all 451 suites and 2,514
+  tests passed, five pre-existing skips, and zero failures. Vitest 3.2.7 still
+  exits one after the report because a worker times out awaiting an
+  `onTaskUpdate` acknowledgement; typecheck, Biome, build, and `git diff
+  --check` all exit zero. A thread-pool run is not closure evidence because it
+  changes E2E isolation behavior.

@@ -56,8 +56,8 @@ Roj can use the native surface for its admission slice: several isolated session
 checkouts over one shared store, bounded divergence against a caller-selected
 base, and an offline raw read of `refs/remotes/origin/HEAD`. Its adapter belongs
 to the consumer repository, not this package. The broader orchestrator requires
-partial clone, atomic checkpoint pushes, remote ref discovery, a scratch index,
-and patch interchange.
+partial clone, atomic checkpoint pushes, remote ref discovery, and snapshot
+replay.
 
 ## Repository creation
 
@@ -334,7 +334,8 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | `git symbolic-ref [-q] HEAD` | `currentBranch({ fullname: true })` | ★ ~ returns the full `refs/heads/…`, and `undefined` when HEAD is detached |
 | `git symbolic-ref -q <ref>`, `for-each-ref --format=%(symref) <ref>` | `readRef({ ref })` | ★ ~ exact raw `HEAD` or full `refs/...`; returns `symbolic`, `direct`, or `absent` without following the target or checking object existence |
 | `git rev-list --left-right --count <current>...<upstream>` | `divergence({ current, upstream })` | ★ ~ returns exact `ahead`/`behind` plus `identical`, `ahead`, `behind`, `diverged`, `unrelated`, or `shallow` |
-| `git read-tree`, `git write-tree`, `git commit-tree` | — | ★ ✘ no index-only object plumbing, and no `GIT_INDEX_FILE` throwaway index |
+| `git read-tree`, `git write-tree`, `git commit-tree` | `readTree()`, `writeTree()`, `commitTree()` | ★ ✔ ordinary calls target the checkout index; `commitTree()` writes one detached authenticated commit and moves no ref |
+| `GIT_INDEX_FILE=<throwaway>` around those commands | `withScratchIndex({ name }, callback)` | ★ ~ the synchronous callback receives `readTree`, `add`, `writeTree`, and `commitTree`; all scratch rows are transaction-scoped and no index file or persistent alternate index exists |
 | general `git rev-list`, ref enumeration through `git for-each-ref`, public `git merge-base` | — | ✘ the narrow divergence and exact raw-ref reads above do not expose general enumeration or merge-base selection |
 
 ## Branches, tags and refs
@@ -658,6 +659,7 @@ merge — with these differences:
 - ✘ no `cherryPick`, `revert` or `rebase`;
 - ✘ no `reflog` or `recoverRef` surface;
 - ✘ no linked-checkout lifecycle, `divergence`, or `readRef` surface;
+- ✘ no `readTree`, `writeTree`, `commitTree`, or scoped scratch-index surface;
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
@@ -695,6 +697,12 @@ retains at most 6 MiB. An active reflog-root scan fails closed above 9,727
 physical direct-ref and checkout-HEAD rows; its SQL state, shared caches, and JS
 headroom total at most 100 MiB minus one byte.
 
+One repository admits at most 16 simultaneous scratch-index names, each at most
+255 UTF-8 bytes. A scratch callback is synchronous and cannot escape its owning
+transaction. `writeTree()` admits at most 10,000 leaf entries, 4 MiB of path
+bytes, 4,096 tree objects, and 16 MiB of serialized trees. `commitTree()` accepts
+at most two ordered parents and eight cumulative revision traversals.
+
 ## Path and ordering rules
 
 - Pathspecs everywhere are **exact path or directory prefix**. No globs, no
@@ -722,7 +730,6 @@ the agent makes. The consumer adapter is outside this package.
 | `--filter=blob:none` partial clone | the initial clone of every project repository ([backlog 41](../backlog/41-partial-clone.md)) |
 | Wildcard fetch refspec (`+refs/checkpoints/*:refs/checkpoints/*`) | pulling snapshot refs back after a sandbox is rebuilt ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
 | `ls-remote` | listing the mirror refs that pruning then deletes ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
-| `read-tree` / `write-tree` / `commit-tree` under `GIT_INDEX_FILE` | snapshotting an uncommitted worktree into a commit without touching the session index ([backlog 43](../backlog/43-index-and-object-write-plumbing.md)) |
 | `apply --3way --cached` | re-applying that snapshot onto a rebased tip ([backlog 44](../backlog/44-patch-interchange.md)) |
 | `diff --binary --full-index <a> <b>` | producing the patch that re-apply consumes ([backlog 44](../backlog/44-patch-interchange.md)) |
 | `update-ref <ref> <new> <old>` compare-and-swap | publishing a rebase result only if the branch has not moved meanwhile ([backlog 39](../backlog/39-plumbing-read-surface.md)) |
@@ -740,6 +747,7 @@ the agent makes. The consumer adapter is outside this package.
 | `ls-files --error-unmatch <path>` | membership test against `lsFiles()` |
 | `ls-tree -r <ref>` | recurse with `lsTree()`, or read the tree through `lsFiles({ ref })` |
 | `cat-file -e <ref>:<path>` | `catFile()`, treating the throw as absence |
+| `GIT_INDEX_FILE=<throwaway> read-tree` / `add -A` / `write-tree` / `commit-tree` | one synchronous `withScratchIndex()` callback; it returns the detached snapshot OID without changing the checkout index, worktree, HEAD, refs, reflogs, tracker, operation journal, or maintenance state |
 | `reset --hard FETCH_HEAD` | `reset({ ref: fetch().fetchHead, hard: true })` |
 | `branch -m main` | `branch()` then `branchDelete()` |
 | `push -u origin main` | `push()` then `configSet("branch.main.remote"/"…merge")` |

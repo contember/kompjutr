@@ -280,6 +280,7 @@ describe("index tracker", () => {
     const db = setup();
     addRepository(db, 1, "/repo");
     seal(db, 1);
+    db.run("PRAGMA ignore_check_constraints = ON");
     db.run(
       "INSERT INTO git_index (checkout_id, path, stage, mode, oid) VALUES (1, '', 0, 33188, ?)",
       TREE,
@@ -309,6 +310,7 @@ describe("index tracker", () => {
     );
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
     expect(dirty(db, 1)).toEqual([]);
+    db.run("PRAGMA ignore_check_constraints = OFF");
   });
 
   it("journals path mutations and keeps non-ASCII owner mapping exact", () => {

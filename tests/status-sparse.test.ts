@@ -120,12 +120,14 @@ const ANCESTOR_INDEX_CORRUPTIONS: readonly AncestorIndexCorruption[] = [
   {
     name: "BLOB path",
     mutate(workspace) {
+      workspace.storage.sql.exec("PRAGMA ignore_check_constraints = ON");
       workspace.storage.sql.exec(
         "UPDATE git_index SET path = ? WHERE checkout_id = ? AND path = ?",
         new TextEncoder().encode("tracked/file.txt"),
         workspace.repo.checkout.checkoutId,
         "tracked/file.txt",
       );
+      workspace.storage.sql.exec("PRAGMA ignore_check_constraints = OFF");
     },
   },
   {

@@ -31,7 +31,16 @@ export {
   type DivergenceResult,
   divergence,
 } from "../core/ops/merge-base.js";
-export { type RawRefTarget, type ReadRefOptions, readRef } from "../core/ops/plumbing.js";
+export {
+  type CommitTreeOptions,
+  commitTree,
+  type RawRefTarget,
+  type ReadRefOptions,
+  type ReadTreeOptions,
+  readRef,
+  readTree,
+  writeTree,
+} from "../core/ops/plumbing.js";
 export type { CommitView, TreeEntryView } from "../core/ops/reads.js";
 export {
   type RecoverRefOptions,
@@ -77,6 +86,7 @@ export {
   type CheckoutRow,
   CheckoutStore,
   type IndexEntry,
+  type IndexStore,
   SharedRepoStore,
   SqliteGitDatabase,
   type StoreOptions,
@@ -96,6 +106,7 @@ export {
   type GitCleanOptions,
   type GitCloneOptions,
   type GitCommitOptions,
+  type GitCommitTreeOptions,
   type GitConfigGetOptions,
   type GitConfigSetOptions,
   type GitDiffOptions,
@@ -112,6 +123,7 @@ export {
   type GitPullOptions,
   type GitPushOptions,
   type GitReadRefOptions,
+  type GitReadTreeOptions,
   type GitRebaseContinueOptions,
   type GitRebaseOptions,
   type GitRecoverRefOptions,
@@ -122,6 +134,12 @@ export {
   type GitRevertContinueOptions,
   type GitRevertOptions,
   type GitRmOptions,
+  type GitScratchAddOptions,
+  type GitScratchCommitTreeOptions,
+  type GitScratchIndex,
+  type GitScratchIndexCallback,
+  type GitScratchIndexOptions,
+  type GitScratchReadTreeOptions,
   type GitStatusOptions,
   type GitStatusReport,
   type GitStatusReportOptions,
@@ -131,4 +149,5 @@ export {
   type GitWorkspaceBinding,
   type GitWorktreeAddOptions,
   type GitWorktreeRemoveOptions,
+  type GitWriteTreeOptions,
 } from "./client.js";

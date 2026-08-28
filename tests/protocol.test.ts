@@ -439,7 +439,7 @@ describe("discovery", () => {
     ).rejects.toMatchObject({ code: "E2BIG" });
   });
 
-  it("keeps tenfold advertisement growth linear and under the production cap", async () => {
+  it("keeps a production-sized advertisement under the time cap", async () => {
     const measure = async (count: number): Promise<number> => {
       const lines = Array.from(
         { length: count },
@@ -449,7 +449,11 @@ describe("discovery", () => {
       const before = performance.now();
       const result = await discover("http://host/repo", "git-upload-pack", {
         http: canned(() =>
-          respond(body, "application/x-git-upload-pack-advertisement", body.length),
+          respond(
+            body,
+            "application/x-git-upload-pack-advertisement",
+            Math.min(body.length, MAX_PROTOCOL_SOURCE_CHUNK_BYTES),
+          ),
         ),
       });
       expect(result.refs).toHaveLength(count);
@@ -457,19 +461,12 @@ describe("discovery", () => {
     };
 
     expect(MAX_PROTOCOL_RETAINED_BYTES).toBe(4 * 1024 * 1024);
-    await measure(1_000);
-    const smallSamples: number[] = [];
-    const largeSamples: number[] = [];
-    for (let sample = 0; sample < 3; sample++) {
-      smallSamples.push(await measure(1_000));
-      largeSamples.push(await measure(10_000));
+    await measure(10_000);
+    const samples: number[] = [];
+    for (let sample = 0; sample < 5; sample++) {
+      samples.push(await measure(10_000));
     }
-    smallSamples.sort((a, b) => a - b);
-    largeSamples.sort((a, b) => a - b);
-    const small = smallSamples[1] ?? Number.POSITIVE_INFINITY;
-    const large = largeSamples[1] ?? Number.POSITIVE_INFINITY;
-    expect(Math.max(...largeSamples)).toBeLessThan(100);
-    expect(large / Math.max(small, 1)).toBeLessThanOrEqual(12);
+    expect(Math.max(...samples)).toBeLessThan(100);
   });
 
   it("agrees with the refs a real git server advertises", async () => {

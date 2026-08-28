@@ -66,15 +66,20 @@ import {
 } from "../core/ops/network.js";
 import {
   type CatFileOptions,
+  type CommitTreeOptions,
   catFile as catFileOp,
+  commitTree as commitTreeOp,
   type HashObjectOptions,
   hashObject as hashObjectOp,
   type RawRefTarget,
   type ReadRefOptions,
+  type ReadTreeOptions,
   readRef as readRefOp,
+  readTree as readTreeOp,
   repoRoot as repoRootOp,
   type UpdateRefOptions,
   updateRef as updateRefOp,
+  writeTree as writeTreeOp,
 } from "../core/ops/plumbing.js";
 import { type PullOptions, pull as pullOp } from "../core/ops/pull.js";
 import { type PushOptions, push as pushOp } from "../core/ops/push.js";
@@ -199,6 +204,9 @@ export type GitRemoteAddOptions = RemoteAddOptions & GitDirOptions;
 export type GitRemoteRemoveOptions = RemoteRemoveOptions & GitDirOptions;
 export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
 export type GitCatFileOptions = CatFileOptions & GitDirOptions;
+export type GitReadTreeOptions = ReadTreeOptions & GitDirOptions;
+export type GitWriteTreeOptions = GitDirOptions;
+export type GitCommitTreeOptions = CommitTreeOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
 export type GitDivergenceOptions = DivergenceOptions & GitDirOptions;
 export type GitReadRefOptions = ReadRefOptions & GitDirOptions;
@@ -220,6 +228,24 @@ export interface GitStatusReport {
   entries: StatusEntry[];
   branch?: StatusBranch;
 }
+
+export type GitScratchReadTreeOptions = ReadTreeOptions;
+export type GitScratchAddOptions = Omit<AddOptions, "excludeRoots">;
+export type GitScratchCommitTreeOptions = CommitTreeOptions;
+
+/** Synchronous operations scoped to one transaction-owned scratch index. */
+export interface GitScratchIndex {
+  readTree(input: GitScratchReadTreeOptions): void;
+  add(input: GitScratchAddOptions): void;
+  writeTree(): string;
+  commitTree(input: GitScratchCommitTreeOptions): string;
+}
+
+export interface GitScratchIndexOptions extends GitDirOptions {
+  name: string;
+}
+
+export type GitScratchIndexCallback<T> = (index: GitScratchIndex) => T;
 
 export interface Git {
   clone(input: GitCloneOptions): Promise<void>;
@@ -264,6 +290,10 @@ export interface Git {
   configSet(input: GitConfigSetOptions): Promise<void>;
   hashObject(input: GitHashObjectOptions): Promise<string>;
   catFile(input: GitCatFileOptions): Promise<GitCatFileResult>;
+  readTree(input: GitReadTreeOptions): Promise<void>;
+  writeTree(input?: GitWriteTreeOptions): Promise<string>;
+  commitTree(input: GitCommitTreeOptions): Promise<string>;
+  withScratchIndex<T>(input: GitScratchIndexOptions, body: GitScratchIndexCallback<T>): Promise<T>;
   updateRef(input: GitUpdateRefOptions): Promise<void>;
   push(input?: GitPushOptions): Promise<PushResult>;
   pull(input?: GitPullOptions): Promise<MergeResult>;
@@ -525,6 +555,55 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
           ? catFileOp(repo, input)
           : catFileRead(repo, input.oid, input.filepath);
       return { oid: result.oid, bytes: result.bytes };
+    },
+    async readTree(input) {
+      const { dir, ...readOptions } = input;
+      readTreeOp(at(dir), context.worktree, readOptions);
+    },
+    async writeTree(input = {}) {
+      return writeTreeOp(at(input.dir));
+    },
+    async commitTree(input) {
+      const { dir, ...commitOptions } = input;
+      return commitTreeOp(context, at(dir), commitOptions);
+    },
+    async withScratchIndex(input, body) {
+      const repo = at(input.dir);
+      return repo.store.withScratchIndex(input.name, (index) => {
+        let active = true;
+        const requireActive = (): void => {
+          if (!active) throw new GitError("EINVAL", "scratch index session is no longer active");
+        };
+        const scratch: GitScratchIndex = {
+          readTree(readOptions) {
+            requireActive();
+            readTreeOp(repo, context.worktree, readOptions, index);
+          },
+          add(addOptions) {
+            requireActive();
+            addOp(
+              repo,
+              context.worktree,
+              { ...addOptions, excludeRoots: excludeRoots(repo) },
+              context,
+              index,
+            );
+          },
+          writeTree() {
+            requireActive();
+            return writeTreeOp(repo, index);
+          },
+          commitTree(commitOptions) {
+            requireActive();
+            return commitTreeOp(context, repo, commitOptions);
+          },
+        };
+        try {
+          return body(scratch);
+        } finally {
+          active = false;
+        }
+      });
     },
     async updateRef(input) {
       const repo = at(input.dir);

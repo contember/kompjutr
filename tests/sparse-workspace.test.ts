@@ -714,11 +714,13 @@ describe("SQLite sparse workspace source", () => {
       mtime: null,
       ino: null,
     });
+    workspace.database.db.run("PRAGMA ignore_check_constraints = ON");
     workspace.database.db.run(
       "UPDATE git_index SET path = CAST(path AS BLOB) WHERE checkout_id = ? AND path = ?",
       workspace.repo.checkout.checkoutId,
       storedPath,
     );
+    workspace.database.db.run("PRAGMA ignore_check_constraints = OFF");
     const recorded = new RecordingIndexAncestorDatabase(workspace.database.db);
     const lookup = createSqliteSparseWorkspaceSource(recorded).indexAncestorFacts;
     if (lookup === undefined) throw new Error("missing index ancestor source");

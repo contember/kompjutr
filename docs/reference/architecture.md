@@ -70,6 +70,9 @@ Repository state is relational rather than a fake `.git` tree:
   `git_index_dirty`, `git_operation_state`, `git_operation_steps`,
   `git_operation_touched`, and `git_checkout_reflog_entries`. Rows below
   `git_checkouts` use `checkout_id`.
+- `git_scratch_indexes` and `git_scratch_index_entries` are repository-scoped
+  transaction-local rows. They never survive a public scratch callback and are
+  therefore neither checkout state nor maintenance roots.
 
 `git_repositories` owns the shared identity, provisional-clone lifecycle, fetch
 generation, and shallow revision. `git_checkouts` owns the immutable canonical
@@ -77,6 +80,16 @@ root, raw `HEAD`, and primary marker. Checkout views of the same store use one
 shared object, pack, ref, config, shallow, fetch, maintenance, and cache
 namespace. Their working trees, indexes, tracker state, operation journals, and
 raw `HEAD` remain independent.
+
+The native `readTree()` and `writeTree()` methods target the selected checkout
+index. `withScratchIndex({ name }, callback)` instead creates one named index
+inside a synchronous outer transaction and passes a revoked-on-return handle
+with `readTree`, `add`, `writeTree`, and `commitTree`. Nested operations join the
+outer transaction. A throw, a returned thenable, or a caught nested operation
+failure poisons and rolls back the whole session, including newly written
+objects. Successful cleanup deletes the scratch header and cascades its entries
+before the callback result becomes visible. The handle cannot be reused after
+return, and no new maintenance lifecycle is required.
 
 No operation depends on a `.git` directory.
 
@@ -239,6 +252,13 @@ New commit objects must produce a valid cache projection atomically with object
 visibility. Malformed, oversized, unsafe-numeric, or otherwise uncacheable new
 commits are rejected. The cache stores identities and messages as bytes so NUL
 and Unicode content round-trip exactly.
+
+`writeTree()` preflights the selected ordered index before materialization and
+rejects conflicts, corrupt rows, missing objects, and structural limits without
+leaving partial objects. `commitTree()` authenticates an exact tree and up to two
+ordered exact commit parents, resolves bounded identity precedence, preserves the
+message bytes exactly, and writes one detached commit without changing any ref,
+reflog, index, tracker, journal, worktree, or maintenance root.
 
 Short bounded logs retain the lazy point-read path. Larger logs use one
 source-validated recursive graph cursor, validate the collected graph for

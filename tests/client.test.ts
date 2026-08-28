@@ -2,11 +2,17 @@
 // configured with `createSqliteGitClient()`, driven only through
 // `workspace.git`, with no Computer fork anywhere.
 
+import { join } from "node:path";
+
 import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
-import { createGit, type Git } from "../src/git/client.js";
+import { Repository } from "../src/core/repository.js";
+import type { Worktree } from "../src/core/worktree.js";
+import type { ScanEntry } from "../src/fs/types.js";
+import { createGit, type Git, type GitScratchIndex } from "../src/git/client.js";
+import { iterateIndexTrackerDirty, readIndexTrackerState } from "../src/sqlite/index-tracker.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -19,6 +25,7 @@ import {
 } from "./helpers/workspace.js";
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
+const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 
 function makeWorkspace(): { workspace: Workspace; storage: SqliteTestStorage } {
   const storage = new SqliteTestStorage();
@@ -47,6 +54,117 @@ function bindNativeGitDatabase(workspace: TestWorkspace, database: SqliteGitData
     timezoneOffset: workspace.context.timezoneOffset,
     defaultIdentity: IDENTITY,
   });
+}
+
+function maintenanceState(database: SqliteGitDatabase, repoId: number) {
+  const db = database.db;
+  return {
+    control: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_maintenance_control WHERE repo_id = ? ORDER BY repo_id",
+      repoId,
+    ),
+    runs: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_maintenance_runs WHERE repo_id = ? ORDER BY run_id",
+      repoId,
+    ),
+    objects: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_maintenance_objects WHERE repo_id = ? ORDER BY run_id, oid",
+      repoId,
+    ),
+    shallow: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_maintenance_shallow WHERE repo_id = ? ORDER BY run_id, oid",
+      repoId,
+    ),
+    repackBatches: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_maintenance_repack_batches WHERE repo_id = ? ORDER BY run_id, batch_id",
+      repoId,
+    ),
+    repackObjects: db.all<Record<string, unknown>>(
+      `SELECT * FROM git_maintenance_repack_objects
+        WHERE repo_id = ? ORDER BY run_id, batch_id, ordinal`,
+      repoId,
+    ),
+    looseCandidates: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_loose_gc_candidates WHERE repo_id = ? ORDER BY oid",
+      repoId,
+    ),
+    packCandidates: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_pack_gc_candidates WHERE repo_id = ? ORDER BY pack_id",
+      repoId,
+    ),
+  };
+}
+
+function clientControlState(
+  workspace: TestWorkspace,
+  dir: string,
+  database: SqliteGitDatabase = workspace.database,
+) {
+  const checkout = database.findCheckout(dir);
+  if (checkout === null) throw new Error(`repository is missing at ${dir}`);
+  const repo = new Repository(database.openCheckout(checkout));
+  const refs = repo.store.listRefs();
+  return {
+    head: repo.checkout.head(),
+    refs,
+    reflogs: [
+      { ref: "HEAD", entries: repo.reflog("HEAD") },
+      ...refs.map((ref) => ({ ref: ref.name, entries: repo.reflog(ref.name) })),
+    ],
+    index: [...repo.checkout.indexScan()],
+    tracker: readIndexTrackerState(database.db, checkout.id),
+    trackerDirty: [...iterateIndexTrackerDirty(database.db, checkout.id)],
+    operation: repo.checkout.readOperationState(),
+    maintenance: maintenanceState(database, checkout.repoId),
+    scratchIndexes: database.db.all<Record<string, unknown>>(
+      "SELECT * FROM git_scratch_indexes WHERE repo_id = ? ORDER BY name",
+      checkout.repoId,
+    ),
+    scratchEntries: database.db.all<Record<string, unknown>>(
+      `SELECT * FROM git_scratch_index_entries
+        WHERE repo_id = ? ORDER BY name, path, stage`,
+      checkout.repoId,
+    ),
+  };
+}
+
+function clientWorktreeState(workspace: TestWorkspace, root: string) {
+  return workspace.worktree.scan(root, { limit: 1_000 }).map((entry) => ({
+    path: entry.path,
+    type: entry.type,
+    mode: entry.mode,
+    target: entry.type === "symlink" ? workspace.worktree.readlink(entry.path) : null,
+    bytes: entry.type === "file" ? [...workspace.worktree.readFile(entry.path)] : [],
+  }));
+}
+
+function syntheticCachedWorktree(inner: Worktree, count: number, contentId: Uint8Array): Worktree {
+  return {
+    ...inner,
+    scan(_root, options): ScanEntry[] {
+      const after = options.after;
+      const start =
+        after === undefined
+          ? 0
+          : Number.parseInt(after.slice(after.lastIndexOf("f") + 1, -4), 10) + 1;
+      const rows: ScanEntry[] = [];
+      for (let index = start; index < count && rows.length < options.limit; index++) {
+        rows.push({
+          path: `/f${index.toString().padStart(5, "0")}.txt`,
+          type: "file",
+          mode: 0o100644,
+          size: 0,
+          mtime: 1,
+          ino: index + 2,
+          nlink: 1,
+          rev: 1,
+          target: null,
+          contentId,
+        });
+      }
+      return rows;
+    },
+  };
 }
 
 async function commitFile(
@@ -821,6 +939,230 @@ describe("createSqliteGitClient", () => {
     expect(store.hasConflicts()).toBe(false);
     expect(workspace.worktree.stat(`${dir}/deleted.txt`)).toBeNull();
     expect(store.readOperationState()).toBeNull();
+  });
+
+  it("matches a Git alternate-index snapshot and preserves every checkout control", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture
+      .write("changed.txt", "base\n")
+      .write("removed.txt", "removed\n")
+      .writeExecutable("bin/run", "#!/bin/sh\n")
+      .symlink("changed.txt", "link");
+    const expectedBase = fixture.commit("base");
+    const expectedBaseTree = fixture.git("rev-parse", `${expectedBase}^{tree}`);
+
+    const { git, workspace } = makeNativeGit();
+    const dir = "/snapshot";
+    await git.init({ dir });
+    writeWorkFile(workspace, `${dir}/changed.txt`, "base\n");
+    writeWorkFile(workspace, `${dir}/removed.txt`, "removed\n");
+    writeWorkFile(workspace, `${dir}/bin/run`, "#!/bin/sh\n", 0o755);
+    workspace.worktree.symlink("changed.txt", `${dir}/link`);
+    await git.add({ dir, paths: [], all: true });
+    const base = (
+      await git.commit({
+        dir,
+        message: "base",
+        author: FIXTURE_IDENTITY,
+        committer: FIXTURE_IDENTITY,
+      })
+    ).oid;
+    expect(base).toBe(expectedBase);
+
+    await git.readTree({ dir, tree: "HEAD" });
+    await expect(git.writeTree({ dir })).resolves.toBe(expectedBaseTree);
+    const beforeDetached = clientControlState(workspace, dir);
+    const beforeDetachedWorktree = clientWorktreeState(workspace, dir);
+    const expectedDetached = fixture.gitInput(
+      "detached\n",
+      "commit-tree",
+      expectedBaseTree,
+      "-p",
+      base,
+    );
+    await expect(
+      git.commitTree({
+        dir,
+        tree: expectedBaseTree,
+        message: "detached\n",
+        parent: [base],
+        author: FIXTURE_IDENTITY,
+        committer: FIXTURE_IDENTITY,
+      }),
+    ).resolves.toBe(expectedDetached);
+    expect(clientControlState(workspace, dir)).toEqual(beforeDetached);
+    expect(clientWorktreeState(workspace, dir)).toEqual(beforeDetachedWorktree);
+
+    writeWorkFile(workspace, `${dir}/changed.txt`, "staged\n");
+    await git.add({ dir, paths: ["changed.txt"] });
+    writeWorkFile(workspace, `${dir}/changed.txt`, "worktree\n");
+    workspace.worktree.unlink(`${dir}/removed.txt`);
+    writeWorkFile(workspace, `${dir}/new/deep.txt`, "new\n");
+    writeWorkFile(workspace, `${dir}/bin/run`, "not executable\n");
+    workspace.worktree.unlink(`${dir}/link`);
+    workspace.worktree.symlink("new/deep.txt", `${dir}/link`);
+
+    fixture
+      .write("changed.txt", "worktree\n")
+      .remove("removed.txt")
+      .write("new/deep.txt", "new\n")
+      .write("bin/run", "not executable\n")
+      .chmod("bin/run", 0o644)
+      .remove("link")
+      .symlink("new/deep.txt", "link");
+    const environment = { GIT_INDEX_FILE: join(fixture.dir, ".git", "snapshot.index") };
+    fixture.gitWithEnv(environment, "read-tree", "HEAD");
+    fixture.gitWithEnv(environment, "add", "-A");
+    const expectedTree = fixture.gitWithEnv(environment, "write-tree");
+    const expectedSnapshot = fixture.gitInputWithEnv(
+      "snapshot\n",
+      environment,
+      "commit-tree",
+      expectedTree,
+      "-p",
+      base,
+    );
+
+    const checkout = workspace.database.findCheckout(dir);
+    if (checkout === null) throw new Error("snapshot repository is missing");
+    const store = workspace.database.openCheckout(checkout);
+    store.writeOperationState(
+      {
+        kind: "cherry-pick",
+        originalHeadRef: "refs/heads/main",
+        originalHeadOid: base,
+        phase: "empty",
+        emptyReason: "result",
+        sourceOid: base,
+        selectedParentOid: null,
+        mainline: null,
+        currentLabel: "HEAD",
+        incomingLabel: base.slice(0, 7),
+        message: "base\n",
+        author: null,
+        committer: null,
+      },
+      [],
+    );
+
+    const beforeControl = clientControlState(workspace, dir);
+    const beforeWorktree = clientWorktreeState(workspace, dir);
+    const beforeObjects = workspace.database.db.scalar<number>(
+      "SELECT count(*) FROM git_objects WHERE repo_id = ?",
+      checkout.repoId,
+    );
+
+    await expect(
+      git.withScratchIndex({ dir, name: "failed-snapshot" }, (scratch) => {
+        scratch.readTree({ tree: "HEAD" });
+        scratch.add({ paths: [], all: true });
+        const tree = scratch.writeTree();
+        scratch.commitTree({
+          tree,
+          message: "rolled back\n",
+          parent: [base],
+          author: FIXTURE_IDENTITY,
+          committer: FIXTURE_IDENTITY,
+        });
+        throw new Error("abort scratch snapshot");
+      }),
+    ).rejects.toThrow("abort scratch snapshot");
+    expect(
+      workspace.database.db.scalar<number>(
+        "SELECT count(*) FROM git_objects WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(beforeObjects);
+    expect(clientControlState(workspace, dir)).toEqual(beforeControl);
+    expect(clientWorktreeState(workspace, dir)).toEqual(beforeWorktree);
+
+    const afterFailureDatabase = new SqliteGitDatabase(workspace.database.db);
+    expect(clientControlState(workspace, dir, afterFailureDatabase)).toEqual(beforeControl);
+    await expect(
+      git.withScratchIndex({ dir, name: "async-snapshot" }, async (scratch) => {
+        scratch.readTree({ tree: "HEAD" });
+        scratch.add({ paths: [], all: true });
+        return scratch.writeTree();
+      }),
+    ).rejects.toMatchObject({ code: "EINVAL" });
+    expect(clientControlState(workspace, dir)).toEqual(beforeControl);
+
+    let leaked: GitScratchIndex | undefined;
+    const beforeStatements = workspace.storage.statementCount;
+    const snapshot = await git.withScratchIndex({ dir, name: "snapshot" }, (scratch) => {
+      leaked = scratch;
+      scratch.readTree({ tree: "HEAD" });
+      scratch.add({ paths: [], all: true });
+      const tree = scratch.writeTree();
+      expect(tree).toBe(expectedTree);
+      return scratch.commitTree({
+        tree,
+        message: "snapshot\n",
+        parent: [base],
+        author: FIXTURE_IDENTITY,
+        committer: FIXTURE_IDENTITY,
+      });
+    });
+    const statements = workspace.storage.statementCount - beforeStatements;
+    expect(statements).toBeLessThan(1_000);
+    expect(snapshot).toBe(expectedSnapshot);
+    const captured = leaked;
+    if (captured === undefined) throw new Error("scratch handle was not captured");
+    expect(() => captured.writeTree()).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(() =>
+      captured.commitTree({ tree: expectedTree, message: "leaked\n", parent: [base] }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+
+    expect((await git.catFile({ dir, oid: snapshot })).bytes).toEqual(
+      new Uint8Array(fixture.gitBinary("cat-file", "commit", expectedSnapshot)),
+    );
+    expect((await git.catFile({ dir, oid: expectedTree })).bytes).toEqual(
+      new Uint8Array(fixture.gitBinary("cat-file", "tree", expectedTree)),
+    );
+    expect(clientControlState(workspace, dir)).toEqual(beforeControl);
+    expect(clientWorktreeState(workspace, dir)).toEqual(beforeWorktree);
+
+    const coldDatabase = new SqliteGitDatabase(workspace.database.db);
+    const coldGit = bindNativeGitDatabase(workspace, coldDatabase);
+    expect(clientControlState(workspace, dir, coldDatabase)).toEqual(beforeControl);
+    expect((await coldGit.catFile({ dir, oid: snapshot })).bytes).toEqual(
+      new Uint8Array(fixture.gitBinary("cat-file", "commit", expectedSnapshot)),
+    );
+  });
+
+  it("keeps the maximal public scratch snapshot below SQL and memory budgets", async () => {
+    const workspace = makeTestWorkspace();
+    const setupGit = bindNativeGit(workspace);
+    await setupGit.init({ dir: "/" });
+    const blob = await setupGit.hashObject({ content: new Uint8Array(), write: true });
+    const checkout = workspace.database.findCheckout("/");
+    if (checkout === null) throw new Error("scale repository is missing");
+    const repo = new Repository(workspace.database.openCheckout(checkout));
+    const contentId = new Uint8Array([7, 8, 9]);
+    repo.store.upsertBlobIds([{ contentId, oid: blob }]);
+    const git = createGit()({
+      database: workspace.database,
+      worktree: syntheticCachedWorktree(workspace.worktree, 10_000, contentId),
+      now: workspace.context.now,
+      timezoneOffset: workspace.context.timezoneOffset,
+      defaultIdentity: IDENTITY,
+    });
+    const beforeControl = clientControlState(workspace, "/");
+    const beforeStatements = workspace.storage.statementCount;
+
+    const oid = await git.withScratchIndex({ name: "maximal" }, (scratch) => {
+      scratch.readTree({ empty: true });
+      scratch.add({ paths: [], all: true });
+      const tree = scratch.writeTree();
+      return scratch.commitTree({ tree, message: "maximal snapshot\n" });
+    });
+
+    expect(oid).toMatch(/^[0-9a-f]{40}$/);
+    expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
+    expect(repo.store.memory.highWaterBytes).toBeLessThan(64 * 1024 * 1024);
+    expect(repo.store.memory.activeCount).toBe(0);
+    expect(clientControlState(workspace, "/")).toEqual(beforeControl);
   });
 
   it("fails explicitly for methods that remain unsupported", async () => {

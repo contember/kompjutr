@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import type {
   GitCherryPickContinueOptions,
   GitCherryPickOptions,
+  GitCommitTreeOptions,
+  CommitTreeOptions as GitCoreCommitTreeOptions,
   DivergenceOptions as GitCoreDivergenceOptions,
+  IndexStore as GitCoreIndexStore,
   ReadRefOptions as GitCoreReadRefOptions,
+  ReadTreeOptions as GitCoreReadTreeOptions,
   StatusReport as GitCoreStatusReport,
   WorktreeAddOptions as GitCoreWorktreeAddOptions,
   WorktreeRemoveOptions as GitCoreWorktreeRemoveOptions,
@@ -16,6 +20,7 @@ import type {
   GitStatusReportOptions as GitEntrypointStatusReportOptions,
   RawRefTarget as GitRawRefTarget,
   GitReadRefOptions,
+  GitReadTreeOptions,
   GitRebaseContinueOptions,
   GitRebaseOptions,
   RebaseResult as GitRebaseResult,
@@ -28,26 +33,40 @@ import type {
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
   GitRevertOptions,
+  GitScratchAddOptions,
+  GitScratchCommitTreeOptions,
+  GitScratchIndex,
+  GitScratchIndexCallback,
+  GitScratchIndexOptions,
+  GitScratchReadTreeOptions,
   StatusFormatOptions as GitStatusFormatOptions,
   GitWorktreeAddOptions,
   WorktreeAddTarget as GitWorktreeAddTarget,
   WorktreeInfo as GitWorktreeInfo,
   GitWorktreeRemoveOptions,
+  GitWriteTreeOptions,
 } from "../src/git/index.js";
 import {
+  commitTree as gitCommitTree,
   divergence as gitDivergence,
   readRef as gitReadRef,
+  readTree as gitReadTree,
   statusFormatOptions as gitStatusFormatOptions,
   worktreeAdd as gitWorktreeAdd,
   worktreeList as gitWorktreeList,
   worktreePrune as gitWorktreePrune,
   worktreeRemove as gitWorktreeRemove,
+  writeTree as gitWriteTree,
 } from "../src/git/index.js";
 import type {
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
   GitCherryPickOptions as RootCherryPickOptions,
+  GitCommitTreeOptions as RootCommitTreeOptions,
+  CommitTreeOptions as RootCoreCommitTreeOptions,
   DivergenceOptions as RootCoreDivergenceOptions,
+  IndexStore as RootCoreIndexStore,
   ReadRefOptions as RootCoreReadRefOptions,
+  ReadTreeOptions as RootCoreReadTreeOptions,
   StatusReport as RootCoreStatusReport,
   WorktreeAddOptions as RootCoreWorktreeAddOptions,
   WorktreeRemoveOptions as RootCoreWorktreeRemoveOptions,
@@ -59,6 +78,7 @@ import type {
   GitWorktreeAddOptions as RootGitWorktreeAddOptions,
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
   RawRefTarget as RootRawRefTarget,
+  GitReadTreeOptions as RootReadTreeOptions,
   GitRebaseContinueOptions as RootRebaseContinueOptions,
   GitRebaseOptions as RootRebaseOptions,
   RebaseResult as RootRebaseResult,
@@ -71,22 +91,116 @@ import type {
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
   GitRevertOptions as RootRevertOptions,
+  GitScratchAddOptions as RootScratchAddOptions,
+  GitScratchCommitTreeOptions as RootScratchCommitTreeOptions,
+  GitScratchIndex as RootScratchIndex,
+  GitScratchIndexCallback as RootScratchIndexCallback,
+  GitScratchIndexOptions as RootScratchIndexOptions,
+  GitScratchReadTreeOptions as RootScratchReadTreeOptions,
   StatusFormatOptions as RootStatusFormatOptions,
   GitStatusOptions as RootStatusOptions,
   GitStatusReport as RootStatusReport,
   GitStatusReportOptions as RootStatusReportOptions,
   WorktreeAddTarget as RootWorktreeAddTarget,
   WorktreeInfo as RootWorktreeInfo,
+  GitWriteTreeOptions as RootWriteTreeOptions,
 } from "../src/index.js";
 import {
+  commitTree as rootCommitTree,
   divergence as rootDivergence,
   readRef as rootReadRef,
+  readTree as rootReadTree,
   statusFormatOptions as rootStatusFormatOptions,
   worktreeAdd as rootWorktreeAdd,
   worktreeList as rootWorktreeList,
   worktreePrune as rootWorktreePrune,
   worktreeRemove as rootWorktreeRemove,
+  writeTree as rootWriteTree,
 } from "../src/index.js";
+
+describe("public object-write plumbing exports", () => {
+  it("exposes matching core operations, facade options, scratch handles, and methods", () => {
+    const coreRead: RootCoreReadTreeOptions = { tree: "HEAD" };
+    const gitCoreRead: GitCoreReadTreeOptions = coreRead;
+    const read: RootReadTreeOptions = { ...coreRead, dir: "/repo" };
+    const gitRead: GitReadTreeOptions = read;
+    const write: RootWriteTreeOptions = { dir: "/repo" };
+    const gitWrite: GitWriteTreeOptions = write;
+    const coreCommit: RootCoreCommitTreeOptions = {
+      tree: "HEAD^{tree}",
+      message: "snapshot\n",
+      parent: ["HEAD"],
+    };
+    const gitCoreCommit: GitCoreCommitTreeOptions = coreCommit;
+    const commit: RootCommitTreeOptions = { ...coreCommit, dir: "/repo" };
+    const gitCommit: GitCommitTreeOptions = commit;
+    const scratchOptions: RootScratchIndexOptions = { dir: "/repo", name: "snapshot" };
+    const gitScratchOptions: GitScratchIndexOptions = scratchOptions;
+    const scratchRead: RootScratchReadTreeOptions = { empty: true };
+    const gitScratchRead: GitScratchReadTreeOptions = scratchRead;
+    const scratchAdd: RootScratchAddOptions = { paths: [], all: true };
+    const gitScratchAdd: GitScratchAddOptions = scratchAdd;
+    const scratchCommit: RootScratchCommitTreeOptions = coreCommit;
+    const gitScratchCommit: GitScratchCommitTreeOptions = scratchCommit;
+    const callback: RootScratchIndexCallback<string> = (scratch: RootScratchIndex) => {
+      scratch.readTree(scratchRead);
+      scratch.add(scratchAdd);
+      const tree = scratch.writeTree();
+      return scratch.commitTree({ ...scratchCommit, tree });
+    };
+    const gitCallback: GitScratchIndexCallback<string> = (scratch: GitScratchIndex) =>
+      callback(scratch);
+    const rootIndex: RootCoreIndexStore | undefined = undefined;
+    const gitIndex: GitCoreIndexStore | undefined = rootIndex;
+    const rootMethods: readonly (keyof RootGit)[] = [
+      "readTree",
+      "writeTree",
+      "commitTree",
+      "withScratchIndex",
+    ];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
+
+    expect([
+      gitCoreRead.tree,
+      gitRead.dir,
+      gitWrite.dir,
+      gitCoreCommit.message,
+      gitCommit.dir,
+      gitScratchOptions.name,
+      gitScratchRead.empty,
+      gitScratchAdd.all,
+      gitScratchCommit.parent,
+      gitCallback,
+      gitIndex,
+      gitMethods,
+      gitReadTree,
+      rootReadTree,
+      gitWriteTree,
+      rootWriteTree,
+      gitCommitTree,
+      rootCommitTree,
+    ]).toEqual([
+      "HEAD",
+      "/repo",
+      "/repo",
+      "snapshot\n",
+      "/repo",
+      "snapshot",
+      true,
+      true,
+      ["HEAD"],
+      gitCallback,
+      undefined,
+      rootMethods,
+      gitReadTree,
+      rootReadTree,
+      gitWriteTree,
+      rootWriteTree,
+      gitCommitTree,
+      rootCommitTree,
+    ]);
+  });
+});
 
 describe("public bounded read exports", () => {
   it("exposes matching divergence and raw-ref operations from both entrypoints", () => {
