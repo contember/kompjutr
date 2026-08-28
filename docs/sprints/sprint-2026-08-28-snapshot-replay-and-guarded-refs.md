@@ -344,3 +344,11 @@ resolved before implementation.
   18.92 s, including Git parity for non-BMP paths and gitlinks, exact result
   limits, one recursive SQL cursor, cold reopen, Computer passthrough, and
   public exports. The T2 root inspection found no remaining material issue.
+- WU4 added atomic index-only snapshot replay through the transaction-scoped
+  scratch handle. Its focused witness passed 105 tests in 19.05 s, including
+  real-Git clean-tree and structural-conflict parity, no-write conflicts,
+  rollback, cold reopen, corrupt rows, the 1,000-entry bound, and a retained
+  clean plan above 16 MiB within the shared 64 MiB limit. Typecheck and Biome
+  passed. Singer's first T3 review found three blockers in nested memory
+  accounting, physical conflict projection, and parent-validation order; the
+  fixes closed all three and the independent re-review approved WU4.

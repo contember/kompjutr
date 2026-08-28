@@ -128,6 +128,11 @@ import {
   tag as tagOp,
 } from "../core/ops/refs.js";
 import {
+  type ReplaySnapshotOptions,
+  type ReplaySnapshotResult,
+  replaySnapshot as replaySnapshotOp,
+} from "../core/ops/replay.js";
+import {
   type RevertContinueOptions,
   type RevertOptions,
   revertAbort as revertAbortOp,
@@ -239,6 +244,7 @@ export interface GitStatusReport {
 export type GitScratchReadTreeOptions = ReadTreeOptions;
 export type GitScratchAddOptions = Omit<AddOptions, "excludeRoots">;
 export type GitScratchCommitTreeOptions = CommitTreeOptions;
+export type GitScratchReplaySnapshotOptions = ReplaySnapshotOptions;
 
 /** Synchronous operations scoped to one transaction-owned scratch index. */
 export interface GitScratchIndex {
@@ -246,6 +252,7 @@ export interface GitScratchIndex {
   add(input: GitScratchAddOptions): void;
   writeTree(): string;
   commitTree(input: GitScratchCommitTreeOptions): string;
+  replaySnapshot(input: GitScratchReplaySnapshotOptions): ReplaySnapshotResult;
 }
 
 export interface GitScratchIndexOptions extends GitDirOptions {
@@ -611,6 +618,10 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
           commitTree(commitOptions) {
             requireActive();
             return commitTreeOp(context, repo, commitOptions);
+          },
+          replaySnapshot(replayOptions) {
+            requireActive();
+            return replaySnapshotOp(repo, index, replayOptions);
           },
         };
         try {

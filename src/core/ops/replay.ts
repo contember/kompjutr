@@ -2,15 +2,32 @@
 
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
 import type { MemoryReservation } from "../../sqlite/memory.js";
-import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { type IndexEntry, type IndexStore, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "../bytes.js";
 import type { TextMergeOptions } from "../diff/xmerge.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
-import { type Commit, hashObject, parseReplayCommit, parseTag } from "../objects.js";
+import { type Commit, hashObject, MODE_COMMIT, parseReplayCommit, parseTag } from "../objects.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
-import { type IntegrationLimits, type IntegrationPlan, planIntegration } from "./integration.js";
+import { joinSorted } from "../streams.js";
+import { indexFromTree } from "./checkout.js";
+import {
+  type IntegrationConflictKind,
+  type IntegrationLimits,
+  type IntegrationPlan,
+  MAX_INTEGRATION_SOURCE_ROWS,
+  planIntegration,
+} from "./integration.js";
+import type { IntegrationStages } from "./integration-structure.js";
+import {
+  projectedTouchedShape,
+  requireBoundedIntegrationTree,
+  reserveIntegrationPlan,
+} from "./integration-worktree.js";
+import { applyProjectedIndex, validateProjectedIndexEntries } from "./merge-apply.js";
+import { type ProjectedMergeEntry, projectMergePlan } from "./merge-projection.js";
 import { MAX_OPERATION_STEPS } from "./operation-state.js";
+import { writeTree } from "./plumbing.js";
 
 export const MAX_REPLAY_REVISION_CODE_UNITS = 1_024;
 export const MAX_REPLAY_REVISION_HOPS = 32;
@@ -67,6 +84,30 @@ export interface ReplayPlan {
   /** Conservative metadata work, excluding the integration plan's own reads. */
   sqlStatements: number;
 }
+
+export interface ReplaySnapshotOptions {
+  snapshot: string;
+  onto: string;
+}
+
+export interface ReplaySnapshotConflictStage {
+  stage: 1 | 2 | 3;
+  mode: string;
+  oid: string;
+}
+
+export interface ReplaySnapshotConflict {
+  path: string;
+  kind: IntegrationConflictKind;
+  stages: readonly ReplaySnapshotConflictStage[];
+}
+
+export type ReplaySnapshotResult =
+  | { outcome: "clean"; tree: string }
+  | { outcome: "conflicted"; conflicts: readonly ReplaySnapshotConflict[] };
+
+export const MAX_SNAPSHOT_REPLAY_SOURCE_ROWS = MAX_INTEGRATION_SOURCE_ROWS;
+const SNAPSHOT_OBJECT_INFO_PAGE = 4_096;
 
 export interface FixedReplayStepInput {
   sourceOid: string;
@@ -432,6 +473,187 @@ function incomingLabel(
 /** Resolve one source commit and build its bounded integration delta without mutating state. */
 export function planReplay(repo: Repository, input: ReplayInput): ReplayPlan {
   return planReplayInternal(repo, input, null);
+}
+
+function requireSnapshotTreesWithoutGitlinks(repo: Repository, plan: ReplayPlan): void {
+  const trees = new Set([plan.selectedParentTreeOid, plan.sourceTreeOid, plan.currentTreeOid]);
+  trees.delete(null);
+  let rows = 0;
+  for (const tree of trees) {
+    if (tree === null) continue;
+    for (const { path, entry } of repo.walkTree(tree)) {
+      if (rows >= MAX_SNAPSHOT_REPLAY_SOURCE_ROWS) {
+        throw new GitError(
+          "E2BIG",
+          `snapshot replay tree scan exceeds ${MAX_SNAPSHOT_REPLAY_SOURCE_ROWS} rows`,
+        );
+      }
+      rows++;
+      if (entry.mode === MODE_COMMIT) {
+        throw new GitError("EUNSUPPORTED", `snapshot replay rejects gitlink ${path}`);
+      }
+    }
+  }
+}
+
+function conflictStages(stagesBySide: IntegrationStages): ReplaySnapshotConflictStage[] {
+  const stages: ReplaySnapshotConflictStage[] = [];
+  if (stagesBySide.base !== null) {
+    stages.push({ stage: 1, mode: stagesBySide.base.mode, oid: stagesBySide.base.oid });
+  }
+  if (stagesBySide.current !== null) {
+    stages.push({ stage: 2, mode: stagesBySide.current.mode, oid: stagesBySide.current.oid });
+  }
+  if (stagesBySide.incoming !== null) {
+    stages.push({ stage: 3, mode: stagesBySide.incoming.mode, oid: stagesBySide.incoming.oid });
+  }
+  return stages;
+}
+
+function snapshotConflicts(
+  plan: IntegrationPlan,
+  projected: readonly ProjectedMergeEntry[],
+): ReplaySnapshotConflict[] {
+  const kinds = new Map<string, IntegrationConflictKind>();
+  for (const entry of plan.entries) {
+    if (entry.kind === "conflict") kinds.set(entry.path, entry.conflict);
+  }
+  const conflicts: ReplaySnapshotConflict[] = [];
+  for (const entry of projected) {
+    if (entry.stages === null) continue;
+    const kind = kinds.get(entry.logicalPath);
+    if (kind === undefined) {
+      throw new CorruptError(`projected conflict ${entry.path} lost its logical conflict kind`);
+    }
+    conflicts.push({ path: entry.path, kind, stages: conflictStages(entry.stages) });
+  }
+  return conflicts;
+}
+
+function* prospectiveSnapshotIndex(
+  repo: Repository,
+  currentTreeOid: string,
+  projected: readonly ProjectedMergeEntry[],
+): Generator<IndexEntry> {
+  const owned = new Set(projectedTouchedShape(projected).map((entry) => entry.path));
+  for (const row of joinSorted(indexFromTree(repo, currentTreeOid), projected, {
+    left: (entry) => entry.path,
+    right: (entry) => entry.path,
+  })) {
+    if (row.right !== undefined) {
+      if (row.right.stages !== null) {
+        throw new CorruptError("clean snapshot projection retained conflict stages");
+      }
+      const identity = row.right.stageZero;
+      if (identity !== null) {
+        yield {
+          path: row.right.path,
+          stage: 0,
+          mode: Number.parseInt(identity.mode, 8),
+          oid: identity.oid,
+          size: null,
+          mtime: null,
+          ino: null,
+          rev: null,
+        };
+      }
+      continue;
+    }
+    if (row.left !== undefined && !owned.has(row.left.path)) yield row.left;
+  }
+}
+
+function validateSnapshotResultObjects(
+  repo: Repository,
+  currentTreeOid: string,
+  projected: readonly ProjectedMergeEntry[],
+): void {
+  const generated = new Set<string>();
+  for (const entry of projected) {
+    if (entry.content !== null && entry.stageZero !== null) generated.add(entry.stageZero.oid);
+  }
+  const required = new Set<string>();
+  for (const entry of prospectiveSnapshotIndex(repo, currentTreeOid, projected)) {
+    if (entry.mode === 0o160000) {
+      throw new GitError("EUNSUPPORTED", `snapshot replay rejects gitlink ${entry.path}`);
+    }
+    required.add(entry.oid);
+  }
+  const missing = new Set(repo.store.missing(required));
+  for (const oid of missing) {
+    if (!generated.has(oid)) throw new ObjectNotFoundError(oid);
+  }
+  const present = [...required].filter((oid) => !missing.has(oid));
+  for (let offset = 0; offset < present.length; offset += SNAPSHOT_OBJECT_INFO_PAGE) {
+    for (const object of repo.store.objectInfo(
+      present.slice(offset, offset + SNAPSHOT_OBJECT_INFO_PAGE),
+    )) {
+      if (object.type !== "blob") {
+        throw new CorruptError(`snapshot replay result ${object.oid} is not a blob`);
+      }
+    }
+  }
+}
+
+/** Replay one one-parent snapshot commit into a caller-owned transient index. */
+export function replaySnapshot(
+  repo: Repository,
+  index: IndexStore,
+  options: ReplaySnapshotOptions,
+): ReplaySnapshotResult {
+  const snapshot = requireBoundedRevision(Reflect.get(options, "snapshot"), {
+    input: "snapshot",
+    operation: "snapshot replay",
+  });
+  const onto = requireBoundedRevision(Reflect.get(options, "onto"), {
+    input: "onto",
+    operation: "snapshot replay",
+  });
+  const sourceOid = resolveBoundedCommitRevision(repo, snapshot, {
+    input: "snapshot",
+    operation: "snapshot replay",
+  });
+  if (readCommit(repo, sourceOid).parent.length !== 1) {
+    throw new GitError("EINVAL", "snapshot replay requires exactly one parent");
+  }
+  const currentOid = repo.peel(repo.revParse(onto));
+  const plan = planReplay(repo, {
+    kind: "cherry-pick",
+    source: sourceOid,
+    currentOid,
+    incomingLabelStyle: "source-subject",
+  });
+  if (plan.sourceCommit.parent.length !== 1 || plan.selectedParentOid === null) {
+    throw new CorruptError("validated snapshot replay source lost its selected parent");
+  }
+
+  const reservation = reserveIntegrationPlan(repo, plan.integration, plan.retainedBytes);
+  try {
+    requireSnapshotTreesWithoutGitlinks(repo, plan);
+    const projected = projectMergePlan(plan.integration, {
+      currentLabel: plan.labels.current,
+      incomingLabel: plan.labels.incoming,
+    });
+    validateProjectedIndexEntries(projected);
+    const conflicts = snapshotConflicts(plan.integration, projected);
+    if (conflicts.length > 0) return { outcome: "conflicted", conflicts };
+
+    requireBoundedIntegrationTree(prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected));
+    validateSnapshotResultObjects(repo, plan.currentTreeOid, projected);
+    return repo.store.runScratchAwareOperation(() =>
+      repo.store.db.transactionSync(() => {
+        index.indexReplace(indexFromTree(repo, plan.currentTreeOid));
+        applyProjectedIndex(repo, index, projected);
+        reservation.set(
+          "other",
+          checkedRetainedAdd(plan.retainedBytes, plan.integration.retainedBytes),
+        );
+        return { outcome: "clean", tree: writeTree(repo, index) };
+      }),
+    );
+  } finally {
+    reservation.dispose();
+  }
 }
 
 function planReplayInternal(

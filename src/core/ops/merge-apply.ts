@@ -1,10 +1,15 @@
 // Atomic low-level application and restoration of one projected merge plan.
 
 import type { WriteEntry } from "../../fs/types.js";
-import { type IndexEntry, type IndexSink, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import {
+  type IndexEntry,
+  type IndexSink,
+  type IndexStore,
+  MAX_BLOB_BATCH_BYTES,
+} from "../../sqlite/store.js";
 import { fromHex, isOid, utf8, utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
-import { MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
+import { hashObject, MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { comparePaths } from "../streams.js";
@@ -292,7 +297,7 @@ function requireIdentity(mode: string, oid: string, path: string): number {
   return Number.parseInt(mode, 8);
 }
 
-function validateEntries(entries: readonly ProjectedMergeEntry[]): void {
+export function validateProjectedIndexEntries(entries: readonly ProjectedMergeEntry[]): void {
   if (entries.length > MAX_MERGE_TOUCHED_PATHS) {
     throw new GitError("E2BIG", `merge apply exceeds ${MAX_MERGE_TOUCHED_PATHS} projected paths`);
   }
@@ -350,6 +355,13 @@ function validateEntries(entries: readonly ProjectedMergeEntry[]): void {
       entry.worktree.mode !== MODE_EXECUTABLE
     ) {
       throw new CorruptError(`projected merge entry ${entry.path} has non-file content`);
+    }
+    if (
+      entry.content !== null &&
+      entry.stageZero !== null &&
+      hashObject("blob", entry.content) !== entry.stageZero.oid
+    ) {
+      throw new CorruptError(`merged content identity does not match ${entry.path}`);
     }
     contentBytes += entry.content?.length ?? 0;
     if (!Number.isSafeInteger(contentBytes) || contentBytes > MAX_MERGE_APPLY_CONTENT_BYTES) {
@@ -838,12 +850,12 @@ function putIdentity(
 }
 
 function applyIndex(
-  repo: Repository,
+  index: IndexStore,
   entries: readonly ProjectedMergeEntry[],
   specs: readonly TouchedSpec[],
 ): void {
   const projected = new Set(entries.map((entry) => entry.path));
-  repo.checkout.indexApply((sink) => {
+  index.indexApply((sink) => {
     for (const spec of specs) {
       if (!projected.has(spec.path)) sink.remove(spec.path);
     }
@@ -865,6 +877,25 @@ function applyIndex(
       }
     }
   });
+}
+
+/** Write a validated clean projection to one caller-selected index. */
+export function applyProjectedIndex(
+  repo: Repository,
+  index: IndexStore,
+  entries: readonly ProjectedMergeEntry[],
+): void {
+  validateProjectedIndexEntries(entries);
+  if (entries.some((entry) => entry.stages !== null)) {
+    throw new GitError("EUNMERGED", "cannot apply a conflicted projection to an index");
+  }
+  const specs = touchedSpecs(entries);
+  repo.store.runScratchAwareOperation(() =>
+    repo.store.db.transactionSync(() => {
+      contentObjects(repo, entries);
+      applyIndex(index, entries, specs);
+    }),
+  );
 }
 
 function applyDestructiveRoots(entries: readonly ProjectedMergeEntry[]): string[] {
@@ -903,7 +934,7 @@ function applyProjectedOperationInternal(
   options: OperationApplyOptions,
   activeRebase: ActiveRebaseApply | null,
 ): OperationApplyResult {
-  validateEntries(entries);
+  validateProjectedIndexEntries(entries);
   if (activeRebase === null) {
     repo.checkout.requireNoOperationState();
   } else {
@@ -1012,7 +1043,7 @@ function applyProjectedOperationInternal(
     );
   }
   materialiseWrites(repo, worktree, entries, contentOids, calls);
-  applyIndex(repo, entries, specs);
+  applyIndex(repo.checkout, entries, specs);
   if (touched !== null) {
     if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
     if (activeRebase === null) {

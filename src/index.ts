@@ -64,6 +64,13 @@ export {
   reflog,
 } from "./core/ops/ref-log.js";
 export {
+  type ReplaySnapshotConflict,
+  type ReplaySnapshotConflictStage,
+  type ReplaySnapshotOptions,
+  type ReplaySnapshotResult,
+  replaySnapshot,
+} from "./core/ops/replay.js";
+export {
   formatPorcelainV1,
   formatPorcelainV2,
   formatShort,
@@ -144,6 +151,7 @@ export {
   type GitScratchIndexCallback,
   type GitScratchIndexOptions,
   type GitScratchReadTreeOptions,
+  type GitScratchReplaySnapshotOptions,
   type GitStatusOptions,
   type GitStatusReport,
   type GitStatusReportOptions,

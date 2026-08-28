@@ -12,6 +12,9 @@ import type {
   MergeBaseResult as GitCoreMergeBaseResult,
   ReadRefOptions as GitCoreReadRefOptions,
   ReadTreeOptions as GitCoreReadTreeOptions,
+  ReplaySnapshotConflict as GitCoreReplaySnapshotConflict,
+  ReplaySnapshotOptions as GitCoreReplaySnapshotOptions,
+  ReplaySnapshotResult as GitCoreReplaySnapshotResult,
   StatusReport as GitCoreStatusReport,
   UpdateRefDeleteOptions as GitCoreUpdateRefDeleteOptions,
   UpdateRefGuardedOptions as GitCoreUpdateRefGuardedOptions,
@@ -51,6 +54,7 @@ import type {
   GitScratchIndexCallback,
   GitScratchIndexOptions,
   GitScratchReadTreeOptions,
+  GitScratchReplaySnapshotOptions,
   StatusFormatOptions as GitStatusFormatOptions,
   GitUpdateRefOptions,
   GitWorktreeAddOptions,
@@ -65,6 +69,7 @@ import {
   mergeBase as gitMergeBase,
   readRef as gitReadRef,
   readTree as gitReadTree,
+  replaySnapshot as gitReplaySnapshot,
   statusFormatOptions as gitStatusFormatOptions,
   updateRef as gitUpdateRef,
   worktreeAdd as gitWorktreeAdd,
@@ -86,6 +91,9 @@ import type {
   MergeBaseResult as RootCoreMergeBaseResult,
   ReadRefOptions as RootCoreReadRefOptions,
   ReadTreeOptions as RootCoreReadTreeOptions,
+  ReplaySnapshotConflict as RootCoreReplaySnapshotConflict,
+  ReplaySnapshotOptions as RootCoreReplaySnapshotOptions,
+  ReplaySnapshotResult as RootCoreReplaySnapshotResult,
   StatusReport as RootCoreStatusReport,
   UpdateRefDeleteOptions as RootCoreUpdateRefDeleteOptions,
   UpdateRefGuardedOptions as RootCoreUpdateRefGuardedOptions,
@@ -125,6 +133,7 @@ import type {
   GitScratchIndexCallback as RootScratchIndexCallback,
   GitScratchIndexOptions as RootScratchIndexOptions,
   GitScratchReadTreeOptions as RootScratchReadTreeOptions,
+  GitScratchReplaySnapshotOptions as RootScratchReplaySnapshotOptions,
   StatusFormatOptions as RootStatusFormatOptions,
   GitStatusOptions as RootStatusOptions,
   GitStatusReport as RootStatusReport,
@@ -139,6 +148,7 @@ import {
   mergeBase as rootMergeBase,
   readRef as rootReadRef,
   readTree as rootReadTree,
+  replaySnapshot as rootReplaySnapshot,
   statusFormatOptions as rootStatusFormatOptions,
   updateRef as rootUpdateRef,
   worktreeAdd as rootWorktreeAdd,
@@ -229,6 +239,35 @@ describe("public object-write plumbing exports", () => {
       gitCommitTree,
       rootCommitTree,
     ]);
+  });
+
+  it("exposes matching scratch snapshot replay contracts", () => {
+    const coreOptions: RootCoreReplaySnapshotOptions = { snapshot: "checkpoint", onto: "HEAD" };
+    const gitCoreOptions: GitCoreReplaySnapshotOptions = coreOptions;
+    const scratchOptions: RootScratchReplaySnapshotOptions = coreOptions;
+    const gitScratchOptions: GitScratchReplaySnapshotOptions = scratchOptions;
+    const conflict: RootCoreReplaySnapshotConflict = {
+      path: "file.txt",
+      kind: "content",
+      stages: [{ stage: 2, mode: "100644", oid: "1".repeat(40) }],
+    };
+    const gitConflict: GitCoreReplaySnapshotConflict = conflict;
+    const result: RootCoreReplaySnapshotResult = {
+      outcome: "conflicted",
+      conflicts: [conflict],
+    };
+    const gitResult: GitCoreReplaySnapshotResult = result;
+    const methods: readonly (keyof RootScratchIndex)[] = ["replaySnapshot"];
+    const gitMethods: readonly (keyof GitScratchIndex)[] = methods;
+
+    expect([
+      gitCoreOptions.snapshot,
+      gitScratchOptions.onto,
+      gitConflict.stages[0]?.stage,
+      gitResult.outcome,
+      gitMethods,
+      gitReplaySnapshot,
+    ]).toEqual(["checkpoint", "HEAD", 2, "conflicted", methods, rootReplaySnapshot]);
   });
 });
 
