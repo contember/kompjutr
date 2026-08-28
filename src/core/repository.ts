@@ -80,6 +80,8 @@ interface RevisionState {
   oid: string;
   /** Stored metadata or a previously-read object promises this oid exists. */
   promised: boolean;
+  /** A bare resolved ref or prefix must still authenticate its final oid. */
+  verifyFinal?: boolean;
   /** Authenticated metadata retained when payload bytes are unnecessary. */
   type?: ObjectType;
   /** One authenticated current object avoids repeating a suffix read. */
@@ -465,7 +467,7 @@ export class Repository {
     }
 
     if (path !== undefined) return this.#resolveRevisionPath(state, path, expression);
-    if (state.promised && state.object === undefined) {
+    if (state.verifyFinal === true && state.object === undefined) {
       const metadata = this.store.typeAndSize(state.oid);
       if (metadata === null) throw new ObjectNotFoundError(state.oid);
       state = { ...state, type: metadata.type };
@@ -529,21 +531,21 @@ export class Repository {
     const selectorStart = base.indexOf("@{");
     if (selectorStart !== -1) {
       if (!base.startsWith("HEAD@{") || !base.endsWith("}")) {
-        throw this.#invalidRevision(expression);
+        throw new RefNotFoundError(expression);
       }
       const digits = base.slice(6, -1);
       const index = boundedDecimal(digits, MAX_HEAD_REFLOG_INDEX);
-      if (index === null) throw this.#invalidRevision(expression);
+      if (index === null) throw new RefNotFoundError(expression);
       const entry = this.checkout.reflog("HEAD")[index];
       if (entry?.newOid === undefined || entry.newOid === null) return undefined;
       return { oid: entry.newOid, promised: true };
     }
     const oid = this.resolveRef(base);
-    if (oid !== null) return { oid, promised: true };
+    if (oid !== null) return { oid, promised: true, verifyFinal: true };
     if (isOid(base)) return { oid: base, promised: false };
     if (isAbbreviatedOid(base)) {
       const resolved = this.store.resolvePrefix(base);
-      if (resolved !== null) return { oid: resolved, promised: true };
+      if (resolved !== null) return { oid: resolved, promised: true, verifyFinal: true };
     }
     return undefined;
   }
