@@ -22,14 +22,17 @@ import type { TransportOperationBudget } from "./transport-budget.js";
 export const MAX_PUSH_COMMITS = 512;
 export const MAX_PUSH_OBJECTS = 100_000;
 export const MAX_PUSH_PLAN_BYTES = 16 * 1024 * 1024;
+export const MAX_PUSH_BRANCH_TARGETS = 1_024;
 
 const PUSH_PLAN_OBJECT_BYTES = 160;
 const PUSH_PLAN_FIXED_BYTES = 256;
 const OBJECT_PAGE = 4096;
 const MAX_TAG_DEPTH = 16;
-const MAX_PUSH_UPDATES = 1_024;
+const MAX_PUSH_UPDATES = MAX_PUSH_BRANCH_TARGETS;
 const PUSH_PLAN_MEMORY_PART = "push-plan";
 const PUSH_AUTH_MEMORY_PART = "push-plan-auth";
+const PUSH_BRANCH_AUTH_MEMORY_PART = "push-branch-target-auth";
+const PUSH_BRANCH_AUTH_READ_MEMORY_PART = "push-branch-target-auth-read";
 const PUSH_GRAPH_MEMORY_PART = "push-plan-graph";
 const PUSH_PACK_PREFLIGHT_MEMORY_PART = "push-pack-preflight";
 const PUSH_PACK_FIRST_MEMORY_PART = "push-pack-first-read";
@@ -120,6 +123,7 @@ class PushRetainedTracker {
   constructor(
     private readonly budget: TransportOperationBudget | undefined,
     private readonly limit: number,
+    private readonly memoryPart = PUSH_PLAN_MEMORY_PART,
   ) {}
 
   get total(): number {
@@ -139,7 +143,7 @@ class PushRetainedTracker {
     if (!Number.isSafeInteger(next) || next > this.limit) {
       throw new GitError("E2BIG", "push plan exceeds the retained-state limit");
     }
-    this.budget?.setMemory(PUSH_PLAN_MEMORY_PART, next);
+    this.budget?.setMemory(this.memoryPart, next);
     if (bytes === 0) this.#parts.delete(part);
     else this.#parts.set(part, bytes);
     this.#total = next;
@@ -154,7 +158,7 @@ class PushRetainedTracker {
     if (!Number.isSafeInteger(next) || next < 0 || next > this.limit) {
       throw new GitError("E2BIG", "push plan exceeds the retained-state limit");
     }
-    this.budget?.setMemory(PUSH_PLAN_MEMORY_PART, next);
+    this.budget?.setMemory(this.memoryPart, next);
     const nextFrom = currentFrom - fromBytes;
     if (nextFrom === 0) this.#parts.delete(from);
     else this.#parts.set(from, nextFrom);
@@ -172,7 +176,7 @@ class PushRetainedTracker {
     const firstBytes = this.#parts.get(first) ?? 0;
     const secondBytes = this.#parts.get(second) ?? 0;
     const next = firstBytes + secondBytes;
-    this.budget?.setMemory(PUSH_PLAN_MEMORY_PART, next);
+    this.budget?.setMemory(this.memoryPart, next);
     for (const part of this.#parts.keys()) {
       if (part !== first && part !== second) this.#parts.delete(part);
     }
@@ -180,7 +184,7 @@ class PushRetainedTracker {
   }
 
   clearAll(): void {
-    this.budget?.clearMemory(PUSH_PLAN_MEMORY_PART);
+    this.budget?.clearMemory(this.memoryPart);
     this.#parts.clear();
     this.#total = 0;
   }
@@ -393,6 +397,7 @@ function authenticateObjects(
   operationBudget: TransportOperationBudget | undefined,
   state: AuthenticationState,
   tracker: PushRetainedTracker,
+  authMemoryPart = PUSH_AUTH_MEMORY_PART,
 ): void {
   tracker.set("root-auth-input", 2 * CONTAINER_BASE_BYTES + oids.length * 2 * SET_ENTRY_BYTES);
   let remaining = oids.filter((oid) => !state.types.has(oid));
@@ -414,7 +419,7 @@ function authenticateObjects(
       if (objectInfo === undefined || oid === undefined || objectInfo.oid !== oid) {
         throw new CorruptError("push authentication lost its oversized object");
       }
-      operationBudget?.setMemory(PUSH_AUTH_MEMORY_PART, objectInfo.size + 256);
+      operationBudget?.setMemory(authMemoryPart, objectInfo.size + 256);
       operationBudget?.chargeSql(authenticationStatements(objectInfo));
       try {
         const object = repo.store.readAuthenticatedObject(oid, objectInfo.type);
@@ -428,12 +433,12 @@ function authenticateObjects(
         state.types.set(oid, object.type);
         if (tag !== null) state.tags.set(oid, tag);
       } finally {
-        operationBudget?.clearMemory(PUSH_AUTH_MEMORY_PART);
+        operationBudget?.clearMemory(authMemoryPart);
       }
       remaining = remaining.slice(1);
       continue;
     }
-    operationBudget?.setMemory(PUSH_AUTH_MEMORY_PART, selectedBytes + selected * 256);
+    operationBudget?.setMemory(authMemoryPart, selectedBytes + selected * 256);
     operationBudget?.chargeSql(8);
     try {
       const batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
@@ -452,8 +457,76 @@ function authenticateObjects(
       }
       remaining = batch.remaining;
     } finally {
-      operationBudget?.clearMemory(PUSH_AUTH_MEMORY_PART);
+      operationBudget?.clearMemory(authMemoryPart);
     }
+  }
+}
+
+/** Hash and parse direct commit targets; callers must omit ZERO_OID deletions. */
+export function authenticatePushBranchTargets(
+  repo: Repository,
+  targetOids: readonly string[],
+  operationBudget: TransportOperationBudget,
+): void {
+  if (!Array.isArray(targetOids)) {
+    throw new GitError("EINVAL", "push branch target list must be an array");
+  }
+  if (targetOids.length > MAX_PUSH_BRANCH_TARGETS) {
+    throw new GitError(
+      "E2BIG",
+      `push branch target list exceeds ${MAX_PUSH_BRANCH_TARGETS} entries`,
+    );
+  }
+  if (
+    operationBudget.memory(PUSH_BRANCH_AUTH_MEMORY_PART) !== 0 ||
+    operationBudget.memory(PUSH_BRANCH_AUTH_READ_MEMORY_PART) !== 0
+  ) {
+    throw new GitError("EINVAL", "push branch target authentication is already active");
+  }
+
+  const tracker = new PushRetainedTracker(
+    operationBudget,
+    MAX_PUSH_PLAN_BYTES,
+    PUSH_BRANCH_AUTH_MEMORY_PART,
+  );
+  try {
+    tracker.set(
+      "target-input",
+      2 * CONTAINER_BASE_BYTES + targetOids.length * (ARRAY_SLOT_BYTES + SET_ENTRY_BYTES),
+    );
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const oid of targetOids) {
+      if (!isOid(oid)) {
+        throw new GitError("EINVAL", "push branch target list contains an invalid object id");
+      }
+      if (oid === ZERO_OID) {
+        throw new GitError("EINVAL", "push branch target list must omit the zero object id");
+      }
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      unique.push(oid);
+    }
+
+    const state: AuthenticationState = { types: new Map(), tags: new Map() };
+    authenticateObjects(
+      repo,
+      unique,
+      operationBudget,
+      state,
+      tracker,
+      PUSH_BRANCH_AUTH_READ_MEMORY_PART,
+    );
+    for (const oid of unique) {
+      if (state.types.get(oid) !== "commit") {
+        throw new GitError("EINVALIDREF", `push branch target ${oid} is not a direct commit`);
+      }
+    }
+  } catch (error) {
+    localPushError(error);
+  } finally {
+    operationBudget.clearMemory(PUSH_BRANCH_AUTH_READ_MEMORY_PART);
+    tracker.clearAll();
   }
 }
 

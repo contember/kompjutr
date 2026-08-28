@@ -7,7 +7,9 @@ import { openRepository } from "../src/core/context.js";
 import { serializeCommit, serializeTag, serializeTree } from "../src/core/objects.js";
 import { clone } from "../src/core/ops/network.js";
 import {
+  authenticatePushBranchTargets,
   disposePushPlan,
+  MAX_PUSH_BRANCH_TARGETS,
   MAX_PUSH_COMMITS,
   MAX_PUSH_PLAN_BYTES,
   openPushPack,
@@ -87,6 +89,151 @@ function update(
 ): PushPlanningUpdate {
   return { source, destination, oid, oldOid, force };
 }
+
+describe("post-push branch target authentication", () => {
+  it("authenticates direct commits in one caller-owned budget and cleans retained state", () => {
+    const workspace = makeRepo();
+    const tree = workspace.repo.store.write("tree", serializeTree([]));
+    const commit = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree,
+        parent: [],
+        author: person,
+        committer: person,
+        message: "target\n",
+      }),
+    );
+    const { budget, reservation } = operation(workspace.repo);
+    budget.setMemory("caller", 256);
+    const statementStart = workspace.storage.statementCount;
+    const chargeStart = budget.sqlStatements;
+
+    authenticatePushBranchTargets(workspace.repo, [commit], budget);
+
+    expect(budget.sqlStatements - chargeStart).toBeGreaterThanOrEqual(
+      workspace.storage.statementCount - statementStart,
+    );
+    expect(budget.memory("push-branch-target-auth")).toBe(0);
+    expect(budget.memory("push-branch-target-auth-read")).toBe(0);
+    expect(budget.memory("caller")).toBe(256);
+    budget.clearMemory("caller");
+    reservation.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("rejects tags and blobs while classifying missing and corrupt commits as local failures", () => {
+    const workspace = makeRepo();
+    const blob = workspace.repo.store.write("blob", new TextEncoder().encode("blob\n"));
+    const tree = workspace.repo.store.write("tree", serializeTree([]));
+    const commit = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree,
+        parent: [],
+        author: person,
+        committer: person,
+        message: "target\n",
+      }),
+    );
+    const tag = workspace.repo.store.write(
+      "tag",
+      serializeTag({ object: commit, type: "commit", tag: "target", message: "target\n" }),
+    );
+    for (const oid of [tag, blob]) {
+      const { budget, reservation } = operation(workspace.repo);
+      expect(() => authenticatePushBranchTargets(workspace.repo, [oid], budget)).toThrow(
+        expect.objectContaining({ code: "EINVALIDREF" }),
+      );
+      expect(budget.retainedBytes).toBe(0);
+      reservation.dispose();
+    }
+
+    const missing = operation(workspace.repo);
+    expect(() =>
+      authenticatePushBranchTargets(workspace.repo, ["f".repeat(40)], missing.budget),
+    ).toThrow(expect.objectContaining({ code: "EPUSHLOCAL" }));
+    expect(missing.budget.retainedBytes).toBe(0);
+    missing.reservation.dispose();
+
+    workspace.repo.store.db.run(
+      "UPDATE git_object_chunks SET data = zeroblob(length(data)) WHERE repo_id = ? AND oid = ?",
+      1,
+      commit,
+    );
+    const corrupt = operation(workspace.repo);
+    expect(() => authenticatePushBranchTargets(workspace.repo, [commit], corrupt.budget)).toThrow(
+      expect.objectContaining({ code: "EPUSHLOCAL" }),
+    );
+    expect(corrupt.budget.retainedBytes).toBe(0);
+    corrupt.reservation.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("accepts the exact input bound after deduplication and rejects the first excess", () => {
+    const workspace = makeRepo();
+    const tree = workspace.repo.store.write("tree", serializeTree([]));
+    const commit = workspace.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree,
+        parent: [],
+        author: person,
+        committer: person,
+        message: "target\n",
+      }),
+    );
+
+    const single = operation(workspace.repo);
+    authenticatePushBranchTargets(workspace.repo, [commit], single.budget);
+    const singleStatements = single.budget.sqlStatements;
+    single.reservation.dispose();
+
+    const exact = operation(workspace.repo);
+    authenticatePushBranchTargets(
+      workspace.repo,
+      Array.from({ length: MAX_PUSH_BRANCH_TARGETS }, () => commit),
+      exact.budget,
+    );
+    expect(exact.budget.sqlStatements).toBe(singleStatements);
+    expect(exact.budget.retainedBytes).toBe(0);
+    exact.reservation.dispose();
+
+    const excess = operation(workspace.repo);
+    expect(() =>
+      authenticatePushBranchTargets(
+        workspace.repo,
+        Array.from({ length: MAX_PUSH_BRANCH_TARGETS + 1 }, () => commit),
+        excess.budget,
+      ),
+    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    expect(excess.budget.sqlStatements).toBe(0);
+    expect(excess.budget.retainedBytes).toBe(0);
+    excess.reservation.dispose();
+
+    const bounded = operation(workspace.repo);
+    bounded.budget.setMemory("caller", MAX_OPERATION_MEMORY_BYTES);
+    expect(() => authenticatePushBranchTargets(workspace.repo, [commit], bounded.budget)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(bounded.budget.sqlStatements).toBe(0);
+    expect(bounded.budget.memory("push-branch-target-auth")).toBe(0);
+    expect(bounded.budget.memory("push-branch-target-auth-read")).toBe(0);
+    expect(bounded.budget.memory("caller")).toBe(MAX_OPERATION_MEMORY_BYTES);
+    bounded.budget.clearMemory("caller");
+    bounded.reservation.dispose();
+
+    const malformed = operation(workspace.repo);
+    for (const oid of [ZERO_OID, "not-an-object-id"]) {
+      expect(() => authenticatePushBranchTargets(workspace.repo, [oid], malformed.budget)).toThrow(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(malformed.budget.retainedBytes).toBe(0);
+    }
+    malformed.reservation.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+});
 
 describe("multi-ref push planning", () => {
   it("sends one deterministic union pack for commits, tags, a tree, a blob, force and deletion", async () => {
