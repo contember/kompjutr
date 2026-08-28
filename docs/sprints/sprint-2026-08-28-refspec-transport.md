@@ -81,10 +81,15 @@ Duplicate destinations fail before a publication token or network POST.
 - An exact missing fetch source fails with `EREFNOTFOUND`. A wildcard with no
   source matches returns an empty mapped result after one discovery GET, with
   zero POSTs, no publication token, and no local mutation.
-- An exact or wildcard push source with no local match fails with
-  `EREFNOTFOUND` before discovery. A deletion of a missing remote ref is a
-  confirmed no-op. Creation and deletion do not require force; deletion has no
-  `force` field.
+- An exact push source with no local match fails with `EREFNOTFOUND` before
+  discovery and fails the whole set even when another mapping matches. Each
+  wildcard with no local matches contributes no command or result row; other
+  expanded mappings continue normally. Only when the complete validated set
+  expands to zero destinations does push return before discovery: zero
+  GET/POST and exactly `{ ok: true, error: null, unpack: { ok: true }, refs: [],
+  tracking: { outcome: "not-applicable" } }`. A deletion of a missing remote ref
+  is also a confirmed no-op. Creation and deletion do not require force;
+  deletion has no `force` field.
 - The remote decides whether its currently checked-out branch may move. A
   complete `ng` status is a confirmed result, not a client-side transport
   error.
@@ -243,7 +248,13 @@ Expanded push destinations, including advertised same-oid updates and missing
 deletions, each receive one ordered result row. No-ops are synthesized as
 successful and omitted from the receive-pack command set. An all-no-op push
 performs discovery but no POST; a named remote may still reconcile its branch
-tracking refs from that confirmed advertisement.
+tracking refs from that confirmed advertisement. The one exception is a local
+refspec set whose complete expansion is empty: it returns the empty successful
+result before discovery because it has no destination to observe or reconcile.
+All mapping, auth-header, push-option, and aggregate bounds are validated first.
+Valid `atomic` and push options are vacuously successful without checking remote
+capabilities because no remote operation exists; malformed or oversized local
+options still fail before the zero-network return.
 
 ### Discovery and tag contract
 
@@ -350,7 +361,7 @@ durable residue.
 | Fetch protocol/ingest/publication first excess after its GET or POST | throw `E2BIG`; no ref publishes and durable residue follows the fetch failure table |
 | Safe local push generation first excess before the complete body checksum | throw `E2BIG`; the incomplete request cannot move a remote ref |
 | Missing configured remote / unsupported URL scheme | throw `ENOREMOTE` / `EURLSCHEME` before request |
-| Missing exact or wildcard local/remote source | throw `EREFNOTFOUND` at the phase frozen in the matrix |
+| Missing exact local push or exact remote fetch source | throw `EREFNOTFOUND` at the phase frozen in the matrix; empty wildcards use their direction-specific successful no-op contract |
 | Selected local branch is checked out | throw `EBRANCHFAIL` before token/POST |
 | Branch or custom-namespace update rejected by its non-force ancestry/type rule / tag replacement without force | throw `ENONFASTFORWARD` / `ETAGFAIL` before publication or push POST |
 | Missing, corrupt, or shallow local push source/closure, or non-limit local pack-body failure before the final checksum | throw `EPUSHLOCAL`; the incomplete request cannot move a remote ref |
@@ -424,7 +435,8 @@ stream error. The initial and authenticated POST bodies are byte-identical;
 - **Acceptance / witness.** Unit parity covers exact and wildcard expansion,
   non-BMP Git-byte ordering, empty matches, invalid names, wildcard placement,
   oid and deletion sources, pre-discovery exact duplicates, zero-network push
-  wildcard collisions, post-discovery fetch wildcard collisions, malformed
+  wildcard collisions, empty-plus-nonempty push expansion, exact-missing
+  failure of a mixed set, post-discovery fetch wildcard collisions, malformed
   advertisements, and every exact/first-excess bound.
 - **Touch points.** `src/core/ops/refspec.ts`,
   `src/core/protocol/remote.ts`, `src/sqlite/ref-validation.ts`,
@@ -605,7 +617,10 @@ stream error. The initial and authenticated POST bodies are byte-identical;
   wildcard recovery, per-ref rejection, no local partial fetch state, tracking
   and reflog outcomes, a hook-changed target, post-status rediscovery failure,
   non-atomic partial tracking, stale/failing/deferred local reconciliation,
-  auth, retry/uncertainty, and cold reopen. Legacy push, fetch, clone, and pull
+  auth, retry/uncertainty, and cold reopen. `tests/push.test.ts` separately
+  proves the exact empty result above with zero HTTP requests, valid atomic and
+  push options, local option rejection, mixed empty/non-empty continuation, and
+  exact-missing failure of the whole set. Legacy push, fetch, clone, and pull
   witnesses remain green.
 - **Touch points.** `src/core/ops/push.ts`, `src/core/ops/network.ts`,
   `src/core/ops/kinds.ts`, `src/git/client.ts`, `src/git/index.ts`,
@@ -704,8 +719,10 @@ npx vitest run tests/checkpoint-transport.test.ts tests/push.test.ts tests/clien
   4 MiB bounds.
 - Fetch publication is always all-or-nothing locally. A non-atomic push may be
   partially accepted remotely; the complete `PushResult` reports that truth.
-- `atomic: true` and non-empty push options are requirements, not hints. Missing
-  server capabilities fail before POST; the client never emulates them.
+- For a non-empty command set, `atomic: true` and non-empty push options are
+  requirements, not hints. Missing server capabilities fail before POST; the
+  client never emulates them. A completely empty local expansion validates
+  syntax and bounds, then returns before capability discovery as frozen above.
 - Discovery and upload counts are logical exchanges. Physical attempts follow
   the frozen transport/auth maxima, and only 401 can reopen a POST body.
 - Only confirmed successful remote branch destinations reconcile configured
@@ -738,7 +755,7 @@ and whether every review gate matches its scope and blast radius. Blocking
 findings are resolved before implementation.
 
 - **Reviewer:** Singer (independent)
-- **Verdict:** APPROVED / CLEAN after five passes
+- **Verdict:** APPROVED / CLEAN, including the WU0 contract delta
 - **Material findings:** the first pass required a frozen Git behavior matrix,
   exact TypeScript surfaces, post-push reconciliation outcomes, a fetch failure
   state table, exact tail-glob and symref validation, one composed memory/SQL
@@ -750,7 +767,10 @@ findings are resolved before implementation.
   phase-specific duplicate/type errors plus `EPUSHUNCERTAIN` precedence over
   response-side `E2BIG`; the fourth pass confirmed those changes and found one
   omitted zero-network push wildcard collision case. It is now explicit and
-  the fifth pass approved the complete plan without remaining findings.
+  the fifth pass approved the complete plan without remaining findings. WU0
+  then proved that an empty push wildcard is a successful no-op rather than
+  `EREFNOTFOUND`; the amended zero/mixed-expansion and capability contracts
+  passed the mandatory independent delta review.
 
 ## Run log
 
@@ -760,3 +780,9 @@ findings are resolved before implementation.
 - 2026-08-28: Independent plan review approved the frozen contract after five
   passes. Implementation may start at WU0; any real-Git mismatch reopens the
   contract-delta gate before WU1.
+- 2026-08-28: WU0 found that Git 2.54.0 treats a push wildcard with no local
+  matches as success, while an exact missing source fails. The frozen contract
+  now returns an empty zero-network push result, preserves matching siblings,
+  and lets exact missing sources fail the whole set. The independent delta
+  review approved the amendment. The five-test real-Git witness passed twice in
+  1.83 seconds; WU1 may start.
