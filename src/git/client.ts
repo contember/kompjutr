@@ -37,8 +37,8 @@ import { type InitOptions, initRepository } from "../core/ops/init.js";
 import type {
   CommitResult,
   DiffSummaryEntry,
+  PushResult as LegacyPushResult,
   MergeResult,
-  PushResult,
   RebaseResult,
   RemoteView,
   ReplayResult,
@@ -64,9 +64,23 @@ import {
   type CloneOptions,
   clone as cloneOp,
   type FetchOptions,
-  type FetchResult,
   fetchInto,
+  type FetchResult as LegacyFetchResult,
 } from "../core/ops/network.js";
+
+export type {
+  FetchRefspec,
+  FetchRefUpdate,
+  FetchResult,
+  LsRemoteResult,
+  PushRefStatus,
+  PushRefspec,
+  PushResult,
+  PushTrackingResult,
+  RemoteRefView,
+  RemoteTarget,
+} from "../core/ops/refspec.js";
+
 import {
   type CatFileOptions,
   type CommitTreeOptions,
@@ -263,7 +277,7 @@ export type GitScratchIndexCallback<T> = (index: GitScratchIndex) => T;
 
 export interface Git {
   clone(input: GitCloneOptions): Promise<void>;
-  fetch(input?: GitFetchOptions): Promise<FetchResult>;
+  fetch(input?: GitFetchOptions): Promise<LegacyFetchResult>;
   init(input?: GitInitOptions): Promise<void>;
   status(input?: GitStatusOptions): Promise<StatusEntry[]>;
   statusReport(input?: GitStatusReportOptions): Promise<GitStatusReport>;
@@ -311,7 +325,7 @@ export interface Git {
   commitTree(input: GitCommitTreeOptions): Promise<string>;
   withScratchIndex<T>(input: GitScratchIndexOptions, body: GitScratchIndexCallback<T>): Promise<T>;
   updateRef(input: GitUpdateRefOptions): Promise<void>;
-  push(input?: GitPushOptions): Promise<PushResult>;
+  push(input?: GitPushOptions): Promise<LegacyPushResult>;
   pull(input?: GitPullOptions): Promise<MergeResult>;
   merge(input: GitMergeOptions): Promise<MergeResult>;
   mergeContinue(input?: GitMergeContinueOptions): Promise<MergeResult>;

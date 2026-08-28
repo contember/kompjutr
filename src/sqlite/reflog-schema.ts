@@ -1,4 +1,6 @@
-export const MAX_REFLOG_REF_BYTES = 1_024;
+import { MAX_REF_NAME_BYTES } from "../core/ref-name.js";
+
+export const MAX_REFLOG_REF_BYTES = MAX_REF_NAME_BYTES;
 export const MAX_REFLOG_RAW_TARGET_BYTES = 1_024;
 export const MAX_REFLOG_IDENTITY_BYTES = 1_024;
 export const MAX_REFLOG_REASON_BYTES = 256;

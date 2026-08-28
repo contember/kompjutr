@@ -786,3 +786,10 @@ findings are resolved before implementation.
   and lets exact missing sources fail the whole set. The independent delta
   review approved the amendment. The five-test real-Git witness passed twice in
   1.83 seconds; WU1 may start.
+- 2026-08-28: WU1 introduced the bounded structured refspec compiler, one
+  aggregate transport memory/SQL budget, shared canonical ref validation, and
+  strict advertisement row and HEAD-symref validation without changing stored
+  ref acceptance. The exact witness passed 70 tests in 1.93 seconds; typecheck,
+  Biome, and diff-check passed. Behavior-coupled facade options remain with
+  WU2, WU4, and WU7, while their independent result and mapping types are now
+  public.

@@ -29,8 +29,14 @@ import type {
   GitStatusOptions as GitEntrypointStatusOptions,
   GitStatusReport as GitEntrypointStatusReport,
   GitStatusReportOptions as GitEntrypointStatusReportOptions,
+  FetchRefspec as GitFetchRefspec,
+  FetchRefUpdate as GitFetchRefUpdate,
+  LsRemoteResult as GitLsRemoteResult,
   GitLsTreeOptions,
   GitMergeBaseOptions,
+  PushRefStatus as GitPushRefStatus,
+  PushRefspec as GitPushRefspec,
+  PushTrackingResult as GitPushTrackingResult,
   RawRefTarget as GitRawRefTarget,
   GitReadRefOptions,
   GitReadTreeOptions,
@@ -42,6 +48,8 @@ import type {
   RefLogEntry as GitRefLogEntry,
   GitRefLogOptions,
   RefLogRecoverySource as GitRefLogRecoverySource,
+  RemoteRefView as GitRemoteRefView,
+  RemoteTarget as GitRemoteTarget,
   ReplayEmptyReason as GitReplayEmptyReason,
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
@@ -56,6 +64,8 @@ import type {
   GitScratchReadTreeOptions,
   GitScratchReplaySnapshotOptions,
   StatusFormatOptions as GitStatusFormatOptions,
+  FetchResult as GitStructuredFetchResult,
+  PushResult as GitStructuredPushResult,
   GitUpdateRefOptions,
   GitWorktreeAddOptions,
   WorktreeAddTarget as GitWorktreeAddTarget,
@@ -64,6 +74,9 @@ import type {
   GitWriteTreeOptions,
 } from "../src/git/index.js";
 import {
+  MAX_REFSPEC_EXPANDED_DESTINATIONS as GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
+  MAX_REFSPEC_MAPPINGS as GIT_MAX_REFSPEC_MAPPINGS,
+  MAX_REFSPEC_REF_BYTES as GIT_MAX_REFSPEC_REF_BYTES,
   commitTree as gitCommitTree,
   divergence as gitDivergence,
   mergeBase as gitMergeBase,
@@ -103,6 +116,8 @@ import type {
   WorktreeRemoveOptions as RootCoreWorktreeRemoveOptions,
   DivergenceRelationship as RootDivergenceRelationship,
   DivergenceResult as RootDivergenceResult,
+  FetchRefspec as RootFetchRefspec,
+  FetchRefUpdate as RootFetchRefUpdate,
   Git as RootGit,
   GitDivergenceOptions as RootGitDivergenceOptions,
   GitLsTreeOptions as RootGitLsTreeOptions,
@@ -112,6 +127,10 @@ import type {
   GitUpdateRefOptions as RootGitUpdateRefOptions,
   GitWorktreeAddOptions as RootGitWorktreeAddOptions,
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
+  LsRemoteResult as RootLsRemoteResult,
+  PushRefStatus as RootPushRefStatus,
+  PushRefspec as RootPushRefspec,
+  PushTrackingResult as RootPushTrackingResult,
   RawRefTarget as RootRawRefTarget,
   GitReadTreeOptions as RootReadTreeOptions,
   GitRebaseContinueOptions as RootRebaseContinueOptions,
@@ -122,6 +141,8 @@ import type {
   RefLogEntry as RootRefLogEntry,
   GitRefLogOptions as RootRefLogOptions,
   RefLogRecoverySource as RootRefLogRecoverySource,
+  RemoteRefView as RootRemoteRefView,
+  RemoteTarget as RootRemoteTarget,
   ReplayEmptyReason as RootReplayEmptyReason,
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
@@ -138,11 +159,16 @@ import type {
   GitStatusOptions as RootStatusOptions,
   GitStatusReport as RootStatusReport,
   GitStatusReportOptions as RootStatusReportOptions,
+  FetchResult as RootStructuredFetchResult,
+  PushResult as RootStructuredPushResult,
   WorktreeAddTarget as RootWorktreeAddTarget,
   WorktreeInfo as RootWorktreeInfo,
   GitWriteTreeOptions as RootWriteTreeOptions,
 } from "../src/index.js";
 import {
+  MAX_REFSPEC_EXPANDED_DESTINATIONS as ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
+  MAX_REFSPEC_MAPPINGS as ROOT_MAX_REFSPEC_MAPPINGS,
+  MAX_REFSPEC_REF_BYTES as ROOT_MAX_REFSPEC_REF_BYTES,
   commitTree as rootCommitTree,
   divergence as rootDivergence,
   mergeBase as rootMergeBase,
@@ -680,5 +706,92 @@ describe("public status exports", () => {
       gitReport.entries[0]?.originalPath,
       gitCore.branch?.head,
     ]).toEqual(["/repo", true, true, "old.txt", "main"]);
+  });
+});
+
+describe("public structured refspec exports", () => {
+  it("exposes matching frozen mapping, result, target, and limit types", () => {
+    const fetch: RootFetchRefspec = {
+      source: "refs/heads/*",
+      destination: "refs/remotes/origin/*",
+      force: true,
+    };
+    const gitFetch: GitFetchRefspec = fetch;
+    const push: RootPushRefspec = {
+      source: null,
+      destination: "refs/checkpoints/old",
+    };
+    const gitPush: GitPushRefspec = push;
+    const namedTarget: RootRemoteTarget = { remote: "origin" };
+    const gitNamedTarget: GitRemoteTarget = namedTarget;
+    const urlTarget: GitRemoteTarget = { url: "https://example.test/repo.git" };
+    const rootUrlTarget: RootRemoteTarget = urlTarget;
+    const update: RootFetchRefUpdate = {
+      source: "refs/heads/main",
+      destination: "refs/remotes/origin/main",
+      oid: "1".repeat(40),
+    };
+    const gitUpdate: GitFetchRefUpdate = update;
+    const fetchResult: RootStructuredFetchResult = {
+      mode: "mapped",
+      defaultBranch: "main",
+      fetchHead: null,
+      updates: [update],
+    };
+    const gitFetchResult: GitStructuredFetchResult = fetchResult;
+    const remoteRef: RootRemoteRefView = { name: update.source, oid: update.oid };
+    const gitRemoteRef: GitRemoteRefView = remoteRef;
+    const lsRemote: RootLsRemoteResult = { refs: [remoteRef], headRef: update.source };
+    const gitLsRemote: GitLsRemoteResult = lsRemote;
+    const status: RootPushRefStatus = { ref: push.destination, ok: true, error: null };
+    const gitStatus: GitPushRefStatus = status;
+    const tracking: RootPushTrackingResult = { outcome: "not-applicable" };
+    const gitTracking: GitPushTrackingResult = tracking;
+    const pushResult: RootStructuredPushResult = {
+      ok: true,
+      error: null,
+      unpack: { ok: true },
+      refs: [status],
+      tracking,
+    };
+    const gitPushResult: GitStructuredPushResult = pushResult;
+
+    expect([
+      gitFetch.destination,
+      gitPush.destination,
+      gitNamedTarget.remote,
+      rootUrlTarget.url,
+      gitUpdate.destination,
+      gitFetchResult.mode,
+      gitRemoteRef.name,
+      gitLsRemote.headRef,
+      gitStatus.ok,
+      gitTracking.outcome,
+      gitPushResult.ok,
+      GIT_MAX_REFSPEC_MAPPINGS,
+      GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
+      GIT_MAX_REFSPEC_REF_BYTES,
+      ROOT_MAX_REFSPEC_MAPPINGS,
+      ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
+      ROOT_MAX_REFSPEC_REF_BYTES,
+    ]).toEqual([
+      "refs/remotes/origin/*",
+      "refs/checkpoints/old",
+      "origin",
+      "https://example.test/repo.git",
+      "refs/remotes/origin/main",
+      "mapped",
+      "refs/heads/main",
+      "refs/heads/main",
+      true,
+      "not-applicable",
+      true,
+      1_024,
+      1_024,
+      1_024,
+      1_024,
+      1_024,
+      1_024,
+    ]);
   });
 });

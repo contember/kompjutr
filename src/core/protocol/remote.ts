@@ -7,6 +7,7 @@
 
 import { isOid, utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
+import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
 import { retainedStringBytes } from "../retained.js";
 import { FLUSH, pkt } from "./pktline.js";
 import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt, pktText } from "./stream.js";
@@ -49,6 +50,7 @@ const HEAD_REF_FIXED_BYTES = 16;
 const BOUNDARY_FIXED_BYTES = 56;
 const ERROR_PREFIX_BYTES = 800;
 const ERROR_PREFIX_CHARACTERS = 200;
+const strictUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface ProtocolMemoryLimits {
   /** Test seam; callers may lower but never raise the production ceiling. */
@@ -264,16 +266,29 @@ async function parseAdvertisement(
 ): Promise<Advertisement> {
   const refs: RemoteRef[] = [];
   const capabilities = new Set<string>();
+  const refNames = new Set<string>();
   let headRef: string | null = null;
+  let headOid: string | null = null;
   let first = true;
+  let flushed = false;
 
   for (;;) {
     const line: Pkt | null = await reader.readPkt();
     if (line === null) break;
     budget.packet(line);
-    if (line.kind === "flush") break;
-    if (line.kind !== "line") continue;
-    let text = utf8Decoder.decode(line.payload);
+    if (line.kind === "flush") {
+      flushed = true;
+      break;
+    }
+    if (line.kind !== "line") {
+      throw new CorruptError("ref advertisement contains an unexpected pkt-line control");
+    }
+    let text: string;
+    try {
+      text = strictUtf8Decoder.decode(line.payload);
+    } catch (error) {
+      throw new CorruptError("ref advertisement contains malformed UTF-8", { cause: error });
+    }
     if (text.endsWith("\n")) text = text.slice(0, -1);
     if (first) {
       first = false;
@@ -286,18 +301,37 @@ async function parseAdvertisement(
           let end = text.indexOf(" ", start);
           if (end < 0) end = text.length;
           const capability = text.slice(start, end);
-          const capabilityBytes = capabilities.has(capability)
+          if (capability.includes("\0")) {
+            throw new CorruptError("ref advertisement has malformed capabilities");
+          }
+          const duplicateCapability = capabilities.has(capability);
+          const capabilityBytes = duplicateCapability
             ? 0
             : CAPABILITY_FIXED_BYTES + retainedStringBytes(capability);
-          const symref = capability.startsWith("symref=HEAD:")
-            ? capability.slice("symref=HEAD:".length)
-            : null;
-          budget.reserve(
-            capabilityBytes +
-              (symref === null ? 0 : HEAD_REF_FIXED_BYTES + retainedStringBytes(symref)),
-          );
+          let symrefBytes = 0;
+          if (capability.startsWith("symref=HEAD")) {
+            if (!capability.startsWith("symref=HEAD:")) {
+              throw new CorruptError("ref advertisement has a malformed HEAD symref");
+            }
+            const symref = capability.slice("symref=HEAD:".length);
+            const checked = checkRefText(symref, MAX_REF_NAME_BYTES);
+            if (
+              checked.problem !== null ||
+              !symref.startsWith("refs/") ||
+              !hasCanonicalRefSyntax(symref)
+            ) {
+              throw new CorruptError("ref advertisement has a malformed HEAD symref");
+            }
+            if (headRef !== null && headRef !== symref) {
+              throw new CorruptError("ref advertisement has conflicting HEAD symrefs");
+            }
+            if (headRef === null) {
+              headRef = symref;
+              symrefBytes = HEAD_REF_FIXED_BYTES + retainedStringBytes(symref);
+            }
+          }
+          budget.reserve(capabilityBytes + symrefBytes);
           capabilities.add(capability);
-          if (symref !== null) headRef = symref;
           start = end + 1;
         }
         text = text.slice(0, nul);
@@ -305,15 +339,39 @@ async function parseAdvertisement(
     }
     if (text.startsWith("ERR ")) throw new GitError("EFETCHFAIL", text.slice(4));
     const space = text.indexOf(" ");
-    if (space < 0) continue;
+    if (space < 0) throw new CorruptError("ref advertisement has a malformed row");
     const oid = text.slice(0, space);
     const name = text.slice(space + 1);
+    if (!isOid(oid)) throw new CorruptError(`ref advertisement has an invalid oid for ${name}`);
+    if (refNames.has(name)) throw new CorruptError(`ref advertisement has duplicate row ${name}`);
+    refNames.add(name);
     // An empty repository advertises only the capabilities line.
-    if (oid === ZERO && name.startsWith("capabilities^{}")) continue;
+    if (oid === ZERO && name === "capabilities^{}") continue;
+    const checked = checkRefText(name, MAX_REF_NAME_BYTES);
+    if (checked.problem !== null || !advertisedRefName(name)) {
+      throw new CorruptError(`ref advertisement has an invalid ref name ${name}`);
+    }
     budget.reserve(REF_FIXED_BYTES + retainedStringBytes(name) + retainedStringBytes(oid));
     refs.push({ name, oid });
+    if (name === "HEAD") headOid = oid;
+  }
+  if (!flushed) throw new CorruptError("truncated ref advertisement");
+  if (headRef !== null && headOid !== null) {
+    const targetOid = refs.find((ref) => ref.name === headRef)?.oid;
+    if (targetOid !== undefined && targetOid !== headOid) {
+      throw new CorruptError("advertised HEAD does not match its symref target");
+    }
   }
   return { refs, capabilities, headRef };
+}
+
+function advertisedRefName(name: string): boolean {
+  if (name === "HEAD") return true;
+  if (name.endsWith("^{}")) {
+    const base = name.slice(0, -3);
+    return base.startsWith("refs/tags/") && hasCanonicalRefSyntax(base);
+  }
+  return name.startsWith("refs/") && hasCanonicalRefSyntax(name);
 }
 
 export interface UploadPackRequest {

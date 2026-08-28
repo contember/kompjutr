@@ -19,7 +19,6 @@ export type {
   CommitResult,
   DiffSummaryEntry,
   MergeResult,
-  PushResult,
   RebaseResult,
   RefUpdateStatus,
   RemoteView,
@@ -63,6 +62,21 @@ export {
   recoverRef,
   reflog,
 } from "./core/ops/ref-log.js";
+export {
+  type FetchRefspec,
+  type FetchRefUpdate,
+  type FetchResult,
+  type LsRemoteResult,
+  MAX_REFSPEC_EXPANDED_DESTINATIONS,
+  MAX_REFSPEC_MAPPINGS,
+  MAX_REFSPEC_REF_BYTES,
+  type PushRefStatus,
+  type PushRefspec,
+  type PushResult,
+  type PushTrackingResult,
+  type RemoteRefView,
+  type RemoteTarget,
+} from "./core/ops/refspec.js";
 export {
   type ReplaySnapshotConflict,
   type ReplaySnapshotConflictStage,

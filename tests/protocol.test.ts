@@ -295,6 +295,19 @@ describe("discovery", () => {
     ).rejects.toMatchObject({ code: "EFETCHFAIL", message: "access denied" });
   });
 
+  it("rejects an advertisement truncated before its terminating flush", async () => {
+    const body = concat([
+      pkt("# service=git-upload-pack\n"),
+      FLUSH,
+      pkt(`${OID} refs/heads/main\n`),
+    ]);
+    await expect(
+      discover("http://host/repo", "git-upload-pack", {
+        http: canned(() => respond(body, "application/x-git-upload-pack-advertisement")),
+      }),
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
+  });
+
   it("drains a large HTTP error while retaining only its prefix", async () => {
     let yielded = 0;
     const chunk = new Uint8Array(1024 * 1024).fill(0x61);
@@ -341,28 +354,16 @@ describe("discovery", () => {
     ).rejects.toMatchObject({ code: "E2BIG" });
   });
 
-  it("bounds duplicate refs before retaining the over-limit entry", async () => {
+  it("rejects duplicate advertisement rows before retaining another entry", async () => {
     const line = `${OID} refs/heads/repeated`;
-    const response = (count: number) =>
-      canned(() =>
-        respond(
-          advertisementBody(Array.from({ length: count }, () => line)),
-          "application/x-git-upload-pack-advertisement",
-        ),
-      );
-
+    const response = canned(() =>
+      respond(advertisementBody([line, line]), "application/x-git-upload-pack-advertisement"),
+    );
     await expect(
       discover("http://host/repo", "git-upload-pack", {
-        http: response(2),
-        protocolLimits: { entries: 2 },
+        http: response,
       }),
-    ).resolves.toMatchObject({ refs: [{}, {}] });
-    await expect(
-      discover("http://host/repo", "git-upload-pack", {
-        http: response(3),
-        protocolLimits: { entries: 2 },
-      }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
   });
 
   it("charges duplicate capabilities and the HEAD symref before retention", async () => {
@@ -406,6 +407,93 @@ describe("discovery", () => {
         protocolLimits: { retainedBytes: retained - 1 },
       }),
     ).rejects.toMatchObject({ code: "E2BIG" });
+  });
+
+  it("accepts identical HEAD symrefs once and rejects conflicts or malformed targets", async () => {
+    const headRef = "refs/heads/main";
+    const identical = advertisementBody([
+      `${OID} HEAD\0symref=HEAD:${headRef} symref=HEAD:${headRef}`,
+      `${OID} ${headRef}`,
+    ]);
+    await expect(
+      discover("http://host/repo", "git-upload-pack", {
+        http: canned(() => respond(identical, "application/x-git-upload-pack-advertisement")),
+      }),
+    ).resolves.toMatchObject({ headRef });
+
+    const badCapabilities = [
+      `symref=HEAD:${headRef} symref=HEAD:refs/heads/other`,
+      "symref=HEAD:main",
+      "symref=HEAD",
+      "symref=HEAD:refs/heads/.hidden",
+    ];
+    for (const capabilities of badCapabilities) {
+      const body = advertisementBody([`${OID} HEAD\0${capabilities}`]);
+      await expect(
+        discover("http://host/repo", "git-upload-pack", {
+          http: canned(() => respond(body, "application/x-git-upload-pack-advertisement")),
+        }),
+      ).rejects.toMatchObject({ code: "ECORRUPT" });
+    }
+  });
+
+  it("requires advertised HEAD and its present symref target to have the same oid", async () => {
+    const headRef = "refs/heads/main";
+    const absentTarget = advertisementBody([`${OID} HEAD\0symref=HEAD:${headRef}`]);
+    await expect(
+      discover("http://host/repo", "git-upload-pack", {
+        http: canned(() => respond(absentTarget, "application/x-git-upload-pack-advertisement")),
+      }),
+    ).resolves.toMatchObject({ headRef, refs: [{ name: "HEAD", oid: OID }] });
+
+    const mismatched = advertisementBody([
+      `${OID} HEAD\0symref=HEAD:${headRef}`,
+      `${"2".repeat(40)} ${headRef}`,
+    ]);
+    await expect(
+      discover("http://host/repo", "git-upload-pack", {
+        http: canned(() => respond(mismatched, "application/x-git-upload-pack-advertisement")),
+      }),
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
+  });
+
+  it("accepts only HEAD, canonical refs, and peeled tag pseudo-rows", async () => {
+    const accepted = advertisementBody([
+      `${OID} HEAD`,
+      `${"2".repeat(40)} refs/heads/main`,
+      `${"3".repeat(40)} refs/tags/v1`,
+      `${"4".repeat(40)} refs/tags/v1^{}`,
+    ]);
+    await expect(
+      discover("http://host/repo", "git-upload-pack", {
+        http: canned(() => respond(accepted, "application/x-git-upload-pack-advertisement")),
+      }),
+    ).resolves.toMatchObject({
+      refs: [
+        { name: "HEAD", oid: OID },
+        { name: "refs/heads/main", oid: "2".repeat(40) },
+        { name: "refs/tags/v1", oid: "3".repeat(40) },
+        { name: "refs/tags/v1^{}", oid: "4".repeat(40) },
+      ],
+    });
+
+    const malformed = [
+      `${"A".repeat(40)} refs/heads/main`,
+      `${OID.slice(1)} refs/heads/main`,
+      `${OID} main`,
+      `${OID} refs/heads/main^{}`,
+      `${OID} refs/heads/.hidden`,
+      `${OID} refs/heads/main extra`,
+      `${OID}refs/heads/main`,
+    ];
+    for (const row of malformed) {
+      const body = advertisementBody([row]);
+      await expect(
+        discover("http://host/repo", "git-upload-pack", {
+          http: canned(() => respond(body, "application/x-git-upload-pack-advertisement")),
+        }),
+      ).rejects.toMatchObject({ code: "ECORRUPT" });
+    }
   });
 
   it("bounds pkt-line text and cumulative negotiation input", async () => {
