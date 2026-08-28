@@ -261,6 +261,33 @@ function validatePushOption(option: string, index: number): number {
   }
 }
 
+function validatePushOptionList(pushOptions: unknown): void {
+  if (pushOptions !== undefined && !Array.isArray(pushOptions)) {
+    throw new GitError("EINVAL", "receive-pack push options must be an array");
+  }
+  if (Array.isArray(pushOptions) && pushOptions.length > MAX_PUSH_OPTIONS) {
+    throw new GitError("E2BIG", `push option count exceeds ${MAX_PUSH_OPTIONS}`);
+  }
+}
+
+/** Validate push-option text and return each value's exact UTF-8 wire size. */
+export function validatePushOptions(pushOptions: unknown): readonly number[] {
+  validatePushOptionList(pushOptions);
+  if (!Array.isArray(pushOptions)) return [];
+
+  const optionBytes: number[] = [];
+  let totalOptionBytes = 0;
+  for (const [index, option] of pushOptions.entries()) {
+    const bytes = validatePushOption(option, index);
+    if (bytes > MAX_PUSH_OPTIONS_BYTES - totalOptionBytes) {
+      throw new GitError("E2BIG", `push options exceed ${MAX_PUSH_OPTIONS_BYTES} bytes`);
+    }
+    optionBytes.push(bytes);
+    totalOptionBytes += bytes;
+  }
+  return optionBytes;
+}
+
 function requireCapability(advertised: Set<string>, capability: string): void {
   if (!advertised.has(capability)) {
     throw new GitError("EUNSUPPORTED", `remote does not support receive-pack ${capability}`);
@@ -277,9 +304,7 @@ function prepareRequest(
   if (request.commands.length > MAX_RECEIVE_PACK_COMMANDS) {
     throw new GitError("E2BIG", `receive-pack command count exceeds ${MAX_RECEIVE_PACK_COMMANDS}`);
   }
-  if (request.pushOptions !== undefined && !Array.isArray(request.pushOptions)) {
-    throw new GitError("EINVAL", "receive-pack push options must be an array");
-  }
+  validatePushOptionList(request.pushOptions);
   if (request.atomic !== undefined && typeof request.atomic !== "boolean") {
     throw new GitError("EINVAL", "receive-pack atomic must be a boolean");
   }
@@ -293,9 +318,6 @@ function prepareRequest(
     throw new GitError("EINVAL", "receive-pack message callback must be a function");
   }
   const pushOptions = request.pushOptions ?? [];
-  if (pushOptions.length > MAX_PUSH_OPTIONS) {
-    throw new GitError("E2BIG", `push option count exceeds ${MAX_PUSH_OPTIONS}`);
-  }
 
   const commands: ReceivePackCommand[] = [];
   const destinations = new Set<string>();
@@ -321,20 +343,15 @@ function prepareRequest(
     else hasNonDeletion = true;
   }
 
-  const optionBytes: number[] = [];
-  let totalOptionBytes = 0;
+  const optionBytes = validatePushOptions(pushOptions);
   for (const [index, option] of pushOptions.entries()) {
-    const bytes = validatePushOption(option, index);
-    if (bytes > MAX_PUSH_OPTIONS_BYTES - totalOptionBytes) {
-      throw new GitError("E2BIG", `push options exceed ${MAX_PUSH_OPTIONS_BYTES} bytes`);
-    }
+    const bytes = optionBytes[index];
+    if (bytes === undefined) throw new Error("receive-pack option accounting is incomplete");
     requestBytes = addRequestMemory(
       operationBudget,
       requestBytes,
       OPTION_FIXED_BYTES + retainedStringBytes(option),
     );
-    optionBytes.push(bytes);
-    totalOptionBytes += bytes;
   }
 
   requireCapability(request.advertised, "report-status");

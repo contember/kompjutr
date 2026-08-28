@@ -8,10 +8,12 @@ import { FLUSH, pkt } from "../src/core/protocol/pktline.js";
 import {
   MAX_PUSH_OPTION_BYTES,
   MAX_PUSH_OPTIONS,
+  MAX_PUSH_OPTIONS_BYTES,
   MAX_RECEIVE_PACK_COMMANDS,
   type ReceivePackCommand,
   type ReceivePackRequest,
   receivePack,
+  validatePushOptions,
 } from "../src/core/protocol/receive-pack.js";
 import { discover } from "../src/core/protocol/remote.js";
 import {
@@ -203,6 +205,29 @@ describe("receive-pack against Git", () => {
 });
 
 describe("receive-pack request validation", () => {
+  it("validates push options without commands or capability checks", () => {
+    expect(validatePushOptions(undefined)).toEqual([]);
+    expect(validatePushOptions([])).toEqual([]);
+    expect(validatePushOptions(["carriage\rreturn"])).toEqual([15]);
+
+    const exact = Array.from({ length: MAX_PUSH_OPTIONS }, () => "x".repeat(MAX_PUSH_OPTION_BYTES));
+    const exactBytes = validatePushOptions(exact);
+    expect(exactBytes).toHaveLength(MAX_PUSH_OPTIONS);
+    expect(exactBytes.reduce((total, bytes) => total + bytes, 0)).toBe(MAX_PUSH_OPTIONS_BYTES);
+
+    expect(() => validatePushOptions([...exact, ""])).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(() => validatePushOptions(["x".repeat(MAX_PUSH_OPTION_BYTES + 1)])).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    for (const malformed of ["not-an-array", [7], ["bad\0option"], ["bad\noption"], ["\ud800"]]) {
+      expect(() => validatePushOptions(malformed)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+    }
+  });
+
   it("rejects missing capabilities before POST", async () => {
     let posts = 0;
     const http: GitHttpClient = async () => {
