@@ -69,13 +69,13 @@ repository.
   `push origin <branch> [--force]`, and
   `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'`.
 
-What they issue that the surface still lacks, and the item that closes it:
+Coverage of the calls that decide whether Phase 1 is usable:
 
 | Call | Issued by | Item |
 |---|---|---|
-| a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | [38](38-clone-depth-and-deepening.md) — the default only; deepening is deferred |
-| `branch -m`, `remote set-url` | both | [18](18-branch-and-remote-management.md) — required subset |
-| `ls-files -- '<dir>/*-<hash>.svg'` | builder | [36](36-glob-pathspecs.md) |
+| a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | Served: optionless clone is complete; [38](38-clone-depth-and-deepening.md) now retains only explicit shallow deepening |
+| `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
+| `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | [36](36-glob-pathspecs.md) — glob filtering is served; untracked and standard-ignore selection remain |
 | `clone --filter=blob:none` | both | [41](41-partial-clone.md) — scale, not a correctness gate; `depth: 0` serves the workflow today |
 | `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | [61](61-git-shell-command-and-argv-entry.md) — git as a synchronous shell command plus `cli()` |
 
@@ -98,28 +98,28 @@ units) or *long* (roughly seven to ten); an item whose acceptance scope exceeds
 one work unit is split at the WU level inside its own sprint, never across two.
 A blocked item must not move ahead of its blocker.
 
-**Phase 1** closes every row of the table above and ends at an integration gate:
-one consumer adapter runs its real workflow against the package, and everything
-below the gate is re-planned from what that run finds. **Phase 2** is production
-scale. **Phase 3** is Git parity that no consumer issues; it stays filed and
-unscheduled until a caller appears.
+**Phase 1** closes every remaining row of the table above and ends at an
+integration gate: one consumer adapter runs its real workflow against the
+package, and everything below the gate is re-planned from what that run finds.
+**Phase 2** is production scale. **Phase 3** is Git parity that no consumer
+issues; it stays filed and unscheduled until a caller appears.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
 | **Phase 1 — a consumer can run** | | | | |
-| 1 | First-contact defaults | [38](38-clone-depth-and-deepening.md) (default + ADR), [18](18-branch-and-remote-management.md) (required subset), [36](36-glob-pathspecs.md) | normal | Small items both consumers hit on first use: a full clone by default, `branch -m`, a glob pathspec for `lsFiles`. |
-| 2 | Agent shell git | [61](61-git-shell-command-and-argv-entry.md) | normal | The agent's side of both workloads: git as a synchronous shell command and the argv entry point over the existing ops and formatters. Independent of sprint 1; may run in parallel with it. |
+| 1 | Agent shell git and builder file selection | [61](61-git-shell-command-and-argv-entry.md), [36](36-glob-pathspecs.md) (`lsFiles` modes only) | long | Close the two remaining consumer calls: synchronous local Git for the agent and bounded tracked/untracked/non-ignored selection for the builder. The work units are independent until facade integration. |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 3 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
+| 2 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
 | **Phase 2 — production scale** | | | | |
-| 4 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
-| 5 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
-| 6 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| 3 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
+| 4 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 5 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
 | **Phase 3 — parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
 | — | Plumbing reads | [39](39-plumbing-read-surface.md) | normal | Type/size probes, tree/blob filters, ref enumeration, and general commit enumeration have no current caller. |
+| — | Mutating glob pathspecs | [36](36-glob-pathspecs.md) (rest) | normal | Read selection is scheduled in Phase 1; no consumer currently issues glob-shaped add/rm/reset/checkout/clean/diff/status mutations. |
 | — | Rebase extensions | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | Both consumers issue `rebase <upstream>` and nothing else. |
 | — | Interactive rebase | [26](26-interactive-rebase.md) | long | |
 | — | Rebase merge topology | [27](27-rebase-merges.md) | long | |
@@ -136,16 +136,16 @@ units over the same files, and a long sprint does not make that safe.
 - [13 — Add force-with-lease push](13-force-with-lease.md)
 - [15 — Make network operations abortable](15-abortable-network-operations.md)
 - [17 — Add repository integrity audit and snapshots](17-integrity-audit-and-snapshots.md)
-- [18 — Complete branch and remote management](18-branch-and-remote-management.md)
+- [18 — Complete remaining branch and remote management](18-branch-and-remote-management.md)
 - [25 — Add explicit rebase targets and roots](25-rebase-targets-and-roots.md)
 - [26 — Add programmable interactive rebase](26-interactive-rebase.md)
 - [27 — Replay merge topology during rebase](27-rebase-merges.md)
 - [28 — Compose pull with native rebase](28-pull-rebase.md)
 - [29 — Update dependent refs after rebase](29-rebase-update-refs.md)
 - [35 — Add a staged diff mode](35-staged-diff.md)
-- [36 — Support glob pathspecs](36-glob-pathspecs.md)
+- [36 — Complete ls-files selection and mutating glob pathspecs](36-glob-pathspecs.md)
 - [37 — Complete history reads — patch output for `show`, path filter for `log`](37-history-reads-patch-and-paths.md)
-- [38 — Align clone depth with Git and allow deepening](38-clone-depth-and-deepening.md)
+- [38 — Deepen and unshallow repositories](38-clone-depth-and-deepening.md)
 - [39 — Complete the remaining plumbing reads](39-plumbing-read-surface.md)
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)

@@ -1,39 +1,22 @@
 ---
 id: 18
-title: Complete branch and remote management
+title: Complete remaining branch and remote management
 blocked-by: []
 ---
 
-# 18 — Complete branch and remote management
+# 18 — Complete remaining branch and remote management
 
-**Summary.** Add the small ref and config operations needed to maintain a cloned
-repository without manipulating implementation-specific config keys. Two of
-them are on both consumers' first-contact path and go first.
+**Summary.** Add the typed upstream and remote lifecycle operations that have no
+current consumer. Branch rename and single fetch-URL get/set are already served.
 
 ## Problem
 
-Branches can be created, listed, and deleted, while remotes can be added, listed,
-and removed. The typed API cannot rename branches or remotes, set an upstream,
-change fetch and push URLs, or remove a remote together with its tracking refs.
-
-The project builder runs `git branch -m main` right after `init` and re-points
-`origin` before pushing to a new home; the orchestrator does `remote set-url`
-and `remote get-url` when a sandbox is rebuilt. Today `branch -m` is spelled as
-`branch()` + `branchDelete()`, which detaches nothing but also migrates no
-branch config, and URL changes go through raw `configSet`.
+The native API can rename current and inactive branches atomically, including
+their exact `branch.<name>.*` config, and can get or replace one remote fetch
+URL. It still requires raw config access for upstream changes and has no typed
+remote rename, separate push-URL management, or tracking-ref cleanup on remove.
 
 ## Approach / acceptance
-
-**Required subset — both consumers issue these:**
-
-- Branch rename, including the current branch without detaching `HEAD`, with
-  its `branch.<name>.*` config migrated atomically and the checkout's raw
-  `HEAD` retargeted through the existing ref-mutation seam.
-- Remote URL get and set as typed operations over the existing config.
-- Real Git parity for current and inactive branch rename, a collision, and a
-  URL change followed by a push.
-
-**Rest — no caller yet:**
 
 - Explicit upstream set/unset operations.
 - Remote rename, separate fetch and push URLs, and explicit tracking-ref cleanup
@@ -48,4 +31,4 @@ branch config, and URL changes go through raw `configSet`.
 `src/core/ops/config.ts`, `src/core/ops/refs.ts`, `src/git/client.ts`,
 `src/compat/computer/client.ts`, `tests/refs.test.ts`, `tests/client.test.ts`
 
-<!-- Split 2026-08-28 by consumer demand -->
+<!-- Required first-contact subset shipped 2026-08-28; this file retains only the no-caller remainder. -->

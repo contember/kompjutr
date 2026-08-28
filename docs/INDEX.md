@@ -15,19 +15,16 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-28-first-contact-defaults.md`](sprints/sprint-2026-08-28-first-contact-defaults.md)
-  — Git-compatible clone defaults, branch rename, typed remote URLs, and bounded
-  `lsFiles()` globs.
+None. The next sprint has not started.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- First-contact defaults are active: full-history clone by default, the required
-  branch/remote subset, and a bounded glob pathspec for `lsFiles()`.
-- The backlog plan is gated on a consumer: Phase 1 closes the calls two internal
-  consumers issue, then one adapter runs end to end before anything else is
-  scheduled — [`backlog/README.md`](backlog/README.md#consumer-demand).
+- Next: agent-side synchronous Git commands plus bounded tracked/untracked/
+  non-ignored file selection for the builder.
+- Phase 1 then ends at a real consumer-adapter integration gate before later
+  work is re-planned — [`backlog/README.md`](backlog/README.md#consumer-demand).
 
 ## Key reference
 
@@ -54,9 +51,13 @@ decisions → reference → archive.
 - [`decisions/0010-require-valid-utf8-git-paths.md`](decisions/0010-require-valid-utf8-git-paths.md)
 - [`decisions/0012-run-maintenance-as-resumable-generations.md`](decisions/0012-run-maintenance-as-resumable-generations.md)
 - [`decisions/0013-publish-clones-through-provisional-ownership.md`](decisions/0013-publish-clones-through-provisional-ownership.md)
+- [`decisions/0014-default-clone-is-complete.md`](decisions/0014-default-clone-is-complete.md)
 
 ## Historical records
 
+- [`archive/sprint-2026-08-28-first-contact-defaults.md`](archive/sprint-2026-08-28-first-contact-defaults.md)
+  — complete clone defaults, atomic branch rename, typed remote URLs, and
+  bounded tracked `lsFiles()` globs.
 - [`archive/sprint-2026-08-28-refspec-transport.md`](archive/sprint-2026-08-28-refspec-transport.md)
   — bounded remote discovery, wildcard mapped fetch, exact atomic publication,
   and structured atomic multi-ref push with tracking reconciliation.

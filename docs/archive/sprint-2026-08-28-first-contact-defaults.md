@@ -1,3 +1,20 @@
+> **OUTCOME — shipped 2026-08-28.** Optionless clone now fetches complete
+> history, all branches, and normal tag coverage; explicit shallow and selection
+> options remain opt-in. Native callers gained atomic branch rename, bounded
+> typed remote URL access, and bounded default-glob filtering for tracked
+> `lsFiles()` index/ref reads. Commit map: plan → `3cc78f2`; WU1 → `e1bbec6`;
+> WU3 → `3b05a89`; WU4 → `4121ff7`; WU2 → `a7dbee7`; facade integration →
+> `bdbb237`; remote bounds and facade validation → `5bec3c6` and `16d369d`;
+> closure isolation witnesses → `9a09bc1` and `2cc3c28`; closure → this
+> archived record. Verification: the routine gate passed 139 tests in 5.27 s;
+> the complete sliced runner passed 2,721 tests with five known skips and zero
+> failures, with its slowest 96-test E2E slice at 64.94 s. Typecheck, Biome,
+> build, and diff validation passed. Independent T3 integration review approved
+> the final implementation after affected fixes. Deferred: untracked and
+> standard-ignore `lsFiles()` modes, mutating glob pathspecs, deepening,
+> upstream and remaining remote lifecycle management, partial clone, SSH,
+> abort signals, and force-with-lease.
+
 # Sprint — First-contact defaults (2026-08-28)
 
 **Goal.** Make the first operations issued by a real consumer behave like Git
@@ -165,8 +182,11 @@ are binding.
   cleanup remain in
   [backlog 18](../backlog/18-branch-and-remote-management.md).
 - Glob pathspecs for add/rm/reset/checkout/clean/diff/status remain in
-  [backlog 36](../backlog/36-glob-pathspecs.md); this sprint closes only the
-  first-contact `lsFiles()` call.
+  [backlog 36](../backlog/36-glob-pathspecs.md); this sprint closes only tracked
+  index/ref glob filtering for `lsFiles()`.
+- `lsFiles --others --exclude-standard` selection also remains in backlog 36.
+  The sprint closes the bounded pathspec part of the builder call, not its
+  untracked/ignore modes.
 - Pathspec magic (`:(exclude)`, `:(icase)`, attributes, top/literal aliases),
   partial clone, SSH, abort signals, and force-with-lease are unchanged.
 - `@cloudflare/computer` receives the corrected clone default because it shares
@@ -219,3 +239,45 @@ whether the review strategy is proportionate to each WU and integrated risk.
 - 2026-08-28 — Initial plan review blocked WU2 and WU4; proposal corrected and
   returned for review before implementation.
 - 2026-08-28 — Beauvoir approved the corrected plan; implementation may start.
+- 2026-08-28 — WU1 landed as `e1bbec6`; its independent review was clean after
+  preserving explicit single-branch tag auto-follow, and the complete clone
+  file passed 38/38 in 23 seconds.
+- 2026-08-28 — Initial T3 reviews returned WU2 for exact dotted config-section
+  bounds and validation, and WU4 for bounded derived-tree traversal plus stricter
+  runtime/pathspec semantics. Both work units entered their required fix and
+  re-review loop before facade integration.
+- 2026-08-28 — WU3 landed as `3b05a89`; its T1 witness proves typed remote URL
+  get/set, the next fetch target, push fallback, and fail-closed missing or
+  multi-valued URL handling.
+- 2026-08-28 — WU4 landed as `4121ff7` after review-to-clean. The final gate
+  proved the deepest legal derived-tree path in 9 SQL statements and an index
+  worst case of 903 statements, with pathspec and ignore isolation clean.
+- 2026-08-28 — WU2 landed as `a7dbee7` after review-to-clean. Its final gate
+  passed 20 focused rename/config-section witnesses and approved exact dotted
+  sections, indexed bounded updates, strict stored UTF-8, and atomic rollback.
+- 2026-08-28 — Native facade integration landed as `bdbb237`; complete client
+  and public-export files passed 44/44, then the routine smoke suite passed
+  139/139 in 5.3 seconds.
+- 2026-08-28 — Integration review found that the builder's full `ls-files`
+  command also needs untracked and standard-ignore modes. Backlog 36 and the
+  Phase 1 schedule were re-scoped instead of overstating WU4's tracked-path
+  result.
+- 2026-08-28 — Remote URL access was hardened in `5bec3c6` and `16d369d` with
+  bounded metadata-first reads, byte-exact stored UTF-8 validation, explicit
+  name/value caps, runtime facade-option validation, and public limit witnesses.
+- 2026-08-28 — The final T3 integration review was clean. Its independent gates
+  passed 78 cross-WU tests and 11 remote/store/export bounds tests; no material
+  finding remained.
+- 2026-08-28 — The first closure run exposed two push checkpoint tests that
+  implicitly depended on the old single-branch clone default. `9a09bc1` made
+  that test intent explicit and the complete checkpoint file passed 8/8.
+- 2026-08-28 — The second closure run exposed protocol's 100 ms timing witness
+  running beside heavy clone and concurrency files. `2cc3c28` moved that file
+  to a one-worker full-suite slice without weakening its threshold; the isolated
+  protocol file passed 42/42.
+- 2026-08-28 — The final sliced full suite passed 2,721 tests with five known
+  skips and no failures. The routine suite passed 139/139 in 5.27 seconds;
+  typecheck, Biome, build, and diff validation also passed.
+- 2026-08-28 — The agent-docs structure lint retained its pre-existing hard
+  finding for tracked `docs/AGENTS.md`; this sprint did not modify that unrelated
+  root file.

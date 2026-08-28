@@ -20,6 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-08-28-first-contact-defaults.md`](sprint-2026-08-28-first-contact-defaults.md)
-  — Git-compatible clone defaults, branch rename, typed remote URLs, and bounded
-  `lsFiles()` globs.
+None. The next sprint is selected in [`../backlog/README.md`](../backlog/README.md).

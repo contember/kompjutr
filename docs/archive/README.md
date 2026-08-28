@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [First-contact defaults](sprint-2026-08-28-first-contact-defaults.md)
+  — complete clone defaults, atomic branch rename, typed remote URLs, and
+  bounded tracked `lsFiles()` globs.
 - [Refspec transport](sprint-2026-08-28-refspec-transport.md)
   — bounded remote discovery, wildcard mapped fetch, exact atomic publication,
   and structured atomic multi-ref push with tracking reconciliation.
