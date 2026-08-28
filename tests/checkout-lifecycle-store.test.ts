@@ -480,7 +480,7 @@ describe("checkout lifecycle storage", () => {
     expect(busyQueries).toEqual([[expect.any(String), 1]]);
   });
 
-  it("bulk-removes the maximum non-primary set in five statements and is idempotent", () => {
+  it("bulk-removes the maximum non-primary set in seven statements and is idempotent", () => {
     const { db, database, primary } = repository();
     db.run(
       `WITH RECURSIVE sequence(id) AS (
@@ -500,7 +500,7 @@ describe("checkout lifecycle storage", () => {
     expect(removed).toHaveLength(1_023);
     expect(Object.isFrozen(removed)).toBe(true);
     expect(removed.every(Object.isFrozen)).toBe(true);
-    expect(db.storage.statementCount).toBe(5);
+    expect(db.storage.statementCount).toBe(7);
     expect(database.listCheckouts(primary.repoId)).toEqual([primary]);
     expect(database.removeCheckouts(primary.repoId, ids)).toEqual([]);
   });
