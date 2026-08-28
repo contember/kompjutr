@@ -90,6 +90,7 @@ export type {
   RemoteTarget,
 } from "../core/ops/refspec.js";
 
+import type { LsFilesOptions } from "../core/ops/pathspec.js";
 import {
   type CatFileOptions,
   type CommitTreeOptions,
@@ -137,9 +138,11 @@ import {
 import {
   type BranchDeleteOptions,
   type BranchOptions,
+  type BranchRenameOptions,
   branchDelete as branchDeleteOp,
   branchList as branchListOp,
   branch as branchOp,
+  branchRename as branchRenameOp,
   type CheckoutOptions,
   type CurrentBranchOptions,
   checkout as checkoutOp,
@@ -229,6 +232,7 @@ export type GitRebaseOptions = RebaseStartOptions & GitDirOptions;
 export type GitRebaseContinueOptions = RebaseContinueOptions & GitDirOptions;
 export type GitBranchOptions = BranchOptions & GitDirOptions;
 export type GitBranchDeleteOptions = BranchDeleteOptions & GitDirOptions;
+export type GitBranchRenameOptions = BranchRenameOptions & GitDirOptions;
 export type GitTagOptions = TagOptions & GitDirOptions;
 export type GitTagDeleteOptions = TagDeleteOptions & GitDirOptions;
 export type GitCheckoutOptions = CheckoutOptions & GitDirOptions;
@@ -246,6 +250,7 @@ export type GitCommitTreeOptions = CommitTreeOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
 export type GitDivergenceOptions = DivergenceOptions & GitDirOptions;
 export type GitMergeBaseOptions = MergeBaseOptions & GitDirOptions;
+export type GitLsFilesOptions = Pick<LsFilesOptions, "paths"> & GitDirOptions & { ref?: string };
 export type GitLsTreeOptions = LsTreeOptions & GitDirOptions & { ref: string; path?: string };
 export type GitReadRefOptions = ReadRefOptions & GitDirOptions;
 export type GitRefLogOptions = RefLogReadOptions & GitDirOptions;
@@ -317,10 +322,11 @@ export interface Git {
   repoRoot(input?: GitDirOptions): Promise<string>;
   maintenance(input?: GitMaintenanceOptions): Promise<GitMaintenanceResult>;
   currentBranch(input?: GitDirOptions & CurrentBranchOptions): Promise<string | undefined>;
-  lsFiles(input?: GitDirOptions & { ref?: string }): Promise<string[]>;
+  lsFiles(input?: GitLsFilesOptions): Promise<string[]>;
   lsTree(input: GitLsTreeOptions): Promise<TreeEntryView[]>;
   branch(input: GitBranchOptions): Promise<void>;
   branchDelete(input: GitBranchDeleteOptions): Promise<void>;
+  branchRename(input: GitBranchRenameOptions): Promise<void>;
   branchList(input?: GitDirOptions): Promise<string[]>;
   tag(input: GitTagOptions): Promise<void>;
   tagDelete(input: GitTagDeleteOptions): Promise<void>;
@@ -548,8 +554,11 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return currentBranchOp(at(input.dir), input);
     },
     async lsFiles(input = {}) {
-      const repo = at(input.dir);
-      return input.ref === undefined ? lsFilesOp(repo) : lsFilesAtRef(repo, input.ref);
+      const { dir, ref, ...lsFilesOptions } = input;
+      const repo = at(dir);
+      return ref === undefined
+        ? lsFilesOp(repo, lsFilesOptions)
+        : lsFilesAtRef(repo, ref, lsFilesOptions);
     },
     async lsTree(input) {
       return lsTreeOp(at(input.dir), input.ref, input.path, { recursive: input.recursive });
@@ -563,6 +572,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       const repo = at(input.dir);
       repo.checkout.requireNoOperationState();
       branchDeleteOp(context, repo, input);
+    },
+    async branchRename(input) {
+      branchRenameOp(context, at(input.dir), input);
     },
     async branchList(input = {}) {
       return branchListOp(at(input.dir));

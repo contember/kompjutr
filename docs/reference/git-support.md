@@ -327,7 +327,9 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 
 | Git | kompjutr | |
 |---|---|---|
-| `git ls-files` | `lsFiles()` | ★ ~ index paths; `{ ref }` lists a tree instead. ✘ `--stage`, ✘ `--others`/`--exclude-standard`, ✘ `--error-unmatch` |
+| `git ls-files` | `lsFiles()` | ★ ~ index paths; `{ ref }` lists a tree instead |
+| `git ls-files -- <pathspecs>` | `lsFiles({ paths })` | ★ ~ bounded literals and default `*`, `?`, bracket-class, and `**` globs; wildcards cross `/`. Leading `/` and all leading-`:` magic are rejected; bare leading `!` and `^` are literals |
+| `--stage`, `--others`, `--exclude-standard`, `--error-unmatch` | — | ✘ |
 | `git ls-tree <ref> [<path>]` | `lsTree()` | ★ ~ one level by default; `recursive: true` returns bounded recursive mode/type/oid/path rows; a `<path>` naming a blob returns that single entry |
 | `git cat-file <oid>` | `catFile()` | ★ ~ returns `{ oid, bytes }`; `filepath` or the `<oid>:<path>` shorthand reads inside a tree. ✘ `-t`, `-s`, `-p`, ✘ `-e` (a missing path throws instead of exiting non-zero) |
 | `git hash-object [-w]` | `hashObject()` | ~ blobs only; `write` stores it. ✘ `-t commit\|tree\|tag`, ✘ stdin batching |
@@ -343,7 +345,7 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 
 ## Branches, tags and refs
 
-### `git branch` — `branch()`, `branchDelete()`, `branchList()`
+### `git branch` — `branch()`, `branchDelete()`, `branchRename()`, `branchList()`
 
 | Git | kompjutr | |
 |---|---|---|
@@ -351,9 +353,10 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | `-f`, `--force` | `force` | ✔ |
 | `-d` | `branchDelete({ name })` | ★ ✔ deletes only when the tip is provably reachable from the comparison commit; retains bounded recovery history |
 | `-D` | `branchDelete({ name, force: true })` | ✔ bypasses only the reachability proof |
+| `-m <new>` / `-m <old> <new>` | `branchRename({ newName })` / `branchRename({ oldName, newName })` | ★ ✔ atomically moves the direct ref, selected symbolic `HEAD`, and bounded `branch.<name>.*` config |
 | `--list` | `branchList()` | ✔ names only |
 | `--show-current` | `currentBranch()` | ★ ✔ `undefined` on a detached HEAD |
-| `-m` (rename), `--set-upstream-to`, `--contains`, `-v` | — | ★ ✘ set upstream through `configSet("branch.<n>.remote"/"…merge")`; rename is create-plus-delete |
+| `--set-upstream-to`, `--contains`, `-v` | — | ★ ✘ set upstream through `configSet("branch.<n>.remote"/"…merge")` |
 
 Safe deletion prefers the branch's configured local or remote-tracking
 upstream when that direct target exists. Otherwise it compares with the active
@@ -367,6 +370,11 @@ does not bypass authoritative commit validation, structural bounds, or the
 transactional expected-tip guard that prevents deleting a concurrently moved
 ref. The Computer interface has no `force` field, so its `branchDelete()`
 exposes only the safe default.
+
+Rename has no force mode. It rejects an occupied destination, a detached
+selected checkout, a source attached to another checkout, destination branch
+config, and an active operation. Upstream management and remote rename remain
+separate, unsupported operations.
 
 ### `git tag` — `tag()`, `tagDelete()`, `tagList()`
 
@@ -698,6 +706,7 @@ merge — with these differences:
 - ✘ no linked-checkout lifecycle, `divergence`, or `readRef` surface;
 - ✘ no `readTree`, `writeTree`, `commitTree`, or scoped scratch-index surface;
 - ✘ no `lsRemote` surface;
+- ✘ no native `branchRename()` or `lsFiles({ paths })` extensions;
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
@@ -789,7 +798,7 @@ consumer adapter is outside this package.
 | `diff --binary --full-index <snap>^ <snap>` then `apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` while the snapshot and new tip share one object store; no textual patch crosses the process boundary |
 | `update-ref <ref> <new> <old>` / guarded `-d` | `updateRef({ ref, value, expected })` / `updateRef({ ref, delete: true, expected })`; a stale direct target throws `ESTALEHEAD` |
 | `reset --hard FETCH_HEAD` | `reset({ ref: fetch().fetchHead, hard: true })` |
-| `branch -m main` | `branch()` then `branchDelete()` |
+| `branch -m main` | `branchRename({ newName: "main" })` |
 | `push -u origin main` | `push()` then `configSet("branch.main.remote"/"…merge")` |
 | `symbolic-ref -q HEAD` | `currentBranch({ fullname: true })` |
 | `symbolic-ref -q refs/remotes/origin/HEAD` | `readRef({ ref: "refs/remotes/origin/HEAD" })` |

@@ -529,6 +529,56 @@ describe("createSqliteGitClient", () => {
     expect(tables).toContain("git_index");
   });
 
+  it("supports branch rename for current and inactive branches through the native facade", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/branch-rename";
+    await git.init({ dir });
+    await commitFile(git, workspace, dir, "README.md", "base\n", "base");
+    await git.configSet({ dir, path: "branch.main.remote", value: "origin" });
+    await git.branch({ dir, name: "topic" });
+    await git.configSet({ dir, path: "branch.topic.merge", value: "refs/heads/topic" });
+
+    await git.branchRename({ dir, newName: "primary" });
+
+    await expect(git.currentBranch({ dir })).resolves.toBe("primary");
+    await expect(git.branchList({ dir })).resolves.toEqual(["primary", "topic"]);
+    await expect(git.configGet({ dir, path: "branch.primary.remote" })).resolves.toBe("origin");
+    await expect(git.configGet({ dir, path: "branch.main.remote" })).resolves.toBeUndefined();
+
+    await git.branchRename({ dir, oldName: "topic", newName: "feature" });
+
+    await expect(git.currentBranch({ dir })).resolves.toBe("primary");
+    await expect(git.branchList({ dir })).resolves.toEqual(["feature", "primary"]);
+    await expect(git.configGet({ dir, path: "branch.feature.merge" })).resolves.toBe(
+      "refs/heads/topic",
+    );
+    await expect(git.configGet({ dir, path: "branch.topic.merge" })).resolves.toBeUndefined();
+  });
+
+  it("selects index and ref paths through lsFiles pathspecs", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/ls-files-pathspec";
+    await git.init({ dir });
+    writeWorkFile(workspace, `${dir}/root.ts`, "root\n");
+    writeWorkFile(workspace, `${dir}/dir/one.ts`, "one\n");
+    writeWorkFile(workspace, `${dir}/dir/nested/two.ts`, "two\n");
+    writeWorkFile(workspace, `${dir}/dir/readme.md`, "readme\n");
+    await git.add({ dir, paths: ["."], all: true });
+    await git.commit({ dir, message: "tracked paths" });
+    writeWorkFile(workspace, `${dir}/dir/staged.ts`, "staged\n");
+    await git.add({ dir, paths: ["dir/staged.ts"] });
+
+    await expect(git.lsFiles({ dir, paths: ["dir/*.ts"] })).resolves.toEqual([
+      "dir/nested/two.ts",
+      "dir/one.ts",
+      "dir/staged.ts",
+    ]);
+    await expect(git.lsFiles({ dir, ref: "HEAD", paths: ["dir/*.ts"] })).resolves.toEqual([
+      "dir/nested/two.ts",
+      "dir/one.ts",
+    ]);
+  });
+
   it("uses the workspace's default identity when nothing else supplies one", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});
@@ -1066,6 +1116,7 @@ describe("createSqliteGitClient", () => {
       () => git.commit({ dir, message: "blocked" }),
       () => git.branch({ dir, name: "blocked" }),
       () => git.branchDelete({ dir, name: "spare" }),
+      () => git.branchRename({ dir, newName: "blocked" }),
       () => git.tag({ dir, name: "blocked" }),
       () => git.tagDelete({ dir, name: "before-rebase" }),
       () => git.checkout({ dir, ref: "upstream" }),

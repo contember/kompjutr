@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  GitBranchRenameOptions,
   GitCherryPickContinueOptions,
   GitCherryPickOptions,
   GitCommitTreeOptions,
@@ -32,6 +33,7 @@ import type {
   GitFetchOptions,
   FetchRefspec as GitFetchRefspec,
   FetchRefUpdate as GitFetchRefUpdate,
+  GitLsFilesOptions,
   GitLsRemoteOptions,
   LsRemoteResult as GitLsRemoteResult,
   GitLsTreeOptions,
@@ -100,6 +102,7 @@ import {
   writeTree as gitWriteTree,
 } from "../src/git/index.js";
 import type {
+  GitBranchRenameOptions as RootBranchRenameOptions,
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
   GitCherryPickOptions as RootCherryPickOptions,
   GitCommitTreeOptions as RootCommitTreeOptions,
@@ -138,6 +141,7 @@ import type {
   GitUpdateRefOptions as RootGitUpdateRefOptions,
   GitWorktreeAddOptions as RootGitWorktreeAddOptions,
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
+  GitLsFilesOptions as RootLsFilesOptions,
   LsRemoteResult as RootLsRemoteResult,
   PushRefStatus as RootPushRefStatus,
   PushRefspec as RootPushRefspec,
@@ -314,6 +318,31 @@ describe("public object-write plumbing exports", () => {
 });
 
 describe("public bounded read exports", () => {
+  it("exposes matching branch-rename and ls-files facade contracts", () => {
+    const rootRename: RootBranchRenameOptions = {
+      dir: "/repo",
+      oldName: "main",
+      newName: "primary",
+    };
+    const gitRename: GitBranchRenameOptions = rootRename;
+    const rootLsFiles: RootLsFilesOptions = {
+      dir: "/repo",
+      ref: "HEAD",
+      paths: ["src/*.ts"],
+    };
+    const gitLsFiles: GitLsFilesOptions = rootLsFiles;
+    const rootMethods: readonly (keyof RootGit)[] = ["branchRename", "lsFiles"];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
+
+    expect([
+      gitRename.oldName,
+      gitRename.newName,
+      gitLsFiles.ref,
+      gitLsFiles.paths,
+      gitMethods,
+    ]).toEqual(["main", "primary", "HEAD", ["src/*.ts"], rootMethods]);
+  });
+
   it("exposes matching divergence and raw-ref operations from both entrypoints", () => {
     const coreDivergence: RootCoreDivergenceOptions = { current: "HEAD", upstream: "main" };
     const gitCoreDivergence: GitCoreDivergenceOptions = coreDivergence;
