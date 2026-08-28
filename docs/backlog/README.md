@@ -53,6 +53,9 @@ not effort: a wrong answer outranks a missing one.
   [42](42-remote-ref-discovery-and-refspec-fetch.md).
 - **Not a parity gap.** [60](60-consolidate-limits-and-split-store.md) is
   cleanup: no new behaviour, no new surface.
+  [62](62-sparse-status-rename-classification.md) is performance: a
+  tracker-backed `status` still pays a whole-repository join for rename
+  detection.
 
 ## Consumer demand
 
@@ -169,3 +172,4 @@ units over the same files, and a long sprint does not make that safe.
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [60 — Consolidate operation limits and split the store](60-consolidate-limits-and-split-store.md)
 - [61 — Provide git as a synchronous shell command and the argv entry point](61-git-shell-command-and-argv-entry.md)
+- [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
