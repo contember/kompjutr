@@ -31,6 +31,7 @@ import type {
   GitStatusReportOptions as GitEntrypointStatusReportOptions,
   FetchRefspec as GitFetchRefspec,
   FetchRefUpdate as GitFetchRefUpdate,
+  GitLsRemoteOptions,
   LsRemoteResult as GitLsRemoteResult,
   GitLsTreeOptions,
   GitMergeBaseOptions,
@@ -74,6 +75,9 @@ import type {
   GitWriteTreeOptions,
 } from "../src/git/index.js";
 import {
+  MAX_LS_REMOTE_PATTERN_BYTES as GIT_MAX_LS_REMOTE_PATTERN_BYTES,
+  MAX_LS_REMOTE_PATTERNS as GIT_MAX_LS_REMOTE_PATTERNS,
+  MAX_LS_REMOTE_REFS as GIT_MAX_LS_REMOTE_REFS,
   MAX_REFSPEC_EXPANDED_DESTINATIONS as GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS as GIT_MAX_REFSPEC_MAPPINGS,
   MAX_REFSPEC_REF_BYTES as GIT_MAX_REFSPEC_REF_BYTES,
@@ -120,6 +124,7 @@ import type {
   FetchRefUpdate as RootFetchRefUpdate,
   Git as RootGit,
   GitDivergenceOptions as RootGitDivergenceOptions,
+  GitLsRemoteOptions as RootGitLsRemoteOptions,
   GitLsTreeOptions as RootGitLsTreeOptions,
   GitMergeBaseOptions as RootGitMergeBaseOptions,
   GitReadRefOptions as RootGitReadRefOptions,
@@ -166,6 +171,9 @@ import type {
   GitWriteTreeOptions as RootWriteTreeOptions,
 } from "../src/index.js";
 import {
+  MAX_LS_REMOTE_PATTERN_BYTES as ROOT_MAX_LS_REMOTE_PATTERN_BYTES,
+  MAX_LS_REMOTE_PATTERNS as ROOT_MAX_LS_REMOTE_PATTERNS,
+  MAX_LS_REMOTE_REFS as ROOT_MAX_LS_REMOTE_REFS,
   MAX_REFSPEC_EXPANDED_DESTINATIONS as ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS as ROOT_MAX_REFSPEC_MAPPINGS,
   MAX_REFSPEC_REF_BYTES as ROOT_MAX_REFSPEC_REF_BYTES,
@@ -743,6 +751,18 @@ describe("public structured refspec exports", () => {
     const gitRemoteRef: GitRemoteRefView = remoteRef;
     const lsRemote: RootLsRemoteResult = { refs: [remoteRef], headRef: update.source };
     const gitLsRemote: GitLsRemoteResult = lsRemote;
+    const lsRemoteOptions: RootGitLsRemoteOptions = {
+      dir: "/repo",
+      remote: "origin",
+      patterns: ["refs/heads/*"],
+    };
+    const gitLsRemoteOptions: GitLsRemoteOptions = lsRemoteOptions;
+    const urlLsRemoteOptions: GitLsRemoteOptions = {
+      url: "https://example.test/repo.git",
+    };
+    const rootUrlLsRemoteOptions: RootGitLsRemoteOptions = urlLsRemoteOptions;
+    const rootMethods: readonly (keyof RootGit)[] = ["lsRemote"];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
     const status: RootPushRefStatus = { ref: push.destination, ok: true, error: null };
     const gitStatus: GitPushRefStatus = status;
     const tracking: RootPushTrackingResult = { outcome: "not-applicable" };
@@ -765,6 +785,9 @@ describe("public structured refspec exports", () => {
       gitFetchResult.mode,
       gitRemoteRef.name,
       gitLsRemote.headRef,
+      gitLsRemoteOptions.patterns,
+      rootUrlLsRemoteOptions.url,
+      gitMethods,
       gitStatus.ok,
       gitTracking.outcome,
       gitPushResult.ok,
@@ -774,6 +797,12 @@ describe("public structured refspec exports", () => {
       ROOT_MAX_REFSPEC_MAPPINGS,
       ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
       ROOT_MAX_REFSPEC_REF_BYTES,
+      GIT_MAX_LS_REMOTE_PATTERNS,
+      GIT_MAX_LS_REMOTE_PATTERN_BYTES,
+      GIT_MAX_LS_REMOTE_REFS,
+      ROOT_MAX_LS_REMOTE_PATTERNS,
+      ROOT_MAX_LS_REMOTE_PATTERN_BYTES,
+      ROOT_MAX_LS_REMOTE_REFS,
     ]).toEqual([
       "refs/remotes/origin/*",
       "refs/checkpoints/old",
@@ -783,6 +812,9 @@ describe("public structured refspec exports", () => {
       "mapped",
       "refs/heads/main",
       "refs/heads/main",
+      ["refs/heads/*"],
+      "https://example.test/repo.git",
+      rootMethods,
       true,
       "not-applicable",
       true,
@@ -792,6 +824,12 @@ describe("public structured refspec exports", () => {
       1_024,
       1_024,
       1_024,
+      1_024,
+      1_024,
+      16_384,
+      1_024,
+      1_024,
+      16_384,
     ]);
   });
 });

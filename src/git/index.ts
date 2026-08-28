@@ -25,6 +25,11 @@ export type {
   StatusRow,
 } from "../core/ops/kinds.js";
 export {
+  MAX_LS_REMOTE_PATTERN_BYTES,
+  MAX_LS_REMOTE_PATTERNS,
+  MAX_LS_REMOTE_REFS,
+} from "../core/ops/ls-remote.js";
+export {
   type DivergenceOptions,
   type DivergenceRelationship,
   type DivergenceResult,
@@ -146,6 +151,7 @@ export {
   type GitFetchOptions,
   type GitHashObjectOptions,
   type GitInitOptions,
+  type GitLsRemoteOptions,
   type GitLsTreeOptions,
   type GitMaintenanceOptions,
   type GitMaintenanceResult,

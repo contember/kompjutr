@@ -7,6 +7,7 @@
 
 import { isOid, utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
+import type { TransportOperationBudget } from "../ops/transport-budget.js";
 import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
 import { retainedStringBytes } from "../retained.js";
 import { FLUSH, pkt } from "./pktline.js";
@@ -72,6 +73,10 @@ export interface ProtocolRequestOptions extends RemoteRequestOptions {
   authSession?: RemoteAuthSession;
 }
 
+interface DiscoveryRequestOptions extends ProtocolRequestOptions {
+  operationBudget?: TransportOperationBudget;
+}
+
 class NegotiationBudget {
   #retained: number;
   #input = 0;
@@ -80,8 +85,11 @@ class NegotiationBudget {
   constructor(
     private readonly limits: ResolvedProtocolMemoryLimits,
     fixedBytes: number,
+    private readonly operationBudget?: TransportOperationBudget,
+    private readonly memoryPart = "protocol-negotiation",
   ) {
     if (fixedBytes > limits.retainedBytes) this.#tooLarge("retained state");
+    operationBudget?.setMemory(memoryPart, fixedBytes);
     this.#retained = fixedBytes;
   }
 
@@ -95,6 +103,7 @@ class NegotiationBudget {
   reserve(bytes: number, entries = 1): void {
     if (entries > this.limits.entries - this.#entries) this.#tooLarge("entry count");
     if (bytes > this.limits.retainedBytes - this.#retained) this.#tooLarge("retained state");
+    this.operationBudget?.setMemory(this.memoryPart, this.#retained + bytes);
     this.#entries += entries;
     this.#retained += bytes;
   }
@@ -191,11 +200,13 @@ export function baseHeaders(): Record<string, string> {
 export async function discover(
   url: string,
   service: Service,
-  options: ProtocolRequestOptions = {},
+  options: DiscoveryRequestOptions = {},
 ): Promise<Advertisement> {
   const budget = new NegotiationBudget(
     resolvedProtocolLimits(options.protocolLimits),
     ADVERTISEMENT_FIXED_BYTES,
+    options.operationBudget,
+    "protocol-discovery",
   );
   const base = normalizeRemoteUrl(url);
   const response = await requestWithAuth(

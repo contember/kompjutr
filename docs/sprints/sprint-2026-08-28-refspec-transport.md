@@ -793,3 +793,8 @@ findings are resolved before implementation.
   Biome, and diff-check passed. Behavior-coupled facade options remain with
   WU2, WU4, and WU7, while their independent result and mapping types are now
   public.
+- 2026-08-28: WU2 exposed one-shot `lsRemote` over the validated advertisement
+  with bounded Git tail-wildmatch patterns, aggregate memory/SQL accounting,
+  stable auth/transport errors, and no durable mutation or caching. Real Smart
+  HTTP parity and request-count witnesses passed 20 tests in 2.39 seconds;
+  typecheck, Biome, and diff-check passed.
