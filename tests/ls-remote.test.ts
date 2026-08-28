@@ -251,6 +251,11 @@ describe("lsRemote", () => {
     await expect(git.lsRemote({ url: "ssh://example.test/repo.git" })).rejects.toMatchObject({
       code: "EURLSCHEME",
     });
+    for (const field of ["onAuth", "onProgress", "onMessage"]) {
+      const invalidCallback: GitLsRemoteOptions = {};
+      Object.defineProperty(invalidCallback, field, { value: "invalid", enumerable: true });
+      await expect(git.lsRemote(invalidCallback)).rejects.toMatchObject({ code: "EINVAL" });
+    }
 
     expect(requestTail(beforeRequests)).toHaveLength(0);
   });

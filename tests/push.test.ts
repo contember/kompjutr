@@ -1,10 +1,16 @@
 import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
-import { createSqliteGitClient } from "../src/compat/computer.js";
+import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
+import { openRepository } from "../src/core/context.js";
+import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServerOptions, startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
+import { makeWorkspace } from "./helpers/workspace.js";
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
 const fixtures: GitFixture[] = [];
@@ -27,6 +33,16 @@ function workspace(storage = new SqliteTestStorage()): Workspace {
     storage,
     git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
     defaultGitIdentity: IDENTITY,
+  });
+}
+
+function nativeGit(ws: Workspace, storage: SqliteTestStorage): Git {
+  return createGit()({
+    database: new SqliteGitDatabase(new TestDatabase(storage)),
+    worktree: new ComputerWorktree(ws.provider()),
+    now: () => 1_600_000_000_000,
+    timezoneOffset: () => 0,
+    defaultIdentity: IDENTITY,
   });
 }
 
@@ -134,7 +150,13 @@ describe("push", () => {
       fixture.git("config", "receive.denyCurrentBranch", "refuse");
       const trackingEntries = reflog(storage, "refs/remotes/origin/main").length;
 
-      await expect(ws.git.push({})).rejects.toMatchObject({ code: "EPUSHREJECTED" });
+      await expect(ws.git.push({})).resolves.toEqual({
+        ok: false,
+        error: "branch is currently checked out",
+        refs: {
+          "refs/heads/main": { ok: false, error: "branch is currently checked out" },
+        },
+      });
 
       expect(await ws.git.revParse({ ref: "refs/remotes/origin/main" })).toBe(tracked);
       expect(reflog(storage, "refs/remotes/origin/main")).toHaveLength(trackingEntries);
@@ -263,6 +285,195 @@ describe("push", () => {
         timezone: 0,
         reason: "push",
       });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns the exact empty result for an unmatched wildcard without HTTP", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const git = nativeGit(ws, storage);
+      const requests = server.requests.length;
+
+      await expect(
+        git.push({
+          refspecs: [
+            {
+              source: "refs/heads/missing/*",
+              destination: "refs/heads/missing/*",
+            },
+          ],
+        }),
+      ).resolves.toEqual({
+        ok: true,
+        error: null,
+        unpack: { ok: true },
+        refs: [],
+        tracking: { outcome: "not-applicable" },
+      });
+      expect(server.requests).toHaveLength(requests);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("validates atomic push options locally and sends valid options", async () => {
+    const fixture = remoteFixture();
+    fixture.git("config", "receive.advertisePushOptions", "true");
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const git = nativeGit(ws, storage);
+      const oid = await localCommit(ws, "options\n", "push options");
+      const beforeInvalid = server.requests.length;
+
+      await expect(
+        git.push({
+          atomic: true,
+          pushOptions: ["invalid\noption"],
+          refspecs: [{ source: "refs/heads/main", destination: "refs/heads/main" }],
+        }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      expect(server.requests).toHaveLength(beforeInvalid);
+
+      await expect(
+        git.push({
+          atomic: true,
+          pushOptions: ["checkpoint.session=1"],
+          refspecs: [{ source: "refs/heads/main", destination: "refs/heads/main" }],
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        refs: [{ ref: "refs/heads/main", ok: true, error: null }],
+      });
+      expect(fixture.git("rev-parse", "refs/heads/main")).toBe(oid);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps one 1,024-command public push inside aggregate budgets", async () => {
+    const fixture = remoteFixture();
+    const remoteOid = fixture.git("rev-parse", "refs/heads/main");
+    const destinations = Array.from(
+      { length: 1_024 },
+      (_, index) => `refs/checkpoints/bulk/${index.toString().padStart(4, "0")}`,
+    );
+    fixture.gitInput(
+      `${destinations.map((destination) => `create ${destination} ${remoteOid}`).join("\n")}\n`,
+      "update-ref",
+      "--stdin",
+    );
+    const server = await startGitServer(fixture.dir, { requireAuth: true });
+    try {
+      const workspace = makeWorkspace();
+      const git = createGit()({
+        database: workspace.database,
+        worktree: workspace.worktree,
+        now: workspace.context.now,
+        timezoneOffset: workspace.context.timezoneOffset,
+        defaultIdentity: IDENTITY,
+      });
+      await git.init({});
+      await git.remoteAdd({ name: "origin", url: server.url });
+      const memory = openRepository(workspace.context, "/").store.memory;
+      memory.assertIdle();
+      const highWaterBefore = memory.highWaterBytes;
+      const first = destinations[0];
+      if (first === undefined) throw new Error("bulk push fixture is empty");
+      const refspecs: [PushRefspec, ...PushRefspec[]] = [
+        { source: null, destination: first },
+        ...destinations.slice(1).map((destination) => ({ source: null, destination })),
+      ];
+      const requestsBefore = server.requests.length;
+      workspace.storage.resetCounters();
+
+      const result = await git.push({
+        remote: "origin",
+        onAuth: () => ({ username: "agent", password: "secret" }),
+        refspecs,
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.refs).toHaveLength(1_024);
+      expect(result.refs.map((status) => status.ref)).toEqual(destinations);
+      expect(result.refs.every((status) => status.ok && status.error === null)).toBe(true);
+      expect(result.tracking).toEqual({ outcome: "not-applicable" });
+      expect(workspace.storage.statementCount).toBeLessThan(1_000);
+      expect(memory.highWaterBytes).toBeGreaterThan(highWaterBefore);
+      expect(memory.highWaterBytes).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
+      memory.assertIdle();
+      expect(server.requests.slice(requestsBefore).map((request) => request.method)).toEqual([
+        "GET",
+        "GET",
+        "POST",
+      ]);
+      expect(fixture.gitResult("show-ref", "--verify", first).status).not.toBe(0);
+      expect(fixture.gitResult("show-ref", "--verify", destinations.at(-1) ?? "").status).not.toBe(
+        0,
+      );
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps nonempty mappings when a sibling wildcard is empty", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const git = nativeGit(ws, storage);
+      const oid = await localCommit(ws, "mixed\n", "mixed mapping");
+
+      await expect(
+        git.push({
+          refspecs: [
+            {
+              source: "refs/heads/missing/*",
+              destination: "refs/heads/missing/*",
+            },
+            { source: "refs/heads/main", destination: "refs/heads/main" },
+          ],
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        refs: [{ ref: "refs/heads/main", ok: true, error: null }],
+      });
+      expect(fixture.git("rev-parse", "refs/heads/main")).toBe(oid);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("fails an exact-missing mixed set before discovery", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const git = nativeGit(ws, storage);
+      await localCommit(ws, "local\n", "local only");
+      const requests = server.requests.length;
+
+      await expect(
+        git.push({
+          refspecs: [
+            { source: "refs/heads/main", destination: "refs/heads/main" },
+            { source: "refs/heads/missing", destination: "refs/heads/missing" },
+          ],
+        }),
+      ).rejects.toMatchObject({ code: "EREFNOTFOUND" });
+      expect(server.requests).toHaveLength(requests);
     } finally {
       await server.close();
     }

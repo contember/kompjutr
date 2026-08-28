@@ -17,7 +17,6 @@ export type {
   DiffSummaryEntry,
   MergeResult,
   RebaseResult,
-  RefUpdateStatus,
   RemoteView,
   ReplayEmptyReason,
   ReplayResult,

@@ -36,6 +36,7 @@ import type {
   LsRemoteResult as GitLsRemoteResult,
   GitLsTreeOptions,
   GitMergeBaseOptions,
+  GitPushOptions,
   PushRefStatus as GitPushRefStatus,
   PushRefspec as GitPushRefspec,
   PushTrackingResult as GitPushTrackingResult,
@@ -129,6 +130,7 @@ import type {
   GitLsRemoteOptions as RootGitLsRemoteOptions,
   GitLsTreeOptions as RootGitLsTreeOptions,
   GitMergeBaseOptions as RootGitMergeBaseOptions,
+  GitPushOptions as RootGitPushOptions,
   GitReadRefOptions as RootGitReadRefOptions,
   GitRevParseOptions as RootGitRevParseOptions,
   GitUpdateRefOptions as RootGitUpdateRefOptions,
@@ -738,6 +740,28 @@ describe("public structured refspec exports", () => {
       destination: "refs/checkpoints/old",
     };
     const gitPush: GitPushRefspec = push;
+    const pushOptions: RootGitPushOptions = {
+      dir: "/repo",
+      remote: "origin",
+      atomic: true,
+      pushOptions: ["ci.skip=true"],
+      refspecs: [
+        {
+          source: "refs/heads/main",
+          destination: "refs/heads/main",
+        },
+        push,
+      ],
+    };
+    const gitPushOptions: GitPushOptions = pushOptions;
+    const legacyPushOptions: GitPushOptions = {
+      url: "https://example.test/repo.git",
+      ref: "main",
+      remoteRef: "release",
+      force: true,
+      delete: false,
+    };
+    const rootLegacyPushOptions: RootGitPushOptions = legacyPushOptions;
     const namedTarget: RootRemoteTarget = { remote: "origin" };
     const gitNamedTarget: GitRemoteTarget = namedTarget;
     const urlTarget: GitRemoteTarget = { url: "https://example.test/repo.git" };
@@ -769,7 +793,7 @@ describe("public structured refspec exports", () => {
       url: "https://example.test/repo.git",
     };
     const rootUrlLsRemoteOptions: RootGitLsRemoteOptions = urlLsRemoteOptions;
-    const rootMethods: readonly (keyof RootGit)[] = ["lsRemote"];
+    const rootMethods: readonly (keyof RootGit)[] = ["lsRemote", "push"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
     const status: RootPushRefStatus = { ref: push.destination, ok: true, error: null };
     const gitStatus: GitPushRefStatus = status;
@@ -783,11 +807,17 @@ describe("public structured refspec exports", () => {
       tracking,
     };
     const gitPushResult: GitStructuredPushResult = pushResult;
+    const pushMethod = async (_input?: RootGitPushOptions): Promise<RootStructuredPushResult> =>
+      pushResult;
+    const rootPushMethod: RootGit["push"] = pushMethod;
+    const gitPushMethod: GitEntrypointGit["push"] = rootPushMethod;
 
     expect([
       gitFetch.destination,
       fetchOptions.url,
       gitPush.destination,
+      gitPushOptions.atomic,
+      rootLegacyPushOptions.remoteRef,
       gitNamedTarget.remote,
       rootUrlTarget.url,
       gitUpdate.destination,
@@ -800,6 +830,7 @@ describe("public structured refspec exports", () => {
       gitStatus.ok,
       gitTracking.outcome,
       gitPushResult.ok,
+      typeof gitPushMethod,
       GIT_MAX_REFSPEC_MAPPINGS,
       GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
       GIT_MAX_REFSPEC_REF_BYTES,
@@ -816,6 +847,8 @@ describe("public structured refspec exports", () => {
       "refs/remotes/origin/*",
       "https://example.test/repo.git",
       "refs/checkpoints/old",
+      true,
+      "release",
       "origin",
       "https://example.test/repo.git",
       "refs/remotes/origin/main",
@@ -828,6 +861,7 @@ describe("public structured refspec exports", () => {
       true,
       "not-applicable",
       true,
+      "function",
       1_024,
       1_024,
       1_024,

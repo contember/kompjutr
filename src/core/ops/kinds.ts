@@ -63,17 +63,6 @@ export interface RemoteView {
   url: string;
 }
 
-export interface RefUpdateStatus {
-  ok: boolean;
-  error?: string;
-}
-
-export interface PushResult {
-  ok: boolean;
-  error: string | null;
-  refs: Record<string, RefUpdateStatus>;
-}
-
 export interface MergeResult {
   oid?: string;
   alreadyMerged?: boolean;

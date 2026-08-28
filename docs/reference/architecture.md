@@ -542,11 +542,28 @@ charges collision comparisons by bytes examined.
 
 ## Smart HTTP
 
-Clone and fetch stream incoming `upload-pack` responses directly into a
-provisional pack. Push discovers `receive-pack`, plans one branch update against
-the freshly advertised refs, and streams a replayable full-object pack. A 401
-opens a new body stream from the immutable OID plan; network failures never
-automatically replay a POST.
+Every `lsRemote()`, fetch, or push call owns one fresh advertisement and one
+root transport budget. `lsRemote()` validates and projects the advertisement
+without mutation. Legacy fetch selection and compiled exact or one-star fetch
+refspecs stream one `upload-pack` response into a provisional pack. Mapped fetch
+authenticates every selected object root and publishes all exact destinations
+in one fenced SQLite transaction; no failed member can leave a partial ref set.
+
+Push expands its compiled mappings from one bounded local-ref snapshot before
+network access, joins them with one `receive-pack` advertisement, and plans one
+deterministic union pack for every active destination. Ref commands and public
+results use destination UTF-8 byte order. Same-OID updates are reported but do
+not enter the command set; a wholly empty wildcard expansion performs no HTTP.
+The planner authenticates commit, tree, blob, and tag roots, rejects unsafe
+namespace changes before POST, and subtracts an advertised closure only when
+the local boundary proves it.
+
+One replayable request carries up to 1,024 commands, optional atomic capability,
+bounded push options, and at most one union pack. A 401 opens a new body stream
+from the immutable plan; network failures never automatically replay a POST.
+Complete report status resolves ordered per-ref acceptance and rejection.
+Missing, extra, malformed, or incomplete status after the request may have been
+consumed is classified as uncertain.
 
 A clone first reserves its destination as a provisional repository with a
 five-minute renewable owner generation. The provisional root blocks parent
@@ -562,12 +579,15 @@ with existing clone targets, then changes the index and SQLite worktree in one
 transaction, so failed writes cannot leave unindexed clone paths while unrelated
 untracked paths remain caller-owned.
 
-The outbound planner walks validated commit projections and changed tree edges.
-It subtracts locally known advertised remote closures, excludes gitlinks, and
-reserves the worst-case two-pass SQL cost before starting the POST. The server's
-advertised old OID is included in the ref command, so a concurrent remote update
-is rejected by the server. Local remote-tracking refs move only after a complete
-`report-status` success.
+The outbound planner reserves the worst-case two-pass SQL cost before starting
+the POST. Every command includes the freshly advertised old OID, so a concurrent
+remote update is rejected by the server. After complete status, push performs
+one best-effort rediscovery and atomically reconciles successful branch tracking
+refs through the same fenced publication seam as fetch. A hook-changed target
+must be locally authenticated; otherwise reconciliation is deferred. Stale or
+failed local reconciliation is returned separately and never hides the
+confirmed remote result. Custom namespaces and explicit push URLs do not mutate
+remote-tracking refs.
 
 ## Transactions and trust boundaries
 

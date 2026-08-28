@@ -6,7 +6,7 @@ import { type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
 import { checkRefText, MAX_REF_NAME_BYTES } from "../ref-name.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
-import { type RemoteAuthOptions, remoteUrlFor } from "./network.js";
+import { type RemoteAuthOptions, remoteUrlFor, validateRemoteAuthOptions } from "./network.js";
 import type { LsRemoteResult, RemoteTarget } from "./refspec.js";
 import { TransportOperationBudget } from "./transport-budget.js";
 
@@ -378,6 +378,7 @@ export async function lsRemote(
   repo: Repository,
   options: LsRemoteOptions = {},
 ): Promise<LsRemoteResult> {
+  validateRemoteAuthOptions(options);
   const reservation = repo.store.reserveMemory();
   const budget = new TransportOperationBudget(reservation);
   try {

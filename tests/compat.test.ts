@@ -8,6 +8,23 @@ import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 describe("Computer client operation interlocks", () => {
+  it("rejects ambiguous legacy push targets before network access", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({
+      storage,
+      git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
+      defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
+    });
+    await workspace.git.init({});
+
+    await expect(
+      workspace.git.push({
+        remote: "origin",
+        url: "https://example.test/repo.git",
+      }),
+    ).rejects.toMatchObject({ code: "EINVAL" });
+  });
+
   it("preserves legacy direct and symbolic update-ref behavior", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({

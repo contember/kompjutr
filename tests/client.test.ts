@@ -587,7 +587,7 @@ describe("createSqliteGitClient", () => {
     }
   });
 
-  it("pushes a committed change through Smart HTTP", async () => {
+  it("keeps Computer push legacy while native push returns structured status", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("README.md", "before\n");
@@ -596,7 +596,7 @@ describe("createSqliteGitClient", () => {
 
     const server = await startGitServer(fixture.dir);
     try {
-      const { workspace } = makeWorkspace();
+      const { storage, workspace } = makeWorkspace();
       await workspace.git.clone({ url: server.url, dir: "/" });
       await workspace.fs.writeFile("/README.md", "after\n");
       await workspace.git.add({ paths: ["README.md"] });
@@ -608,8 +608,53 @@ describe("createSqliteGitClient", () => {
         error: null,
         refs: { "refs/heads/main": { ok: true } },
       });
+      expect(result).not.toHaveProperty("unpack");
+      expect(result).not.toHaveProperty("tracking");
       expect(fixture.git("rev-parse", "refs/heads/main")).toBe(local.oid);
       expect(fixture.git("show", "HEAD:README.md")).toBe("after");
+
+      const native = createGit()({
+        database: new SqliteGitDatabase(new TestDatabase(storage)),
+        worktree: new ComputerWorktree(workspace.provider()),
+        now: () => 1_600_000_000_000,
+        timezoneOffset: () => 0,
+        defaultIdentity: IDENTITY,
+      });
+      await expect(native.push({})).resolves.toEqual({
+        ok: true,
+        error: null,
+        unpack: { ok: true },
+        refs: [{ ref: "refs/heads/main", ok: true, error: null }],
+        tracking: { outcome: "unchanged" },
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("projects a confirmed Computer push rejection without native fields", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("README.md", "before\n");
+    fixture.commit("initial");
+
+    const server = await startGitServer(fixture.dir);
+    try {
+      const { workspace } = makeWorkspace();
+      await workspace.git.clone({ url: server.url, dir: "/" });
+      await workspace.fs.writeFile("/README.md", "after\n");
+      await workspace.git.add({ paths: ["README.md"] });
+      await workspace.git.commit({ message: "local change" });
+
+      const result = await workspace.git.push({});
+      expect(result.ok).toBe(false);
+      if (result.error === null) throw new Error("rejected push did not report an error");
+      expect(result.error).toContain("checked out");
+      expect(result.refs).toEqual({
+        "refs/heads/main": { ok: false, error: result.error },
+      });
+      expect(result).not.toHaveProperty("unpack");
+      expect(result).not.toHaveProperty("tracking");
     } finally {
       await server.close();
     }

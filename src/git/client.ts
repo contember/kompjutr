@@ -37,7 +37,6 @@ import { type InitOptions, initRepository } from "../core/ops/init.js";
 import type {
   CommitResult,
   DiffSummaryEntry,
-  PushResult as LegacyPushResult,
   MergeResult,
   RebaseResult,
   RemoteView,
@@ -71,6 +70,7 @@ import {
 import type {
   FetchResult as StructuredFetchResult,
   LsRemoteResult as StructuredLsRemoteResult,
+  PushResult as StructuredPushResult,
 } from "../core/ops/refspec.js";
 
 export type {
@@ -332,7 +332,7 @@ export interface Git {
   commitTree(input: GitCommitTreeOptions): Promise<string>;
   withScratchIndex<T>(input: GitScratchIndexOptions, body: GitScratchIndexCallback<T>): Promise<T>;
   updateRef(input: GitUpdateRefOptions): Promise<void>;
-  push(input?: GitPushOptions): Promise<LegacyPushResult>;
+  push(input?: GitPushOptions): Promise<StructuredPushResult>;
   pull(input?: GitPullOptions): Promise<MergeResult>;
   merge(input: GitMergeOptions): Promise<MergeResult>;
   mergeContinue(input?: GitMergeContinueOptions): Promise<MergeResult>;

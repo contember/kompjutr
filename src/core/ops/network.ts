@@ -93,6 +93,20 @@ export interface RemoteAuthOptions {
   onMessage?: MessageCallback;
 }
 
+/** Validate the static remote/auth callback surface before any network request. */
+export function validateRemoteAuthOptions(options: unknown): void {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new GitError("EINVAL", "remote options must be an object");
+  }
+  fetchHeaderBytes(Reflect.get(options, "headers"), "EINVAL");
+  for (const field of ["onAuth", "onProgress", "onMessage"]) {
+    const callback = Reflect.get(options, field);
+    if (callback !== undefined && typeof callback !== "function") {
+      throw new GitError("EINVAL", `remote ${field} must be a function`);
+    }
+  }
+}
+
 export interface CloneOptions extends RemoteAuthOptions {
   url: string;
   dir?: string;
@@ -146,6 +160,7 @@ export function validateFetchOptions(options: unknown): void {
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new GitError("EINVAL", "fetch options must be an object");
   }
+  validateRemoteAuthOptions(options);
   if (!("remote" in options) && !("url" in options) && !("refspecs" in options)) {
     return;
   }
@@ -643,10 +658,7 @@ function effectiveShallows(
   return [...effective];
 }
 
-function fetchHeaderBytes(
-  headers: Record<string, string> | undefined,
-  code: "EAUTH" | "EINVAL",
-): number {
+function fetchHeaderBytes(headers: unknown, code: "EAUTH" | "EINVAL"): number {
   if (headers === undefined) return 0;
   if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
     throw new GitError(code, "remote authentication headers must be a string record");
@@ -702,18 +714,25 @@ function fetchRemoteUrl(
   return { remote, url };
 }
 
-function fetchAuth(
+/** Build one authenticated remote session charged to a named root-memory portion. */
+export function createRemoteAuth(
   context: GitContext,
-  options: FetchOperationOptions,
+  options: RemoteAuthOptions,
   url: string,
   budget: TransportOperationBudget,
+  memoryPart: string,
+  additionalRetainedBytes = 0,
 ) {
+  validateRemoteAuthOptions(options);
+  if (!Number.isSafeInteger(additionalRetainedBytes) || additionalRetainedBytes < 0) {
+    throw new GitError("EINVAL", "remote option retained bytes must be a safe nonnegative integer");
+  }
   const optionBytes =
     FETCH_OPTIONS_FIXED_BYTES +
     retainedStringBytes(url) +
-    (options.remote === undefined ? 0 : retainedStringBytes(options.remote)) +
+    additionalRetainedBytes +
     fetchHeaderBytes(options.headers, "EINVAL");
-  budget.setMemory(FETCH_OPTIONS_MEMORY_PART, optionBytes);
+  budget.setMemory(memoryPart, optionBytes);
   const onAuth = options.onAuth;
   return {
     ...(context.http === undefined ? {} : { http: context.http }),
@@ -728,16 +747,29 @@ function fetchAuth(
             } catch (cause) {
               throw new GitError("EAUTH", "remote authentication callback failed", { cause });
             }
-            budget.setMemory(
-              FETCH_OPTIONS_MEMORY_PART,
-              optionBytes + fetchCredentialsBytes(credentials),
-            );
+            budget.setMemory(memoryPart, optionBytes + fetchCredentialsBytes(credentials));
             return credentials;
           },
         }),
     authSession: new RemoteAuthSession(),
     operationBudget: budget,
   };
+}
+
+function fetchAuth(
+  context: GitContext,
+  options: FetchOperationOptions,
+  url: string,
+  budget: TransportOperationBudget,
+) {
+  return createRemoteAuth(
+    context,
+    options,
+    url,
+    budget,
+    FETCH_OPTIONS_MEMORY_PART,
+    options.remote === undefined ? 0 : retainedStringBytes(options.remote),
+  );
 }
 
 function fetchProgressSink(

@@ -52,12 +52,12 @@ so `push`, `fetch`, `pull`, `clone` and `ls-remote` never appear on that side.
 [Reference workload coverage](#reference-workload-coverage) collects what that
 workload would need gained, or routed differently.
 
-Roj can use the native surface for its admission slice: several isolated session
-checkouts over one shared store, bounded divergence against a caller-selected
-base, and an offline raw read of `refs/remotes/origin/HEAD`. Its adapter belongs
-to the consumer repository, not this package. The broader orchestrator requires
-partial clone, atomic checkpoint pushes, and remote ref discovery. Local
-snapshot replay is available without textual patch interchange.
+The native surface supports several isolated session checkouts over one shared
+store, bounded divergence against a caller-selected base, offline raw ref reads,
+atomic checkpoint transport, and remote ref discovery. A consumer adapter
+belongs to the consumer repository, not this package. Partial clone remains the
+main network gap. Local snapshot replay is available without textual patch
+interchange.
 
 ## Repository creation
 
@@ -396,9 +396,23 @@ rolled-back movements record nothing.
 ## Remotes and network
 
 Transport is Smart HTTP over `http(s)` only. Authentication is `headers` or an
-`onAuth` callback; there are no credential helpers and no `.netrc`. ★ ✘
-`git ls-remote` has no equivalent either: the remote's advertised refs are
-consumed inside clone, fetch and push, and never surfaced to the caller.
+`onAuth` callback; there are no credential helpers and no `.netrc`.
+
+### `git ls-remote` — `lsRemote()`
+
+| Git | kompjutr | |
+|---|---|---|
+| `<remote>` / explicit URL | `remote` (default `origin`), `url` | ★ ✔ |
+| no pattern | omitted `patterns` | ✔ returns the complete bounded advertisement |
+| `<patterns>...` | `patterns` | ★ ✔ Git tail-wildmatch literals, `*`, `?`, bracket classes, negation, and escapes |
+| `--symref` | `headRef` in the result | ✔ validated advertised `HEAD` target |
+| peeled annotated tags | `refs` entries ending in `^{}` | ✔ retained in advertisement order |
+| auth | `headers`, `onAuth` | ✔ |
+
+Each call performs one logical `upload-pack` discovery and makes no repository
+mutation. It returns `{ refs, headRef }`; an empty pattern match still returns
+the observed `headRef`. The shared options accept `onProgress` and `onMessage`,
+but discovery has no upload or side-band events to emit through them.
 
 ### `git remote` — `remoteAdd()`, `remoteRemove()`, `remoteList()`
 
@@ -417,7 +431,8 @@ consumed inside clone, fetch and push, and never surfaced to the caller.
 |---|---|---|
 | `<remote>` / explicit URL | `remote` (default `origin`), `url` | ★ ✔ |
 | no ref selector | default | ✔ fetches every advertised `refs/heads/*`; `singleBranch: true` selects the remote HEAD branch instead |
-| `<refspec>` | `ref`, `remoteRef` | ★ ~ one exact advertised ref selector, not refspec syntax — no wildcards or leading `+` |
+| one legacy selector | `ref`, `remoteRef` | ✔ exact branch-compatible selection |
+| one or more refspecs | `refspecs: [{ source, destination, force? }]` | ★ ✔ full `refs/...` names, exact and one-star wildcard mappings |
 | `FETCH_HEAD` | `fetchHead` in the result | ★ ~ an oid, not a written ref: `reset --hard FETCH_HEAD` becomes `reset({ ref: fetchHead })` |
 | `--depth <n>` | `depth` | ✔ shallow boundaries are recorded and honoured |
 | `--single-branch` | `singleBranch: true` | ✔ |
@@ -425,15 +440,20 @@ consumed inside clone, fetch and push, and never surfaced to the caller.
 | `--tags` | `tags: true` | ✔ fetches every advertised tag |
 | `--no-tags` | `tags: false` | ✔ disables automatic tag following |
 | `--prune` | `prune` | ✔ |
+| mapped `--depth`, mapped `--prune` | — | ✘ rejected rather than mixed with typed mappings |
 | `--all`, `--unshallow`, `--deepen`, `--filter`, `--recurse-submodules` | — | ✘ |
 
-Returns `{ defaultBranch, fetchHead }`. Only a complete, validated pack becomes
-readable; an interrupted ingest cannot move a ref. A selected tag is still
-fetched when it is itself the explicit selector. Tag publication authenticates
-annotated chains and never clobbers a different existing local tag. Auto-follow
-silently preserves an existing local tag, while `tags: true` and an explicitly
-selected tag reject a different local target with `ETAGFAIL` and publish no
-refs.
+Legacy fetch returns `{ mode: "legacy", defaultBranch, fetchHead, updates: [] }`.
+Mapped fetch returns `{ mode: "mapped", defaultBranch, fetchHead: null,
+updates }`, with updates ordered by destination UTF-8 bytes. Exact missing
+sources fail; an unmatched wildcard is a successful discovery-only no-op. One
+complete validated pack and every selected destination publish atomically.
+Interrupted ingest, a stale candidate, or one invalid destination moves no ref.
+A selected tag is still fetched when it is itself the explicit selector. Tag
+publication authenticates annotated chains and never clobbers a different
+existing local tag. Auto-follow silently preserves an existing local tag, while
+`tags: true` and an explicitly selected tag reject a different local target
+with `ETAGFAIL` and publish no refs.
 
 ### `git pull` — `pull()`
 
@@ -469,16 +489,26 @@ visible even if the integration afterwards refuses (`ESTALEHEAD`,
 
 | Git | kompjutr | |
 |---|---|---|
-| `<remote> <src>:<dst>` | `remote`, `ref`, `remoteRef` | ★ ~ **one branch per call**; branch refs only — no `refs/checkpoints/*`-style namespace, no `<oid>:<ref>` source, no several refspecs in one push |
+| one legacy branch | `remote`, `ref`, `remoteRef` | ✔ translated through the structured operation |
+| `<src>:<dst>` mappings | `refspecs: [{ source, destination, force? }]` | ★ ✔ exact refs, one-star wildcards, full-OID sources, and custom namespaces |
 | explicit URL | `url` | ✔ also honours `remote.<n>.pushurl` |
-| `--force` | `force` | ★ ✔ |
-| `--delete` | `delete` | ★ ~ one ref per call |
+| `--force` | legacy `force`, or per-mapping `force` | ★ ✔ |
+| `--delete` | legacy `delete`, or `{ source: null, destination }` | ★ ✔ several explicit deletions may share one request |
 | `--force-with-lease` | — | ~ implicit: the advertised old oid is always sent, so the server rejects a concurrent remote update |
-| `--tags`, `--all`, `--mirror`, `--set-upstream`, `--atomic` (multi-ref) | — | ★ ✘ |
+| `--atomic` | `atomic` | ★ ✔ requires the advertised capability |
+| `--push-option=<text>` | `pushOptions` | ✔ bounded protocol-v0 push options |
+| `--tags`, `--all`, `--mirror`, `--set-upstream` | — | ✘ |
 
-Returns `PushResult`. The local remote-tracking ref moves only after a complete
-`report-status` success. Pushing from a detached HEAD without an explicit `ref`
-throws `EDETACHED`.
+Returns ordered `PushResult` with overall `ok`/`error`, unpack status, one row
+for every expanded destination, and a separate tracking outcome. A complete
+`report-status` resolves even when the server rejects some or all refs; malformed
+or incomplete status after POST is uncertain and throws. No-op destinations are
+reported without commands, and a wholly unmatched wildcard returns an exact
+empty result without discovery. A configured remote reconciles only successful
+branch destinations after status; custom refs and explicit URLs never create
+tracking refs. Reconciliation reports `updated`, `unchanged`, `stale`,
+`deferred`, or `failed` without hiding a confirmed remote result. Pushing from a
+detached HEAD without an explicit legacy `ref` throws `EDETACHED`.
 
 ## Integration
 
@@ -638,9 +668,9 @@ These have no method and no equivalent. `stash` and the argv entry point throw
   trees but never followed); `sparse-checkout` as a command — sparse hydration is
   an internal optimisation, not a user-facing mode
 - **Inspection:** `blame`, `bisect`, `describe`, `shortlog`, `grep`,
-  general `rev-list`, ref enumeration through `for-each-ref`, `ls-remote` ★,
-  `whatchanged`; bounded merge-base, divergence, and one exact raw-ref read are
-  available through the narrower methods above
+  general `rev-list`, ref enumeration through `for-each-ref`, `whatchanged`;
+  bounded remote discovery, merge-base, divergence, and one exact raw-ref read
+  are available through the narrower methods above
 - **Patches:** `apply` ★, `am`, `format-patch`, `send-email`, `cherry`
 - **Maintenance binaries:** `gc`, `fsck`, `repack`, `prune`, `count-objects`,
   `verify-pack`; storage maintenance is available only through the bounded
@@ -663,6 +693,7 @@ merge — with these differences:
 - ✘ no `reflog` or `recoverRef` surface;
 - ✘ no linked-checkout lifecycle, `divergence`, or `readRef` surface;
 - ✘ no `readTree`, `writeTree`, `commitTree`, or scoped scratch-index surface;
+- ✘ no `lsRemote` surface;
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;
@@ -674,6 +705,9 @@ merge — with these differences:
 - `rm()` remains cached-only, recursive, and unconditional: it removes matching
   index entries without changing working-tree bytes or applying native content
   safety checks;
+- `fetch()` and `push()` retain Computer's legacy single-selection inputs and
+  result shapes. The adapter projects the native structured push status to its
+  ref-keyed record and does not expose unpack or tracking reconciliation;
 - `pull` returns `void` rather than a `MergeResult`.
 
 ## Limits
@@ -723,19 +757,17 @@ is already served by the surface as it stands: clone by branch, add / rm / reset
 checkout / clean, commit, status (v1 and short, including unmerged rows and NUL
 framing), merge `--ff-only`, rebase with continue and abort plus index-stage
 conflict resolution, branch create and delete, remote add / remove / list, fetch
-of one branch, force push of one branch, linked-checkout add / list / remove /
-prune, caller-selected divergence, offline raw-ref reads, and every local read
-the agent makes. The consumer adapter is outside this package.
+of one branch, typed multi-ref fetch and push, atomic checkpoint transport,
+remote discovery, linked-checkout add / list / remove / prune, caller-selected
+divergence, offline raw-ref reads, and every local read the agent makes. The
+consumer adapter is outside this package.
 
 ### Hard gaps — no route through the current surface
 
 | Missing | What issues it |
 |---|---|
 | `worktree repair` / `unlock` | the broader Git-layout recovery and lock lifecycle; the SQLite-native admission path has no pointer or lock state to repair |
-| Several refspecs in one push, `--atomic`, and refs outside `refs/heads/*` | one checkpoint mirrors the session branch *and* writes or deletes its snapshot ref in a single atomic push; pruning deletes a batch of mirror refs at once ([backlog 08](../backlog/08-extend-push-refspecs.md)) |
 | `--filter=blob:none` partial clone | the initial clone of every project repository ([backlog 41](../backlog/41-partial-clone.md)) |
-| Wildcard fetch refspec (`+refs/checkpoints/*:refs/checkpoints/*`) | pulling snapshot refs back after a sandbox is rebuilt ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
-| `ls-remote` | listing the mirror refs that pruning then deletes ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
 | `diff -z` | NUL-framed diff path lists parsed by the orchestrator; status formatters already provide NUL framing |
 
 ### Adaptable — the capability exists under another shape
@@ -763,9 +795,9 @@ the agent makes. The consumer adapter is outside this package.
 Credential helpers stay out of scope — `onAuth` covers what this workload needs
 from them. The typed checkout lifecycle covers session creation and teardown;
 Git's administrative `repair` and `unlock` shapes have no SQLite-native state to
-operate on. Textual patch interchange has no current caller. Live remote
-discovery remains a concrete gap in
-[42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md).
+operate on. Textual patch interchange has no current caller. Remote discovery
+and branch-plus-checkpoint transport use `lsRemote()`, mapped `fetch()`, and
+mapped `push()` directly.
 
 ---
 

@@ -835,3 +835,19 @@ findings are resolved before implementation.
   publication allowance stay below the shared 1,000-statement ceiling. The
   final focused gate passed 13 tests in 2.89 seconds; typecheck, targeted Biome,
   and diff-check passed. Independent affected re-review returned clean.
+- 2026-08-28: WU7 composed the structured native push over one bounded local
+  snapshot, advertisement, union pack, and ordered receive-pack command set.
+  Complete remote results now resolve independently from branch-tracking
+  reconciliation; the latter publishes one fenced batch or reports unchanged,
+  stale, deferred, or a stable local failure. The Computer facade retains its
+  legacy projection, public exports and reference docs match the frozen
+  contract, and the checkpoint workflow covers atomic round trips, recovery,
+  partial rejection, uncertainty, hook replacement, local races, corruption,
+  memory exhaustion, and cold reopen. A real authenticated 1,024-command
+  public deletion proves ordered complete statuses, fewer than 1,000 SQL
+  statements, at most 64 MiB aggregate memory, idle cleanup, and exactly the
+  allowed GET/GET/POST sequence. The final focused gate passed 72 tests in 5.03
+  seconds; typecheck, targeted Biome, and diff-check passed. Independent T3
+  review returned clean after fixes for post-status failure containment,
+  no-op planner authentication, pre-request `lsRemote` callback validation,
+  the aggregate boundary witness, and callback documentation precision.

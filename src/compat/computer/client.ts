@@ -7,6 +7,8 @@
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
 import type {
+  GitPushOptions as ComputerPushOptions,
+  PushResult as ComputerPushResult,
   GitClient,
   GitClientFactory,
   WorkspaceGitClientOptions,
@@ -38,7 +40,7 @@ import {
   updateRef as updateRefOp,
 } from "../../core/ops/plumbing.js";
 import { pull as pullOp } from "../../core/ops/pull.js";
-import { push as pushOp } from "../../core/ops/push.js";
+import { type PushOptions, push as pushOp } from "../../core/ops/push.js";
 import {
   catFile as catFileRead,
   log as logOp,
@@ -56,6 +58,7 @@ import {
   tagList as tagListOp,
   tag as tagOp,
 } from "../../core/ops/refs.js";
+import type { PushResult } from "../../core/ops/refspec.js";
 import {
   add as addOp,
   lsFiles as lsFilesOp,
@@ -306,7 +309,7 @@ export function createSqliteGitClient(
       async push(input = {}) {
         const repo = at(input.dir);
         repo.checkout.requireNoOperationState();
-        return pushOp(ctx(), repo, input);
+        return projectPushResult(await pushOp(ctx(), repo, nativePushOptions(input)));
       },
       async pull(input = {}) {
         const repo = at(input.dir);
@@ -332,6 +335,33 @@ export function createSqliteGitClient(
     };
     return client;
   };
+}
+
+function nativePushOptions(input: ComputerPushOptions): PushOptions {
+  if (input.remote !== undefined && input.url !== undefined) {
+    throw new GitError("EINVAL", "push remote and url are mutually exclusive");
+  }
+  const target = input.url === undefined ? { remote: input.remote } : { url: input.url };
+  return {
+    ...target,
+    ref: input.ref,
+    remoteRef: input.remoteRef,
+    force: input.force,
+    delete: input.delete,
+    headers: input.headers,
+    onAuth: input.onAuth,
+    onProgress: input.onProgress,
+    onMessage: input.onMessage,
+  };
+}
+
+function projectPushResult(result: PushResult): ComputerPushResult {
+  const refs: ComputerPushResult["refs"] = {};
+  for (const status of result.refs) {
+    refs[status.ref] =
+      status.error === null ? { ok: status.ok } : { ok: status.ok, error: status.error };
+  }
+  return { ok: result.ok, error: result.error, refs };
 }
 
 function buildContext(
