@@ -10,7 +10,7 @@ import {
   requireBranchRef,
   ZERO_OID,
 } from "../protocol/receive-pack.js";
-import { discover } from "../protocol/remote.js";
+import { type Advertisement, discover } from "../protocol/remote.js";
 import { RemoteAuthSession } from "../protocol/transport.js";
 import type { Repository } from "../repository.js";
 import type { PushResult, RefUpdateStatus } from "./kinds.js";
@@ -73,25 +73,76 @@ function resultFor(
 }
 
 function trackingRef(remote: string, remoteRef: string): string {
-  return `refs/remotes/${remote}/${remoteRef.slice("refs/heads/".length)}`;
+  return `${trackingPrefix(remote)}${remoteRef.slice("refs/heads/".length)}`;
+}
+
+function trackingPrefix(remote: string): string {
+  return `refs/remotes/${remote}/`;
+}
+
+type TrackingPublication = ReturnType<Repository["store"]["beginTrackingRefPublication"]>;
+
+function readableAuthenticatedCommit(repo: Repository, oid: string): boolean {
+  try {
+    repo.readAuthenticatedCommit(oid);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function advertisedOid(advertisement: Advertisement, remoteRef: string): string {
+  const advertised = advertisement.refs.filter((ref) => ref.name === remoteRef);
+  if (advertised.length > 1) {
+    throw new CorruptError(`remote advertised ${remoteRef} more than once`);
+  }
+  const oid = advertised[0]?.oid ?? ZERO_OID;
+  if (!/^[0-9a-f]{40}$/.test(oid)) {
+    throw new CorruptError(`remote advertised an invalid oid for ${remoteRef}`);
+  }
+  return oid;
 }
 
 function updateTracking(
   context: GitContext,
   repo: Repository,
-  remote: string,
-  remoteRef: string,
+  publication: TrackingPublication,
   newOid: string,
-  deleting: boolean,
 ): void {
-  const tracking = trackingRef(remote, remoteRef);
-  repo.mutateRefs(
-    {
-      puts: deleting ? [] : [{ name: tracking, target: newOid }],
-      deletes: deleting ? [tracking] : [],
-    },
-    operationRefLogMetadata(context, repo, "push"),
-  );
+  try {
+    repo.store.publishTrackingRef(
+      publication,
+      newOid === ZERO_OID ? null : newOid,
+      operationRefLogMetadata(context, repo, "push"),
+    );
+  } catch (error) {
+    if (hasErrorCode(error, "ESTALEFETCH")) return;
+    throw error;
+  }
+}
+
+async function reconcileTracking(
+  context: GitContext,
+  repo: Repository,
+  remoteRef: string,
+  url: string,
+  auth: Parameters<typeof discover>[2],
+  fallback: TrackingPublication,
+  confirmed: string,
+): Promise<void> {
+  let target = confirmed;
+  try {
+    target = advertisedOid(await discover(url, "git-receive-pack", auth), remoteRef);
+  } catch {
+    // The remote update is already confirmed; failed rediscovery falls back to that outcome.
+    target = confirmed;
+  }
+  if (target !== ZERO_OID && !readableAuthenticatedCommit(repo, target)) {
+    if (target === confirmed) return;
+    target = confirmed;
+    if (target !== ZERO_OID && !readableAuthenticatedCommit(repo, target)) return;
+  }
+  updateTracking(context, repo, fallback, target);
 }
 
 export async function push(
@@ -111,6 +162,7 @@ export async function push(
   if (newOid !== ZERO_OID && repo.typeOf(newOid) !== "commit") {
     throw new GitError("EINVALIDREF", `${localRef} does not point to a commit`);
   }
+  if (newOid !== ZERO_OID) repo.readAuthenticatedCommit(newOid);
 
   const authSession = new RemoteAuthSession();
   const auth = {
@@ -120,69 +172,81 @@ export async function push(
     authSession,
   };
   const advertisement = await discover(url, "git-receive-pack", auth);
-  const advertised = advertisement.refs.filter((ref) => ref.name === remoteRef);
-  if (advertised.length > 1)
-    throw new CorruptError(`remote advertised ${remoteRef} more than once`);
-  const oldOid = advertised[0]?.oid ?? ZERO_OID;
-  if (!/^[0-9a-f]{40}$/.test(oldOid)) {
-    throw new CorruptError(`remote advertised an invalid oid for ${remoteRef}`);
-  }
+  const oldOid = advertisedOid(advertisement, remoteRef);
+  let trackingPublication: TrackingPublication | null = null;
 
-  const deleting = options.delete === true;
-  if ((!deleting && oldOid === newOid) || (deleting && oldOid === ZERO_OID)) {
-    if (options.url === undefined) {
-      updateTracking(context, repo, remote, remoteRef, newOid, deleting);
-    }
-    return resultFor(remoteRef, { ok: true });
-  }
-
-  const plan = deleting
-    ? undefined
-    : planPushObjects(
-        repo,
-        newOid,
-        oldOid,
-        options.force === true,
-        advertisement.refs.map((ref) => ref.oid),
-      );
-  const say = progressSink(options.onProgress, options.onMessage);
-  let status: ReceivePackStatus;
   try {
-    status = await receivePack(
-      {
-        url,
-        oldOid,
-        newOid,
-        ref: remoteRef,
-        advertised: advertisement.capabilities,
-        ...(plan === undefined ? {} : { pack: () => openPushPack(repo, plan) }),
-        ...(say === undefined ? {} : { onProgress: say }),
-      },
-      auth,
-    );
-  } catch (error) {
-    if (
-      hasErrorCode(error, "EHTTP") ||
-      hasErrorCode(error, "EUNSUPPORTED") ||
-      hasErrorCode(error, "EPUSHREJECTED") ||
-      hasErrorCode(error, "EPUSHLOCAL")
-    ) {
-      throw error;
+    const deleting = options.delete === true;
+    if ((!deleting && oldOid === newOid) || (deleting && oldOid === ZERO_OID)) {
+      if (
+        options.url === undefined &&
+        (newOid === ZERO_OID || readableAuthenticatedCommit(repo, newOid))
+      ) {
+        trackingPublication = repo.store.beginTrackingRefPublication(
+          trackingPrefix(remote),
+          trackingRef(remote, remoteRef),
+        );
+        updateTracking(context, repo, trackingPublication, newOid);
+      }
+      return resultFor(remoteRef, { ok: true });
     }
-    throw new GitError(
-      "EPUSHUNCERTAIN",
-      `remote may have updated ${remoteRef}; discover or fetch before retrying`,
-      { cause: error },
-    );
+
+    const plan = deleting
+      ? undefined
+      : planPushObjects(
+          repo,
+          newOid,
+          oldOid,
+          options.force === true,
+          advertisement.refs.map((ref) => ref.oid),
+        );
+    if (options.url === undefined) {
+      trackingPublication = repo.store.beginTrackingRefPublication(
+        trackingPrefix(remote),
+        trackingRef(remote, remoteRef),
+      );
+    }
+    const say = progressSink(options.onProgress, options.onMessage);
+    let status: ReceivePackStatus;
+    try {
+      status = await receivePack(
+        {
+          url,
+          oldOid,
+          newOid,
+          ref: remoteRef,
+          advertised: advertisement.capabilities,
+          ...(plan === undefined ? {} : { pack: () => openPushPack(repo, plan) }),
+          ...(say === undefined ? {} : { onProgress: say }),
+        },
+        auth,
+      );
+    } catch (error) {
+      if (
+        hasErrorCode(error, "EHTTP") ||
+        hasErrorCode(error, "EUNSUPPORTED") ||
+        hasErrorCode(error, "EPUSHREJECTED") ||
+        hasErrorCode(error, "EPUSHLOCAL")
+      ) {
+        throw error;
+      }
+      throw new GitError(
+        "EPUSHUNCERTAIN",
+        `remote may have updated ${remoteRef}; discover or fetch before retrying`,
+        { cause: error },
+      );
+    }
+    const refStatus = status.refs.get(remoteRef)!;
+    const unpackError = status.unpack === "ok" ? null : `unpack ${status.unpack}`;
+    const result = resultFor(remoteRef, refStatus, unpackError);
+    if (!result.ok) {
+      throw new GitError("EPUSHREJECTED", result.error ?? `remote rejected ${remoteRef}`);
+    }
+    if (trackingPublication !== null) {
+      await reconcileTracking(context, repo, remoteRef, url, auth, trackingPublication, newOid);
+    }
+    return result;
+  } finally {
+    trackingPublication?.dispose();
   }
-  const refStatus = status.refs.get(remoteRef)!;
-  const unpackError = status.unpack === "ok" ? null : `unpack ${status.unpack}`;
-  const result = resultFor(remoteRef, refStatus, unpackError);
-  if (!result.ok) {
-    throw new GitError("EPUSHREJECTED", result.error ?? `remote rejected ${remoteRef}`);
-  }
-  if (options.url === undefined) {
-    updateTracking(context, repo, remote, remoteRef, newOid, deleting);
-  }
-  return result;
 }

@@ -69,7 +69,9 @@ describe("push", () => {
       await ws.git.clone({ url: server.url, dir: "/" });
       const oid = await localCommit(ws, "updated\n", "update");
 
+      storage.resetCounters();
       await expect(ws.git.push({})).resolves.toMatchObject({ ok: true });
+      expect(storage.statementCount).toBeLessThan(1_000);
       expect(fixture.git("rev-parse", "main")).toBe(oid);
       expect(await ws.git.revParse({ ref: "refs/remotes/origin/main" })).toBe(oid);
       expect(reflog(storage, "refs/remotes/origin/main")[0]).toEqual({
@@ -84,7 +86,9 @@ describe("push", () => {
 
       const posts = server.requests.filter((request) => request.method === "POST").length;
       const trackingEntries = reflog(storage, "refs/remotes/origin/main").length;
+      storage.resetCounters();
       await expect(ws.git.push({})).resolves.toMatchObject({ ok: true });
+      expect(storage.statementCount).toBeLessThan(1_000);
       expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(posts);
       expect(reflog(storage, "refs/remotes/origin/main")).toHaveLength(trackingEntries);
     } finally {

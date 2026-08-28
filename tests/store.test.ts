@@ -9,7 +9,7 @@ import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
 import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
-import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/schema.js";
+import { MAX_BLOB_ID_CACHE_ROWS, MAX_TRACKING_REF_REVISIONS } from "../src/sqlite/schema.js";
 import {
   ancestors,
   blobIdMismatchRetainedBytes,
@@ -118,6 +118,7 @@ describe("repository registry", () => {
       "git_refs",
       "git_repositories",
       "git_shallow",
+      "git_tracking_ref_revisions",
       "git_tree_effective",
       "git_tree_entries",
       "git_tree_sources",
@@ -1299,6 +1300,250 @@ describe("refs, config and index", () => {
     assertMemoryCoordinatorIdle(second);
   });
 
+  it("fences a tracking fallback after a newer same-target fetch generation", () => {
+    const { store } = open();
+    const prefix = "refs/remotes/origin/";
+    const tracking = `${prefix}main`;
+    const original = "1".repeat(40);
+    store.setRef(tracking, original);
+    const fallback = store.beginTrackingRefPublication(prefix, tracking);
+    const newer = store.beginFetchPublication(prefix);
+
+    try {
+      expect(
+        store.publishFetchRefs(
+          newer,
+          { trackingPuts: [{ name: tracking, target: original }] },
+          fetchMetadata,
+        ),
+      ).toBe(false);
+      expect(() => store.publishTrackingRef(fallback, "2".repeat(40), fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+      expect(store.getRef(tracking)).toBe(original);
+    } finally {
+      fallback.dispose();
+      newer.dispose();
+    }
+
+    const independent = store.beginTrackingRefPublication(prefix, tracking);
+    const upstream = store.beginFetchPublication("refs/remotes/upstream/");
+    try {
+      expect(
+        store.publishFetchRefs(
+          upstream,
+          {
+            trackingPuts: [{ name: "refs/remotes/upstream/main", target: "3".repeat(40) }],
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(store.publishTrackingRef(independent, "2".repeat(40), fetchMetadata)).toBe(true);
+      expect(store.getRef(tracking)).toBe("2".repeat(40));
+    } finally {
+      independent.dispose();
+      upstream.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("keeps a pending narrower fetch disjoint from first broad tracking publication", () => {
+    const { store } = open();
+    const narrowPrefix = "refs/remotes/team/sub/";
+    const narrowRef = `${narrowPrefix}main`;
+    const broadPrefix = "refs/remotes/team/";
+    const broadRef = `${broadPrefix}main`;
+    const historicalBroad = store.beginFetchPublication(broadPrefix);
+    try {
+      expect(store.publishFetchRefs(historicalBroad, {}, fetchMetadata)).toBe(false);
+    } finally {
+      historicalBroad.dispose();
+    }
+    const tracking = store.beginTrackingRefPublication(broadPrefix, broadRef);
+    const fetch = store.beginFetchPublication(narrowPrefix);
+
+    try {
+      expect(store.publishTrackingRef(tracking, "1".repeat(40), fetchMetadata)).toBe(true);
+      expect(
+        store.publishFetchRefs(
+          fetch,
+          { trackingPuts: [{ name: narrowRef, target: "2".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(store.getRef(broadRef)).toBe("1".repeat(40));
+      expect(store.getRef(narrowRef)).toBe("2".repeat(40));
+    } finally {
+      fetch.dispose();
+      tracking.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("lets a fresh tracking observation supersede an older tracking snapshot", () => {
+    const { store } = open();
+    const prefix = "refs/remotes/origin/";
+    const tracking = `${prefix}main`;
+    store.setRef(tracking, "1".repeat(40));
+    const fallback = store.beginTrackingRefPublication(prefix, tracking);
+    const fetch = store.beginFetchPublication(prefix);
+    let fresh: ReturnType<typeof store.beginTrackingRefPublication> | null = null;
+
+    try {
+      expect(
+        store.publishFetchRefs(
+          fetch,
+          { trackingPuts: [{ name: tracking, target: "2".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      fresh = store.beginTrackingRefPublication(prefix, tracking);
+      expect(fresh.target).toBe("2".repeat(40));
+      expect(store.publishTrackingRef(fresh, "3".repeat(40), fetchMetadata)).toBe(true);
+      expect(store.getRef(tracking)).toBe("3".repeat(40));
+      expect(() => store.publishTrackingRef(fallback, "4".repeat(40), fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+    } finally {
+      fallback.dispose();
+      fetch.dispose();
+      fresh?.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it.each([
+    { label: "put", initial: "1".repeat(40), target: "1".repeat(40) },
+    { label: "delete", initial: null, target: null },
+  ])("fences an older pending fetch after an idempotent tracking $label", ({ initial, target }) => {
+    const { store } = open();
+    const prefix = "refs/remotes/origin/";
+    const tracking = `${prefix}main`;
+    if (initial !== null) store.setRef(tracking, initial);
+    const older = store.beginFetchPublication(prefix);
+    const observation = store.beginTrackingRefPublication(prefix, tracking);
+
+    try {
+      expect(store.publishTrackingRef(observation, target, fetchMetadata)).toBe(false);
+      expect(() =>
+        store.publishFetchRefs(
+          older,
+          { trackingPuts: [{ name: tracking, target: "2".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+      expect(store.getRef(tracking)).toBe(initial);
+    } finally {
+      older.dispose();
+      observation.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("creates a durable exact tracking revision before first fetch and detects ABA", () => {
+    const { db, store } = open();
+    const prefix = "refs/remotes/origin/";
+    const tracking = `${prefix}main`;
+    const original = "1".repeat(40);
+    store.setRef(tracking, original);
+    const stale = store.beginTrackingRefPublication(prefix, tracking);
+
+    try {
+      expect(
+        db.scalar<number>(
+          "SELECT revision FROM git_tracking_ref_revisions WHERE repo_id = 1 AND ref_name = ?",
+          tracking,
+        ),
+      ).toBe(0);
+      store.setRef(tracking, "2".repeat(40));
+      store.setRef(tracking, original);
+      expect(
+        db.scalar<number>(
+          "SELECT revision FROM git_tracking_ref_revisions WHERE repo_id = 1 AND ref_name = ?",
+          tracking,
+        ),
+      ).toBe(2);
+      expect(() => store.publishTrackingRef(stale, "3".repeat(40), fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+      expect(store.getRef(tracking)).toBe(original);
+    } finally {
+      stale.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("enforces the exact tracking revision cardinality from stored rows", () => {
+    const { db, store } = open();
+    db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (0) UNION ALL SELECT id + 1 FROM sequence WHERE id < ?
+       )
+       INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision)
+       SELECT 1, 'refs/remotes/bound/' || printf('%06d', id), 0 FROM sequence`,
+      MAX_TRACKING_REF_REVISIONS - 1,
+    );
+    expect(
+      db.scalar<number>("SELECT count(*) FROM git_tracking_ref_revisions WHERE repo_id = 1"),
+    ).toBe(MAX_TRACKING_REF_REVISIONS);
+    expect(() =>
+      store.beginTrackingRefPublication("refs/remotes/overflow/", "refs/remotes/overflow/main"),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+
+    db.run(
+      "INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision) VALUES (1, ?, 0)",
+      "refs/remotes/overflow/main",
+    );
+    expect(() => store.setRef("refs/heads/main", "1".repeat(40))).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(store.getRef("refs/heads/main")).toBeNull();
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("rejects a tracking token when its repository disappeared", () => {
+    const { db, store } = open();
+    db.run("DELETE FROM git_repositories WHERE id = 1");
+    expect(() =>
+      store.beginTrackingRefPublication("refs/remotes/origin/", "refs/remotes/origin/main"),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("rejects disposed, consumed, and cross-repository tracking tokens", () => {
+    const { database, store } = open();
+    const prefix = "refs/remotes/origin/";
+    const tracking = `${prefix}main`;
+    const disposed = store.beginTrackingRefPublication(prefix, tracking);
+    disposed.dispose();
+    expect(() => store.publishTrackingRef(disposed, "1".repeat(40), fetchMetadata)).toThrowError(
+      expect.objectContaining({ code: "ESTALEFETCH" }),
+    );
+
+    const secondRepository = database.createRepository("/other", "ref: refs/heads/main");
+    const second = database.openCheckout(secondRepository);
+    const foreign = store.beginTrackingRefPublication(prefix, tracking);
+    try {
+      expect(() => second.publishTrackingRef(foreign, "2".repeat(40), fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+    } finally {
+      foreign.dispose();
+    }
+
+    const consumed = store.beginTrackingRefPublication(prefix, tracking);
+    try {
+      expect(store.publishTrackingRef(consumed, "3".repeat(40), fetchMetadata)).toBe(true);
+      expect(() => store.publishTrackingRef(consumed, "4".repeat(40), fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+    } finally {
+      consumed.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+    assertMemoryCoordinatorIdle(second);
+  });
+
   it("publishes an exact remote HEAD update and prune in one ref transaction", () => {
     const { store } = open();
     const prefix = "refs/remotes/origin/";
@@ -1580,6 +1825,48 @@ describe("refs, config and index", () => {
     }
     assertMemoryCoordinatorIdle(exhaustedRevision.store);
 
+    const corruptTrackingRevision = open();
+    const corruptTrackingToken = corruptTrackingRevision.store.beginTrackingRefPublication(
+      "refs/remotes/origin/",
+      "refs/remotes/origin/main",
+    );
+    try {
+      corruptTrackingRevision.db.run("PRAGMA ignore_check_constraints = ON");
+      corruptTrackingRevision.db.run(
+        "UPDATE git_tracking_ref_revisions SET revision = zeroblob(1) WHERE repo_id = 1",
+      );
+      corruptTrackingRevision.db.run("PRAGMA ignore_check_constraints = OFF");
+      expect(() =>
+        corruptTrackingRevision.store.publishTrackingRef(
+          corruptTrackingToken,
+          "1".repeat(40),
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    } finally {
+      corruptTrackingToken.dispose();
+    }
+    assertMemoryCoordinatorIdle(corruptTrackingRevision.store);
+
+    const exhaustedTrackingRevision = open();
+    const exhaustedTrackingToken = exhaustedTrackingRevision.store.beginTrackingRefPublication(
+      "refs/remotes/origin/",
+      "refs/remotes/origin/main",
+    );
+    try {
+      exhaustedTrackingRevision.db.run(
+        "UPDATE git_tracking_ref_revisions SET revision = ? WHERE repo_id = 1",
+        Number.MAX_SAFE_INTEGER,
+      );
+      expect(() =>
+        exhaustedTrackingRevision.store.setRef("refs/remotes/origin/main", "1".repeat(40)),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(exhaustedTrackingRevision.store.getRef("refs/remotes/origin/main")).toBeNull();
+    } finally {
+      exhaustedTrackingToken.dispose();
+    }
+    assertMemoryCoordinatorIdle(exhaustedTrackingRevision.store);
+
     const corruptShallowRevision = open();
     corruptShallowRevision.db.run("PRAGMA ignore_check_constraints = ON");
     corruptShallowRevision.db.run(
@@ -1638,6 +1925,12 @@ describe("refs, config and index", () => {
       expect(() => memoryBound.store.beginFetchPublication("refs/remotes/origin/")).toThrowError(
         expect.objectContaining({ code: "E2BIG" }),
       );
+      expect(() =>
+        memoryBound.store.beginTrackingRefPublication(
+          "refs/remotes/origin/",
+          "refs/remotes/origin/main",
+        ),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
       expect(blocker.currentBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
     } finally {
       blocker.dispose();
@@ -1665,6 +1958,38 @@ describe("refs, config and index", () => {
     } finally {
       token.dispose();
     }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("publishes exact tracking state within the maximal namespace statement bound", () => {
+    const { db, store } = open();
+    db.run("UPDATE git_repositories SET fetch_generation = 1 WHERE id = 1");
+    db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1024
+       )
+       INSERT INTO git_fetch_namespaces
+         (repo_id, tracking_prefix, latest_generation, revision)
+       SELECT 1, 'refs/remotes/n-' || printf('%04d', id) || '/', 1, 0 FROM sequence`,
+    );
+
+    db.storage.resetCounters();
+    const token = store.beginTrackingRefPublication(
+      "refs/remotes/origin/",
+      "refs/remotes/origin/main",
+    );
+    expect(db.storage.statementCount).toBeLessThan(1_000);
+    try {
+      db.storage.resetCounters();
+      expect(store.publishTrackingRef(token, "1".repeat(40), fetchMetadata)).toBe(true);
+      expect(db.storage.statementCount).toBeLessThan(1_000);
+      expect(store.getRef("refs/remotes/origin/main")).toBe("1".repeat(40));
+    } finally {
+      token.dispose();
+    }
+    expect(db.scalar<number>("SELECT count(*) FROM git_fetch_namespaces WHERE repo_id = 1")).toBe(
+      1_024,
+    );
     assertMemoryCoordinatorIdle(store);
   });
 

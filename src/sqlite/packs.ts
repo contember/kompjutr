@@ -1013,6 +1013,17 @@ export class PackStore {
     return this.#readObjects(oids, null, expectedType, false);
   }
 
+  /** Cold-read and hash one canonical object from a complete pack. */
+  readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
+    if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
+    const object = this.#readObjects([oid], null, expectedType, true, new Map(), true).get(oid);
+    if (object === undefined) return null;
+    if (hashObject(object.type, object.data) !== oid) {
+      throw new CorruptError(`packed ${expectedType} ${oid} does not match its bytes`);
+    }
+    return object;
+  }
+
   /** Cold-read and hash exact canonical complete-pack sources. */
   authenticateCompleteSources(
     objects: readonly { oid: string; type: ObjectType; size: number; packId: number }[],

@@ -188,6 +188,13 @@ export class Repository {
     return this.#readCommitEntry(oid).commit;
   }
 
+  /** Read, hash, and parse a commit from its authoritative physical source. */
+  readAuthenticatedCommit(oid: string): Commit {
+    const object = this.store.readAuthenticatedObject(oid, "commit");
+    if (object === null) throw new ObjectNotFoundError(oid);
+    return this.store.prepareCommit(oid, object.data).commit;
+  }
+
   #readCommitEntry(oid: string, fill?: CommitFillBuffer): CommitCacheEntry {
     const cached = this.store.cachedCommit(oid);
     if (cached !== null) return cached;

@@ -33,7 +33,8 @@ interface PlannedCommit {
   parents: readonly string[];
 }
 
-const PUSH_FIXED_STATEMENTS = 24;
+// Includes two authoritative commit reads and configured tracking reconciliation.
+const PUSH_FIXED_STATEMENTS = 64;
 const SMALL_BATCH_STATEMENTS = 8;
 const LARGE_PACKED_STATEMENTS = 192;
 const MAX_PUSH_STATEMENTS = 1_000;

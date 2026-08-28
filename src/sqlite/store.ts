@@ -103,6 +103,7 @@ import {
   initializeGitSchema,
   MAX_CHECKOUT_ROOT_BYTES,
   MAX_CHECKOUTS_PER_REPOSITORY,
+  MAX_TRACKING_REF_REVISIONS,
 } from "./schema.js";
 import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
 import {
@@ -290,6 +291,30 @@ export class FetchPublicationToken {
   }
 }
 
+export class TrackingRefPublicationToken {
+  readonly #isDisposed: () => boolean;
+  readonly #dispose: () => void;
+
+  constructor(
+    readonly trackingPrefix: string,
+    readonly refName: string,
+    readonly target: string | null,
+    isDisposed: () => boolean,
+    dispose: () => void,
+  ) {
+    this.#isDisposed = isDisposed;
+    this.#dispose = dispose;
+  }
+
+  get disposed(): boolean {
+    return this.#isDisposed();
+  }
+
+  dispose(): void {
+    this.#dispose();
+  }
+}
+
 export interface FetchPublicationPlan {
   /** Tracking refs learned from the advertisement, excluding the remote HEAD symref. */
   trackingPuts?: Iterable<RefRow>;
@@ -356,6 +381,15 @@ interface FetchPublicationState {
   readonly shallowRevision: number;
   readonly trackingRefs: ReadonlyMap<string, string>;
   readonly globalRefs: ReadonlyMap<string, string | null>;
+  readonly budget: RefMutationBudget;
+  readonly reservation: MemoryReservation;
+  disposed: boolean;
+}
+
+interface TrackingRefPublicationState {
+  readonly refName: string;
+  readonly target: string | null;
+  readonly refRevision: number;
   readonly budget: RefMutationBudget;
   readonly reservation: MemoryReservation;
   disposed: boolean;
@@ -2225,6 +2259,10 @@ export class SharedRepoStore {
     return this.#ops().read(oid);
   }
 
+  readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
+    return this.#ops().readAuthenticatedObject(oid, expectedType);
+  }
+
   objectInfo(oids: readonly string[]): ObjectReadInfo[] {
     return this.#ops().objectInfo(oids);
   }
@@ -2309,6 +2347,21 @@ export class SharedRepoStore {
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
     if (mutation.head !== undefined) throw new GitError("EINVAL", "HEAD belongs to a checkout");
     return this.#ops().mutateRefs(mutation, metadata);
+  }
+
+  beginTrackingRefPublication(
+    trackingPrefix: string,
+    refName: string,
+  ): TrackingRefPublicationToken {
+    return this.#ops().beginTrackingRefPublication(trackingPrefix, refName);
+  }
+
+  publishTrackingRef(
+    token: TrackingRefPublicationToken,
+    target: string | null,
+    metadata: RefLogMetadata,
+  ): boolean {
+    return this.#ops().publishTrackingRef(token, target, metadata);
   }
 
   beginFetchPublication(
@@ -3713,6 +3766,11 @@ export class CheckoutStore {
   readonly #lifetime: CheckoutStoreLifetime;
   readonly #issuedFetchPublications = new WeakSet<FetchPublicationToken>();
   readonly #fetchPublicationStates = new WeakMap<FetchPublicationToken, FetchPublicationState>();
+  readonly #issuedTrackingRefPublications = new WeakSet<TrackingRefPublicationToken>();
+  readonly #trackingRefPublicationStates = new WeakMap<
+    TrackingRefPublicationToken,
+    TrackingRefPublicationState
+  >();
 
   constructor(
     shared: SharedRepoStore,
@@ -4023,6 +4081,27 @@ export class CheckoutStore {
     const cached = this.#objects.get(this.#objectCacheKey(oid));
     if (cached !== undefined) return cached;
     return this.#readLoose(oid) ?? this.#packs.read(oid);
+  }
+
+  /** Cold-read and hash one authoritative loose or complete-pack object. */
+  readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
+    if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
+    const loose = this.#looseRow(oid);
+    if (loose === null) return this.#packs.readAuthenticatedObject(oid, expectedType);
+    const cacheKey = this.#objectCacheKey(oid);
+    try {
+      const object = this.#readLooseObjectRows([{ oid, ...loose }]).get(oid);
+      if (object === undefined) throw new CorruptError(`loose ${expectedType} ${oid} disappeared`);
+      if (object.type !== expectedType) {
+        throw new CorruptError(`${oid} is a ${object.type}, not a ${expectedType}`);
+      }
+      if (hashObject(object.type, object.data) !== oid) {
+        throw new CorruptError(`loose ${expectedType} ${oid} does not match its bytes`);
+      }
+      return object;
+    } finally {
+      this.#objects.delete(cacheKey);
+    }
   }
 
   /** Validate bounded object metadata without reading payload bytes. */
@@ -5087,6 +5166,264 @@ export class CheckoutStore {
     this.mutateRefs({ puts, deletes }, this.#genericRefLogMetadata("ref batch update"));
   }
 
+  #readTrackingRefRevision(refName: string): number | null {
+    const row = this.#db.one<{ repo_id: unknown; ref_name: unknown; revision: unknown }>(
+      `SELECT repo_id, ref_name, revision FROM git_tracking_ref_revisions
+        WHERE repo_id = ? AND ref_name = ?`,
+      this.#repoId,
+      refName,
+    );
+    if (row === undefined) return null;
+    const storedName = requireRefName(row.ref_name, "stored tracking revision ref", "stored");
+    if (row.repo_id !== this.#repoId || storedName !== refName) {
+      throw new CorruptError("tracking revision crossed repository or ref boundaries");
+    }
+    return requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+  }
+
+  #trackingRefRevisionCount(): number {
+    const row = this.#db.one<{ repo_id: unknown; revision_rows: unknown }>(
+      `SELECT id AS repo_id,
+              (SELECT count(*) FROM (
+                 SELECT 1 FROM git_tracking_ref_revisions
+                  WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
+               )) AS revision_rows
+         FROM git_repositories WHERE id = ?`,
+      this.#repoId,
+      this.#repoId,
+    );
+    if (row === undefined) throw new CorruptError("tracking repository is missing");
+    if (requireSafeId(row.repo_id, "tracking repository id") !== this.#repoId) {
+      throw new CorruptError("tracking revision count crossed repository boundaries");
+    }
+    const count = row.revision_rows;
+    if (
+      typeof count !== "number" ||
+      !Number.isSafeInteger(count) ||
+      count < 0 ||
+      count > MAX_TRACKING_REF_REVISIONS
+    ) {
+      throw new CorruptError("tracking revision count is invalid");
+    }
+    return count;
+  }
+
+  #ensureTrackingRefRevision(refName: string): number {
+    const count = this.#trackingRefRevisionCount();
+    const existing = this.#readTrackingRefRevision(refName);
+    if (existing !== null) return existing;
+    if (count === MAX_TRACKING_REF_REVISIONS) {
+      throw new GitError("E2BIG", "repository tracking revision count exceeds 100,000");
+    }
+    this.#db.run(
+      "INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision) VALUES (?, ?, 0)",
+      this.#repoId,
+      refName,
+    );
+    const created = this.#readTrackingRefRevision(refName);
+    if (created !== 0) throw new CorruptError("tracking revision creation failed");
+    return created;
+  }
+
+  #advanceTrackingRefObservations(trackingPrefix: string): void {
+    const count = this.#trackingRefRevisionCount();
+    if (count === 0) return;
+    let matched = 0;
+    let previousName: string | null = null;
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, ref_name, revision FROM git_tracking_ref_revisions
+        WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?
+        ORDER BY ref_name`,
+      this.#repoId,
+      trackingPrefix,
+      trackingPrefix,
+    )) {
+      const name = requireRefName(row.ref_name, "stored tracking revision ref", "stored");
+      if (
+        row.repo_id !== this.#repoId ||
+        !name.startsWith(trackingPrefix) ||
+        (previousName !== null && comparePaths(previousName, name) >= 0)
+      ) {
+        throw new CorruptError("tracking observation scan crossed or reordered repositories");
+      }
+      previousName = name;
+      matched++;
+      if (matched > count) throw new CorruptError("tracking observation count is invalid");
+      const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+      if (revision === Number.MAX_SAFE_INTEGER) {
+        throw new GitError("E2BIG", "tracking ref revision is exhausted");
+      }
+    }
+    if (matched === 0) return;
+    this.#db.run(
+      `UPDATE git_tracking_ref_revisions SET revision = revision + 1
+        WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?`,
+      this.#repoId,
+      trackingPrefix,
+      trackingPrefix,
+    );
+  }
+
+  #bumpTrackingRefRevisions(changedNames: ReadonlySet<string>, budget: RefMutationBudget): void {
+    if (changedNames.size === 0) return;
+    const affected: string[] = [];
+    for (const page of jsonPages(changedNames, "tracking ref revision lookup")) {
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, ref_name, revision FROM git_tracking_ref_revisions
+          WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))
+          ORDER BY ref_name`,
+        this.#repoId,
+        page,
+      )) {
+        const name = requireRefName(row.ref_name, "stored tracking revision ref", "stored");
+        if (row.repo_id !== this.#repoId || !changedNames.has(name)) {
+          throw new CorruptError("tracking revision scan crossed repository or ref boundaries");
+        }
+        const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+        if (revision === Number.MAX_SAFE_INTEGER) {
+          throw new GitError("E2BIG", "tracking ref revision is exhausted");
+        }
+        budget.charge(
+          REF_MUTATION_ITEM_RETAINED_BYTES +
+            2 *
+              boundedRefText(name, "stored tracking revision ref", MAX_REFLOG_REF_BYTES, "stored"),
+        );
+        affected.push(name);
+      }
+    }
+    for (const page of jsonPages(affected, "tracking ref revision update")) {
+      this.#db.run(
+        `UPDATE git_tracking_ref_revisions SET revision = revision + 1
+          WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))`,
+        this.#repoId,
+        page,
+      );
+    }
+  }
+
+  /** Snapshot one exact tracking ref after every earlier fetch observation. */
+  beginTrackingRefPublication(
+    trackingPrefix: string,
+    refName: string,
+  ): TrackingRefPublicationToken {
+    const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
+    const name = requireRefName(refName, "tracking publication ref", "input");
+    if (!name.startsWith(prefix) || name === `${prefix}HEAD`) {
+      throw new GitError("EINVAL", "tracking publication ref is outside its branch namespace");
+    }
+    const reservation = this.#memory.reserve();
+    try {
+      const budget = new RefMutationBudget(reservation, true);
+      budget.charge(
+        REF_MUTATION_ITEM_RETAINED_BYTES +
+          2 *
+            (boundedRefText(prefix, "tracking publication prefix", MAX_REFLOG_REF_BYTES, "input") +
+              boundedRefText(name, "tracking publication ref", MAX_REFLOG_REF_BYTES, "input")),
+      );
+      const snapshot = this.#db.transactionSync(() => {
+        const refRevision = this.#ensureTrackingRefRevision(name);
+        const raw = this.#db.scalar<unknown>(
+          "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
+          this.#repoId,
+          name,
+        );
+        const target =
+          raw === undefined ? null : requireRawRefTarget(raw, `stored target of ${name}`, "stored");
+        if (target !== null) {
+          budget.charge(
+            2 *
+              boundedRefText(
+                target,
+                `stored target of ${name}`,
+                MAX_REFLOG_RAW_TARGET_BYTES,
+                "stored",
+              ),
+          );
+        }
+        const state: TrackingRefPublicationState = {
+          refName: name,
+          target,
+          refRevision,
+          budget,
+          reservation,
+          disposed: false,
+        };
+        return state;
+      });
+      let issuedToken: TrackingRefPublicationToken | null = null;
+      const token = new TrackingRefPublicationToken(
+        prefix,
+        snapshot.refName,
+        snapshot.target,
+        () => snapshot.disposed,
+        () => {
+          if (snapshot.disposed) return;
+          snapshot.disposed = true;
+          snapshot.reservation.dispose();
+          if (issuedToken !== null) {
+            this.#issuedTrackingRefPublications.delete(issuedToken);
+            this.#trackingRefPublicationStates.delete(issuedToken);
+          }
+        },
+      );
+      issuedToken = token;
+      this.#issuedTrackingRefPublications.add(token);
+      this.#trackingRefPublicationStates.set(token, snapshot);
+      return token;
+    } catch (error) {
+      reservation.dispose();
+      throw error;
+    }
+  }
+
+  /** Publish one tracking result unless its exact observation is stale. */
+  publishTrackingRef(
+    token: TrackingRefPublicationToken,
+    target: string | null,
+    metadata: RefLogMetadata,
+  ): boolean {
+    if (!this.#issuedTrackingRefPublications.has(token)) {
+      throw staleFetch("tracking publication token was not issued by this repository");
+    }
+    const state = this.#trackingRefPublicationStates.get(token);
+    if (state === undefined || state.disposed) {
+      throw staleFetch("tracking publication token is no longer active");
+    }
+    state.budget.requireSqlHeadroom();
+    const normalized = normalizeRefMutation(
+      {
+        puts: target === null ? [] : [{ name: state.refName, target }],
+        deletes: target === null ? [state.refName] : [],
+        expected: { name: state.refName, target: state.target },
+      },
+      state.budget,
+    );
+    const checkedMetadata = validateRefLogMetadata(metadata);
+    let changed: boolean;
+    try {
+      changed = this.#db.transactionSync(() => {
+        const refRevision = this.#readTrackingRefRevision(state.refName);
+        if (refRevision !== state.refRevision) {
+          throw staleFetch("the tracking ref changed after observation");
+        }
+        const refChanged = this.#mutateRefs(normalized, checkedMetadata);
+        if (!refChanged) {
+          this.#bumpTrackingRefRevisions(new Set([state.refName]), state.budget);
+          this.#bumpFetchNamespaceRevisions(new Set([state.refName]), state.budget);
+        }
+        return refChanged;
+      });
+    } catch (error) {
+      if (hasErrorCode(error, "ESTALEHEAD")) {
+        throw staleFetch(`tracking ref ${state.refName} changed after observation`);
+      }
+      throw error;
+    }
+    this.#issuedTrackingRefPublications.delete(token);
+    this.#trackingRefPublicationStates.delete(token);
+    return changed;
+  }
+
   /** Fence one remote-tracking namespace and retain its exact publication snapshot. */
   beginFetchPublication(
     trackingPrefix: string,
@@ -5141,6 +5478,8 @@ export class CheckoutStore {
         if (currentGeneration === Number.MAX_SAFE_INTEGER) {
           throw new GitError("E2BIG", "fetch publication generation is exhausted");
         }
+
+        this.#advanceTrackingRefObservations(prefix);
 
         const namespaces = this.#readFetchNamespaces(budget);
         for (const namespace of namespaces) {
@@ -5614,8 +5953,13 @@ export class CheckoutStore {
         checkout_id: unknown;
         next_ordinal: unknown;
         latest_ordinal: unknown;
+        tracking_ref_revision_rows: unknown;
       }>(
         `SELECT repository.id AS repo_id, checkout.id AS checkout_id, state.next_ordinal,
+                (SELECT count(*) FROM (
+                   SELECT 1 FROM git_tracking_ref_revisions
+                    WHERE repo_id = ? LIMIT ${MAX_TRACKING_REF_REVISIONS + 1}
+                 )) AS tracking_ref_revision_rows,
                 (SELECT max(ordinal) FROM (
                    SELECT entry.ordinal FROM git_reflog_entries entry
                     WHERE entry.repo_id = repository.id
@@ -5627,6 +5971,7 @@ export class CheckoutStore {
            JOIN git_reflog_state state ON state.repo_id = repository.id
            JOIN git_checkouts checkout ON checkout.repo_id = repository.id
           WHERE repository.id = ? AND checkout.id = ?`,
+        this.#repoId,
         this.#repoId,
         this.#checkoutId,
       );
@@ -5656,6 +6001,14 @@ export class CheckoutStore {
             );
       if ((nextOrdinal === 0 && latestOrdinal !== null) || (latestOrdinal ?? 0) > nextOrdinal) {
         throw new CorruptError("reflog state precedes its newest entry");
+      }
+      const trackingRefRevisionCount = requireFetchGeneration(
+        header.tracking_ref_revision_rows,
+        "stored tracking ref revision count",
+        0,
+      );
+      if (trackingRefRevisionCount > MAX_TRACKING_REF_REVISIONS) {
+        throw new CorruptError("tracking ref revision count exceeds its bound");
       }
 
       const checkouts: CheckoutRow[] = [];
@@ -6005,6 +6358,9 @@ export class CheckoutStore {
           this.#repoId,
           page,
         );
+      }
+      if (trackingRefRevisionCount > 0) {
+        this.#bumpTrackingRefRevisions(changedNames, normalized.budget);
       }
       this.#bumpFetchNamespaceRevisions(changedNames, normalized.budget);
       bumpMaintenanceRootEpoch(this.#db, this.#repoId);

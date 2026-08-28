@@ -25,6 +25,7 @@ export {
 export const SCHEMA_VERSION = 1;
 export const MAX_CHECKOUTS_PER_REPOSITORY = 1_024;
 export const MAX_CHECKOUT_ROOT_BYTES = 4_096;
+export const MAX_TRACKING_REF_REVISIONS = 100_000;
 export { MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 
 const COMMIT_TABLE = `CREATE TABLE IF NOT EXISTS git_commits (
@@ -187,6 +188,23 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, name),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
+
+  `CREATE TABLE IF NOT EXISTS git_tracking_ref_revisions (
+     repo_id INTEGER NOT NULL CHECK (
+       typeof(repo_id) = 'integer' AND repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     ref_name TEXT NOT NULL CHECK (
+       typeof(ref_name) = 'text'
+       AND length(CAST(ref_name AS BLOB)) BETWEEN 1 AND 1024
+       AND substr(ref_name, 1, 13) = 'refs/remotes/'
+     ),
+     revision INTEGER NOT NULL CHECK (
+       typeof(revision) = 'integer'
+       AND revision BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     PRIMARY KEY (repo_id, ref_name),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_fetch_namespaces (
      repo_id INTEGER NOT NULL CHECK (

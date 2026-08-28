@@ -22,6 +22,7 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_identity_control", "global"],
   ["git_repositories", "shared"],
   ["git_refs", "shared"],
+  ["git_tracking_ref_revisions", "shared"],
   ["git_fetch_namespaces", "shared"],
   ["git_reflog_state", "shared"],
   ["git_reflog_entries", "shared"],
@@ -114,6 +115,7 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_refs" },
   { type: "table", name: "git_repositories" },
   { type: "table", name: "git_shallow" },
+  { type: "table", name: "git_tracking_ref_revisions" },
   { type: "table", name: "git_tree_effective" },
   { type: "trigger", name: "git_tree_effective_loose_delete" },
   { type: "trigger", name: "git_tree_effective_loose_insert" },
@@ -145,6 +147,7 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ],
   ["git_checkouts", ["id", "repo_id", "root", "head", "is_primary"]],
   ["git_refs", ["repo_id", "name", "target"]],
+  ["git_tracking_ref_revisions", ["repo_id", "ref_name", "revision"]],
   ["git_fetch_namespaces", ["repo_id", "tracking_prefix", "latest_generation", "revision"]],
   ["git_reflog_state", ["repo_id", "next_ordinal"]],
   [
@@ -504,6 +507,7 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_identity_control")).toEqual(["singleton"]);
     expect(primaryKeyOf(db, "git_checkouts")).toEqual(["id"]);
     expect(primaryKeyOf(db, "git_fetch_namespaces")).toEqual(["repo_id", "tracking_prefix"]);
+    expect(primaryKeyOf(db, "git_tracking_ref_revisions")).toEqual(["repo_id", "ref_name"]);
     expect(primaryKeyOf(db, "git_index")).toEqual(["checkout_id", "path", "stage"]);
     expect(primaryKeyOf(db, "git_index_state")).toEqual(["checkout_id"]);
     expect(primaryKeyOf(db, "git_index_dirty")).toEqual(["checkout_id", "path"]);
@@ -518,6 +522,9 @@ describe("git schema", () => {
       { table: "git_repositories", from: "repo_id", to: "id" },
     ]);
     expect(cascadeForeignKeysOf(db, "git_fetch_namespaces")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_tracking_ref_revisions")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },
     ]);
     for (const table of ["git_index", "git_index_state", "git_index_dirty"]) {
