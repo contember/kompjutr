@@ -27,3 +27,4 @@ a commit message suffices.
 - [0012 — Run maintenance as resumable generations](0012-run-maintenance-as-resumable-generations.md) — accepted (2026-08-27)
 - [0013 — Publish clones through provisional ownership](0013-publish-clones-through-provisional-ownership.md) — accepted (2026-08-28)
 - [0014 — Make an optionless clone complete](0014-default-clone-is-complete.md) — accepted (2026-08-28)
+- [0015 — Route Git argv through one synchronous runner](0015-route-git-argv-through-one-synchronous-runner.md) — accepted (2026-08-28)

@@ -54,6 +54,7 @@ decisions → reference → archive.
 - [`decisions/0012-run-maintenance-as-resumable-generations.md`](decisions/0012-run-maintenance-as-resumable-generations.md)
 - [`decisions/0013-publish-clones-through-provisional-ownership.md`](decisions/0013-publish-clones-through-provisional-ownership.md)
 - [`decisions/0014-default-clone-is-complete.md`](decisions/0014-default-clone-is-complete.md)
+- [`decisions/0015-route-git-argv-through-one-synchronous-runner.md`](decisions/0015-route-git-argv-through-one-synchronous-runner.md)
 
 ## Historical records
 

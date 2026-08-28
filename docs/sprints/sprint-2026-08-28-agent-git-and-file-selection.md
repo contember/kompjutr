@@ -147,6 +147,41 @@ destination-derived ceilings, discard policy, and the shell demand hint.
 - **Touch points.** This sprint, `docs/decisions/0015-*.md`,
   `docs/decisions/README.md`.
 
+#### WU0 pinned Git 2.54.0 witness
+
+The probe used `LC_ALL=C`, empty global and system config files, fixed identity
+and timestamps, and `GIT_EDITOR=true`. `∅` below means an empty byte stream. Full
+usage blocks and fixture-dependent OIDs/paths map to byte-exact table cases in
+the later differential files; this table pins their stream and status class.
+
+| Family | Successful triplet | Command/domain refusal triplets |
+|---|---|---|
+| `status` | All four aliases: porcelain-v1 bytes on stdout, `∅` stderr, 0. Clean and unborn repositories return `∅`, `∅`, 0. Nested `cwd` keeps repository-root-relative porcelain paths. | Unknown option: `∅`, `error:` plus status usage, 129. Plain status, branch/ignored/v2 modes, paths, duplicates and extra argv are strict-parser no-op cases. |
+| `diff` | Worktree patch on stdout, `∅`, 0; clean diff is `∅`, `∅`, 0. Root and nested `cwd` produce the same root-relative patch. | Unknown option: `∅`, `error:` plus diff usage, 129. `--`, staged/ref/path modes and extra argv are strict-parser no-op cases. |
+| `log` | Default medium, oneline, admitted literal format, ref and linear-range bytes on stdout, `∅`, 0. Count zero and an empty format return `∅`, `∅`, 0. | Unknown option and nonnumeric count: `∅`, one `fatal:` line, 128. Unborn HEAD: `∅`, one `fatal:` line, 128. Missing ref: `∅`, three fatal/hint lines, 128. Merge, divergent, unrelated and shallow-boundary ranges fail closed before output. |
+| `rev-list` | `--count a..b`: decimal plus newline on stdout, `∅`, 0 for linear, divergent and merge graphs. | Missing range or unknown option: `∅`, rev-list usage, 129. Enumeration, symmetric ranges and extra argv are strict-parser no-op cases. |
+| `symbolic-ref` | `--short HEAD`: short name plus newline, `∅`, 0, including unborn HEAD and the nearest nested checkout. | Detached or missing ref: `∅`, one `fatal: ref … is not a symbolic ref` line, 128. Unknown option: `∅`, error plus usage, 129. Writes and extra formatting are strict-parser no-op cases. |
+| `add` | One or more root-, cwd-, or directory-relative paths: `∅`, `∅`, 0; `--` only changes option parsing. | Missing path: `∅`, one `fatal: pathspec … did not match any files` line, 128. Checkout escape: `∅`, one `fatal: … is outside repository` line, 128. Unknown option: `∅`, error plus usage, 129. No path, glob and every option are strict-parser no-op cases. |
+| `commit` | A nonempty `-m` or `--message=` commit writes Git's bracketed commit summary to stdout, `∅`, 0. | Empty cleaned message: `∅`, `Aborting commit due to empty commit message.` plus newline, 1. Clean index: two status lines on stdout, `∅`, 1. Unmerged index: stage rows on stdout, then error/hints/fatal on stderr, 128. Unknown option or missing `-m` value: `∅`, error/usage, 129. Other message spellings, duplicates and extra argv are strict-parser no-op cases. |
+| `rebase` | Resolved `--continue`: commit summary on stdout, success line on stderr, 0. Conflicted `--abort`: `∅`, `∅`, 0 and restores HEAD/index/worktree. | Unresolved `--continue`: three guidance lines on stdout, `∅`, 1. Either action without a rebase: `∅`, `fatal: no rebase in progress` plus newline, 128. Unknown option: `∅`, error plus usage, 129. Starts, skip and extra argv are strict-parser no-op cases. |
+| dispatcher | — | Unknown subcommand: `∅`, `git: '<name>' is not a git command. See 'git --help'.` plus newline, 1. Refused `push`: `∅`, Git's eight-line no-destination guidance, 128. Every network command is rejected before transport. Missing/outside checkout: `∅`, one `fatal: not a git repository …` line, 128. |
+
+Default medium log records are `commit <full oid>`, an optional `Merge:` line
+with seven-hex parent IDs, `Author:`, `Date:   `, one blank line, and every
+message line indented by four spaces; records are separated by one blank line.
+The admitted custom placeholders match Git byte-for-byte. `%B` retains its own
+trailing newline before the record terminator and `%n` inserts one literal
+newline. A leading-zero count is accepted. Joined `-n1`, shorthands other than
+`-1`, signed/whitespace counts, values above 50,000, duplicate count/format
+selectors, options after a revision, and unsupported or dangling `%` sequences
+are parser refusals even where Git accepts them.
+
+`strace -f -e read` recorded zero `read(0, …)` calls for a representative of
+every accepted family, including `commit -m` and both rebase actions. Git fills
+partial env identities field-by-field from repository config; native CLI keeps
+the existing complete-source `resolveIdentity()` precedence recorded in
+[ADR 0015](../decisions/0015-route-git-argv-through-one-synchronous-runner.md).
+
 ### WU1 — Complete bounded builder file selection (effort M)
 
 - **Problem.** `lsFiles({ paths })` sees tracked index/ref paths only and cannot
@@ -446,3 +481,9 @@ catches every cross-layer wiring failure.
   stdout/stderr/combined limits and raw shell diagnostic seam support Git's
   observed stream split without changing `CommandResult.status()`; WU0 may
   resume.
+- 2026-08-28 — WU0 completed the controlled Git 2.54.0 matrix. All accepted
+  families preserve the frozen command scope and made zero stdin reads; nested
+  cwd, default/merge log records, literal formats, numeric grammar, linear versus
+  non-linear ranges, identity precedence, network refusal, commit failures and
+  rebase stream splits are pinned above. The runner architecture is unchanged.
+  → [ADR 0015](../decisions/0015-route-git-argv-through-one-synchronous-runner.md)
