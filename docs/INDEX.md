@@ -15,13 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- None.
+- [`sprints/sprint-2026-08-28-index-and-object-write-plumbing.md`](sprints/sprint-2026-08-28-index-and-object-write-plumbing.md)
+  — scoped scratch indexes plus bounded tree and commit construction.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Index and object write plumbing is next. It adds bounded scratch indexes and
+- Index and object write plumbing is active. It adds bounded scratch indexes and
   tree/commit construction for the reference snapshot workload.
 
 ## Key reference

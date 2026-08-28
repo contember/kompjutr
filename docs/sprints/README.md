@@ -19,4 +19,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- None.
+- [`sprint-2026-08-28-index-and-object-write-plumbing.md`](sprint-2026-08-28-index-and-object-write-plumbing.md)
+  — scoped scratch indexes plus bounded tree and commit construction.
