@@ -1,0 +1,422 @@
+import { GitError } from "../../core/errors.js";
+import {
+  gitCliCommitMessageRequired,
+  gitCliLogFailure,
+  gitCliNetworkRefusal,
+  gitCliUnknownCommand,
+  gitCliUnknownOptionFailure,
+  gitCliUsageFailure,
+  gitCliUtf8ByteLength,
+} from "./result.js";
+import {
+  GIT_CLI_MAX_ARGV_BYTES,
+  GIT_CLI_MAX_ARGV_ENTRIES,
+  GIT_CLI_MAX_COMMIT_MESSAGE_BYTES,
+  GIT_CLI_MAX_CWD_BYTES,
+  GIT_CLI_MAX_ENV_BYTES,
+  GIT_CLI_MAX_ENV_ENTRIES,
+  GIT_CLI_MAX_LOG_COUNT,
+  GIT_CLI_MAX_LOG_FORMAT_BYTES,
+  GIT_CLI_MAX_STDIN_BYTES,
+  type GitCliEnvironment,
+  type GitCliInvocation,
+  type GitCliLogCommand,
+  type GitCliLogFormat,
+  type GitCliParseResult,
+  type GitCliRevision,
+  type ParsedGitCliCommand,
+} from "./types.js";
+
+const INPUT_KEYS = new Set(["argv", "cwd", "env", "stdin"]);
+const NETWORK_COMMANDS = new Set(["fetch", "push", "pull", "clone", "ls-remote"]);
+const DECIMAL_COUNT = /^[0-9]+$/;
+const GLOB_PATHSPEC = /[*?[]/;
+
+export interface ValidatedGitCliInput {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly env: GitCliEnvironment;
+  readonly stdin?: string;
+}
+
+export function parseGitCliInput(input: unknown, logLimitHint?: number): GitCliParseResult {
+  const validated = validateGitCliInput(input);
+  const parsed = parseGitCliCommand(validated.argv, logLimitHint);
+  if (!parsed.ok) return parsed;
+  return {
+    ok: true,
+    invocation: {
+      command: parsed.invocation.command,
+      cwd: validated.cwd,
+      env: validated.env,
+    },
+  };
+}
+
+export function validateGitCliInput(input: unknown): ValidatedGitCliInput {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new GitError("EINVAL", "git CLI input must be an object");
+  }
+  validateInputKeys(input);
+  if (!("argv" in input) || !Array.isArray(input.argv)) {
+    throw new GitError("EINVAL", "git CLI argv must be an array");
+  }
+  if (input.argv.length > GIT_CLI_MAX_ARGV_ENTRIES) {
+    throw new GitError("E2BIG", `git CLI argv exceeds ${GIT_CLI_MAX_ARGV_ENTRIES} entries`);
+  }
+  const argv: string[] = [];
+  let argvBytes = 0;
+  for (const argument of input.argv) {
+    if (typeof argument !== "string") {
+      throw new GitError("EINVAL", "git CLI argv entries must be strings");
+    }
+    const bytes = gitCliUtf8ByteLength(argument, "git CLI argument", true);
+    if (bytes > GIT_CLI_MAX_ARGV_BYTES - argvBytes) {
+      throw new GitError("E2BIG", `git CLI argv exceeds ${GIT_CLI_MAX_ARGV_BYTES} bytes`);
+    }
+    argvBytes += bytes;
+    argv.push(argument);
+  }
+  const cwd = validateCwd(input);
+  const env = validateEnvironment(input);
+  let stdin: string | undefined;
+  if ("stdin" in input && input.stdin !== undefined) {
+    if (typeof input.stdin !== "string") {
+      throw new GitError("EINVAL", "git CLI stdin must be a string");
+    }
+    const bytes = gitCliUtf8ByteLength(input.stdin, "git CLI stdin", false);
+    if (bytes > GIT_CLI_MAX_STDIN_BYTES) {
+      throw new GitError("E2BIG", `git CLI stdin exceeds ${GIT_CLI_MAX_STDIN_BYTES} bytes`);
+    }
+    stdin = input.stdin;
+  }
+  return { argv, cwd, env, stdin };
+}
+
+export function parseGitCliCommand(
+  argv: readonly string[],
+  logLimitHint?: number,
+): GitCliParseResult {
+  const name = argv[0];
+  if (name === undefined) return { ok: false, result: gitCliUnknownCommand(undefined) };
+  if (NETWORK_COMMANDS.has(name)) {
+    return { ok: false, result: gitCliNetworkRefusal(name) };
+  }
+  let command: ParsedGitCliCommand | undefined;
+  if (name === "status") command = parseStatus(argv);
+  else if (name === "diff") command = parseDiff(argv);
+  else if (name === "log") return parseLog(argv, logLimitHint);
+  else if (name === "rev-list") command = parseRevList(argv);
+  else if (name === "symbolic-ref") command = parseSymbolicRef(argv);
+  else if (name === "add") command = parseAdd(argv);
+  else if (name === "commit") command = parseCommit(argv);
+  else if (name === "rebase") command = parseRebase(argv);
+  else return { ok: false, result: gitCliUnknownCommand(name) };
+  if (command === undefined) return invalidInvocation(name, argv);
+  return invocation(command);
+}
+
+function parseStatus(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length !== 2) return undefined;
+  const option = argv[1];
+  if (option === "--porcelain" || option === "--porcelain=v1") {
+    return { kind: "status", format: "porcelain-v1" };
+  }
+  if (option === "--short" || option === "-s") return { kind: "status", format: "short" };
+  return undefined;
+}
+
+function parseDiff(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  return argv.length === 1 ? { kind: "diff" } : undefined;
+}
+
+function parseLog(argv: readonly string[], logLimitHint?: number): GitCliParseResult {
+  let count: number | undefined;
+  let format: GitCliLogFormat = { kind: "default" };
+  let hasFormat = false;
+  let revision: GitCliRevision | undefined;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) throw new Error("git CLI argv changed during parsing");
+    if (revision !== undefined) {
+      return {
+        ok: false,
+        result: gitCliLogFailure("options and revisions must precede no extra arguments"),
+      };
+    }
+    if (argument === "-1") {
+      if (count !== undefined) return duplicateLogSelector("count");
+      count = 1;
+      continue;
+    }
+    if (argument === "-n") {
+      if (count !== undefined) return duplicateLogSelector("count");
+      const value = argv[index + 1];
+      if (value === undefined) {
+        return { ok: false, result: gitCliLogFailure("option '-n' requires a value") };
+      }
+      const parsed = parseCount(value);
+      if (parsed === undefined) {
+        return { ok: false, result: gitCliLogFailure(`'${value}': not an integer`) };
+      }
+      count = parsed;
+      index++;
+      continue;
+    }
+    if (argument.startsWith("--max-count=")) {
+      if (count !== undefined) return duplicateLogSelector("count");
+      const value = argument.slice("--max-count=".length);
+      const parsed = parseCount(value);
+      if (parsed === undefined) {
+        return { ok: false, result: gitCliLogFailure(`'${value}': not an integer`) };
+      }
+      count = parsed;
+      continue;
+    }
+    if (argument === "--oneline") {
+      if (hasFormat) return duplicateLogSelector("format");
+      hasFormat = true;
+      format = { kind: "oneline" };
+      continue;
+    }
+    if (argument.startsWith("--format=")) {
+      if (hasFormat) return duplicateLogSelector("format");
+      const template = argument.slice("--format=".length);
+      validateLogFormat(template);
+      hasFormat = true;
+      format = { kind: "template", template };
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      return { ok: false, result: gitCliLogFailure(`unrecognized argument: ${argument}`) };
+    }
+    const parsedRevision = parseRevision(argument);
+    if (parsedRevision === undefined) {
+      return { ok: false, result: gitCliLogFailure(`invalid revision expression: ${argument}`) };
+    }
+    revision = parsedRevision;
+  }
+  if (logLimitHint !== undefined && (count === undefined || logLimitHint < count)) {
+    count = logLimitHint;
+  }
+  const command: GitCliLogCommand = { kind: "log", count, format, revision };
+  return invocation(command);
+}
+
+function parseRevList(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length !== 3 || argv[1] !== "--count") return undefined;
+  const value = argv[2];
+  if (value === undefined) return undefined;
+  const range = parseRange(value);
+  if (range === undefined) return undefined;
+  return { kind: "rev-list", left: range.left, right: range.right };
+}
+
+function parseSymbolicRef(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length !== 3 || argv[1] !== "--short" || argv[2] === "") return undefined;
+  const ref = argv[2];
+  if (ref === undefined) return undefined;
+  return { kind: "symbolic-ref", ref };
+}
+
+function parseAdd(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  const paths: string[] = [];
+  let endOptions = false;
+  for (let index = 1; index < argv.length; index++) {
+    const argument = argv[index];
+    if (argument === undefined) return undefined;
+    if (!endOptions && argument === "--") {
+      endOptions = true;
+      continue;
+    }
+    if (!endOptions && argument.startsWith("-")) return undefined;
+    if (argument.length === 0 || GLOB_PATHSPEC.test(argument) || argument.startsWith(":")) {
+      return undefined;
+    }
+    paths.push(argument);
+  }
+  if (paths.length === 0) return undefined;
+  return { kind: "add", paths };
+}
+
+function parseCommit(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length === 3 && argv[1] === "-m") {
+    const message = argv[2];
+    if (message === undefined) return undefined;
+    validateCommitMessage(message);
+    return { kind: "commit", message };
+  }
+  if (argv.length === 2 && argv[1]?.startsWith("--message=")) {
+    const message = argv[1].slice("--message=".length);
+    validateCommitMessage(message);
+    return { kind: "commit", message };
+  }
+  return undefined;
+}
+
+function parseRebase(argv: readonly string[]): ParsedGitCliCommand | undefined {
+  if (argv.length !== 2) return undefined;
+  if (argv[1] === "--continue") return { kind: "rebase", action: "continue" };
+  if (argv[1] === "--abort") return { kind: "rebase", action: "abort" };
+  return undefined;
+}
+
+function invalidInvocation(command: string, argv: readonly string[]): GitCliParseResult {
+  if (command === "log") {
+    return { ok: false, result: gitCliLogFailure("unsupported git log invocation") };
+  }
+  if (command === "commit" && argv.length === 2 && argv[1] === "-m") {
+    return { ok: false, result: gitCliCommitMessageRequired() };
+  }
+  if (
+    command === "status" ||
+    command === "diff" ||
+    command === "rev-list" ||
+    command === "symbolic-ref" ||
+    command === "add" ||
+    command === "commit" ||
+    command === "rebase"
+  ) {
+    const option = argv.find(
+      (argument, index) => index > 0 && argument !== "--" && argument.startsWith("-"),
+    );
+    if (option !== undefined) {
+      return { ok: false, result: gitCliUnknownOptionFailure(command, option) };
+    }
+    return {
+      ok: false,
+      result: gitCliUsageFailure(command, `unsupported git ${command} invocation`),
+    };
+  }
+  return { ok: false, result: gitCliUnknownCommand(command) };
+}
+
+function duplicateLogSelector(selector: string): GitCliParseResult {
+  return { ok: false, result: gitCliLogFailure(`duplicate log ${selector} selector`) };
+}
+
+function parseCount(value: string): number | undefined {
+  if (!DECIMAL_COUNT.test(value)) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > GIT_CLI_MAX_LOG_COUNT) return undefined;
+  return parsed;
+}
+
+function validateLogFormat(template: string): void {
+  const bytes = gitCliUtf8ByteLength(template, "git CLI log format", true);
+  if (bytes > GIT_CLI_MAX_LOG_FORMAT_BYTES) {
+    throw new GitError("E2BIG", `git CLI log format exceeds ${GIT_CLI_MAX_LOG_FORMAT_BYTES} bytes`);
+  }
+  for (let index = 0; index < template.length; index++) {
+    if (template.charCodeAt(index) !== 0x25) continue;
+    const first = template[index + 1];
+    if (
+      first === "H" ||
+      first === "h" ||
+      first === "P" ||
+      first === "s" ||
+      first === "B" ||
+      first === "n" ||
+      first === "%"
+    ) {
+      index++;
+      continue;
+    }
+    const second = template[index + 2];
+    if ((first === "a" || first === "c") && (second === "n" || second === "e" || second === "t")) {
+      index += 2;
+      continue;
+    }
+    throw new GitError("EINVAL", "git CLI log format contains an unsupported placeholder");
+  }
+}
+
+function validateCommitMessage(message: string): void {
+  const bytes = gitCliUtf8ByteLength(message, "git CLI commit message", true);
+  if (bytes > GIT_CLI_MAX_COMMIT_MESSAGE_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `git CLI commit message exceeds ${GIT_CLI_MAX_COMMIT_MESSAGE_BYTES} bytes`,
+    );
+  }
+}
+
+function parseRevision(value: string): GitCliRevision | undefined {
+  const range = parseRange(value);
+  if (range !== undefined) return { kind: "range", left: range.left, right: range.right };
+  if (value.includes("..")) return undefined;
+  return value.length === 0 ? undefined : { kind: "ref", ref: value };
+}
+
+function parseRange(value: string): { left: string; right: string } | undefined {
+  const separator = value.indexOf("..");
+  if (separator <= 0 || separator + 2 >= value.length) return undefined;
+  if (value.indexOf("..", separator + 2) !== -1 || value[separator + 2] === ".") return undefined;
+  return { left: value.slice(0, separator), right: value.slice(separator + 2) };
+}
+
+function invocation(command: ParsedGitCliCommand): GitCliParseResult {
+  const value: GitCliInvocation = { command, cwd: "/", env: {} };
+  return { ok: true, invocation: value };
+}
+
+function validateInputKeys(input: object): void {
+  for (const key of Reflect.ownKeys(input)) {
+    if (typeof key !== "string" || !INPUT_KEYS.has(key)) {
+      throw new GitError("EINVAL", `unknown git CLI input field: ${String(key)}`);
+    }
+  }
+}
+
+function validateCwd(input: object): string {
+  if (!("cwd" in input) || input.cwd === undefined) return "/";
+  if (typeof input.cwd !== "string" || input.cwd.length === 0 || !input.cwd.startsWith("/")) {
+    throw new GitError("EINVAL", "git CLI cwd must be a non-empty absolute path");
+  }
+  const bytes = gitCliUtf8ByteLength(input.cwd, "git CLI cwd", true);
+  if (bytes > GIT_CLI_MAX_CWD_BYTES) {
+    throw new GitError("E2BIG", `git CLI cwd exceeds ${GIT_CLI_MAX_CWD_BYTES} bytes`);
+  }
+  return input.cwd;
+}
+
+function validateEnvironment(input: object): GitCliEnvironment {
+  if (!("env" in input) || input.env === undefined) return {};
+  if (typeof input.env !== "object" || input.env === null || Array.isArray(input.env)) {
+    throw new GitError("EINVAL", "git CLI env must be an object");
+  }
+  const keys = Reflect.ownKeys(input.env);
+  if (keys.length > GIT_CLI_MAX_ENV_ENTRIES) {
+    throw new GitError("E2BIG", `git CLI env exceeds ${GIT_CLI_MAX_ENV_ENTRIES} entries`);
+  }
+  let bytes = 0;
+  let authorName: string | undefined;
+  let authorEmail: string | undefined;
+  let committerName: string | undefined;
+  let committerEmail: string | undefined;
+  for (const key of keys) {
+    if (typeof key !== "string" || key.length === 0 || key.includes("=")) {
+      throw new GitError("EINVAL", "git CLI env names must be non-empty strings without '='");
+    }
+    const value: unknown = Reflect.get(input.env, key);
+    if (typeof value !== "string")
+      throw new GitError("EINVAL", "git CLI env values must be strings");
+    const entryBytes =
+      gitCliUtf8ByteLength(key, "git CLI env name", true) +
+      gitCliUtf8ByteLength(value, "git CLI env value", true);
+    if (!Number.isSafeInteger(entryBytes) || entryBytes > GIT_CLI_MAX_ENV_BYTES - bytes) {
+      throw new GitError("E2BIG", `git CLI env exceeds ${GIT_CLI_MAX_ENV_BYTES} bytes`);
+    }
+    bytes += entryBytes;
+    if (key === "GIT_AUTHOR_NAME") authorName = value;
+    else if (key === "GIT_AUTHOR_EMAIL") authorEmail = value;
+    else if (key === "GIT_COMMITTER_NAME") committerName = value;
+    else if (key === "GIT_COMMITTER_EMAIL") committerEmail = value;
+  }
+  return {
+    GIT_AUTHOR_NAME: authorName,
+    GIT_AUTHOR_EMAIL: authorEmail,
+    GIT_COMMITTER_NAME: committerName,
+    GIT_COMMITTER_EMAIL: committerEmail,
+  };
+}
