@@ -64,11 +64,14 @@ prefix of a command and ignores the rest.
 | `commit` | exactly one `-m <message>`/`--message=<message>` | editor, amend, signing, hooks and file input |
 | `rebase` | `--continue` or `--abort` | starting or extending a rebase through argv |
 
-Unknown subcommands and every network subcommand fail without fallback.
-Usage/unknown-option errors use Git's 129 convention; ordinary command refusal
-and fatal repository errors use the command-specific code pinned by WU0.
-Expected Git-domain errors become the exact bounded multiline `error:`, `fatal:`
-or usage bytes pinned by WU0; unexpected programming errors remain exceptions.
+Unknown subcommands and every network subcommand fail without fallback. There
+is no universal usage code or diagnostic stream: each accepted or rejected form
+uses the exact command-specific `{ stdout, stderr, exitCode }` triplet pinned by
+WU0. In Git 2.54.0 an unknown subcommand exits 1, an unknown `status` option
+exits 129 with usage, an unknown `log` option or nonnumeric log count exits 128
+with one fatal line, and a refused `push` exits 128 with multiline guidance.
+Expected Git-domain errors become those exact bounded bytes on either stream;
+unexpected programming errors remain exceptions.
 The common input has `cwd` only: it replaces native `dir`, defaults to `/`, and
 selects the nearest checkout. A runtime `dir` field is rejected. Path operands
 are resolved from `cwd` and may not escape the checkout. No accepted command
@@ -96,6 +99,10 @@ their corresponding author fields; the combined result exists only when both
 are then present. Complete environment identities win over repository
 `user.name`/`user.email`, then the binding default, exactly as
 `resolveIdentity()` does. Other bounded environment entries are ignored.
+This complete-source policy deliberately differs from Git 2.54.0, which fills a
+partial environment identity field-by-field from config. The CLI preserves the
+existing native identity contract; the differential witness records the
+divergence instead of silently changing every typed commit operation.
 
 Native `Git` implements the public narrow capability
 `GitCliRunner.runCli(input, options?): GitCliResult`; `Git.cli(input)` is its
@@ -130,7 +137,7 @@ destination-derived ceilings, discard policy, and the shell demand hint.
   on shell command types; shell never imports Git; async `Git.cli()` and the
   shell bridge call one synchronous dispatcher. Freeze the full grammar above,
   Git default-log format, literal-format rules, duplicate policy, recognized env
-  keys and field-by-field precedence, raw diagnostic framing, `cwd`-only
+  keys and native source precedence, per-command output/error triplets, `cwd`-only
   contract, numeric grammar, and public `GitCliRunner`, `GitCliRunOptions`, and
   `createGitCommand` signatures.
 - **Acceptance / witness.** The matrix is complete enough that each accepted
@@ -233,9 +240,12 @@ destination-derived ceilings, discard policy, and the shell demand hint.
   nested-checkout exclusion, operation ownership, conflict stages, reflog
   causality, and rollback. Do not add a second mutation implementation.
 - **Acceptance / witness.** Differential tests cover ordinary add/commit, env
-  identity, empty/missing message, missing path, unmerged refusal, conflicted
-  rebase resolution via `add` plus `rebase --continue`, abort after reopen, and
-  unchanged public state after every rejected argv. Run
+  identity and its deliberate partial-env divergence, empty/missing message,
+  missing path, unmerged refusal, conflicted rebase resolution via `add` plus
+  `rebase --continue`, abort after reopen, and unchanged public state after every
+  rejected argv. Rebase witnesses compare the exact Git stream split: unresolved
+  guidance is stdout-only, while successful continuation emits the commit summary
+  on stdout and progress/success on stderr. Run
   `npx vitest run tests/git-cli-parity.test.ts -t "add|commit|rebase"` and the
   matching focused E2E rebase case.
 - **Touch points.** `src/git/cli/write.ts`, `tests/git-cli-parity.test.ts`,
@@ -317,7 +327,7 @@ The label summarizes the gate; the concrete witness and escalation rule bind it.
 | Scope | Risk / rationale | Required gate and review | Escalate when |
 |---|---|---|---|
 | Sprint integration (T3) | One synchronous dispatcher crosses core operations, two async facades, shell streaming, exports and file selection. | After all WUs, one independent reviewer checks the frozen integrated diff for exact allowlist/error parity, bounds, transaction ownership, layering and honest deferrals. Run the routine gate and focused cross-layer suite. Any fix to a public contract, mutation, traversal bound or shell execution seam returns to review until clean. | A network command, new schema, general rev-list, mutating glob, async shell, or consumer-side code becomes necessary. |
-| WU0 (T1) | Evidence and one ADR; no runtime change. | Direct Git 2.54.0 probe and complete matrix are sufficient. The mandatory independent plan review checks the ADR direction and scope. | Probe evidence changes the command set or requires a new core capability. |
+| WU0 (T1) | Evidence and one ADR; no runtime change. | Direct Git 2.54.0 probe and complete per-command stdout/stderr/status matrix are sufficient. The mandatory independent plan review checks the ADR direction and scope. | Probe evidence changes the command set, runner architecture, output framing or requires a new core capability. |
 | WU1 (T3) | Untrusted globs combine an index cursor, worktree traversal and ignore evaluation. | Differential plus exact cost/bound witnesses and independent review-to-clean of ordering, unique-path divergence, nested-root/ignore pruning, 700-statement combined allocation, memory budgets and ref-mode rejection. Every traversal or bound fix is re-reviewed. | A schema/index change, materialized whole-tree snapshot, mutating pathspec, additional exclude source, or >700-statement combined path is needed. |
 | WU2 (T3) | The parser and mapper define the security boundary for untrusted argv and outputs. | Exact parser/bounds table plus independent review-to-clean. Every accepted-language, runtime-validation, exception-mapping or limit change is re-reviewed. | Shell grammar changes, subprocess fallback, or dynamic command registration enters scope. |
 | WU3 (T2) | Read-only formatting over existing bounded ops; one separate linear-chain reader is new. | Differential file plus one independent review of single-parent range proof, formats, cwd and output accounting. One fix pass; re-review only if the admitted graph or bounds change. | Merge history, general exclusion ordering, path-filtered history, staged diff or a two-sided graph walk is needed; promote to T3 before proceeding. |
@@ -398,7 +408,7 @@ whether each tier is proportionate and whether the reduced routine suite still
 catches every cross-layer wiring failure.
 
 - **Reviewer:** Bohr (`agent_git_plan_review`)
-- **Verdict:** approved
+- **Verdict:** approved after WU0 framing re-review
 - **Material findings:** Initial review blocked implementation on an undefined
   public sync seam, stderr rewriting through `warn()`, an invalid general
   ancestor-stop assumption, overclaimed conflict/exclude-standard parity, and
@@ -407,8 +417,10 @@ catches every cross-layer wiring failure.
   destination-specific output preflight, restricts ranges to proven linear
   chains, states unique-path and `.gitignore`-only divergences with an exact
   700-statement combined allocation, and completes the grammar and public run
-  options. Final re-review found no blocker; tiering, sequencing and test cadence
-  were approved.
+  options. Final proposal review approved those corrections. WU0 then proved
+  that Git uses command-specific exit codes and may write failure or success
+  diagnostics to either stream, so the framing contract was corrected and
+  returned for another review.
 
 ## Run log
 
@@ -424,3 +436,13 @@ catches every cross-layer wiring failure.
 - 2026-08-28 — Bohr approved the corrected proposal. Implementation may start;
   any WU0 change to command scope, runner architecture or output framing returns
   the plan for independent review.
+- 2026-08-28 — WU0 stopped without edits after Git 2.54.0 contradicted the
+  universal usage/framing assumption: `log` failures use exit 128, unresolved
+  rebase guidance is stdout-only, and successful continuation splits summary and
+  progress across streams. The plan now pins a command-specific triplet and
+  records native partial-env identity as a deliberate divergence. Re-review is
+  required before WU0 resumes.
+- 2026-08-28 — Bohr approved the command-specific framing delta. The separate
+  stdout/stderr/combined limits and raw shell diagnostic seam support Git's
+  observed stream split without changing `CommandResult.status()`; WU0 may
+  resume.
