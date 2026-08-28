@@ -46,8 +46,20 @@ const DEFAULT_ABBREV = 7;
 const DIFF_WINDOW_ROWS = 1000;
 const DIFF_REPOSITORY_BYTES = 8 * 1024 * 1024;
 const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
+const DIFF_PATH_BYTES = 2_200;
 
 export type { DiffOptions } from "./diff-internal.js";
+
+export interface DiffFormatOptions {
+  /** Apply Git's C-style path quoting in patch headers. */
+  quotePaths?: boolean;
+  /** Escape non-ASCII UTF-8 bytes as octal when paths are quoted. */
+  quoteNonAscii?: boolean;
+  /** Compare the index to the worktree, as plain `git diff` does. */
+  indexBase?: boolean;
+  /** Bound rendered UTF-8 bytes before appending them. */
+  maxOutputBytes?: number;
+}
 
 /** One side of a file's change; null means the file is absent there. */
 interface Endpoint {
@@ -69,12 +81,17 @@ export function diff(
   worktree: Worktree,
   options: DiffOptions = {},
   sparseWorkspace?: SparseWorkspaceSource,
+  formatOptions: DiffFormatOptions = {},
 ): string {
   const abbrev = options.abbrev ?? DEFAULT_ABBREV;
-  // Appended, not collected and joined: the parts array and the joined
-  // result are alive at the same instant, so joining doubles the patch.
-  let out = "";
-  for (const change of collect(repo, worktree, options, sparseWorkspace)) {
+  const out = new DiffOutput(formatOptions.maxOutputBytes);
+  for (const change of collect(
+    repo,
+    worktree,
+    options,
+    sparseWorkspace,
+    formatOptions.indexBase === true,
+  )) {
     const before = change.before;
     const after = change.after;
     if (
@@ -83,19 +100,24 @@ export function diff(
       before !== null &&
       after !== null
     ) {
-      let header = `diff --git a/${change.originalPath} b/${change.path}\n`;
+      let header =
+        `diff --git ${diffHeaderPath(change.originalPath, "a/", formatOptions)} ` +
+        `${diffHeaderPath(change.path, "b/", formatOptions)}\n`;
       if (before.mode !== after.mode) {
         header += `old mode ${before.mode}\nnew mode ${after.mode}\n`;
       }
-      out +=
-        `${header}similarity index ${change.similarity}%\n` +
-        `rename from ${change.originalPath}\nrename to ${change.path}\n`;
+      out.append(header);
+      out.append(`similarity index ${change.similarity}%\n`);
+      out.append(`rename from ${diffHeaderPath(change.originalPath, "", formatOptions)}\n`);
+      out.append(`rename to ${diffHeaderPath(change.path, "", formatOptions)}\n`);
       continue;
     }
-    const left = before === null ? "/dev/null" : `a/${change.path}`;
-    const right = after === null ? "/dev/null" : `b/${change.path}`;
+    const left = before === null ? "/dev/null" : diffHeaderPath(change.path, "a/", formatOptions);
+    const right = after === null ? "/dev/null" : diffHeaderPath(change.path, "b/", formatOptions);
 
-    let header = `diff --git a/${change.path} b/${change.path}\n`;
+    let header =
+      `diff --git ${diffHeaderPath(change.path, "a/", formatOptions)} ` +
+      `${diffHeaderPath(change.path, "b/", formatOptions)}\n`;
     let headerLines = 1;
     if (before === null && after !== null) {
       header += `new file mode ${after.mode}\n`;
@@ -119,13 +141,14 @@ export function diff(
     }
 
     if (oldOid === newOid) {
-      if (headerLines > 1) out += header;
+      if (headerLines > 1) out.append(header);
       continue;
     }
     const oldBytes = before === null ? new Uint8Array(0) : endpointBytes(before);
     const newBytes = after === null ? new Uint8Array(0) : endpointBytes(after);
     if (isBinary(oldBytes) || isBinary(newBytes)) {
-      out += `${header}Binary files ${left} and ${right} differ\n`;
+      out.append(header);
+      out.append(`Binary files ${left} and ${right} differ\n`);
       continue;
     }
     const text = diffText(utf8Decoder.decode(oldBytes), utf8Decoder.decode(newBytes), {
@@ -134,9 +157,150 @@ export function diff(
     if (text.hunks === "") {
       continue;
     }
-    out += `${header}--- ${left}\n+++ ${right}\n${text.hunks}`;
+    out.append(header);
+    out.append(`--- ${left}\n`);
+    out.append(`+++ ${right}\n`);
+    out.append(text.hunks);
   }
-  return out;
+  return out.finish();
+}
+
+class DiffOutput {
+  #bytes = 0;
+  #output = "";
+
+  constructor(private readonly maximum: number | undefined) {
+    if (maximum !== undefined && (!Number.isSafeInteger(maximum) || maximum < 0)) {
+      throw new GitError("EINVAL", "diff output ceiling must be a non-negative safe integer");
+    }
+  }
+
+  append(value: string): void {
+    if (value === "") return;
+    if (this.maximum !== undefined) {
+      const bytes = diffUtf8Bytes(value);
+      if (bytes > this.maximum - this.#bytes) {
+        throw new GitError("E2BIG", `diff output exceeds ${this.maximum} UTF-8 bytes`);
+      }
+      this.#bytes += bytes;
+    }
+    this.#output += value;
+  }
+
+  finish(): string {
+    return this.#output;
+  }
+}
+
+function diffUtf8Bytes(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) {
+        throw new GitError("EINVAL", "diff output must be well-formed UTF-16");
+      }
+      index++;
+      bytes += 4;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new GitError("EINVAL", "diff output must be well-formed UTF-16");
+    } else {
+      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3;
+    }
+    if (!Number.isSafeInteger(bytes)) throw new GitError("E2BIG", "diff output is too large");
+  }
+  return bytes;
+}
+
+/** Format one already-bounded repository path for a Git patch header. */
+export function diffHeaderPath(
+  path: string,
+  prefix: "" | "a/" | "b/",
+  options: DiffFormatOptions,
+): string {
+  if (options.quotePaths !== true) return `${prefix}${path}`;
+  const quoteNonAscii = options.quoteNonAscii ?? true;
+  if (typeof quoteNonAscii !== "boolean") {
+    throw new GitError("EINVAL", "diff quoteNonAscii must be a boolean");
+  }
+  validateDiffPath(path);
+  return quoteNonAscii ? quoteDiffUtf8(`${prefix}${path}`) : quoteDiffUnicode(`${prefix}${path}`);
+}
+
+function validateDiffPath(path: string): void {
+  let bytes = 0;
+  for (let index = 0; index < path.length; index++) {
+    const code = path.charCodeAt(index);
+    if (code === 0) throw new GitError("EINVAL", "diff path must not contain NUL");
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = path.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) {
+        throw new GitError("EINVAL", "diff path must be well-formed UTF-16");
+      }
+      index++;
+      bytes += 4;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new GitError("EINVAL", "diff path must be well-formed UTF-16");
+    } else {
+      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3;
+    }
+    if (bytes > DIFF_PATH_BYTES) {
+      throw new GitError("E2BIG", `diff path exceeds ${DIFF_PATH_BYTES} UTF-8 bytes`);
+    }
+  }
+}
+
+function quoteDiffUtf8(path: string): string {
+  let quoted = false;
+  let output = "";
+  for (const byte of utf8.encode(path)) {
+    const escaped = escapeDiffByte(byte);
+    if (escaped !== null) {
+      quoted = true;
+      output += escaped;
+    } else if (byte >= 0x80) {
+      quoted = true;
+      output += octalByte(byte);
+    } else {
+      output += String.fromCharCode(byte);
+    }
+  }
+  return quoted ? `"${output}"` : output;
+}
+
+function quoteDiffUnicode(path: string): string {
+  let quoted = false;
+  let output = "";
+  for (const character of path) {
+    const code = character.codePointAt(0);
+    if (code === undefined) throw new GitError("ECORRUPT", "diff path contains no code point");
+    const escaped = code < 0x80 ? escapeDiffByte(code) : null;
+    if (escaped === null) output += character;
+    else {
+      quoted = true;
+      output += escaped;
+    }
+  }
+  return quoted ? `"${output}"` : output;
+}
+
+function escapeDiffByte(byte: number): string | null {
+  if (byte === 0x07) return "\\a";
+  if (byte === 0x08) return "\\b";
+  if (byte === 0x09) return "\\t";
+  if (byte === 0x0a) return "\\n";
+  if (byte === 0x0b) return "\\v";
+  if (byte === 0x0c) return "\\f";
+  if (byte === 0x0d) return "\\r";
+  if (byte === 0x22) return '\\"';
+  if (byte === 0x5c) return "\\\\";
+  if (byte < 0x20 || byte === 0x7f) return octalByte(byte);
+  return null;
+}
+
+function octalByte(byte: number): string {
+  return `\\${byte.toString(8).padStart(3, "0")}`;
 }
 
 export function diffSummary(
@@ -191,8 +355,11 @@ function* collect(
   worktree: Worktree,
   options: DiffOptions,
   sparseWorkspace: SparseWorkspaceSource | undefined,
+  indexBase = false,
 ): Generator<FileChange> {
-  const sparse = boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
+  const sparse = indexBase
+    ? null
+    : boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
   if (sparse !== null) {
     yield* collectPendingChanges(
       repo,
@@ -205,12 +372,12 @@ function* collect(
   const classification = classifyDiffRenames(
     repo,
     options,
-    pendingChanges(repo, worktree, options, true),
+    pendingChanges(repo, worktree, options, true, indexBase),
   );
   yield* collectPendingChanges(
     repo,
     worktree,
-    pendingChanges(repo, worktree, options),
+    pendingChanges(repo, worktree, options, false, indexBase),
     classification,
   );
 }
@@ -292,7 +459,12 @@ function* pendingChanges(
   worktree: Worktree,
   options: DiffOptions,
   renameCandidatesOnly = false,
+  indexBase = false,
 ): Generator<PendingChange> {
+  if (indexBase) {
+    yield* indexWorktreeChanges(repo, worktree, options, renameCandidatesOnly);
+    return;
+  }
   const fromTreeOid = resolveFrom(repo, options);
   const byPath = { left: (entry: TargetEntry) => entry.path };
 
@@ -355,6 +527,52 @@ function* pendingChanges(
     }
   }
   yield* resolveWorkingCandidateIdentities(repo, worktree, candidates, false, renameCandidatesOnly);
+}
+
+function* indexWorktreeChanges(
+  repo: Repository,
+  worktree: Worktree,
+  options: DiffOptions,
+  renameCandidatesOnly: boolean,
+): Generator<PendingChange> {
+  const candidates: WorkingCandidate[] = [];
+  for (const row of joinSorted(
+    stageZero(repo.checkout.indexScan()),
+    walkWorktreeEntriesStream(
+      worktree,
+      repo.root,
+      options.paths === undefined || options.paths.length === 0
+        ? { filesOnly: true }
+        : { paths: options.paths },
+    ),
+    { left: (entry) => entry.path, right: (entry) => entry.path },
+  )) {
+    const index = row.left;
+    if (index === undefined || index.mode === 0o160000 || !matchesPaths(row.path, options.paths)) {
+      continue;
+    }
+    const worktreeEntry = row.right;
+    candidates.push({
+      path: row.path,
+      before: indexTarget(index),
+      index,
+      worktree: worktreeEntry,
+    });
+    if (candidates.length >= DIFF_WINDOW_ROWS) {
+      yield* resolveWorkingCandidateIdentities(
+        repo,
+        worktree,
+        candidates,
+        false,
+        renameCandidatesOnly,
+      );
+    }
+  }
+  yield* resolveWorkingCandidateIdentities(repo, worktree, candidates, false, renameCandidatesOnly);
+}
+
+function indexTarget(entry: IndexEntry): TargetEntry {
+  return { path: entry.path, mode: entry.mode.toString(8).padStart(6, "0"), oid: entry.oid };
 }
 
 function* resolveWorkingCandidateIdentities(

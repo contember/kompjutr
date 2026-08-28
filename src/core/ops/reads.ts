@@ -14,6 +14,8 @@ import {
 import type { Repository } from "../repository.js";
 import { compileReadPathspec, type LsFilesOptions } from "./pathspec.js";
 
+const LINEAR_RANGE_ERROR = "log range is not a complete single-parent chain";
+
 /** Matches `CommitView` on Computer's GitClient surface. */
 export interface CommitView {
   oid: string;
@@ -79,6 +81,41 @@ export function log(
     if (options.depth !== undefined && out.length >= options.depth) break;
   }
   return out;
+}
+
+/**
+ * Read the right side of a range only when it reaches the exclusive left tip
+ * through a complete single-parent chain.
+ */
+export function linearLogRange(
+  repo: Repository,
+  left: string,
+  right: string,
+  depth?: number,
+): CommitView[] {
+  const leftOid = repo.peel(repo.revParse(left));
+  const rightOid = repo.peel(repo.revParse(right));
+  if (leftOid === rightOid) return [];
+
+  const boundary = repo.shallow();
+  const out: CommitView[] = [];
+  let expected = rightOid;
+  for (const entry of repo.walkIndexed(rightOid)) {
+    if (entry.oid !== expected) throw unsupportedLinearRange();
+    if (entry.oid === leftOid) return out;
+    if (boundary.has(entry.oid) || entry.commit.parent.length !== 1) {
+      throw unsupportedLinearRange();
+    }
+    if (depth === undefined || out.length < depth) {
+      out.push(parsedCommitView(entry.oid, entry.commit));
+    }
+    expected = entry.commit.parent[0]!;
+  }
+  throw unsupportedLinearRange();
+}
+
+function unsupportedLinearRange(): GitError {
+  return new GitError("EUNSUPPORTED", LINEAR_RANGE_ERROR);
 }
 
 export function show(repo: Repository, ref: string): CommitView {
