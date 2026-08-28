@@ -319,7 +319,7 @@ describe("push and pull concurrency", () => {
   });
 
   it("does not publish an unreadable tip observed after confirmed push success", async () => {
-    const { fixture } = remoteFixture();
+    const { fixture, initial } = remoteFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
     const response = bufferedHttpResponseBarrier(fetchHttpClient, {
@@ -345,10 +345,13 @@ describe("push and pull concurrency", () => {
       expect(repo.has(unknown)).toBe(false);
 
       response.release();
-      await expect(pushing).resolves.toMatchObject({ ok: true });
+      await expect(pushing).resolves.toMatchObject({
+        ok: true,
+        tracking: { outcome: "deferred" },
+      });
 
       expect(fixture.git("rev-parse", "main")).toBe(unknown);
-      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(pushed);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
       assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
     } finally {
       response.release();
@@ -388,10 +391,13 @@ describe("push and pull concurrency", () => {
       corruptLooseObject(cold.repo, candidate);
 
       response.release();
-      await expect(pushing).resolves.toMatchObject({ ok: true });
+      await expect(pushing).resolves.toMatchObject({
+        ok: true,
+        tracking: { outcome: "deferred" },
+      });
 
       expect(fixture.git("rev-parse", "main")).toBe(candidate);
-      expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBe(pushed);
+      expect(cold.repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
       expect(cold.repo.readCommit(pushed).message).toContain("pushed before corrupt tip");
       cold.repo.store.db.run(
         "DELETE FROM git_commits WHERE repo_id = ? AND oid = ?",
@@ -539,12 +545,27 @@ describe("push and pull concurrency", () => {
         const losingPush = order === "left-first" ? rightPush : leftPush;
         const losingBarrier = order === "left-first" ? rightPost.barrier : leftPost.barrier;
         winningBarrier.release();
-        await expect(winningPush).resolves.toMatchObject({ ok: true });
+        await expect(winningPush).resolves.toMatchObject({
+          ok: true,
+          tracking: { outcome: order === "left-first" ? "stale" : "updated" },
+        });
         losingBarrier.release();
-        await expect(losingPush).rejects.toMatchObject({ code: "EPUSHREJECTED" });
+        await expect(losingPush).resolves.toMatchObject({
+          ok: false,
+          refs: [
+            {
+              ref: "refs/heads/main",
+              ok: false,
+              error: "incorrect old value provided",
+            },
+          ],
+          tracking: { outcome: "not-applicable" },
+        });
 
         expect(fixture.git("rev-parse", "main")).toBe(winner);
-        expect(repo.store.getRef("refs/remotes/origin/main")).toBe(winner);
+        expect(repo.store.getRef("refs/remotes/origin/main")).toBe(
+          order === "left-first" ? initial : winner,
+        );
         expect(repo.head()).toEqual(head);
         expect(repo.checkout.indexEntries()).toEqual(index);
         expect(repo.checkout.readOperationState()).toEqual(journal);
