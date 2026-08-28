@@ -123,6 +123,15 @@ log hint only tightens an absent or larger argv count; it never changes other
 commands. `Git.cli()` uses the intrinsic defaults. `createGitCommand()` supplies
 destination-derived ceilings, discard policy, and the shell demand hint.
 
+Resolved run options are also passed to command handlers. A mutating handler
+must run the native operation, format its success result, and apply the output
+preflight inside one outer database transaction. Any exception escapes that
+transaction before expected Git-domain errors are mapped; storage caches are
+then revalidated after rollback. The dispatcher repeats the output check as
+defense in depth. This preserves the public runner signature while making
+destination-specific `E2BIG` failures atomic. →
+[ADR 0016](../decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)
+
 ## Work units
 
 ### WU0 — Pin argv, cwd, formatting, and exit contracts (effort S)
@@ -234,7 +243,9 @@ the existing complete-source `resolveIdentity()` precedence recorded in
   count/bytes,
   stdin bytes, commit-message bytes, formatted records, and combined stdout/
   stderr bytes before returning. The native async method and shell adapter will
-  receive the same runner, not reparse argv.
+  receive the same runner, not reparse argv. Pass the resolved run options to
+  handlers so mutations can preflight their formatted result before commit; the
+  public runner signature does not change.
 - **Acceptance / witness.** Table tests prove exact bounds, invalid runtime
   types, duplicate/mutually exclusive flags, missing values, unsupported
   subcommands/options, network refusal, cwd outside a checkout, and stable
@@ -273,14 +284,17 @@ the existing complete-source `resolveIdentity()` precedence recorded in
 - **Scope.** Implement bounded add, one-message commit with env identity, and
   rebase continue/abort through existing transactional operations. Preserve
   nested-checkout exclusion, operation ownership, conflict stages, reflog
-  causality, and rollback. Do not add a second mutation implementation.
+  causality, and rollback. Use the ADR 0016 wrapper so mutation, formatting, and
+  output preflight share one outer transaction; map expected errors only after
+  rollback and cache revalidation. Do not add a second mutation implementation.
 - **Acceptance / witness.** Differential tests cover ordinary add/commit, env
   identity and its deliberate partial-env divergence, empty/missing message,
   missing path, unmerged refusal, conflicted rebase resolution via `add` plus
   `rebase --continue`, abort after reopen, and unchanged public state after every
-  rejected argv. Rebase witnesses compare the exact Git stream split: unresolved
-  guidance is stdout-only, while successful continuation emits the commit summary
-  on stdout and progress/success on stderr. Run
+  rejected argv or stdout/stderr/combined output overflow. Rebase witnesses
+  compare the exact Git stream split: unresolved guidance is stdout-only, while
+  successful continuation emits the commit summary on stdout and progress/success
+  on stderr. Run
   `npx vitest run tests/git-cli-parity.test.ts -t "add|commit|rebase"` and the
   matching focused E2E rebase case.
 - **Touch points.** `src/git/cli/write.ts`, `tests/git-cli-parity.test.ts`,
@@ -410,6 +424,9 @@ The label summarizes the gate; the concrete witness and escalation rule bind it.
   implements narrow `GitCliRunner.runCli()`; async client methods wrap the same
   runner, and `createGitCommand(workspace.git)` invokes it directly. → ADR 0015
   in WU0.
+- Mutating CLI handlers receive resolved run options and preflight their result
+  inside the same outer database transaction as the native operation; expected
+  failures are mapped only after rollback and cache revalidation. → ADR 0016.
 - Git may import shell command types in the dedicated adapter entry. Shell never
   imports Git, and the root entry does not silently install the command.
 - `lsFiles()` defaults remain cached-only. Worktree selection is explicit and
@@ -487,3 +504,9 @@ catches every cross-layer wiring failure.
   non-linear ranges, identity precedence, network refusal, commit failures and
   rebase stream splits are pinned above. The runner architecture is unchanged.
   → [ADR 0015](../decisions/0015-route-git-argv-through-one-synchronous-runner.md)
+- 2026-08-28 — WU4 stopped before edits because the WU2 kernel applied caller
+  output ceilings only after a mutating handler returned. The corrected seam
+  passes resolved limits to handlers and requires mutation, result formatting,
+  and preflight inside one outer transaction; the public runner stays unchanged.
+  Independent plan-delta review is required before WU4 resumes. →
+  [ADR 0016](../decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)

@@ -28,3 +28,4 @@ a commit message suffices.
 - [0013 — Publish clones through provisional ownership](0013-publish-clones-through-provisional-ownership.md) — accepted (2026-08-28)
 - [0014 — Make an optionless clone complete](0014-default-clone-is-complete.md) — accepted (2026-08-28)
 - [0015 — Route Git argv through one synchronous runner](0015-route-git-argv-through-one-synchronous-runner.md) — accepted (2026-08-28)
+- [0016 — Preflight mutating CLI output inside the transaction](0016-preflight-mutating-cli-output-inside-the-transaction.md) — proposed (2026-08-28)

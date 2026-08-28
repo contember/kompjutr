@@ -55,6 +55,7 @@ decisions → reference → archive.
 - [`decisions/0013-publish-clones-through-provisional-ownership.md`](decisions/0013-publish-clones-through-provisional-ownership.md)
 - [`decisions/0014-default-clone-is-complete.md`](decisions/0014-default-clone-is-complete.md)
 - [`decisions/0015-route-git-argv-through-one-synchronous-runner.md`](decisions/0015-route-git-argv-through-one-synchronous-runner.md)
+- [`decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md`](decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)
 
 ## Historical records
 
