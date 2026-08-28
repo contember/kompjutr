@@ -2278,8 +2278,8 @@ describe("pack deferred resolution", () => {
     const boundary = await measure(990);
     const overBoundary = await measure(991);
     const wide = await measure(3_293);
-    expect(small).toBe(20);
-    expect(large).toBe(20);
+    expect(small).toBe(19);
+    expect(large).toBe(19);
     expect(boundary).toBeLessThanOrEqual(28);
     expect(overBoundary).toBeLessThanOrEqual(28);
     expect(wide).toBeLessThanOrEqual(33);
