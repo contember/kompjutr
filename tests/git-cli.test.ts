@@ -23,6 +23,7 @@ import {
   type ParsedGitCliCommand,
   parseGitCliCommand,
   parseGitCliInput,
+  type ResolvedGitCliRunOptions,
   resolveGitCliRunOptions,
   validateGitCliInput,
 } from "../src/git/cli/index.js";
@@ -590,7 +591,7 @@ describe("git CLI result accounting and dispatch", () => {
     let seenCwd = "";
     let seenCount: number | undefined;
     const runner = createGitCliRunner({
-      log(invocation) {
+      log(invocation, _options) {
         seenCwd = invocation.cwd;
         seenCount = invocation.command.count;
         return gitCliResult(invocation.env.GIT_AUTHOR_NAME ?? "", "", 0);
@@ -613,14 +614,119 @@ describe("git CLI result accounting and dispatch", () => {
     expect(seenCount).toBe(2);
   });
 
+  it("passes exact resolved defaults and overrides to every handler", () => {
+    const seen: Array<{ command: string; options: ResolvedGitCliRunOptions }> = [];
+    function record(command: string, options: ResolvedGitCliRunOptions): GitCliResult {
+      seen.push({ command, options });
+      return gitCliResult("", "", 0);
+    }
+    const runner = createGitCliRunner({
+      status(_invocation, options) {
+        return record("status", options);
+      },
+      diff(_invocation, options) {
+        return record("diff", options);
+      },
+      log(_invocation, options) {
+        return record("log", options);
+      },
+      revList(_invocation, options) {
+        return record("rev-list", options);
+      },
+      symbolicRef(_invocation, options) {
+        return record("symbolic-ref", options);
+      },
+      add(_invocation, options) {
+        return record("add", options);
+      },
+      commit(_invocation, options) {
+        return record("commit", options);
+      },
+      rebase(_invocation, options) {
+        return record("rebase", options);
+      },
+    });
+    const commands = [
+      ["status", "--porcelain"],
+      ["diff"],
+      ["log"],
+      ["rev-list", "--count", "main..HEAD"],
+      ["symbolic-ref", "--short", "HEAD"],
+      ["add", "file"],
+      ["commit", "-m", "message"],
+      ["rebase", "--abort"],
+    ];
+    const defaults = resolveGitCliRunOptions(undefined);
+    for (const argv of commands) runner.runCli({ argv });
+    expect(seen).toEqual(
+      commands.map((argv) => ({
+        command: argv[0],
+        options: defaults,
+      })),
+    );
+
+    const overrides = {
+      maxStdoutBytes: 7,
+      maxStderrBytes: 8,
+      maxCombinedOutputBytes: 9,
+      discardStderr: true,
+      logLimitHint: 2,
+    };
+    const resolvedOverrides = resolveGitCliRunOptions(overrides);
+    for (const argv of commands) runner.runCli({ argv }, overrides);
+    expect(seen.slice(commands.length)).toEqual(
+      commands.map((argv) => ({
+        command: argv[0],
+        options: resolvedOverrides,
+      })),
+    );
+
+    const calls = seen.length;
+    for (const argv of [
+      ["status"],
+      ["diff", "--"],
+      ["log", "-n", "bad"],
+      ["rev-list", "HEAD"],
+      ["symbolic-ref", "HEAD"],
+      ["add", ":file"],
+      ["commit", "-m"],
+      ["rebase", "--skip"],
+      ["push"],
+      ["unknown"],
+    ]) {
+      runner.runCli({ argv });
+    }
+    expect(seen).toHaveLength(calls);
+  });
+
+  it("freezes handler options and preserves the caller ceiling", () => {
+    let frozen = false;
+    let changed = true;
+    const runner = createGitCliRunner({
+      status(_invocation, options) {
+        frozen = Object.isFrozen(options);
+        changed = Reflect.set(options, "maxStdoutBytes", 2);
+        return gitCliResult("xx", "", 0);
+      },
+    });
+    expect(() =>
+      runner.runCli(
+        { argv: ["status", "--porcelain"] },
+        { maxStdoutBytes: 1, maxCombinedOutputBytes: 1 },
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(frozen).toBe(true);
+    expect(changed).toBe(false);
+  });
+
   it("returns every parser refusal without invoking an operation", () => {
     let calls = 0;
     const handlers: GitCliHandlers = {
-      status() {
+      status(_invocation, _options) {
         calls++;
         return gitCliResult("unexpected", "", 0);
       },
-      add() {
+      add(_invocation, _options) {
         calls++;
         return gitCliResult("unexpected", "", 0);
       },

@@ -8,6 +8,7 @@ import type {
   GitCliRunner,
   GitCliRunOptions,
   ParsedGitCliCommand,
+  ResolvedGitCliRunOptions,
 } from "./types.js";
 
 export * from "./parse.js";
@@ -19,10 +20,10 @@ export function runGitCli(
   handlers: GitCliHandlers,
   options?: GitCliRunOptions,
 ): GitCliResult {
-  const resolved = resolveGitCliRunOptions(options);
+  const resolved = Object.freeze(resolveGitCliRunOptions(options));
   const parsed = parseGitCliInput(input, resolved.logLimitHint);
   if (!parsed.ok) return boundedGitCliResult(parsed.result, resolved);
-  return boundedGitCliResult(dispatch(parsed.invocation, handlers), resolved);
+  return boundedGitCliResult(dispatch(parsed.invocation, handlers, resolved), resolved);
 }
 
 export function createGitCliRunner(handlers: GitCliHandlers): GitCliRunner {
@@ -33,39 +34,66 @@ export function createGitCliRunner(handlers: GitCliHandlers): GitCliRunner {
   };
 }
 
-function dispatch(invocation: GitCliInvocation, handlers: GitCliHandlers): GitCliResult {
+function dispatch(
+  invocation: GitCliInvocation,
+  handlers: GitCliHandlers,
+  options: ResolvedGitCliRunOptions,
+): GitCliResult {
   const command = invocation.command;
   if (command.kind === "status") {
-    return requireHandler(handlers.status, command.kind)(specificInvocation(invocation, command));
+    return requireHandler(handlers.status, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
   if (command.kind === "diff") {
-    return requireHandler(handlers.diff, command.kind)(specificInvocation(invocation, command));
+    return requireHandler(handlers.diff, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
   if (command.kind === "log") {
-    return requireHandler(handlers.log, command.kind)(specificInvocation(invocation, command));
+    return requireHandler(handlers.log, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
   if (command.kind === "rev-list") {
-    return requireHandler(handlers.revList, command.kind)(specificInvocation(invocation, command));
+    return requireHandler(handlers.revList, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
   if (command.kind === "symbolic-ref") {
-    return requireHandler(
-      handlers.symbolicRef,
-      command.kind,
-    )(specificInvocation(invocation, command));
+    return requireHandler(handlers.symbolicRef, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
   if (command.kind === "add") {
-    return requireHandler(handlers.add, command.kind)(specificInvocation(invocation, command));
+    return requireHandler(handlers.add, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
   if (command.kind === "commit") {
-    return requireHandler(handlers.commit, command.kind)(specificInvocation(invocation, command));
+    return requireHandler(handlers.commit, command.kind)(
+      specificInvocation(invocation, command),
+      options,
+    );
   }
-  return requireHandler(handlers.rebase, command.kind)(specificInvocation(invocation, command));
+  return requireHandler(handlers.rebase, command.kind)(
+    specificInvocation(invocation, command),
+    options,
+  );
 }
 
 function requireHandler<Command extends ParsedGitCliCommand>(
-  handler: ((invocation: GitCliInvocation<Command>) => GitCliResult) | undefined,
+  handler:
+    | ((invocation: GitCliInvocation<Command>, options: ResolvedGitCliRunOptions) => GitCliResult)
+    | undefined,
   command: string,
-): (invocation: GitCliInvocation<Command>) => GitCliResult {
+): (invocation: GitCliInvocation<Command>, options: ResolvedGitCliRunOptions) => GitCliResult {
   if (handler === undefined) throw new Error(`missing git CLI handler for ${command}`);
   return handler;
 }

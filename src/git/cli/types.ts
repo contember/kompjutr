@@ -120,6 +120,7 @@ export interface GitCliInvocation<Command extends ParsedGitCliCommand = ParsedGi
 
 export type GitCliCommandHandler<Command extends ParsedGitCliCommand> = (
   invocation: GitCliInvocation<Command>,
+  options: ResolvedGitCliRunOptions,
 ) => GitCliResult;
 
 export interface GitCliHandlers {
