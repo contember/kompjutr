@@ -6,9 +6,11 @@ blocked-by: []
 
 # 46 — Complete `rev-parse` revision syntax
 
-**Summary.** Tier B. `revParse()` resolves refs, oids and `~`/`^` chains only.
+**Summary.** Tier A. `revParse()` resolves refs, oids and `~`/`^` chains only.
 Peeling to a type, reading a path out of a revision, and asking whether a
-revision exists have no spelling.
+revision exists have no spelling. The orchestrator issues all three on its
+checkpoint path: `<snap>^{tree}`, `--verify --quiet <snap>^{commit}`, and
+`HEAD:<lockfile>`.
 
 ## Problem
 

@@ -7,7 +7,9 @@ blocked-by: []
 # 36 — Support glob pathspecs
 
 **Summary.** Tier A (missing capability). Every pathspec is an exact path or a
-directory prefix, so `add("*.ts")` matches nothing.
+directory prefix, so `add("*.ts")` matches nothing. The project builder lists
+files with `ls-files -- '<dir>/*-<hash>.svg'`, so `lsFiles` is the first
+command that needs it.
 
 ## Problem
 

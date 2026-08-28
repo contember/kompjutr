@@ -7,7 +7,9 @@ blocked-by: []
 # 41 — Add partial clone with lazy blob backfill
 
 **Summary.** Tier A. `clone()` cannot omit blobs, so first contact with a
-repository costs every byte its history ever held.
+repository costs every byte its history ever held. Scale, not a correctness
+gate: both consumers clone blobless by default, but `depth: 0` runs their
+workflow today, so this lands after the integration gate.
 
 ## Problem
 

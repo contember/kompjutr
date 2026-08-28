@@ -31,17 +31,17 @@ not effort: a wrong answer outranks a missing one.
   [42](42-remote-ref-discovery-and-refspec-fetch.md) ·
   [43](43-index-and-object-write-plumbing.md) ·
   [44](44-patch-interchange.md) ·
+  [46](46-rev-parse-revision-syntax.md) ·
   [06](06-stash-operations.md) ·
+  [08](08-extend-push-refspecs.md) ·
   [18](18-branch-and-remote-management.md) ·
   [28](28-pull-rebase.md)
 - **B — real gap, narrower audience or a workaround exists.**
-  [08](08-extend-push-refspecs.md) ·
   [13](13-force-with-lease.md) ·
   [25](25-rebase-targets-and-roots.md) ·
   [26](26-interactive-rebase.md) ·
   [27](27-rebase-merges.md) ·
-  [29](29-rebase-update-refs.md) ·
-  [46](46-rev-parse-revision-syntax.md)
+  [29](29-rebase-update-refs.md)
 - **C — deliberately out of scope.** Not filed: `bisect`, `blame`, `describe`,
   `shortlog`, `grep`, `archive`, `bundle`, `am`/`format-patch`, submodules,
   notes, hooks, signing, credential helpers, LFS, `.gitattributes` filters,
@@ -50,6 +50,53 @@ not effort: a wrong answer outranks a missing one.
   the [reference workload](../reference/git-support.md#reference-workload-coverage)
   and are tracked in [44](44-patch-interchange.md) and
   [42](42-remote-ref-discovery-and-refspec-fetch.md).
+- **Not a parity gap.** [60](60-consolidate-limits-and-split-store.md) is
+  cleanup: no new behaviour, no new surface.
+
+## Consumer demand
+
+Two internal consumers define what "usable" means. Both run Git today as a
+shell binary inside a container sandbox; kompjutr replaces that once the sandbox
+is a Durable Object. Neither is wired to this package yet, so their call sites —
+not this backlog — are the acceptance test. Their names stay out of this public
+repository.
+
+- **The agent-session orchestrator** — the
+  [reference workload](../reference/git-support.md#the-reference-workload):
+  clone, one checkout per session, a snapshot of uncommitted work after every
+  agent turn, checkpoint refs mirrored to the remote, publish by fast-forward,
+  rebase onto the trunk, restore after a sandbox loss. A second orchestrator
+  issues a strict subset of the same calls (no checkpoints, no throwaway index).
+- **The project builder** — a smaller shape: blobless clone by branch, `init`,
+  `branch -m`, `add <path>`, `commit --allow-empty`, `remote remove` + `add`,
+  `push origin <branch> [--force]`, and
+  `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'`.
+
+What they issue that the surface still lacks, and the item that closes it:
+
+| Call | Issued by | Item |
+|---|---|---|
+| `read-tree` / `write-tree` / `commit-tree` under a throwaway index | orchestrator | [43](43-index-and-object-write-plumbing.md) — active sprint |
+| `diff --binary --full-index <snap>^1 <snap>` → `apply --3way --cached` → `write-tree` | orchestrator | [44](44-patch-interchange.md) — re-scoped to an index-only three-way replay; the patch format is deferred |
+| `update-ref <ref> <new> <old>`, `merge-base`, `ls-tree -r` | orchestrator | [39](39-plumbing-read-surface.md) — required subset |
+| `rev-parse <rev>^{tree}`, `<rev>^{commit}`, `<rev>:<path>`, `--verify --quiet` | orchestrator | [46](46-rev-parse-revision-syntax.md) |
+| `ls-remote`, `fetch origin '+refs/checkpoints/*:refs/checkpoints/*'` | orchestrator | [42](42-remote-ref-discovery-and-refspec-fetch.md) |
+| one atomic push of a branch plus a `refs/checkpoints/*` ref; batch delete of mirror refs | orchestrator | [08](08-extend-push-refspecs.md) |
+| a full-history clone that later runs `merge-base`, `rebase`, `rev-list --count` | both | [38](38-clone-depth-and-deepening.md) — the default only; deepening is deferred |
+| `branch -m`, `remote set-url` | both | [18](18-branch-and-remote-management.md) — required subset |
+| `ls-files -- '<dir>/*-<hash>.svg'` | builder | [36](36-glob-pathspecs.md) |
+| `clone --filter=blob:none` | both | [41](41-partial-clone.md) — scale, not a correctness gate; `depth: 0` serves the workflow today |
+
+Everything else both consumers issue is served, or routes through another
+spelling listed under
+[reference workload coverage](../reference/git-support.md#reference-workload-coverage).
+
+**Open decision, not filed.** Inside the sandbox the agent runs `git` as a
+shell command — `status --short`, `add`, `commit -m`, `log`, `diff`,
+`rebase --continue`. `cli()` throws `EUNSUPPORTED` and `kompjutr/shell` has no
+Git command. Someone owns an argv-to-typed adapter for that subset — this
+package or the consumer — before an agent can work inside a Durable Object
+checkout. Decide before the integration gate; file it where it lands.
 
 ## Sprint plan
 
@@ -58,30 +105,36 @@ exists once its file lands in [`../sprints/`](../sprints/). Every scheduled item
 belongs to exactly one sprint. A sprint is *normal* (roughly four to six work
 units) or *long* (roughly seven to ten); an item whose acceptance scope exceeds
 one work unit is split at the WU level inside its own sprint, never across two.
-A blocked item must not move ahead of its blocker. Re-evaluate after each sprint
-as production evidence arrives.
+A blocked item must not move ahead of its blocker.
+
+**Phase 1** closes every row of the table above and ends at an integration gate:
+one consumer adapter runs its real workflow against the package, and everything
+below the gate is re-planned from what that run finds. **Phase 2** is production
+scale. **Phase 3** is Git parity that no consumer issues; it stays filed and
+unscheduled until a caller appears.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
-| 1 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | First reference-workload gap: a scratch index plus `readTree`, `writeTree` and `commitTree` over the existing bounded tree builder. |
-| 2 | Patch interchange | [44](44-patch-interchange.md) | long | Two halves — `--binary` and `--full-index` in the writer, then a new parser and `apply --3way` over the existing three-way engine. |
-| 3 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Fetch and push share the refspec type and its validation, so one sprint defines it in a seam unit first. |
-| 4 | Workload plumbing and revision reads | [39](39-plumbing-read-surface.md), [46](46-rev-parse-revision-syntax.md) | long | Both close gaps issued by the reference workload. Together they sit at the upper bound of a long sprint; 39 provides guarded ref updates and bounded reads, while 46 provides revision and path resolution. |
-| 5 | Clone shape | [38](38-clone-depth-and-deepening.md), [41](41-partial-clone.md) | long | Both change the clone contract and both need an ADR. 41 additionally introduces a promisor object state every read path must honour. |
-| 6 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | Runs after 43 and 41 add the planned index and promisor storage shapes; concurrency and restart qualification is complete. |
-| 7 | Everyday reads and pathspecs | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md), [36](36-glob-pathspecs.md) | long | 36 reuses the existing compiled matcher seam. Together the staged diff, two history reads, and cross-command matcher fill a long sprint. |
-| 8 | Network operation safety | [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Both harden network operations after the fetch, push, clone, and promisor contracts have settled: 13 protects remote refs, while 15 protects local state and resources during cancellation. |
-| 9 | Stash operations | [06](06-stash-operations.md) | normal | A self-contained daily workflow over the existing merge engine and operation journal, without a dependency on the network-safety work. |
-| 10 | Branch and remote management | [18](18-branch-and-remote-management.md) | normal | Follows the refspec work so branch, remote, URL, upstream, and tracking-ref management build on the settled transport configuration. |
-| 11 | Rebase extensions I | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | All three write to the planner and the lifecycle, so they run as sequential work units rather than in parallel. |
-| 12 | Interactive rebase | [26](26-interactive-rebase.md) | long | Lands after the explicit-target work so its todo model builds on the settled planner and lifecycle. Bounded todo editing and autosquash remain one focused unit. |
-| 13 | Rebase merge topology | [27](27-rebase-merges.md) | long | Hardest of the rebase family; scheduled after sprints 11 and 12 so topology work lands on the settled planner and journal model. |
-| 14 | Gitlink conflicts | [58](58-materialize-gitlink-conflicts.md) | normal | The current behaviour fails loudly and no reference workload needs the missing materialisation, so it stays behind the common and evidence-backed workflows. |
-| — | Unscheduled | [09](09-outbound-delta-compression.md) | — | Optimization deferred until a concrete workload justifies it. |
-| — | Unscheduled | [59](59-byte-preserving-git-paths.md) | — | The current UTF-8 boundary fails closed. Widen the public path model only when a concrete non-UTF-8 workload justifies the cross-cutting migration. |
-
-The sequence now starts with the first reference-workload gap after the runtime
-qualification sprints.
+| **Phase 1 — a consumer can run** | | | | |
+| 1 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | Active. The snapshot of uncommitted work after every agent turn. |
+| 2 | Snapshot replay and guarded refs | [44](44-patch-interchange.md), [39](39-plumbing-read-surface.md) (required subset), [46](46-rev-parse-revision-syntax.md) | normal | The rest of the checkpoint cycle: replay the snapshot tree onto the rebased tip through the scratch index from 43, publish the result with compare-and-swap, and resolve the peel and path spellings the probes use. |
+| 3 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Checkpoint refs out (atomic multi-ref push, batch delete) and back in (`ls-remote`, wildcard fetch). One seam unit defines the refspec type for both. |
+| 4 | First-contact defaults | [38](38-clone-depth-and-deepening.md) (default + ADR), [18](18-branch-and-remote-management.md) (required subset), [36](36-glob-pathspecs.md) | normal | Small items both consumers hit on first use: a full clone by default, `branch -m`, a glob pathspec for `lsFiles`. |
+| — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
+| **Cleanup** | | | | |
+| 5 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
+| **Phase 2 — production scale** | | | | |
+| 6 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
+| 7 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 8 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| **Phase 3 — parity without a caller (unscheduled)** | | | | |
+| — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
+| — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
+| — | Rebase extensions | [25](25-rebase-targets-and-roots.md), [28](28-pull-rebase.md), [29](29-rebase-update-refs.md) | long | Both consumers issue `rebase <upstream>` and nothing else. |
+| — | Interactive rebase | [26](26-interactive-rebase.md) | long | |
+| — | Rebase merge topology | [27](27-rebase-merges.md) | long | |
+| — | Branch and remote management, rest | [18](18-branch-and-remote-management.md) (rest) | normal | Upstream set/unset, remote rename, separate push URLs. |
+| — | Gitlink conflicts, delta compression, byte paths | [58](58-materialize-gitlink-conflicts.md), [09](09-outbound-delta-compression.md), [59](59-byte-preserving-git-paths.md) | — | Fail closed today; widen only with a concrete workload. |
 
 Do not merge 26 and 27 into one sprint. They are two independent extra-large
 units over the same files, and a long sprint does not make that safe.
@@ -108,7 +161,8 @@ units over the same files, and a long sprint does not make that safe.
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [42 — Add remote ref discovery and refspec fetch](42-remote-ref-discovery-and-refspec-fetch.md)
 - [43 — Add index and object write plumbing](43-index-and-object-write-plumbing.md)
-- [44 — Add patch interchange — apply, and appliable diff output](44-patch-interchange.md)
+- [44 — Replay a snapshot onto a new tip; patch interchange deferred](44-patch-interchange.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
+- [60 — Consolidate operation limits and split the store](60-consolidate-limits-and-split-store.md)

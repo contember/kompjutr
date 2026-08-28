@@ -24,6 +24,9 @@ decisions → reference → archive.
      If everything is "hot", nothing is. -->
 - Index and object write plumbing is active. It adds bounded scratch indexes and
   tree/commit construction for the reference snapshot workload.
+- The backlog plan is gated on a consumer: Phase 1 closes the calls two internal
+  consumers issue, then one adapter runs end to end before anything else is
+  scheduled — [`backlog/README.md`](backlog/README.md#consumer-demand).
 
 ## Key reference
 
