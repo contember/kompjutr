@@ -127,9 +127,12 @@ Resolved run options are also passed to command handlers. A mutating handler
 must run the native operation, format its success result, and apply the output
 preflight inside one outer database transaction. Any exception escapes that
 transaction before expected Git-domain errors are mapped; storage caches are
-then revalidated after rollback. The dispatcher repeats the output check as
-defense in depth. This preserves the public runner signature while making
-destination-specific `E2BIG` failures atomic. →
+then revalidated after rollback. Only native-operation errors may enter domain
+mapping; formatting and preflight errors are rethrown unchanged. A command that
+mutates the worktree first proves `context.worktree.db === repo.store.db` and
+fails closed without transaction affinity. The dispatcher repeats the output
+check as defense in depth. This preserves the public runner signature while
+making destination-specific `E2BIG` failures atomic. →
 [ADR 0016](../decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)
 
 ## Work units
@@ -286,7 +289,9 @@ the existing complete-source `resolveIdentity()` precedence recorded in
   nested-checkout exclusion, operation ownership, conflict stages, reflog
   causality, and rollback. Use the ADR 0016 wrapper so mutation, formatting, and
   output preflight share one outer transaction; map expected errors only after
-  rollback and cache revalidation. Do not add a second mutation implementation.
+  rollback and cache revalidation, and only when they came from the native-op
+  phase. Prove worktree/database transaction affinity before continue or abort.
+  Do not add a second mutation implementation.
 - **Acceptance / witness.** Differential tests cover ordinary add/commit, env
   identity and its deliberate partial-env divergence, empty/missing message,
   missing path, unmerged refusal, conflicted rebase resolution via `add` plus
@@ -294,7 +299,13 @@ the existing complete-source `resolveIdentity()` precedence recorded in
   rejected argv or stdout/stderr/combined output overflow. Rebase witnesses
   compare the exact Git stream split: unresolved guidance is stdout-only, while
   successful continuation emits the commit summary on stdout and progress/success
-  on stderr. Run
+  on stderr. Overflow remains a thrown `E2BIG`, not an exit triplet. Direct
+  rollback witnesses cover the native and Computer worktrees; after reopen they
+  prove the worktree, index, refs, reflog, operation journal, loose objects, and
+  derived/object caches match the pre-call state and no orphan object is
+  readable. With `discardStderr: true`, oversized stderr alone does not roll back
+  a mutation because it is neither validated nor charged; stdout or combined
+  first-excess still rolls back. Run
   `npx vitest run tests/git-cli-parity.test.ts -t "add|commit|rebase"` and the
   matching focused E2E rebase case.
 - **Touch points.** `src/git/cli/write.ts`, `tests/git-cli-parity.test.ts`,
@@ -426,7 +437,9 @@ The label summarizes the gate; the concrete witness and escalation rule bind it.
   in WU0.
 - Mutating CLI handlers receive resolved run options and preflight their result
   inside the same outer database transaction as the native operation; expected
-  failures are mapped only after rollback and cache revalidation. → ADR 0016.
+  native-operation failures are mapped only after rollback and cache
+  revalidation. Formatting/preflight failures are rethrown, and worktree writes
+  require database identity. → ADR 0016.
 - Git may import shell command types in the dedicated adapter entry. Shell never
   imports Git, and the root entry does not silently install the command.
 - `lsFiles()` defaults remain cached-only. Worktree selection is explicit and
@@ -508,5 +521,12 @@ catches every cross-layer wiring failure.
   output ceilings only after a mutating handler returned. The corrected seam
   passes resolved limits to handlers and requires mutation, result formatting,
   and preflight inside one outer transaction; the public runner stays unchanged.
-  Independent plan-delta review is required before WU4 resumes. →
+  The first plan-delta review additionally required phase-aware error mapping,
+  fail-closed worktree/database affinity, and direct orphan-object/cache plus
+  native/Computer rollback witnesses. Independent re-review is required before
+  WU4 resumes. →
   [ADR 0016](../decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)
+- 2026-08-29 — Noether approved the corrected atomicity seam. Phase-aware
+  mapping, database-affinity checks, internal rollback witnesses, and
+  discard-stderr commit semantics are now binding; ADR 0016 is accepted and WU4
+  may resume.
