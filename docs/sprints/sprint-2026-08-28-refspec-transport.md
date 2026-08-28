@@ -826,3 +826,12 @@ findings are resolved before implementation.
   and cold reopen are covered. The final focused gate passed 67 tests in 14.59
   seconds; typecheck, targeted Biome, and diff-check passed. Independent
   re-review returned clean after the SQL-cleanup and peeled-target witnesses.
+- 2026-08-28: WU6 replaced scalar branch planning with one deterministic,
+  opaque multi-root pack plan for commits, tags, trees, blobs, and deletions.
+  Only advertised OIDs authenticated inside the local commit closure suppress
+  objects; 1,024 authoritative source snapshots avoid per-ref SQL reads. The
+  structural plan, graph walk, and two replayable pack streams compose in one
+  root memory reservation, while both pack passes and a 128-statement
+  publication allowance stay below the shared 1,000-statement ceiling. The
+  final focused gate passed 13 tests in 2.89 seconds; typecheck, targeted Biome,
+  and diff-check passed. Independent affected re-review returned clean.

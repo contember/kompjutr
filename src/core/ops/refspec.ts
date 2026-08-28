@@ -95,6 +95,11 @@ export interface ExpandedPushRefspec {
   readonly force: boolean;
 }
 
+/** One authoritative local-expansion snapshot paired with the observed remote destination. */
+export interface PushPlanningUpdate extends ExpandedPushRefspec {
+  readonly oldOid: string;
+}
+
 interface CompiledMapping {
   readonly source: string | null;
   readonly destination: string;

@@ -3,7 +3,12 @@ import { openRepository } from "../src/core/context.js";
 import { isTreeMode, serializeCommit, serializeTree } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import { clone } from "../src/core/ops/network.js";
-import { planPushObjects } from "../src/core/ops/push-plan.js";
+import {
+  type PushPlan,
+  planPushObjects,
+  pushPlanObjectCount,
+  pushPlanObjectOidAt,
+} from "../src/core/ops/push-plan.js";
 import { add } from "../src/core/ops/staging.js";
 import { ZERO_OID } from "../src/core/protocol/receive-pack.js";
 import type { Repository } from "../src/core/repository.js";
@@ -39,6 +44,16 @@ function completeClosure(repo: Repository, root: string): Set<string> {
   return found;
 }
 
+function planOids(plan: PushPlan): Set<string> {
+  const result = new Set<string>();
+  for (let index = 0; index < pushPlanObjectCount(plan); index++) {
+    const oid = pushPlanObjectOidAt(plan, index);
+    if (oid === null) throw new Error("push plan lost an object");
+    result.add(oid);
+  }
+  return result;
+}
+
 describe("push object planning", () => {
   it("matches the complete closure for a new nested branch", async () => {
     const fixture = new GitFixture().init();
@@ -56,7 +71,7 @@ describe("push object planning", () => {
       const tip = commit(workspace.context, repo, { message: "topic" }).oid;
 
       const plan = planPushObjects(repo, tip, ZERO_OID, false);
-      const planned = new Set(plan.objects.map((object) => object.oid));
+      const planned = planOids(plan);
       const expected = completeClosure(repo, tip);
       const tipCommit = repo.readCommit(tip);
       const parentCommit = repo.readCommit(tipCommit.parent[0]!);
@@ -76,7 +91,7 @@ describe("push object planning", () => {
       const remoteTip = tipCommit.parent[0]!;
       const incremental = planPushObjects(repo, tip, ZERO_OID, false, [remoteTip]);
       for (const oid of completeClosure(repo, remoteTip)) expected.delete(oid);
-      expect(new Set(incremental.objects.map((object) => object.oid))).toEqual(expected);
+      expect(planOids(incremental)).toEqual(expected);
     } finally {
       await server.close();
     }
@@ -131,7 +146,7 @@ describe("push object planning", () => {
       const plan = planPushObjects(repo, merge, old, false);
       const expected = completeClosure(repo, merge);
       for (const oid of completeClosure(repo, old)) expected.delete(oid);
-      expect(new Set(plan.objects.map((object) => object.oid))).toEqual(expected);
+      expect(planOids(plan)).toEqual(expected);
     } finally {
       await server.close();
     }
