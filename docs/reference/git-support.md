@@ -56,8 +56,8 @@ Roj can use the native surface for its admission slice: several isolated session
 checkouts over one shared store, bounded divergence against a caller-selected
 base, and an offline raw read of `refs/remotes/origin/HEAD`. Its adapter belongs
 to the consumer repository, not this package. The broader orchestrator requires
-partial clone, atomic checkpoint pushes, remote ref discovery, and snapshot
-replay.
+partial clone, atomic checkpoint pushes, and remote ref discovery. Local
+snapshot replay is available without textual patch interchange.
 
 ## Repository creation
 
@@ -317,26 +317,29 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | abbreviated oid | ✔ resolved by unique prefix |
 | `<rev>~<n>`, `<rev>^<n>`, `<rev>^0` | ★ ✔ chained suffixes allowed |
 | `HEAD@{0}` … `HEAD@{1023}` | ✔ active new-OID reflog endpoints; composes with `^` and `~` |
-| `--verify`, `--quiet` (existence probe) | ★ ~ an unresolvable rev throws; there is no quiet non-zero-exit mode |
+| `--verify`, `--quiet` (existence probe) | `tryRevParse()` | ★ ~ returns `undefined` only for semantic absence; malformed or corrupt stored state still throws |
 | `FETCH_HEAD` | ★ ✘ `fetch()` returns the tip as `fetchHead`; no `FETCH_HEAD` ref is written |
-| `<rev>^{commit}`, `<rev>^{tree}` (peel to type) | ★ ✘ |
-| `@`, `@{upstream}`, arbitrary `<ref>@{n}`, dates, `:/text`, `<a>..<b>`, `<rev>:<path>` | ★ ✘ (`<oid>:<path>` works in `catFile` only) |
+| `<rev>^{}`, `^{commit}`, `^{tree}`, `^{blob}`, `^{tag}` | ★ ✔ bounded typed peeling with authoritative type checks |
+| `<rev>:<path>` | ★ ✔ returns the blob or tree oid; internal resolution also preserves the entry mode |
+| `@`, `@{upstream}`, arbitrary `<ref>@{n}`, dates, `:/text`, `<a>..<b>` | ★ ✘ |
 
 ### Plumbing
 
 | Git | kompjutr | |
 |---|---|---|
 | `git ls-files` | `lsFiles()` | ★ ~ index paths; `{ ref }` lists a tree instead. ✘ `--stage`, ✘ `--others`/`--exclude-standard`, ✘ `--error-unmatch` |
-| `git ls-tree <ref> [<path>]` | `lsTree()` | ★ ~ one level only, never recursive; a `<path>` naming a blob returns that single entry |
+| `git ls-tree <ref> [<path>]` | `lsTree()` | ★ ~ one level by default; `recursive: true` returns bounded recursive mode/type/oid/path rows; a `<path>` naming a blob returns that single entry |
 | `git cat-file <oid>` | `catFile()` | ★ ~ returns `{ oid, bytes }`; `filepath` or the `<oid>:<path>` shorthand reads inside a tree. ✘ `-t`, `-s`, `-p`, ✘ `-e` (a missing path throws instead of exiting non-zero) |
 | `git hash-object [-w]` | `hashObject()` | ~ blobs only; `write` stores it. ✘ `-t commit\|tree\|tag`, ✘ stdin batching |
-| `git update-ref <ref> <value> [<oldvalue>]` | `updateRef()` | ★ ~ `force` overwrites, `symbolic` writes `ref: …`. ✘ `-d` (delete), ✘ `--stdin`, ✘ old-value guard |
+| `git update-ref <ref> <value> [<oldvalue>]` | `updateRef()` | ★ ~ direct refs support `expected` compare-and-set and guarded deletion; `null` means expected absence. Legacy `force` and `symbolic` writes remain. ✘ `--stdin` and multi-ref transactions |
 | `git symbolic-ref [-q] HEAD` | `currentBranch({ fullname: true })` | ★ ~ returns the full `refs/heads/…`, and `undefined` when HEAD is detached |
 | `git symbolic-ref -q <ref>`, `for-each-ref --format=%(symref) <ref>` | `readRef({ ref })` | ★ ~ exact raw `HEAD` or full `refs/...`; returns `symbolic`, `direct`, or `absent` without following the target or checking object existence |
 | `git rev-list --left-right --count <current>...<upstream>` | `divergence({ current, upstream })` | ★ ~ returns exact `ahead`/`behind` plus `identical`, `ahead`, `behind`, `diverged`, `unrelated`, or `shallow` |
+| `git merge-base --all <current> <incoming>` | `mergeBase()` | ★ ~ returns every bounded best base plus `already-merged`, `fast-forward`, `divergent`, `unrelated`, or `shallow` classification |
 | `git read-tree`, `git write-tree`, `git commit-tree` | `readTree()`, `writeTree()`, `commitTree()` | ★ ✔ ordinary calls target the checkout index; `commitTree()` writes one detached authenticated commit and moves no ref |
-| `GIT_INDEX_FILE=<throwaway>` around those commands | `withScratchIndex({ name }, callback)` | ★ ~ the synchronous callback receives `readTree`, `add`, `writeTree`, and `commitTree`; all scratch rows are transaction-scoped and no index file or persistent alternate index exists |
-| general `git rev-list`, ref enumeration through `git for-each-ref`, public `git merge-base` | — | ✘ the narrow divergence and exact raw-ref reads above do not expose general enumeration or merge-base selection |
+| `GIT_INDEX_FILE=<throwaway>` around those commands | `withScratchIndex({ name }, callback)` | ★ ~ the synchronous callback receives `readTree`, `add`, `writeTree`, `commitTree`, and `replaySnapshot`; all scratch rows are transaction-scoped and no index file or persistent alternate index exists |
+| `git diff --binary --full-index <snap>^ <snap>` then `git apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` | ★ ~ index-only replay while all objects share one store; clean results return a tree, conflicts return physical stage rows and write nothing. ✘ textual patch interchange |
+| general `git rev-list`, ref enumeration through `git for-each-ref` | — | ✘ the bounded reads above do not expose general enumeration |
 
 ## Branches, tags and refs
 
@@ -635,8 +638,8 @@ These have no method and no equivalent. `stash` and the argv entry point throw
   trees but never followed); `sparse-checkout` as a command — sparse hydration is
   an internal optimisation, not a user-facing mode
 - **Inspection:** `blame`, `bisect`, `describe`, `shortlog`, `grep`,
-  general `rev-list`, ref enumeration through `for-each-ref`, public `merge-base`,
-  `ls-remote` ★, `whatchanged`; bounded divergence and one exact raw-ref read are
+  general `rev-list`, ref enumeration through `for-each-ref`, `ls-remote` ★,
+  `whatchanged`; bounded merge-base, divergence, and one exact raw-ref read are
   available through the narrower methods above
 - **Patches:** `apply` ★, `am`, `format-patch`, `send-email`, `cherry`
 - **Maintenance binaries:** `gc`, `fsck`, `repack`, `prune`, `count-objects`,
@@ -701,7 +704,10 @@ One repository admits at most 16 simultaneous scratch-index names, each at most
 255 UTF-8 bytes. A scratch callback is synchronous and cannot escape its owning
 transaction. `writeTree()` admits at most 10,000 leaf entries, 4 MiB of path
 bytes, 4,096 tree objects, and 16 MiB of serialized trees. `commitTree()` accepts
-at most two ordered parents and eight cumulative revision traversals.
+at most two ordered parents and eight cumulative revision traversals. Recursive
+`lsTree()` returns at most 10,000 rows and 16 MiB of charged result state.
+Snapshot replay inherits the 1,000-entry, 200,000-source-row, 32 MiB retained
+plan, and shared 64 MiB memory bounds of the integration engine.
 
 ## Path and ordering rules
 
@@ -730,10 +736,6 @@ the agent makes. The consumer adapter is outside this package.
 | `--filter=blob:none` partial clone | the initial clone of every project repository ([backlog 41](../backlog/41-partial-clone.md)) |
 | Wildcard fetch refspec (`+refs/checkpoints/*:refs/checkpoints/*`) | pulling snapshot refs back after a sandbox is rebuilt ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
 | `ls-remote` | listing the mirror refs that pruning then deletes ([backlog 42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md)) |
-| `apply --3way --cached` | re-applying that snapshot onto a rebased tip ([backlog 44](../backlog/44-patch-interchange.md)) |
-| `diff --binary --full-index <a> <b>` | producing the patch that re-apply consumes ([backlog 44](../backlog/44-patch-interchange.md)) |
-| `update-ref <ref> <new> <old>` compare-and-swap | publishing a rebase result only if the branch has not moved meanwhile ([backlog 39](../backlog/39-plumbing-read-surface.md)) |
-| `rev-parse <rev>^{commit}` / `^{tree}` / `<rev>:<path>` | snapshot parent and tree probes, and a lockfile-changed check ([backlog 46](../backlog/46-rev-parse-revision-syntax.md)) |
 | `diff -z` | NUL-framed diff path lists parsed by the orchestrator; status formatters already provide NUL framing |
 
 ### Adaptable — the capability exists under another shape
@@ -746,8 +748,10 @@ the agent makes. The consumer adapter is outside this package.
 | `log <a>..<b>` | walk from the tip and stop at the base oid |
 | `ls-files --error-unmatch <path>` | membership test against `lsFiles()` |
 | `ls-tree -r <ref>` | recurse with `lsTree()`, or read the tree through `lsFiles({ ref })` |
-| `cat-file -e <ref>:<path>` | `catFile()`, treating the throw as absence |
+| `rev-parse --verify --quiet <rev>` / `cat-file -e <rev>:<path>` | `tryRevParse()` returns the oid or `undefined` for semantic absence |
 | `GIT_INDEX_FILE=<throwaway> read-tree` / `add -A` / `write-tree` / `commit-tree` | one synchronous `withScratchIndex()` callback; it returns the detached snapshot OID without changing the checkout index, worktree, HEAD, refs, reflogs, tracker, operation journal, or maintenance state |
+| `diff --binary --full-index <snap>^ <snap>` then `apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` while the snapshot and new tip share one object store; textual patch interchange remains deferred ([backlog 44](../backlog/44-patch-interchange.md)) |
+| `update-ref <ref> <new> <old>` / guarded `-d` | `updateRef({ ref, value, expected })` / `updateRef({ ref, delete: true, expected })`; a stale direct target throws `ESTALEHEAD` |
 | `reset --hard FETCH_HEAD` | `reset({ ref: fetch().fetchHead, hard: true })` |
 | `branch -m main` | `branch()` then `branchDelete()` |
 | `push -u origin main` | `push()` then `configSet("branch.main.remote"/"…merge")` |

@@ -84,12 +84,22 @@ raw `HEAD` remain independent.
 The native `readTree()` and `writeTree()` methods target the selected checkout
 index. `withScratchIndex({ name }, callback)` instead creates one named index
 inside a synchronous outer transaction and passes a revoked-on-return handle
-with `readTree`, `add`, `writeTree`, and `commitTree`. Nested operations join the
-outer transaction. A throw, a returned thenable, or a caught nested operation
-failure poisons and rolls back the whole session, including newly written
-objects. Successful cleanup deletes the scratch header and cascades its entries
-before the callback result becomes visible. The handle cannot be reused after
-return, and no new maintenance lifecycle is required.
+with `readTree`, `add`, `writeTree`, `commitTree`, and `replaySnapshot`. Nested
+operations join the outer transaction. A throw, a returned thenable, or a caught
+nested operation failure poisons and rolls back the whole session, including
+newly written objects. Successful cleanup deletes the scratch header and
+cascades its entries before the callback result becomes visible. The handle
+cannot be reused after return, and no new maintenance lifecycle is required.
+
+`replaySnapshot({ snapshot, onto })` accepts exactly one parent on the snapshot
+commit. It plans the snapshot-parent/snapshot delta against `onto`, rejects
+gitlinks, and projects structural conflicts to the physical paths Git uses. A
+conflict returns ordered path/kind/stage rows without changing the selected
+scratch index or object store. A clean result atomically seeds the scratch index
+from `onto`, authenticates and writes merged blobs, applies only stage-zero
+entries, and returns the bounded result-tree oid. The worktree, checkout index,
+HEAD, refs, reflogs, tracker, and operation journal remain outside that scratch
+transaction.
 
 No operation depends on a `.git` directory.
 
@@ -100,6 +110,17 @@ retention in the same synchronous transaction. Moving a branch attached to any
 checkout records the shared direct ref before that checkout's causal `HEAD`
 entry, even when another checkout initiated the mutation. Failed, stale, no-op,
 and rolled-back mutations record nothing.
+
+A checkpoint restore composes separate public transactions: inspect the
+snapshot, replay and optionally commit it through a scratch callback, apply the
+clean tree with `readTree({ updateWorktree: true })`, then publish a direct ref
+with `updateRef({ expected })`. This sequence is deliberately not atomic. If the
+ref changes after tree application, publication throws `ESTALEHEAD`; the
+checkout index and worktree keep the replayed tree, the tracker keeps its dirty
+overlay, the rival ref and raw HEAD remain unchanged, replay-created objects
+remain, no failed-publication reflog is appended, scratch rows are gone, and the
+operation journal is unchanged. The caller must resynchronise or retry from that
+explicit state.
 
 Reflog reads are newest-first and page strictly before a store-wide ordinal.
 Direct-ref retention is per shared ref; `HEAD` retention is per checkout. An

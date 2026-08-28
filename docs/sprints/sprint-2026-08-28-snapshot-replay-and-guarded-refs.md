@@ -352,3 +352,11 @@ resolved before implementation.
   passed. Singer's first T3 review found three blockers in nested memory
   accounting, physical conflict projection, and parent-validation order; the
   fixes closed all three and the independent re-review approved WU4.
+- WU5 proved the public inspect/replay/commit/apply/guarded-publish sequence
+  against real Git and pinned the deliberately non-atomic stale-publisher
+  state across a cold reopen. Its focused witness passed 50 tests in 11.53 s;
+  typecheck and the repository Biome check passed. The independent sprint
+  integration review approved replay isolation and bounds, public facade and
+  export contracts, and the consumer checkpoint composition with no material
+  findings. The agent-docs lint retained one pre-existing unrelated finding:
+  the stray tracked root file `docs/AGENTS.md`.

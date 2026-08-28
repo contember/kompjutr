@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git } from "../src/git/client.js";
-import { readIndexTrackerState } from "../src/sqlite/index-tracker.js";
+import {
+  iterateIndexTrackerDirty,
+  readIndexTrackerState,
+  resealIndexTracker,
+} from "../src/sqlite/index-tracker.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
@@ -12,6 +16,8 @@ import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
 
 const fixtures: GitFixture[] = [];
+const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
+const FIXTURE_NOW = 1_577_836_800_000;
 
 function fixture(): GitFixture {
   const created = new GitFixture().init();
@@ -33,21 +39,26 @@ function bindGit(workspace: TestRepository, database: SqliteGitDatabase = worksp
 }
 
 async function importWorkspace(source: GitFixture): Promise<TestRepository> {
-  const workspace = makeRepo("/");
+  const workspace = makeRepo("/", { now: () => FIXTURE_NOW });
   await importFixture(source, workspace.repo.checkout);
   return workspace;
 }
 
-function controlState(workspace: TestRepository) {
-  const row = workspace.database.checkoutAt("/");
+function reopenDatabase(workspace: TestRepository): SqliteGitDatabase {
+  return new SqliteGitDatabase(workspace.database.db, { now: () => FIXTURE_NOW });
+}
+
+function controlState(workspace: TestRepository, database: SqliteGitDatabase = workspace.database) {
+  const row = database.checkoutAt("/");
   if (row === null) throw new Error("repository is missing");
-  const repo = new Repository(workspace.database.openCheckout(row));
+  const repo = new Repository(database.openCheckout(row));
   return {
     head: repo.checkout.head(),
     refs: repo.store.listRefs(),
     reflogs: repo.store.listRefs().map((ref) => ({ name: ref.name, rows: repo.reflog(ref.name) })),
     index: [...repo.checkout.indexScan()],
-    tracker: readIndexTrackerState(workspace.database.db, repo.checkout.checkoutId),
+    tracker: readIndexTrackerState(database.db, repo.checkout.checkoutId),
+    trackerDirty: [...iterateIndexTrackerDirty(database.db, repo.checkout.checkoutId)],
     operation: repo.checkout.readOperationState(),
     worktree: workspace.worktree.scan("/", { limit: 10_000 }),
   };
@@ -61,6 +72,38 @@ function scratchRows(workspace: TestRepository): Record<string, unknown>[] {
 
 function objectCount(workspace: TestRepository): number {
   return workspace.database.db.scalar<number>("SELECT count(*) FROM git_objects") ?? -1;
+}
+
+async function initialiseCheckedOutTip(
+  workspace: TestRepository,
+  git: Git,
+  tip: string,
+  tree: string,
+): Promise<void> {
+  await git.readTree({ tree: tip, updateWorktree: true });
+  if (!resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, tree, [])) {
+    throw new Error("index tracker could not be initialised");
+  }
+}
+
+async function composeSnapshotCommit(
+  git: Git,
+  snapshot: string,
+  onto: string,
+  name: string,
+): Promise<{ tree: string; commit: string }> {
+  return git.withScratchIndex({ name }, (scratch) => {
+    const replayed = scratch.replaySnapshot({ snapshot, onto });
+    if (replayed.outcome !== "clean") throw new Error("snapshot replay is conflicted");
+    const commit = scratch.commitTree({
+      tree: replayed.tree,
+      message: "restore checkpoint\n",
+      parent: [onto],
+      author: FIXTURE_IDENTITY,
+      committer: FIXTURE_IDENTITY,
+    });
+    return { tree: replayed.tree, commit };
+  });
 }
 
 function gitReplayTree(source: GitFixture, snapshot: string, onto: string, name: string): string {
@@ -153,7 +196,7 @@ describe("scratch snapshot replay", () => {
     expect(controlState(workspace)).toEqual(before);
     expect(scratchRows(workspace)).toEqual([]);
 
-    const coldDatabase = new SqliteGitDatabase(workspace.database.db);
+    const coldDatabase = reopenDatabase(workspace);
     const cold = bindGit(workspace, coldDatabase);
     await expect(
       cold.withScratchIndex({ name: "cold" }, (scratch) =>
@@ -176,6 +219,8 @@ describe("scratch snapshot replay", () => {
     const onto = source.commit("onto");
     const workspace = await importWorkspace(source);
     const git = bindGit(workspace);
+    const publishRef = "refs/checkpoints/conflicted";
+    await git.updateRef({ ref: publishRef, value: onto, expected: null });
     const before = controlState(workspace);
     const beforeObjects = objectCount(workspace);
     const expectedStages = [
@@ -183,6 +228,15 @@ describe("scratch snapshot replay", () => {
       { stage: 2, mode: "100644", oid: source.git("rev-parse", `${onto}:conflict.txt`) },
       { stage: 3, mode: "100644", oid: source.git("rev-parse", `${snapshot}:conflict.txt`) },
     ];
+
+    await expect(git.tryRevParse({ ref: "missing-checkpoint" })).resolves.toBeUndefined();
+    await expect(git.mergeBase({ current: onto, incoming: snapshot })).resolves.toEqual({
+      kind: "divergent",
+      bases: [base],
+    });
+    expect(
+      (await git.lsTree({ ref: snapshot, recursive: true })).some((row) => row.mode === "160000"),
+    ).toBe(false);
 
     await git.withScratchIndex({ name: "conflict" }, (scratch) => {
       scratch.readTree({ tree: base });
@@ -196,6 +250,10 @@ describe("scratch snapshot replay", () => {
 
     expect(objectCount(workspace)).toBe(beforeObjects);
     expect(controlState(workspace)).toEqual(before);
+    await expect(git.readRef({ ref: publishRef })).resolves.toEqual({
+      kind: "direct",
+      oid: onto,
+    });
     expect(scratchRows(workspace)).toEqual([]);
   });
 
@@ -405,4 +463,123 @@ describe("scratch snapshot replay", () => {
     );
     expect(workspace.repo.store.memory.activeCount).toBe(0);
   }, 30_000);
+});
+
+describe("checkpoint restore composition", () => {
+  it("inspects, replays, applies, and guardedly publishes through the public client", async () => {
+    const { source, base, snapshot, onto, expectedTree } = cleanHistory();
+    const expectedCommit = source.gitInput(
+      "restore checkpoint\n",
+      "commit-tree",
+      expectedTree,
+      "-p",
+      onto,
+    );
+    const workspace = await importWorkspace(source);
+    const git = bindGit(workspace);
+    const ontoTree = source.git("rev-parse", `${onto}^{tree}`);
+    const publishRef = "refs/checkpoints/current";
+    await initialiseCheckedOutTip(workspace, git, onto, ontoTree);
+    await git.updateRef({ ref: publishRef, value: onto, expected: null });
+    const beforeReplay = controlState(workspace);
+    const beforeObjects = objectCount(workspace);
+
+    await expect(git.revParse({ ref: `${snapshot}^{commit}` })).resolves.toBe(snapshot);
+    await expect(git.tryRevParse({ ref: "missing-checkpoint" })).resolves.toBeUndefined();
+    const snapshotRows = await git.lsTree({ ref: snapshot, recursive: true });
+    expect(snapshotRows.some((row) => row.mode === "160000")).toBe(false);
+    await expect(git.mergeBase({ current: onto, incoming: snapshot })).resolves.toEqual({
+      kind: "divergent",
+      bases: [base],
+    });
+
+    const restored = await composeSnapshotCommit(git, snapshot, onto, "restore");
+    expect(restored).toEqual({ tree: expectedTree, commit: expectedCommit });
+    expect(controlState(workspace)).toEqual(beforeReplay);
+    expect(scratchRows(workspace)).toEqual([]);
+
+    await git.readTree({ tree: restored.tree, updateWorktree: true });
+    await git.updateRef({ ref: publishRef, value: restored.commit, expected: onto });
+
+    await expect(git.writeTree()).resolves.toBe(expectedTree);
+    await expect(git.diff({ ref: restored.commit })).resolves.toBe("");
+    await expect(git.readRef({ ref: publishRef })).resolves.toEqual({
+      kind: "direct",
+      oid: expectedCommit,
+    });
+    const afterPublish = controlState(workspace);
+    expect(afterPublish.head).toBe("ref: refs/heads/onto");
+    expect(afterPublish.operation).toBeNull();
+    expect(afterPublish.tracker).toEqual({ available: true, baselineTreeOid: ontoTree });
+    expect(afterPublish.trackerDirty.length).toBeGreaterThan(0);
+    expect(afterPublish.reflogs.find((entry) => entry.name === publishRef)?.rows[0]?.newOid).toBe(
+      expectedCommit,
+    );
+    expect(objectCount(workspace)).toBeGreaterThan(beforeObjects);
+    expect(scratchRows(workspace)).toEqual([]);
+
+    const coldDatabase = reopenDatabase(workspace);
+    const cold = bindGit(workspace, coldDatabase);
+    await expect(cold.readRef({ ref: publishRef })).resolves.toEqual({
+      kind: "direct",
+      oid: expectedCommit,
+    });
+    await expect(cold.writeTree()).resolves.toBe(expectedTree);
+    expect(controlState(workspace, coldDatabase)).toEqual(afterPublish);
+  });
+
+  it("leaves the applied tree intact when a guarded publisher loses a ref race", async () => {
+    const { source, snapshot, onto, expectedTree } = cleanHistory();
+    const workspace = await importWorkspace(source);
+    const git = bindGit(workspace);
+    const ontoTree = source.git("rev-parse", `${onto}^{tree}`);
+    const publishRef = "refs/checkpoints/raced";
+    await initialiseCheckedOutTip(workspace, git, onto, ontoTree);
+    await git.updateRef({ ref: publishRef, value: onto, expected: null });
+    const beforeObjects = objectCount(workspace);
+
+    const restored = await composeSnapshotCommit(git, snapshot, onto, "raced-restore");
+    await git.readTree({ tree: restored.tree, updateWorktree: true });
+    await git.updateRef({ ref: publishRef, value: snapshot, expected: onto });
+    const beforeFailedPublish = controlState(workspace);
+    const objectsBeforeFailedPublish = objectCount(workspace);
+    const reflogRowsBefore = beforeFailedPublish.reflogs.find((entry) => entry.name === publishRef)
+      ?.rows.length;
+
+    await expect(
+      git.updateRef({ ref: publishRef, value: restored.commit, expected: onto }),
+    ).rejects.toMatchObject({ code: "ESTALEHEAD" });
+
+    expect(controlState(workspace)).toEqual(beforeFailedPublish);
+    expect(
+      controlState(workspace).reflogs.find((entry) => entry.name === publishRef)?.rows.length,
+    ).toBe(reflogRowsBefore);
+    expect(objectCount(workspace)).toBe(objectsBeforeFailedPublish);
+    expect(objectCount(workspace)).toBeGreaterThan(beforeObjects);
+    expect(workspace.repo.has(restored.tree)).toBe(true);
+    expect(workspace.repo.has(restored.commit)).toBe(true);
+    expect(scratchRows(workspace)).toEqual([]);
+    await expect(git.readRef({ ref: "HEAD" })).resolves.toEqual({
+      kind: "symbolic",
+      target: "refs/heads/onto",
+    });
+    await expect(git.readRef({ ref: publishRef })).resolves.toEqual({
+      kind: "direct",
+      oid: snapshot,
+    });
+    await expect(git.writeTree()).resolves.toBe(expectedTree);
+    await expect(git.diff({ ref: restored.commit })).resolves.toBe("");
+    expect(beforeFailedPublish.operation).toBeNull();
+    expect(beforeFailedPublish.tracker).toEqual({ available: true, baselineTreeOid: ontoTree });
+    expect(beforeFailedPublish.trackerDirty.length).toBeGreaterThan(0);
+
+    const coldDatabase = reopenDatabase(workspace);
+    const cold = bindGit(workspace, coldDatabase);
+    await expect(cold.readRef({ ref: publishRef })).resolves.toEqual({
+      kind: "direct",
+      oid: snapshot,
+    });
+    await expect(cold.writeTree()).resolves.toBe(expectedTree);
+    expect(controlState(workspace, coldDatabase)).toEqual(beforeFailedPublish);
+  });
 });
