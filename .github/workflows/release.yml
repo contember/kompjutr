@@ -38,7 +38,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ripgrep
-      - run: npm test
+      - run: npm run test:full
       - run: npm run build
       - name: Build and test the release artifact
         run: npm run package:smoke -- --pack-destination "${{ runner.temp }}/npm-package"

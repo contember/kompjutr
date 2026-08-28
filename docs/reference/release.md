@@ -13,7 +13,7 @@ Pull requests and pushes to `main` run these gates on `ubuntu-latest`:
 1. `npm ci`
 2. `npm run check`
 3. `npm run typecheck`
-4. `npm test`
+4. `npm run test:full`
 5. `npm run build`
 6. `npm run package:smoke`
 
@@ -23,6 +23,10 @@ that exact tarball into two temporary consumers. The standalone consumer imports
 `kompjutr/testing` without Computer installed. The compatibility consumer
 installs Computer and imports `kompjutr/compat/computer`. The command removes its
 temporary consumers even when a check fails.
+
+`npm run test:full` covers every Vitest file in bounded root shards plus separate
+filesystem, shell, and end-to-end slices. This keeps each worker pool short-lived
+without weakening the exhaustive CI and release gate.
 
 Benchmarks are not CI gates. Run and report them only under the CPU lease defined
 in `bench/CLAUDE.md`.

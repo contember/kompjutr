@@ -51,6 +51,17 @@ repeat review until clean.
 | WU1 | <why this is easy/normal/fundamental> | <exact test; review policy> | <conditions> |
 | WU2 | <why this is easy/normal/fundamental> | <exact test; review policy> | <conditions> |
 
+## Test cadence
+
+- **Per WU.** Run the exact acceptance witness above. Add the relevant stable
+  slice (`npm run test:fs`, `npm run test:shell`, or `npm run test:e2e`) only
+  when the change crosses that domain.
+- **Routine integration.** Run `npm test`; keep this smoke gate below 30 seconds.
+- **Sprint closure.** Run `npm run test:full` once after final review and focused
+  fixes have settled. CI and release also use this exhaustive gate.
+- **Failure loop.** Reproduce a full-suite failure with its exact file or domain
+  slice. Rerun the full suite only after the focused witness is stable.
+
 ## Out of scope (explicit)
 
 <What's deliberately deferred + why; link follow-up backlog items.>

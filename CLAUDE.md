@@ -10,8 +10,12 @@ The project is still in development and has no production users, so backward com
 ## Commands
 
 ```bash
-npm test                             # full suite
-npx vitest run tests/status.test.ts  # single file
+npm test                             # fast cross-layer smoke suite, target <30 s
+npm run test:fs                      # filesystem slice
+npm run test:shell                   # shell slice
+npm run test:e2e                     # end-to-end slice
+npm run test:full                    # exhaustive batched suite; sprint closure and CI only
+npx vitest run tests/status.test.ts  # exact focused witness
 npm run typecheck                    # tsc --noEmit over src + tests + bench
 npm run check                        # biome lint + format check
 npm run format                       # biome format --write

@@ -66,19 +66,26 @@ the sprint integration and every WU. The strategy lives in the sprint and states
 the actual gate, whether independent review is required, when fixes need another
 review, and what scope drift escalates it. A tier label alone is not a strategy.
 Easy work may need only its direct witness; fundamental work may retain strict
-review-to-clean. Multiple sprints may be active at once.
+review-to-clean. The plan also defines the exact focused, routine, and closure
+test cadence, including the expected budget of the routine gate. Multiple
+sprints may be active at once.
 
 Before implementation, a reviewer who did not author the plan reviews it against
 HEAD. The review covers grounding, WU boundaries and dependencies, acceptance
-witnesses, and whether each review gate is proportionate to its scope and blast
-radius. Resolve blocking findings in the plan and record the reviewer, verdict,
-and material findings in `## Plan review`. Do not start implementation with a
-pending or blocking verdict.
+witnesses, test cadence, and whether each review gate is proportionate to its
+scope and blast radius. Resolve blocking findings in the plan and record the
+reviewer, verdict, and material findings in `## Plan review`. Do not start
+implementation with a pending or blocking verdict.
 
-**Run** — work the WUs under their declared review gates. If scope expands or an
-escalation condition is met, raise the gate before commit and record why. Append
-discoveries, deviations, and blockers to the sprint's **`## Run log`** as you go.
-The run log is ephemeral scratch — see graduation below.
+**Run** — work the WUs under their declared review gates. Run each WU's exact
+witness and only the relevant stable slice while iterating. `npm test` is the
+fast cross-layer smoke gate; it is not a substitute for the WU witness. Run
+`npm run test:full` once, after review and focused fixes have settled, at sprint
+closure. If it fails, reproduce and stabilize the affected file or slice before
+rerunning the full suite. If scope expands or an escalation condition is met,
+raise the gate before commit and record why. Append discoveries, deviations, and
+blockers to the sprint's **`## Run log`** as you go. The run log is ephemeral
+scratch — see graduation below.
 
 **Close** — when shipped: stamp an **`OUTCOME`** header at the top (commit map +
 verification numbers + what was deferred), `git mv` the file to

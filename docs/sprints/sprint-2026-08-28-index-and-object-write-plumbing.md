@@ -248,8 +248,12 @@ mutation outside the selected index is a stop condition.
 
 ## Gates
 
+WU iteration uses the exact focused witnesses above. The exhaustive suite runs
+once at sprint closure after review and focused fixes have settled; any failure
+is reproduced and stabilized in its exact file before another full run.
+
 ```bash
-GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true cpu-lease run -n 4 -- npm test
+GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true cpu-lease run -n 4 -- npm run test:full
 cpu-lease run -n 2 -- npm run typecheck
 npm run check
 cpu-lease run -n 2 -- npm run build
@@ -340,3 +344,9 @@ closure; it is not represented as pre-implementation approval of completed work.
   `onTaskUpdate` acknowledgement; typecheck, Biome, build, and `git diff
   --check` all exit zero. A thread-pool run is not closure evidence because it
   changes E2E isolation behavior.
+- 2026-08-28: Routine testing now separates a 14-file cross-layer smoke gate
+  from filesystem, shell, end-to-end, and exhaustive gates. The smoke gate
+  passes 121 tests in 6.51 seconds; filesystem passes 447 in 10.23 seconds,
+  shell passes 282 in 5.27 seconds, and end-to-end passes 96 in 66.87 seconds.
+  The exhaustive command covers all 139 test files through eight bounded root
+  shards and the three domain slices; CI and release use that command.

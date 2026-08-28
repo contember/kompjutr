@@ -30,6 +30,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes ripgrep
-      - run: npm test
+      - run: npm run test:full
       - run: npm run build
       - run: npm run package:smoke
