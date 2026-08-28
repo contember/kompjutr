@@ -11,11 +11,17 @@ import type { TargetEntry } from "./tree-stream.js";
 const CHECKOUT_BLOB_BYTES = 3 * 1024 * 1024;
 const textDecoder = new TextDecoder();
 
+export interface CheckoutWriteBudget {
+  maxBytes: number;
+  writtenBytes: number;
+}
+
 export function flushCheckoutWrites(
   repo: Repository,
   worktree: Worktree,
   entries: TargetEntry[],
   sink: IndexSink,
+  budget?: CheckoutWriteBudget,
 ): void {
   if (entries.length === 0) return;
   let pending = entries.splice(0, entries.length);
@@ -43,6 +49,12 @@ export function flushCheckoutWrites(
       if (data === undefined) {
         deferred.push(entry);
         continue;
+      }
+      if (budget !== undefined) {
+        if (data.length > budget.maxBytes - budget.writtenBytes) {
+          throw new GitError("E2BIG", `checkout writes exceed ${budget.maxBytes} bytes`);
+        }
+        budget.writtenBytes += data.length;
       }
       const contentId = fromHex(entry.oid);
       const absolute = joinPath(repo.root, entry.path);

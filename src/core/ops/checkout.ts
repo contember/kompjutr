@@ -1,15 +1,20 @@
 // Materialising a tree into the working tree, and keeping the SQL index in
 // step with it.
 
-import { contentIdKey, type IndexEntry, type IndexSink } from "../../sqlite/store.js";
-import { fromHex } from "../bytes.js";
+import {
+  contentIdKey,
+  type IndexEntry,
+  type IndexSink,
+  type IndexStore,
+} from "../../sqlite/store.js";
+import { fromHex, utf8 } from "../bytes.js";
 import { GitError } from "../errors.js";
 import { isTreeMode, type TreeEntry } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
 import { fileModeFor, gitModeFor, type Worktree } from "../worktree.js";
-import { flushCheckoutWrites } from "./checkout-writes.js";
+import { type CheckoutWriteBudget, flushCheckoutWrites } from "./checkout-writes.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import { indexMatchesStat, type WorktreePath, walkWorktreeEntriesStream } from "./worktree-io.js";
 
@@ -53,10 +58,18 @@ export interface CheckoutOptions {
   discardUnmerged?: boolean;
   /** Bound each paged worktree traversal used by checkout. */
   maxWorktreeRowsPerPass?: number;
+  /** Bound each tree and index traversal used by checkout. */
+  maxSourceRowsPerPass?: number;
+  /** Bound aggregate blob bytes materialised into the worktree. */
+  maxWriteBytes?: number;
 }
 
 const CHECKOUT_WINDOW_ROWS = 1_000;
 const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
+const CHECKOUT_PRUNE_BYTES = 16 * 1024 * 1024;
+const CHECKOUT_PRUNE_PATHS = 50_000;
+const CHECKOUT_REMOVE_BINDING_BYTES = 1_000_000;
+const CHECKOUT_REMOVE_BATCHES = 16;
 const CHECKOUT_PATH_FIXED_BYTES = 96;
 const CHECKOUT_UNMERGED_PATHS = 10_000;
 const CHECKOUT_UNMERGED_BYTES = 4 * 1024 * 1024;
@@ -71,24 +84,39 @@ export function checkoutTree(
   worktree: Worktree,
   treeOid: string | null,
   options: CheckoutOptions = {},
+  index: IndexStore = repo.checkout,
 ): void {
+  const writeBudget = checkoutWriteBudget(options.maxWriteBytes);
   if (options.discardUnmerged === true) {
-    discardUnmergedPaths(repo, worktree, options.maxWorktreeRowsPerPass);
+    discardUnmergedPaths(
+      repo,
+      worktree,
+      options.maxWorktreeRowsPerPass,
+      options.maxSourceRowsPerPass,
+      index,
+    );
   }
   const preservedRemovals =
     options.restoreStructure === true
-      ? restoreStructuralConflicts(repo, worktree, treeOid, options)
+      ? restoreStructuralConflicts(repo, worktree, treeOid, options, index)
       : new Set<string>();
   const removed: string[] = [];
+  let prunePlan: CheckoutPrunePlan | undefined;
 
   // Remove obsolete paths before writing replacements. This also handles a
   // directory-to-file transition without retaining the whole target tree.
-  repo.checkout.indexApply((sink) => {
+  index.indexApply((sink) => {
     let retainedBytes = 0;
-    for (const row of joinSorted(treeStream(repo, treeOid), stageZero(repo.checkout.indexScan()), {
-      left: (entry) => entry.path,
-      right: (entry) => entry.path,
-    })) {
+    for (const row of joinSorted(
+      boundedCheckoutSourceRows(treeStream(repo, treeOid), options.maxSourceRowsPerPass, "tree"),
+      stageZero(
+        boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index"),
+      ),
+      {
+        left: (entry) => entry.path,
+        right: (entry) => entry.path,
+      },
+    )) {
       const entry = row.left;
       const existing = row.right;
       if (entry !== undefined || existing === undefined || options.prune === false) continue;
@@ -102,26 +130,32 @@ export function checkoutTree(
       }
       removed.push(existing.path);
     }
-    for (let offset = 0; offset < removed.length; offset += CHECKOUT_WINDOW_ROWS) {
-      flushRemovals(
+    if (removed.length > 0) {
+      prunePlan = planEmptyDirectories(
         repo,
         worktree,
-        removed.slice(offset, offset + CHECKOUT_WINDOW_ROWS),
+        removed,
         preservedRemovals,
-        sink,
+        options.maxWorktreeRowsPerPass,
       );
     }
+    flushRemovals(repo, worktree, removed, preservedRemovals, sink);
   });
-  if (removed.length > 0) pruneEmptyDirectories(repo, worktree, removed);
+  if (prunePlan !== undefined) pruneEmptyDirectories(repo, worktree, prunePlan);
 
   const written: TargetEntry[] = [];
   const candidates: CheckoutCandidate[] = [];
-  repo.checkout.indexApply((sink) => {
+  index.indexApply((sink) => {
     for (const row of joinSorted3(
-      treeStream(repo, treeOid),
-      stageZero(repo.checkout.indexScan()),
+      boundedCheckoutSourceRows(treeStream(repo, treeOid), options.maxSourceRowsPerPass, "tree"),
+      stageZero(
+        boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index"),
+      ),
       boundedCheckoutWorktreeEntries(
-        walkWorktreeEntriesStream(worktree, repo.root, { includeIgnored: true }),
+        walkWorktreeEntriesStream(worktree, repo.root, {
+          includeIgnored: true,
+          maxScanRows: options.maxWorktreeRowsPerPass,
+        }),
         options.maxWorktreeRowsPerPass,
       ),
       { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
@@ -139,11 +173,11 @@ export function checkoutTree(
       }
       candidates.push({ entry, index: row.b, worktree: row.c });
       if (candidates.length >= CHECKOUT_WINDOW_ROWS) {
-        flushCheckoutCandidates(repo, worktree, candidates, written, sink);
+        flushCheckoutCandidates(repo, worktree, candidates, written, sink, writeBudget);
       }
     }
-    flushCheckoutCandidates(repo, worktree, candidates, written, sink);
-    flushCheckoutWrites(repo, worktree, written, sink);
+    flushCheckoutCandidates(repo, worktree, candidates, written, sink, writeBudget);
+    flushCheckoutWrites(repo, worktree, written, sink, writeBudget);
   });
 }
 
@@ -151,11 +185,13 @@ function discardUnmergedPaths(
   repo: Repository,
   worktree: Worktree,
   maxWorktreeRows: number | undefined,
+  maxSourceRows: number | undefined,
+  index: IndexStore,
 ): void {
   const paths: string[] = [];
   let previousUnmerged: string | null = null;
   let retainedBytes = 0;
-  for (const entry of repo.checkout.indexScan()) {
+  for (const entry of boundedCheckoutSourceRows(index.indexScan(), maxSourceRows, "index")) {
     if (entry.stage === 0 || entry.path === previousUnmerged) continue;
     previousUnmerged = entry.path;
     if (paths.length >= CHECKOUT_UNMERGED_PATHS) {
@@ -179,6 +215,7 @@ function discardUnmergedPaths(
       walkWorktreeEntriesStream(worktree, repo.root, {
         includeIgnored: true,
         filesOnly: true,
+        maxScanRows: maxWorktreeRows,
       }),
       maxWorktreeRows,
     ),
@@ -186,14 +223,10 @@ function discardUnmergedPaths(
   )) {
     if (row.left !== undefined && row.right !== undefined) physical.push(row.left);
   }
-  for (let offset = 0; offset < physical.length; offset += CHECKOUT_WINDOW_ROWS) {
-    worktree.removeFiles(
-      physical
-        .slice(offset, offset + CHECKOUT_WINDOW_ROWS)
-        .map((path) => joinPath(repo.root, path)),
-    );
+  for (const batch of planWorktreeRemovalBatches(repo, physical, "checkout conflict removal")) {
+    worktree.removeFiles(batch.map((path) => joinPath(repo.root, path)));
   }
-  repo.checkout.indexApply((sink) => {
+  index.indexApply((sink) => {
     for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
       for (const path of paths.slice(offset, offset + CHECKOUT_WINDOW_ROWS)) sink.remove(path);
       sink.flush();
@@ -211,6 +244,7 @@ function restoreStructuralConflicts(
   worktree: Worktree,
   treeOid: string | null,
   options: CheckoutOptions,
+  index: IndexStore,
 ): Set<string> {
   const removals = new Set<string>();
   const preservedRemovals = new Set<string>();
@@ -218,8 +252,8 @@ function restoreStructuralConflicts(
   let activeBytes = 0;
   const activeLeaves: Array<{ path: string; upper: string; bytes: number }> = [];
   for (const row of joinSorted3(
-    treeStream(repo, treeOid),
-    stageZero(repo.checkout.indexScan()),
+    boundedCheckoutSourceRows(treeStream(repo, treeOid), options.maxSourceRowsPerPass, "tree"),
+    stageZero(boundedCheckoutSourceRows(index.indexScan(), options.maxSourceRowsPerPass, "index")),
     walkStructuralPaths(worktree, repo.root, options.maxWorktreeRowsPerPass),
     { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
   )) {
@@ -290,7 +324,9 @@ function restoreStructuralConflicts(
         break;
       }
     }
-    const structural = current?.type === "dir" ? target.path : activeLeaf?.path;
+    const targetType = target.mode === "120000" ? "symlink" : "file";
+    const structural =
+      current !== undefined && current.type !== targetType ? target.path : activeLeaf?.path;
     if (structural === undefined || removals.has(structural)) continue;
     if (activeLeaf?.path === structural) {
       activeBytes -= activeLeaf.bytes;
@@ -307,9 +343,9 @@ function restoreStructuralConflicts(
   }
 
   const paths = [...removals].sort(comparePaths);
-  for (let offset = 0; offset < paths.length; offset += CHECKOUT_WINDOW_ROWS) {
+  for (const batch of planWorktreeRemovalBatches(repo, paths, "checkout structural removal")) {
     worktree.removeFiles(
-      paths.slice(offset, offset + CHECKOUT_WINDOW_ROWS).map((path) => joinPath(repo.root, path)),
+      batch.map((path) => joinPath(repo.root, path)),
       { recursive: true },
     );
   }
@@ -328,6 +364,29 @@ function* boundedCheckoutWorktreeEntries(
     rows++;
     yield entry;
   }
+}
+
+function* boundedCheckoutSourceRows<T>(
+  entries: Iterable<T>,
+  maxRows: number | undefined,
+  label: "tree" | "index",
+): Generator<T> {
+  let rows = 0;
+  for (const entry of entries) {
+    if (maxRows !== undefined && rows >= maxRows) {
+      throw new GitError("E2BIG", `checkout ${label} scan exceeds ${maxRows} rows`);
+    }
+    rows++;
+    yield entry;
+  }
+}
+
+function checkoutWriteBudget(maxBytes: number | undefined): CheckoutWriteBudget | undefined {
+  if (maxBytes === undefined) return undefined;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new GitError("EINVAL", "checkout write byte limit must be a safe nonnegative integer");
+  }
+  return { maxBytes, writtenBytes: 0 };
 }
 
 function* walkStructuralPaths(
@@ -367,6 +426,7 @@ function flushCheckoutCandidates(
   candidates: CheckoutCandidate[],
   written: TargetEntry[],
   sink: IndexSink,
+  writeBudget: CheckoutWriteBudget | undefined,
 ): void {
   if (candidates.length === 0) return;
   const contentIds: Uint8Array[] = [];
@@ -406,7 +466,7 @@ function flushCheckoutCandidates(
     if (unchanged) continue;
     written.push(candidate.entry);
     if (written.length >= CHECKOUT_WINDOW_ROWS) {
-      flushCheckoutWrites(repo, worktree, written, sink);
+      flushCheckoutWrites(repo, worktree, written, sink, writeBudget);
     }
   }
 }
@@ -420,11 +480,13 @@ function flushRemovals(
 ): void {
   if (removed.length === 0) return;
   const physical = removed.filter((path) => !preserved.has(path));
-  if (physical.length > 0) {
-    worktree.removeFiles(physical.map((path) => joinPath(repo.root, path)));
+  for (const batch of planWorktreeRemovalBatches(repo, physical, "checkout tracked removal")) {
+    worktree.removeFiles(batch.map((path) => joinPath(repo.root, path)));
   }
-  for (const path of removed) sink.remove(path);
-  sink.flush();
+  for (let offset = 0; offset < removed.length; offset += CHECKOUT_WINDOW_ROWS) {
+    for (const path of removed.slice(offset, offset + CHECKOUT_WINDOW_ROWS)) sink.remove(path);
+    sink.flush();
+  }
 }
 
 /** Conflict stages are not what a checkout replaces, and never were. */
@@ -468,23 +530,121 @@ export function writeEntry(repo: Repository, worktree: Worktree, entry: TargetEn
   };
 }
 
-/** Drop directories left empty by a checkout, deepest first, like git. */
-function pruneEmptyDirectories(repo: Repository, worktree: Worktree, removed: string[]): void {
-  const directories = new Set<string>();
+interface CheckoutPrunePlan {
+  batches: string[][];
+}
+
+/** Preflight the retained directory state before checkout starts removing paths. */
+function planEmptyDirectories(
+  repo: Repository,
+  worktree: Worktree,
+  removed: readonly string[],
+  preserved: ReadonlySet<string>,
+  maxRows: number | undefined,
+): CheckoutPrunePlan {
+  const directories = new Map<string, boolean>();
+  const physicalRemovals = new Set<string>();
+  let retainedBytes = 0;
   for (const path of removed) {
-    const parts = path.split("/");
-    for (let i = parts.length - 1; i > 0; i--) directories.add(parts.slice(0, i).join("/"));
-  }
-  const deepestFirst = [...directories].sort((a, b) => b.split("/").length - a.split("/").length);
-  for (const directory of deepestFirst) {
-    const absolute = joinPath(repo.root, directory);
-    if (
-      worktree.stat(absolute)?.type === "dir" &&
-      worktree.scan(absolute, { limit: 1 }).length === 0
-    ) {
-      worktree.rmdir(absolute);
+    if (!preserved.has(path)) physicalRemovals.add(path);
+    let slash = path.lastIndexOf("/");
+    while (slash > 0) {
+      const directory = path.slice(0, slash);
+      if (!directories.has(directory)) {
+        if (directories.size >= CHECKOUT_PRUNE_PATHS) {
+          throw new GitError(
+            "E2BIG",
+            `checkout directory-prune state exceeds ${CHECKOUT_PRUNE_PATHS} paths`,
+          );
+        }
+        retainedBytes += CHECKOUT_PATH_FIXED_BYTES + directory.length * 2;
+        if (retainedBytes > CHECKOUT_PRUNE_BYTES) {
+          throw new GitError(
+            "E2BIG",
+            `checkout directory-prune state exceeds ${CHECKOUT_PRUNE_BYTES} bytes`,
+          );
+        }
+        directories.set(directory, false);
+      }
+      slash = directory.lastIndexOf("/");
     }
   }
+  if (directories.size === 0) return { batches: [] };
+  for (const entry of walkWorktreeEntriesStream(worktree, repo.root, {
+    includeIgnored: true,
+    includeDirectories: true,
+    maxScanRows: maxRows,
+  })) {
+    if (physicalRemovals.has(entry.path)) continue;
+    if (entry.stat.type === "dir" && directories.has(entry.path)) continue;
+    let candidate = entry.path;
+    while (candidate !== "") {
+      if (directories.has(candidate)) directories.set(candidate, true);
+      const slash = candidate.lastIndexOf("/");
+      candidate = slash < 0 ? "" : candidate.slice(0, slash);
+    }
+  }
+
+  const roots: string[] = [];
+  for (const [directory, hasContents] of directories) {
+    if (hasContents) continue;
+    const slash = directory.lastIndexOf("/");
+    const parent = slash < 0 ? undefined : directory.slice(0, slash);
+    if (parent !== undefined && directories.get(parent) === false) continue;
+    roots.push(directory);
+  }
+  roots.sort(comparePaths);
+  return {
+    batches: planWorktreeRemovalBatches(repo, roots, "checkout directory pruning"),
+  };
+}
+
+/** Drop preflighted empty candidate subtrees after tracked leaves are gone. */
+function pruneEmptyDirectories(
+  repo: Repository,
+  worktree: Worktree,
+  plan: CheckoutPrunePlan,
+): void {
+  for (const batch of plan.batches) {
+    worktree.removeFiles(
+      batch.map((path) => joinPath(repo.root, path)),
+      { recursive: true },
+    );
+  }
+}
+
+/** Keep every JSON binding below the platform ceiling before the first delete. */
+function planWorktreeRemovalBatches(
+  repo: Repository,
+  paths: readonly string[],
+  label: string,
+): string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let bytes = 2;
+  const flush = (): void => {
+    if (batch.length === 0) return;
+    if (batches.length >= CHECKOUT_REMOVE_BATCHES) {
+      throw new GitError("E2BIG", `${label} exceeds ${CHECKOUT_REMOVE_BATCHES} removal batches`);
+    }
+    batches.push(batch);
+    batch = [];
+    bytes = 2;
+  };
+
+  for (const path of paths) {
+    const absolute = joinPath(repo.root, path);
+    const itemBytes = utf8.encode(JSON.stringify(absolute)).byteLength;
+    if (itemBytes + 2 > CHECKOUT_REMOVE_BINDING_BYTES) {
+      throw new GitError("E2BIG", `${label} path exceeds ${CHECKOUT_REMOVE_BINDING_BYTES} bytes`);
+    }
+    const separator = batch.length === 0 ? 0 : 1;
+    if (batch.length > 0 && bytes + separator + itemBytes > CHECKOUT_REMOVE_BINDING_BYTES) flush();
+    batch.push(path);
+    bytes += (batch.length === 1 ? 0 : 1) + itemBytes;
+  }
+  flush();
+  return batches;
 }
 
 /** Index rows describing a tree exactly, without touching the working tree. */

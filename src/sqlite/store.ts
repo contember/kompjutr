@@ -2189,6 +2189,10 @@ class ScratchTransactionCoordinator {
   #failure: unknown;
   readonly #storageWrites = new Set<ScratchStorageCache>();
 
+  get active(): boolean {
+    return this.#depth > 0;
+  }
+
   enter(): boolean {
     const outermost = this.#depth === 0;
     this.#depth++;
@@ -2292,6 +2296,17 @@ export class SharedRepoStore {
       throw new CorruptError("shared operations facade belongs to another repository");
     }
     if (this.#operations === null) this.#operations = operations;
+  }
+
+  /** Poison an owning scratch transaction when a nested operation fails. */
+  runScratchAwareOperation<T>(body: () => T): T {
+    this.#scratchTransactions.requireHealthy();
+    try {
+      return body();
+    } catch (error) {
+      if (this.#scratchTransactions.active) this.#scratchTransactions.fail(error);
+      throw error;
+    }
   }
 
   /** Run one named scratch index inside the caller's synchronous transaction. */

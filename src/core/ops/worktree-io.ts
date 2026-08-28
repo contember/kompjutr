@@ -57,6 +57,8 @@ export interface WalkOptions {
   includeDirectories?: boolean;
   /** Skip a directory and every descendant after its scan row is observed. */
   pruneDirectory?: (path: string) => boolean;
+  /** Fail before consuming more raw filesystem rows, including directories. */
+  maxScanRows?: number;
 }
 
 /** One immutable exact/prefix pathspec projection in Git byte order. */
@@ -283,6 +285,12 @@ export function* walkWorktreeEntriesStream(
   options: WalkOptions = {},
 ): Generator<WorktreePath> {
   if (
+    options.maxScanRows !== undefined &&
+    (!Number.isSafeInteger(options.maxScanRows) || options.maxScanRows < 0)
+  ) {
+    throw new GitError("EINVAL", "worktree scan row limit must be a safe nonnegative integer");
+  }
+  if (
     options.filesOnly === true &&
     ((options.excludeRoots?.length ?? 0) > 0 ||
       (options.paths?.length ?? 0) > 0 ||
@@ -303,6 +311,7 @@ export function* walkWorktreeEntriesStream(
   );
   let after: string | undefined;
   let afterSubtree: string | undefined;
+  let scannedRows = 0;
   const pruned: Array<{ directory: string; lower: string; upper: string }> = [];
 
   while (true) {
@@ -320,6 +329,10 @@ export function* walkWorktreeEntriesStream(
     for (let index = 0; index < entries.length; index++) {
       const entry = entries[index];
       if (entry === undefined) continue;
+      if (options.maxScanRows !== undefined && scannedRows >= options.maxScanRows) {
+        throw new GitError("E2BIG", `worktree scan exceeds ${options.maxScanRows} rows`);
+      }
+      scannedRows++;
       after = entry.path;
 
       while (

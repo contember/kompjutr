@@ -97,7 +97,8 @@ missing contract found during planning.
   sparse index accelerators but retains bounded full-scan behavior. `readTree`
   replaces the selected index from a tree or the empty tree. Its update-worktree
   mode uses the selected index for conflict and dirty-state decisions without
-  changing the checkout index or tracker.
+  changing the checkout index or resealing the tracker; filesystem triggers
+  keep the existing tracker baseline and journal accurate worktree dirtiness.
 - **Acceptance / witness.** A scratch `readTree` + `add --all` cycle matches
   Git's alternate-index entries and leaves checkout index bytes, worktree (when
   update is false), tracker, HEAD, refs, and reflogs unchanged. Update-worktree
@@ -237,3 +238,12 @@ git diff --check
   poison coordinator now forces the outer rollback across repositories for both
   throws and thenables; the new regression and all 149 focused store/schema
   tests plus 37 commit tests pass.
+- 2026-08-28: WU2 made add and checkout operate on either checkout or scratch
+  index rows, then added tree-ish and empty `readTree` with transactional
+  reset-with-update behavior. Real Git parity covers alternate-index staging,
+  annotated tags, file/symlink and file/directory transitions, and exact control
+  state isolation. Row, retained-memory, hash, checkout-write, and SQL binding
+  limits fail closed before mutation; directory pruning uses bounded scans and
+  preflighted bulk removals. Independent review is clean, typecheck and Biome
+  pass, and all 119 focused plumbing, staging, worktree, and sparse-checkout
+  tests pass.

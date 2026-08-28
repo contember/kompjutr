@@ -5,7 +5,12 @@
 // tracked-file count is the single `SELECT` over `git_index` — everything
 // after that is bounded by what actually changed.
 
-import { contentIdKey, type IndexEntry, type IndexSink } from "../../sqlite/store.js";
+import {
+  contentIdKey,
+  type IndexEntry,
+  type IndexSink,
+  type IndexStore,
+} from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { GitError, hasErrorCode, PathspecNotFoundError } from "../errors.js";
@@ -42,10 +47,14 @@ import {
 
 const ADD_WINDOW_ROWS = 1000;
 const ADD_RETAINED_BYTES = 16 * 1024 * 1024;
+const ADD_MAX_ROWS_PER_STREAM = 50_000;
+const ADD_MAX_HASH_BYTES = 64 * 1024 * 1024;
+const ADD_MAX_HASH_RANGE_READS = 64;
 const ADD_SELECTED_RETAINED_BYTES = 8 * 1024 * 1024;
 const ADD_SELECTED_PATHS = 1_000;
 const ADD_SELECTED_ROWS = 32_768;
 const ADD_SELECTED_PATH_BYTES = 2_200;
+const ADD_SCALAR_PATHS = 128;
 const INDEX_ROW_FIXED_BYTES = 256;
 const PATH_ENTRY_FIXED_BYTES = 96;
 const SELECTED_RESULT_FIXED_BYTES = 64;
@@ -74,6 +83,14 @@ interface AddIndexPath {
 interface AddIndexSnapshot {
   paths: AddIndexPath[];
   conflicted: Set<string>;
+}
+
+interface AddOperationLimits {
+  indexRows: number;
+  worktreeRows: number;
+  headRows: number;
+  hashBytes: number;
+  hashRangeReads: number;
 }
 
 interface StageCandidate {
@@ -110,39 +127,67 @@ export function add(
   worktree: Worktree,
   options: AddOptions,
   context?: Pick<GitContext, "selectedPaths" | "sparseWorkspace">,
+  index: IndexStore = repo.checkout,
 ): void {
-  const all = options.all === true;
-  const specs = normalizeSpecs(options.paths);
-  if (!all && specs.length === 0) return;
+  repo.store.runScratchAwareOperation(() => {
+    const all = options.all === true;
+    const specs = normalizeSpecs(options.paths);
+    if (!all && specs.length === 0) return;
 
-  const force = options.force === true;
-  const trackedOnly = all && options.trackedOnly === true;
-  const pathspec = all ? undefined : compilePathspecs(specs);
-  if (!all && pathspec !== undefined) {
-    const selected = selectAddPaths(repo, specs, pathspec, context);
-    if (selected !== null) {
-      assertSelectedPathspecsMatch(specs, selected);
-      applyAdd(
-        repo,
-        worktree,
-        options,
-        snapshotAddIndexRows(selected.index, pathspec, selected.retainedBytes),
-        selectedWorktreeFiles(selected.worktree, pathspec),
-        pathspec,
-        force,
-        false,
-      );
-      return;
+    const limits: AddOperationLimits = {
+      indexRows: 0,
+      worktreeRows: 0,
+      headRows: 0,
+      hashBytes: 0,
+      hashRangeReads: 0,
+    };
+    const force = options.force === true;
+    const trackedOnly = all && options.trackedOnly === true;
+    const pathspec = all ? undefined : compilePathspecs(specs);
+    if (!all && pathspec !== undefined) {
+      const selected =
+        index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context) : null;
+      if (selected !== null) {
+        assertSelectedPathspecsMatch(specs, selected);
+        applyAdd(
+          repo,
+          worktree,
+          options,
+          snapshotAddIndexRows(selected.index, pathspec, selected.retainedBytes, limits),
+          selectedWorktreeFiles(selected.worktree, pathspec),
+          pathspec,
+          force,
+          false,
+          index,
+          limits,
+        );
+        return;
+      }
+      if (specs.length > ADD_SCALAR_PATHS) {
+        throw new GitError("E2BIG", `add pathspec fallback exceeds ${ADD_SCALAR_PATHS} paths`);
+      }
+      assertPathspecsMatch(repo, worktree, specs, index);
     }
-    assertPathspecsMatch(repo, worktree, specs);
-  }
 
-  const snapshot = snapshotAddIndex(repo, pathspec);
-  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
-    pathspec,
-    includeIgnored: true,
+    const snapshot = snapshotAddIndex(index, pathspec, limits);
+    const walked = walkWorktreeEntriesStream(worktree, repo.root, {
+      pathspec,
+      includeIgnored: true,
+      maxScanRows: ADD_MAX_ROWS_PER_STREAM,
+    });
+    applyAdd(
+      repo,
+      worktree,
+      options,
+      snapshot,
+      walked,
+      pathspec,
+      force,
+      trackedOnly,
+      index,
+      limits,
+    );
   });
-  applyAdd(repo, worktree, options, snapshot, walked, pathspec, force, trackedOnly);
 }
 
 function applyAdd(
@@ -154,6 +199,8 @@ function applyAdd(
   pathspec: CompiledPathspecMatcher | undefined,
   force: boolean,
   trackedOnly: boolean,
+  index: IndexStore,
+  limits: AddOperationLimits,
 ): void {
   let ignores: IgnoreMatcher | undefined;
   const isIgnored = (path: string): boolean => {
@@ -165,14 +212,19 @@ function applyAdd(
   // `commit -a` never adds a path HEAD does not already have.
   const head = trackedOnly ? treeStream(repo, repo.headTree()) : [];
 
-  repo.checkout.indexApply((sink) => {
+  index.indexApply((sink) => {
     const pending: StageCandidate[] = [];
-    const flush = (): void => stageCandidates(repo, worktree, pending, sink);
-    for (const row of joinSorted3(walked, snapshot.paths, head, {
-      a: (entry) => entry.path,
-      b: (entry) => entry.path,
-      c: (entry) => entry.path,
-    })) {
+    const flush = (): void => stageCandidates(repo, worktree, pending, sink, limits);
+    for (const row of joinSorted3(
+      boundedAddWorktreeRows(walked, limits),
+      snapshot.paths,
+      boundedAddHeadRows(head, limits),
+      {
+        a: (entry) => entry.path,
+        b: (entry) => entry.path,
+        c: (entry) => entry.path,
+      },
+    )) {
       if (trackedOnly && row.c === undefined) continue;
       const existing = row.b?.entry;
 
@@ -927,22 +979,28 @@ function lowerBoundSelectedPath<T extends { path: string }>(
 }
 
 function snapshotAddIndex(
-  repo: Repository,
+  index: IndexStore,
   pathspec: CompiledPathspecMatcher | undefined,
+  limits: AddOperationLimits,
 ): AddIndexSnapshot {
-  return snapshotAddIndexRows(repo.checkout.indexScan(), pathspec, 0);
+  return snapshotAddIndexRows(index.indexScan(), pathspec, 0, limits);
 }
 
 function snapshotAddIndexRows(
   entries: Iterable<IndexEntry>,
   pathspec: CompiledPathspecMatcher | undefined,
   initialRetained: number,
+  limits: AddOperationLimits,
 ): AddIndexSnapshot {
   const paths: AddIndexPath[] = [];
   const conflicted = new Set<string>();
   let retained = initialRetained;
   let current: AddIndexPath | null = null;
   for (const entry of entries) {
+    if (limits.indexRows >= ADD_MAX_ROWS_PER_STREAM) {
+      throw new GitError("E2BIG", `add index scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
+    }
+    limits.indexRows++;
     if (pathspec !== undefined && !pathspec.matches(entry.path)) continue;
     retained +=
       INDEX_ROW_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid);
@@ -967,11 +1025,38 @@ function snapshotAddIndexRows(
   return { paths, conflicted };
 }
 
+function* boundedAddWorktreeRows(
+  entries: Iterable<WorktreePath>,
+  limits: AddOperationLimits,
+): Generator<WorktreePath> {
+  for (const entry of entries) {
+    if (limits.worktreeRows >= ADD_MAX_ROWS_PER_STREAM) {
+      throw new GitError("E2BIG", `add worktree scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
+    }
+    limits.worktreeRows++;
+    yield entry;
+  }
+}
+
+function* boundedAddHeadRows(
+  entries: Iterable<TargetEntry>,
+  limits: AddOperationLimits,
+): Generator<TargetEntry> {
+  for (const entry of entries) {
+    if (limits.headRows >= ADD_MAX_ROWS_PER_STREAM) {
+      throw new GitError("E2BIG", `add HEAD scan exceeds ${ADD_MAX_ROWS_PER_STREAM} rows`);
+    }
+    limits.headRows++;
+    yield entry;
+  }
+}
+
 function stageCandidates(
   repo: Repository,
   worktree: Worktree,
   candidates: StageCandidate[],
   sink: IndexSink,
+  limits: AddOperationLimits,
 ): void {
   if (candidates.length === 0) return;
   const rows = candidates.splice(0);
@@ -989,9 +1074,19 @@ function stageCandidates(
     if (row.existing !== undefined && indexMatchesStat(row.existing, row.worktree.stat)) continue;
     const contentId = row.worktree.stat.contentId;
     const oid = contentId === null ? undefined : identities.get(contentIdKey(contentId));
-    if (oid === undefined) unresolved.push(row.worktree);
-    else mapped.set(row.path, oid);
+    if (oid === undefined) {
+      if (row.worktree.stat.size > ADD_MAX_HASH_BYTES - limits.hashBytes) {
+        throw new GitError("E2BIG", `add hashing exceeds ${ADD_MAX_HASH_BYTES} bytes`);
+      }
+      limits.hashBytes += row.worktree.stat.size;
+      unresolved.push(row.worktree);
+    } else mapped.set(row.path, oid);
   }
+  const rangeReads = worktreeHashRangeReads(unresolved);
+  if (rangeReads > ADD_MAX_HASH_RANGE_READS - limits.hashRangeReads) {
+    throw new GitError("E2BIG", `add hashing exceeds ${ADD_MAX_HASH_RANGE_READS} range reads`);
+  }
+  limits.hashRangeReads += rangeReads;
   const hashes = hashWorktreePaths(repo, worktree, unresolved);
   repo.store.upsertBlobIds(
     [...hashes.values()].flatMap((hashed) => {
@@ -1640,11 +1735,16 @@ function normalizeSpecs(paths: string[]): string[] {
  * match lives under a directory that exists on disk, and anything tracked
  * shows up in a prefix scan of the index. Neither needs the whole tree.
  */
-function assertPathspecsMatch(repo: Repository, worktree: Worktree, specs: string[]): void {
+function assertPathspecsMatch(
+  repo: Repository,
+  worktree: Worktree,
+  specs: string[],
+  index: IndexStore,
+): void {
   for (const spec of specs) {
     if (spec === "") continue;
     if (worktree.stat(joinPath(repo.root, spec)) !== null) continue;
-    const tracked = repo.checkout.indexScan({ prefix: spec, pageSize: 1 }).next();
+    const tracked = index.indexScan({ prefix: spec, pageSize: 1 }).next();
     if (tracked.done !== true) continue;
     throw new PathspecNotFoundError(spec);
   }
