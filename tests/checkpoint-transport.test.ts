@@ -71,7 +71,7 @@ describe("checkpoint transport workflow", () => {
     try {
       const authoring = makeWorkspace({ startTime: 1_700_000_000_000 });
       const git = bindGit(authoring);
-      await git.clone({ url: server.url, dir: "/", onAuth });
+      await git.clone({ url: server.url, dir: "/", onAuth, singleBranch: true });
       const intermediate = await commit(authoring, git, "checkpoint\n", "checkpoint");
       await git.updateRef({
         ref: "refs/checkpoints/session/step-1",
@@ -215,7 +215,7 @@ describe("checkpoint transport workflow", () => {
     try {
       const workspace = makeWorkspace();
       const git = bindGit(workspace);
-      await git.clone({ url: server.url, dir: "/" });
+      await git.clone({ url: server.url, dir: "/", singleBranch: true });
       const tip = await commit(workspace, git, "partial\n", "partial");
       await git.updateRef({
         ref: "refs/checkpoints/session/rejected",
@@ -309,7 +309,7 @@ describe("checkpoint transport workflow", () => {
     try {
       const workspace = makeWorkspace();
       const git = bindGit(workspace);
-      await git.clone({ url: server.url, dir: "/" });
+      await git.clone({ url: server.url, dir: "/", singleBranch: true });
       const tip = await commit(workspace, git, "hooked\n", "hooked");
 
       const result = await git.push({
@@ -339,7 +339,7 @@ describe("checkpoint transport workflow", () => {
     try {
       const workspace = makeWorkspace();
       const normalGit = bindGit(workspace);
-      await normalGit.clone({ url: server.url, dir: "/" });
+      await normalGit.clone({ url: server.url, dir: "/", singleBranch: true });
       const intermediate = await commit(workspace, normalGit, "intermediate\n", "intermediate");
       const tip = await commit(workspace, normalGit, "tip\n", "tip");
       let posted = false;
@@ -382,7 +382,7 @@ describe("checkpoint transport workflow", () => {
     try {
       const workspace = makeWorkspace();
       const normalGit = bindGit(workspace);
-      await normalGit.clone({ url: server.url, dir: "/" });
+      await normalGit.clone({ url: server.url, dir: "/", singleBranch: true });
       await normalGit.updateRef({
         ref: "refs/remotes/origin/session",
         value: base,
@@ -428,7 +428,7 @@ describe("checkpoint transport workflow", () => {
     try {
       const workspace = makeWorkspace();
       const normalGit = bindGit(workspace);
-      await normalGit.clone({ url: server.url, dir: "/" });
+      await normalGit.clone({ url: server.url, dir: "/", singleBranch: true });
       const tip = await commit(workspace, normalGit, "bounded\n", "bounded");
       let posted = false;
       const exhaustingHttp: GitHttpClient = async (request) => {
