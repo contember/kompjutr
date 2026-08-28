@@ -1219,6 +1219,49 @@ describe("refs, config and index", () => {
     expect(store.getRef("HEAD")).toBe("c".repeat(40));
   });
 
+  it("streams repository refs with symbolic targets in strict Git byte order", () => {
+    const { database, store } = open();
+    const direct = "1".repeat(40);
+    const privateUse = "refs/tags/\ue000";
+    const supplementary = "refs/tags/\u{10000}";
+    store.updateRefs([
+      { name: supplementary, target: direct },
+      { name: "refs/heads/main", target: direct },
+      { name: privateUse, target: direct },
+      {
+        name: "refs/remotes/origin/HEAD",
+        target: "ref: refs/remotes/origin/main",
+      },
+    ]);
+    const foreign = database.openCheckout(
+      database.createRepository("/foreign", "ref: refs/heads/main"),
+    );
+    foreign.setRef("refs/heads/foreign", "2".repeat(40));
+
+    expect([...store.shared.iterateRefs()]).toEqual([
+      { name: "refs/heads/main", target: direct },
+      {
+        name: "refs/remotes/origin/HEAD",
+        target: "ref: refs/remotes/origin/main",
+      },
+      { name: privateUse, target: direct },
+      { name: supplementary, target: direct },
+    ]);
+  });
+
+  it.each([
+    ["name", "UPDATE git_refs SET name = '' WHERE repo_id = 1"],
+    ["target", "UPDATE git_refs SET target = 'broken' WHERE repo_id = 1"],
+  ])("rejects a corrupt stored ref %s while streaming", (_field, corruption) => {
+    const { db, store } = open();
+    store.setRef("refs/heads/main", "1".repeat(40));
+    db.run(corruption);
+
+    expect(() => [...store.shared.iterateRefs()]).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
   it("lets only the newest same-namespace fetch publish, including after its raw no-op", () => {
     const { store } = open();
     const name = "refs/remotes/origin/main";

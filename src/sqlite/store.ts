@@ -2810,6 +2810,11 @@ export class SharedRepoStore {
     return this.#ops().listRefs(prefix);
   }
 
+  /** Stream one validated, repository-scoped raw-ref snapshot in Git byte order. */
+  *iterateRefs(): Generator<RefRow> {
+    yield* this.#ops().iterateRefs();
+  }
+
   reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {
     if (refName === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
     return this.#ops().reflog(refName, options);
@@ -7178,6 +7183,35 @@ export class CheckoutStore implements IndexStore {
       prefix,
       nextPrefix(prefix),
     );
+  }
+
+  /** Stream all raw refs without materializing repository ref state. */
+  *iterateRefs(): Generator<RefRow> {
+    let rows = 0;
+    let previousName: string | null = null;
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, name, target
+         FROM git_refs
+        WHERE repo_id = ?
+        ORDER BY name
+        LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`,
+      this.#repoId,
+    )) {
+      if (row.repo_id !== this.#repoId) {
+        throw new CorruptError("raw ref snapshot crossed repository boundaries");
+      }
+      const name = requireRefName(row.name, "stored ref name", "stored");
+      const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
+      if (previousName !== null && comparePaths(previousName, name) >= 0) {
+        throw new CorruptError("stored refs are not in strict Git byte order");
+      }
+      rows++;
+      if (rows > MAX_REFLOG_STATE_ROWS) {
+        throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
+      }
+      previousName = name;
+      yield { name, target };
+    }
   }
 
   head(): string {
