@@ -1046,7 +1046,7 @@ describe("synthetic pack ingest", () => {
     await maintenance.packs.ingest(slices(singleBlobPack(utf8.encode("count maintenance\n")), 17), {
       reclaimPending: false,
     });
-    expect(maintenanceDb.storage.statementCount).toBe(ordinaryStatements - 4);
+    expect(maintenanceDb.storage.statementCount).toBe(ordinaryStatements - 3);
 
     const invalidOptions = {};
     Reflect.set(invalidOptions, "reclaimPending", "no");
@@ -1249,8 +1249,8 @@ describe("synthetic pack ingest", () => {
 
     const blobs = await measure("blob");
     const commits = await measure("commit");
-    expect(blobs.statements).toBe(17);
-    expect(commits.statements).toBe(18);
+    expect(blobs.statements).toBe(16);
+    expect(commits.statements).toBe(17);
     expect(commits.cached).toBe(500);
     expect(commits.statements - blobs.statements).toBe(1);
   });
