@@ -87,6 +87,8 @@ import {
   MAX_REFSPEC_EXPANDED_DESTINATIONS as GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS as GIT_MAX_REFSPEC_MAPPINGS,
   MAX_REFSPEC_REF_BYTES as GIT_MAX_REFSPEC_REF_BYTES,
+  MAX_REMOTE_NAME_BYTES as GIT_MAX_REMOTE_NAME_BYTES,
+  MAX_REMOTE_URL_BYTES as GIT_MAX_REMOTE_URL_BYTES,
   commitTree as gitCommitTree,
   divergence as gitDivergence,
   mergeBase as gitMergeBase,
@@ -189,6 +191,8 @@ import {
   MAX_REFSPEC_EXPANDED_DESTINATIONS as ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS as ROOT_MAX_REFSPEC_MAPPINGS,
   MAX_REFSPEC_REF_BYTES as ROOT_MAX_REFSPEC_REF_BYTES,
+  MAX_REMOTE_NAME_BYTES as ROOT_MAX_REMOTE_NAME_BYTES,
+  MAX_REMOTE_URL_BYTES as ROOT_MAX_REMOTE_URL_BYTES,
   commitTree as rootCommitTree,
   divergence as rootDivergence,
   mergeBase as rootMergeBase,
@@ -924,10 +928,22 @@ describe("public remote URL exports", () => {
     const rootMethods: readonly (keyof RootGit)[] = ["remoteGetUrl", "remoteSetUrl"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
 
-    expect([gitGet.name, gitSet.url, gitMethods]).toEqual([
+    expect([
+      gitGet.name,
+      gitSet.url,
+      gitMethods,
+      GIT_MAX_REMOTE_NAME_BYTES,
+      GIT_MAX_REMOTE_URL_BYTES,
+      ROOT_MAX_REMOTE_NAME_BYTES,
+      ROOT_MAX_REMOTE_URL_BYTES,
+    ]).toEqual([
       "origin",
       "https://example.test/repo.git",
       rootMethods,
+      2_189,
+      8_192,
+      2_189,
+      8_192,
     ]);
   });
 });

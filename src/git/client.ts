@@ -398,6 +398,17 @@ export function createGit(options: CreateGitOptions = {}): GitFactory {
   return (binding) => createGitClient(binding, options);
 }
 
+function remoteOptionsDir(options: unknown, operation: string): string | undefined {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new GitError("EINVAL", `${operation} options must be an object`);
+  }
+  const dir = Reflect.get(options, "dir");
+  if (dir !== undefined && typeof dir !== "string") {
+    throw new GitError("EINVAL", `${operation} dir must be a string`);
+  }
+  return dir;
+}
+
 function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions): Git {
   const context: GitContext = {
     database: binding.database,
@@ -601,13 +612,13 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       remoteAdd(at(input.dir), input);
     },
     async remoteGetUrl(input) {
-      return remoteGetUrl(at(input.dir), input);
+      return remoteGetUrl(at(remoteOptionsDir(input, "remote get-url")), input);
     },
     async remoteRemove(input) {
       remoteRemove(at(input.dir), input);
     },
     async remoteSetUrl(input) {
-      remoteSetUrl(at(input.dir), input);
+      remoteSetUrl(at(remoteOptionsDir(input, "remote set-url")), input);
     },
     async remoteList(input = {}) {
       return remoteList(at(input.dir));
