@@ -21,6 +21,7 @@ export type RefLogReason =
   | "branch: create"
   | "branch: reset"
   | "branch: delete"
+  | "branch: rename"
   | "tag: create"
   | "tag: update"
   | "tag: delete"

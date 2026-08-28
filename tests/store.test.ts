@@ -9,12 +9,19 @@ import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
 import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
-import { MAX_BLOB_ID_CACHE_ROWS, MAX_TRACKING_REF_REVISIONS } from "../src/sqlite/schema.js";
+import {
+  MAX_BLOB_ID_CACHE_ROWS,
+  MAX_INDEX_PATH_BYTES,
+  MAX_TRACKING_REF_REVISIONS,
+} from "../src/sqlite/schema.js";
 import {
   ancestors,
   blobIdMismatchRetainedBytes,
+  CONFIG_SECTION_MOVE_UPDATE_SQL,
   contentIdKey,
   MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
+  MAX_CONFIG_SECTION_MOVE_ROWS,
+  MAX_CONFIG_SECTION_MOVE_TEXT_BYTES,
   MAX_REF_MUTATION_RETAINED_BYTES,
   REF_MUTATION_FIXED_RETAINED_BYTES,
   refMutationCheckoutRetainedBytes,
@@ -2672,6 +2679,251 @@ describe("refs, config and index", () => {
     expect(store.configPaths("remote.")).toEqual(["remote.origin.fetch"]);
     store.configUnset("user.email");
     expect(store.configGet("user.email")).toBeUndefined();
+  });
+
+  it("moves an exact config section while preserving paths and sequences", () => {
+    const { db, store } = open();
+    store.configAdd("branch.old.merge", "refs/heads/main");
+    store.configAdd("branch.old.remote", "first");
+    store.configAdd("branch.old.remote", "second");
+    store.configSet("branch.old.child.remote", "dotted sibling");
+    store.configSet("branch.older.remote", "untouched");
+
+    store.configMoveSection("branch.old.", "branch.new.");
+
+    expect(store.configPaths("branch.old.")).toEqual(["branch.old.child.remote"]);
+    expect(store.configGetAll("branch.new.remote")).toEqual(["first", "second"]);
+    expect(
+      db.all<{ path: string; seq: number; value: string }>(
+        "SELECT path, seq, value FROM git_config WHERE repo_id = 1 ORDER BY path, seq",
+      ),
+    ).toEqual([
+      { path: "branch.new.merge", seq: 0, value: "refs/heads/main" },
+      { path: "branch.new.remote", seq: 0, value: "first" },
+      { path: "branch.new.remote", seq: 1, value: "second" },
+      { path: "branch.old.child.remote", seq: 0, value: "dotted sibling" },
+      { path: "branch.older.remote", seq: 0, value: "untouched" },
+    ]);
+  });
+
+  it("moves a config section beside a dotted destination sibling without absorbing it", () => {
+    const { store } = open();
+    store.configSet("branch.old.remote", "origin");
+    store.configSet("branch.new.child.remote", "sibling");
+
+    store.configMoveSection("branch.old.", "branch.new.");
+
+    expect(store.configGet("branch.new.remote")).toBe("origin");
+    expect(store.configGet("branch.new.child.remote")).toBe("sibling");
+  });
+
+  it("refuses a config section destination before changing the source", () => {
+    const { store } = open();
+    store.configSet("branch.old.remote", "origin");
+    store.configSet("branch.new.merge", "refs/heads/main");
+
+    expect(() => store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+      expect.objectContaining({ code: "EEXIST" }),
+    );
+    expect(store.configGet("branch.old.remote")).toBe("origin");
+    expect(store.configGet("branch.new.merge")).toBe("refs/heads/main");
+  });
+
+  it("detects exact config section destinations in both dotted rename directions", () => {
+    const intoDotted = open();
+    intoDotted.store.configSet("branch.foo.remote", "source");
+    intoDotted.store.configSet("branch.foo.bar.remote", "destination");
+    expect(() => intoDotted.store.configMoveSection("branch.foo.", "branch.foo.bar.")).toThrowError(
+      expect.objectContaining({ code: "EEXIST" }),
+    );
+    expect(intoDotted.store.configGet("branch.foo.remote")).toBe("source");
+    expect(intoDotted.store.configGet("branch.foo.bar.remote")).toBe("destination");
+
+    const fromDotted = open();
+    fromDotted.store.configSet("branch.foo.bar.remote", "source");
+    fromDotted.store.configSet("branch.foo.remote", "destination");
+    expect(() => fromDotted.store.configMoveSection("branch.foo.bar.", "branch.foo.")).toThrowError(
+      expect.objectContaining({ code: "EEXIST" }),
+    );
+    expect(fromDotted.store.configGet("branch.foo.bar.remote")).toBe("source");
+    expect(fromDotted.store.configGet("branch.foo.remote")).toBe("destination");
+  });
+
+  it("bounds inspected config section candidates but ignores unrelated sparse config", () => {
+    const crowded = open();
+    crowded.store.configSet("branch.old.remote", "origin");
+    for (let index = 0; index < MAX_CONFIG_SECTION_MOVE_ROWS; index++) {
+      crowded.store.configSet(
+        `branch.old.child-${index.toString().padStart(4, "0")}.remote`,
+        "sibling",
+      );
+    }
+    expect(() => crowded.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(crowded.store.configGet("branch.old.remote")).toBe("origin");
+    expect(crowded.store.configGet("branch.new.remote")).toBeUndefined();
+
+    const sparse = open();
+    sparse.store.configSet("branch.old.remote", "origin");
+    for (let index = 0; index <= MAX_CONFIG_SECTION_MOVE_ROWS; index++) {
+      sparse.store.configSet(`remote.unrelated-${index.toString().padStart(4, "0")}.url`, "x");
+    }
+    const mutationPlan = sparse.db.all<{ detail: string }>(
+      `EXPLAIN QUERY PLAN ${CONFIG_SECTION_MOVE_UPDATE_SQL}`,
+      "branch.new.",
+      "branch.old.",
+      1,
+      "branch.old.",
+      "branch.old/",
+      JSON.stringify([{ path: "branch.old.remote", seq: 0 }]),
+    );
+    expect(mutationPlan.map((row) => row.detail)).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(
+          /SEARCH git_config USING .*\(repo_id=\? AND path>[?]? AND path<[?]?\)/,
+        ),
+      ]),
+    );
+    sparse.db.storage.resetCounters();
+    sparse.store.configMoveSection("branch.old.", "branch.new.");
+    expect(sparse.db.storage.statementCount).toBe(5);
+    expect(sparse.store.configGet("branch.new.remote")).toBe("origin");
+  });
+
+  it("rejects invalid config section inputs before issuing SQL", () => {
+    const { db, store } = open();
+    const calls: readonly (readonly unknown[])[] = [
+      [42, "branch.new."],
+      ["branch.old.", null],
+      ["branch.old", "branch.new."],
+      ["branch..old.", "branch.new."],
+      ["branch.\ud800.", "branch.new."],
+      [`${"x".repeat(MAX_INDEX_PATH_BYTES + 1)}.`, "branch.new."],
+    ];
+    for (const args of calls) {
+      db.storage.resetCounters();
+      expect(() => Reflect.apply(store.configMoveSection, store, args)).toThrowError(
+        expect.objectContaining({ code: expect.stringMatching(/^(EINVAL|E2BIG)$/) }),
+      );
+      expect(db.storage.statementCount).toBe(0);
+    }
+  });
+
+  it("accepts the exact config section row bound and rejects one more", () => {
+    const exact = open();
+    for (let index = 0; index < MAX_CONFIG_SECTION_MOVE_ROWS; index++) {
+      exact.store.configSet(`branch.old.key-${index.toString().padStart(4, "0")}`, "x");
+    }
+    exact.db.storage.resetCounters();
+    exact.store.configMoveSection("branch.old.", "branch.new.");
+    expect(exact.db.storage.statementCount).toBe(5);
+    expect(exact.db.storage.statementCount).toBeLessThan(1_000);
+    expect(exact.store.configPaths("branch.new.")).toHaveLength(MAX_CONFIG_SECTION_MOVE_ROWS);
+
+    const over = open();
+    for (let index = 0; index <= MAX_CONFIG_SECTION_MOVE_ROWS; index++) {
+      over.store.configSet(`branch.old.key-${index.toString().padStart(4, "0")}`, "x");
+    }
+    expect(() => over.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(over.store.configPaths("branch.old.")).toHaveLength(MAX_CONFIG_SECTION_MOVE_ROWS + 1);
+    expect(over.store.configPaths("branch.new.")).toEqual([]);
+  });
+
+  it("accepts the exact config section text bound and rejects one more byte", () => {
+    const path = "branch.old.remote";
+    const pathBytes = new TextEncoder().encode(path).byteLength;
+    const exact = open();
+    exact.store.configSet(path, "x".repeat(MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes));
+    exact.store.configMoveSection("branch.old.", "branch.new.");
+    expect(exact.store.configGet("branch.new.remote")?.length).toBe(
+      MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes,
+    );
+
+    const over = open();
+    over.store.configSet(path, "x".repeat(MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes + 1));
+    expect(() => over.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(over.store.configGet(path)?.length).toBe(
+      MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes + 1,
+    );
+  });
+
+  it("rejects corrupt config section rows before mutation", () => {
+    const corruptValue = open();
+    corruptValue.store.configSet("branch.old.remote", "origin");
+    corruptValue.db.run(
+      "UPDATE git_config SET value = zeroblob(4) WHERE repo_id = 1 AND path = 'branch.old.remote'",
+    );
+    expect(() => corruptValue.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(corruptValue.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
+
+    const corruptSequence = open();
+    corruptSequence.store.configSet("branch.old.remote", "origin");
+    corruptSequence.db.run(
+      "UPDATE git_config SET seq = 0.5 WHERE repo_id = 1 AND path = 'branch.old.remote'",
+    );
+    expect(() =>
+      corruptSequence.store.configMoveSection("branch.old.", "branch.new."),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(corruptSequence.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
+
+    const emptyVariable = open();
+    emptyVariable.store.configSet("branch.old.", "invalid");
+    expect(() => emptyVariable.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(emptyVariable.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
+
+    const invalidValueUtf8 = open();
+    invalidValueUtf8.store.configSet("branch.old.remote", "old");
+    invalidValueUtf8.db.run(
+      `UPDATE git_config SET value = CAST(x'f09080' AS TEXT)
+        WHERE repo_id = 1 AND path = 'branch.old.remote'`,
+    );
+    expect(() =>
+      invalidValueUtf8.store.configMoveSection("branch.old.", "branch.new."),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(invalidValueUtf8.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
+
+    const invalidPathUtf8 = open();
+    invalidPathUtf8.store.configSet("branch.old.remote", "origin");
+    invalidPathUtf8.db.run(
+      `UPDATE git_config SET path = CAST(x'6272616e63682e6f6c642ef09080' AS TEXT)
+        WHERE repo_id = 1 AND path = 'branch.old.remote'`,
+    );
+    expect(() =>
+      invalidPathUtf8.store.configMoveSection("branch.old.", "branch.new."),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(invalidPathUtf8.db.scalar<number>("SELECT count(*) FROM git_config")).toBe(1);
+
+    const forbiddenVariable = open();
+    const nulPath = "branch.old.bad\0name";
+    forbiddenVariable.store.configSet(nulPath, "origin");
+    expect(() =>
+      forbiddenVariable.store.configMoveSection("branch.old.", "branch.new."),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(forbiddenVariable.store.configGet(nulPath)).toBe("origin");
+    expect(forbiddenVariable.store.configPaths("branch.new.")).toEqual([]);
+  });
+
+  it("keeps a config section move in the caller's transaction rollback", () => {
+    const { db, store } = open();
+    store.configSet("branch.old.remote", "origin");
+
+    expect(() =>
+      db.transactionSync(() => {
+        store.configMoveSection("branch.old.", "branch.new.");
+        throw new Error("injected failure");
+      }),
+    ).toThrow(/injected failure/);
+    expect(store.configGet("branch.old.remote")).toBe("origin");
+    expect(store.configGet("branch.new.remote")).toBeUndefined();
   });
 
   it("keys the index by path and stage", () => {

@@ -6,6 +6,7 @@ import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
+import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted } from "../streams.js";
@@ -70,6 +71,97 @@ export interface BranchDeleteOptions {
   name: string;
   /** Delete even when the branch is not fully merged. */
   force?: boolean;
+}
+
+export interface BranchRenameOptions {
+  /** Branch to rename. Defaults to the selected checkout's current branch. */
+  oldName?: string;
+  newName: string;
+}
+
+export function branchRename(
+  context: GitContext,
+  repo: Repository,
+  options: BranchRenameOptions,
+): void {
+  const runtimeOptions: unknown = options;
+  const optionObject =
+    typeof runtimeOptions === "object" && runtimeOptions !== null ? runtimeOptions : null;
+  const newName = optionObject === null ? undefined : Reflect.get(optionObject, "newName");
+  const oldName = optionObject === null ? undefined : Reflect.get(optionObject, "oldName");
+  const destination = branchRenameRef(newName, "new branch name");
+  const requestedSource =
+    oldName === undefined ? null : branchRenameRef(oldName, "old branch name");
+  const metadata = operationRefLogMetadata(context, repo, "branch: rename");
+
+  repo.store.db.transactionSync(() => {
+    repo.checkout.requireNoOperationState();
+    const oldHead = repo.checkout.head();
+    let source: string;
+    if (requestedSource === null) {
+      const selected = oldHead.startsWith("ref: ") ? oldHead.slice(5) : null;
+      if (selected?.startsWith(HEADS) !== true) {
+        throw new GitError("EBRANCHFAIL", "cannot rename branch from detached HEAD");
+      }
+      source = selected;
+    } else {
+      source = requestedSource;
+    }
+
+    const tip = repo.store.getRef(source);
+    if (tip === null) {
+      throw new GitError("EBRANCHFAIL", `branch '${source.slice(HEADS.length)}' not found`);
+    }
+    if (!isOid(tip)) {
+      throw new CorruptError(`branch '${source.slice(HEADS.length)}' is not a direct ref`);
+    }
+    repo.readAuthenticatedCommit(tip);
+    if (source === destination || repo.store.getRef(destination) !== null) {
+      throw new GitError(
+        "EBRANCHFAIL",
+        `a branch named '${destination.slice(HEADS.length)}' already exists`,
+      );
+    }
+
+    const sourceHead = `ref: ${source}`;
+    const owner = context.database
+      .listCheckouts(repo.store.repoId)
+      .find((checkout) => checkout.head === sourceHead);
+    if (owner !== undefined && owner.id !== repo.checkout.checkoutId) {
+      throw new GitError(
+        "EBRANCHFAIL",
+        `cannot rename branch '${source.slice(HEADS.length)}': it is checked out at ${owner.root}`,
+      );
+    }
+
+    repo.store.configMoveSection(
+      `branch.${source.slice(HEADS.length)}.`,
+      `branch.${destination.slice(HEADS.length)}.`,
+    );
+    repo.mutateRefs(
+      {
+        puts: [{ name: destination, target: tip }],
+        deletes: [source],
+        head: oldHead === sourceHead ? `ref: ${destination}` : undefined,
+        expected: { name: source, target: tip },
+      },
+      metadata,
+    );
+  });
+}
+
+function branchRenameRef(value: unknown, label: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new GitError("EINVAL", `${label} is required`);
+  }
+  const checked = checkRefText(value, MAX_REF_NAME_BYTES - HEADS.length);
+  if (checked.problem === "too-long") {
+    throw new GitError("E2BIG", `${label} exceeds its UTF-8 byte bound`);
+  }
+  if (checked.problem !== null) throw new GitError("EINVAL", `${label} is invalid`);
+  const ref = `${HEADS}${value}`;
+  if (!hasCanonicalRefSyntax(ref)) throw new GitError("EINVAL", `${label} is invalid`);
+  return ref;
 }
 
 export function branchDelete(

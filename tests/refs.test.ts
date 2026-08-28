@@ -15,6 +15,7 @@ import {
 } from "../src/core/ops/config.js";
 import { initRepository } from "../src/core/ops/init.js";
 import type { RemoteView } from "../src/core/ops/kinds.js";
+import type { MergeStateMetadata } from "../src/core/ops/merge-state.js";
 import {
   catFile,
   hashObject,
@@ -28,6 +29,7 @@ import {
   branch,
   branchDelete,
   branchList,
+  branchRename,
   checkout,
   currentBranch,
   switchBranch,
@@ -435,6 +437,303 @@ describe("branch", () => {
     branch(ws.context, ws.repo, { name: "dup", startPoint: "main", force: true });
     fixture.git("branch", "-f", "dup", "main");
     expect(ws.repo.resolveRef("refs/heads/dup")).toBe(fixture.git("rev-parse", "dup"));
+  });
+
+  it("branch rename moves current HEAD, config, and causal reflogs", () => {
+    ws.repo.store.configAdd("branch.main.merge", "refs/heads/main");
+    ws.repo.store.configAdd("branch.main.merge", "refs/heads/integration");
+    ws.repo.store.configSet("branch.main.remote", "origin");
+    fixture.git("config", "--add", "branch.main.merge", "refs/heads/main");
+    fixture.git("config", "--add", "branch.main.merge", "refs/heads/integration");
+    fixture.git("config", "branch.main.remote", "origin");
+
+    branchRename(ws.context, ws.repo, { newName: "primary" });
+    fixture.git("branch", "-m", "primary");
+
+    expect(currentBranch(ws.repo)).toBe(fixture.git("branch", "--show-current"));
+    expect(branchList(ws.repo)).toEqual(lines(fixture.git("branch", "--format=%(refname:short)")));
+    expect(ws.repo.store.configGetAll("branch.primary.merge")).toEqual(
+      lines(fixture.git("config", "--get-all", "branch.primary.merge")),
+    );
+    expect(ws.repo.store.configGet("branch.primary.remote")).toBe(
+      fixture.git("config", "--get", "branch.primary.remote"),
+    );
+    expect(ws.repo.store.configPaths("branch.main.")).toEqual([]);
+    expect(
+      ws.repo.store.db.all<Record<string, unknown>>(
+        `SELECT ref_name, old_raw, new_raw, reason FROM git_reflog_entries
+          WHERE repo_id = ? ORDER BY ordinal`,
+        ws.repo.store.repoId,
+      ),
+    ).toEqual([
+      {
+        ref_name: "refs/heads/main",
+        old_raw: fixture.git("rev-parse", "primary"),
+        new_raw: null,
+        reason: "branch: rename",
+      },
+      {
+        ref_name: "refs/heads/primary",
+        old_raw: null,
+        new_raw: fixture.git("rev-parse", "primary"),
+        reason: "branch: rename",
+      },
+    ]);
+    expect(
+      ws.repo.store.db.one<Record<string, unknown>>(
+        `SELECT old_raw, new_raw, reason FROM git_checkout_reflog_entries
+          WHERE checkout_id = ? ORDER BY ordinal DESC LIMIT 1`,
+        ws.repo.checkout.checkoutId,
+      ),
+    ).toEqual({
+      old_raw: "ref: refs/heads/main",
+      new_raw: "ref: refs/heads/primary",
+      reason: "branch: rename",
+    });
+  });
+
+  it("branch rename moves an inactive branch without moving the selected HEAD", () => {
+    ws.repo.store.configSet("branch.side.remote", "origin");
+    fixture.git("config", "branch.side.remote", "origin");
+
+    branchRename(ws.context, ws.repo, { oldName: "side", newName: "topic" });
+    fixture.git("branch", "-m", "side", "topic");
+
+    expect(currentBranch(ws.repo)).toBe("main");
+    expect(currentBranch(ws.repo)).toBe(fixture.git("branch", "--show-current"));
+    expect(branchList(ws.repo)).toEqual(lines(fixture.git("branch", "--format=%(refname:short)")));
+    expect(ws.repo.store.configGet("branch.topic.remote")).toBe(
+      fixture.git("config", "--get", "branch.topic.remote"),
+    );
+    expect(ws.repo.store.configPaths("branch.side.")).toEqual([]);
+  });
+
+  it("branch rename matches Git while preserving a dotted sibling section", () => {
+    branch(ws.context, ws.repo, { name: "foo" });
+    branch(ws.context, ws.repo, { name: "foo.bar" });
+    fixture.git("branch", "foo");
+    fixture.git("branch", "foo.bar");
+    ws.repo.checkout.setHead("ref: refs/heads/foo");
+    fixture.git("checkout", "-q", "foo");
+    ws.repo.store.configSet("branch.foo.remote", "origin");
+    ws.repo.store.configSet("branch.foo.bar.remote", "sibling");
+    fixture.git("config", "branch.foo.remote", "origin");
+    fixture.git("config", "branch.foo.bar.remote", "sibling");
+
+    branchRename(ws.context, ws.repo, { newName: "renamed" });
+    fixture.git("branch", "-m", "renamed");
+
+    expect(branchList(ws.repo)).toEqual(lines(fixture.git("branch", "--format=%(refname:short)")));
+    expect(ws.repo.store.configGet("branch.renamed.remote")).toBe(
+      fixture.git("config", "--get", "branch.renamed.remote"),
+    );
+    expect(ws.repo.store.configGet("branch.foo.bar.remote")).toBe(
+      fixture.git("config", "--get", "branch.foo.bar.remote"),
+    );
+    expect(ws.repo.store.configGet("branch.foo.remote")).toBeUndefined();
+    expect(runGit("config", "--get", "branch.foo.remote").ok).toBe(false);
+  });
+
+  it("branch rename rejects exact config conflicts in both dotted directions", () => {
+    branch(ws.context, ws.repo, { name: "foo" });
+    ws.repo.store.configSet("branch.foo.remote", "source");
+    ws.repo.store.configSet("branch.foo.bar.remote", "destination");
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "foo", newName: "foo.bar" }),
+    ).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+    expect(ws.repo.store.getRef("refs/heads/foo")).not.toBeNull();
+    expect(ws.repo.store.getRef("refs/heads/foo.bar")).toBeNull();
+
+    ws.repo.store.configUnset("branch.foo.remote");
+    ws.repo.store.configUnset("branch.foo.bar.remote");
+    ws.repo.store.deleteRef("refs/heads/foo");
+    branch(ws.context, ws.repo, { name: "foo.bar" });
+    ws.repo.store.configSet("branch.foo.bar.remote", "source");
+    ws.repo.store.configSet("branch.foo.remote", "destination");
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "foo.bar", newName: "foo" }),
+    ).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+    expect(ws.repo.store.getRef("refs/heads/foo.bar")).not.toBeNull();
+    expect(ws.repo.store.getRef("refs/heads/foo")).toBeNull();
+  });
+
+  it("branch rename rejects collisions, missing refs, detached HEAD, and invalid names", () => {
+    const before = branchList(ws.repo);
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "side", newName: "main" }),
+    ).toThrowError(expect.objectContaining({ code: "EBRANCHFAIL" }));
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "missing", newName: "topic" }),
+    ).toThrowError(expect.objectContaining({ code: "EBRANCHFAIL" }));
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "side", newName: "bad..name" }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("main is missing");
+    ws.repo.checkout.setHead(main);
+    fixture.git("checkout", "-q", "--detach", main);
+    expect(() => branchRename(ws.context, ws.repo, { newName: "primary" })).toThrowError(
+      expect.objectContaining({ code: "EBRANCHFAIL" }),
+    );
+    expect(branchList(ws.repo)).toEqual(before);
+    expect(branchList(ws.repo)).toEqual(
+      lines(fixture.git("for-each-ref", "--format=%(refname:short)", "refs/heads/")),
+    );
+  });
+
+  it("branch rename validates runtime names before reads or transaction work", () => {
+    const calls: readonly (readonly unknown[])[] = [
+      [ws.context, ws.repo, {}],
+      [ws.context, ws.repo, { newName: 42 }],
+      [ws.context, ws.repo, { oldName: 42, newName: "topic" }],
+      [ws.context, ws.repo, { oldName: "bad..old", newName: "topic" }],
+      [ws.context, ws.repo, { oldName: "side", newName: "bad..topic" }],
+    ];
+    for (const args of calls) {
+      ws.storage.resetCounters();
+      expect(() => Reflect.apply(branchRename, undefined, args)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(ws.storage.statementCount).toBe(0);
+    }
+  });
+
+  it("branch rename rejects an inactive branch attached to another checkout", () => {
+    ws.database.createCheckout(ws.repo.store.repoId, "/linked", "ref: refs/heads/side");
+    ws.repo.store.configSet("branch.side.remote", "origin");
+
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "side", newName: "topic" }),
+    ).toThrowError(expect.objectContaining({ code: "EBRANCHFAIL" }));
+    expect(ws.repo.store.getRef("refs/heads/side")).not.toBeNull();
+    expect(ws.repo.store.getRef("refs/heads/topic")).toBeNull();
+    expect(ws.repo.store.configGet("branch.side.remote")).toBe("origin");
+  });
+
+  it("branch rename rejects destination config and a live operation without partial state", () => {
+    ws.repo.store.configSet("branch.side.remote", "origin");
+    ws.repo.store.configSet("branch.topic.merge", "refs/heads/topic");
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "side", newName: "topic" }),
+    ).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+    expect(ws.repo.store.getRef("refs/heads/side")).not.toBeNull();
+    expect(ws.repo.store.getRef("refs/heads/topic")).toBeNull();
+    expect(ws.repo.store.configGet("branch.side.remote")).toBe("origin");
+
+    ws.repo.store.configUnset("branch.topic.merge");
+    const main = ws.repo.store.getRef("refs/heads/main");
+    const side = ws.repo.store.getRef("refs/heads/side");
+    if (main === null || side === null) throw new Error("branch fixture is incomplete");
+    const state: MergeStateMetadata = {
+      originalHeadRef: "refs/heads/main",
+      originalHeadOid: main,
+      currentParentOid: main,
+      incomingParentOid: side,
+      phase: "ready",
+      mode: "no-commit",
+      mergeOrigin: "merge",
+      currentLabel: "HEAD",
+      incomingLabel: "side",
+      message: "pending merge\n",
+      author: null,
+      committer: null,
+    };
+    ws.repo.checkout.writeMergeState(state, []);
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "side", newName: "topic" }),
+    ).toThrowError(expect.objectContaining({ code: "EMERGEACTIVE" }));
+    expect(ws.repo.store.getRef("refs/heads/side")).toBe(side);
+    expect(ws.repo.store.getRef("refs/heads/topic")).toBeNull();
+    expect(ws.repo.store.configGet("branch.side.remote")).toBe("origin");
+  });
+
+  it("branch rename rolls ref, HEAD, and config back when publication fails", () => {
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("main is missing");
+    ws.repo.store.configSet("branch.main.remote", "origin");
+    ws.repo.store.db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, 'refs/tags/corrupt', zeroblob(40))",
+      ws.repo.store.repoId,
+    );
+
+    expect(() => branchRename(ws.context, ws.repo, { newName: "primary" })).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(ws.repo.checkout.head()).toBe("ref: refs/heads/main");
+    expect(ws.repo.store.getRef("refs/heads/main")).toBe(main);
+    expect(ws.repo.store.getRef("refs/heads/primary")).toBeNull();
+    expect(ws.repo.store.configGet("branch.main.remote")).toBe("origin");
+    expect(ws.repo.store.configGet("branch.primary.remote")).toBeUndefined();
+  });
+
+  it("branch rename authenticates source commits before moving config or refs", () => {
+    const blob = ws.repo.store.write("blob", utf8.encode("not a commit\n"));
+    ws.repo.store.setRef("refs/heads/blob-source", blob);
+    ws.repo.store.configSet("branch.blob-source.remote", "origin");
+    expect(() =>
+      branchRename(ws.context, ws.repo, { oldName: "blob-source", newName: "blob-target" }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(ws.repo.store.getRef("refs/heads/blob-source")).toBe(blob);
+    expect(ws.repo.store.getRef("refs/heads/blob-target")).toBeNull();
+    expect(ws.repo.store.configGet("branch.blob-source.remote")).toBe("origin");
+    expect(ws.repo.store.configGet("branch.blob-target.remote")).toBeUndefined();
+
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("main is missing");
+    const corrupt = ws.repo.store.write(
+      "commit",
+      serializeCommit({
+        tree: ws.repo.readCommit(main).tree,
+        parent: [main],
+        author: {
+          name: "Fixture",
+          email: "fixture@example.com",
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+        },
+        committer: {
+          name: "Fixture",
+          email: "fixture@example.com",
+          timestamp: 1_577_836_800,
+          timezoneOffset: 0,
+        },
+        message: "cached then corrupted\n",
+      }),
+    );
+    expect(ws.repo.store.cachedCommit(corrupt)).not.toBeNull();
+    ws.repo.store.setRef("refs/heads/corrupt-source", corrupt);
+    ws.repo.store.configSet("branch.corrupt-source.remote", "origin");
+    ws.repo.store.db.run(
+      "UPDATE git_objects SET stored = 'raw' WHERE repo_id = ? AND oid = ?",
+      ws.repo.store.repoId,
+      corrupt,
+    );
+    ws.repo.store.db.run(
+      `UPDATE git_object_chunks SET data = zeroblob((
+         SELECT size FROM git_objects WHERE repo_id = ? AND oid = ?
+       )) WHERE repo_id = ? AND oid = ? AND seq = 0`,
+      ws.repo.store.repoId,
+      corrupt,
+      ws.repo.store.repoId,
+      corrupt,
+    );
+    ws.repo.store.db.run(
+      "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ? AND seq > 0",
+      ws.repo.store.repoId,
+      corrupt,
+    );
+
+    expect(() =>
+      branchRename(ws.context, ws.repo, {
+        oldName: "corrupt-source",
+        newName: "corrupt-target",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(ws.repo.store.getRef("refs/heads/corrupt-source")).toBe(corrupt);
+    expect(ws.repo.store.getRef("refs/heads/corrupt-target")).toBeNull();
+    expect(ws.repo.store.configGet("branch.corrupt-source.remote")).toBe("origin");
+    expect(ws.repo.store.configGet("branch.corrupt-target.remote")).toBeUndefined();
   });
 });
 

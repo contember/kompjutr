@@ -196,6 +196,16 @@ const MAX_FETCH_PUBLICATION_INPUTS = 100_000;
 const MAX_GLOBAL_CHECKOUT_LIST = 8_192;
 const CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES = 1_024;
 export const MAX_CHECKOUT_LIST_RETAINED_BYTES = 6 * 1024 * 1024;
+export const MAX_CONFIG_SECTION_MOVE_ROWS = 1_024;
+export const MAX_CONFIG_SECTION_MOVE_TEXT_BYTES = 1024 * 1024;
+export const CONFIG_SECTION_MOVE_UPDATE_SQL = `UPDATE git_config
+       SET path = ? || substr(path, length(?) + 1)
+     WHERE repo_id = ? AND path >= ? AND path < ?
+       AND EXISTS (
+         SELECT 1 FROM json_each(?) AS wanted
+          WHERE json_extract(wanted.value, '$.path') = git_config.path
+            AND json_extract(wanted.value, '$.seq') = git_config.seq
+       )`;
 export const PROVISIONAL_CLONE_LEASE_MS = 5 * 60 * 1_000;
 const PROVISIONAL_CLONE_RENEW_WINDOW_MS = PROVISIONAL_CLONE_LEASE_MS / 2;
 const REF_ROW_RETAINED_BYTES = 256;
@@ -211,6 +221,24 @@ export const REF_MUTATION_FIXED_RETAINED_BYTES =
 export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 12;
 export const MAX_FETCH_PUBLICATION_SQL_STATEMENTS = 1_000;
 export const FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS = 32;
+
+interface ConfigSectionCandidateMetadata {
+  readonly path: string;
+  readonly seq: number;
+  readonly pathBytes: number;
+  readonly valueType: unknown;
+  readonly valueBytes: number | null;
+}
+
+interface ConfigSectionMoveMetadata extends ConfigSectionCandidateMetadata {
+  readonly valueBytes: number;
+}
+
+interface ConfigSectionMoveRow {
+  readonly path: string;
+  readonly seq: number;
+  readonly value: string;
+}
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
@@ -794,6 +822,7 @@ function isObjectType(value: string | null): value is ObjectType {
 }
 
 const JSON_ENCODER = new TextEncoder();
+const CONFIG_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
 const JSON_BATCH_ROWS = 2_048;
 const JSON_BATCH_BYTES = 1024 * 1024;
 
@@ -2850,6 +2879,10 @@ export class SharedRepoStore {
 
   configPaths(prefix: string): string[] {
     return this.#ops().configPaths(prefix);
+  }
+
+  configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
+    this.#ops().configMoveSection(sourcePrefix, destinationPrefix);
   }
 
   cachedCommit(oid: string): CommitCacheEntry | null {
@@ -7585,6 +7618,151 @@ export class CheckoutStore implements IndexStore {
       .map((row) => row.path);
   }
 
+  /** Validate and move one exact dotted config section without changing value order. */
+  configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
+    const source = requireConfigSectionPrefix(sourcePrefix, "source");
+    const destination = requireConfigSectionPrefix(destinationPrefix, "destination");
+    if (source === destination) {
+      throw new GitError("EINVAL", "config section source and destination must differ");
+    }
+
+    this.#db.transactionSync(() => {
+      let destinationCandidates = 0;
+      for (const row of this.#db.iterate(
+        configSectionMetadataSql(),
+        this.#repoId,
+        destination,
+        nextPrefix(destination),
+      )) {
+        destinationCandidates++;
+        if (destinationCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
+          throw new GitError(
+            "E2BIG",
+            `config section ${destination} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
+          );
+        }
+        const candidate = requireConfigSectionMetadata(row, this.#repoId, destination);
+        if (configSectionVariable(candidate.path, destination) !== null) {
+          throw new GitError("EEXIST", `config section ${destination} already exists`);
+        }
+      }
+
+      const metadata: ConfigSectionMoveMetadata[] = [];
+      let sourceCandidates = 0;
+      let textBytes = 0;
+      for (const row of this.#db.iterate(
+        configSectionMetadataSql(),
+        this.#repoId,
+        source,
+        nextPrefix(source),
+      )) {
+        sourceCandidates++;
+        if (sourceCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
+          throw new GitError(
+            "E2BIG",
+            `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
+          );
+        }
+        const candidate = requireConfigSectionMetadata(row, this.#repoId, source);
+        const variable = configSectionVariable(candidate.path, source);
+        if (variable === null) continue;
+        if (
+          candidate.valueType !== "text" ||
+          candidate.valueBytes === null ||
+          candidate.valueBytes < 0
+        ) {
+          throw new CorruptError(`config section ${source} has an invalid stored value`);
+        }
+        const destinationBytes = configSectionDestinationBytes(destination, variable);
+        if (destinationBytes > MAX_INDEX_PATH_BYTES) {
+          throw new GitError(
+            "E2BIG",
+            `moved config path exceeds its ${MAX_INDEX_PATH_BYTES} byte bound`,
+          );
+        }
+        textBytes += candidate.pathBytes + candidate.valueBytes;
+        if (!Number.isSafeInteger(textBytes) || textBytes > MAX_CONFIG_SECTION_MOVE_TEXT_BYTES) {
+          throw new GitError(
+            "E2BIG",
+            `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_TEXT_BYTES} text bytes`,
+          );
+        }
+        metadata.push({ ...candidate, valueBytes: candidate.valueBytes });
+      }
+
+      const buffered: ConfigSectionMoveRow[] = [];
+      let verifiedBytes = 0;
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, seq, CAST(path AS BLOB) AS path_blob,
+                CAST(value AS BLOB) AS value_blob
+           FROM git_config
+          WHERE repo_id = ? AND path >= ? AND path < ?
+            AND length(path) > length(?)
+            AND instr(substr(path, length(?) + 1), '.') = 0
+          ORDER BY path COLLATE BINARY, seq
+          LIMIT ${MAX_CONFIG_SECTION_MOVE_ROWS + 1}`,
+        this.#repoId,
+        source,
+        nextPrefix(source),
+        source,
+        source,
+      )) {
+        const expected = metadata[buffered.length];
+        if (expected === undefined || row.repo_id !== this.#repoId || row.seq !== expected.seq) {
+          throw new CorruptError(`config section ${source} changed after validation`);
+        }
+        const pathBytes = readBlob(row.path_blob);
+        const valueBytes = readBlob(row.value_blob);
+        const path = decodeConfigText(pathBytes, `config path in ${source}`);
+        const value = decodeConfigText(valueBytes, `config value at ${path}`);
+        if (
+          path !== expected.path ||
+          pathBytes.byteLength !== expected.pathBytes ||
+          valueBytes.byteLength !== expected.valueBytes ||
+          configSectionVariable(path, source) === null
+        ) {
+          throw new CorruptError(`config section ${source} changed after validation`);
+        }
+        verifiedBytes += pathBytes.byteLength + valueBytes.byteLength;
+        if (
+          !Number.isSafeInteger(verifiedBytes) ||
+          verifiedBytes > MAX_CONFIG_SECTION_MOVE_TEXT_BYTES
+        ) {
+          throw new CorruptError(`config section ${source} changed after validation`);
+        }
+        buffered.push({ path, seq: expected.seq, value });
+      }
+      if (buffered.length !== metadata.length || verifiedBytes !== textBytes) {
+        throw new CorruptError(`config section ${source} changed after validation`);
+      }
+      if (buffered.length === 0) return;
+
+      let changedRows = 0;
+      for (const page of jsonPages(
+        buffered.map((row) => ({ path: row.path, seq: row.seq })),
+        "config section move",
+      )) {
+        this.#db.run(
+          CONFIG_SECTION_MOVE_UPDATE_SQL,
+          destination,
+          source,
+          this.#repoId,
+          source,
+          nextPrefix(source),
+          page,
+        );
+        const changed = this.#db.scalar<unknown>("SELECT changes()");
+        if (typeof changed !== "number" || !Number.isSafeInteger(changed) || changed < 0) {
+          throw new CorruptError(`config section ${source} returned an invalid change count`);
+        }
+        changedRows += changed;
+      }
+      if (changedRows !== buffered.length) {
+        throw new CorruptError(`config section ${source} changed during its move`);
+      }
+    });
+  }
+
   // -- integration operation journal --------------------------------
 
   /** Read and validate the one durable incomplete integration operation. */
@@ -8827,4 +9005,130 @@ export class CheckoutStore implements IndexStore {
 function nextPrefix(prefix: string): string {
   const last = prefix.charCodeAt(prefix.length - 1);
   return `${prefix.slice(0, -1)}${String.fromCharCode(last + 1)}`;
+}
+
+function requireConfigSectionPrefix(value: string, label: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new GitError("EINVAL", `config section ${label} is required`);
+  }
+  boundedCanonicalUtf8Bytes(value, MAX_INDEX_PATH_BYTES, `config section ${label}`);
+  if (value === "." || value.startsWith(".") || !value.endsWith(".") || value.includes("..")) {
+    throw new GitError("EINVAL", `config section ${label} is not a canonical dotted prefix`);
+  }
+  return value;
+}
+
+function boundedCanonicalUtf8Bytes(value: string, limit: number, label: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit === 0 || unit === 0x0a || unit === 0x0d) {
+      throw new GitError("EINVAL", `${label} contains an invalid character`);
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) {
+        throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+    if (bytes > limit) throw new GitError("E2BIG", `${label} exceeds ${limit} UTF-8 bytes`);
+  }
+  return bytes;
+}
+
+function configSectionMetadataSql(): string {
+  return `SELECT
+                CASE WHEN typeof(repo_id) = 'integer' THEN repo_id END AS repo_id,
+                typeof(path) AS path_type,
+                length(CAST(path AS BLOB)) AS path_bytes,
+                CASE WHEN typeof(path) = 'text'
+                           AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+                     THEN path END AS path,
+                typeof(seq) AS seq_type,
+                CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+                typeof(value) AS value_type,
+                length(CAST(value AS BLOB)) AS value_bytes
+           FROM git_config
+          WHERE repo_id = ? AND path >= ? AND path < ?
+          ORDER BY path COLLATE BINARY, seq
+          LIMIT ${MAX_CONFIG_SECTION_MOVE_ROWS + 1}`;
+}
+
+function requireConfigSectionMetadata(
+  row: Record<string, unknown>,
+  repoId: number,
+  prefix: string,
+): ConfigSectionCandidateMetadata {
+  if (row.repo_id !== repoId) {
+    throw new CorruptError("config section scan crossed repository boundaries");
+  }
+  if (
+    row.path_type !== "text" ||
+    typeof row.path !== "string" ||
+    typeof row.path_bytes !== "number" ||
+    !Number.isSafeInteger(row.path_bytes) ||
+    row.path_bytes < 1 ||
+    row.path_bytes > MAX_INDEX_PATH_BYTES ||
+    !row.path.startsWith(prefix)
+  ) {
+    throw new CorruptError(`config section ${prefix} has an invalid stored path`);
+  }
+  if (
+    row.seq_type !== "integer" ||
+    typeof row.seq !== "number" ||
+    !Number.isSafeInteger(row.seq) ||
+    row.seq < 0
+  ) {
+    throw new CorruptError(`config section ${prefix} has an invalid sequence`);
+  }
+  const valueBytes =
+    typeof row.value_bytes === "number" && Number.isSafeInteger(row.value_bytes)
+      ? row.value_bytes
+      : null;
+  return {
+    path: row.path,
+    seq: row.seq,
+    pathBytes: row.path_bytes,
+    valueType: row.value_type,
+    valueBytes,
+  };
+}
+
+function configSectionVariable(path: string, prefix: string): string | null {
+  const variable = path.slice(prefix.length);
+  if (variable === "") {
+    throw new CorruptError(`config section ${prefix} has an empty variable name`);
+  }
+  return variable.includes(".") ? null : variable;
+}
+
+function configSectionDestinationBytes(destination: string, variable: string): number {
+  const destinationBytes = boundedCanonicalUtf8Bytes(
+    destination,
+    MAX_INDEX_PATH_BYTES,
+    "config section destination",
+  );
+  const remaining = MAX_INDEX_PATH_BYTES - destinationBytes;
+  let variableBytes: number;
+  try {
+    variableBytes = boundedCanonicalUtf8Bytes(variable, remaining, "moved config variable");
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) throw error;
+    throw new CorruptError("config section has an invalid stored variable name", { cause: error });
+  }
+  return destinationBytes + variableBytes;
+}
+
+function decodeConfigText(bytes: Uint8Array, label: string): string {
+  try {
+    return CONFIG_TEXT_DECODER.decode(bytes);
+  } catch (error) {
+    throw new CorruptError(`${label} is not canonical UTF-8`, { cause: error });
+  }
 }
