@@ -34,6 +34,7 @@ import {
   type RawObject,
   type Tag,
   type TreeEntry,
+  typeForMode,
 } from "./objects.js";
 
 /** Where a short ref name is looked up, in git's own order. */
@@ -68,6 +69,23 @@ export interface ResolvedHead {
   /** The commit HEAD resolves to, or null on an unborn branch. */
   oid: string | null;
 }
+
+export interface RevisionResolution {
+  oid: string;
+  /** Present only for `<revision>:<path>` resolution. */
+  mode?: string;
+}
+
+interface RevisionState {
+  oid: string;
+  /** Stored metadata or a previously-read object promises this oid exists. */
+  promised: boolean;
+}
+
+type RevisionSuffix =
+  | { kind: "ancestor"; count: number }
+  | { kind: "parent"; which: number }
+  | { kind: "peel"; want: ObjectType | null };
 
 interface WalkNode {
   oid: string;
@@ -331,100 +349,253 @@ export class Repository {
 
   // -- revisions ------------------------------------------------------
 
-  /**
-   * `gitrevisions(7)` subset: a ref, a full or abbreviated oid, and the
-   * `^`, `^N` and `~N` suffixes, chained.
-   */
+  /** Resolve the bounded `gitrevisions(7)` subset and retain path mode. */
+  resolveRevision(expression: string): RevisionResolution {
+    const resolved = this.#tryResolveRevision(expression);
+    if (resolved === undefined) throw new RefNotFoundError(expression);
+    return resolved;
+  }
+
+  /** Resolve the bounded subset to an oid. */
   revParse(expression: string): string {
+    return this.resolveRevision(expression).oid;
+  }
+
+  /** Return undefined only when a syntactically valid revision is absent. */
+  tryRevParse(expression: string): string | undefined {
+    return this.#tryResolveRevision(expression)?.oid;
+  }
+
+  #tryResolveRevision(expression: string): RevisionResolution | undefined {
     if (expression.length > MAX_REVISION_EXPRESSION_UNITS) {
       throw new GitError("E2BIG", "revision expression exceeds 1024 UTF-16 code units");
     }
     const trimmed = expression.trim();
-    if (trimmed === "") throw new RefNotFoundError(expression);
+    if (trimmed === "") return undefined;
+
+    const colon = trimmed.indexOf(":");
+    const revision = colon === -1 ? trimmed : trimmed.slice(0, colon);
+    const path = colon === -1 ? undefined : trimmed.slice(colon + 1);
+    if (revision === "") throw this.#invalidRevision(expression);
 
     // Split the base name from its suffix chain at the first ^ or ~ that
     // is not part of the name.
-    let split = trimmed.length;
-    for (let i = 0; i < trimmed.length; i++) {
-      const char = trimmed[i]!;
+    let split = revision.length;
+    for (let i = 0; i < revision.length; i++) {
+      const char = revision[i]!;
       if (char === "^" || char === "~") {
         split = i;
         break;
       }
     }
-    const base = trimmed.slice(0, split);
-    const suffix = trimmed.slice(split);
+    const base = revision.slice(0, split);
+    const suffix = revision.slice(split);
+    const operations = this.#parseRevisionSuffix(suffix, expression);
 
-    let oid = this.#resolveBase(base, expression);
+    let state = this.#resolveRevisionBase(base, expression);
+    if (state === undefined) return undefined;
+    for (const operation of operations) {
+      if (operation.kind === "peel") {
+        state = this.#peelRevision(state, operation.want, expression);
+        if (state === undefined) return undefined;
+        continue;
+      }
+      if (operation.kind === "ancestor") {
+        state = this.#peelRevision(state, "commit", expression);
+        if (state === undefined) return undefined;
+        for (let i = 0; i < operation.count; i++) {
+          const parent = this.#revisionParent(state, 1, expression);
+          if (parent === undefined) return undefined;
+          state = parent;
+        }
+        continue;
+      }
+      if (operation.which === 0) {
+        state = this.#peelRevision(state, "commit", expression);
+        if (state === undefined) return undefined;
+        continue;
+      }
+      const parent = this.#revisionParent(state, operation.which, expression);
+      if (parent === undefined) return undefined;
+      state = parent;
+    }
+
+    if (path !== undefined) return this.#resolveRevisionPath(state, path, expression);
+    if (state.promised) {
+      if (this.store.typeAndSize(state.oid) === null) throw new ObjectNotFoundError(state.oid);
+    }
+    return { oid: state.oid };
+  }
+
+  #parseRevisionSuffix(suffix: string, expression: string): RevisionSuffix[] {
+    const operations: RevisionSuffix[] = [];
     let position = 0;
     let traversals = 0;
+    const reserve = (count: number): void => {
+      if (count > MAX_REVISION_TRAVERSALS - traversals) {
+        throw new GitError("E2BIG", "revision expression exceeds 32 traversal operations");
+      }
+      traversals += count;
+    };
     while (position < suffix.length) {
       const operator = suffix[position++]!;
+      if (operator !== "^" && operator !== "~") throw this.#invalidRevision(expression);
+      if (operator === "^" && suffix[position] === "{") {
+        const close = suffix.indexOf("}", position + 1);
+        if (close === -1) throw this.#invalidRevision(expression);
+        const type = suffix.slice(position + 1, close);
+        if (
+          type !== "" &&
+          type !== "commit" &&
+          type !== "tree" &&
+          type !== "blob" &&
+          type !== "tag"
+        ) {
+          throw this.#invalidRevision(expression);
+        }
+        reserve(1);
+        operations.push({ kind: "peel", want: type === "" ? null : type });
+        position = close + 1;
+        continue;
+      }
       const digitsStart = position;
       while (position < suffix.length && suffix[position]! >= "0" && suffix[position]! <= "9") {
         position++;
       }
       const digits = suffix.slice(digitsStart, position);
+      const value = digits === "" ? 1 : boundedDecimal(digits, Number.MAX_SAFE_INTEGER);
+      if (value === null) {
+        throw new GitError("E2BIG", "revision expression exceeds 32 traversal operations");
+      }
       if (operator === "~") {
-        const count = digits === "" ? 1 : boundedDecimal(digits, Number.MAX_SAFE_INTEGER);
-        if (count === null || count > MAX_REVISION_TRAVERSALS - traversals) {
-          throw new GitError("E2BIG", "revision expression exceeds 32 traversal operations");
-        }
-        traversals += count;
-        for (let i = 0; i < count; i++) oid = this.#firstParent(oid, expression);
-      } else if (operator === "^") {
-        const which = digits === "" ? 1 : boundedDecimal(digits, Number.MAX_SAFE_INTEGER);
-        if (which === null || traversals >= MAX_REVISION_TRAVERSALS) {
-          throw new GitError("E2BIG", "revision expression exceeds 32 traversal operations");
-        }
-        traversals++;
-        if (which === 0) {
-          oid = this.peel(oid);
-          continue;
-        }
-        oid = this.#parent(oid, which, expression);
+        reserve(Math.max(1, value));
+        operations.push({ kind: "ancestor", count: value });
       } else {
-        throw new RefNotFoundError(expression);
+        reserve(1);
+        operations.push({ kind: "parent", which: value });
       }
     }
-    return oid;
+    return operations;
   }
 
-  #resolveBase(base: string, expression: string): string {
-    if (base === "") throw new RefNotFoundError(base);
+  #resolveRevisionBase(base: string, expression: string): RevisionState | undefined {
+    if (base === "") throw this.#invalidRevision(expression);
     const selectorStart = base.indexOf("@{");
     if (selectorStart !== -1) {
       if (!base.startsWith("HEAD@{") || !base.endsWith("}")) {
-        throw new RefNotFoundError(expression);
+        throw this.#invalidRevision(expression);
       }
       const digits = base.slice(6, -1);
       const index = boundedDecimal(digits, MAX_HEAD_REFLOG_INDEX);
-      if (index === null) throw new RefNotFoundError(expression);
+      if (index === null) throw this.#invalidRevision(expression);
       const entry = this.checkout.reflog("HEAD")[index];
-      if (entry?.newOid === undefined || entry.newOid === null) {
-        throw new RefNotFoundError(expression);
-      }
-      return entry.newOid;
+      if (entry?.newOid === undefined || entry.newOid === null) return undefined;
+      return { oid: entry.newOid, promised: true };
     }
-    const viaRef = this.resolveRef(base);
-    if (viaRef !== null) return viaRef;
-    if (isOid(base) && this.store.has(base)) return base;
+    if (this.expandRef(base) !== null) {
+      const oid = this.resolveRef(base);
+      return oid === null ? undefined : { oid, promised: true };
+    }
+    if (isOid(base)) return { oid: base, promised: false };
     if (isAbbreviatedOid(base)) {
       const resolved = this.store.resolvePrefix(base);
-      if (resolved !== null) return resolved;
+      if (resolved !== null) return { oid: resolved, promised: true };
     }
-    throw new RefNotFoundError(base);
+    return undefined;
   }
 
-  #firstParent(oid: string, expression: string): string {
-    return this.#parent(oid, 1, expression);
-  }
-
-  #parent(oid: string, which: number, expression: string): string {
-    const commit = this.readCommit(this.peel(oid));
-    const parent = commit.parent[which - 1];
+  #revisionParent(
+    state: RevisionState,
+    which: number,
+    expression: string,
+  ): RevisionState | undefined {
+    const commitState = this.#peelRevision(state, "commit", expression);
+    if (commitState === undefined) return undefined;
+    const object = this.#readRevisionObject(commitState);
+    if (object === undefined) return undefined;
+    if (object.type !== "commit") throw new CorruptError(`${commitState.oid} is not a commit`);
+    const parent = parseCommit(object.data).parent[which - 1];
     if (parent === undefined) throw new RefNotFoundError(expression);
-    return parent;
+    const parentState = { oid: parent, promised: true };
+    const parentObject = this.#readRevisionObject(parentState);
+    if (parentObject === undefined) throw new ObjectNotFoundError(parent);
+    if (parentObject.type !== "commit") {
+      throw new CorruptError(`parent ${parent} is a ${parentObject.type}, not a commit`);
+    }
+    parseCommit(parentObject.data);
+    return parentState;
+  }
+
+  #peelRevision(
+    initial: RevisionState,
+    want: ObjectType | null,
+    expression: string,
+  ): RevisionState | undefined {
+    let state = initial;
+    let expected: ObjectType | undefined;
+    for (let hops = 0; hops < 16; hops++) {
+      const object = this.#readRevisionObject(state);
+      if (object === undefined) return undefined;
+      if (expected !== undefined && object.type !== expected) {
+        throw new CorruptError(`tag target ${state.oid} is a ${object.type}, not a ${expected}`);
+      }
+      this.#validateRevisionObject(object);
+      if (want === null && object.type !== "tag") return state;
+      if (object.type === want) return state;
+      if (want === "tree" && object.type === "commit") {
+        const tree = parseCommit(object.data).tree;
+        const treeState = { oid: tree, promised: true };
+        const treeObject = this.#readRevisionObject(treeState);
+        if (treeObject === undefined) throw new ObjectNotFoundError(tree);
+        if (treeObject.type !== "tree") {
+          throw new CorruptError(`commit tree ${tree} is a ${treeObject.type}, not a tree`);
+        }
+        parseTree(treeObject.data);
+        return treeState;
+      }
+      if (object.type !== "tag") throw new RefNotFoundError(expression);
+      const tag = parseTag(object.data);
+      expected = tag.type;
+      state = { oid: tag.object, promised: true };
+    }
+    throw new CorruptError(`tag chain from ${initial.oid} is too deep`);
+  }
+
+  #resolveRevisionPath(
+    state: RevisionState,
+    path: string,
+    expression: string,
+  ): RevisionResolution | undefined {
+    const treeState = this.#peelRevision(state, "tree", expression);
+    if (treeState === undefined) return undefined;
+    if (path === "") return { oid: treeState.oid, mode: "40000" };
+    const entry = this.resolveTreePath(treeState.oid, path);
+    if (entry === null) return undefined;
+    const object = this.#readRevisionObject({ oid: entry.oid, promised: true });
+    if (object === undefined) throw new ObjectNotFoundError(entry.oid);
+    const expected = typeForMode(entry.mode);
+    if (object.type !== expected) {
+      throw new CorruptError(`tree entry ${entry.oid} is a ${object.type}, not a ${expected}`);
+    }
+    this.#validateRevisionObject(object);
+    return { oid: entry.oid, mode: entry.mode };
+  }
+
+  #readRevisionObject(state: RevisionState): RawObject | undefined {
+    const object = this.store.read(state.oid);
+    if (object !== null) return object;
+    if (state.promised) throw new ObjectNotFoundError(state.oid);
+    return undefined;
+  }
+
+  #validateRevisionObject(object: RawObject): void {
+    if (object.type === "commit") parseCommit(object.data);
+    else if (object.type === "tree") parseTree(object.data);
+    else if (object.type === "tag") parseTag(object.data);
+  }
+
+  #invalidRevision(expression: string): GitError {
+    return new GitError("EINVAL", `invalid revision expression: ${expression}`);
   }
 
   // -- walking --------------------------------------------------------

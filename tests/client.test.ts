@@ -331,6 +331,26 @@ describe("createSqliteGitClient", () => {
     });
   });
 
+  it("exposes typed, path, and quiet revision resolution", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/revision";
+    await git.init({ dir });
+    const head = await commitFile(git, workspace, dir, "nested/file.txt", "value\n", "base");
+    const phantom = "f".repeat(40);
+
+    await expect(git.revParse({ dir, ref: "HEAD^{commit}" })).resolves.toBe(head);
+    await expect(git.revParse({ dir, ref: "HEAD:nested/file.txt" })).resolves.toMatch(
+      /^[0-9a-f]{40}$/,
+    );
+    await expect(git.tryRevParse({ dir, ref: "HEAD" })).resolves.toBe(head);
+    await expect(git.tryRevParse({ dir, ref: "missing" })).resolves.toBeUndefined();
+    await expect(git.tryRevParse({ dir, ref: phantom })).resolves.toBe(phantom);
+    await expect(git.tryRevParse({ dir, ref: `${phantom}^{}` })).resolves.toBeUndefined();
+    await expect(git.tryRevParse({ dir, ref: "HEAD^{blob}" })).rejects.toMatchObject({
+      code: "ENOTFOUND",
+    });
+  });
+
   it("selects checkout-local HEAD while sharing refs across an unequal-id cold reopen", async () => {
     const { git, workspace } = makeNativeGit();
     await git.init({ dir: "/primary" });

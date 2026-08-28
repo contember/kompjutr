@@ -126,20 +126,8 @@ export interface CatFileResult {
 }
 
 export function catFile(repo: Repository, spec: string, filepath?: string): CatFileResult {
-  // `cat-file -p <oid>:<path>` shorthand.
-  let ref = spec;
-  let path = filepath;
-  const colon = spec.indexOf(":");
-  if (path === undefined && colon > 0) {
-    ref = spec.slice(0, colon);
-    path = spec.slice(colon + 1);
-  }
-  let oid = repo.revParse(ref);
-  if (path !== undefined && path !== "") {
-    const entry = repo.resolveTreePath(treeOf(repo, oid), path);
-    if (entry === null) throw new RefNotFoundError(`${ref}:${path}`);
-    oid = entry.oid;
-  }
+  const expression = filepath === undefined ? spec : `${spec}:${filepath}`;
+  const oid = repo.resolveRevision(expression).oid;
   const object = repo.read(oid);
   return { oid, bytes: object.data, type: object.type };
 }

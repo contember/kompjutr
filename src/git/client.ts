@@ -185,6 +185,7 @@ export type GitAddOptions = Omit<AddOptions, "excludeRoots"> & GitDirOptions;
 export type GitRmOptions = Omit<RmOptions, "excludeRoots"> & GitDirOptions;
 export type GitResetOptions = ResetOptions & GitDirOptions;
 export type GitCommitOptions = CommitOptions & GitDirOptions;
+export type GitRevParseOptions = GitDirOptions & { ref: string };
 export type GitMergeOptions = MergeOptions & GitDirOptions;
 export type GitMergeContinueOptions = MergeContinueOptions & GitDirOptions;
 export type GitCherryPickOptions = CherryPickOptions & GitDirOptions;
@@ -262,7 +263,8 @@ export interface Git {
   commit(input: GitCommitOptions): Promise<CommitResult>;
   log(input?: GitDirOptions & { ref?: string; depth?: number }): Promise<CommitView[]>;
   show(input: GitDirOptions & { ref: string }): Promise<CommitView>;
-  revParse(input: GitDirOptions & { ref: string }): Promise<string>;
+  revParse(input: GitRevParseOptions): Promise<string>;
+  tryRevParse(input: GitRevParseOptions): Promise<string | undefined>;
   divergence(input: GitDivergenceOptions): Promise<DivergenceResult>;
   readRef(input: GitReadRefOptions): Promise<RawRefTarget>;
   worktreeAdd(input: GitWorktreeAddOptions): Promise<WorktreeInfo>;
@@ -456,6 +458,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     },
     async revParse(input) {
       return at(input.dir).revParse(input.ref);
+    },
+    async tryRevParse(input) {
+      return at(input.dir).tryRevParse(input.ref);
     },
     async divergence(input) {
       return divergenceOp(at(input.dir), input);

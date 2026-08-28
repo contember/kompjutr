@@ -81,7 +81,7 @@ export {
   worktreePrune,
   worktreeRemove,
 } from "./core/ops/worktrees.js";
-export { Repository } from "./core/repository.js";
+export { Repository, type RevisionResolution } from "./core/repository.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";
 export { NodeFsCompat } from "./fs/compat/node.js";
 export { createFilesystem } from "./fs/filesystem.js";
@@ -126,6 +126,7 @@ export {
   type GitRefLogOptions,
   type GitRevertContinueOptions,
   type GitRevertOptions,
+  type GitRevParseOptions,
   type GitScratchAddOptions,
   type GitScratchCommitTreeOptions,
   type GitScratchIndex,

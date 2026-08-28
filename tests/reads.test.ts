@@ -13,6 +13,7 @@ import {
   MODE_TREE,
   parseTreeStream,
   serializeCommit,
+  serializeTag,
   serializeTree,
 } from "../src/core/objects.js";
 import { catFile, log, lsFilesAtRef, lsTree, show } from "../src/core/ops/reads.js";
@@ -144,6 +145,132 @@ describe("rev-parse", () => {
     expect(repo.typeOf(raw)).toBe("tag");
     expect(repo.typeOf(peeled)).toBe("commit");
     expect(raw).not.toBe(peeled);
+  });
+
+  it("matches typed peeling and revision paths while retaining entry modes", () => {
+    for (const expression of [
+      "v1-annotated^{}",
+      "v1-annotated^{tag}",
+      "v1-annotated^{commit}",
+      "v1-annotated^{tree}",
+      "v1-annotated~0",
+      "v1-annotated^{}~2^{tree}",
+      "HEAD^{commit}",
+      "HEAD^{tree}",
+      "HEAD:src/a.ts",
+      "HEAD:src",
+      "HEAD:",
+    ]) {
+      expect(repo.revParse(expression), expression).toBe(fixture.git("rev-parse", expression));
+    }
+
+    expect(repo.resolveRevision("HEAD:src/a.ts")).toEqual({
+      oid: fixture.git("rev-parse", "HEAD:src/a.ts"),
+      mode: "100644",
+    });
+    expect(repo.resolveRevision("HEAD:src")).toEqual({
+      oid: fixture.git("rev-parse", "HEAD:src"),
+      mode: "40000",
+    });
+  });
+
+  it("returns undefined only for semantic absence", () => {
+    const phantom = "f".repeat(40);
+    expect(repo.tryRevParse("missing")).toBeUndefined();
+    expect(repo.tryRevParse("deadbeef")).toBeUndefined();
+    expect(repo.tryRevParse("HEAD:missing.txt")).toBeUndefined();
+    expect(repo.tryRevParse(phantom)).toBe(phantom);
+    expect(repo.tryRevParse(`${phantom}^{}`)).toBeUndefined();
+
+    expect(() => repo.tryRevParse("HEAD^{blob}")).toThrow(
+      expect.objectContaining({ code: "ENOTFOUND" }),
+    );
+    expect(() => repo.tryRevParse("HEAD^{bogus}")).toThrow(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(() => repo.tryRevParse("missing^{bogus}")).toThrow(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    expect(repo.tryRevParse(`HEAD${"^{}".repeat(32)}`)).toBe(repo.revParse("HEAD"));
+    expect(() => repo.tryRevParse(`HEAD${"^{}".repeat(33)}`)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(() => repo.tryRevParse(`missing${"~0".repeat(33)}`)).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+  });
+
+  it("throws when stored revisions promise missing objects", () => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const local = new Repository(store);
+    const missing = "f".repeat(40);
+    const identity = {
+      name: "Fixture",
+      email: "fixture@example.com",
+      timestamp: 1,
+      timezoneOffset: 0,
+    };
+    const commit = (tree: string, parent: string[] = []): string =>
+      store.write(
+        "commit",
+        serializeCommit({
+          tree,
+          parent,
+          author: identity,
+          committer: identity,
+          message: "fixture\n",
+        }),
+      );
+
+    store.setRef("refs/heads/main", missing);
+    expect(() => local.tryRevParse("main")).toThrow(expect.objectContaining({ code: "ENOTFOUND" }));
+
+    const emptyTree = store.write("tree", new Uint8Array(0));
+    const missingParent = commit(emptyTree, [missing]);
+    store.setRef("refs/heads/main", missingParent);
+    expect(() => local.tryRevParse("main^")).toThrow(
+      expect.objectContaining({ code: "ENOTFOUND" }),
+    );
+
+    const missingTree = commit(missing);
+    store.setRef("refs/heads/main", missingTree);
+    expect(() => local.tryRevParse("main^{tree}")).toThrow(
+      expect.objectContaining({ code: "ENOTFOUND" }),
+    );
+
+    const danglingTag = store.write(
+      "tag",
+      serializeTag({
+        object: missing,
+        type: "commit",
+        tag: "dangling",
+        tagger: identity,
+        message: "dangling\n",
+      }),
+    );
+    store.setRef("refs/tags/dangling", danglingTag);
+    expect(() => local.tryRevParse("dangling^{}")).toThrow(
+      expect.objectContaining({ code: "ENOTFOUND" }),
+    );
+
+    const missingEntryTree = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "missing.txt", oid: missing }]),
+    );
+    store.setRef("refs/heads/main", commit(missingEntryTree));
+    expect(() => local.tryRevParse("main:missing.txt")).toThrow(
+      expect.objectContaining({ code: "ENOTFOUND" }),
+    );
+
+    const wrongEntryTree = store.write(
+      "tree",
+      serializeTree([{ mode: MODE_FILE, name: "wrong.txt", oid: emptyTree }]),
+    );
+    store.setRef("refs/heads/main", commit(wrongEntryTree));
+    expect(() => local.tryRevParse("main:wrong.txt")).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 
   it("reports an unknown revision", () => {

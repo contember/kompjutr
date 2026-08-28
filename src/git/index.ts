@@ -78,7 +78,7 @@ export {
   worktreePrune,
   worktreeRemove,
 } from "../core/ops/worktrees.js";
-export { Repository } from "../core/repository.js";
+export { Repository, type RevisionResolution } from "../core/repository.js";
 export type { Worktree, WorktreeDirent, WorktreeStat } from "../core/worktree.js";
 export type { SqlDatabase } from "../sqlite/db.js";
 export { initializeGitSchema, SCHEMA_VERSION } from "../sqlite/schema.js";
@@ -133,6 +133,7 @@ export {
   type GitResetOptions,
   type GitRevertContinueOptions,
   type GitRevertOptions,
+  type GitRevParseOptions,
   type GitRmOptions,
   type GitScratchAddOptions,
   type GitScratchCommitTreeOptions,

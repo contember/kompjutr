@@ -330,3 +330,8 @@ resolved before implementation.
   object membership; object existence is required only by a suffix/path that
   reads it. The WU1 quiet matrix now preserves that external contract; Singer
   independently approved the plan correction before WU1.
+- WU1 shipped one structured resolver for typed peeling, paths, and quiet
+  absence. Its focused witness passed 85 tests in 17.98 s; typecheck passed. An
+  initial bare-ref BLOB read regressed the indexed log cost witness, so bare
+  refs now verify bounded object metadata only and payload reads remain
+  suffix/path-driven.

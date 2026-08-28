@@ -33,6 +33,8 @@ import type {
   ReplayResult as GitReplayResult,
   GitRevertContinueOptions,
   GitRevertOptions,
+  RevisionResolution as GitRevisionResolution,
+  GitRevParseOptions,
   GitScratchAddOptions,
   GitScratchCommitTreeOptions,
   GitScratchIndex,
@@ -75,6 +77,7 @@ import type {
   Git as RootGit,
   GitDivergenceOptions as RootGitDivergenceOptions,
   GitReadRefOptions as RootGitReadRefOptions,
+  GitRevParseOptions as RootGitRevParseOptions,
   GitWorktreeAddOptions as RootGitWorktreeAddOptions,
   GitWorktreeRemoveOptions as RootGitWorktreeRemoveOptions,
   RawRefTarget as RootRawRefTarget,
@@ -91,6 +94,7 @@ import type {
   ReplayResult as RootReplayResult,
   GitRevertContinueOptions as RootRevertContinueOptions,
   GitRevertOptions as RootRevertOptions,
+  RevisionResolution as RootRevisionResolution,
   GitScratchAddOptions as RootScratchAddOptions,
   GitScratchCommitTreeOptions as RootScratchCommitTreeOptions,
   GitScratchIndex as RootScratchIndex,
@@ -222,6 +226,12 @@ describe("public bounded read exports", () => {
       target: "refs/remotes/origin/main",
     };
     const gitTarget: GitRawRefTarget = target;
+    const revision: RootGitRevParseOptions = { dir: "/repo", ref: "HEAD^{tree}" };
+    const gitRevision: GitRevParseOptions = revision;
+    const resolved: RootRevisionResolution = { oid: "1".repeat(40), mode: "40000" };
+    const gitResolved: GitRevisionResolution = resolved;
+    const rootMethods: readonly (keyof RootGit)[] = ["revParse", "tryRevParse"];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
 
     expect([
       gitCoreDivergence.current,
@@ -231,6 +241,9 @@ describe("public bounded read exports", () => {
       gitCoreRead.ref,
       gitRead.dir,
       gitTarget.kind,
+      gitRevision.ref,
+      gitResolved.mode,
+      gitMethods,
       gitDivergence,
       rootDivergence,
       gitReadRef,
@@ -243,6 +256,9 @@ describe("public bounded read exports", () => {
       "refs/remotes/origin/HEAD",
       "/repo",
       "symbolic",
+      "HEAD^{tree}",
+      "40000",
+      rootMethods,
       gitDivergence,
       rootDivergence,
       gitReadRef,
