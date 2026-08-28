@@ -284,9 +284,9 @@ models overlap.
   current linked-worktree session model.
 - Multi-ref checkpoint pushes, partial clone, wildcard refspec fetch, remote ref
   discovery, scratch indexes, and patch interchange remain in backlog
-  [08](../backlog/08-extend-push-refspecs.md),
+  [08](sprint-2026-08-28-refspec-transport.md),
   [41](../backlog/41-partial-clone.md),
-  [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md),
+  [42](sprint-2026-08-28-refspec-transport.md),
   the later [index and object write plumbing sprint](sprint-2026-08-28-index-and-object-write-plumbing.md), and
   then-open backlog 44. They belong to the broader checkpoint workload, not the
   current consumer admission gate.

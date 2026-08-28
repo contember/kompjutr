@@ -1,3 +1,21 @@
+> **OUTCOME — shipped 2026-08-28.** Added bounded remote ref discovery,
+> structured exact and wildcard fetch, one atomic exact-ref publication seam,
+> bounded multi-root pack planning, ordered multi-command receive-pack, and a
+> structured native push with independent tracking reconciliation. Commit map:
+> plan → `24a59de`; WU0 → `47d383b`; WU1 → `480c1c9`; WU2 → `f751053`; WU3 →
+> `5ed9421`; WU4 → `978bc02` with aggregate ingest budgeting in `bdf94d0`; WU5
+> → `b882e5b` with shared option validation in `0544c67`; WU6 → `ca8b789`; WU7
+> seams → `2175df6`, `28870b5`, and `345b27c`; closure witnesses → `7847156`,
+> `3786994`, `aa27cdd`, `5616646`, `76bbee7`, and `972fc44`; closure → this
+> archived record. Verification: the 132-test routine gate passed in 6.21 s;
+> the complete sliced runner passed 2,674 tests with five known skips and zero
+> failures in 369.49 s; its slowest slice was the 96-test E2E gate at 62.80 s.
+> Typecheck, Biome, build, and diff validation passed. Independent T3 review
+> approved every implementation area after affected fixes. Backlog closed: 08
+> and 42. Deferred: configured textual refspecs, pruning mapped fetches,
+> force-with-lease, abort signals, deepening, partial clone, SSH, credential
+> helpers, and protocol v2 remain outside this sprint.
+
 # Sprint — Refspec transport (2026-08-28)
 
 **Goal.** Move bounded sets of arbitrary refs through Smart HTTP: discover

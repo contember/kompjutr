@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Refspec transport](sprint-2026-08-28-refspec-transport.md)
+  — bounded remote discovery, wildcard mapped fetch, exact atomic publication,
+  and structured atomic multi-ref push with tracking reconciliation.
 - [Snapshot replay and guarded refs](sprint-2026-08-28-snapshot-replay-and-guarded-refs.md)
   — bounded checkpoint replay, guarded ref publication, revision resolution,
   merge-base, and recursive tree reads.

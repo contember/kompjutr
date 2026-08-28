@@ -158,7 +158,7 @@ The sprint closes those gaps without adding submodule or byte-path architecture.
   new status/dirty semantics — [58](../backlog/58-materialize-gitlink-conflicts.md).
 - Byte-preserving arbitrary Git paths need a byte-path public representation —
   [59](../backlog/59-byte-preserving-git-paths.md).
-- General fetch refspec parsing remains [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md).
+- General fetch refspec parsing remains [42](sprint-2026-08-28-refspec-transport.md).
 - Ignored-tree pruning, commit tracker reseal, and full-status prepass reduction
   remain [54](sprint-2026-08-27-worktree-performance-and-budget.md),
   [56](sprint-2026-08-27-worktree-performance-and-budget.md), and
