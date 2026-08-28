@@ -150,6 +150,10 @@ export interface AddOptions {
   excludeRoots?: string[];
 }
 
+export type AddLiteralPathsResult =
+  | { outcome: "staged" }
+  | { outcome: "ignored"; paths: readonly string[] };
+
 /**
  * Stage working-tree changes into the index.
  *
@@ -164,64 +168,99 @@ export function add(
   index: IndexStore = repo.checkout,
 ): void {
   repo.store.runScratchAwareOperation(() => {
-    const all = options.all === true;
-    const specs = normalizeSpecs(options.paths);
-    if (!all && specs.length === 0) return;
-
-    const limits: AddOperationLimits = {
-      indexRows: 0,
-      worktreeRows: 0,
-      headRows: 0,
-      hashBytes: 0,
-      hashRangeReads: 0,
-    };
-    const force = options.force === true;
-    const trackedOnly = all && options.trackedOnly === true;
-    const pathspec = all ? undefined : compilePathspecs(specs);
-    if (!all && pathspec !== undefined) {
-      const selected =
-        index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context) : null;
-      if (selected !== null) {
-        assertSelectedPathspecsMatch(specs, selected);
-        applyAdd(
-          repo,
-          worktree,
-          options,
-          snapshotAddIndexRows(selected.index, pathspec, selected.retainedBytes, limits),
-          selectedWorktreeFiles(selected.worktree, pathspec),
-          pathspec,
-          force,
-          false,
-          index,
-          limits,
-        );
-        return;
-      }
-      if (specs.length > ADD_SCALAR_PATHS) {
-        throw new GitError("E2BIG", `add pathspec fallback exceeds ${ADD_SCALAR_PATHS} paths`);
-      }
-      assertPathspecsMatch(repo, worktree, specs, index);
-    }
-
-    const snapshot = snapshotAddIndex(index, pathspec, limits);
-    const walked = walkWorktreeEntriesStream(worktree, repo.root, {
-      pathspec,
-      includeIgnored: true,
-      maxScanRows: ADD_MAX_ROWS_PER_STREAM,
-    });
-    applyAdd(
-      repo,
-      worktree,
-      options,
-      snapshot,
-      walked,
-      pathspec,
-      force,
-      trackedOnly,
-      index,
-      limits,
-    );
+    runAdd(repo, worktree, options, normalizeSpecs(options.paths), context, index);
   });
+}
+
+/** Stage already-normalized literal paths without rewriting their bytes. */
+export function addLiteralPaths(
+  repo: Repository,
+  worktree: Worktree,
+  options: AddOptions,
+  context?: Pick<GitContext, "selectedPaths" | "sparseWorkspace">,
+): AddLiteralPathsResult {
+  return repo.store.runScratchAwareOperation(() => {
+    if (options.all === true) {
+      throw new GitError("EINVAL", "literal add requires explicit paths");
+    }
+    compilePathspecs(options.paths);
+    const specs = uniqueSpecs(options.paths);
+    const preflight = preflightLiteralAdd(repo, worktree, specs, options.excludeRoots);
+    runAdd(repo, worktree, options, specs, context, repo.checkout, preflight.ignores);
+    return preflight.ignored.length === 0
+      ? { outcome: "staged" }
+      : { outcome: "ignored", paths: preflight.ignored };
+  });
+}
+
+function runAdd(
+  repo: Repository,
+  worktree: Worktree,
+  options: AddOptions,
+  specs: string[],
+  context: Pick<GitContext, "selectedPaths" | "sparseWorkspace"> | undefined,
+  index: IndexStore,
+  preloadedIgnores?: IgnoreMatcher,
+): void {
+  const all = options.all === true;
+  if (!all && specs.length === 0) return;
+
+  const limits: AddOperationLimits = {
+    indexRows: 0,
+    worktreeRows: 0,
+    headRows: 0,
+    hashBytes: 0,
+    hashRangeReads: 0,
+  };
+  const force = options.force === true;
+  const trackedOnly = all && options.trackedOnly === true;
+  const pathspec = all ? undefined : compilePathspecs(specs);
+  if (!all && pathspec !== undefined) {
+    const selected =
+      index === repo.checkout ? selectAddPaths(repo, specs, pathspec, context) : null;
+    if (selected !== null) {
+      assertSelectedPathspecsMatch(specs, selected);
+      applyAdd(
+        repo,
+        worktree,
+        options,
+        snapshotAddIndexRows(selected.index, pathspec, selected.retainedBytes, limits),
+        selectedWorktreeFiles(selected.worktree, pathspec),
+        pathspec,
+        force,
+        false,
+        index,
+        limits,
+        preloadedIgnores,
+      );
+      return;
+    }
+    if (specs.length > ADD_SCALAR_PATHS) {
+      throw new GitError("E2BIG", `add pathspec fallback exceeds ${ADD_SCALAR_PATHS} paths`);
+    }
+    assertPathspecsMatch(repo, worktree, specs, index);
+  }
+
+  const snapshot = snapshotAddIndex(index, pathspec, limits);
+  const walked = walkWorktreeEntriesStream(worktree, repo.root, {
+    pathspec,
+    excludeRoots: options.excludeRoots,
+    includeIgnored: true,
+    maxScanRows: ADD_MAX_ROWS_PER_STREAM,
+  });
+  applyAdd(
+    repo,
+    worktree,
+    options,
+    snapshot,
+    walked,
+    pathspec,
+    force,
+    trackedOnly,
+    index,
+    limits,
+    preloadedIgnores,
+  );
 }
 
 function applyAdd(
@@ -235,11 +274,12 @@ function applyAdd(
   trackedOnly: boolean,
   index: IndexStore,
   limits: AddOperationLimits,
+  preloadedIgnores?: IgnoreMatcher,
 ): void {
-  let ignores: IgnoreMatcher | undefined;
+  let ignores = preloadedIgnores;
   const isIgnored = (path: string): boolean => {
     if (force) return false;
-    ignores ??= loadIgnoreMatcher(worktree, repo.root);
+    ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots: options.excludeRoots });
     return ignores.ignores(path, false);
   };
   const excluded = relativeExcludeRoots(repo.root, options.excludeRoots);
@@ -1916,6 +1956,42 @@ function normalizeSpecs(paths: string[]): string[] {
     if (!out.includes(spec)) out.push(spec);
   }
   return out;
+}
+
+function uniqueSpecs(paths: readonly string[]): string[] {
+  return [...new Set(paths)];
+}
+
+interface LiteralAddPreflight {
+  ignored: string[];
+  ignores?: IgnoreMatcher;
+}
+
+function preflightLiteralAdd(
+  repo: Repository,
+  worktree: Worktree,
+  specs: readonly string[],
+  excludeRoots: readonly string[] | undefined,
+): LiteralAddPreflight {
+  const excluded = relativeExcludeRoots(repo.root, excludeRoots);
+  const ignored: string[] = [];
+  let ignores: IgnoreMatcher | undefined;
+  for (const spec of specs) {
+    if (spec === "" || isExcluded(spec, excluded)) continue;
+    const stat = worktree.stat(joinPath(repo.root, spec));
+    if (stat === null || (stat.type !== "dir" && literalSelectionIsExactTracked(repo, spec))) {
+      continue;
+    }
+    ignores ??= loadIgnoreMatcher(worktree, repo.root, { excludeRoots: [...(excludeRoots ?? [])] });
+    if (ignores.ignores(spec, stat.type === "dir")) ignored.push(spec);
+  }
+  ignored.sort(comparePaths);
+  return { ignored, ignores };
+}
+
+function literalSelectionIsExactTracked(repo: Repository, spec: string): boolean {
+  const exact = repo.checkout.indexScan({ prefix: spec, pageSize: 1 }).next();
+  return exact.done !== true && exact.value.path === spec;
 }
 
 /**

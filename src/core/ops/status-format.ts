@@ -176,6 +176,105 @@ export function formatShort(entries: StatusEntry[], options: StatusFormatOptions
   return formatPorcelainV1(entries, options);
 }
 
+/** Long status text used when `git commit` finds an unchanged index tree. */
+export function formatCommitRefusalStatus(
+  entries: StatusDetail[],
+  branch: string,
+  options: StatusFormatOptions = {},
+  maxOutputBytes = STATUS_FORMAT_MAX_OUTPUT_BYTES,
+): string {
+  const resolved = resolveOptions(options);
+  validateStatusPaths(entries);
+  const out = new StatusTextOutput(maxOutputBytes);
+  out.append(`On branch ${branch}\n`);
+  let unstaged = false;
+  let untracked = false;
+  for (const entry of entries) {
+    if (entry.worktree === "?") untracked = true;
+    else if (entry.ignored !== true && entry.unmerged !== true && entry.worktree !== " ") {
+      unstaged = true;
+    }
+  }
+  if (!unstaged && !untracked) {
+    out.append("nothing to commit, working tree clean\n");
+    return out.finish();
+  }
+  if (unstaged) {
+    out.append(
+      "Changes not staged for commit:\n" +
+        '  (use "git add <file>..." to update what will be committed)\n' +
+        '  (use "git restore <file>..." to discard changes in working directory)\n',
+    );
+    for (const entry of entries) {
+      if (
+        entry.ignored === true ||
+        entry.unmerged === true ||
+        entry.worktree === "?" ||
+        entry.worktree === " "
+      ) {
+        continue;
+      }
+      const label = commitWorktreeLabel(entry);
+      out.append(`\t${`${label}:`.padEnd(12, " ")}${formatPath(entry.path, resolved, true)}\n`);
+    }
+    out.append("\n");
+  }
+  if (untracked) {
+    out.append(
+      "Untracked files:\n" + '  (use "git add <file>..." to include in what will be committed)\n',
+    );
+    for (const entry of entries) {
+      if (entry.worktree !== "?") continue;
+      out.append(`\t${formatPath(entry.path, resolved, true)}\n`);
+    }
+    out.append("\n");
+  }
+  out.append(
+    unstaged
+      ? 'no changes added to commit (use "git add" and/or "git commit -a")\n'
+      : 'nothing added to commit but untracked files present (use "git add" to track)\n',
+  );
+  return out.finish();
+}
+
+function commitWorktreeLabel(entry: StatusDetail): "deleted" | "modified" | "typechange" {
+  if (entry.worktree === "D") return "deleted";
+  if (
+    entry.unmerged !== true &&
+    entry.ignored !== true &&
+    "indexMode" in entry &&
+    "worktreeMode" in entry &&
+    entry.indexMode.slice(0, 3) !== entry.worktreeMode.slice(0, 3)
+  ) {
+    return "typechange";
+  }
+  return "modified";
+}
+
+class StatusTextOutput {
+  #bytes = 0;
+  #output = "";
+  readonly #maximum: number;
+
+  constructor(maximum: number) {
+    if (!Number.isSafeInteger(maximum) || maximum < 0) {
+      throw new GitError("EINVAL", "status output ceiling must be a safe nonnegative integer");
+    }
+    this.#maximum = Math.min(maximum, STATUS_FORMAT_MAX_OUTPUT_BYTES);
+  }
+
+  append(value: string): void {
+    const metrics = outputMetrics(value);
+    if (metrics.utf8Bytes > this.#maximum - this.#bytes) throwStatusBudget();
+    this.#bytes += metrics.utf8Bytes;
+    this.#output += value;
+  }
+
+  finish(): string {
+    return this.#output;
+  }
+}
+
 interface OutputMetrics {
   codeUnits: number;
   utf8Bytes: number;

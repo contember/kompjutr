@@ -30,6 +30,7 @@ const STREAM_ABOVE = 512 * 1024;
 
 /** Rows per working-tree scan. This is also the metadata memory bound. */
 export const WORKTREE_SCAN_PAGE = 1000;
+const DIRTY_EXCLUDED_SCAN_ROWS = 100_000;
 
 /** Files held while one bulk hash pass is assembled. */
 const HASH_BATCH = 1000;
@@ -643,11 +644,16 @@ export function* dirtyPathStream(
   worktree: Worktree,
   paths?: string[],
   limits?: DirtyPathLimits,
+  excludeRoots: string[] = [],
 ): Generator<string> {
   const pathspec = compilePathspecs(paths);
+  const excluded = excludeRoots.flatMap((path) => {
+    const relative = relativeTo(repo.root, path);
+    return relative === null || relative === "" ? [] : [relative];
+  });
   let root: string | null = null;
-  let scanned: Generator<ScanEntry> | null = null;
-  let current: IteratorResult<ScanEntry, void> | null = null;
+  let scanned: Generator<WorktreePath> | null = null;
+  let current: IteratorResult<WorktreePath, void> | null = null;
   const pending: { index: IndexEntry; path: WorktreePath }[] = [];
 
   const flush = function* (): Generator<string> {
@@ -731,19 +737,19 @@ export function* dirtyPathStream(
     }
     if (entry.stage !== 0) continue;
     if (!pathspec.matchesEntry(entry.path)) continue;
+    if (excluded.some((root) => entry.path === root || entry.path.startsWith(`${root}/`))) continue;
 
     if (scanned === null) {
       const canonical = worktree.realpath(repo.root);
       root = canonical;
-      scanned = scanWorktreeEntries(worktree, canonical, limits);
+      scanned = scanDirtyWorktreeEntries(worktree, repo.root, canonical, limits, excludeRoots);
       current = scanned.next();
     }
     if (root === null || current === null) throw new Error("dirty path scan has no cursor");
 
-    let cursor: IteratorResult<ScanEntry, void> = current;
+    let cursor: IteratorResult<WorktreePath, void> = current;
     while (cursor.done !== true) {
-      const relative = relativeTo(root, cursor.value.path);
-      if (relative === null || comparePaths(relative, entry.path) < 0) cursor = scanned.next();
+      if (comparePaths(cursor.value.path, entry.path) < 0) cursor = scanned.next();
       else break;
     }
     current = cursor;
@@ -752,19 +758,51 @@ export function* dirtyPathStream(
       yield entry.path;
       continue;
     }
-    const relative = relativeTo(root, cursor.value.path);
-    if (relative !== entry.path) {
+    if (cursor.value.path !== entry.path) {
       yield* flush();
       yield entry.path;
       continue;
     }
 
-    const stat = cursor.value;
+    const stat = cursor.value.stat;
     current = scanned.next();
     pending.push({ index: entry, path: { path: entry.path, stat } });
     if (pending.length >= HASH_BATCH) yield* flush();
   }
   yield* flush();
+}
+
+function* scanDirtyWorktreeEntries(
+  worktree: Worktree,
+  lexicalRoot: string,
+  canonicalRoot: string,
+  limits: DirtyPathLimits | undefined,
+  excludeRoots: string[],
+): Generator<WorktreePath> {
+  if (excludeRoots.length === 0) {
+    for (const stat of scanWorktreeEntries(worktree, canonicalRoot, limits)) {
+      const path = relativeTo(canonicalRoot, stat.path);
+      if (path !== null) yield { path, stat };
+    }
+    return;
+  }
+  for (const entry of walkWorktreeEntriesStream(worktree, lexicalRoot, {
+    excludeRoots,
+    includeIgnored: true,
+    maxScanRows: DIRTY_EXCLUDED_SCAN_ROWS,
+  })) {
+    if (entry.stat.type === "dir") continue;
+    if (limits !== undefined) {
+      if (limits.worktreeRows >= limits.maxWorktreeRows) {
+        throw new GitError(
+          "E2BIG",
+          `dirty-path scan exceeds ${limits.maxWorktreeRows} worktree rows`,
+        );
+      }
+      limits.worktreeRows++;
+    }
+    yield entry;
+  }
 }
 
 /** Files and symlinks from a paged scan over an already canonical root. */

@@ -200,8 +200,9 @@ export function requireCleanIntegrationWorktree(
   repo: Repository,
   worktree: Worktree,
   operation: IntegrationOperation,
+  excludeRoots: string[] = [],
 ): void {
-  const dirty = dirtyPathStream(repo, worktree, undefined, dirtyPathLimits()).next();
+  const dirty = dirtyPathStream(repo, worktree, undefined, dirtyPathLimits(), excludeRoots).next();
   if (dirty.done !== true) {
     throw new GitError(
       "ECHECKOUTFAIL",

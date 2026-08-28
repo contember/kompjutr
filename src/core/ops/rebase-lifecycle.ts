@@ -2,12 +2,14 @@
 
 import { MAX_OPERATION_MEMORY_BYTES } from "../../sqlite/memory.js";
 import { type IndexEntry, MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
+import { utf8 } from "../bytes.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
+import { relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
-import { joinSorted } from "../streams.js";
+import { comparePaths, joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
-import { checkoutTree } from "./checkout.js";
+import { checkoutTree, checkoutTreeExcluding } from "./checkout.js";
 import { resolveIdentity, writeUnpublishedCommit } from "./commit.js";
 import { MAX_INTEGRATION_STRUCTURE_BYTES } from "./integration.js";
 import {
@@ -59,6 +61,8 @@ const REBASE_BASELINE_MAX_BYTES = 32 * 1024 * 1024;
 const REBASE_INTEGRATION_PLAN_BYTES = 20 * 1024 * 1024;
 const REBASE_INTEGRATION_OVERHEAD_BYTES = 2 * 1024 * 1024;
 const REBASE_FINAL_PUBLICATION_SQL_STATEMENTS = 32 + MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS;
+const REBASE_EXCLUDE_ROOTS = 64;
+const REBASE_EXCLUDE_BYTES = 1024 * 1024;
 if (
   MAX_MERGE_STATE_BYTES +
     MAX_REPLAY_PLAN_METADATA_BYTES +
@@ -83,6 +87,51 @@ export interface RebaseContinueOptions {
 }
 
 export type RebaseLifecycleResult = RebaseResult;
+
+interface RebaseExclusions {
+  absolute: string[];
+  relative: string[];
+}
+
+const NO_REBASE_EXCLUSIONS: RebaseExclusions = { absolute: [], relative: [] };
+
+function rebaseExclusions(repo: Repository, roots: readonly string[]): RebaseExclusions {
+  if (roots.length > REBASE_EXCLUDE_ROOTS) {
+    throw new GitError("E2BIG", `rebase exclusions exceed ${REBASE_EXCLUDE_ROOTS} roots`);
+  }
+  const absolute: string[] = [];
+  const relative: string[] = [];
+  let retainedBytes = 0;
+  for (const root of roots) {
+    const path = relativeTo(repo.root, root);
+    if (path === null || path === "") {
+      throw new GitError("EINVAL", `rebase exclusion ${root} is not nested under ${repo.root}`);
+    }
+    retainedBytes += utf8.encode(root).byteLength + utf8.encode(path).byteLength;
+    if (!Number.isSafeInteger(retainedBytes) || retainedBytes > REBASE_EXCLUDE_BYTES) {
+      throw new GitError("E2BIG", `rebase exclusions exceed ${REBASE_EXCLUDE_BYTES} bytes`);
+    }
+    if (relative.includes(path)) continue;
+    absolute.push(root);
+    relative.push(path);
+  }
+  absolute.sort(comparePaths);
+  relative.sort(comparePaths);
+  return { absolute, relative };
+}
+
+function requirePathsOutsideExclusions(
+  paths: Iterable<string>,
+  exclusions: RebaseExclusions,
+): void {
+  for (const path of paths) {
+    for (const root of exclusions.relative) {
+      if (path === root || path.startsWith(`${root}/`) || root.startsWith(`${path}/`)) {
+        throw new GitError("ECHECKOUTFAIL", `rebase would change foreign checkout path ${path}`);
+      }
+    }
+  }
+}
 
 function checkedStatements(total: number, additional: number): number {
   if (
@@ -225,13 +274,14 @@ function requireCurrentBaseline(
   repo: Repository,
   worktree: Worktree,
   state: RebaseStateMetadata,
+  exclusions: RebaseExclusions,
 ): string {
   const tree = repo.readCommit(state.currentParentOid).tree;
   requireRebaseIndex(repo);
   if (!integrationIndexMatchesTree(repo, tree)) {
     throw new GitError("ECHECKOUTFAIL", "rebase index differs from its current replay parent");
   }
-  requireCleanIntegrationWorktree(repo, worktree, "rebase");
+  requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
   return tree;
 }
 
@@ -295,6 +345,7 @@ function hardMaterializeTree(
   worktree: Worktree,
   baselineTree: string,
   target: BaselineTransition,
+  exclusions: RebaseExclusions,
 ): void {
   const blockers = hardResetBlockersAgainst(
     repo,
@@ -302,6 +353,7 @@ function hardMaterializeTree(
     baselineTree,
     target.treeOid,
     checkoutGuardLimits(),
+    exclusions.absolute,
   );
   if (blockers.untracked.length > 0) {
     throw new GitError(
@@ -309,7 +361,7 @@ function hardMaterializeTree(
       `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
     );
   }
-  checkoutTree(repo, worktree, target.treeOid, {
+  checkoutTreeExcluding(repo, worktree, target.treeOid, exclusions.absolute, {
     preserveMatchingIndex: false,
     restoreStructure: true,
     discardUnmerged: true,
@@ -538,6 +590,7 @@ function applyOneStep(
   worktree: Worktree,
   expectedIntegrityOid: string,
   options: RebaseContinueOptions,
+  exclusions: RebaseExclusions,
 ): "advanced" | "conflicted" {
   return repo.store.db.transactionSync(() => {
     const journal = repo.checkout.requireOperationState("rebase");
@@ -546,7 +599,7 @@ function applyOneStep(
     }
     requireOriginalHead(repo, journal.state);
     if (journal.state.phase !== "running") return "conflicted";
-    const currentTree = requireCurrentBaseline(repo, worktree, journal.state);
+    const currentTree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     const journalReservation = repo.store.reserveMemory();
     journalReservation.set("other", journal.retainedBytes);
     try {
@@ -587,6 +640,9 @@ function applyOneStep(
             new Set(),
             "rebase",
           );
+          for (const entry of projected) {
+            requirePathsOutsideExclusions([entry.path, entry.logicalPath], exclusions);
+          }
           requireSafeIntegrationWorktree(
             repo,
             worktree,
@@ -738,6 +794,7 @@ function publishCompleted(
   context: GitContext,
   repo: Repository,
   worktree: Worktree,
+  exclusions: RebaseExclusions,
 ): RebaseLifecycleResult {
   return repo.store.db.transactionSync(() => {
     const journal = repo.checkout.requireOperationState("rebase");
@@ -745,7 +802,7 @@ function publishCompleted(
     if (journal.state.phase !== "running" || journal.state.currentStep !== journal.steps.length) {
       throw new CorruptError("rebase publication started before replay completion");
     }
-    const tree = requireCurrentBaseline(repo, worktree, journal.state);
+    const tree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
       throw new CorruptError("completed rebase baseline changed before publication");
     }
@@ -803,6 +860,7 @@ function driveRebase(
   repo: Repository,
   worktree: Worktree,
   options: RebaseContinueOptions,
+  exclusions: RebaseExclusions,
 ): RebaseLifecycleResult {
   for (;;) {
     const state = readRebaseDriveState(repo);
@@ -810,9 +868,9 @@ function driveRebase(
       return { outcome: "conflicted", replayed: state.replayed, skipped: state.skipped };
     }
     if (state.currentStep === state.stepCount) {
-      return publishCompleted(context, repo, worktree);
+      return publishCompleted(context, repo, worktree, exclusions);
     }
-    applyOneStep(context, repo, worktree, state.integrityOid, options);
+    applyOneStep(context, repo, worktree, state.integrityOid, options, exclusions);
   }
 }
 
@@ -903,17 +961,21 @@ export function startRebase(
       fastForward: true,
     };
   }
-  return driveRebase(context, repo, worktree, options);
+  return driveRebase(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
 }
 
 type PreparedContinuation = { phase: "running" } | { phase: "conflicted"; integrityOid: string };
 
-function prepareContinuation(repo: Repository, worktree: Worktree): PreparedContinuation {
+function prepareContinuation(
+  repo: Repository,
+  worktree: Worktree,
+  exclusions: RebaseExclusions,
+): PreparedContinuation {
   const journal = repo.checkout.requireOperationState("rebase");
   requireOriginalHead(repo, journal.state);
   requireResumedTopology(repo, journal);
   if (journal.state.phase === "running") {
-    requireCurrentBaseline(repo, worktree, journal.state);
+    requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     return { phase: "running" };
   }
   requireConflictOwnership(repo, worktree, journal);
@@ -926,8 +988,36 @@ export function continueRebase(
   worktree: Worktree,
   options: RebaseContinueOptions = {},
 ): RebaseLifecycleResult {
-  const prepared = prepareContinuation(repo, worktree);
-  if (prepared.phase === "running") return driveRebase(context, repo, worktree, options);
+  return continueRebaseInternal(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+}
+
+export function continueRebaseExcluding(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  excludeRoots: readonly string[],
+  options: RebaseContinueOptions = {},
+): RebaseLifecycleResult {
+  return continueRebaseInternal(
+    context,
+    repo,
+    worktree,
+    options,
+    rebaseExclusions(repo, excludeRoots),
+  );
+}
+
+function continueRebaseInternal(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: RebaseContinueOptions,
+  exclusions: RebaseExclusions,
+): RebaseLifecycleResult {
+  const prepared = prepareContinuation(repo, worktree, exclusions);
+  if (prepared.phase === "running") {
+    return driveRebase(context, repo, worktree, options, exclusions);
+  }
   repo.store.db.transactionSync(() => {
     const current = repo.checkout.requireOperationState("rebase");
     if (current.integrityOid !== prepared.integrityOid) {
@@ -938,7 +1028,7 @@ export function continueRebase(
       throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
     }
     const treeStats = requireRebaseIndex(repo);
-    requireCleanIntegrationWorktree(repo, worktree, "rebase");
+    requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
     const journalReservation = repo.store.reserveMemory();
     journalReservation.set("other", current.retainedBytes);
     try {
@@ -960,7 +1050,7 @@ export function continueRebase(
           );
           if (resultEmpty) {
             if (baseline === null) throw new CorruptError("result-empty rebase lost its baseline");
-            hardMaterializeTree(repo, worktree, currentTree, baseline);
+            hardMaterializeTree(repo, worktree, currentTree, baseline, exclusions);
             advance(repo, current, "skipped", null);
           } else {
             const identities = stepIdentities(context, repo, plan, options);
@@ -981,7 +1071,7 @@ export function continueRebase(
       journalReservation.dispose();
     }
   });
-  return driveRebase(context, repo, worktree, options);
+  return driveRebase(context, repo, worktree, options, exclusions);
 }
 
 interface PreparedSkip {
@@ -1020,10 +1110,16 @@ export function skipRebase(
     }
     requireOriginalHead(repo, current.state);
     requireTransitionBudget(current, 192 + prepared.baseline.sqlStatements);
-    hardMaterializeTree(repo, worktree, prepared.currentTree, prepared.baseline);
+    hardMaterializeTree(
+      repo,
+      worktree,
+      prepared.currentTree,
+      prepared.baseline,
+      NO_REBASE_EXCLUSIONS,
+    );
     advance(repo, current, "skipped", null);
   });
-  return driveRebase(context, repo, worktree, options);
+  return driveRebase(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
 }
 
 interface PreparedAbort {
@@ -1046,6 +1142,22 @@ function prepareAbort(repo: Repository, worktree: Worktree): PreparedAbort {
 }
 
 export function abortRebase(repo: Repository, worktree: Worktree): void {
+  abortRebaseInternal(repo, worktree, NO_REBASE_EXCLUSIONS);
+}
+
+export function abortRebaseExcluding(
+  repo: Repository,
+  worktree: Worktree,
+  excludeRoots: readonly string[],
+): void {
+  abortRebaseInternal(repo, worktree, rebaseExclusions(repo, excludeRoots));
+}
+
+function abortRebaseInternal(
+  repo: Repository,
+  worktree: Worktree,
+  exclusions: RebaseExclusions,
+): void {
   const prepared = prepareAbort(repo, worktree);
   repo.store.db.transactionSync(() => {
     const current = repo.checkout.requireOperationState("rebase");
@@ -1054,7 +1166,7 @@ export function abortRebase(repo: Repository, worktree: Worktree): void {
     }
     requireOriginalHead(repo, current.state);
     requireTransitionBudget(current, 192 + prepared.baseline.sqlStatements);
-    hardMaterializeTree(repo, worktree, prepared.baselineTree, prepared.baseline);
+    hardMaterializeTree(repo, worktree, prepared.baselineTree, prepared.baseline, exclusions);
     repo.checkout.clearOperationState();
   });
 }

@@ -5,7 +5,9 @@ import type { Repository } from "../repository.js";
 import type { Worktree } from "../worktree.js";
 import {
   abortRebase,
+  abortRebaseExcluding,
   continueRebase,
+  continueRebaseExcluding,
   type RebaseContinueOptions,
   type RebaseLifecycleResult,
   type RebaseStartOptions,
@@ -33,6 +35,16 @@ export function rebaseContinue(
   return continueRebase(context, repo, worktree, options);
 }
 
+export function rebaseContinueExcluding(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  excludeRoots: readonly string[],
+  options: RebaseContinueOptions = {},
+): RebaseLifecycleResult {
+  return continueRebaseExcluding(context, repo, worktree, excludeRoots, options);
+}
+
 export function rebaseSkip(
   context: GitContext,
   repo: Repository,
@@ -44,4 +56,12 @@ export function rebaseSkip(
 
 export function rebaseAbort(repo: Repository, worktree: Worktree): void {
   abortRebase(repo, worktree);
+}
+
+export function rebaseAbortExcluding(
+  repo: Repository,
+  worktree: Worktree,
+  excludeRoots: readonly string[],
+): void {
+  abortRebaseExcluding(repo, worktree, excludeRoots);
 }

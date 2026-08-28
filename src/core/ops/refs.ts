@@ -471,6 +471,7 @@ export function checkoutBlockersAgainst(
   paths: string[] | undefined,
   prune: boolean,
   limits?: CheckoutBlockerLimits,
+  excludeRoots: string[] = [],
 ): CheckoutBlockers {
   return checkoutBlockersAgainstMode(
     repo,
@@ -481,6 +482,7 @@ export function checkoutBlockersAgainst(
     prune,
     limits,
     false,
+    excludeRoots,
   );
 }
 
@@ -491,6 +493,7 @@ export function hardResetBlockersAgainst(
   baselineTree: string | null,
   tree: string | null,
   limits: CheckoutBlockerLimits,
+  excludeRoots: string[] = [],
 ): CheckoutBlockers {
   return checkoutBlockersAgainstMode(
     repo,
@@ -501,6 +504,7 @@ export function hardResetBlockersAgainst(
     true,
     limits,
     true,
+    excludeRoots,
   );
 }
 
@@ -513,6 +517,7 @@ function checkoutBlockersAgainstMode(
   prune: boolean,
   limits: CheckoutBlockerLimits | undefined,
   discardTrackedChanges: boolean,
+  excludeRoots: string[],
 ): CheckoutBlockers {
   const tracked: string[] = [];
   const untracked: string[] = [];
@@ -522,7 +527,7 @@ function checkoutBlockersAgainstMode(
   const untrackedAncestors: PendingTarget[] = [];
   const budget = new CheckoutGuardBudget();
 
-  for (const row of checkoutGuardRows(repo, worktree, baselineTree, tree)) {
+  for (const row of checkoutGuardRows(repo, worktree, baselineTree, tree, excludeRoots)) {
     if (limits !== undefined) {
       if (limits.rows >= limits.maxRows) {
         throw new GitError("E2BIG", `checkout guard exceeds ${limits.maxRows} source rows`);
@@ -639,6 +644,7 @@ function* checkoutGuardRows(
   worktree: Worktree,
   baselineTree: string | null,
   tree: string | null,
+  excludeRoots: string[],
 ): Generator<CheckoutGuardRow> {
   const trees = joinSorted(treeStream(repo, tree), treeStream(repo, baselineTree), {
     left: (entry) => entry.path,
@@ -646,7 +652,7 @@ function* checkoutGuardRows(
   });
   const current = joinSorted(
     stageZero(repo.checkout.indexScan()),
-    walkWorktreeEntriesStream(worktree, repo.root),
+    walkWorktreeEntriesStream(worktree, repo.root, { excludeRoots }),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   );
   for (const row of joinSorted(trees, current, {
