@@ -15,13 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-28-snapshot-replay-and-guarded-refs.md`](sprints/sprint-2026-08-28-snapshot-replay-and-guarded-refs.md)
+  — checkpoint replay through a scratch index plus bounded revision, tree, and
+  guarded-ref plumbing.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Snapshot replay and guarded refs are next: replay a checkpoint tree through
+- Snapshot replay and guarded refs are active: replay a checkpoint tree through
   the shipped scratch-index seam, publish it safely, and resolve the required
   revision spellings.
 - The backlog plan is gated on a consumer: Phase 1 closes the calls two internal

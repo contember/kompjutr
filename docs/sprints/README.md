@@ -20,4 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [`sprint-2026-08-28-snapshot-replay-and-guarded-refs.md`](sprint-2026-08-28-snapshot-replay-and-guarded-refs.md)
+  — checkpoint replay through a scratch index plus bounded revision, tree, and
+  guarded-ref plumbing.
