@@ -87,6 +87,7 @@ describe("repository registry", () => {
       "git_checkouts",
       "git_commits",
       "git_config",
+      "git_fetch_namespaces",
       "git_identity_control",
       "git_index",
       "git_index_dirty",
@@ -1116,6 +1117,13 @@ describe("bulk existence", () => {
 });
 
 describe("refs, config and index", () => {
+  const fetchMetadata = {
+    actor: null,
+    reason: "fetch publication",
+    timestamp: 1_800_000_000,
+    timezoneOffset: 0,
+  };
+
   it("stores shared refs relationally with HEAD on the checkout row", () => {
     const { store } = open();
     store.setRef("refs/heads/main", "a".repeat(40));
@@ -1127,6 +1135,537 @@ describe("refs, config and index", () => {
     expect(store.head()).toBe("ref: refs/heads/main");
     store.setHead("c".repeat(40));
     expect(store.getRef("HEAD")).toBe("c".repeat(40));
+  });
+
+  it("lets only the newest same-namespace fetch publish, including after its raw no-op", () => {
+    const { store } = open();
+    const name = "refs/remotes/origin/main";
+    const current = "1".repeat(40);
+    store.setRef(name, current);
+    const older = store.beginFetchPublication("refs/remotes/origin/");
+    const newer = store.beginFetchPublication("refs/remotes/origin/");
+
+    try {
+      expect(newer.generation).toBe(older.generation + 1);
+      expect(
+        store.publishFetchRefs(newer, { trackingPuts: [{ name, target: current }] }, fetchMetadata),
+      ).toBe(false);
+      expect(() =>
+        store.publishFetchRefs(
+          older,
+          { trackingPuts: [{ name, target: "2".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+      expect(store.getRef(name)).toBe(current);
+    } finally {
+      older.dispose();
+      newer.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("fences overlapping tracking prefixes and lets disjoint prefixes commute", () => {
+    const { store } = open();
+    const broad = store.beginFetchPublication("refs/remotes/team/");
+    const narrow = store.beginFetchPublication("refs/remotes/team/sub/");
+    const origin = store.beginFetchPublication("refs/remotes/origin/");
+    const upstream = store.beginFetchPublication("refs/remotes/upstream/");
+
+    try {
+      expect(() => store.publishFetchRefs(broad, {}, fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+      expect(
+        store.publishFetchRefs(
+          narrow,
+          {
+            trackingPuts: [{ name: "refs/remotes/team/sub/main", target: "1".repeat(40) }],
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(
+        store.publishFetchRefs(
+          upstream,
+          {
+            trackingPuts: [{ name: "refs/remotes/upstream/main", target: "2".repeat(40) }],
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(
+        store.publishFetchRefs(
+          origin,
+          {
+            trackingPuts: [{ name: "refs/remotes/origin/main", target: "3".repeat(40) }],
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(store.listRefs("refs/remotes/")).toEqual([
+        { name: "refs/remotes/origin/main", target: "3".repeat(40) },
+        { name: "refs/remotes/team/sub/main", target: "1".repeat(40) },
+        { name: "refs/remotes/upstream/main", target: "2".repeat(40) },
+      ]);
+    } finally {
+      broad.dispose();
+      narrow.dispose();
+      origin.dispose();
+      upstream.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("detects generic tracking ABA while unrelated local branches coexist", () => {
+    const { db, store } = open();
+    const tracking = "refs/remotes/origin/main";
+    const local = "refs/heads/local";
+    const first = "1".repeat(40);
+    store.setRef(tracking, first);
+    store.setRef(local, "a".repeat(40));
+    const stale = store.beginFetchPublication("refs/remotes/origin/");
+
+    try {
+      store.setRef(tracking, "2".repeat(40));
+      store.setRef(tracking, first);
+      const revision = db.scalar<number>(
+        "SELECT revision FROM git_fetch_namespaces WHERE repo_id = 1 AND tracking_prefix = ?",
+        "refs/remotes/origin/",
+      );
+      expect(revision).toBe(2);
+      store.setRef(local, "b".repeat(40));
+      expect(
+        db.scalar<number>(
+          "SELECT revision FROM git_fetch_namespaces WHERE repo_id = 1 AND tracking_prefix = ?",
+          "refs/remotes/origin/",
+        ),
+      ).toBe(revision);
+      expect(() =>
+        store.publishFetchRefs(
+          stale,
+          { trackingPuts: [{ name: tracking, target: first }] },
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+    } finally {
+      stale.dispose();
+    }
+
+    const fresh = store.beginFetchPublication("refs/remotes/origin/");
+    try {
+      store.setRef(local, "c".repeat(40));
+      expect(
+        store.publishFetchRefs(
+          fresh,
+          { trackingPuts: [{ name: tracking, target: "3".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(store.getRef(tracking)).toBe("3".repeat(40));
+      expect(store.getRef(local)).toBe("c".repeat(40));
+    } finally {
+      fresh.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("detects tracking ABA from a store opened before the fetch namespace existed", () => {
+    const first = open();
+    const tracking = "refs/remotes/origin/main";
+    const original = "1".repeat(40);
+    first.store.setRef(tracking, original);
+    const secondDatabase = new SqliteGitDatabase(new TestDatabase(first.db.storage));
+    const checkout = secondDatabase.checkoutAt("/repo");
+    if (checkout === null) throw new Error("shared checkout is missing");
+    const second = secondDatabase.openCheckout(checkout);
+    const token = second.beginFetchPublication("refs/remotes/origin/");
+
+    try {
+      first.store.setRef(tracking, "2".repeat(40));
+      first.store.setRef(tracking, original);
+      expect(() =>
+        second.publishFetchRefs(
+          token,
+          { trackingPuts: [{ name: tracking, target: "3".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+      expect(second.getRef(tracking)).toBe(original);
+    } finally {
+      token.dispose();
+    }
+    assertMemoryCoordinatorIdle(first.store);
+    assertMemoryCoordinatorIdle(second);
+  });
+
+  it("publishes an exact remote HEAD update and prune in one ref transaction", () => {
+    const { store } = open();
+    const prefix = "refs/remotes/origin/";
+    store.updateRefs([
+      { name: `${prefix}HEAD`, target: `ref: ${prefix}old` },
+      { name: `${prefix}main`, target: "1".repeat(40) },
+      { name: `${prefix}old`, target: "2".repeat(40) },
+    ]);
+    const token = store.beginFetchPublication(prefix);
+
+    try {
+      expect(token.trackingRefs).toEqual([
+        { name: `${prefix}HEAD`, target: `ref: ${prefix}old` },
+        { name: `${prefix}main`, target: "1".repeat(40) },
+        { name: `${prefix}old`, target: "2".repeat(40) },
+      ]);
+      expect(
+        store.publishFetchRefs(
+          token,
+          {
+            trackingPuts: [{ name: `${prefix}main`, target: "3".repeat(40) }],
+            trackingKeep: [`${prefix}main`],
+            remoteHead: `ref: ${prefix}main`,
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(store.listRefs(prefix)).toEqual([
+        { name: `${prefix}HEAD`, target: `ref: ${prefix}main` },
+        { name: `${prefix}main`, target: "3".repeat(40) },
+      ]);
+      expect(store.reflog(`${prefix}old`)[0]).toMatchObject({
+        oldRaw: "2".repeat(40),
+        newRaw: null,
+        reason: "fetch publication",
+      });
+    } finally {
+      token.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("accepts an idempotent global tag winner and rejects a different target", () => {
+    const { store } = open();
+    const tag = "refs/tags/release";
+    const same = store.beginFetchPublication("refs/remotes/origin/", [tag]);
+    const winner = store.beginFetchPublication("refs/remotes/upstream/", [tag]);
+
+    try {
+      expect(
+        store.publishFetchRefs(
+          winner,
+          { globalTagPuts: [{ name: tag, target: "1".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(
+        store.publishFetchRefs(
+          same,
+          { globalTagPuts: [{ name: tag, target: "1".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toBe(false);
+    } finally {
+      same.dispose();
+      winner.dispose();
+    }
+
+    const different = store.beginFetchPublication("refs/remotes/mirror/", [tag]);
+    const replacement = store.beginFetchPublication("refs/remotes/vendor/", [tag]);
+    try {
+      store.publishFetchRefs(
+        replacement,
+        { globalTagPuts: [{ name: tag, target: "2".repeat(40) }] },
+        fetchMetadata,
+      );
+      expect(() =>
+        store.publishFetchRefs(
+          different,
+          { globalTagPuts: [{ name: tag, target: "3".repeat(40) }] },
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+      expect(store.getRef(tag)).toBe("2".repeat(40));
+    } finally {
+      different.dispose();
+      replacement.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("checks only selected global tags and accepts an idempotent concurrent winner", () => {
+    const { store } = open();
+    const ignored = "refs/tags/ignored";
+    const selected = "refs/tags/selected";
+    store.setRef(selected, "0".repeat(40));
+    const token = store.beginFetchPublication("refs/remotes/origin/", [ignored, selected]);
+
+    try {
+      store.setRef(ignored, "1".repeat(40));
+      store.setRef(selected, "2".repeat(40));
+      expect(
+        store.publishFetchRefs(
+          token,
+          {
+            trackingPuts: [{ name: "refs/remotes/origin/main", target: "3".repeat(40) }],
+            globalTagPuts: [{ name: selected, target: "2".repeat(40) }],
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(store.getRef(ignored)).toBe("1".repeat(40));
+      expect(store.getRef(selected)).toBe("2".repeat(40));
+      expect(store.getRef("refs/remotes/origin/main")).toBe("3".repeat(40));
+    } finally {
+      token.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("serializes global shallow mutations across disjoint fetch namespaces", () => {
+    const { db, store } = open();
+    const origin = store.beginFetchPublication("refs/remotes/origin/");
+    const upstream = store.beginFetchPublication("refs/remotes/upstream/");
+    const originShallow = "1".repeat(40);
+    const upstreamShallow = "2".repeat(40);
+
+    try {
+      expect(
+        store.publishFetchRefs(
+          upstream,
+          {
+            trackingPuts: [{ name: "refs/remotes/upstream/main", target: upstreamShallow }],
+            shallowAdd: [upstreamShallow],
+          },
+          fetchMetadata,
+        ),
+      ).toBe(true);
+      expect(() =>
+        store.publishFetchRefs(
+          origin,
+          {
+            trackingPuts: [{ name: "refs/remotes/origin/main", target: originShallow }],
+            shallowAdd: [originShallow],
+          },
+          fetchMetadata,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+      expect(store.getRef("refs/remotes/origin/main")).toBeNull();
+      expect(store.shallow()).toEqual(new Set([upstreamShallow]));
+      expect(db.scalar<number>("SELECT shallow_revision FROM git_repositories WHERE id = 1")).toBe(
+        1,
+      );
+    } finally {
+      origin.dispose();
+      upstream.dispose();
+    }
+
+    const stale = store.beginFetchPublication("refs/remotes/origin/");
+    try {
+      store.setShallow(["3".repeat(40)]);
+      expect(() =>
+        store.publishFetchRefs(stale, { shallowRemove: [upstreamShallow] }, fetchMetadata),
+      ).toThrowError(expect.objectContaining({ code: "ESTALEFETCH" }));
+      expect(store.shallow()).toEqual(new Set([upstreamShallow, "3".repeat(40)]));
+    } finally {
+      stale.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("snapshots shallow boundaries authoritatively across live store views", () => {
+    const first = open();
+    const oldBoundary = "1".repeat(40);
+    const currentBoundary = "2".repeat(40);
+    first.store.setShallow([oldBoundary]);
+    expect(first.store.shallow()).toEqual(new Set([oldBoundary]));
+
+    const secondDatabase = new SqliteGitDatabase(new TestDatabase(first.db.storage));
+    const checkout = secondDatabase.checkoutAt("/repo");
+    if (checkout === null) throw new Error("shared checkout is missing");
+    const second = secondDatabase.openCheckout(checkout);
+    second.setShallow([currentBoundary], [oldBoundary]);
+    const token = first.store.beginFetchPublication("refs/remotes/origin/");
+    try {
+      expect(token.shallow).toEqual([currentBoundary]);
+      expect(token.shallowRevision).toBe(2);
+    } finally {
+      token.dispose();
+    }
+    assertMemoryCoordinatorIdle(first.store);
+    assertMemoryCoordinatorIdle(second);
+  });
+
+  it("rejects disposed, consumed, and cross-repository publication tokens", () => {
+    const { database, store } = open();
+    const secondRepository = database.createRepository("/other", "ref: refs/heads/main");
+    const second = database.openCheckout(secondRepository);
+    const disposed = store.beginFetchPublication("refs/remotes/origin/");
+    disposed.dispose();
+    expect(disposed.disposed).toBe(true);
+    expect(() => store.publishFetchRefs(disposed, {}, fetchMetadata)).toThrowError(
+      expect.objectContaining({ code: "ESTALEFETCH" }),
+    );
+
+    const foreign = store.beginFetchPublication("refs/remotes/upstream/");
+    try {
+      expect(() => second.publishFetchRefs(foreign, {}, fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+    } finally {
+      foreign.dispose();
+    }
+
+    const consumed = store.beginFetchPublication("refs/remotes/vendor/");
+    try {
+      expect(store.publishFetchRefs(consumed, {}, fetchMetadata)).toBe(false);
+      expect(() => store.publishFetchRefs(consumed, {}, fetchMetadata)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+    } finally {
+      consumed.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
+    assertMemoryCoordinatorIdle(second);
+  });
+
+  it("fails closed on corrupt or exhausted fetch generations and revisions", () => {
+    const corruptGeneration = open();
+    corruptGeneration.db.run("PRAGMA ignore_check_constraints = ON");
+    corruptGeneration.db.run(
+      "UPDATE git_repositories SET fetch_generation = zeroblob(1) WHERE id = 1",
+    );
+    corruptGeneration.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      corruptGeneration.store.beginFetchPublication("refs/remotes/origin/"),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    assertMemoryCoordinatorIdle(corruptGeneration.store);
+
+    const exhaustedGeneration = open();
+    exhaustedGeneration.db.run(
+      "UPDATE git_repositories SET fetch_generation = ? WHERE id = 1",
+      Number.MAX_SAFE_INTEGER,
+    );
+    expect(() =>
+      exhaustedGeneration.store.beginFetchPublication("refs/remotes/origin/"),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    assertMemoryCoordinatorIdle(exhaustedGeneration.store);
+
+    const corruptRevision = open();
+    const corruptToken = corruptRevision.store.beginFetchPublication("refs/remotes/origin/");
+    try {
+      corruptRevision.db.run("PRAGMA ignore_check_constraints = ON");
+      corruptRevision.db.run(
+        "UPDATE git_fetch_namespaces SET revision = zeroblob(1) WHERE repo_id = 1",
+      );
+      corruptRevision.db.run("PRAGMA ignore_check_constraints = OFF");
+      expect(() =>
+        corruptRevision.store.publishFetchRefs(corruptToken, {}, fetchMetadata),
+      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    } finally {
+      corruptToken.dispose();
+    }
+    assertMemoryCoordinatorIdle(corruptRevision.store);
+
+    const exhaustedRevision = open();
+    const exhaustedToken = exhaustedRevision.store.beginFetchPublication("refs/remotes/origin/");
+    try {
+      exhaustedRevision.db.run(
+        "UPDATE git_fetch_namespaces SET revision = ? WHERE repo_id = 1",
+        Number.MAX_SAFE_INTEGER,
+      );
+      expect(() =>
+        exhaustedRevision.store.setRef("refs/remotes/origin/main", "1".repeat(40)),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(exhaustedRevision.store.getRef("refs/remotes/origin/main")).toBeNull();
+    } finally {
+      exhaustedToken.dispose();
+    }
+    assertMemoryCoordinatorIdle(exhaustedRevision.store);
+
+    const corruptShallowRevision = open();
+    corruptShallowRevision.db.run("PRAGMA ignore_check_constraints = ON");
+    corruptShallowRevision.db.run(
+      "UPDATE git_repositories SET shallow_revision = zeroblob(1) WHERE id = 1",
+    );
+    corruptShallowRevision.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() =>
+      corruptShallowRevision.store.beginFetchPublication("refs/remotes/origin/"),
+    ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    assertMemoryCoordinatorIdle(corruptShallowRevision.store);
+
+    const exhaustedShallowRevision = open();
+    exhaustedShallowRevision.db.run(
+      "UPDATE git_repositories SET shallow_revision = ? WHERE id = 1",
+      Number.MAX_SAFE_INTEGER,
+    );
+    expect(() => exhaustedShallowRevision.store.setShallow(["1".repeat(40)])).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(exhaustedShallowRevision.store.shallow()).toEqual(new Set());
+    assertMemoryCoordinatorIdle(exhaustedShallowRevision.store);
+  });
+
+  it("bounds fetch namespace count, retained inputs, and shared operation memory", () => {
+    const namespaceBound = open();
+    namespaceBound.db.run("UPDATE git_repositories SET fetch_generation = 1 WHERE id = 1");
+    namespaceBound.db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1024
+       )
+       INSERT INTO git_fetch_namespaces
+         (repo_id, tracking_prefix, latest_generation, revision)
+       SELECT 1, 'refs/remotes/n-' || printf('%04d', id) || '/', 1, 0 FROM sequence`,
+    );
+    expect(() => namespaceBound.store.beginFetchPublication("refs/remotes/overflow/")).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    assertMemoryCoordinatorIdle(namespaceBound.store);
+
+    const inputBound = open();
+    const candidates = function* (): Generator<string> {
+      for (let index = 0; index <= 100_000; index++) yield "refs/tags/repeated";
+    };
+    expect(() =>
+      inputBound.store.beginFetchPublication("refs/remotes/origin/", candidates()),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(
+      inputBound.db.scalar<number>("SELECT fetch_generation FROM git_repositories WHERE id = 1"),
+    ).toBe(0);
+    assertMemoryCoordinatorIdle(inputBound.store);
+
+    const memoryBound = open();
+    const blocker = memoryBound.store.reserveMemory();
+    blocker.set("other", MAX_REF_MUTATION_RETAINED_BYTES);
+    try {
+      expect(() => memoryBound.store.beginFetchPublication("refs/remotes/origin/")).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(blocker.currentBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
+    } finally {
+      blocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(memoryBound.store);
+  });
+
+  it("publishes 9,329 tracking refs in fewer than 1,000 SQL statements", () => {
+    const { db, store } = open();
+    const refs = Array.from({ length: 9_329 }, (_, index) => ({
+      name: `refs/remotes/origin/branch-${index.toString().padStart(4, "0")}`,
+      target: index.toString(16).padStart(40, "0"),
+    }));
+    const token = store.beginFetchPublication("refs/remotes/origin/");
+
+    try {
+      db.storage.resetCounters();
+      expect(store.publishFetchRefs(token, { trackingPuts: refs }, fetchMetadata)).toBe(true);
+      expect(db.storage.statementCount).toBeLessThan(1_000);
+      expect(db.scalar<number>("SELECT count(*) FROM git_refs WHERE repo_id = 1")).toBe(9_329);
+      expect(store.getRef("refs/remotes/origin/branch-0000")).toBe("0".repeat(40));
+      expect(store.getRef("refs/remotes/origin/branch-9328")).toBe(
+        (9_328).toString(16).padStart(40, "0"),
+      );
+    } finally {
+      token.dispose();
+    }
+    assertMemoryCoordinatorIdle(store);
   });
 
   it("updates 9,329 refs and shallow boundaries in bounded statements", () => {
@@ -1157,7 +1696,7 @@ describe("refs, config and index", () => {
       refs.slice(0, 1_000),
       refs.slice(-1_000).map((ref) => ref.name),
     );
-    expect(db.storage.statementCount).toBeLessThanOrEqual(10);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(11);
     expect(db.scalar<number>("SELECT next_ordinal FROM git_reflog_state WHERE repo_id = 1")).toBe(
       10_329,
     );
@@ -1174,12 +1713,12 @@ describe("refs, config and index", () => {
 
     db.storage.resetCounters();
     store.setShallow(oids);
-    expect(db.storage.statementCount).toBeLessThanOrEqual(6);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(8);
     expect(store.shallow().size).toBe(oids.length);
 
     db.storage.resetCounters();
     store.setShallow([], oids.slice(0, 1_000));
-    expect(db.storage.statementCount).toBeLessThanOrEqual(2);
+    expect(db.storage.statementCount).toBeLessThanOrEqual(4);
     expect(store.shallow().size).toBe(oids.length - 1_000);
   });
 

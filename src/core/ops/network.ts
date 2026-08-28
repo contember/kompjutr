@@ -6,7 +6,11 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import { type CheckoutStore, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import {
+  type CheckoutStore,
+  type FetchPublicationToken,
+  MAX_BLOB_BATCH_BYTES,
+} from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
@@ -80,9 +84,20 @@ interface FetchBehavior {
   resultRef?: string;
   /** A configured selector auto-follows tags even when coverage is one branch. */
   autoTags?: boolean;
-  /** Private clone ownership checkpoint; never exposed through fetch options. */
-  checkpoint?: () => Promise<void> | undefined;
+  /** Private lifecycle and deterministic-test checkpoint. */
+  checkpoint?: (stage: FetchCheckpointStage) => Promise<void> | undefined;
 }
+
+type FetchCheckpointStage =
+  | "before-discovery"
+  | "after-discovery"
+  | "before-upload"
+  | "before-ingest"
+  | "pack-ingest"
+  | "after-ingest"
+  | "after-shallow-response"
+  | "before-ref-publication"
+  | "after-ref-publication";
 
 interface FetchSelection {
   coverage: RemoteRef[];
@@ -156,22 +171,26 @@ function advertisedTags(advertisement: Advertisement): AdvertisedTag[] {
   return tags;
 }
 
-function localTagNames(repo: Repository): Set<string> {
-  return new Set(repo.store.listRefs("refs/tags/").map((ref) => ref.name));
+function snapshottedTagNames(snapshot: FetchPublicationToken): Set<string> {
+  return new Set(snapshot.globalRefs.filter((ref) => ref.target !== null).map((ref) => ref.name));
 }
 
-function eligibleAutoTags(repo: Repository, tags: readonly AdvertisedTag[]): AdvertisedTag[] {
-  const local = localTagNames(repo);
+function eligibleAutoTags(
+  repo: Repository,
+  tags: readonly AdvertisedTag[],
+  snapshot: FetchPublicationToken,
+): AdvertisedTag[] {
+  const local = snapshottedTagNames(snapshot);
   const present = repo.store.hasAll(tags.map((tag) => tag.peeledOid));
   return tags.filter((tag) => !local.has(tag.ref.name) && present.has(tag.peeledOid));
 }
 
-function preflightAllTags(repo: Repository, tags: readonly AdvertisedTag[]): void {
+function preflightAllTags(snapshot: FetchPublicationToken, tags: readonly AdvertisedTag[]): void {
   if (tags.length === 0) return;
-  const existing = new Map(repo.store.listRefs("refs/tags/").map((ref) => [ref.name, ref.target]));
+  const existing = new Map(snapshot.globalRefs.map((ref) => [ref.name, ref.target]));
   for (const tag of tags) {
     const target = existing.get(tag.ref.name);
-    if (target !== undefined && target !== tag.ref.oid) {
+    if (target !== undefined && target !== null && target !== tag.ref.oid) {
       throw new GitError("ETAGFAIL", `fetch would clobber existing tag ${tag.ref.name}`);
     }
   }
@@ -371,13 +390,13 @@ async function ingestPack(
   repo: Repository,
   pack: AsyncIterable<Uint8Array>,
   say: ((text: string) => void) | undefined,
-  checkpoint: (() => Promise<void> | undefined) | undefined,
+  checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
 ): Promise<void> {
   const yieldNow =
     checkpoint === undefined
       ? context.yieldNow
       : async (): Promise<void> => {
-          const pending = checkpoint();
+          const pending = checkpoint("pack-ingest");
           if (pending !== undefined) await pending;
         };
   await repo.store.packs.ingest(pack, {
@@ -401,10 +420,10 @@ async function transferPack(
   },
   auth: Parameters<typeof uploadPack>[1],
   say: ((text: string) => void) | undefined,
-  checkpoint: (() => Promise<void> | undefined) | undefined,
-): Promise<void> {
-  if (request.wants.length === 0) return;
-  const beforeUpload = checkpoint?.();
+  checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
+): Promise<{ shallow: string[]; unshallow: string[] }> {
+  if (request.wants.length === 0) return { shallow: [], unshallow: [] };
+  const beforeUpload = checkpoint?.("before-upload");
   if (beforeUpload !== undefined) await beforeUpload;
   const result = await uploadPack(
     {
@@ -419,17 +438,40 @@ async function transferPack(
     },
     auth,
   );
-  const beforeIngest = checkpoint?.();
+  const beforeIngest = checkpoint?.("before-ingest");
   if (beforeIngest !== undefined) await beforeIngest;
   await ingestPack(context, repo, result.pack, say, checkpoint);
-  const afterIngest = checkpoint?.();
+  const afterIngest = checkpoint?.("after-ingest");
   if (afterIngest !== undefined) await afterIngest;
   if (result.shallow.length > 0 || result.unshallow.length > 0) {
-    repo.store.setShallow(result.shallow, result.unshallow);
-    repo.invalidateShallow();
-    const afterShallow = checkpoint?.();
+    const afterShallow = checkpoint?.("after-shallow-response");
     if (afterShallow !== undefined) await afterShallow;
   }
+  return { shallow: result.shallow, unshallow: result.unshallow };
+}
+
+function accumulateShallow(
+  target: { add: Set<string>; remove: Set<string> },
+  source: { shallow: readonly string[]; unshallow: readonly string[] },
+): void {
+  for (const oid of source.unshallow) {
+    target.add.delete(oid);
+    target.remove.add(oid);
+  }
+  for (const oid of source.shallow) {
+    target.remove.delete(oid);
+    target.add.add(oid);
+  }
+}
+
+function effectiveShallows(
+  baseline: readonly string[],
+  mutation: { add: ReadonlySet<string>; remove: ReadonlySet<string> },
+): string[] {
+  const effective = new Set(baseline);
+  for (const oid of mutation.remove) effective.delete(oid);
+  for (const oid of mutation.add) effective.add(oid);
+  return [...effective];
 }
 
 export async function fetchInto(
@@ -449,11 +491,9 @@ export async function fetchInto(
     ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
     authSession: new RemoteAuthSession(),
   };
-  const beforeDiscovery = behavior.checkpoint?.();
+  const beforeDiscovery = behavior.checkpoint?.("before-discovery");
   if (beforeDiscovery !== undefined) await beforeDiscovery;
   const advertisement = await discover(url, "git-upload-pack", auth);
-  const afterDiscovery = behavior.checkpoint?.();
-  if (afterDiscovery !== undefined) await afterDiscovery;
   const requestedRef = options.remoteRef ?? options.ref;
   const coverageRef = behavior.coverageRef ?? requestedRef;
   const selection = selectRefs(advertisement, {
@@ -472,109 +512,147 @@ export async function fetchInto(
     selection.coverage.filter((ref) => ref.name.startsWith("refs/tags/")).map((ref) => ref.name),
   );
   const requiredTags = tags.filter((tag) => allTags || selectedTagNames.has(tag.ref.name));
-  preflightAllTags(repo, requiredTags);
-
-  const say = progressSink(options.onProgress, options.onMessage);
-  const initialAutoTags = autoTags && tags.length > 0 ? eligibleAutoTags(repo, tags) : [];
-  const transferRefs = [
-    ...selection.coverage,
-    ...(allTags ? tags.map((tag) => tag.ref) : initialAutoTags.map((tag) => tag.ref)),
-  ];
-  const requiredTagTargets = requiredTags.map((tag) => tag.peeledOid);
-  const wants = repo.store.missing([...transferRefs.map((ref) => ref.oid), ...requiredTagTargets]);
-  const shallows = [...repo.shallow()];
-  await transferPack(
-    context,
-    repo,
-    {
-      url,
-      wants,
-      shallows,
-      advertised: advertisement.capabilities,
-      ...(options.depth === undefined ? {} : { depth: options.depth }),
-      ...(autoTags ? { includeTag: true } : {}),
-    },
-    auth,
-    say,
-    behavior.checkpoint,
+  const candidateTags = allTags || autoTags ? tags : requiredTags;
+  const trackingPrefix = `refs/remotes/${remote}/`;
+  const publication = repo.beginFetchPublication(
+    trackingPrefix,
+    candidateTags.map((tag) => tag.ref.name),
   );
 
-  // A server without include-tag may omit annotated tag objects. Once their
-  // peeled targets are local, one bounded fallback request completes them.
-  if (autoTags && tags.length > 0) {
-    const eligible = eligibleAutoTags(repo, tags);
-    const fallbackWants = repo.store.missing(eligible.map((tag) => tag.ref.oid));
-    const wanted = new Set(fallbackWants);
-    await transferPack(
-      context,
-      repo,
-      {
-        url,
-        wants: fallbackWants,
-        shallows: [...repo.shallow()],
-        advertised: advertisement.capabilities,
-        haves: eligible.filter((tag) => wanted.has(tag.ref.oid)).map((tag) => tag.peeledOid),
-      },
-      auth,
-      say,
-      behavior.checkpoint,
-    );
-  }
+  try {
+    preflightAllTags(publication, requiredTags);
+    const afterDiscovery = behavior.checkpoint?.("after-discovery");
+    if (afterDiscovery !== undefined) await afterDiscovery;
 
-  const finalAutoTags = autoTags && tags.length > 0 ? eligibleAutoTags(repo, tags) : [];
-  const selectedTags = allTags ? tags : autoTags ? finalAutoTags : requiredTags;
-  authenticateTags(repo, selectedTags);
-  const publishedRefs = [
-    ...selection.coverage.filter((ref) => !ref.name.startsWith("refs/tags/")),
-    ...selectedTags.map((tag) => tag.ref),
-  ];
-
-  // One transaction: either every tracking ref moves or none does.
-  const trackingPrefix = `refs/remotes/${remote}/`;
-  const deletes: string[] = [];
-  if (options.prune === true) {
-    const advertised = new Set(
-      advertisement.refs
-        .filter((ref) => ref.name.startsWith("refs/heads/"))
-        .map((ref) => `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`),
+    const say = progressSink(options.onProgress, options.onMessage);
+    const initialAutoTags =
+      autoTags && tags.length > 0 ? eligibleAutoTags(repo, tags, publication) : [];
+    const transferRefs = [
+      ...selection.coverage,
+      ...(allTags ? tags.map((tag) => tag.ref) : initialAutoTags.map((tag) => tag.ref)),
+    ];
+    const requiredTagTargets = requiredTags.map((tag) => tag.peeledOid);
+    const wantedOids = [...transferRefs.map((ref) => ref.oid), ...requiredTagTargets];
+    const advertisedHeads = selection.coverage.filter((ref) => ref.name.startsWith("refs/heads/"));
+    const publishedShallow = new Set(publication.shallow);
+    const depthOneAlreadyPublished =
+      options.depth === 1 &&
+      advertisedHeads.length > 0 &&
+      advertisedHeads.every((ref) => publishedShallow.has(ref.oid));
+    // An unproven depth request must renegotiate shallow boundaries even when a prior
+    // failed publication already left the advertised tip object complete.
+    const wants =
+      options.depth !== undefined && options.depth > 0 && !depthOneAlreadyPublished
+        ? [...new Set(wantedOids)]
+        : repo.store.missing(wantedOids);
+    const shallows = [...publication.shallow];
+    const shallow = { add: new Set<string>(), remove: new Set<string>() };
+    accumulateShallow(
+      shallow,
+      await transferPack(
+        context,
+        repo,
+        {
+          url,
+          wants,
+          shallows,
+          advertised: advertisement.capabilities,
+          ...(options.depth === undefined ? {} : { depth: options.depth }),
+          ...(autoTags ? { includeTag: true } : {}),
+        },
+        auth,
+        say,
+        behavior.checkpoint,
+      ),
     );
-    for (const existing of repo.store.listRefs(trackingPrefix)) {
-      if (!advertised.has(existing.name)) deletes.push(existing.name);
+
+    // A server without include-tag may omit annotated tag objects. Once their
+    // peeled targets are local, one bounded fallback request completes them.
+    if (autoTags && tags.length > 0) {
+      const eligible = eligibleAutoTags(repo, tags, publication);
+      const fallbackWants = repo.store.missing(eligible.map((tag) => tag.ref.oid));
+      const wanted = new Set(fallbackWants);
+      accumulateShallow(
+        shallow,
+        await transferPack(
+          context,
+          repo,
+          {
+            url,
+            wants: fallbackWants,
+            shallows: effectiveShallows(shallows, shallow),
+            advertised: advertisement.capabilities,
+            haves: eligible.filter((tag) => wanted.has(tag.ref.oid)).map((tag) => tag.peeledOid),
+          },
+          auth,
+          say,
+          behavior.checkpoint,
+        ),
+      );
     }
-  }
-  const updates = [];
-  for (const ref of publishedRefs) {
-    if (ref.name.startsWith("refs/heads/")) {
-      updates.push({
+
+    const finalAutoTags =
+      autoTags && tags.length > 0 ? eligibleAutoTags(repo, tags, publication) : [];
+    const selectedTags = allTags ? tags : autoTags ? finalAutoTags : requiredTags;
+    authenticateTags(repo, selectedTags);
+    const publishedRefs = selection.coverage.filter((ref) => !ref.name.startsWith("refs/tags/"));
+
+    const trackingPuts = publishedRefs
+      .filter((ref) => ref.name.startsWith("refs/heads/"))
+      .map((ref) => ({
         name: `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`,
         target: ref.oid,
-      });
-    } else if (ref.name.startsWith("refs/tags/")) {
-      updates.push({ name: ref.name, target: ref.oid });
+      }));
+    const trackingKeep =
+      options.prune === true
+        ? advertisement.refs
+            .filter((ref) => ref.name.startsWith("refs/heads/"))
+            .map((ref) => `${trackingPrefix}${ref.name.slice("refs/heads/".length)}`)
+        : undefined;
+    const retainedTracking = new Set(publication.trackingRefs.map((ref) => ref.name));
+    const keptTracking = new Set(trackingKeep ?? retainedTracking);
+    const updatedTracking = new Set(trackingPuts.map((ref) => ref.name));
+    let remoteHead: string | null | undefined;
+    const headRef = advertisement.headRef ?? "";
+    if (headRef.startsWith("refs/heads/")) {
+      const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
+      const retained =
+        retainedTracking.has(tracking) &&
+        (trackingKeep === undefined || keptTracking.has(tracking));
+      if (updatedTracking.has(tracking) || retained) {
+        remoteHead = `ref: ${tracking}`;
+      } else if (options.prune === true) {
+        remoteHead = null;
+      }
+    } else if (options.prune === true) {
+      remoteHead = null;
     }
-  }
-  // The remote's HEAD is a symref into *our* tracking namespace, not into
-  // the local branches, and only once the branch it names has been fetched.
-  const headRef = advertisement.headRef ?? "";
-  if (headRef.startsWith("refs/heads/")) {
-    const tracking = `${trackingPrefix}${headRef.slice("refs/heads/".length)}`;
-    const updated = updates.some((ref) => ref.name === tracking);
-    const retained = !deletes.includes(tracking) && repo.store.getRef(tracking) !== null;
-    if (updated || retained) {
-      updates.push({ name: `${trackingPrefix}HEAD`, target: `ref: ${tracking}` });
-    }
-  }
-  preflightAllTags(repo, requiredTags);
-  const beforeRefs = behavior.checkpoint?.();
-  if (beforeRefs !== undefined) await beforeRefs;
-  repo.mutateRefs({ puts: updates, deletes }, operationRefLogMetadata(context, repo, refLogReason));
-  const afterRefs = behavior.checkpoint?.();
-  if (afterRefs !== undefined) await afterRefs;
 
-  return {
-    defaultBranch: advertisement.headRef,
-    fetchHead: selection.result?.oid ?? null,
-  };
+    const beforeRefs = behavior.checkpoint?.("before-ref-publication");
+    if (beforeRefs !== undefined) await beforeRefs;
+    repo.publishFetchRefs(
+      publication,
+      {
+        trackingPuts,
+        ...(trackingKeep === undefined ? {} : { trackingKeep }),
+        ...(remoteHead === undefined ? {} : { remoteHead }),
+        globalTagPuts: selectedTags.map((tag) => ({ name: tag.ref.name, target: tag.ref.oid })),
+        shallowAdd: shallow.add,
+        shallowRemove: shallow.remove,
+      },
+      operationRefLogMetadata(context, repo, refLogReason),
+    );
+    publication.dispose();
+    const afterRefs = behavior.checkpoint?.("after-ref-publication");
+    if (afterRefs !== undefined) await afterRefs;
+
+    return {
+      defaultBranch: advertisement.headRef,
+      fetchHead: selection.result?.oid ?? null,
+    };
+  } finally {
+    publication.dispose();
+  }
 }
 
 function tryInitialClone(context: GitContext, repo: Repository, treeOid: string): boolean {

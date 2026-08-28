@@ -373,3 +373,23 @@ git diff --check
   witness. Typecheck, build, Biome, and diff validation pass. The docs linter
   reports only its known false positive for the managed `docs/AGENTS.md`
   symlink.
+- 2026-08-28: WU3 allocates a durable generation after fetch discovery and
+  snapshots the exact tracking namespace, selected global-tag candidates, and
+  shallow boundaries. Overlapping namespaces fence older owners; tracking ABA,
+  selected tag conflicts, and global shallow drift reject with `ESTALEFETCH`
+  before the atomic ref/prune/remote-HEAD/tag/shallow publication. Disjoint
+  namespaces commute unless they contend on a selected tag or shallow state.
+- 2026-08-28: Direct and network witnesses cover both same-remote completion
+  orders, old prune versus a new branch, cross-store tracking ABA, local
+  branch/index/journal coexistence on success and stale rejection, disjoint tag
+  winners and conflicts, auto-follow retry, both shallow completion orders,
+  complete-object retention, exact cold state, and complete reflog idempotence
+  after response loss. An unproved depth retry renegotiates shallow state even
+  when the failed attempt already completed its pack.
+- 2026-08-28: Independent WU3 review found and closed cached-negative
+  cross-store ABA, checks against unselected tags, idempotent tag cardinality,
+  missing schema and coexistence witnesses, unversioned global shallow state,
+  stale cached shallow baselines, shallow response-loss retry, and a quadratic
+  depth-one proof. The final affected gate passes all 180 tests across six
+  files. Typecheck, build, Biome, and diff validation pass; the docs linter
+  reports only its known managed-`docs/AGENTS.md` symlink false positive.

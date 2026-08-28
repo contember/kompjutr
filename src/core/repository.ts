@@ -11,6 +11,8 @@ import {
 import type {
   BlobReadBatch,
   CheckoutStore,
+  FetchPublicationPlan,
+  FetchPublicationToken,
   ObjectReadBatch,
   RefLogEntry,
   RefLogMetadata,
@@ -299,6 +301,21 @@ export class Repository {
 
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
     return this.checkout.mutateRefs(mutation, metadata);
+  }
+
+  beginFetchPublication(
+    trackingPrefix: string,
+    candidateGlobalRefs: Iterable<string> = [],
+  ): FetchPublicationToken {
+    return this.store.beginFetchPublication(trackingPrefix, candidateGlobalRefs);
+  }
+
+  publishFetchRefs(
+    token: FetchPublicationToken,
+    plan: FetchPublicationPlan,
+    metadata: RefLogMetadata,
+  ): boolean {
+    return this.store.publishFetchRefs(token, plan, metadata);
   }
 
   activeRefLogOids(): Generator<string> {

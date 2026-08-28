@@ -107,6 +107,14 @@ const STATEMENTS = [
        OR (typeof(clone_expires_ms) = 'integer'
            AND clone_expires_ms BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER})
      ),
+     fetch_generation INTEGER NOT NULL DEFAULT 0 CHECK (
+       typeof(fetch_generation) = 'integer'
+       AND fetch_generation BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     shallow_revision INTEGER NOT NULL DEFAULT 0 CHECK (
+       typeof(shallow_revision) = 'integer'
+       AND shallow_revision BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
      CHECK (
        (lifecycle = 'ready' AND clone_generation IS NULL AND clone_expires_ms IS NULL)
        OR
@@ -179,6 +187,28 @@ const STATEMENTS = [
      PRIMARY KEY (repo_id, name),
      FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
    )`,
+
+  `CREATE TABLE IF NOT EXISTS git_fetch_namespaces (
+     repo_id INTEGER NOT NULL CHECK (
+       typeof(repo_id) = 'integer' AND repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     tracking_prefix TEXT NOT NULL CHECK (
+       typeof(tracking_prefix) = 'text'
+       AND length(CAST(tracking_prefix AS BLOB)) BETWEEN 1 AND 1024
+       AND substr(tracking_prefix, 1, 13) = 'refs/remotes/'
+       AND substr(tracking_prefix, -1) = '/'
+     ),
+     latest_generation INTEGER NOT NULL CHECK (
+       typeof(latest_generation) = 'integer'
+       AND latest_generation BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     revision INTEGER NOT NULL CHECK (
+       typeof(revision) = 'integer'
+       AND revision BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     PRIMARY KEY (repo_id, tracking_prefix),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
 
   ...REFLOG_SCHEMA_STATEMENTS,
 

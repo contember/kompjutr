@@ -34,7 +34,7 @@ The conformance suite uses these outcomes:
 | Owner | Durable checkpoints |
 |---|---|
 | `clone` | Repository creation and routing; fetch pack and shallow state; ref/HEAD/config publication; initial index and worktree materialization. |
-| `fetch` | In-memory advertisement; pending pack reservation and streamed checkpoints; complete pack; shallow state; atomic tracking/tag/prune publication. |
+| `fetch` | Advertisement followed by a durable namespace generation and exact tracking/tag/shallow snapshot; pending pack reservation and streamed checkpoints; complete pack; atomic tracking/tag/prune/shallow publication. |
 | `push` | Local OID snapshot; remote receive-pack side effect; configured-remote tracking publication. |
 | `pull` | HEAD and upstream snapshot; all fetch checkpoints; snapshot revalidation; synchronous merge publication. |
 | `maintenance` | Run allocation; root pages; mark pages; repack selection, pack publication, and finalization; sweep pages; finish or rollover. |
@@ -61,6 +61,25 @@ the local expiry before its next durable write; after takeover, the old owner
 cannot write or publish. Pack IDs are monotonic across reclaim and deletion, so
 a stale cache key cannot refer to replacement bytes.
 
+Fetch allocates a repository-wide generation after discovery and records it as
+the latest owner for every overlapping remote-tracking prefix. Publication
+requires that generation, the namespace revision, and the exact tracking-ref
+snapshot to remain current. Generic tracking mutations advance the revision,
+including cross-store ABA changes. A stale owner gets `ESTALEFETCH` before any
+ref or shallow mutation, while its complete pack remains readable. Disjoint
+tracking namespaces commute unless they select a conflicting global tag or
+both carry shallow deltas. Tags compare only the names the fetch actually
+publishes; an identical concurrent winner is idempotent, while a different
+target rejects the whole publication. On retry, an existing local tag is part
+of the new snapshot, so auto-follow skips it and tracking publication can
+proceed. Shallow boundaries are repository-wide,
+so their authoritative discovery snapshot and durable revision serialize
+otherwise disjoint depth fetches. Tracking refs, prune, remote HEAD, selected
+tags, and shallow deltas commit in one transaction. A retry after a lost result
+is a no-op and does not allocate new reflog ordinals. A depth retry whose
+boundary was not published renegotiates shallow state even when the prior pack
+already made the advertised tip complete.
+
 `git_pack_entries` authenticates every physical entry of each pack, including
 duplicate OIDs. `git_pack_objects` remains the single canonical read location
 for each OID. Publication compares the exact ordered rows with the digest made
@@ -86,7 +105,7 @@ public method that reaches the same synchronous transaction.
 | Repository route and readiness | `clone` × clone/public calls | One exact provisional owner hides partial state while its root remains a traversal barrier. An active same-root clone gets `EBUSY`; exact-expiry cold retry replaces only the abandoned owner, and a fenced owner gets `ESTALE`. Different roots `coexist`. Ready publication follows complete refs, index, and worktree; fallback target collisions get `EEXIST`, and fallback index/worktree writes are atomic. |
 | Ordinary pack ownership | `clone`/`fetch` × `clone`/`fetch` | One durable generation lease fences ordinary ingest per repository. An unexpired competitor gets `EBUSY`; expiry fences the old owner with `ESTALE`, reclaims only its pending pack, and allocates a never-reused pack ID. Unrelated local work still `coexist`s. |
 | Maintenance pack ownership | `maintenance` × pack owners | Selected, pending, published, and finalized maintenance packs keep exact durable ownership and bypass the ordinary lease. Disjoint packs `coexist`; a publication whose canonical OID is still owned by another pending pack gets `stale-reject` and remains pending for exact recovery. If an ordinary complete owner wins first, maintenance finalizes against it and atomically discards its fully redundant pack. |
-| Tracking refs, tags, and prune | `fetch`/`pull` × fetch | One fetch publishes its complete ref set atomically. Competing publications for the same tracking namespace or global tag are currently `unfenced`; disjoint refs `coexist`. |
+| Tracking refs, tags, prune, and shallow boundaries | `fetch`/`pull` × fetch/local mutation | The latest discovery fences each overlapping tracking namespace. Same-namespace drift and tracking ABA `stale-reject`; complete fetched objects remain. Disjoint namespaces `coexist` when selected global tags and shallow state do not conflict. Selected tags use exact CAS with an idempotent same-target winner. Repository-wide shallow deltas use a durable revision, so the first valid publisher wins and the loser retries. Local branches, index changes, and journals `coexist`. |
 | Remote push CAS | `push` × push/remote writer | The remote receive-pack expected OID produces `stale-reject` for a losing writer. A lost response is reported as `EPUSHUNCERTAIN`. |
 | Local push tracking ref | configured `push` × fetch/push | Publication follows the remote side effect. Competing newer local tracking publication is currently `unfenced`. Explicit-URL push does not publish a local tracking ref. |
 | Pull snapshot | `pull` × HEAD/upstream/journal mutation | Changed HEAD or upstream configuration produces `stale-reject` after fetched state is retained. An active journal at invocation produces `active-reject`; pull rechecks merge state after fetch. |

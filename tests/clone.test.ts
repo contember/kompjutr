@@ -980,7 +980,7 @@ describe("fetch", () => {
     }
   });
 
-  it("rechecks required tag conflicts after the network round trip", async () => {
+  it("rejects required tag drift after the network round trip", async () => {
     const { fixture, head } = makeFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
@@ -1011,7 +1011,7 @@ describe("fetch", () => {
       repo.store.setRef("refs/tags/release", head);
       releasePost();
 
-      await expect(fetching).rejects.toMatchObject({ code: "ETAGFAIL" });
+      await expect(fetching).rejects.toMatchObject({ code: "ESTALEFETCH" });
       expect(repo.store.getRef("refs/tags/release")).toBe(head);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(head);
     } finally {
@@ -1050,6 +1050,32 @@ describe("fetch", () => {
       expect(withoutTags.fetchHead).toBe(main);
       expect(repo.store.getRef("refs/remotes/origin/main")).toBe(main);
       expect(repo.tags()).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("does not create a dangling remote HEAD when prune fetches another branch", async () => {
+    const { fixture } = makeFixture();
+    fixture.git("checkout", "-q", "-b", "topic");
+    fixture.write("topic.txt", "topic\n");
+    const topic = fixture.commit("topic");
+    fixture.git("checkout", "-q", "main");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    try {
+      await fetchInto(workspace.context, workspace.repo, {
+        url: server.url,
+        remoteRef: "topic",
+        singleBranch: true,
+        tags: false,
+        prune: true,
+      });
+
+      expect(workspace.repo.store.getRef("refs/remotes/origin/topic")).toBe(topic);
+      expect(workspace.repo.store.getRef("refs/remotes/origin/main")).toBeNull();
+      expect(workspace.repo.store.getRef("refs/remotes/origin/HEAD")).toBeNull();
     } finally {
       await server.close();
       fixture.dispose();
@@ -1192,11 +1218,11 @@ describe("fetch", () => {
         statements.push({ refs: count, fetch: fetchStatements, prune: pruneStatements });
       }
 
-      // Ref publication adds one maintenance root-epoch statement per fetch.
+      // Durable fetch snapshots add fixed work; page growth stays unchanged.
       expect(statements).toEqual([
-        { refs: 1, fetch: 40, prune: 16 },
-        { refs: 1_000, fetch: 40, prune: 16 },
-        { refs: 9_329, fetch: 52, prune: 28 },
+        { refs: 1, fetch: 49, prune: 26 },
+        { refs: 1_000, fetch: 49, prune: 26 },
+        { refs: 9_329, fetch: 61, prune: 38 },
       ]);
     } finally {
       await server.close();
