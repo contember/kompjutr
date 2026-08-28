@@ -5,6 +5,7 @@ import {
   countAheadBehind,
   MAX_MERGE_BASES,
   MERGE_BASE_SQL_STATEMENTS,
+  mergeBase,
   selectMergeBases,
 } from "../src/core/ops/merge-base.js";
 import { Repository } from "../src/core/repository.js";
@@ -123,6 +124,33 @@ describe("bounded merge-base selection", () => {
 
       expect(gitBases(fixture, current, incoming)).toEqual([base]);
       expect(selection).toMatchObject({ kind: "divergent", bases: [base], commits: 3 });
+    } finally {
+      fixture.dispose();
+    }
+  });
+
+  it("resolves public revision inputs and returns only kind and all best bases", () => {
+    const { fixture, base, current, incoming } = divergentFixture();
+    try {
+      const { db, store, repo } = harness();
+      importReachable(store, fixture, [current, incoming]);
+      store.setRef("refs/heads/current", current);
+      store.setRef("refs/heads/incoming", incoming);
+
+      expect(mergeBase(repo, { current: "current", incoming: "incoming" })).toEqual({
+        kind: "divergent",
+        bases: [base],
+      });
+
+      const database = new SqliteGitDatabase(db);
+      const checkout = database.findCheckout("/repo");
+      if (checkout === null) throw new Error("cold repository is missing");
+      expect(
+        mergeBase(new Repository(database.openCheckout(checkout)), {
+          current: current,
+          incoming: `${incoming}^{commit}`,
+        }),
+      ).toEqual({ kind: "divergent", bases: [base] });
     } finally {
       fixture.dispose();
     }

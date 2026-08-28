@@ -56,6 +56,9 @@ import {
   type DivergenceOptions,
   type DivergenceResult,
   divergence as divergenceOp,
+  type MergeBaseOptions,
+  type MergeBaseResult,
+  mergeBase as mergeBaseOp,
 } from "../core/ops/merge-base.js";
 import {
   type CloneOptions,
@@ -86,6 +89,7 @@ import { type PushOptions, push as pushOp } from "../core/ops/push.js";
 import {
   type CommitView,
   catFile as catFileRead,
+  type LsTreeOptions,
   log as logOp,
   lsFilesAtRef,
   lsTree as lsTreeOp,
@@ -210,6 +214,8 @@ export type GitWriteTreeOptions = GitDirOptions;
 export type GitCommitTreeOptions = CommitTreeOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
 export type GitDivergenceOptions = DivergenceOptions & GitDirOptions;
+export type GitMergeBaseOptions = MergeBaseOptions & GitDirOptions;
+export type GitLsTreeOptions = LsTreeOptions & GitDirOptions & { ref: string; path?: string };
 export type GitReadRefOptions = ReadRefOptions & GitDirOptions;
 export type GitRefLogOptions = RefLogReadOptions & GitDirOptions;
 export type GitRecoverRefOptions = RecoverRefOptions & GitDirOptions;
@@ -266,6 +272,7 @@ export interface Git {
   revParse(input: GitRevParseOptions): Promise<string>;
   tryRevParse(input: GitRevParseOptions): Promise<string | undefined>;
   divergence(input: GitDivergenceOptions): Promise<DivergenceResult>;
+  mergeBase(input: GitMergeBaseOptions): Promise<MergeBaseResult>;
   readRef(input: GitReadRefOptions): Promise<RawRefTarget>;
   worktreeAdd(input: GitWorktreeAddOptions): Promise<WorktreeInfo>;
   worktreeList(input?: GitDirOptions): Promise<readonly WorktreeInfo[]>;
@@ -277,7 +284,7 @@ export interface Git {
   maintenance(input?: GitMaintenanceOptions): Promise<GitMaintenanceResult>;
   currentBranch(input?: GitDirOptions & CurrentBranchOptions): Promise<string | undefined>;
   lsFiles(input?: GitDirOptions & { ref?: string }): Promise<string[]>;
-  lsTree(input: GitDirOptions & { ref: string; path?: string }): Promise<TreeEntryView[]>;
+  lsTree(input: GitLsTreeOptions): Promise<TreeEntryView[]>;
   branch(input: GitBranchOptions): Promise<void>;
   branchDelete(input: GitBranchDeleteOptions): Promise<void>;
   branchList(input?: GitDirOptions): Promise<string[]>;
@@ -465,6 +472,9 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async divergence(input) {
       return divergenceOp(at(input.dir), input);
     },
+    async mergeBase(input) {
+      return mergeBaseOp(at(input.dir), input);
+    },
     async readRef(input) {
       return readRefOp(at(input.dir), input);
     },
@@ -502,7 +512,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
       return input.ref === undefined ? lsFilesOp(repo) : lsFilesAtRef(repo, input.ref);
     },
     async lsTree(input) {
-      return lsTreeOp(at(input.dir), input.ref, input.path);
+      return lsTreeOp(at(input.dir), input.ref, input.path, { recursive: input.recursive });
     },
     async branch(input) {
       const repo = at(input.dir);

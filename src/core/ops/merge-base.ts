@@ -63,6 +63,16 @@ export interface DivergenceOptions {
   upstream: string;
 }
 
+export interface MergeBaseOptions {
+  current: string;
+  incoming: string;
+}
+
+export interface MergeBaseResult {
+  kind: MergeBaseKind;
+  bases: readonly string[];
+}
+
 export type DivergenceRelationship =
   | "identical"
   | "ahead"
@@ -317,6 +327,14 @@ export function divergence(repo: Repository, options: DivergenceOptions): Diverg
   if (behind === 0) return { relationship: "ahead", ahead, behind };
   if (ahead === 0) return { relationship: "behind", ahead, behind };
   return { relationship: "diverged", ahead, behind };
+}
+
+/** Resolve two revisions and return their bounded best-common-ancestor classification. */
+export function mergeBase(repo: Repository, options: MergeBaseOptions): MergeBaseResult {
+  const currentOid = repo.peel(repo.revParse(options.current));
+  const incomingOid = repo.peel(repo.revParse(options.incoming));
+  const { kind, bases } = selectMergeBases(repo, { currentOid, incomingOid });
+  return { kind, bases };
 }
 
 /** Select ancestry mode and all best common ancestors without mutating repository state. */

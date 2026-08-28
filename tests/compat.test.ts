@@ -35,6 +35,28 @@ describe("Computer client operation interlocks", () => {
     await expect(workspace.git.revParse({ ref: "alias" })).resolves.toBe(second.oid);
   });
 
+  it("passes the compatible recursive ls-tree option through Computer", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({
+      storage,
+      git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
+      defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
+    });
+    await workspace.git.init({});
+    await workspace.fs.writeFile("/root.txt", "root\n");
+    await workspace.fs.mkdir("/nested", { recursive: true });
+    await workspace.fs.writeFile("/nested/file.txt", "nested\n");
+    await workspace.git.add({ paths: ["root.txt", "nested"] });
+    await workspace.git.commit({ message: "tree" });
+
+    await expect(workspace.git.lsTree({ ref: "HEAD" })).resolves.toHaveLength(2);
+    const recursiveInput = { ref: "HEAD", recursive: true };
+    await expect(workspace.git.lsTree(recursiveInput)).resolves.toEqual([
+      expect.objectContaining({ path: "nested/file.txt", type: "blob" }),
+      expect.objectContaining({ path: "root.txt", type: "blob" }),
+    ]);
+  });
+
   it("keeps Computer rm cached-only, recursive, and unconditional", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({

@@ -1,13 +1,14 @@
 // Read-only queries over the object database. These back `log`, `show`,
 // `rev-parse`, `ls-tree`, `ls-files` and `cat-file`.
 
-import { ObjectNotFoundError, RefNotFoundError } from "../errors.js";
+import { GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
 import {
   type Commit,
   displayMode,
   isTreeMode,
   type ObjectType,
   type Person,
+  type TreeEntry,
   typeForMode,
 } from "../objects.js";
 import type { Repository } from "../repository.js";
@@ -29,6 +30,14 @@ export interface TreeEntryView {
   oid: string;
   type: "blob" | "tree" | "commit";
 }
+
+export interface LsTreeOptions {
+  recursive?: boolean;
+}
+
+export const MAX_LS_TREE_ENTRIES = 10_000;
+export const MAX_LS_TREE_RETAINED_BYTES = 16 * 1024 * 1024;
+const LS_TREE_ENTRY_BYTES = 256;
 
 function parsedCommitView(oid: string, commit: Commit): CommitView {
   return {
@@ -75,7 +84,47 @@ export function show(repo: Repository, ref: string): CommitView {
   return commitView(repo, repo.peel(repo.revParse(ref)));
 }
 
-export function lsTree(repo: Repository, ref: string, path = ""): TreeEntryView[] {
+function treeEntryView(path: string, entry: TreeEntry): TreeEntryView {
+  return {
+    mode: displayMode(entry.mode),
+    path,
+    oid: entry.oid,
+    type: typeForMode(entry.mode),
+  };
+}
+
+export function collectRecursiveTreeEntries(
+  entries: Iterable<{ path: string; entry: TreeEntry }>,
+): TreeEntryView[] {
+  const out: TreeEntryView[] = [];
+  let retainedBytes = 0;
+  for (const { path, entry } of entries) {
+    if (out.length >= MAX_LS_TREE_ENTRIES) {
+      throw new GitError("E2BIG", `recursive ls-tree exceeds ${MAX_LS_TREE_ENTRIES} entries`);
+    }
+    const rowBytes = LS_TREE_ENTRY_BYTES + path.length * 2;
+    if (!Number.isSafeInteger(rowBytes) || rowBytes > MAX_LS_TREE_RETAINED_BYTES - retainedBytes) {
+      throw new GitError(
+        "E2BIG",
+        `recursive ls-tree exceeds ${MAX_LS_TREE_RETAINED_BYTES} retained bytes`,
+      );
+    }
+    retainedBytes += rowBytes;
+    out.push(treeEntryView(path, entry));
+  }
+  return out;
+}
+
+export function lsTree(
+  repo: Repository,
+  ref: string,
+  path = "",
+  options: LsTreeOptions = {},
+): TreeEntryView[] {
+  const recursive = Reflect.get(options, "recursive");
+  if (recursive !== undefined && typeof recursive !== "boolean") {
+    throw new GitError("EINVAL", "ls-tree recursive must be a boolean");
+  }
   const commitish = repo.revParse(ref);
   const rootTree = treeOf(repo, commitish);
   let treeOid = rootTree;
@@ -83,24 +132,16 @@ export function lsTree(repo: Repository, ref: string, path = ""): TreeEntryView[
     const found = repo.resolveTreePath(rootTree, path);
     if (found === null) throw new RefNotFoundError(`${ref}:${path}`);
     if (!isTreeMode(found.mode)) {
-      return [
-        {
-          mode: displayMode(found.mode),
-          path,
-          oid: found.oid,
-          type: typeForMode(found.mode),
-        },
-      ];
+      return [treeEntryView(path, found)];
     }
     treeOid = found.oid;
   }
-  const prefix = path === "" ? "" : `${path.replace(/\/+$/, "")}/`;
-  return repo.readTree(treeOid).map((entry) => ({
-    mode: displayMode(entry.mode),
-    path: `${prefix}${entry.name}`,
-    oid: entry.oid,
-    type: typeForMode(entry.mode),
-  }));
+  const base = path.replace(/\/+$/, "");
+  if (recursive === true) {
+    return collectRecursiveTreeEntries(repo.walkTree(treeOid, base));
+  }
+  const prefix = base === "" ? "" : `${base}/`;
+  return repo.readTree(treeOid).map((entry) => treeEntryView(`${prefix}${entry.name}`, entry));
 }
 
 /** The tree of a commit, or the object itself when it already is a tree. */
@@ -116,7 +157,7 @@ export function lsFilesAtRef(repo: Repository, ref: string): string[] {
   const tree = treeOf(repo, repo.revParse(ref));
   const out: string[] = [];
   for (const { path } of repo.walkTree(tree)) out.push(path);
-  return out.sort();
+  return out;
 }
 
 export interface CatFileResult {

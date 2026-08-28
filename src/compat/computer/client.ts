@@ -227,7 +227,11 @@ export function createSqliteGitClient(
         return input.ref === undefined ? lsFilesOp(repo) : lsFilesAtRef(repo, input.ref);
       },
       async lsTree(input) {
-        return lsTreeOp(at(input.dir), input.ref, input.path);
+        const recursive = Reflect.get(input, "recursive");
+        if (recursive !== undefined && typeof recursive !== "boolean") {
+          throw new GitError("EINVAL", "ls-tree recursive must be a boolean");
+        }
+        return lsTreeOp(at(input.dir), input.ref, input.path, { recursive });
       },
 
       async branch(input) {

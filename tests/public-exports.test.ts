@@ -6,6 +6,10 @@ import type {
   CommitTreeOptions as GitCoreCommitTreeOptions,
   DivergenceOptions as GitCoreDivergenceOptions,
   IndexStore as GitCoreIndexStore,
+  LsTreeOptions as GitCoreLsTreeOptions,
+  MergeBaseKind as GitCoreMergeBaseKind,
+  MergeBaseOptions as GitCoreMergeBaseOptions,
+  MergeBaseResult as GitCoreMergeBaseResult,
   ReadRefOptions as GitCoreReadRefOptions,
   ReadTreeOptions as GitCoreReadTreeOptions,
   StatusReport as GitCoreStatusReport,
@@ -22,6 +26,8 @@ import type {
   GitStatusOptions as GitEntrypointStatusOptions,
   GitStatusReport as GitEntrypointStatusReport,
   GitStatusReportOptions as GitEntrypointStatusReportOptions,
+  GitLsTreeOptions,
+  GitMergeBaseOptions,
   RawRefTarget as GitRawRefTarget,
   GitReadRefOptions,
   GitReadTreeOptions,
@@ -56,6 +62,7 @@ import type {
 import {
   commitTree as gitCommitTree,
   divergence as gitDivergence,
+  mergeBase as gitMergeBase,
   readRef as gitReadRef,
   readTree as gitReadTree,
   statusFormatOptions as gitStatusFormatOptions,
@@ -73,6 +80,10 @@ import type {
   CommitTreeOptions as RootCoreCommitTreeOptions,
   DivergenceOptions as RootCoreDivergenceOptions,
   IndexStore as RootCoreIndexStore,
+  LsTreeOptions as RootCoreLsTreeOptions,
+  MergeBaseKind as RootCoreMergeBaseKind,
+  MergeBaseOptions as RootCoreMergeBaseOptions,
+  MergeBaseResult as RootCoreMergeBaseResult,
   ReadRefOptions as RootCoreReadRefOptions,
   ReadTreeOptions as RootCoreReadTreeOptions,
   StatusReport as RootCoreStatusReport,
@@ -86,6 +97,8 @@ import type {
   DivergenceResult as RootDivergenceResult,
   Git as RootGit,
   GitDivergenceOptions as RootGitDivergenceOptions,
+  GitLsTreeOptions as RootGitLsTreeOptions,
+  GitMergeBaseOptions as RootGitMergeBaseOptions,
   GitReadRefOptions as RootGitReadRefOptions,
   GitRevParseOptions as RootGitRevParseOptions,
   GitUpdateRefOptions as RootGitUpdateRefOptions,
@@ -123,6 +136,7 @@ import type {
 import {
   commitTree as rootCommitTree,
   divergence as rootDivergence,
+  mergeBase as rootMergeBase,
   readRef as rootReadRef,
   readTree as rootReadTree,
   statusFormatOptions as rootStatusFormatOptions,
@@ -275,6 +289,48 @@ describe("public bounded read exports", () => {
       rootDivergence,
       gitReadRef,
       rootReadRef,
+    ]);
+  });
+
+  it("exposes matching merge-base and recursive tree types from both entrypoints", () => {
+    const coreMergeBase: RootCoreMergeBaseOptions = { current: "HEAD", incoming: "main" };
+    const gitCoreMergeBase: GitCoreMergeBaseOptions = coreMergeBase;
+    const mergeBaseOptions: RootGitMergeBaseOptions = { ...coreMergeBase, dir: "/repo" };
+    const gitMergeBaseOptions: GitMergeBaseOptions = mergeBaseOptions;
+    const kind: RootCoreMergeBaseKind = "divergent";
+    const gitKind: GitCoreMergeBaseKind = kind;
+    const result: RootCoreMergeBaseResult = { kind, bases: ["1".repeat(40)] };
+    const gitResult: GitCoreMergeBaseResult = result;
+    const coreLsTree: RootCoreLsTreeOptions = { recursive: true };
+    const gitCoreLsTree: GitCoreLsTreeOptions = coreLsTree;
+    const lsTreeOptions: RootGitLsTreeOptions = {
+      dir: "/repo",
+      ref: "HEAD",
+      path: "src",
+      recursive: true,
+    };
+    const gitLsTreeOptions: GitLsTreeOptions = lsTreeOptions;
+    const rootMethods: readonly (keyof RootGit)[] = ["mergeBase", "lsTree"];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
+
+    expect([
+      gitCoreMergeBase.current,
+      gitMergeBaseOptions.dir,
+      gitKind,
+      gitResult.bases,
+      gitCoreLsTree.recursive,
+      gitLsTreeOptions.path,
+      gitMethods,
+      gitMergeBase,
+    ]).toEqual([
+      "HEAD",
+      "/repo",
+      "divergent",
+      ["1".repeat(40)],
+      true,
+      "src",
+      rootMethods,
+      rootMergeBase,
     ]);
   });
 });

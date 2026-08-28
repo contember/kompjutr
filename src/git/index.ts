@@ -30,6 +30,10 @@ export {
   type DivergenceRelationship,
   type DivergenceResult,
   divergence,
+  type MergeBaseKind,
+  type MergeBaseOptions,
+  type MergeBaseResult,
+  mergeBase,
 } from "../core/ops/merge-base.js";
 export {
   type CommitTreeOptions,
@@ -46,7 +50,7 @@ export {
   updateRef,
   writeTree,
 } from "../core/ops/plumbing.js";
-export type { CommitView, TreeEntryView } from "../core/ops/reads.js";
+export type { CommitView, LsTreeOptions, TreeEntryView } from "../core/ops/reads.js";
 export {
   type RecoverRefOptions,
   type RefLogEndpoint,
@@ -121,8 +125,10 @@ export {
   type GitFetchOptions,
   type GitHashObjectOptions,
   type GitInitOptions,
+  type GitLsTreeOptions,
   type GitMaintenanceOptions,
   type GitMaintenanceResult,
+  type GitMergeBaseOptions,
   type GitMergeContinueOptions,
   type GitMergeOptions,
   type GitPullOptions,

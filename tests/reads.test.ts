@@ -16,7 +16,16 @@ import {
   serializeTag,
   serializeTree,
 } from "../src/core/objects.js";
-import { catFile, log, lsFilesAtRef, lsTree, show } from "../src/core/ops/reads.js";
+import {
+  catFile,
+  collectRecursiveTreeEntries,
+  log,
+  lsFilesAtRef,
+  lsTree,
+  MAX_LS_TREE_ENTRIES,
+  MAX_LS_TREE_RETAINED_BYTES,
+  show,
+} from "../src/core/ops/reads.js";
 import { treeStream } from "../src/core/ops/tree-stream.js";
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
@@ -32,6 +41,7 @@ import { SqliteTestStorage } from "./helpers/storage.js";
 const timingGate = process.env.KOMPJUTR_TIMING_GATE === "1";
 
 let fixture: GitFixture;
+let fixtureDb: TestDatabase;
 let repo: Repository;
 
 describe("SQL cursor adapter", () => {
@@ -97,6 +107,8 @@ beforeAll(async () => {
   fixture.write("README.md", "# demo\n");
   fixture.write("src/a.ts", "export const a = 1;\n");
   fixture.write("src/nested/b.ts", "export const b = 2;\n");
+  fixture.write("src/\ue000.ts", "private use\n");
+  fixture.write("src/\ud83d\ude00.ts", "non-BMP\n");
   fixture.commit("first");
   fixture.write("src/a.ts", "export const a = 2;\n");
   fixture.commit("second");
@@ -108,7 +120,8 @@ beforeAll(async () => {
   fixture.git("tag", "v1");
   fixture.git("tag", "-a", "v1-annotated", "-m", "annotated release");
 
-  const database = new SqliteGitDatabase(new TestDatabase());
+  fixtureDb = new TestDatabase();
+  const database = new SqliteGitDatabase(fixtureDb);
   const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
   await importFixture(fixture, store);
   repo = new Repository(store);
@@ -469,13 +482,89 @@ describe("ls-tree and cat-file", () => {
 
   it("lists a subdirectory", () => {
     const ours = lsTree(repo, "HEAD", "src").map((e) => `${e.mode} ${e.type} ${e.oid}\t${e.path}`);
-    const theirs = fixture.git("ls-tree", "HEAD", "src/").split("\n");
+    const theirs = fixture.git("-c", "core.quotePath=false", "ls-tree", "HEAD", "src/").split("\n");
     expect(ours).toEqual(theirs);
+  });
+
+  it("lists recursive entries in Git path order with modes and gitlinks", () => {
+    fixtureDb.storage.histogram = new Map();
+    fixtureDb.storage.resetCounters();
+
+    const ours = lsTree(repo, "HEAD", "", { recursive: true }).map(
+      (entry) => `${entry.mode} ${entry.type} ${entry.oid}\t${entry.path}`,
+    );
+    const theirs = fixture.git("-c", "core.quotePath=false", "ls-tree", "-r", "HEAD").split("\n");
+    expect(ours).toEqual(theirs);
+    const walkStatements = [...fixtureDb.storage.histogram].filter(([query]) =>
+      query.startsWith("WITH RECURSIVE params(repo_id, root_oid"),
+    );
+    expect(walkStatements).toEqual([[expect.any(String), 1]]);
+
+    const database = new SqliteGitDatabase(fixtureDb);
+    const checkout = database.findCheckout("/repo");
+    if (checkout === null) throw new Error("cold repository is missing");
+    const cold = new Repository(database.openCheckout(checkout));
+    expect(lsTree(cold, "HEAD", "src", { recursive: true })).toEqual(
+      lsTree(repo, "HEAD", "src", { recursive: true }),
+    );
+  });
+
+  it("preserves recursive gitlinks as commit entries", async () => {
+    const gitlink = new GitFixture().init();
+    try {
+      gitlink.write("base.txt", "base\n");
+      const target = gitlink.commit("base");
+      gitlink.git("update-index", "--add", "--cacheinfo", `160000,${target},vendor/module`);
+      gitlink.git("commit", "-q", "-m", "add gitlink");
+      const db = new TestDatabase();
+      const database = new SqliteGitDatabase(db);
+      const store = database.openCheckout(
+        database.createRepository("/repo", "ref: refs/heads/main"),
+      );
+      await importFixture(gitlink, store);
+
+      const ours = lsTree(new Repository(store), "HEAD", "", { recursive: true }).map(
+        (entry) => `${entry.mode} ${entry.type} ${entry.oid}\t${entry.path}`,
+      );
+      expect(ours).toEqual(gitlink.git("ls-tree", "-r", "HEAD").split("\n"));
+      expect(ours.some((entry) => entry.startsWith("160000 commit "))).toBe(true);
+    } finally {
+      gitlink.dispose();
+    }
+  });
+
+  it("accepts exact recursive result limits and rejects the first excess", () => {
+    const entry = { mode: MODE_FILE, name: "leaf", oid: "1".repeat(40) };
+    const rows = function* (count: number, path: string) {
+      for (let index = 0; index < count; index++) yield { path, entry };
+    };
+
+    expect(collectRecursiveTreeEntries(rows(MAX_LS_TREE_ENTRIES, "x"))).toHaveLength(
+      MAX_LS_TREE_ENTRIES,
+    );
+    expect(() => collectRecursiveTreeEntries(rows(MAX_LS_TREE_ENTRIES + 1, "x"))).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+
+    const byteBoundaryRows = 8_192;
+    const boundaryPath = "x".repeat(
+      (MAX_LS_TREE_RETAINED_BYTES - byteBoundaryRows * 256) / (byteBoundaryRows * 2),
+    );
+    expect(collectRecursiveTreeEntries(rows(byteBoundaryRows, boundaryPath))).toHaveLength(
+      byteBoundaryRows,
+    );
+    const excess = function* () {
+      yield* rows(byteBoundaryRows, boundaryPath);
+      yield { path: "x", entry };
+    };
+    expect(() => collectRecursiveTreeEntries(excess())).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
   });
 
   it("lists every path in a tree", () => {
     expect(lsFilesAtRef(repo, "HEAD")).toEqual(
-      fixture.git("ls-tree", "-r", "--name-only", "HEAD").split("\n").sort(),
+      fixture.git("-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", "HEAD").split("\n"),
     );
   });
 

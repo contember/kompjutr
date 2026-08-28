@@ -286,6 +286,13 @@ describe("createSqliteGitClient", () => {
       ahead: 1,
       behind: 0,
     });
+    await expect(git.mergeBase({ dir, current: "HEAD", incoming: "base" })).resolves.toEqual({
+      kind: "already-merged",
+      bases: [base],
+    });
+    await expect(git.lsTree({ dir, ref: "HEAD", recursive: true })).resolves.toEqual([
+      expect.objectContaining({ mode: "100644", path: "file.txt", type: "blob" }),
+    ]);
     await expect(git.readRef({ dir, ref: "HEAD" })).resolves.toEqual({
       kind: "symbolic",
       target: "refs/heads/main",

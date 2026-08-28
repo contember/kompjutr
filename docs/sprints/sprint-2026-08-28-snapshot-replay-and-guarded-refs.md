@@ -339,3 +339,8 @@ resolved before implementation.
   legacy Computer surface. All 101 focused tests passed; the slowest slice was
   `refs.test.ts` at 35.56 s. Typecheck and Biome passed, and Singer's independent
   T3 review found no material issues.
+- WU3 exposed revision-based merge-base selection and bounded recursive tree
+  rows through the native facade. Its focused witness passed 113 tests in
+  18.92 s, including Git parity for non-BMP paths and gitlinks, exact result
+  limits, one recursive SQL cursor, cold reopen, Computer passthrough, and
+  public exports. The T2 root inspection found no remaining material issue.
