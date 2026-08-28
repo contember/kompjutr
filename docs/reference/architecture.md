@@ -506,6 +506,20 @@ the freshly advertised refs, and streams a replayable full-object pack. A 401
 opens a new body stream from the immutable OID plan; network failures never
 automatically replay a POST.
 
+A clone first reserves its destination as a provisional repository with a
+five-minute renewable owner generation. The provisional root blocks parent
+worktree traversal but ordinary routing and public store opens cannot observe it.
+The owner renews at discovery, pack, ref, and worktree boundaries. Exact expiry
+allows a cold retry to remove the abandoned indexed paths and repository rows,
+while preserving untracked files and allocating new monotonic identities. The
+old owner is fenced with `ESTALE`. Readiness is published atomically only after
+refs, configuration, index, and worktree state are complete; caught cleanup can
+delete only the same provisional generation. The native empty-worktree path is
+create-only and atomic. The fallback rejects exact and structural collisions
+with existing clone targets, then changes the index and SQLite worktree in one
+transaction, so failed writes cannot leave unindexed clone paths while unrelated
+untracked paths remain caller-owned.
+
 The outbound planner walks validated commit projections and changed tree edges.
 It subtracts locally known advertised remote closures, excludes gitlinks, and
 reserves the worst-case two-pass SQL cost before starting the POST. The server's

@@ -355,3 +355,21 @@ git diff --check
   Each cold partial state remains readable and retry converges without duplicate
   objects. Immediate post-checkout reopen preserves HEAD, index, worktree,
   status, and reflog. Independent review is clean; all 262 affected tests pass.
+- 2026-08-28: WU2 now reserves clone roots through a five-minute exact-owner
+  lease. Provisional roots remain traversal barriers but are absent from public
+  repository lookup. Same-root overlap gets `EBUSY`, exact-expiry takeover
+  fences the old owner with `ESTALE`, and repository, checkout, and owner
+  identities are never reused.
+- 2026-08-28: Clone worktree, index, tracker, and ready state now publish in one
+  store-owned SQLite transaction. The shared-database guard runs before
+  reservation or cleanup; native capacity rollback can retry the bounded
+  fallback, and fallback rejects exact or structural target collisions while
+  preserving unrelated untracked paths. A stale owner after response loss
+  cannot discard or republish the ready repository.
+- 2026-08-28: Two independent WU2 reviews are clean after direct probes for
+  owner forgery, cache rollback, injected checkout cardinality, public
+  filesystem isolation, and cold replacement safety. The final affected gate
+  passes all 343 tests across 16 files, including the 24,252-path fallback cost
+  witness. Typecheck, build, Biome, and diff validation pass. The docs linter
+  reports only its known false positive for the managed `docs/AGENTS.md`
+  symlink.

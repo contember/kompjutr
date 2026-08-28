@@ -73,10 +73,45 @@ const STATEMENTS = [
      value TEXT NOT NULL
    )`,
 
+  `CREATE TABLE IF NOT EXISTS git_identity_control (
+     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+     last_repo_id INTEGER NOT NULL CHECK (
+       typeof(last_repo_id) = 'integer'
+       AND last_repo_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     last_checkout_id INTEGER NOT NULL CHECK (
+       typeof(last_checkout_id) = 'integer'
+       AND last_checkout_id BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     last_clone_generation INTEGER NOT NULL CHECK (
+       typeof(last_clone_generation) = 'integer'
+       AND last_clone_generation BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER}
+     )
+   )`,
+
   // Shared store identity. Working-tree routing belongs to git_checkouts.
   `CREATE TABLE IF NOT EXISTS git_repositories (
      id INTEGER PRIMARY KEY CHECK (
        typeof(id) = 'integer' AND id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     lifecycle TEXT NOT NULL DEFAULT 'ready' CHECK (
+       typeof(lifecycle) = 'text' AND lifecycle IN ('ready', 'provisional')
+     ),
+     clone_generation INTEGER UNIQUE CHECK (
+       clone_generation IS NULL
+       OR (typeof(clone_generation) = 'integer'
+           AND clone_generation BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER})
+     ),
+     clone_expires_ms INTEGER CHECK (
+       clone_expires_ms IS NULL
+       OR (typeof(clone_expires_ms) = 'integer'
+           AND clone_expires_ms BETWEEN 0 AND ${Number.MAX_SAFE_INTEGER})
+     ),
+     CHECK (
+       (lifecycle = 'ready' AND clone_generation IS NULL AND clone_expires_ms IS NULL)
+       OR
+       (lifecycle = 'provisional'
+        AND clone_generation IS NOT NULL AND clone_expires_ms IS NOT NULL)
      )
    )`,
 
@@ -1079,6 +1114,11 @@ export function initializeGitSchema(db: SqlDatabase): void {
     }
 
     for (const statement of STATEMENTS) bounded.run(statement);
+    bounded.run(
+      `INSERT OR IGNORE INTO git_identity_control
+         (singleton, last_repo_id, last_checkout_id, last_clone_generation)
+       VALUES (1, 0, 0, 0)`,
+    );
     bounded.run(
       "INSERT INTO git_meta (key, value) VALUES ('schema_version', ?)",
       String(SCHEMA_VERSION),

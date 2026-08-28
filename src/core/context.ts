@@ -111,7 +111,6 @@ export function nestedRoots(context: GitContext, root: string): string[] {
   const base = normalizePath(root);
   const prefix = base === "/" ? "/" : `${base}/`;
   return context.database
-    .listRoutingCheckouts()
-    .map((row) => row.root)
+    .listRoutingRoots()
     .filter((candidate) => candidate !== base && candidate.startsWith(prefix));
 }

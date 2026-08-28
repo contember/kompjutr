@@ -551,10 +551,13 @@ describe("worktree prune", () => {
       workspace.repo.store.repoId,
       "1".repeat(40),
     );
+    workspace.database.db.run(
+      "UPDATE git_identity_control SET last_checkout_id = 1024 WHERE singleton = 1",
+    );
     workspace.storage.resetCounters();
     const listed = worktreeList(workspace.context, workspace.repo);
     expect(listed).toHaveLength(1_024);
-    expect(workspace.storage.statementCount).toBe(2);
+    expect(workspace.storage.statementCount).toBe(3);
     expect(() =>
       worktreeAdd(workspace.context, workspace.repo, {
         root: "/first-over-limit",
@@ -566,7 +569,7 @@ describe("worktree prune", () => {
     workspace.storage.resetCounters();
     const pruned = worktreePrune(workspace.context, workspace.repo);
     expect(pruned).toHaveLength(1_023);
-    expect(workspace.storage.statementCount).toBe(6);
+    expect(workspace.storage.statementCount).toBe(8);
     expect(workspace.database.listCheckouts(workspace.repo.store.repoId)).toHaveLength(1);
   });
 });

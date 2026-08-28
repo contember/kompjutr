@@ -122,7 +122,7 @@ describe("workspace fixture", () => {
     workspace.storage.resetCounters();
     const linked = openRepository(workspace.context, "/linked/src/file.ts");
 
-    expect(workspace.storage.statementCount).toBe(1);
+    expect(workspace.storage.statementCount).toBe(3);
     expect(linked.store).toBe(workspace.repo.store);
     expect(linked.checkout.checkoutId).toBe(checkoutId);
     expect(linked.checkout.checkoutId).not.toBe(linked.store.repoId);
@@ -193,7 +193,7 @@ describe("workspace fixture", () => {
     });
   });
 
-  it("starts a reused repository id with clean incomplete tracker state", () => {
+  it("starts monotonic replacement identities with clean incomplete tracker state", () => {
     const workspace = makeRepo("/");
     const repoId = workspace.repo.store.repoId;
     const checkoutId = workspace.repo.checkout.checkoutId;
@@ -205,9 +205,13 @@ describe("workspace fixture", () => {
     workspace.repo.store.destroy();
 
     const replacement = initRepository(workspace.context, { dir: "/replacement" });
-    expect(replacement.store.repoId).toBe(repoId);
-    expect(replacement.checkout.checkoutId).toBe(checkoutId);
-    expect(readIndexTrackerState(workspace.database.db, checkoutId)).toEqual({ available: false });
-    expect([...iterateIndexTrackerDirty(workspace.database.db, checkoutId)]).toEqual([]);
+    expect(replacement.store.repoId).toBeGreaterThan(repoId);
+    expect(replacement.checkout.checkoutId).toBeGreaterThan(checkoutId);
+    expect(readIndexTrackerState(workspace.database.db, replacement.checkout.checkoutId)).toEqual({
+      available: false,
+    });
+    expect([
+      ...iterateIndexTrackerDirty(workspace.database.db, replacement.checkout.checkoutId),
+    ]).toEqual([]);
   });
 });

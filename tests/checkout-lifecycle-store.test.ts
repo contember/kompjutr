@@ -231,6 +231,7 @@ describe("checkout lifecycle storage", () => {
       primary.repoId,
       OID,
     );
+    db.run("UPDATE git_identity_control SET last_checkout_id = 1023 WHERE singleton = 1");
 
     const accepted = database.createCheckout(primary.repoId, "/session-1024", OTHER_OID);
     expect(accepted.id).toBe(1_024);
@@ -244,7 +245,7 @@ describe("checkout lifecycle storage", () => {
     expect(() => database.createCheckout(primary.repoId, "/session-1025", OID)).toThrowError(
       expect.objectContaining({ code: "EWORKTREELIMIT" }),
     );
-    expect(db.storage.statementCount).toBe(2);
+    expect(db.storage.statementCount).toBe(3);
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(db.scalar<number>("SELECT count(*) FROM git_checkouts")).toBe(before.checkouts);
     expect(db.scalar<number>("SELECT count(*) FROM git_index_state")).toBe(before.indexStates);
@@ -266,6 +267,11 @@ describe("checkout lifecycle storage", () => {
               CASE id WHEN 1 THEN 1 ELSE 0 END
          FROM sequence`,
     );
+    db.run(
+      `UPDATE git_identity_control
+          SET last_repo_id = 1, last_checkout_id = 1024
+        WHERE singleton = 1`,
+    );
 
     db.storage.resetCounters();
     const checkouts = database.listCheckouts(1);
@@ -275,7 +281,7 @@ describe("checkout lifecycle storage", () => {
     expect(checkouts.every(Object.isFrozen)).toBe(true);
     expect(utf8.encode(checkouts[0]?.root ?? "").byteLength).toBe(4_096);
     expect(utf8.encode(checkouts[0]?.head ?? "").byteLength).toBe(1_024);
-    expect(db.storage.statementCount).toBe(1);
+    expect(db.storage.statementCount).toBe(2);
   });
 
   it("removes private state while preserving shared objects, refs, and caches", () => {
@@ -400,7 +406,7 @@ describe("checkout lifecycle storage", () => {
     expect(cached.indexGet("rolled-back.txt")).toBeNull();
   });
 
-  it("revokes a removed facade before its exact checkout id is reused", () => {
+  it("revokes a removed facade before the root gets a new checkout identity", () => {
     const { database, primary } = repository();
     const removedRow = database.createCheckout(primary.repoId, "/session", OTHER_OID);
     const removedStore = database.openCheckout(removedRow);
@@ -408,7 +414,7 @@ describe("checkout lifecycle storage", () => {
 
     const recreated = database.createCheckout(primary.repoId, "/session", OTHER_OID);
     const current = database.openCheckout(recreated);
-    expect(recreated.id).toBe(removedRow.id);
+    expect(recreated.id).toBeGreaterThan(removedRow.id);
     expect(() =>
       removedStore.indexPut({
         path: "escaped.txt",
@@ -474,7 +480,7 @@ describe("checkout lifecycle storage", () => {
     expect(busyQueries).toEqual([[expect.any(String), 1]]);
   });
 
-  it("bulk-removes the maximum non-primary set in four statements and is idempotent", () => {
+  it("bulk-removes the maximum non-primary set in five statements and is idempotent", () => {
     const { db, database, primary } = repository();
     db.run(
       `WITH RECURSIVE sequence(id) AS (
@@ -485,6 +491,7 @@ describe("checkout lifecycle storage", () => {
       primary.repoId,
       OID,
     );
+    db.run("UPDATE git_identity_control SET last_checkout_id = 1024 WHERE singleton = 1");
     const ids = Array.from({ length: 1_023 }, (_, index) => index + 2);
 
     db.storage.resetCounters();
@@ -493,7 +500,7 @@ describe("checkout lifecycle storage", () => {
     expect(removed).toHaveLength(1_023);
     expect(Object.isFrozen(removed)).toBe(true);
     expect(removed.every(Object.isFrozen)).toBe(true);
-    expect(db.storage.statementCount).toBe(4);
+    expect(db.storage.statementCount).toBe(5);
     expect(database.listCheckouts(primary.repoId)).toEqual([primary]);
     expect(database.removeCheckouts(primary.repoId, ids)).toEqual([]);
   });

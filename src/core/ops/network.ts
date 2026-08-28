@@ -6,10 +6,10 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { type CheckoutStore, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
-import { AlreadyInitializedError, CorruptError, GitError } from "../errors.js";
+import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import { type ObjectType, parseTag, type RawObject } from "../objects.js";
 import { normalizePath } from "../paths.js";
 import { type MessageCallback, type ProgressCallback, progressSink } from "../protocol/progress.js";
@@ -22,9 +22,12 @@ import {
 } from "../protocol/remote.js";
 import { type AuthCallback, RemoteAuthSession } from "../protocol/transport.js";
 import { Repository } from "../repository.js";
-import { checkoutTree } from "./checkout.js";
+import { joinSorted } from "../streams.js";
+import { checkoutTree, matchesPaths, type TargetEntry } from "./checkout.js";
 import { isInitialCheckoutFallback, tryInitialCheckout } from "./initial-checkout.js";
 import { operationRefLogMetadata } from "./ref-log.js";
+import { treeStream } from "./tree-stream.js";
+import { walkWorktreeEntriesStream } from "./worktree-io.js";
 
 /** How many commits back from each local tip are offered as `have`s. */
 const HAVE_BUDGET = 256;
@@ -77,6 +80,8 @@ interface FetchBehavior {
   resultRef?: string;
   /** A configured selector auto-follows tags even when coverage is one branch. */
   autoTags?: boolean;
+  /** Private clone ownership checkpoint; never exposed through fetch options. */
+  checkpoint?: () => Promise<void> | undefined;
 }
 
 interface FetchSelection {
@@ -366,11 +371,19 @@ async function ingestPack(
   repo: Repository,
   pack: AsyncIterable<Uint8Array>,
   say: ((text: string) => void) | undefined,
+  checkpoint: (() => Promise<void> | undefined) | undefined,
 ): Promise<void> {
+  const yieldNow =
+    checkpoint === undefined
+      ? context.yieldNow
+      : async (): Promise<void> => {
+          const pending = checkpoint();
+          if (pending !== undefined) await pending;
+        };
   await repo.store.packs.ingest(pack, {
     ...(say === undefined ? {} : { onProgress: say }),
     now: context.now,
-    ...(context.yieldNow === undefined ? {} : { yieldNow: context.yieldNow }),
+    ...(yieldNow === undefined ? {} : { yieldNow }),
   });
 }
 
@@ -388,8 +401,11 @@ async function transferPack(
   },
   auth: Parameters<typeof uploadPack>[1],
   say: ((text: string) => void) | undefined,
+  checkpoint: (() => Promise<void> | undefined) | undefined,
 ): Promise<void> {
   if (request.wants.length === 0) return;
+  const beforeUpload = checkpoint?.();
+  if (beforeUpload !== undefined) await beforeUpload;
   const result = await uploadPack(
     {
       url: request.url,
@@ -403,10 +419,16 @@ async function transferPack(
     },
     auth,
   );
-  await ingestPack(context, repo, result.pack, say);
+  const beforeIngest = checkpoint?.();
+  if (beforeIngest !== undefined) await beforeIngest;
+  await ingestPack(context, repo, result.pack, say, checkpoint);
+  const afterIngest = checkpoint?.();
+  if (afterIngest !== undefined) await afterIngest;
   if (result.shallow.length > 0 || result.unshallow.length > 0) {
     repo.store.setShallow(result.shallow, result.unshallow);
     repo.invalidateShallow();
+    const afterShallow = checkpoint?.();
+    if (afterShallow !== undefined) await afterShallow;
   }
 }
 
@@ -427,7 +449,11 @@ export async function fetchInto(
     ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
     authSession: new RemoteAuthSession(),
   };
+  const beforeDiscovery = behavior.checkpoint?.();
+  if (beforeDiscovery !== undefined) await beforeDiscovery;
   const advertisement = await discover(url, "git-upload-pack", auth);
+  const afterDiscovery = behavior.checkpoint?.();
+  if (afterDiscovery !== undefined) await afterDiscovery;
   const requestedRef = options.remoteRef ?? options.ref;
   const coverageRef = behavior.coverageRef ?? requestedRef;
   const selection = selectRefs(advertisement, {
@@ -470,6 +496,7 @@ export async function fetchInto(
     },
     auth,
     say,
+    behavior.checkpoint,
   );
 
   // A server without include-tag may omit annotated tag objects. Once their
@@ -490,6 +517,7 @@ export async function fetchInto(
       },
       auth,
       say,
+      behavior.checkpoint,
     );
   }
 
@@ -537,7 +565,11 @@ export async function fetchInto(
     }
   }
   preflightAllTags(repo, requiredTags);
+  const beforeRefs = behavior.checkpoint?.();
+  if (beforeRefs !== undefined) await beforeRefs;
   repo.mutateRefs({ puts: updates, deletes }, operationRefLogMetadata(context, repo, refLogReason));
+  const afterRefs = behavior.checkpoint?.();
+  if (afterRefs !== undefined) await afterRefs;
 
   return {
     defaultBranch: advertisement.headRef,
@@ -546,25 +578,88 @@ export async function fetchInto(
 }
 
 function tryInitialClone(context: GitContext, repo: Repository, treeOid: string): boolean {
-  try {
-    return tryInitialCheckout(context, repo, treeOid);
-  } catch (error) {
-    if (isInitialCheckoutFallback(error)) return false;
-    throw error;
+  return tryInitialCheckout(context, repo, treeOid, { requireSharedDatabase: true });
+}
+
+function* cloneTargetEntries(
+  repo: Repository,
+  treeOid: string,
+  paths: string[] | undefined,
+): Generator<TargetEntry> {
+  for (const entry of treeStream(repo, treeOid)) {
+    if (entry.mode !== "160000" && matchesPaths(entry.path, paths)) yield entry;
+  }
+}
+
+function requireCloneTargetsAbsent(
+  context: GitContext,
+  repo: Repository,
+  treeOid: string,
+  paths: string[] | undefined,
+): void {
+  let existingLeafAncestor: string | null = null;
+  for (const row of joinSorted(
+    cloneTargetEntries(repo, treeOid, paths),
+    walkWorktreeEntriesStream(context.worktree, repo.root, {
+      includeDirectories: true,
+      includeIgnored: true,
+    }),
+    { left: (entry) => entry.path, right: (entry) => entry.path },
+  )) {
+    if (
+      existingLeafAncestor !== null &&
+      row.path !== existingLeafAncestor &&
+      !row.path.startsWith(`${existingLeafAncestor}/`)
+    ) {
+      existingLeafAncestor = null;
+    }
+    if (row.left !== undefined && (row.right !== undefined || existingLeafAncestor !== null)) {
+      throw new GitError("EEXIST", `clone target path already exists: ${row.left.path}`);
+    }
+    if (row.right !== undefined && row.right.stat.type !== "dir") {
+      existingLeafAncestor = row.right.path;
+    }
   }
 }
 
 export async function clone(context: GitContext, options: CloneOptions): Promise<void> {
   const root = normalizePath(options.dir ?? "/");
-  if (context.database.checkoutAt(root) !== null) throw new AlreadyInitializedError(root);
+  if (context.worktree.db !== context.database.db) {
+    throw new GitError(
+      "EUNSUPPORTED",
+      "clone requires the working tree and Git store to share one database",
+    );
+  }
   const url = normalizeRemoteUrl(options.url);
   const remote = options.remote ?? "origin";
-
-  const row = context.database.createRepository(root, "ref: refs/heads/main");
-  const repo = new Repository(context.database.openCheckout(row));
+  const cleanup = (store: CheckoutStore): undefined => {
+    checkoutTree(new Repository(store), context.worktree, null);
+    return undefined;
+  };
+  const owner = context.database.beginProvisionalClone(
+    root,
+    "ref: refs/heads/main",
+    context.now(),
+    cleanup,
+  );
+  const repo = new Repository(owner.store);
+  const heartbeat = (): void => {
+    context.database.renewProvisionalClone(owner, context.now());
+  };
+  const checkpoint = (): Promise<void> | undefined => {
+    heartbeat();
+    const yieldNow = context.yieldNow;
+    if (yieldNow === undefined) return;
+    return (async () => {
+      await yieldNow();
+      heartbeat();
+    })();
+  };
   try {
+    heartbeat();
     repo.store.configSet(`remote.${remote}.url`, url);
     repo.store.configSet(`remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
+    heartbeat();
 
     const depth = options.depth ?? 1;
     const result = await fetchInto(
@@ -583,12 +678,14 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
         ...(options.onMessage === undefined ? {} : { onMessage: options.onMessage }),
       },
       "clone: fetch",
+      { checkpoint },
     );
 
     const branch = branchNameFor(options.ref, result.defaultBranch);
     const tip = result.fetchHead;
     if (tip === null) throw new GitError("EFETCHFAIL", "remote advertised no usable ref");
 
+    heartbeat();
     repo.store.db.transactionSync(() => {
       repo.mutateRefs(
         {
@@ -600,18 +697,35 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
       repo.store.configSet(`branch.${branch}.remote`, remote);
       repo.store.configSet(`branch.${branch}.merge`, `refs/heads/${branch}`);
     });
+    const afterLocalRefs = checkpoint();
+    if (afterLocalRefs !== undefined) await afterLocalRefs;
 
     const tree = repo.readCommit(repo.peel(tip)).tree;
-    const initial = options.paths === undefined && tryInitialClone(context, repo, tree);
-    if (!initial) {
+    const beforeMaterialization = checkpoint();
+    if (beforeMaterialization !== undefined) await beforeMaterialization;
+    const fallback = (): undefined => {
+      requireCloneTargetsAbsent(context, repo, tree, options.paths);
       checkoutTree(repo, context.worktree, tree, {
         ...(options.paths === undefined ? {} : { paths: options.paths }),
       });
+      return undefined;
+    };
+    try {
+      context.database.publishProvisionalClone(owner, context.now(), () => {
+        const initial = options.paths === undefined && tryInitialClone(context, repo, tree);
+        if (!initial) return fallback();
+        return undefined;
+      });
+    } catch (error) {
+      if (!isInitialCheckoutFallback(error)) throw error;
+      context.database.publishProvisionalClone(owner, context.now(), fallback);
     }
   } catch (error) {
-    // A clone that fails leaves nothing behind: the destination had no
-    // repository before the call, so removing ours restores that.
-    repo.store.destroy();
+    try {
+      context.database.discardProvisionalClone(owner, context.now(), cleanup);
+    } catch (discardError) {
+      if (!hasErrorCode(discardError, "ESTALE")) throw discardError;
+    }
     throw error;
   }
 }

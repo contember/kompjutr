@@ -2,6 +2,7 @@
 // every hot path runs inside one Durable Object turn.
 
 import type { Dirent, EntryType, Filesystem, Stat } from "../fs/types.js";
+import type { SqlDatabase } from "../sqlite/db.js";
 
 export type WorktreeEntryType = EntryType;
 export type WorktreeStat = Stat;
@@ -30,7 +31,7 @@ export type Worktree = Pick<
   | "writeFiles"
   | "makeDirectories"
   | "removeFiles"
->;
+> & { readonly db?: SqlDatabase };
 
 /** The git tree mode for a working-tree entry. */
 export function gitModeFor(stat: WorktreeStat): string {

@@ -50,6 +50,7 @@ decisions → reference → archive.
 - [`decisions/0009-split-shared-store-from-checkouts.md`](decisions/0009-split-shared-store-from-checkouts.md)
 - [`decisions/0010-require-valid-utf8-git-paths.md`](decisions/0010-require-valid-utf8-git-paths.md)
 - [`decisions/0012-run-maintenance-as-resumable-generations.md`](decisions/0012-run-maintenance-as-resumable-generations.md)
+- [`decisions/0013-publish-clones-through-provisional-ownership.md`](decisions/0013-publish-clones-through-provisional-ownership.md)
 
 ## Historical records
 

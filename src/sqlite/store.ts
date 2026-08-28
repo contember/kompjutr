@@ -189,6 +189,8 @@ const MAX_REF_MUTATION_INPUTS = 100_000;
 const MAX_GLOBAL_CHECKOUT_LIST = 8_192;
 const CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES = 1_024;
 export const MAX_CHECKOUT_LIST_RETAINED_BYTES = 6 * 1024 * 1024;
+export const PROVISIONAL_CLONE_LEASE_MS = 5 * 60 * 1_000;
+const PROVISIONAL_CLONE_RENEW_WINDOW_MS = PROVISIONAL_CLONE_LEASE_MS / 2;
 const REF_ROW_RETAINED_BYTES = 256;
 const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
 const REF_MUTATION_EVENT_RETAINED_BYTES = 2_048;
@@ -213,6 +215,14 @@ export interface CheckoutRow {
   readonly head: string;
   readonly isPrimary: boolean;
 }
+
+export interface ProvisionalCloneOwner {
+  readonly checkout: CheckoutRow;
+  readonly generation: number;
+  readonly store: CheckoutStore;
+}
+
+export type RepositoryLifecycle = "ready" | "provisional";
 
 export interface RefRow {
   name: string;
@@ -1666,6 +1676,119 @@ function requireSafeId(value: unknown, label: string): number {
   return value;
 }
 
+function requireIdentityCounter(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new CorruptError(`${label} is not a safe nonnegative integer`);
+  }
+  return value;
+}
+
+function requireStoredIdentityMaximum(value: unknown, label: string): number {
+  return value === null ? 0 : requireSafeId(value, label);
+}
+
+function nextIdentity(value: number, label: string): number {
+  if (value >= Number.MAX_SAFE_INTEGER) {
+    throw new GitError("E2BIG", `${label} space is exhausted`);
+  }
+  return value + 1;
+}
+
+function requireMilliseconds(value: unknown, label: string, source: "input" | "stored"): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    if (source === "stored") throw new CorruptError(`${label} is invalid`);
+    throw new GitError("EINVAL", `${label} must be a safe nonnegative integer`);
+  }
+  return value;
+}
+
+function provisionalCloneExpiry(nowMs: number): number {
+  if (nowMs > Number.MAX_SAFE_INTEGER - PROVISIONAL_CLONE_LEASE_MS) {
+    throw new GitError("E2BIG", "clone lease clock exceeds its safe range");
+  }
+  return nowMs + PROVISIONAL_CLONE_LEASE_MS;
+}
+
+interface StoredRepositoryLifecycle {
+  repoId: number;
+  lifecycle: RepositoryLifecycle;
+  cloneGeneration: number | null;
+  cloneExpiresMs: number | null;
+}
+
+function requireStoredRepositoryLifecycle(row: Record<string, unknown>): StoredRepositoryLifecycle {
+  const repoId = requireSafeId(row.repo_id, "repository id");
+  const lifecycle = row.lifecycle;
+  if (lifecycle !== "ready" && lifecycle !== "provisional") {
+    throw new CorruptError("repository lifecycle is invalid");
+  }
+  const cloneGeneration =
+    row.clone_generation === null ? null : requireSafeId(row.clone_generation, "clone generation");
+  const cloneExpiresMs =
+    row.clone_expires_ms === null
+      ? null
+      : requireMilliseconds(row.clone_expires_ms, "clone lease expiry", "stored");
+  if (
+    (lifecycle === "ready" && (cloneGeneration !== null || cloneExpiresMs !== null)) ||
+    (lifecycle === "provisional" && (cloneGeneration === null || cloneExpiresMs === null))
+  ) {
+    throw new CorruptError("repository lifecycle fields are inconsistent");
+  }
+  return { repoId, lifecycle, cloneGeneration, cloneExpiresMs };
+}
+
+interface StoredCheckoutLifecycle extends StoredRepositoryLifecycle {
+  checkout: CheckoutRow;
+}
+
+const CHECKOUT_LIFECYCLE_CARDINALITY_SQL = `
+  (SELECT COUNT(*) FROM (
+     SELECT 1 FROM git_checkouts membership
+      WHERE membership.repo_id = checkout.repo_id
+      LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}
+   )) AS lifecycle_checkout_count,
+  (SELECT COUNT(*) FROM (
+     SELECT 1 FROM git_checkouts membership
+      WHERE membership.repo_id = checkout.repo_id AND membership.is_primary = 1
+      LIMIT 2
+   )) AS lifecycle_primary_count`;
+
+function requireStoredCheckoutLifecycle(row: Record<string, unknown>): StoredCheckoutLifecycle {
+  const checkout = requireStoredCheckoutRow(row);
+  const repository = requireStoredRepositoryLifecycle(row);
+  if (checkout.repoId !== repository.repoId) {
+    throw new CorruptError("checkout lifecycle crossed repository boundaries");
+  }
+  return { ...repository, checkout };
+}
+
+function requireCheckoutLifecycleCardinality(
+  row: Record<string, unknown>,
+  stored: StoredCheckoutLifecycle,
+): void {
+  const checkoutCount = requireSafeRefLogInteger(
+    row.lifecycle_checkout_count,
+    "repository checkout count",
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
+    throw new GitError("E2BIG", "repository exceeds 1,024 checkouts");
+  }
+  const primaryCount = requireSafeRefLogInteger(
+    row.lifecycle_primary_count,
+    "repository primary checkout count",
+    0,
+    checkoutCount,
+  );
+  if (primaryCount !== 1) {
+    throw new CorruptError("repository must have exactly one primary checkout");
+  }
+  if (stored.lifecycle === "provisional" && (checkoutCount !== 1 || !stored.checkout.isPrimary)) {
+    throw new CorruptError("provisional repository must have exactly one primary checkout");
+  }
+}
+
 function requireCheckoutRoot(value: unknown, source: "input" | "stored"): string {
   if (typeof value !== "string" || value.includes("\0")) {
     if (source === "stored") throw new CorruptError("checkout root is invalid");
@@ -2044,6 +2167,21 @@ export class SharedRepoStore {
   }
 }
 
+interface ProvisionalStoreRecord {
+  generation: number;
+  repoId: number;
+  checkoutId: number;
+  shared: SharedRepoStore;
+  store: CheckoutStore;
+  lifetime: CheckoutStoreLifetime;
+}
+
+interface AllocatedIdentity {
+  repoId: number;
+  checkoutId: number;
+  cloneGeneration: number;
+}
+
 /** Owns the schema plus shared-store and checkout facade registries. */
 export class SqliteGitDatabase {
   readonly #db: SqlDatabase;
@@ -2053,6 +2191,8 @@ export class SqliteGitDatabase {
   readonly #checkoutLifetimes = new Map<number, CheckoutStoreLifetime>();
   readonly #validatedCheckoutRows = new WeakMap<CheckoutRow, number>();
   readonly #checkoutRowGenerations = new Map<number, number>();
+  readonly #provisionalStores = new Map<number, ProvisionalStoreRecord>();
+  readonly #issuedProvisionalOwners = new WeakSet<ProvisionalCloneOwner>();
   readonly #objects: ByteLru<string, RawObject>;
   readonly #packRows: ByteLru<string, Uint8Array>;
   readonly #memory = new MemoryCoordinator();
@@ -2072,40 +2212,290 @@ export class SqliteGitDatabase {
     );
     enforceForeignKeys(db);
     initializeGitSchema(db);
+    this.#readIdentityControl();
   }
 
   get db(): SqlDatabase {
     return this.#db;
   }
 
+  #readIdentityControl(): AllocatedIdentity {
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT control.singleton, control.last_repo_id, control.last_checkout_id,
+              control.last_clone_generation,
+              (SELECT MAX(id) FROM git_repositories) AS max_repo_id,
+              (SELECT MAX(id) FROM git_checkouts) AS max_checkout_id,
+              (SELECT MAX(clone_generation) FROM git_repositories) AS max_clone_generation
+         FROM git_identity_control control WHERE control.singleton = 1`,
+    );
+    if (row === undefined || row.singleton !== 1) {
+      throw new CorruptError("Git identity control singleton is missing");
+    }
+    const control: AllocatedIdentity = {
+      repoId: requireIdentityCounter(row.last_repo_id, "last repository id"),
+      checkoutId: requireIdentityCounter(row.last_checkout_id, "last checkout id"),
+      cloneGeneration: requireIdentityCounter(row.last_clone_generation, "last clone generation"),
+    };
+    const maxRepoId = requireStoredIdentityMaximum(row.max_repo_id, "maximum repository id");
+    const maxCheckoutId = requireStoredIdentityMaximum(row.max_checkout_id, "maximum checkout id");
+    const maxCloneGeneration = requireStoredIdentityMaximum(
+      row.max_clone_generation,
+      "maximum clone generation",
+    );
+    if (
+      maxRepoId > control.repoId ||
+      maxCheckoutId > control.checkoutId ||
+      maxCloneGeneration > control.cloneGeneration
+    ) {
+      throw new CorruptError("Git identity control trails stored identities");
+    }
+    return control;
+  }
+
+  #allocateIdentities(
+    allocateRepo: boolean,
+    allocateCheckout: boolean,
+    allocateClone: boolean,
+  ): AllocatedIdentity {
+    const previous = this.#readIdentityControl();
+    const next: AllocatedIdentity = {
+      repoId: allocateRepo ? nextIdentity(previous.repoId, "repository id") : previous.repoId,
+      checkoutId: allocateCheckout
+        ? nextIdentity(previous.checkoutId, "checkout id")
+        : previous.checkoutId,
+      cloneGeneration: allocateClone
+        ? nextIdentity(previous.cloneGeneration, "clone generation")
+        : previous.cloneGeneration,
+    };
+    const updated = this.#db.one<Record<string, unknown>>(
+      `UPDATE git_identity_control
+          SET last_repo_id = ?, last_checkout_id = ?, last_clone_generation = ?
+        WHERE singleton = 1
+          AND last_repo_id = ? AND last_checkout_id = ? AND last_clone_generation = ?
+      RETURNING singleton, last_repo_id, last_checkout_id, last_clone_generation`,
+      next.repoId,
+      next.checkoutId,
+      next.cloneGeneration,
+      previous.repoId,
+      previous.checkoutId,
+      previous.cloneGeneration,
+    );
+    if (updated === undefined || updated.singleton !== 1) {
+      throw new CorruptError("Git identity control changed during allocation");
+    }
+    const checked: AllocatedIdentity = {
+      repoId: requireIdentityCounter(updated.last_repo_id, "allocated repository id"),
+      checkoutId: requireIdentityCounter(updated.last_checkout_id, "allocated checkout id"),
+      cloneGeneration: requireIdentityCounter(
+        updated.last_clone_generation,
+        "allocated clone generation",
+      ),
+    };
+    if (
+      checked.repoId !== next.repoId ||
+      checked.checkoutId !== next.checkoutId ||
+      checked.cloneGeneration !== next.cloneGeneration
+    ) {
+      throw new CorruptError("Git identity allocation returned unexpected counters");
+    }
+    return checked;
+  }
+
+  #repositoryAtRoot(root: string): StoredCheckoutLifecycle | null {
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        WHERE checkout.root = ?`,
+      root,
+    );
+    if (row === undefined) return null;
+    const stored = requireStoredCheckoutLifecycle(row);
+    requireCheckoutLifecycleCardinality(row, stored);
+    return stored;
+  }
+
+  #requireReadyRepository(repoId: number): StoredRepositoryLifecycle {
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS repo_id, lifecycle, clone_generation, clone_expires_ms
+         FROM git_repositories WHERE id = ?`,
+      repoId,
+    );
+    if (row === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
+    const stored = requireStoredRepositoryLifecycle(row);
+    if (stored.repoId !== repoId) {
+      throw new CorruptError("repository lookup returned another repository");
+    }
+    if (stored.lifecycle !== "ready") {
+      throw new GitError("ENOTFOUND", "repository is not published");
+    }
+    return stored;
+  }
+
+  #storedProvisionalOwner(owner: ProvisionalCloneOwner): StoredCheckoutLifecycle {
+    if (!this.#issuedProvisionalOwners.has(owner)) {
+      throw new GitError("ESTALE", "provisional clone owner was not issued by this database");
+    }
+    const repoId = requireSafeId(owner.checkout.repoId, "provisional repository id");
+    const checkoutId = requireSafeId(owner.checkout.id, "provisional checkout id");
+    const generation = requireSafeId(owner.generation, "provisional clone generation");
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_repositories repository
+         JOIN git_checkouts checkout ON checkout.repo_id = repository.id
+        WHERE repository.id = ? AND checkout.id = ? AND checkout.is_primary = 1`,
+      repoId,
+      checkoutId,
+    );
+    if (row === undefined) throw new GitError("ESTALE", "provisional clone owner is stale");
+    const stored = requireStoredCheckoutLifecycle(row);
+    if (
+      stored.lifecycle !== "provisional" ||
+      stored.cloneGeneration !== generation ||
+      stored.checkout.root !== owner.checkout.root ||
+      stored.checkout.repoId !== repoId ||
+      stored.checkout.id !== checkoutId
+    ) {
+      throw new GitError("ESTALE", "provisional clone owner is stale");
+    }
+    requireCheckoutLifecycleCardinality(row, stored);
+    return stored;
+  }
+
+  #requireProvisionalOwner(owner: ProvisionalCloneOwner, nowMs: number): StoredCheckoutLifecycle {
+    const stored = this.#storedProvisionalOwner(owner);
+    const generation = owner.generation;
+    const expiry = stored.cloneExpiresMs;
+    if (expiry === null) throw new CorruptError("provisional clone lease is missing");
+    if (nowMs >= expiry) throw new GitError("ESTALE", "provisional clone lease has expired");
+    const record = this.#provisionalStores.get(generation);
+    if (record === undefined || record.store !== owner.store) {
+      throw new GitError("ESTALE", "provisional clone facade is no longer active");
+    }
+    if (record.repoId !== stored.repoId || record.checkoutId !== stored.checkout.id) {
+      throw new CorruptError("provisional clone facade has mismatched identity");
+    }
+    return stored;
+  }
+
+  #provisionalStore(checkout: CheckoutRow, generation: number): ProvisionalStoreRecord {
+    const existing = this.#provisionalStores.get(generation);
+    if (existing !== undefined) {
+      if (existing.repoId !== checkout.repoId || existing.checkoutId !== checkout.id) {
+        throw new CorruptError("provisional clone generation belongs to another repository");
+      }
+      return existing;
+    }
+    if (this.#nextStoreGeneration >= Number.MAX_SAFE_INTEGER) {
+      throw new GitError("E2BIG", "repository store generation is exhausted");
+    }
+    const shared = new SharedRepoStore(
+      this.#db,
+      checkout.repoId,
+      this.#nextStoreGeneration++,
+      this.#objects,
+      this.#packRows,
+      this.#memory,
+    );
+    const lifetime = new CheckoutStoreLifetime();
+    const store = new CheckoutStore(
+      shared,
+      checkout,
+      this.#options,
+      () => {
+        throw new GitError("EINVAL", "provisional clone requires exact-owner discard");
+      },
+      lifetime,
+    );
+    const record: ProvisionalStoreRecord = {
+      generation,
+      repoId: checkout.repoId,
+      checkoutId: checkout.id,
+      shared,
+      store,
+      lifetime,
+    };
+    this.#provisionalStores.set(generation, record);
+    return record;
+  }
+
+  #evictProvisional(generation: number): void {
+    const record = this.#provisionalStores.get(generation);
+    if (record === undefined) return;
+    this.#evictProvisionalRecord(record);
+  }
+
+  #evictProvisionalRecord(record: ProvisionalStoreRecord): void {
+    if (this.#provisionalStores.get(record.generation) !== record) return;
+    record.lifetime.revoke();
+    record.shared.clearCaches();
+    this.#provisionalStores.delete(record.generation);
+  }
+
+  #provisionalRecordForOwner(owner: ProvisionalCloneOwner): ProvisionalStoreRecord | null {
+    if (!this.#issuedProvisionalOwners.has(owner)) return null;
+    if (!Number.isSafeInteger(owner.generation) || owner.generation < 1) return null;
+    const record = this.#provisionalStores.get(owner.generation);
+    return record !== undefined && record.store === owner.store ? record : null;
+  }
+
+  #evictProvisionalOwner(owner: ProvisionalCloneOwner): void {
+    const record = this.#provisionalRecordForOwner(owner);
+    if (record === null) return;
+    this.#evictProvisionalRecord(record);
+  }
+
   /** The checkout whose root is the nearest registered ancestor of `dir`. */
   findCheckout(dir: string): CheckoutRow | null {
     const path = normalizeRoot(dir);
     const row = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-         FROM git_checkouts
-        WHERE root = '/' OR root = ? OR substr(?, 1, length(root) + 1) = root || '/'
-        ORDER BY length(CAST(root AS BLOB)) DESC, id DESC
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        WHERE checkout.root = '/' OR checkout.root = ?
+           OR substr(?, 1, length(checkout.root) + 1) = checkout.root || '/'
+        ORDER BY length(CAST(checkout.root AS BLOB)) DESC, checkout.id DESC
         LIMIT 1`,
       path,
       path,
     );
-    return row === undefined ? null : this.#rememberCheckout(requireStoredCheckoutRow(row));
+    if (row === undefined) return null;
+    const stored = requireStoredCheckoutLifecycle(row);
+    requireCheckoutLifecycleCardinality(row, stored);
+    return stored.lifecycle === "provisional" ? null : this.#rememberCheckout(stored.checkout);
   }
 
   checkoutAt(root: string): CheckoutRow | null {
     const row = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-         FROM git_checkouts WHERE root = ?`,
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        WHERE checkout.root = ?`,
       requireCheckoutRoot(root, "input"),
     );
-    return row === undefined ? null : this.#rememberCheckout(requireStoredCheckoutRow(row));
+    if (row === undefined) return null;
+    const stored = requireStoredCheckoutLifecycle(row);
+    requireCheckoutLifecycleCardinality(row, stored);
+    return stored.lifecycle === "provisional" ? null : this.#rememberCheckout(stored.checkout);
   }
 
   listCheckouts(repoId: number): readonly CheckoutRow[] {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
+    this.#requireReadyRepository(repoId);
     const rows: CheckoutRow[] = [];
     let primaryCount = 0;
     let previousRoot: string | null = null;
@@ -2148,23 +2538,40 @@ export class SqliteGitDatabase {
     const primaryCounts = new Map<number, number>();
     const checkoutCounts = new Map<number, number>();
     let previousRoot: string | null = null;
+    let retainedBytes = 0;
+    let routingCount = 0;
     for (const raw of this.#db.iterate(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-         FROM git_checkouts ORDER BY root COLLATE BINARY LIMIT ${MAX_GLOBAL_CHECKOUT_LIST + 1}`,
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_GLOBAL_CHECKOUT_LIST + 1}`,
     )) {
-      const row = requireStoredCheckoutRow(raw);
+      const stored = requireStoredCheckoutLifecycle(raw);
+      requireCheckoutLifecycleCardinality(raw, stored);
+      const row = stored.checkout;
+      routingCount++;
       if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
         throw new CorruptError("checkout roots are not in strict byte order");
       }
       previousRoot = row.root;
-      rows.push(this.#rememberCheckout(row));
+      retainedBytes +=
+        CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
+        checkoutTextEncoder.encode(row.root).byteLength +
+        boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
+      if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
+        throw new GitError("E2BIG", "checkout routing exceeds its 6 MiB retained bound");
+      }
+      if (stored.lifecycle === "ready") rows.push(this.#rememberCheckout(row));
       primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
       const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
       if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
         throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
       }
       checkoutCounts.set(row.repoId, checkoutCount);
-      if (rows.length > MAX_GLOBAL_CHECKOUT_LIST) {
+      if (routingCount > MAX_GLOBAL_CHECKOUT_LIST) {
         throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
       }
     }
@@ -2174,20 +2581,339 @@ export class SqliteGitDatabase {
     return rows;
   }
 
+  /** All routing roots, including provisional roots that block parent traversal. */
+  listRoutingRoots(): string[] {
+    const roots: string[] = [];
+    const primaryCounts = new Map<number, number>();
+    const checkoutCounts = new Map<number, number>();
+    let previousRoot: string | null = null;
+    let retainedBytes = 0;
+    for (const raw of this.#db.iterate(
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_GLOBAL_CHECKOUT_LIST + 1}`,
+    )) {
+      const stored = requireStoredCheckoutLifecycle(raw);
+      requireCheckoutLifecycleCardinality(raw, stored);
+      const row = stored.checkout;
+      if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+        throw new CorruptError("checkout roots are not in strict byte order");
+      }
+      previousRoot = row.root;
+      primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
+      const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
+      if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
+        throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
+      }
+      checkoutCounts.set(row.repoId, checkoutCount);
+      retainedBytes +=
+        CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
+        checkoutTextEncoder.encode(row.root).byteLength +
+        boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
+      if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
+        throw new GitError("E2BIG", "checkout routing exceeds its 6 MiB retained bound");
+      }
+      roots.push(row.root);
+      if (roots.length > MAX_GLOBAL_CHECKOUT_LIST) {
+        throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
+      }
+    }
+    for (const count of primaryCounts.values()) {
+      if (count !== 1) throw new CorruptError("repository must have exactly one primary checkout");
+    }
+    return roots;
+  }
+
+  beginProvisionalClone(
+    root: string,
+    head: string,
+    now: number,
+    cleanup: (store: CheckoutStore) => undefined,
+  ): ProvisionalCloneOwner {
+    const normalized = requireCheckoutRoot(root, "input");
+    const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
+    const nowMs = requireMilliseconds(now, "clone lease clock", "input");
+    const expiresMs = provisionalCloneExpiry(nowMs);
+    let cleanupGeneration: number | null = null;
+    let created: {
+      checkout: CheckoutRow;
+      generation: number;
+      evictedGeneration: number | null;
+    };
+    try {
+      created = this.#db.transactionSync(() => {
+        const existing = this.#repositoryAtRoot(normalized);
+        let evictedGeneration: number | null = null;
+        if (existing !== null) {
+          if (existing.lifecycle === "ready") {
+            throw new GitError("EALREADYINIT", `repository already exists at ${normalized}`);
+          }
+          const oldGeneration = existing.cloneGeneration;
+          const oldExpiry = existing.cloneExpiresMs;
+          if (oldGeneration === null || oldExpiry === null) {
+            throw new CorruptError("provisional clone owner is incomplete");
+          }
+          if (nowMs < oldExpiry) {
+            throw new GitError("EBUSY", `clone at ${normalized} is still in progress`);
+          }
+          cleanupGeneration = oldGeneration;
+          const oldStore = this.#provisionalStore(existing.checkout, oldGeneration).store;
+          const result = cleanup(oldStore);
+          if (isThenableResult(result)) {
+            void Promise.resolve(result).catch(() => {});
+            throw new GitError("EINVAL", "provisional clone cleanup must be synchronous");
+          }
+          const deleted = this.#db.one<Record<string, unknown>>(
+            `DELETE FROM git_repositories
+            WHERE id = ? AND lifecycle = 'provisional'
+              AND clone_generation = ? AND clone_expires_ms = ? AND clone_expires_ms <= ?
+          RETURNING id AS repo_id`,
+            existing.repoId,
+            oldGeneration,
+            oldExpiry,
+            nowMs,
+          );
+          if (
+            deleted === undefined ||
+            requireSafeId(deleted.repo_id, "deleted provisional repository id") !== existing.repoId
+          ) {
+            throw new GitError("ESTALE", "provisional clone ownership changed during takeover");
+          }
+          evictedGeneration = oldGeneration;
+        }
+
+        const identity = this.#allocateIdentities(true, true, true);
+        this.#db.run(
+          `INSERT INTO git_repositories
+             (id, lifecycle, clone_generation, clone_expires_ms)
+           VALUES (?, 'provisional', ?, ?)`,
+          identity.repoId,
+          identity.cloneGeneration,
+          expiresMs,
+        );
+        this.#db.run(
+          `INSERT INTO git_pack_ingest_control
+             (repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms)
+           VALUES (?, 0, 0, NULL, NULL)`,
+          identity.repoId,
+        );
+        this.#db.run(
+          `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+           VALUES (?, ?, ?, ?, 1)`,
+          identity.checkoutId,
+          identity.repoId,
+          normalized,
+          checkedHead,
+        );
+        this.#db.run(
+          "INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (?, 0)",
+          identity.repoId,
+        );
+        this.#db.run(
+          `INSERT OR IGNORE INTO git_index_state
+               (checkout_id, baseline_tree_oid, format, complete) VALUES (?, NULL, 1, 0)`,
+          identity.checkoutId,
+        );
+        const checkout: CheckoutRow = {
+          id: identity.checkoutId,
+          repoId: identity.repoId,
+          root: normalized,
+          head: checkedHead,
+          isPrimary: true,
+        };
+        return { checkout, generation: identity.cloneGeneration, evictedGeneration };
+      });
+    } catch (error) {
+      if (cleanupGeneration !== null) {
+        this.#evictProvisional(cleanupGeneration);
+      }
+      throw error;
+    }
+
+    if (created.evictedGeneration !== null) {
+      this.#evictProvisional(created.evictedGeneration);
+    }
+    const checkout = Object.freeze(created.checkout);
+    const record = this.#provisionalStore(checkout, created.generation);
+    const owner = Object.freeze({ checkout, generation: created.generation, store: record.store });
+    this.#issuedProvisionalOwners.add(owner);
+    return owner;
+  }
+
+  renewProvisionalClone(owner: ProvisionalCloneOwner, now: number): number {
+    const nowMs = requireMilliseconds(now, "clone lease clock", "input");
+    try {
+      return this.#db.transactionSync(() => {
+        const stored = this.#requireProvisionalOwner(owner, nowMs);
+        const currentExpiry = stored.cloneExpiresMs;
+        if (currentExpiry === null) throw new CorruptError("provisional clone lease is missing");
+        if (currentExpiry - nowMs > PROVISIONAL_CLONE_RENEW_WINDOW_MS) return currentExpiry;
+        const nextExpiry = provisionalCloneExpiry(nowMs);
+        const updated = this.#db.one<Record<string, unknown>>(
+          `UPDATE git_repositories SET clone_expires_ms = ?
+            WHERE id = ? AND lifecycle = 'provisional'
+              AND clone_generation = ? AND clone_expires_ms = ? AND clone_expires_ms > ?
+          RETURNING clone_expires_ms`,
+          nextExpiry,
+          stored.repoId,
+          owner.generation,
+          currentExpiry,
+          nowMs,
+        );
+        if (updated === undefined) {
+          throw new GitError("ESTALE", "provisional clone ownership changed during renewal");
+        }
+        const checked = requireMilliseconds(
+          updated.clone_expires_ms,
+          "renewed clone lease expiry",
+          "stored",
+        );
+        if (checked !== nextExpiry) {
+          throw new CorruptError("clone lease renewal returned an unexpected expiry");
+        }
+        return checked;
+      });
+    } catch (error) {
+      if (hasErrorCode(error, "ESTALE")) this.#evictProvisionalOwner(owner);
+      throw error;
+    }
+  }
+
+  publishProvisionalClone(
+    owner: ProvisionalCloneOwner,
+    now: number,
+    prepare?: (store: CheckoutStore) => undefined,
+  ): CheckoutRow {
+    const nowMs = requireMilliseconds(now, "clone lease clock", "input");
+    let prepareStarted = false;
+    let synchronousPrepareFailure = false;
+    try {
+      const published = this.#db.transactionSync(() => {
+        const stored = this.#requireProvisionalOwner(owner, nowMs);
+        const expiry = stored.cloneExpiresMs;
+        if (expiry === null) throw new CorruptError("provisional clone lease is missing");
+        if (prepare !== undefined) {
+          prepareStarted = true;
+          let result: undefined;
+          try {
+            result = prepare(owner.store);
+          } catch (error) {
+            synchronousPrepareFailure = true;
+            throw error;
+          }
+          if (isThenableResult(result)) {
+            void Promise.resolve(result).catch(() => {});
+            throw new GitError("EINVAL", "provisional clone preparation must be synchronous");
+          }
+        }
+        const updated = this.#db.one<Record<string, unknown>>(
+          `UPDATE git_repositories
+              SET lifecycle = 'ready', clone_generation = NULL, clone_expires_ms = NULL
+            WHERE id = ? AND lifecycle = 'provisional'
+              AND clone_generation = ? AND clone_expires_ms = ? AND clone_expires_ms > ?
+          RETURNING id AS repo_id, lifecycle, clone_generation, clone_expires_ms`,
+          stored.repoId,
+          owner.generation,
+          expiry,
+          nowMs,
+        );
+        if (updated === undefined) {
+          throw new GitError("ESTALE", "provisional clone ownership changed before publication");
+        }
+        const lifecycle = requireStoredRepositoryLifecycle(updated);
+        if (lifecycle.repoId !== stored.repoId || lifecycle.lifecycle !== "ready") {
+          throw new CorruptError("clone publication returned an unexpected repository");
+        }
+        return stored.checkout;
+      });
+      this.#evictProvisionalOwner(owner);
+      this.#issuedProvisionalOwners.delete(owner);
+      return this.#rememberCheckout(published, true);
+    } catch (error) {
+      const record = this.#provisionalRecordForOwner(owner);
+      if (synchronousPrepareFailure && record !== null) {
+        // The rollback preserves this exact owner for the bounded native-to-fallback retry.
+        record.shared.revalidateStorageCaches();
+      } else if (prepareStarted || hasErrorCode(error, "ESTALE")) {
+        this.#evictProvisionalOwner(owner);
+      }
+      throw error;
+    }
+  }
+
+  discardProvisionalClone(
+    owner: ProvisionalCloneOwner,
+    now: number,
+    cleanup: (store: CheckoutStore) => undefined,
+  ): void {
+    requireMilliseconds(now, "clone lease clock", "input");
+    let cleanupRecord: ProvisionalStoreRecord | null = null;
+    try {
+      this.#db.transactionSync(() => {
+        const stored = this.#storedProvisionalOwner(owner);
+        const generation = owner.generation;
+        const existing = this.#provisionalStores.get(generation);
+        if (existing !== undefined && existing.store !== owner.store) {
+          throw new GitError("ESTALE", "provisional clone facade belongs to another owner");
+        }
+        cleanupRecord = existing ?? this.#provisionalStore(stored.checkout, generation);
+        const result = cleanup(cleanupRecord.store);
+        if (isThenableResult(result)) {
+          void Promise.resolve(result).catch(() => {});
+          throw new GitError("EINVAL", "provisional clone cleanup must be synchronous");
+        }
+        const deleted = this.#db.one<Record<string, unknown>>(
+          `DELETE FROM git_repositories
+            WHERE id = ? AND lifecycle = 'provisional'
+              AND clone_generation = ?
+          RETURNING id AS repo_id`,
+          stored.repoId,
+          generation,
+        );
+        if (
+          deleted === undefined ||
+          requireSafeId(deleted.repo_id, "discarded provisional repository id") !== stored.repoId
+        ) {
+          throw new GitError("ESTALE", "provisional clone ownership changed before discard");
+        }
+      });
+    } catch (error) {
+      if (cleanupRecord !== null) this.#evictProvisionalRecord(cleanupRecord);
+      else if (hasErrorCode(error, "ESTALE")) this.#evictProvisionalOwner(owner);
+      throw error;
+    }
+    if (cleanupRecord === null) {
+      throw new CorruptError("provisional clone cleanup facade was not created");
+    }
+    this.#evictProvisionalRecord(cleanupRecord);
+    this.#issuedProvisionalOwners.delete(owner);
+  }
+
   createRepository(root: string, head: string): CheckoutRow {
     const normalized = requireCheckoutRoot(root, "input");
     const checkedHead = requireRawRefTarget(head, "initial HEAD target", "input");
     return this.#db.transactionSync(() => {
-      const lastRepoId = this.#db.scalar<unknown>("SELECT MAX(id) FROM git_repositories");
-      const lastCheckoutId = this.#db.scalar<unknown>("SELECT MAX(id) FROM git_checkouts");
-      const repoId =
-        lastRepoId === null ? 1 : requireSafeId(lastRepoId, "latest repository id") + 1;
-      const checkoutId =
-        lastCheckoutId === null ? 1 : requireSafeId(lastCheckoutId, "latest checkout id") + 1;
-      if (!Number.isSafeInteger(repoId) || !Number.isSafeInteger(checkoutId)) {
-        throw new GitError("E2BIG", "store or checkout id space is exhausted");
+      const existing = this.#repositoryAtRoot(normalized);
+      if (existing !== null) {
+        if (existing.lifecycle === "provisional") {
+          throw new GitError("EBUSY", `clone at ${normalized} is still in progress`);
+        }
+        throw new GitError("EALREADYINIT", `repository already exists at ${normalized}`);
       }
-      this.#db.run("INSERT INTO git_repositories (id) VALUES (?)", repoId);
+      const identity = this.#allocateIdentities(true, true, false);
+      const repoId = identity.repoId;
+      const checkoutId = identity.checkoutId;
+      try {
+        this.#db.run("INSERT INTO git_repositories (id) VALUES (?)", repoId);
+      } catch (error) {
+        throw new CorruptError("repository identity control precedes stored repositories", {
+          cause: error,
+        });
+      }
       this.#db.run(
         `INSERT INTO git_pack_ingest_control
            (repo_id, owner_generation, last_pack_id, active_pack_id, expires_ms)
@@ -2295,12 +3021,7 @@ export class SqliteGitDatabase {
           }
         }
 
-        const lastCheckoutId = this.#db.scalar<unknown>("SELECT MAX(id) FROM git_checkouts");
-        const checkoutId =
-          lastCheckoutId === null ? 1 : requireSafeId(lastCheckoutId, "latest checkout id") + 1;
-        if (!Number.isSafeInteger(checkoutId)) {
-          throw new GitError("E2BIG", "checkout id space is exhausted");
-        }
+        const checkoutId = this.#allocateIdentities(false, true, false).checkoutId;
         try {
           this.#db.run(
             `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
@@ -2517,6 +3238,7 @@ export class SqliteGitDatabase {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
+    this.#requireReadyRepository(repoId);
     const existing = this.#sharedStores.get(repoId);
     if (existing !== undefined) return existing;
     const row = this.#db.one<Record<string, unknown>>(
@@ -2590,6 +3312,15 @@ export class SqliteGitDatabase {
     const checkoutId =
       typeof checkout === "number" ? checkout : requireSafeId(checkout.id, "checkout id");
     if (typeof checkout !== "number") this.#rejectStaleCheckoutRow(checkout, checkoutId);
+    const durable = this.#checkoutById(checkoutId);
+    if (
+      typeof checkout !== "number" &&
+      (checkout.repoId !== durable.repoId ||
+        checkout.root !== durable.root ||
+        checkout.isPrimary !== durable.isPrimary)
+    ) {
+      throw new CorruptError("checkout identity changed before it was opened");
+    }
     const existing = this.#checkoutStores.get(checkoutId);
     if (existing !== undefined) {
       if (
@@ -2602,18 +3333,7 @@ export class SqliteGitDatabase {
       }
       return existing;
     }
-    const stored =
-      typeof checkout === "number"
-        ? this.#checkoutById(checkoutId)
-        : this.#isRememberedCheckout(checkout, checkoutId)
-          ? requireStoredCheckoutRow({
-              checkout_id: checkout.id,
-              repo_id: checkout.repoId,
-              root: checkout.root,
-              head: checkout.head,
-              is_primary: checkout.isPrimary ? 1 : 0,
-            })
-          : this.#verifyCheckoutRow(checkout);
+    const stored = durable;
     const shared = this.openShared(stored.repoId);
     const installed = this.#checkoutStores.get(checkoutId);
     if (installed !== undefined) return installed;
@@ -2632,30 +3352,22 @@ export class SqliteGitDatabase {
 
   #checkoutById(checkoutId: number): CheckoutRow {
     const raw = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-         FROM git_checkouts WHERE id = ?`,
+      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              checkout.head, checkout.is_primary, repository.lifecycle,
+              repository.clone_generation, repository.clone_expires_ms,
+              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+         FROM git_checkouts checkout
+         JOIN git_repositories repository ON repository.id = checkout.repo_id
+        WHERE checkout.id = ?`,
       checkoutId,
     );
     if (raw === undefined) throw new GitError("ENOTFOUND", "checkout does not exist");
-    return requireStoredCheckoutRow(raw);
-  }
-
-  #verifyCheckoutRow(checkout: CheckoutRow): CheckoutRow {
-    const stored = this.#checkoutById(requireSafeId(checkout.id, "checkout id"));
-    if (
-      checkout.repoId !== stored.repoId ||
-      checkout.root !== stored.root ||
-      checkout.head !== stored.head ||
-      checkout.isPrimary !== stored.isPrimary
-    ) {
-      throw new CorruptError("checkout identity changed before it was opened");
+    const stored = requireStoredCheckoutLifecycle(raw);
+    requireCheckoutLifecycleCardinality(raw, stored);
+    if (stored.lifecycle !== "ready") {
+      throw new GitError("ENOTFOUND", "checkout is not published");
     }
-    return stored;
-  }
-
-  #isRememberedCheckout(checkout: CheckoutRow, checkoutId: number): boolean {
-    const generation = this.#validatedCheckoutRows.get(checkout);
-    return generation !== undefined && generation === this.#checkoutRowGenerations.get(checkoutId);
+    return stored.checkout;
   }
 
   #rejectStaleCheckoutRow(checkout: CheckoutRow, checkoutId: number): void {
@@ -2735,7 +3447,8 @@ export class SqliteGitDatabase {
     if (!Number.isSafeInteger(repoId) || repoId < 1) {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
-    this.#db.run("DELETE FROM git_repositories WHERE id = ?", repoId);
+    this.#requireReadyRepository(repoId);
+    this.#db.run("DELETE FROM git_repositories WHERE id = ? AND lifecycle = 'ready'", repoId);
     const shared = this.#sharedStores.get(repoId);
     shared?.clearCaches();
     this.#sharedStores.delete(repoId);

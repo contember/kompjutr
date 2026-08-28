@@ -87,6 +87,7 @@ describe("repository registry", () => {
       "git_checkouts",
       "git_commits",
       "git_config",
+      "git_identity_control",
       "git_index",
       "git_index_dirty",
       "git_index_state",
@@ -105,7 +106,9 @@ describe("repository registry", () => {
       "git_operation_steps",
       "git_operation_touched",
       "git_pack_data",
+      "git_pack_entries",
       "git_pack_gc_candidates",
+      "git_pack_ingest_control",
       "git_pack_meta",
       "git_pack_objects",
       "git_pack_pending",
@@ -129,7 +132,7 @@ describe("repository registry", () => {
     ).toBe(0);
   });
 
-  it("creates one primary checkout atomically in six statements", () => {
+  it("creates one primary checkout atomically in eight statements", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     db.storage.resetCounters();
@@ -143,7 +146,7 @@ describe("repository registry", () => {
       head: "ref: refs/heads/main",
       isPrimary: true,
     });
-    expect(db.storage.statementCount).toBe(6);
+    expect(db.storage.statementCount).toBe(8);
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(db.one("SELECT repo_id, is_primary FROM git_checkouts")).toEqual({
       repo_id: 1,
@@ -247,7 +250,7 @@ describe("repository registry", () => {
     first.destroy();
     second.destroy();
     const recreated = database.createRepository("/recreated", "ref: refs/heads/main");
-    expect(recreated.repoId).toBe(firstRow.repoId);
+    expect(recreated.repoId).toBeGreaterThan(secondRow.repoId);
     expect(insertRawBlob(db, recreated.repoId, data)).toBe(oid);
     const replacement = database.openCheckout(recreated);
     db.storage.resetCounters();
@@ -306,13 +309,13 @@ describe("repository registry", () => {
     for (const forged of [
       { ...secondaryRow, repoId: repository.repoId + 1 },
       { ...secondaryRow, root: "/forged" },
-      { ...secondaryRow, head: "1".repeat(40) },
       { ...secondaryRow, isPrimary: true },
     ]) {
       expect(() => database.openCheckout(forged)).toThrowError(
         expect.objectContaining({ code: "ECORRUPT" }),
       );
     }
+    expect(() => database.openCheckout({ ...secondaryRow, head: "1".repeat(40) })).not.toThrow();
     const secondary = database.openCheckout(secondaryRow);
     expect(() =>
       database.openCheckout({ ...secondaryRow, repoId: repository.repoId + 1 }),

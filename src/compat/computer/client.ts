@@ -356,7 +356,7 @@ function buildContext(
   };
   const context: GitContext = {
     database: new SqliteGitDatabase(db, options),
-    worktree: new ComputerWorktree(provider),
+    worktree: new ComputerWorktree(provider, db),
     now: options.now ?? Date.now,
     timezoneOffset: options.timezoneOffset ?? (() => 0),
   };

@@ -227,6 +227,10 @@ describe("createSqliteGitClient", () => {
       primary.repoId,
       oid,
     );
+    workspace.database.db.run(
+      "UPDATE git_identity_control SET last_checkout_id = ? WHERE singleton = 1",
+      secondaryId,
+    );
     expect(secondaryId).not.toBe(primary.id);
     expect(secondaryId).not.toBe(primary.repoId);
     await expect(git.readRef({ dir: "/primary", ref: "HEAD" })).resolves.toEqual({

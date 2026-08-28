@@ -31,6 +31,7 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../../fs/types.js";
+import type { SqlDatabase } from "../../sqlite/db.js";
 
 const MAX_PATH_CODE_UNITS = 4096;
 const MAX_HANDLE_COUNT = 5_000;
@@ -162,7 +163,10 @@ function entryType(entry: DirentLike): WorktreeEntryType | null {
 }
 
 export class ComputerWorktree implements Worktree {
-  constructor(private readonly provider: SQLiteWorkspaceProvider) {}
+  constructor(
+    private readonly provider: SQLiteWorkspaceProvider,
+    readonly db?: SqlDatabase,
+  ) {}
 
   stat(path: string): WorktreeStat | null {
     try {

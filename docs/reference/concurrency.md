@@ -43,6 +43,18 @@ Pack data and index checkpoints are durable but invisible to object reads until
 the pack becomes complete. Ref, HEAD, reflog, checkout, journal, and individual
 maintenance transitions publish through synchronous database transactions.
 
+Clone reserves its destination as a provisional repository with a renewable
+five-minute owner generation. The root blocks traversal into a parent repository
+but is absent from ordinary lookup and public store opens. A live same-root clone
+gets `EBUSY`; exact expiry lets a cold retry remove only the abandoned tracked
+state and allocate new monotonic identities. Each network and pack resumption
+renews or validates the lease. A fenced owner gets `ESTALE` and cannot publish or
+discard its replacement. Readiness publishes only after refs, configuration,
+index, and initial worktree materialization are complete. The fallback
+materializer rejects existing target-path collisions, then changes its index and
+SQLite worktree in one transaction, so a failed write cannot leave an unindexed
+clone path. Unrelated untracked paths remain outside cleanup ownership.
+
 Ordinary pack leases last five minutes and renew only near half-life, so source
 chunking does not add one SQL statement per chunk. Every async resumption checks
 the local expiry before its next durable write; after takeover, the old owner
@@ -71,7 +83,7 @@ public method that reaches the same synchronous transaction.
 
 | Durable seam | Owners | Current behavior |
 |---|---|---|
-| Repository route and readiness | `clone` × clone/public calls | A live clone removes its repository on caught failure. A cold interrupted clone has no provisional owner, so same-root retry and observation are `unfenced`. Different roots `coexist`. |
+| Repository route and readiness | `clone` × clone/public calls | One exact provisional owner hides partial state while its root remains a traversal barrier. An active same-root clone gets `EBUSY`; exact-expiry cold retry replaces only the abandoned owner, and a fenced owner gets `ESTALE`. Different roots `coexist`. Ready publication follows complete refs, index, and worktree; fallback target collisions get `EEXIST`, and fallback index/worktree writes are atomic. |
 | Ordinary pack ownership | `clone`/`fetch` × `clone`/`fetch` | One durable generation lease fences ordinary ingest per repository. An unexpired competitor gets `EBUSY`; expiry fences the old owner with `ESTALE`, reclaims only its pending pack, and allocates a never-reused pack ID. Unrelated local work still `coexist`s. |
 | Maintenance pack ownership | `maintenance` × pack owners | Selected, pending, published, and finalized maintenance packs keep exact durable ownership and bypass the ordinary lease. Disjoint packs `coexist`; a publication whose canonical OID is still owned by another pending pack gets `stale-reject` and remains pending for exact recovery. If an ordinary complete owner wins first, maintenance finalizes against it and atomically discards its fully redundant pack. |
 | Tracking refs, tags, and prune | `fetch`/`pull` × fetch | One fetch publishes its complete ref set atomically. Competing publications for the same tracking namespace or global tag are currently `unfenced`; disjoint refs `coexist`. |
@@ -87,7 +99,8 @@ The implementation seams are
 [`push.ts`](../../src/core/ops/push.ts),
 [`pull.ts`](../../src/core/ops/pull.ts),
 [`maintenance.ts`](../../src/core/ops/maintenance.ts), and
-[`packs.ts`](../../src/sqlite/packs.ts).
+[`packs.ts`](../../src/sqlite/packs.ts), with durable ownership in
+[`store.ts`](../../src/sqlite/store.ts).
 
 ## Deterministic test model
 

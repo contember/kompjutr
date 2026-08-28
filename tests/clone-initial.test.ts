@@ -236,7 +236,7 @@ describe("clone initial-state fast path", () => {
       expect(await workspace.fs.readFile("/repo/file-0000.txt", "utf8")).toBe("same\n");
       expect(await workspace.fs.readFile("/repo/zz-large.bin")).toEqual(large);
       expect(count(workspace, "git_index")).toBe(1_101);
-      expect(storage.walkStatements).toBe(3);
+      expect(storage.walkStatements).toBe(4);
       expect(await git.status({ dir: "/repo" })).toEqual([]);
     } finally {
       await server.close();
@@ -257,6 +257,7 @@ describe("clone initial-state fast path", () => {
         const initial = binding.initialWorktree;
         if (initial === undefined) throw new Error("workspace did not bind its initial writer");
         const observed: InitialWorktreeWriter = {
+          supportsDatabase: (database) => initial.supportsDatabase?.(database) === true,
           tryRun(root, body) {
             pathAttempts++;
             return initial.tryRun(root, body);
@@ -270,7 +271,7 @@ describe("clone initial-state fast path", () => {
       expect(pathAttempts).toBe(0);
       expect(await paths.fs.readFile("/repo/a.txt", "utf8")).toBe("a\n");
       expect(paths.filesystem.stat("/repo/b.txt")).toBeNull();
-      expect(pathStorage.walkStatements).toBe(2);
+      expect(pathStorage.walkStatements).toBe(3);
       expect(readIndexTrackerState(paths.db, repoId(paths))).toEqual({ available: false });
 
       const absentFactory: GitFactory = (binding) =>
@@ -280,7 +281,7 @@ describe("clone initial-state fast path", () => {
       await absent.git.clone({ url: server.url, dir: "/repo" });
       expect(await absent.fs.readFile("/repo/a.txt", "utf8")).toBe("a\n");
       expect(await absent.fs.readFile("/repo/b.txt", "utf8")).toBe("b\n");
-      expect(absentStorage.walkStatements).toBe(2);
+      expect(absentStorage.walkStatements).toBe(3);
       expect(readIndexTrackerState(absent.db, repoId(absent))).toEqual({ available: false });
 
       let unavailableAttempts = 0;
@@ -288,6 +289,7 @@ describe("clone initial-state fast path", () => {
         const initial = binding.initialWorktree;
         if (initial === undefined) throw new Error("workspace did not bind its initial writer");
         const observed: InitialWorktreeWriter = {
+          supportsDatabase: (database) => initial.supportsDatabase?.(database) === true,
           tryRun(root, body) {
             unavailableAttempts++;
             return initial.tryRun(root, body);
@@ -303,7 +305,7 @@ describe("clone initial-state fast path", () => {
       expect(unavailableAttempts).toBe(1);
       expect(await unavailable.fs.readFile("/repo/keep.txt", "utf8")).toBe("keep\n");
       expect(await unavailable.fs.readFile("/repo/b.txt", "utf8")).toBe("b\n");
-      expect(unavailableStorage.walkStatements).toBe(2);
+      expect(unavailableStorage.walkStatements).toBe(3);
       expect(readIndexTrackerState(unavailable.db, repoId(unavailable))).toEqual({
         available: false,
       });
@@ -311,6 +313,7 @@ describe("clone initial-state fast path", () => {
       const injected = new GitError("EFBIG", "injected writer failure");
       const failingFactory: GitFactory = (binding) => {
         const failing: InitialWorktreeWriter = {
+          supportsDatabase: () => true,
           tryRun() {
             throw injected;
           },
@@ -327,6 +330,7 @@ describe("clone initial-state fast path", () => {
       const injectedCapacity = new GitError("E2BIG", "injected writer capacity failure");
       const capacityFactory: GitFactory = (binding) => {
         const failing: InitialWorktreeWriter = {
+          supportsDatabase: () => true,
           tryRun() {
             throw injectedCapacity;
           },
@@ -409,7 +413,7 @@ describe("clone initial-state fast path", () => {
     }
   });
 
-  it("keeps a 24,252-file clone below 1,000 statements with 1,000-oid windows", async () => {
+  it("keeps a 24,252-file fallback clone below 1,000 statements with 1,000-oid windows", async () => {
     const fixture = new GitFixture().init();
     for (let index = 0; index < 24_252; index++) {
       fixture.write(`file-${String(index).padStart(5, "0")}.txt`, `content-${index}\n`);
@@ -417,7 +421,9 @@ describe("clone initial-state fast path", () => {
     fixture.commit("synthetic scale");
     const server = await startGitServer(fixture.dir);
     const storage = new RecordingStorage();
-    const workspace = makeRuntime(storage);
+    const fallbackFactory: GitFactory = (binding) =>
+      createGit()({ ...binding, initialWorktree: undefined });
+    const workspace = makeRuntime(storage, fallbackFactory);
     const git = workspace.git;
     storage.resetCounters();
 
@@ -425,7 +431,7 @@ describe("clone initial-state fast path", () => {
       await git.clone({ url: server.url, dir: "/repo" });
 
       expect(count(workspace, "git_index")).toBe(24_252);
-      expect(storage.walkStatements).toBe(1);
+      expect(storage.walkStatements).toBe(3);
       expect(storage.maxBlobReadOids).toBe(1_000);
       expect(storage.inner.statementCount).toBeLessThan(1_000);
     } finally {

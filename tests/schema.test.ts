@@ -19,6 +19,7 @@ interface SchemaDefinition extends SchemaObject {
 
 const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_meta", "global"],
+  ["git_identity_control", "global"],
   ["git_repositories", "shared"],
   ["git_refs", "shared"],
   ["git_reflog_state", "shared"],
@@ -76,6 +77,7 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "index", name: "git_checkouts_primary" },
   { type: "table", name: "git_commits" },
   { type: "table", name: "git_config" },
+  { type: "table", name: "git_identity_control" },
   { type: "table", name: "git_index" },
   { type: "table", name: "git_index_dirty" },
   { type: "table", name: "git_index_state" },
@@ -124,7 +126,11 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
 
 const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] = [
   ["git_meta", ["key", "value"]],
-  ["git_repositories", ["id"]],
+  [
+    "git_identity_control",
+    ["singleton", "last_repo_id", "last_checkout_id", "last_clone_generation"],
+  ],
+  ["git_repositories", ["id", "lifecycle", "clone_generation", "clone_expires_ms"]],
   ["git_checkouts", ["id", "repo_id", "root", "head", "is_primary"]],
   ["git_refs", ["repo_id", "name", "target"]],
   ["git_reflog_state", ["repo_id", "next_ordinal"]],
@@ -482,6 +488,7 @@ describe("git schema", () => {
       }
     }
     expect(primaryKeyOf(db, "git_repositories")).toEqual(["id"]);
+    expect(primaryKeyOf(db, "git_identity_control")).toEqual(["singleton"]);
     expect(primaryKeyOf(db, "git_checkouts")).toEqual(["id"]);
     expect(primaryKeyOf(db, "git_index")).toEqual(["checkout_id", "path", "stage"]);
     expect(primaryKeyOf(db, "git_index_state")).toEqual(["checkout_id"]);

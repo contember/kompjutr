@@ -25,3 +25,4 @@ a commit message suffices.
 - [0009 — Split the shared Git store from checkouts](0009-split-shared-store-from-checkouts.md) — accepted (2026-08-26)
 - [0010 — Require valid UTF-8 Git paths](0010-require-valid-utf8-git-paths.md) — accepted (2026-08-26)
 - [0012 — Run maintenance as resumable generations](0012-run-maintenance-as-resumable-generations.md) — accepted (2026-08-27)
+- [0013 — Publish clones through provisional ownership](0013-publish-clones-through-provisional-ownership.md) — accepted (2026-08-28)
