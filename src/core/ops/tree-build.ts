@@ -21,6 +21,11 @@ import type { CommitTreeSnapshotResult } from "../sparse-workspace.js";
 import { comparePaths } from "../streams.js";
 
 export const MAX_TREE_BUILD_PATH_BYTES = 2_200;
+export const MAX_TREE_BUILD_LEAF_ENTRIES = 10_000;
+export const MAX_TREE_BUILD_TOTAL_PATH_BYTES = 4 * 1024 * 1024;
+export const MAX_TREE_BUILD_OBJECTS = 4_096;
+export const MAX_TREE_BUILD_SERIALIZED_BYTES = 16 * 1024 * 1024;
+export const TREE_BUILD_EXECUTION_MEMORY_BYTES = 24 * 1024 * 1024;
 
 const INDEX_DIRTY = 1;
 const MAX_SPARSE_TREE_PATHS = 1_000;
@@ -589,6 +594,7 @@ export function preflightTreeBuild(
         throw new CorruptError("tree-build index contains a file below another file");
       }
     }
+    if (!validOid(entry.oid)) throw new CorruptError("tree-build index oid is invalid");
 
     const segments = validatePath(entry.path);
     const depth = segments.length - 1;

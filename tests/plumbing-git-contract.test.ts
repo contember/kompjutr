@@ -72,6 +72,49 @@ describe("Git tree and commit plumbing contract", () => {
     }
   });
 
+  it("requires file objects while treating gitlinks as opaque commit ids", () => {
+    const fixture = new GitFixture().init();
+    try {
+      const scratchIndex = join(fixture.dir, "object-membership.index");
+      const environment = { GIT_INDEX_FILE: scratchIndex };
+      const missing = "f".repeat(40);
+      fixture.gitWithEnv(environment, "read-tree", "--empty");
+      fixture.gitWithEnv(
+        environment,
+        "update-index",
+        "--add",
+        "--info-only",
+        "--cacheinfo",
+        `100644,${missing},missing.txt`,
+      );
+      expect(() => fixture.gitWithEnv(environment, "write-tree")).toThrow();
+
+      fixture.gitWithEnv(environment, "read-tree", "--empty");
+      fixture.gitWithEnv(
+        environment,
+        "update-index",
+        "--add",
+        "--info-only",
+        "--cacheinfo",
+        `160000,${missing},vendor/module`,
+      );
+      expect(fixture.gitWithEnv(environment, "write-tree")).toMatch(/^[0-9a-f]{40}$/);
+
+      const existingTree = fixture.writeObject("tree", new Uint8Array(0));
+      fixture.gitWithEnv(environment, "read-tree", "--empty");
+      fixture.gitWithEnv(
+        environment,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        `100644,${existingTree},tree-as-file`,
+      );
+      expect(fixture.gitWithEnv(environment, "write-tree")).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      fixture.dispose();
+    }
+  });
+
   it("pins reset-with-update behavior for read-tree", () => {
     const fixture = new GitFixture().init();
     try {

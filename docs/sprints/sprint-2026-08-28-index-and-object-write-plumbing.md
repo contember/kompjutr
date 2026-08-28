@@ -247,3 +247,11 @@ git diff --check
   preflighted bulk removals. Independent review is clean, typecheck and Biome
   pass, and all 119 focused plumbing, staging, worktree, and sparse-checkout
   tests pass.
+- 2026-08-28: WU3 added transactional `writeTree` over either index store. A
+  first scan rejects conflicts, corrupt rows, missing non-gitlink objects, and
+  shared tree-build limits before reopening the index for the existing bounded
+  object encoder. Real Git probes confirm empty, mixed-mode, non-BMP, gitlink,
+  missing-object, and wrong-type-object behavior. The maximal admitted 4,096
+  tree-object shape remains below 1,000 statements; independent review is clean,
+  all 24 focused tests pass, and 126 commit/integration lifecycle tests remain
+  green.

@@ -8,8 +8,13 @@ import type { GitContext } from "../src/core/context.js";
 import { GitError } from "../src/core/errors.js";
 import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
-import { readTree } from "../src/core/ops/plumbing.js";
+import { readTree, writeTree } from "../src/core/ops/plumbing.js";
 import { add } from "../src/core/ops/staging.js";
+import {
+  MAX_TREE_BUILD_LEAF_ENTRIES,
+  MAX_TREE_BUILD_OBJECTS,
+  MAX_TREE_BUILD_TOTAL_PATH_BYTES,
+} from "../src/core/ops/tree-build.js";
 import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
@@ -181,7 +186,207 @@ function pageIndex(index: IndexStore, pageSize: number): IndexStore {
   };
 }
 
+function indexed(path: string, oid: string, mode = 0o100644, stage = 0): IndexEntry {
+  return {
+    path,
+    stage,
+    mode,
+    oid,
+    size: null,
+    mtime: null,
+    ino: null,
+    rev: null,
+  };
+}
+
+function readOnlyIndex(open: () => IterableIterator<IndexEntry>): IndexStore {
+  return {
+    indexScan() {
+      return open();
+    },
+    indexApply() {
+      throw new Error("read-only test index cannot mutate");
+    },
+    indexReplace() {
+      throw new Error("read-only test index cannot mutate");
+    },
+    hasConflicts() {
+      return false;
+    },
+  };
+}
+
 describe("tree and index write plumbing", () => {
+  it("matches Git write-tree for checkout, scratch, empty, mixed-mode, and non-BMP indexes", async () => {
+    const fixture = newFixture();
+    fixture
+      .write("plain.txt", "plain\n")
+      .write("emoji-😀.txt", "emoji\n")
+      .writeExecutable("bin/run", "#!/bin/sh\n")
+      .symlink("../plain.txt", "links/plain");
+    const base = fixture.commit("base");
+    const baseTree = fixture.git("rev-parse", `${base}^{tree}`);
+    const environment = { GIT_INDEX_FILE: join(fixture.dir, ".git", "tree.index") };
+    fixture.gitWithEnv(environment, "read-tree", base);
+    fixture.gitWithEnv(
+      environment,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `160000,${base},vendor/module`,
+    );
+    const expectedScratch = fixture.gitWithEnv(environment, "write-tree");
+    const expectedEmpty = fixture.writeObject("tree", new Uint8Array(0));
+    const workspace = makeRepo("/");
+    await importFixture(fixture, workspace.repo.checkout);
+    readTree(workspace.repo, workspace.worktree, { tree: base });
+    const beforeControl = controlState(workspace);
+    const beforeWorktree = worktreeState(workspace);
+
+    expect(writeTree(workspace.repo)).toBe(baseTree);
+    workspace.repo.store.withScratchIndex("write-tree", (scratch) => {
+      readTree(workspace.repo, workspace.worktree, { tree: base }, scratch);
+      scratch.indexApply((sink) => {
+        sink.put(indexed("vendor/module", base, 0o160000));
+      });
+      expect(writeTree(workspace.repo, scratch)).toBe(expectedScratch);
+      readTree(workspace.repo, workspace.worktree, { empty: true }, scratch);
+      expect(writeTree(workspace.repo, scratch)).toBe(expectedEmpty);
+    });
+
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual(beforeWorktree);
+  });
+
+  it("rejects every unmerged stage before writing a tree object", () => {
+    const workspace = makeRepo("/");
+    const ancestor = workspace.repo.store.write("blob", utf8.encode("ancestor\n"));
+    const ours = workspace.repo.store.write("blob", utf8.encode("ours\n"));
+    const theirs = workspace.repo.store.write("blob", utf8.encode("theirs\n"));
+    const beforeObjects = workspace.repo.store.objectCount();
+
+    expect(() =>
+      workspace.repo.store.withScratchIndex("unmerged-tree", (scratch) => {
+        scratch.indexReplace([
+          indexed("conflict.txt", ancestor, 0o100644, 1),
+          indexed("conflict.txt", ours, 0o100644, 2),
+          indexed("conflict.txt", theirs, 0o100644, 3),
+        ]);
+        writeTree(workspace.repo, scratch);
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EUNMERGED" }));
+
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    expect(workspace.database.db.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(
+      0,
+    );
+
+    let advancedPastConflict = false;
+    const conflictRows = function* (): Generator<IndexEntry> {
+      yield indexed("conflict.txt", ancestor, 0o100644, 1);
+      advancedPastConflict = true;
+      throw new Error("write-tree scanned past the first conflict");
+    };
+    expect(() => writeTree(workspace.repo, readOnlyIndex(conflictRows))).toThrowError(
+      expect.objectContaining({ code: "EUNMERGED" }),
+    );
+    expect(advancedPastConflict).toBe(false);
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+  });
+
+  it("rejects missing file objects while allowing gitlinks and existing wrong types", () => {
+    const workspace = makeRepo("/");
+    const missing = "f".repeat(40);
+    const beforeObjects = workspace.repo.store.objectCount();
+
+    expect(() =>
+      writeTree(
+        workspace.repo,
+        readOnlyIndex(() => [indexed("missing.txt", missing)].values()),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "ENOTFOUND" }));
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+
+    const gitlinkTree = writeTree(
+      workspace.repo,
+      readOnlyIndex(() => [indexed("vendor/module", missing, 0o160000)].values()),
+    );
+    expect(workspace.repo.resolveTreePath(gitlinkTree, "vendor/module")).toEqual({
+      mode: "160000",
+      name: "module",
+      oid: missing,
+    });
+
+    const existingTree = workspace.repo.store.write("tree", new Uint8Array(0));
+    const wrongTypeTree = writeTree(
+      workspace.repo,
+      readOnlyIndex(() => [indexed("tree-as-file", existingTree)].values()),
+    );
+    expect(workspace.repo.readTree(wrongTypeTree)).toEqual([
+      { mode: "100644", name: "tree-as-file", oid: existingTree },
+    ]);
+  });
+
+  it("preflights corrupt and first-over-limit indexes without partial objects", () => {
+    const workspace = makeRepo("/");
+    const blob = workspace.repo.store.write("blob", new Uint8Array(0));
+    const suffix = "x".repeat(500);
+    const cases: Array<() => IterableIterator<IndexEntry>> = [
+      () => [indexed("b", blob), indexed("a", blob)].values(),
+      () => [indexed("bad-mode", blob, 0o100600)].values(),
+      () => [indexed("bad-oid", "z".repeat(40))].values(),
+      function* () {
+        for (let index = 0; index <= MAX_TREE_BUILD_LEAF_ENTRIES; index++) {
+          yield indexed(`f${index.toString().padStart(5, "0")}`, blob);
+        }
+      },
+      function* () {
+        const count = Math.ceil(MAX_TREE_BUILD_TOTAL_PATH_BYTES / (suffix.length + 7)) + 1;
+        for (let index = 0; index < count; index++) {
+          yield indexed(`${index.toString().padStart(6, "0")}-${suffix}`, blob);
+        }
+      },
+      function* () {
+        for (let index = 0; index < MAX_TREE_BUILD_OBJECTS; index++) {
+          const ordinal = index.toString().padStart(4, "0");
+          yield indexed(`d${ordinal}/f${ordinal}`, blob);
+        }
+      },
+    ];
+
+    for (const open of cases) {
+      const beforeObjects = workspace.repo.store.objectCount();
+      const beforeStatements = workspace.storage.statementCount;
+      expect(() => writeTree(workspace.repo, readOnlyIndex(open))).toThrow();
+      expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+      expect(workspace.storage.statementCount - beforeStatements).toBeLessThan(1_000);
+    }
+  });
+
+  it("materializes the maximal admitted tree-object shape below the SQL gate", () => {
+    const workspace = makeRepo("/");
+    const blob = workspace.repo.store.write("blob", new Uint8Array(0));
+    const suffix = "x".repeat(900);
+    const rows = function* (): Generator<IndexEntry> {
+      for (let index = 0; index < MAX_TREE_BUILD_OBJECTS - 1; index++) {
+        const ordinal = index.toString().padStart(4, "0");
+        yield indexed(`d${ordinal}/f${ordinal}-${suffix}`, blob);
+      }
+    };
+    const beforeControl = controlState(workspace);
+    const beforeObjects = workspace.repo.store.objectCount();
+    const beforeStatements = workspace.storage.statementCount;
+
+    const oid = writeTree(workspace.repo, readOnlyIndex(rows));
+    const statements = workspace.storage.statementCount - beforeStatements;
+
+    expect(workspace.repo.store.read(oid)?.type).toBe("tree");
+    expect(workspace.repo.store.objectCount() - beforeObjects).toBe(MAX_TREE_BUILD_OBJECTS);
+    expect(statements).toBeLessThan(1_000);
+    expect(controlState(workspace)).toEqual(beforeControl);
+    expect(worktreeState(workspace)).toEqual([]);
+  });
+
   it("matches a Git alternate-index snapshot without changing checkout state", async () => {
     const fixture = newFixture();
     fixture

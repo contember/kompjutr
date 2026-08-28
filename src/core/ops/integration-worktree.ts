@@ -11,20 +11,28 @@ import type { ProjectedMergeEntry } from "./merge-projection.js";
 import { projectMergePlan } from "./merge-projection.js";
 import type { MergeTouchedPath } from "./merge-state.js";
 import { checkoutBlockers, checkoutBlockersAgainst } from "./refs.js";
-import { preflightTreeBuild, type TreeBuildPreflightStats } from "./tree-build.js";
+import {
+  MAX_TREE_BUILD_LEAF_ENTRIES,
+  MAX_TREE_BUILD_OBJECTS,
+  MAX_TREE_BUILD_SERIALIZED_BYTES,
+  MAX_TREE_BUILD_TOTAL_PATH_BYTES,
+  preflightTreeBuild,
+  TREE_BUILD_EXECUTION_MEMORY_BYTES,
+  type TreeBuildPreflightStats,
+} from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
 import { type DirtyPathLimits, dirtyPathStream, walkWorktreeEntriesStream } from "./worktree-io.js";
 
-export const MAX_INTEGRATION_INDEX_ENTRIES = 10_000;
-export const MAX_INTEGRATION_INDEX_PATH_BYTES = 4 * 1024 * 1024;
-export const MAX_INTEGRATION_TREE_OBJECTS = 4_096;
-export const MAX_INTEGRATION_SERIALIZED_TREE_BYTES = 16 * 1024 * 1024;
+export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
+export const MAX_INTEGRATION_INDEX_PATH_BYTES = MAX_TREE_BUILD_TOTAL_PATH_BYTES;
+export const MAX_INTEGRATION_TREE_OBJECTS = MAX_TREE_BUILD_OBJECTS;
+export const MAX_INTEGRATION_SERIALIZED_TREE_BYTES = MAX_TREE_BUILD_SERIALIZED_BYTES;
 export const INTEGRATION_INDEX_SQL_STATEMENTS = 48;
 export const INTEGRATION_GUARD_SQL_STATEMENTS = 300;
 export const INTEGRATION_COLLISION_SQL_STATEMENTS = 160;
 const MAX_REPOSITORY_ROWS = 50_000;
 const MAX_GUARD_HASH_BYTES = 32 * 1024 * 1024;
-export const INTEGRATION_EXECUTION_HEADROOM_BYTES = 24 * 1024 * 1024;
+export const INTEGRATION_EXECUTION_HEADROOM_BYTES = TREE_BUILD_EXECUTION_MEMORY_BYTES;
 const MAX_RELOCATION_COLLISIONS = 1_000;
 
 function dirtyPathLimits(): DirtyPathLimits {

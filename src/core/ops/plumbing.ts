@@ -4,16 +4,26 @@
 import type { IndexEntry, IndexStore } from "../../sqlite/store.js";
 import { utf8 } from "../bytes.js";
 import { type GitContext, openRepository } from "../context.js";
-import { GitError } from "../errors.js";
+import { GitError, ObjectNotFoundError } from "../errors.js";
 import { hashObject as hashRaw } from "../objects.js";
 import type { Repository } from "../repository.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree } from "./checkout.js";
 import { type CatFileResult, catFile as readObject, treeOf } from "./reads.js";
 import { operationRefLogMetadata } from "./ref-log.js";
+import {
+  buildTreeInBatch,
+  MAX_TREE_BUILD_LEAF_ENTRIES,
+  MAX_TREE_BUILD_OBJECTS,
+  MAX_TREE_BUILD_SERIALIZED_BYTES,
+  MAX_TREE_BUILD_TOTAL_PATH_BYTES,
+  preflightTreeBuild,
+  TREE_BUILD_EXECUTION_MEMORY_BYTES,
+} from "./tree-build.js";
 
 const READ_TREE_MAX_ROWS_PER_STREAM = 50_000;
 const READ_TREE_MAX_WRITE_BYTES = 64 * 1024 * 1024;
+const WRITE_TREE_INDEX_PAGE = 2_048;
 
 export interface HashObjectOptions {
   content: Uint8Array | string;
@@ -104,6 +114,44 @@ function* boundedReadTreeIndex(repo: Repository, treeOid: string | null): Genera
     rows++;
     yield entry;
   }
+}
+
+/** Materialize the selected index as trees without changing refs or worktree state. */
+export function writeTree(repo: Repository, index: IndexStore = repo.checkout): string {
+  return repo.store.runScratchAwareOperation(() =>
+    repo.store.db.transactionSync(() => {
+      const reservation = repo.store.reserveMemory();
+      try {
+        reservation.set("tree", TREE_BUILD_EXECUTION_MEMORY_BYTES);
+        if (index.hasConflicts()) {
+          throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
+        }
+        const requiredObjects = new Set<string>();
+        const entries = function* (): Generator<IndexEntry> {
+          for (const entry of index.indexScan({ pageSize: WRITE_TREE_INDEX_PAGE })) {
+            if (entry.stage !== 0) {
+              throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
+            }
+            if (entry.mode !== 0o160000) requiredObjects.add(entry.oid);
+            yield entry;
+          }
+        };
+        preflightTreeBuild(entries(), {
+          maxLeafEntries: MAX_TREE_BUILD_LEAF_ENTRIES,
+          maxTotalPathBytes: MAX_TREE_BUILD_TOTAL_PATH_BYTES,
+          maxTreeObjects: MAX_TREE_BUILD_OBJECTS,
+          maxSerializedTreeBytes: MAX_TREE_BUILD_SERIALIZED_BYTES,
+        });
+        const missing = repo.store.missing(requiredObjects);
+        if (missing[0] !== undefined) throw new ObjectNotFoundError(missing[0]);
+        return repo.store.writeObjects((batch) =>
+          buildTreeInBatch(batch, index.indexScan({ pageSize: WRITE_TREE_INDEX_PAGE })),
+        );
+      } finally {
+        reservation.dispose();
+      }
+    }),
+  );
 }
 
 export interface UpdateRefOptions {
