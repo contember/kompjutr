@@ -1470,17 +1470,21 @@ export async function clone(context: GitContext, options: CloneOptions): Promise
     repo.store.configSet(`remote.${remote}.fetch`, `+refs/heads/*:refs/remotes/${remote}/*`);
     heartbeat();
 
-    const depth = options.depth ?? 1;
+    const depth =
+      options.depth !== undefined && options.depth > 0 && Number.isFinite(options.depth)
+        ? options.depth
+        : undefined;
+    const singleBranch = options.singleBranch ?? depth !== undefined;
     const result = await fetchInto(
       context,
       repo,
       {
         remote,
         url,
-        singleBranch: options.singleBranch ?? true,
-        tags: !(options.noTags ?? true),
+        singleBranch,
+        ...(options.noTags === true ? { tags: false } : singleBranch ? {} : { tags: true }),
         ...(options.ref === undefined ? {} : { ref: options.ref }),
-        ...(depth > 0 && Number.isFinite(depth) ? { depth } : {}),
+        ...(depth === undefined ? {} : { depth }),
         ...(options.headers === undefined ? {} : { headers: options.headers }),
         ...(options.onAuth === undefined ? {} : { onAuth: options.onAuth }),
         ...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),

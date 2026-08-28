@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import { openRepository } from "../src/core/context.js";
 import { GitError } from "../src/core/errors.js";
+import { divergence, mergeBase } from "../src/core/ops/merge-base.js";
 import { clone, fetchInto, remoteUrlFor } from "../src/core/ops/network.js";
 import { log, lsTree } from "../src/core/ops/reads.js";
 import {
@@ -94,6 +95,49 @@ function makeFixture(): { fixture: GitFixture; first: string; head: string } {
   fixture.remove("deep/nested/note.txt");
   const head = fixture.commit("second");
   return { fixture, first, head };
+}
+
+function makeCloneSelectionFixture(): {
+  fixture: GitFixture;
+  base: string;
+  detached: string;
+  mainTip: string;
+  topicTip: string;
+} {
+  const fixture = new GitFixture().init();
+  fixture.write("shared.txt", "base\n");
+  const base = fixture.commit("base");
+  fixture.git("branch", "topic");
+  fixture.write("main.txt", "main one\n");
+  fixture.commit("main one");
+  fixture.write("main.txt", "main two\n");
+  const mainTip = fixture.commit("main two");
+  fixture.git("tag", "-a", "main-v1", "-m", "main release", mainTip);
+  fixture.git("checkout", "-q", "topic");
+  fixture.write("topic.txt", "topic\n");
+  const topicTip = fixture.commit("topic");
+  fixture.git("tag", "topic-v1", topicTip);
+  const detached = fixture.git(
+    "commit-tree",
+    fixture.git("rev-parse", "HEAD^{tree}"),
+    "-m",
+    "detached",
+  );
+  fixture.git("tag", "detached", detached);
+  fixture.git("checkout", "-q", "main");
+  return { fixture, base, detached, mainTip, topicTip };
+}
+
+function outputLines(output: string): string[] {
+  return output === "" ? [] : output.split("\n");
+}
+
+function resolvedRefLines(repo: Repository, prefix: string): string[] {
+  return repo.store.listRefs(prefix).map((ref) => {
+    const oid = repo.resolveRef(ref.name);
+    if (oid === null) throw new Error(`could not resolve ${ref.name}`);
+    return `${ref.name} ${oid}`;
+  });
 }
 
 const execFileAsync = promisify(execFile);
@@ -256,7 +300,7 @@ describe("clone", () => {
     const reference = new GitFixture();
     const workspace = makeWorkspace();
     try {
-      await nativeGit(reference.dir, "clone", "--quiet", "--depth", "1", server.url, ".");
+      await nativeGit(reference.dir, "clone", "--quiet", server.url, ".");
       await clone(workspace.context, { url: server.url, dir: "/work" });
 
       const expected = nativeTree(reference.dir);
@@ -434,7 +478,7 @@ describe("clone", () => {
   });
 
   it("reads back what the fixture's git reports", async () => {
-    const { fixture, head } = makeFixture();
+    const { fixture, first, head } = makeFixture();
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace();
     try {
@@ -446,7 +490,7 @@ describe("clone", () => {
         `refs/heads/${fixture.git("rev-parse", "--abbrev-ref", "HEAD")}`,
       );
       const entries = log(repo, { ref: "HEAD" });
-      expect(entries.map((entry) => entry.oid)).toEqual([head]);
+      expect(entries.map((entry) => entry.oid)).toEqual([head, first]);
       expect(entries[0]?.message.trim()).toBe(fixture.git("log", "-1", "--format=%B").trim());
 
       const listed = lsTree(repo, "HEAD").map(
@@ -467,19 +511,147 @@ describe("clone", () => {
     }
   });
 
-  it("records the shallow boundary and stops the walk there", async () => {
-    const { fixture, first, head } = makeFixture();
+  it("makes an explicit depth 1 clone shallow and single-branch like Git", async () => {
+    const { fixture, base, mainTip } = makeCloneSelectionFixture();
     const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
     const workspace = makeWorkspace();
     try {
+      await nativeGit(reference.dir, "clone", "--quiet", "--depth", "1", server.url, ".");
       await clone(workspace.context, { url: server.url, dir: "/work", depth: 1 });
       const repo = openRepository(workspace.context, "/work");
 
-      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([{ oid: head }]);
-      expect([...repo.walk(repo.revParse("HEAD"))].map((entry) => entry.oid)).toEqual([head]);
-      expect(repo.has(first)).toBe(false);
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/",
+          ),
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/tags/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/tags/",
+          ),
+        ),
+      );
+      expect(log(repo, { ref: "HEAD" }).map((entry) => entry.oid)).toEqual(
+        outputLines(await nativeGit(reference.dir, "rev-list", "HEAD")),
+      );
+      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([{ oid: mainTip }]);
+      expect(repo.has(base)).toBe(false);
     } finally {
       await server.close();
+      reference.dispose();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps depth 1 on all branches when singleBranch is explicitly false", async () => {
+    const { fixture, base, detached, mainTip, topicTip } = makeCloneSelectionFixture();
+    const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
+    const workspace = makeWorkspace();
+    try {
+      await nativeGit(
+        reference.dir,
+        "clone",
+        "--quiet",
+        "--depth",
+        "1",
+        "--no-single-branch",
+        server.url,
+        ".",
+      );
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 1,
+        singleBranch: false,
+      });
+      const repo = openRepository(workspace.context, "/work");
+
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/",
+          ),
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/tags/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/tags/",
+          ),
+        ),
+      );
+      for (const ref of ["HEAD", "refs/remotes/origin/topic", "refs/tags/detached"]) {
+        expect(log(repo, { ref }).map((entry) => entry.oid)).toEqual(
+          outputLines(await nativeGit(reference.dir, "rev-list", ref)),
+        );
+      }
+      const shallow = tableRows(workspace, "SELECT oid FROM git_shallow");
+      expect(shallow).toHaveLength(3);
+      expect(shallow).toEqual(
+        expect.arrayContaining([{ oid: detached }, { oid: mainTip }, { oid: topicTip }]),
+      );
+      expect(repo.has(base)).toBe(false);
+    } finally {
+      await server.close();
+      reference.dispose();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps noTags independent on a depth 1 clone", async () => {
+    const { fixture, mainTip } = makeCloneSelectionFixture();
+    const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
+    const workspace = makeWorkspace();
+    try {
+      await nativeGit(
+        reference.dir,
+        "clone",
+        "--quiet",
+        "--depth",
+        "1",
+        "--no-tags",
+        server.url,
+        ".",
+      );
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 1, noTags: true });
+      const repo = openRepository(workspace.context, "/work");
+
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/",
+          ),
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/tags/")).toEqual([]);
+      expect(log(repo, { ref: "HEAD" }).map((entry) => entry.oid)).toEqual(
+        outputLines(await nativeGit(reference.dir, "rev-list", "HEAD")),
+      );
+      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([{ oid: mainTip }]);
+    } finally {
+      await server.close();
+      reference.dispose();
       fixture.dispose();
     }
   });
@@ -530,26 +702,195 @@ describe("clone", () => {
     }
   }, 180_000);
 
-  it("defaults to depth 1, a single branch and no tags", async () => {
-    const { fixture, head } = makeFixture();
-    fixture.git("branch", "topic");
-    fixture.git("tag", "v1");
+  it("defaults to complete history, all branches and normal tag following", async () => {
+    const { fixture, base } = makeCloneSelectionFixture();
     const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
     const workspace = makeWorkspace();
     try {
+      await nativeGit(reference.dir, "clone", "--quiet", server.url, ".");
       await clone(workspace.context, { url: server.url, dir: "/work" });
       const repo = openRepository(workspace.context, "/work");
 
-      expect(repo.store.listRefs("refs/remotes/").map((ref) => ref.name)).toEqual([
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-      ]);
-      expect(repo.tags()).toEqual([]);
-      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([{ oid: head }]);
+      const nativeRemoteRefs = outputLines(
+        await nativeGit(
+          reference.dir,
+          "for-each-ref",
+          "--format=%(refname) %(objectname)",
+          "refs/remotes/",
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(nativeRemoteRefs);
+      const nativeTags = outputLines(
+        await nativeGit(
+          reference.dir,
+          "for-each-ref",
+          "--format=%(refname) %(objectname)",
+          "refs/tags/",
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/tags/")).toEqual(nativeTags);
+
+      expect(log(repo, { ref: "HEAD" }).map((entry) => entry.oid)).toEqual(
+        outputLines(await nativeGit(reference.dir, "rev-list", "HEAD")),
+      );
+      expect(log(repo, { ref: "refs/remotes/origin/topic" }).map((entry) => entry.oid)).toEqual(
+        outputLines(await nativeGit(reference.dir, "rev-list", "refs/remotes/origin/topic")),
+      );
+      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([]);
+
+      const nativeBases = outputLines(
+        await nativeGit(reference.dir, "merge-base", "--all", "HEAD", "refs/remotes/origin/topic"),
+      );
+      expect(nativeBases).toEqual([base]);
+      expect(mergeBase(repo, { current: "HEAD", incoming: "refs/remotes/origin/topic" })).toEqual({
+        kind: "divergent",
+        bases: nativeBases,
+      });
+      const nativeCounts = (
+        await nativeGit(
+          reference.dir,
+          "rev-list",
+          "--left-right",
+          "--count",
+          "HEAD...refs/remotes/origin/topic",
+        )
+      )
+        .split(/\s+/)
+        .map(Number);
+      const ahead = nativeCounts[0];
+      const behind = nativeCounts[1];
+      if (ahead === undefined || behind === undefined) {
+        throw new Error("git did not report divergence counts");
+      }
+      expect(divergence(repo, { current: "HEAD", upstream: "refs/remotes/origin/topic" })).toEqual({
+        relationship: "diverged",
+        ahead,
+        behind,
+      });
       expect(remoteUrlFor(repo, "origin")).toBe(server.url);
       expect(repo.store.configGet("branch.main.merge")).toBe("refs/heads/main");
     } finally {
       await server.close();
+      reference.dispose();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps explicit singleBranch true limited to the remote HEAD branch", async () => {
+    const { fixture } = makeCloneSelectionFixture();
+    const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
+    const workspace = makeWorkspace();
+    try {
+      await nativeGit(reference.dir, "clone", "--quiet", "--single-branch", server.url, ".");
+      await clone(workspace.context, { url: server.url, dir: "/work", singleBranch: true });
+      const repo = openRepository(workspace.context, "/work");
+
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/",
+          ),
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/tags/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/tags/",
+          ),
+        ),
+      );
+      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([]);
+    } finally {
+      await server.close();
+      reference.dispose();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps explicit noTags false within a single branch's reachable tags", async () => {
+    const { fixture } = makeCloneSelectionFixture();
+    const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
+    const workspace = makeWorkspace();
+    try {
+      await nativeGit(
+        reference.dir,
+        "clone",
+        "--quiet",
+        "--single-branch",
+        "--tags",
+        server.url,
+        ".",
+      );
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        singleBranch: true,
+        noTags: false,
+      });
+      const repo = openRepository(workspace.context, "/work");
+
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/",
+          ),
+        ),
+      );
+      expect(resolvedRefLines(repo, "refs/tags/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/tags/",
+          ),
+        ),
+      );
+      expect(repo.tags()).toEqual(["main-v1"]);
+    } finally {
+      await server.close();
+      reference.dispose();
+      fixture.dispose();
+    }
+  });
+
+  it("keeps explicit noTags true tagless while fetching all branches", async () => {
+    const { fixture } = makeCloneSelectionFixture();
+    const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
+    const workspace = makeWorkspace();
+    try {
+      await nativeGit(reference.dir, "clone", "--quiet", "--no-tags", server.url, ".");
+      await clone(workspace.context, { url: server.url, dir: "/work", noTags: true });
+      const repo = openRepository(workspace.context, "/work");
+
+      expect(resolvedRefLines(repo, "refs/remotes/")).toEqual(
+        outputLines(
+          await nativeGit(
+            reference.dir,
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/",
+          ),
+        ),
+      );
+      expect(repo.tags()).toEqual([]);
+      expect(tableRows(workspace, "SELECT oid FROM git_shallow")).toEqual([]);
+    } finally {
+      await server.close();
+      reference.dispose();
       fixture.dispose();
     }
   });
@@ -1118,7 +1459,7 @@ describe("fetch", () => {
     const server = await startGitServer(fixture.dir);
     const workspace = makeWorkspace({ startTime: REFLOG_TIME, now: () => REFLOG_TIME });
     try {
-      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0 });
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 0, noTags: true });
       const repo = openRepository(workspace.context, "/work");
       await fetchInto(workspace.context, repo, {
         depth: 0,

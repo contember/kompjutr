@@ -26,3 +26,4 @@ a commit message suffices.
 - [0010 — Require valid UTF-8 Git paths](0010-require-valid-utf8-git-paths.md) — accepted (2026-08-26)
 - [0012 — Run maintenance as resumable generations](0012-run-maintenance-as-resumable-generations.md) — accepted (2026-08-27)
 - [0013 — Publish clones through provisional ownership](0013-publish-clones-through-provisional-ownership.md) — accepted (2026-08-28)
+- [0014 — Make an optionless clone complete](0014-default-clone-is-complete.md) — accepted (2026-08-28)

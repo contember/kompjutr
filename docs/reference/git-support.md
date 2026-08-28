@@ -79,9 +79,9 @@ native and Computer surfaces use this database-only creation path.
 | Git | kompjutr | |
 |---|---|---|
 | `<url>` | `url` | ★ ✔ `http://` and `https://` only — `ssh://`, `git://` and local paths fail with `EURLSCHEME` |
-| `--depth <n>` | `depth` | ~ **defaults to `1`**; pass `depth: 0` for a full clone |
-| `--single-branch` | `singleBranch` | ~ defaults to `true` |
-| `--no-tags` | `noTags` | ~ defaults to `true` |
+| `--depth <n>` | `depth` | ✔ omitted or `0` means complete history; a positive finite value is shallow and implies `singleBranch: true` unless explicitly overridden |
+| `--single-branch` / `--no-single-branch` | `singleBranch` | ✔ complete clones default to all branches; a positive `depth` defaults to one branch |
+| `--no-tags` / `--tags` | `noTags` | ✔ `true` suppresses tags; omitted or `false` uses Git clone coverage — complete for all branches, reachable auto-follow for one branch |
 | `--branch <ref>` | `ref` | ★ ✔ |
 | `--origin <name>` | `remote` (default `origin`) | ✔ |
 | — | `paths` | ✔ check out only these paths (kompjutr extension) |
