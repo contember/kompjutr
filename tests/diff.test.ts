@@ -373,6 +373,31 @@ describe("diff", () => {
     );
   });
 
+  it("preserves tree-ish tag peeling and blob endpoint errors", async () => {
+    const pair = await open((fixture) => {
+      fixture.write("a.txt", "first\n");
+      fixture.commit("first");
+      fixture.write("a.txt", "second\n");
+      fixture.commit("second");
+      fixture.git("tag", "-a", "commit-tag", "-m", "commit tag", "HEAD");
+      fixture.git("tag", "-a", "tree-tag", "-m", "tree tag", "HEAD^{tree}");
+    });
+
+    for (const endpoint of ["commit-tag", "commit-tag^{tag}", "tree-tag"]) {
+      expect(
+        diff(pair.workspace.repo, pair.workspace.worktree, { ref: "HEAD~1", to: endpoint }),
+        endpoint,
+      ).toBe(gitDiff(pair, "HEAD~1", endpoint));
+    }
+
+    const blob = pair.fixture.git("rev-parse", "HEAD:a.txt");
+    for (const endpoint of [blob, `${blob}^{blob}`]) {
+      expect(() =>
+        diff(pair.workspace.repo, pair.workspace.worktree, { ref: "HEAD~1", to: endpoint }),
+      ).toThrowError(expect.objectContaining({ code: "ENOTFOUND" }));
+    }
+  });
+
   it("matches git diff HEAD for a staged addition", async () => {
     const pair = await open((fixture) => {
       fixture.write("a.txt", "a\n");

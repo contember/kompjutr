@@ -80,6 +80,15 @@ interface RevisionState {
   oid: string;
   /** Stored metadata or a previously-read object promises this oid exists. */
   promised: boolean;
+  /** Authenticated metadata retained when payload bytes are unnecessary. */
+  type?: ObjectType;
+  /** One authenticated current object avoids repeating a suffix read. */
+  object?: RawObject;
+}
+
+interface RevisionStateResolution {
+  state: RevisionState;
+  mode?: string;
 }
 
 type RevisionSuffix =
@@ -367,6 +376,41 @@ export class Repository {
   }
 
   #tryResolveRevision(expression: string): RevisionResolution | undefined {
+    const resolved = this.#tryResolveRevisionState(expression);
+    if (resolved === undefined) return undefined;
+    return resolved.mode === undefined
+      ? { oid: resolved.state.oid }
+      : { oid: resolved.state.oid, mode: resolved.mode };
+  }
+
+  /** Resolve one tree-ish without repeating suffix authentication in its caller. */
+  resolveTreeRevision(expression: string): string {
+    const resolved = this.#tryResolveRevisionState(expression);
+    if (resolved === undefined) throw new RefNotFoundError(expression);
+    const state = resolved.state;
+    let type =
+      resolved.mode === undefined ? (state.object?.type ?? state.type) : typeForMode(resolved.mode);
+    if (type === undefined) {
+      const metadata = this.store.typeAndSize(state.oid);
+      if (metadata === null) throw new ObjectNotFoundError(state.oid);
+      type = metadata.type;
+    }
+    if (type === "tree") return state.oid;
+    if (type === "commit") {
+      return state.object === undefined
+        ? this.readCommit(state.oid).tree
+        : parseCommit(state.object.data).tree;
+    }
+    if (type === "tag") {
+      const peeled = this.peel(state.oid, "commit");
+      const peeledType = this.typeOf(peeled);
+      if (peeledType === "tree") return peeled;
+      if (peeledType === "commit") return this.readCommit(peeled).tree;
+    }
+    throw new ObjectNotFoundError(state.oid);
+  }
+
+  #tryResolveRevisionState(expression: string): RevisionStateResolution | undefined {
     if (expression.length > MAX_REVISION_EXPRESSION_UNITS) {
       throw new GitError("E2BIG", "revision expression exceeds 1024 UTF-16 code units");
     }
@@ -421,10 +465,12 @@ export class Repository {
     }
 
     if (path !== undefined) return this.#resolveRevisionPath(state, path, expression);
-    if (state.promised) {
-      if (this.store.typeAndSize(state.oid) === null) throw new ObjectNotFoundError(state.oid);
+    if (state.promised && state.object === undefined) {
+      const metadata = this.store.typeAndSize(state.oid);
+      if (metadata === null) throw new ObjectNotFoundError(state.oid);
+      state = { ...state, type: metadata.type };
     }
-    return { oid: state.oid };
+    return { state };
   }
 
   #parseRevisionSuffix(suffix: string, expression: string): RevisionSuffix[] {
@@ -492,10 +538,8 @@ export class Repository {
       if (entry?.newOid === undefined || entry.newOid === null) return undefined;
       return { oid: entry.newOid, promised: true };
     }
-    if (this.expandRef(base) !== null) {
-      const oid = this.resolveRef(base);
-      return oid === null ? undefined : { oid, promised: true };
-    }
+    const oid = this.resolveRef(base);
+    if (oid !== null) return { oid, promised: true };
     if (isOid(base)) return { oid: base, promised: false };
     if (isAbbreviatedOid(base)) {
       const resolved = this.store.resolvePrefix(base);
@@ -516,14 +560,14 @@ export class Repository {
     if (object.type !== "commit") throw new CorruptError(`${commitState.oid} is not a commit`);
     const parent = parseCommit(object.data).parent[which - 1];
     if (parent === undefined) throw new RefNotFoundError(expression);
-    const parentState = { oid: parent, promised: true };
+    const parentState: RevisionState = { oid: parent, promised: true };
     const parentObject = this.#readRevisionObject(parentState);
     if (parentObject === undefined) throw new ObjectNotFoundError(parent);
     if (parentObject.type !== "commit") {
       throw new CorruptError(`parent ${parent} is a ${parentObject.type}, not a commit`);
     }
     parseCommit(parentObject.data);
-    return parentState;
+    return { ...parentState, object: parentObject };
   }
 
   #peelRevision(
@@ -540,18 +584,18 @@ export class Repository {
         throw new CorruptError(`tag target ${state.oid} is a ${object.type}, not a ${expected}`);
       }
       this.#validateRevisionObject(object);
-      if (want === null && object.type !== "tag") return state;
-      if (object.type === want) return state;
+      if (want === null && object.type !== "tag") return { ...state, object };
+      if (object.type === want) return { ...state, object };
       if (want === "tree" && object.type === "commit") {
         const tree = parseCommit(object.data).tree;
-        const treeState = { oid: tree, promised: true };
+        const treeState: RevisionState = { oid: tree, promised: true };
         const treeObject = this.#readRevisionObject(treeState);
         if (treeObject === undefined) throw new ObjectNotFoundError(tree);
         if (treeObject.type !== "tree") {
           throw new CorruptError(`commit tree ${tree} is a ${treeObject.type}, not a tree`);
         }
         parseTree(treeObject.data);
-        return treeState;
+        return { ...treeState, object: treeObject };
       }
       if (object.type !== "tag") throw new RefNotFoundError(expression);
       const tag = parseTag(object.data);
@@ -565,10 +609,10 @@ export class Repository {
     state: RevisionState,
     path: string,
     expression: string,
-  ): RevisionResolution | undefined {
+  ): RevisionStateResolution | undefined {
     const treeState = this.#peelRevision(state, "tree", expression);
     if (treeState === undefined) return undefined;
-    if (path === "") return { oid: treeState.oid, mode: "40000" };
+    if (path === "") return { state: treeState, mode: "40000" };
     const entry = this.resolveTreePath(treeState.oid, path);
     if (entry === null) return undefined;
     const object = this.#readRevisionObject({ oid: entry.oid, promised: true });
@@ -578,10 +622,14 @@ export class Repository {
       throw new CorruptError(`tree entry ${entry.oid} is a ${object.type}, not a ${expected}`);
     }
     this.#validateRevisionObject(object);
-    return { oid: entry.oid, mode: entry.mode };
+    return {
+      state: { oid: entry.oid, promised: true, object },
+      mode: entry.mode,
+    };
   }
 
   #readRevisionObject(state: RevisionState): RawObject | undefined {
+    if (state.object !== undefined) return state.object;
     const object = this.store.read(state.oid);
     if (object !== null) return object;
     if (state.promised) throw new ObjectNotFoundError(state.oid);

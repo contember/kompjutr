@@ -25,7 +25,6 @@ import {
   type WorkingCandidate,
 } from "./diff-internal.js";
 import type { DiffSummaryEntry } from "./kinds.js";
-import { treeOf } from "./reads.js";
 import {
   type ExactRename,
   type ExactRenameClassification,
@@ -280,7 +279,7 @@ function boundedSparsePendingChanges(
 ): PendingChange[] | null {
   const fromTreeOid = resolveFrom(repo, options);
   if (options.to !== undefined) {
-    return sparseCommitPair(repo, fromTreeOid, treeOf(repo, repo.revParse(options.to)), options);
+    return sparseCommitPair(repo, fromTreeOid, repo.resolveTreeRevision(options.to), options);
   }
   if (sparseWorkspace === undefined) return null;
   const candidates = sparseWorkingCandidates(repo, sparseWorkspace, fromTreeOid, options);
@@ -298,7 +297,7 @@ function* pendingChanges(
   const byPath = { left: (entry: TargetEntry) => entry.path };
 
   if (options.to !== undefined) {
-    const toTreeOid = treeOf(repo, repo.revParse(options.to));
+    const toTreeOid = repo.resolveTreeRevision(options.to);
     const from = treeStream(repo, fromTreeOid);
     const to = treeStream(repo, toTreeOid);
     for (const row of joinSorted(from, to, { ...byPath, right: (entry) => entry.path })) {
@@ -616,5 +615,5 @@ function endpointBytes(endpoint: Endpoint): Uint8Array {
 /** The "from" tree: an explicit ref, or HEAD — which may be unborn. */
 function resolveFrom(repo: Repository, options: DiffOptions): string | null {
   if (options.ref === undefined) return repo.headTree();
-  return treeOf(repo, repo.revParse(options.ref));
+  return repo.resolveTreeRevision(options.ref);
 }
