@@ -178,11 +178,9 @@ missing contract found during planning.
 
 ## Out of scope (explicit)
 
-- Patch production and application remain
-  [`44`](../backlog/44-patch-interchange.md).
-- Extended revision syntax remains
-  [`46`](../backlog/46-rev-parse-revision-syntax.md); these operations accept
-  only revisions already supported by `Repository.revParse()`.
+- Patch production and application remained in then-open backlog 44.
+- Extended revision syntax remained in then-open backlog 46; these operations
+  accepted only revisions supported by `Repository.revParse()` at the time.
 - General branch/ref plumbing remains
   [`39`](../backlog/39-plumbing-read-surface.md). `commitTree` never updates a
   ref; callers use the existing guarded ref API separately.

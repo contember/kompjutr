@@ -750,7 +750,7 @@ the agent makes. The consumer adapter is outside this package.
 | `ls-tree -r <ref>` | recurse with `lsTree()`, or read the tree through `lsFiles({ ref })` |
 | `rev-parse --verify --quiet <rev>` / `cat-file -e <rev>:<path>` | `tryRevParse()` returns the oid or `undefined` for semantic absence |
 | `GIT_INDEX_FILE=<throwaway> read-tree` / `add -A` / `write-tree` / `commit-tree` | one synchronous `withScratchIndex()` callback; it returns the detached snapshot OID without changing the checkout index, worktree, HEAD, refs, reflogs, tracker, operation journal, or maintenance state |
-| `diff --binary --full-index <snap>^ <snap>` then `apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` while the snapshot and new tip share one object store; textual patch interchange remains deferred ([backlog 44](../backlog/44-patch-interchange.md)) |
+| `diff --binary --full-index <snap>^ <snap>` then `apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` while the snapshot and new tip share one object store; no textual patch crosses the process boundary |
 | `update-ref <ref> <new> <old>` / guarded `-d` | `updateRef({ ref, value, expected })` / `updateRef({ ref, delete: true, expected })`; a stale direct target throws `ESTALEHEAD` |
 | `reset --hard FETCH_HEAD` | `reset({ ref: fetch().fetchHead, hard: true })` |
 | `branch -m main` | `branch()` then `branchDelete()` |
@@ -763,8 +763,8 @@ the agent makes. The consumer adapter is outside this package.
 Credential helpers stay out of scope — `onAuth` covers what this workload needs
 from them. The typed checkout lifecycle covers session creation and teardown;
 Git's administrative `repair` and `unlock` shapes have no SQLite-native state to
-operate on. Patch interchange and live remote discovery remain concrete gaps in
-[44](../backlog/44-patch-interchange.md) and
+operate on. Textual patch interchange has no current caller. Live remote
+discovery remains a concrete gap in
 [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md).
 
 ---

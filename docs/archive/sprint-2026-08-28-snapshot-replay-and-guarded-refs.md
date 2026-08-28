@@ -1,3 +1,18 @@
+> **OUTCOME — shipped 2026-08-28.** Added bounded typed/path revision
+> resolution, guarded direct-ref update and deletion, public merge-base and
+> recursive tree reads, index-only snapshot replay, and the complete public
+> checkpoint restore composition. Commit map: plan → `08427a8`; WU0 →
+> `ba9b350`; WU1 → `f19d364`; WU2 → `9bf8bc0`; WU3 → `f4bf892`; WU4 →
+> `47423f5`; WU5 → `749256e`; bounded-diff fix → `84562b7`; bare-reflog fix →
+> `48558fb`; exhaustive-suite slicing → `3eb6ea3`; closure → this archived
+> record. Verification: the 128-test routine gate passed in 10.27 s; the
+> exhaustive runner passed 2,547 tests with five known skips and zero failures
+> in 525.61 s; every heavyweight pack slice completed within 29.02 s.
+> Typecheck and Biome passed. Independent T3 and integration reviews approved
+> the final implementation. Backlog closed: 44 and 46; 39 now contains only
+> the no-caller plumbing reads. Deferred: textual patch interchange remains
+> unfiled until a process-boundary caller appears.
+
 # Sprint — Snapshot replay and guarded refs (2026-08-28)
 
 **Goal.** Complete the local checkpoint restore cycle with bounded revision
@@ -260,8 +275,8 @@ npx vitest run tests/checkpoint-contract.test.ts tests/snapshot-replay.test.ts t
 
 ## Out of scope (explicit)
 
-- Textual patch output/parsing and general `apply`; backlog 44 retains that
-  deferred half until a patch must cross a process boundary.
+- Textual patch output/parsing and general `apply`; no current caller needs a
+  patch to cross a process boundary, so this remains deliberately unfiled.
 - `catFile` type/size probes, tree/blob filters, `forEachRef`, and `revList` from
   the no-caller remainder of backlog 39.
 - Revision ranges, arbitrary reflog selectors, `@{upstream}`, date selectors,
@@ -360,3 +375,11 @@ resolved before implementation.
   export contracts, and the consumer checkpoint composition with no material
   findings. The agent-docs lint retained one pre-existing unrelated finding:
   the stray tracked root file `docs/AGENTS.md`.
+- The closure gate first exposed two regressions outside the focused witnesses:
+  sparse diff exceeded its SQL budget and bare reflog revisions lost Git's
+  no-object-membership behavior. Focused fixes and independent re-review closed
+  both before the exhaustive rerun.
+- Vitest 3 timed out its worker RPC when the heavyweight pack file ran as one
+  task. The exhaustive runner now executes its five existing describe groups as
+  separate process slices. All 2,547 tests passed; the routine gate remains
+  10.27 s and the longest pack slice is 29.02 s.

@@ -15,17 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-28-snapshot-replay-and-guarded-refs.md`](sprints/sprint-2026-08-28-snapshot-replay-and-guarded-refs.md)
-  — checkpoint replay through a scratch index plus bounded revision, tree, and
-  guarded-ref plumbing.
+- None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Snapshot replay and guarded refs are active: replay a checkpoint tree through
-  the shipped scratch-index seam, publish it safely, and resolve the required
-  revision spellings.
+- Refspec transport is next: atomic multi-ref push, batch ref deletion, remote
+  ref discovery, and wildcard fetch for checkpoint refs.
 - The backlog plan is gated on a consumer: Phase 1 closes the calls two internal
   consumers issue, then one adapter runs end to end before anything else is
   scheduled — [`backlog/README.md`](backlog/README.md#consumer-demand).
@@ -58,6 +55,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-28-snapshot-replay-and-guarded-refs.md`](archive/sprint-2026-08-28-snapshot-replay-and-guarded-refs.md)
+  — bounded checkpoint replay, guarded ref publication, revision resolution,
+  merge-base, and recursive tree reads.
 - [`archive/sprint-2026-08-28-index-and-object-write-plumbing.md`](archive/sprint-2026-08-28-index-and-object-write-plumbing.md)
   — scoped scratch indexes, bounded tree and commit construction, and a public
   snapshot facade that preserves checkout state.

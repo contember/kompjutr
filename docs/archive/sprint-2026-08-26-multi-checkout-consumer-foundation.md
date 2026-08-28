@@ -288,8 +288,8 @@ models overlap.
   [41](../backlog/41-partial-clone.md),
   [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md),
   the later [index and object write plumbing sprint](sprint-2026-08-28-index-and-object-write-plumbing.md), and
-  [44](../backlog/44-patch-interchange.md). They belong to the broader checkpoint
-  workload, not the current consumer admission gate.
+  then-open backlog 44. They belong to the broader checkpoint workload, not the
+  current consumer admission gate.
 - Safe merged-branch deletion and storage reclamation remain follow-up production
   safety work in [33](sprint-2026-08-26-git-boundary-correctness.md#wu1--safe-branch-deletion-33-effort-m) and
   [04](sprint-2026-08-27-repack-and-garbage-collection.md).
