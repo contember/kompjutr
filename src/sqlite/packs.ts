@@ -452,6 +452,8 @@ class ExpectedPackMembership {
 export interface PackIngestOptions {
   /** Refuse a pack larger than this. */
   maxBytes?: number;
+  /** Caller-owned operation budget; ingest uses and disposes one additive child scope. */
+  reservation?: MemoryReservation;
   onProgress?: (message: string) => void;
   /** Awaited periodically so the runtime can flush its write buffer. */
   yieldNow?: () => Promise<void>;
@@ -793,6 +795,7 @@ export class PackStore {
   readonly #objects: ByteLru<string, RawObject>;
   readonly #chunks: ByteLru<string, Uint8Array>;
   readonly #memory: MemoryCoordinator;
+  readonly #scopeMemory: (reservation: MemoryReservation) => MemoryReservation;
   readonly #cacheNamespace: string;
   readonly #now: () => number;
   #cacheGeneration = 0;
@@ -808,6 +811,7 @@ export class PackStore {
     objects: ByteLru<string, RawObject>,
     chunks: ByteLru<string, Uint8Array>,
     memory: MemoryCoordinator,
+    scopeMemory: (reservation: MemoryReservation) => MemoryReservation,
     cacheNamespace: string,
     external: ExternalResolver,
     externalBatch: ExternalBatchResolver,
@@ -822,6 +826,7 @@ export class PackStore {
     this.#objects = objects;
     this.#chunks = chunks;
     this.#memory = memory;
+    this.#scopeMemory = scopeMemory;
     this.#cacheNamespace = cacheNamespace;
     this.#now = options.now ?? Date.now;
     this.#maxBufferedEntry = Math.min(
@@ -3243,7 +3248,10 @@ export class PackStore {
     let activePackId: number | undefined;
     let lease: PackIngestLease | null = null;
     try {
-      const memoryReservation = this.#memory.reserve();
+      const memoryReservation =
+        options.reservation === undefined
+          ? this.#memory.reserve()
+          : this.#scopeMemory(options.reservation);
       const pool = new ChunkPool(MAX_PACK_DELTA_WORKING_BYTES);
       memory = { reservation: memoryReservation, pool };
       const reservation = this.#reservePending(

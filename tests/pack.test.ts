@@ -551,6 +551,65 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
+  it("composes ingest memory under one repository-owned operation reservation", async () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const first = database.openCheckout(
+      database.createRepository("/first", "ref: refs/heads/main"),
+    );
+    const second = database.openCheckout(
+      database.createRepository("/second", "ref: refs/heads/main"),
+    );
+    const reservation = first.reserveMemory();
+    reservation.set("protocol", 1_024);
+    reservation.set("other", 2_048);
+    const callerBytes = reservation.currentBytes;
+    const data = utf8.encode("caller-owned ingest memory\n");
+
+    try {
+      const ingested = await first.packs.ingest(slices(singleBlobPack(data), 19), {
+        reservation,
+      });
+      expect(ingested.count).toBe(1);
+      expect(first.read(hashObject("blob", data))?.data).toEqual(data);
+      expect(reservation.currentBytes).toBe(callerBytes);
+      expect(reservation.highWaterBytes).toBeGreaterThan(callerBytes);
+
+      const foreign = second.reserveMemory();
+      try {
+        await expect(
+          first.packs.ingest(slices(singleBlobPack(utf8.encode("foreign\n")), 11), {
+            reservation: foreign,
+          }),
+        ).rejects.toMatchObject({ code: "EINVAL" });
+        expect(foreign.currentBytes).toBe(0);
+      } finally {
+        foreign.dispose();
+      }
+      expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = 1")).toBe(1);
+
+      const corrupt = singleBlobPack(utf8.encode("corrupt child scope\n"));
+      corrupt[corrupt.length - 1] = (corrupt.at(-1) ?? 0) ^ 0xff;
+      await expect(first.packs.ingest(slices(corrupt, 13), { reservation })).rejects.toThrow(
+        /checksum/,
+      );
+      expect(reservation.currentBytes).toBe(callerBytes);
+      reservation.set("metadata", 1);
+      reservation.clear("metadata");
+    } finally {
+      reservation.clear("protocol");
+      reservation.clear("other");
+      reservation.dispose();
+    }
+
+    const probe = first.reserveMemory();
+    try {
+      probe.set("other", MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      probe.dispose();
+    }
+  });
+
   it("shares and isolates one 4 MiB pack-row cache across repositories", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { chunkBytes: 16 * 1024 * 1024 });

@@ -2626,6 +2626,16 @@ export class SharedRepoStore {
     return this.memory.owns(reservation, this.#memoryOwner);
   }
 
+  scopeMemoryReservation(reservation: MemoryReservation): MemoryReservation {
+    if (reservation.disposed) {
+      throw new GitError("EINVAL", "operation memory reservation is disposed");
+    }
+    if (!this.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "operation memory reservation belongs to another repository");
+    }
+    return reservation.scope();
+  }
+
   lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
     return this.#ops().lookupBlobIds(contentIds);
   }
@@ -4430,6 +4440,7 @@ export class CheckoutStore implements IndexStore {
         this.#objectCache,
         shared.packRows,
         this.#memoryCoordinator,
+        (reservation) => shared.scopeMemoryReservation(reservation),
         shared.cacheNamespace,
         (oid) => this.#readLoose(oid),
         (oids) => this.#readLooseObjects(oids),
