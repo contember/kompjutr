@@ -1,7 +1,7 @@
 ---
 id: 44
 title: Replay a snapshot onto a new tip — index-only three-way; patch interchange deferred
-blocked-by: [./43-index-and-object-write-plumbing.md]
+blocked-by: []
 ---
 
 # 44 — Replay a snapshot onto a new tip
@@ -29,8 +29,8 @@ a shell has no other way to carry a tree delta between two commands. kompjutr
 has no such boundary, and it already has the bounded three-way engine
 (`src/core/ops/integration.ts`, `src/core/ops/merge-apply.ts`,
 [ADR-0003](../decisions/0003-port-xdiff-text-merge.md)) and, after
-[43](43-index-and-object-write-plumbing.md), a scratch index that `readTree`
-seeds and `writeTree` serialises.
+the shipped [index and object write plumbing sprint](../archive/sprint-2026-08-28-index-and-object-write-plumbing.md),
+a scratch index that `readTree` seeds and `writeTree` serialises.
 
 The earlier scope of this item — `--binary` and `--full-index` in the patch
 writer plus a patch parser and `apply()` — reproduced the shell's transport,

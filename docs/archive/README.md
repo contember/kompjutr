@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Index and object write plumbing](sprint-2026-08-28-index-and-object-write-plumbing.md)
+  — scoped scratch indexes, bounded tree and commit construction, and a public
+  snapshot facade that preserves checkout state.
 - [Concurrency and restart conformance](sprint-2026-08-27-concurrency-and-restart-conformance.md)
   — deterministic async-owner schedules, cold restart qualification, and
   bounded ownership and publication fences.

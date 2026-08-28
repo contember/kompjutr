@@ -15,15 +15,15 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-28-index-and-object-write-plumbing.md`](sprints/sprint-2026-08-28-index-and-object-write-plumbing.md)
-  — scoped scratch indexes plus bounded tree and commit construction.
+None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Index and object write plumbing is active. It adds bounded scratch indexes and
-  tree/commit construction for the reference snapshot workload.
+- Snapshot replay and guarded refs are next: replay a checkpoint tree through
+  the shipped scratch-index seam, publish it safely, and resolve the required
+  revision spellings.
 - The backlog plan is gated on a consumer: Phase 1 closes the calls two internal
   consumers issue, then one adapter runs end to end before anything else is
   scheduled — [`backlog/README.md`](backlog/README.md#consumer-demand).
@@ -56,6 +56,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-28-index-and-object-write-plumbing.md`](archive/sprint-2026-08-28-index-and-object-write-plumbing.md)
+  — scoped scratch indexes, bounded tree and commit construction, and a public
+  snapshot facade that preserves checkout state.
 - [`archive/sprint-2026-08-27-concurrency-and-restart-conformance.md`](archive/sprint-2026-08-27-concurrency-and-restart-conformance.md)
   — deterministic async-owner schedules, cold restart qualification, and
   bounded ownership and publication fences.

@@ -1,3 +1,18 @@
+> **OUTCOME — shipped 2026-08-28.** Added repository-scoped transactional
+> scratch indexes, selectable bounded index reads and staging, authenticated
+> `writeTree` and detached `commitTree`, and a public scoped snapshot facade
+> that preserves checkout and journal state. Commit map: plan → `64d32e8`;
+> WU0 → `8f8c40e`; WU1 → `573e059`; WU2 → `8bde63d`; WU3 →
+> `21040d2`; WU4 → `67e9ca1`; review-policy amendment → `f8b834f`;
+> WU5 → `7bfca03`; bounded test cadence → `5b52ea6`; closure → this
+> archived record. Verification: the exhaustive fork report covered all 139
+> test files with 2,514 passes, five known skips, and zero failures; Vitest
+> 3.2.7 then hit its known post-report `onTaskUpdate` timeout. The replacement
+> batched runner accounts for all 139 files, and its smoke, filesystem, shell,
+> end-to-end, and shard mechanics pass independently. Typecheck, Biome, build,
+> and diff validation pass. Backlog closed: 43. Deferred: snapshot replay,
+> guarded plumbing reads, and revision syntax remain in 44, 39, and 46.
+
 # Sprint — Index and object write plumbing (2026-08-28)
 
 **Goal.** Add bounded tree and commit construction, including an isolated

@@ -29,7 +29,6 @@ not effort: a wrong answer outranks a missing one.
   [39](39-plumbing-read-surface.md) ·
   [41](41-partial-clone.md) ·
   [42](42-remote-ref-discovery-and-refspec-fetch.md) ·
-  [43](43-index-and-object-write-plumbing.md) ·
   [44](44-patch-interchange.md) ·
   [46](46-rev-parse-revision-syntax.md) ·
   [61](61-git-shell-command-and-argv-entry.md) ·
@@ -80,7 +79,6 @@ What they issue that the surface still lacks, and the item that closes it:
 
 | Call | Issued by | Item |
 |---|---|---|
-| `read-tree` / `write-tree` / `commit-tree` under a throwaway index | orchestrator | [43](43-index-and-object-write-plumbing.md) — active sprint |
 | `diff --binary --full-index <snap>^1 <snap>` → `apply --3way --cached` → `write-tree` | orchestrator | [44](44-patch-interchange.md) — re-scoped to an index-only three-way replay; the patch format is deferred |
 | `update-ref <ref> <new> <old>`, `merge-base`, `ls-tree -r` | orchestrator | [39](39-plumbing-read-surface.md) — required subset |
 | `rev-parse <rev>^{tree}`, `<rev>^{commit}`, `<rev>:<path>`, `--verify --quiet` | orchestrator | [46](46-rev-parse-revision-syntax.md) |
@@ -120,18 +118,17 @@ unscheduled until a caller appears.
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
 | **Phase 1 — a consumer can run** | | | | |
-| 1 | Index and object write plumbing | [43](43-index-and-object-write-plumbing.md) | normal | Active. The snapshot of uncommitted work after every agent turn. |
-| 2 | Snapshot replay and guarded refs | [44](44-patch-interchange.md), [39](39-plumbing-read-surface.md) (required subset), [46](46-rev-parse-revision-syntax.md) | normal | The rest of the checkpoint cycle: replay the snapshot tree onto the rebased tip through the scratch index from 43, publish the result with compare-and-swap, and resolve the peel and path spellings the probes use. |
-| 3 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Checkpoint refs out (atomic multi-ref push, batch delete) and back in (`ls-remote`, wildcard fetch). One seam unit defines the refspec type for both. |
-| 4 | First-contact defaults | [38](38-clone-depth-and-deepening.md) (default + ADR), [18](18-branch-and-remote-management.md) (required subset), [36](36-glob-pathspecs.md) | normal | Small items both consumers hit on first use: a full clone by default, `branch -m`, a glob pathspec for `lsFiles`. |
-| 5 | Agent shell git | [61](61-git-shell-command-and-argv-entry.md) | normal | The agent's side of both workloads: git as a synchronous shell command and the argv entry point over the existing ops and formatters. Independent of sprints 2–4; may run in parallel with them. |
+| 1 | Snapshot replay and guarded refs | [44](44-patch-interchange.md), [39](39-plumbing-read-surface.md) (required subset), [46](46-rev-parse-revision-syntax.md) | normal | The rest of the checkpoint cycle: replay the snapshot tree onto the rebased tip through the scratch index, publish the result with compare-and-swap, and resolve the peel and path spellings the probes use. |
+| 2 | Refspec transport | [42](42-remote-ref-discovery-and-refspec-fetch.md), [08](08-extend-push-refspecs.md) | long | Checkpoint refs out (atomic multi-ref push, batch delete) and back in (`ls-remote`, wildcard fetch). One seam unit defines the refspec type for both. |
+| 3 | First-contact defaults | [38](38-clone-depth-and-deepening.md) (default + ADR), [18](18-branch-and-remote-management.md) (required subset), [36](36-glob-pathspecs.md) | normal | Small items both consumers hit on first use: a full clone by default, `branch -m`, a glob pathspec for `lsFiles`. |
+| 4 | Agent shell git | [61](61-git-shell-command-and-argv-entry.md) | normal | The agent's side of both workloads: git as a synchronous shell command and the argv entry point over the existing ops and formatters. Independent of sprints 1–3; may run in parallel with them. |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 6 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
+| 5 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
 | **Phase 2 — production scale** | | | | |
-| 7 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
-| 8 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
-| 9 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| 6 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
+| 7 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 8 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
 | **Phase 3 — parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
@@ -165,7 +162,6 @@ units over the same files, and a long sprint does not make that safe.
 - [39 — Complete the plumbing read surface](39-plumbing-read-surface.md)
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [42 — Add remote ref discovery and refspec fetch](42-remote-ref-discovery-and-refspec-fetch.md)
-- [43 — Add index and object write plumbing](43-index-and-object-write-plumbing.md)
 - [44 — Replay a snapshot onto a new tip; patch interchange deferred](44-patch-interchange.md)
 - [46 — Complete `rev-parse` revision syntax](46-rev-parse-revision-syntax.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)

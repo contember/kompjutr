@@ -287,7 +287,7 @@ models overlap.
   [08](../backlog/08-extend-push-refspecs.md),
   [41](../backlog/41-partial-clone.md),
   [42](../backlog/42-remote-ref-discovery-and-refspec-fetch.md),
-  [43](../backlog/43-index-and-object-write-plumbing.md), and
+  the later [index and object write plumbing sprint](sprint-2026-08-28-index-and-object-write-plumbing.md), and
   [44](../backlog/44-patch-interchange.md). They belong to the broader checkpoint
   workload, not the current consumer admission gate.
 - Safe merged-branch deletion and storage reclamation remain follow-up production
