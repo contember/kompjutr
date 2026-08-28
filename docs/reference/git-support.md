@@ -414,16 +414,20 @@ mutation. It returns `{ refs, headRef }`; an empty pattern match still returns
 the observed `headRef`. The shared options accept `onProgress` and `onMessage`,
 but discovery has no upload or side-band events to emit through them.
 
-### `git remote` — `remoteAdd()`, `remoteRemove()`, `remoteList()`
+### `git remote` — `remoteAdd()`, `remoteRemove()`, `remoteList()`, URL access
 
 | Git | kompjutr | |
 |---|---|---|
 | `remote add [-f] <name> <url>` | `remoteAdd({ name, url, force })` | ★ ✔ |
 | `remote remove <name>` | `remoteRemove()` | ★ ✔ |
 | `remote`, `remote -v` | `remoteList()` | ★ ✔ `{ name, url }[]` |
-| `remote get-url <name>` | — | ★ ~ read `remote.<n>.url` with `configGet()` |
-| `remote set-url` | — | ★ ~ use `configSet("remote.<n>.url", …)` |
-| `remote rename`, `remote prune`, `remote show` | — | ✘ |
+| `remote get-url <name>` | `remoteGetUrl({ name })` | ★ ✔ fetch URL |
+| `remote set-url <name> <url>` | `remoteSetUrl({ name, url })` | ★ ✔ replaces the existing fetch URL |
+| `remote set-url --add/--delete`, `remote rename`, `remote prune`, `remote show` | — | ✘ |
+
+Both typed URL operations require exactly one configured fetch URL and reject a
+missing or multi-valued remote. `remoteSetUrl()` changes the next fetch target
+and the push target when no separate `remote.<name>.pushurl` is configured.
 
 ### `git fetch` — `fetch()`
 
@@ -787,7 +791,6 @@ consumer adapter is outside this package.
 | `reset --hard FETCH_HEAD` | `reset({ ref: fetch().fetchHead, hard: true })` |
 | `branch -m main` | `branch()` then `branchDelete()` |
 | `push -u origin main` | `push()` then `configSet("branch.main.remote"/"…merge")` |
-| `remote get-url` / `set-url` | `configGet()` / `configSet()` on `remote.<n>.url` |
 | `symbolic-ref -q HEAD` | `currentBranch({ fullname: true })` |
 | `symbolic-ref -q refs/remotes/origin/HEAD` | `readRef({ ref: "refs/remotes/origin/HEAD" })` |
 | `rev-list --left-right --count <current>...<upstream>` | `divergence({ current, upstream })` |

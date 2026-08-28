@@ -51,7 +51,9 @@ import type {
   RefLogEntry as GitRefLogEntry,
   GitRefLogOptions,
   RefLogRecoverySource as GitRefLogRecoverySource,
+  GitRemoteGetUrlOptions,
   RemoteRefView as GitRemoteRefView,
+  GitRemoteSetUrlOptions,
   RemoteTarget as GitRemoteTarget,
   ReplayEmptyReason as GitReplayEmptyReason,
   ReplayResult as GitReplayResult,
@@ -150,7 +152,9 @@ import type {
   RefLogEntry as RootRefLogEntry,
   GitRefLogOptions as RootRefLogOptions,
   RefLogRecoverySource as RootRefLogRecoverySource,
+  GitRemoteGetUrlOptions as RootRemoteGetUrlOptions,
   RemoteRefView as RootRemoteRefView,
+  GitRemoteSetUrlOptions as RootRemoteSetUrlOptions,
   RemoteTarget as RootRemoteTarget,
   ReplayEmptyReason as RootReplayEmptyReason,
   ReplayResult as RootReplayResult,
@@ -874,6 +878,27 @@ describe("public structured refspec exports", () => {
       1_024,
       1_024,
       16_384,
+    ]);
+  });
+});
+
+describe("public remote URL exports", () => {
+  it("exposes matching typed get and set options from both entrypoints", () => {
+    const rootGet: RootRemoteGetUrlOptions = { dir: "/repo", name: "origin" };
+    const gitGet: GitRemoteGetUrlOptions = rootGet;
+    const rootSet: RootRemoteSetUrlOptions = {
+      dir: "/repo",
+      name: "origin",
+      url: "https://example.test/repo.git",
+    };
+    const gitSet: GitRemoteSetUrlOptions = rootSet;
+    const rootMethods: readonly (keyof RootGit)[] = ["remoteGetUrl", "remoteSetUrl"];
+    const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
+
+    expect([gitGet.name, gitSet.url, gitMethods]).toEqual([
+      "origin",
+      "https://example.test/repo.git",
+      rootMethods,
     ]);
   });
 });

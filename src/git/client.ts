@@ -23,10 +23,14 @@ import {
   configGet,
   configSet,
   type RemoteAddOptions,
+  type RemoteGetUrlOptions,
   type RemoteRemoveOptions,
+  type RemoteSetUrlOptions,
   remoteAdd,
+  remoteGetUrl,
   remoteList,
   remoteRemove,
+  remoteSetUrl,
 } from "../core/ops/config.js";
 import {
   type DiffOptions,
@@ -231,7 +235,9 @@ export type GitCheckoutOptions = CheckoutOptions & GitDirOptions;
 export type GitConfigGetOptions = ConfigGetOptions & GitDirOptions;
 export type GitConfigSetOptions = ConfigSetOptions & GitDirOptions;
 export type GitRemoteAddOptions = RemoteAddOptions & GitDirOptions;
+export type GitRemoteGetUrlOptions = RemoteGetUrlOptions & GitDirOptions;
 export type GitRemoteRemoveOptions = RemoteRemoveOptions & GitDirOptions;
+export type GitRemoteSetUrlOptions = RemoteSetUrlOptions & GitDirOptions;
 export type GitHashObjectOptions = HashObjectOptions & GitDirOptions;
 export type GitCatFileOptions = CatFileOptions & GitDirOptions;
 export type GitReadTreeOptions = ReadTreeOptions & GitDirOptions;
@@ -321,7 +327,9 @@ export interface Git {
   tagList(input?: GitDirOptions): Promise<string[]>;
   checkout(input: GitCheckoutOptions): Promise<void>;
   remoteAdd(input: GitRemoteAddOptions): Promise<void>;
+  remoteGetUrl(input: GitRemoteGetUrlOptions): Promise<string>;
   remoteRemove(input: GitRemoteRemoveOptions): Promise<void>;
+  remoteSetUrl(input: GitRemoteSetUrlOptions): Promise<void>;
   remoteList(input?: GitDirOptions): Promise<RemoteView[]>;
   configGet(input: GitConfigGetOptions): Promise<string | string[] | undefined>;
   configSet(input: GitConfigSetOptions): Promise<void>;
@@ -580,8 +588,14 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async remoteAdd(input) {
       remoteAdd(at(input.dir), input);
     },
+    async remoteGetUrl(input) {
+      return remoteGetUrl(at(input.dir), input);
+    },
     async remoteRemove(input) {
       remoteRemove(at(input.dir), input);
+    },
+    async remoteSetUrl(input) {
+      remoteSetUrl(at(input.dir), input);
     },
     async remoteList(input = {}) {
       return remoteList(at(input.dir));

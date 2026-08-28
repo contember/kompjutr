@@ -163,6 +163,8 @@ export {
   type GitRebaseOptions,
   type GitRecoverRefOptions,
   type GitRefLogOptions,
+  type GitRemoteGetUrlOptions,
+  type GitRemoteSetUrlOptions,
   type GitRevertContinueOptions,
   type GitRevertOptions,
   type GitRevParseOptions,

@@ -63,6 +63,36 @@ export interface RemoteRemoveOptions {
   name: string;
 }
 
+export interface RemoteGetUrlOptions {
+  name: string;
+}
+
+export interface RemoteSetUrlOptions {
+  name: string;
+  url: string;
+}
+
+export function remoteGetUrl(repo: Repository, options: RemoteGetUrlOptions): string {
+  return requireSingleRemoteUrl(repo, options.name);
+}
+
+export function remoteSetUrl(repo: Repository, options: RemoteSetUrlOptions): void {
+  repo.store.db.transactionSync(() => {
+    requireSingleRemoteUrl(repo, options.name);
+    repo.store.configSet(`${REMOTE}${options.name}.url`, options.url);
+  });
+}
+
+function requireSingleRemoteUrl(repo: Repository, name: string): string {
+  const urls = repo.store.configGetAll(`${REMOTE}${name}.url`);
+  const url = urls[0];
+  if (url === undefined) throw new GitError("EREMOTEFAIL", `no such remote: ${name}`);
+  if (urls.length !== 1) {
+    throw new GitError("EUNSUPPORTED", `multiple URLs for remote ${name} are not supported`);
+  }
+  return url;
+}
+
 /** Drops the config section. Remote-tracking refs are left alone. */
 export function remoteRemove(repo: Repository, options: RemoteRemoveOptions): void {
   const paths = repo.store.configPaths(`${REMOTE}${options.name}.`);

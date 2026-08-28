@@ -587,6 +587,85 @@ describe("createSqliteGitClient", () => {
     }
   });
 
+  it("gets and sets the remote URL used by fetch and push", async () => {
+    const original = new GitFixture().init();
+    fixtures.push(original);
+    original.write("README.md", "original\n");
+    const originalHead = original.commit("original");
+
+    const replacement = new GitFixture();
+    fixtures.push(replacement);
+    replacement.git("clone", "-q", original.dir, ".");
+    replacement.write("replacement.txt", "replacement\n");
+    const replacementHead = replacement.commit("replacement");
+
+    const originalServer = await startGitServer(original.dir);
+    const replacementServer = await startGitServer(replacement.dir);
+    try {
+      const { git } = makeNativeGit();
+      const dir = "/typed-remote";
+      await git.clone({ dir, url: originalServer.url });
+
+      await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(originalServer.url);
+      await git.remoteSetUrl({ dir, name: "origin", url: replacementServer.url });
+      await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(replacementServer.url);
+
+      await git.fetch({ dir, remote: "origin" });
+      await expect(git.revParse({ dir, ref: "refs/remotes/origin/main" })).resolves.toBe(
+        replacementHead,
+      );
+
+      await expect(git.configGet({ dir, path: "remote.origin.pushurl" })).resolves.toBeUndefined();
+      await expect(
+        git.push({ dir, remote: "origin", ref: "main", remoteRef: "typed-fallback" }),
+      ).resolves.toMatchObject({ ok: true });
+      expect(replacement.git("rev-parse", "refs/heads/typed-fallback")).toBe(originalHead);
+      expect(original.gitResult("rev-parse", "refs/heads/typed-fallback").status).not.toBe(0);
+    } finally {
+      await Promise.all([originalServer.close(), replacementServer.close()]);
+    }
+  });
+
+  it("rejects a missing remote URL without creating a partial section", async () => {
+    const { git } = makeNativeGit();
+    const dir = "/missing-remote";
+    await git.init({ dir });
+
+    await expect(git.remoteGetUrl({ dir, name: "missing" })).rejects.toMatchObject({
+      code: "EREMOTEFAIL",
+    });
+    await expect(
+      git.remoteSetUrl({ dir, name: "missing", url: "https://example.invalid/new.git" }),
+    ).rejects.toMatchObject({ code: "EREMOTEFAIL" });
+    await expect(git.configGet({ dir, path: "remote.missing.url" })).resolves.toBeUndefined();
+    await expect(git.configGet({ dir, path: "remote.missing.fetch" })).resolves.toBeUndefined();
+    await expect(git.remoteList({ dir })).resolves.toEqual([]);
+  });
+
+  it("rejects a multi-valued remote URL without replacing its values", async () => {
+    const { git } = makeNativeGit();
+    const dir = "/multi-url-remote";
+    await git.init({ dir });
+    await git.remoteAdd({ dir, name: "origin", url: "https://example.invalid/one.git" });
+    await git.configSet({
+      dir,
+      path: "remote.origin.url",
+      value: "https://example.invalid/two.git",
+      append: true,
+    });
+
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).rejects.toMatchObject({
+      code: "EUNSUPPORTED",
+    });
+    await expect(
+      git.remoteSetUrl({ dir, name: "origin", url: "https://example.invalid/new.git" }),
+    ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+    await expect(git.configGet({ dir, path: "remote.origin.url", all: true })).resolves.toEqual([
+      "https://example.invalid/one.git",
+      "https://example.invalid/two.git",
+    ]);
+  });
+
   it("keeps Computer push legacy while native push returns structured status", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
