@@ -9,6 +9,7 @@ const rootExcludes = [
   "--exclude=tests/shell/**",
   "--exclude=tests/e2e/**",
   "--exclude=tests/pack.test.ts",
+  "--exclude=tests/protocol.test.ts",
 ];
 const rootShardCount = 8;
 const packSlices = [
@@ -23,6 +24,11 @@ const slices = [
     name: `root ${index + 1}/${rootShardCount}`,
     args: [...rootExcludes, `--shard=${index + 1}/${rootShardCount}`],
   })),
+  {
+    name: "protocol",
+    args: ["tests/protocol.test.ts"],
+    workers: 1,
+  },
   ...packSlices.map((pattern, index) => ({
     name: `pack ${index + 1}/${packSlices.length}`,
     args: ["tests/pack.test.ts", `--testNamePattern=^(${pattern})`],
@@ -34,10 +40,14 @@ const slices = [
 
 for (const slice of slices) {
   process.stdout.write(`\n=== ${slice.name} ===\n`);
-  const result = spawnSync(process.execPath, [vitest, "run", "--maxWorkers=4", ...slice.args], {
-    cwd: root,
-    stdio: "inherit",
-  });
+  const result = spawnSync(
+    process.execPath,
+    [vitest, "run", `--maxWorkers=${slice.workers ?? 4}`, ...slice.args],
+    {
+      cwd: root,
+      stdio: "inherit",
+    },
+  );
   if (result.error !== undefined) throw result.error;
   if (result.status !== 0) {
     const outcome =
