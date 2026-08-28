@@ -8,6 +8,7 @@ import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
+import { MAX_REMOTE_NAME_BYTES, MAX_REMOTE_URL_BYTES } from "../src/core/ops/config.js";
 import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
@@ -714,6 +715,69 @@ describe("createSqliteGitClient", () => {
       "https://example.invalid/one.git",
       "https://example.invalid/two.git",
     ]);
+  });
+
+  it("bounds remote URL input and stored values without changing the remote", async () => {
+    const { git } = makeNativeGit();
+    const dir = "/bounded-url-remote";
+    const original = "https://example.invalid/original.git";
+    await git.init({ dir });
+    await git.remoteAdd({ dir, name: "origin", url: original });
+
+    const boundary = "x".repeat(MAX_REMOTE_URL_BYTES);
+    await expect(git.remoteSetUrl({ dir, name: "origin", url: boundary })).resolves.toBeUndefined();
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(boundary);
+
+    await expect(
+      git.remoteSetUrl({ dir, name: "origin", url: "x".repeat(MAX_REMOTE_URL_BYTES + 1) }),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(boundary);
+
+    await git.configSet({
+      dir,
+      path: "remote.origin.url",
+      value: "x".repeat(MAX_REMOTE_URL_BYTES + 1),
+    });
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).rejects.toMatchObject({
+      code: "E2BIG",
+    });
+    await expect(git.remoteSetUrl({ dir, name: "origin", url: original })).rejects.toMatchObject({
+      code: "E2BIG",
+    });
+    await expect(git.configGet({ dir, path: "remote.origin.url" })).resolves.toBe(
+      "x".repeat(MAX_REMOTE_URL_BYTES + 1),
+    );
+  });
+
+  it("preserves long remote names and empty URL values accepted by real Git", async () => {
+    const { git } = makeNativeGit();
+    const dir = "/long-name-remote";
+    const name = "r".repeat(256);
+    await git.init({ dir });
+    await git.remoteAdd({ dir, name, url: "https://example.invalid/original.git" });
+
+    await expect(git.remoteGetUrl({ dir, name })).resolves.toBe(
+      "https://example.invalid/original.git",
+    );
+    await expect(git.remoteSetUrl({ dir, name, url: "" })).resolves.toBeUndefined();
+    await expect(git.remoteGetUrl({ dir, name })).resolves.toBe("");
+  });
+
+  it("validates remote URL options before constructing config paths", async () => {
+    const { git } = makeNativeGit();
+    const dir = "/invalid-url-options";
+    await git.init({ dir });
+
+    await expect(
+      Reflect.apply(git.remoteGetUrl, git, [{ dir, name: "x".repeat(MAX_REMOTE_NAME_BYTES + 1) }]),
+    ).rejects.toMatchObject({ code: "E2BIG" });
+    await expect(
+      Reflect.apply(git.remoteSetUrl, git, [{ dir, name: "origin", url: "\ud800" }]),
+    ).rejects.toMatchObject({ code: "EINVAL" });
+    await expect(Reflect.apply(git.remoteGetUrl, git, [null])).rejects.toMatchObject({
+      code: "EINVAL",
+    });
+    await expect(git.remoteList({ dir })).resolves.toEqual([]);
   });
 
   it("keeps Computer push legacy while native push returns structured status", async () => {

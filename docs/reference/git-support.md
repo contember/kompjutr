@@ -79,8 +79,8 @@ native and Computer surfaces use this database-only creation path.
 | Git | kompjutr | |
 |---|---|---|
 | `<url>` | `url` | ★ ✔ `http://` and `https://` only — `ssh://`, `git://` and local paths fail with `EURLSCHEME` |
-| `--depth <n>` | `depth` | ✔ omitted or `0` means complete history; a positive finite value is shallow and implies `singleBranch: true` unless explicitly overridden |
-| `--single-branch` / `--no-single-branch` | `singleBranch` | ✔ complete clones default to all branches; a positive `depth` defaults to one branch |
+| `--depth <n>` | `depth` | ✔ omitted or `0` means complete history; a positive safe integer is shallow and implies `singleBranch: true` unless explicitly overridden |
+| `--single-branch` / `--no-single-branch` | `singleBranch` | ✔ complete clones default to all branches; a positive safe-integer `depth` defaults to one branch |
 | `--no-tags` / `--tags` | `noTags` | ✔ `true` suppresses tags; omitted or `false` uses Git clone coverage — complete for all branches, reachable auto-follow for one branch |
 | `--branch <ref>` | `ref` | ★ ✔ |
 | `--origin <name>` | `remote` (default `origin`) | ✔ |
@@ -436,6 +436,8 @@ but discovery has no upload or side-band events to emit through them.
 Both typed URL operations require exactly one configured fetch URL and reject a
 missing or multi-valued remote. `remoteSetUrl()` changes the next fetch target
 and the push target when no separate `remote.<name>.pushurl` is configured.
+Remote names are capped at 2,189 UTF-8 bytes and URLs at 8,192 UTF-8 bytes;
+stored values are authenticated before either operation returns or mutates.
 
 ### `git fetch` — `fetch()`
 
@@ -706,7 +708,8 @@ merge — with these differences:
 - ✘ no linked-checkout lifecycle, `divergence`, or `readRef` surface;
 - ✘ no `readTree`, `writeTree`, `commitTree`, or scoped scratch-index surface;
 - ✘ no `lsRemote` surface;
-- ✘ no native `branchRename()` or `lsFiles({ paths })` extensions;
+- ✘ no native `branchRename()`, `remoteGetUrl()` / `remoteSetUrl()`, or
+  `lsFiles({ paths })` extensions;
 - ✘ no `mergeContinue` / `mergeAbort`: merge is single-shot, so a conflict rolls
   the local integration back and reports `EMERGEFAIL`. A conflicting pull still
   keeps the fetched objects and the remote-tracking ref;

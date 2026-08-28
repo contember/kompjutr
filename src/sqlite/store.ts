@@ -240,6 +240,11 @@ interface ConfigSectionMoveRow {
   readonly value: string;
 }
 
+export type BoundedSingleConfigValue =
+  | { readonly kind: "missing" }
+  | { readonly kind: "single"; readonly value: string }
+  | { readonly kind: "multiple" };
+
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
   objectCacheBytes?: number;
@@ -823,6 +828,10 @@ function isObjectType(value: string | null): value is ObjectType {
 
 const JSON_ENCODER = new TextEncoder();
 const CONFIG_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
+const CANONICAL_CONFIG_TEXT_DECODER = new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: true,
+});
 const JSON_BATCH_ROWS = 2_048;
 const JSON_BATCH_BYTES = 1024 * 1024;
 
@@ -2863,6 +2872,10 @@ export class SharedRepoStore {
 
   configGetBounded(path: string, maxBytes: number): string | undefined {
     return this.#ops().configGetBounded(path, maxBytes);
+  }
+
+  configGetSingleBounded(path: string, maxBytes: number): BoundedSingleConfigValue {
+    return this.#ops().configGetSingleBounded(path, maxBytes);
   }
 
   configSet(path: string, value: string): void {
@@ -7572,6 +7585,88 @@ export class CheckoutStore implements IndexStore {
     return value;
   }
 
+  /** Read zero or one canonical value without materialising a multi-valued key. */
+  configGetSingleBounded(path: string, maxBytes: number): BoundedSingleConfigValue {
+    if (typeof path !== "string" || path === "") {
+      throw new GitError("EINVAL", "bounded config path must be a non-empty string");
+    }
+    boundedCanonicalUtf8Bytes(path, MAX_INDEX_PATH_BYTES, "bounded config path");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
+    }
+
+    const metadata: { seq: number; bytes: number }[] = [];
+    for (const row of this.#db.iterate(
+      `SELECT repo_id, typeof(seq) AS seq_type,
+              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+              typeof(value) AS value_type,
+              length(CAST(value AS BLOB)) AS value_bytes
+         FROM git_config
+        WHERE repo_id = ? AND path = ?
+        ORDER BY seq
+        LIMIT 2`,
+      this.#repoId,
+      path,
+    )) {
+      if (row.repo_id !== this.#repoId) {
+        throw new CorruptError(`config ${path} crossed repository boundaries`);
+      }
+      if (
+        row.seq_type !== "integer" ||
+        typeof row.seq !== "number" ||
+        !Number.isSafeInteger(row.seq) ||
+        row.seq < 0 ||
+        row.value_type !== "text" ||
+        typeof row.value_bytes !== "number" ||
+        !Number.isSafeInteger(row.value_bytes) ||
+        row.value_bytes < 0
+      ) {
+        throw new CorruptError(`config ${path} has invalid value metadata`);
+      }
+      if (row.value_bytes > maxBytes) {
+        throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
+      }
+      metadata.push({ seq: row.seq, bytes: row.value_bytes });
+    }
+    const expected = metadata[0];
+    if (expected === undefined) return { kind: "missing" };
+    if (metadata.length !== 1) return { kind: "multiple" };
+
+    const row = this.#db.one<Record<string, unknown>>(
+      `SELECT repo_id, typeof(seq) AS seq_type,
+              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+              typeof(value) AS value_type,
+              length(CAST(value AS BLOB)) AS value_bytes,
+              CAST(value AS BLOB) AS value_blob
+         FROM git_config
+        WHERE repo_id = ? AND path = ? AND seq = ?
+        LIMIT 1`,
+      this.#repoId,
+      path,
+      expected.seq,
+    );
+    if (
+      row === undefined ||
+      row.repo_id !== this.#repoId ||
+      row.seq_type !== "integer" ||
+      row.seq !== expected.seq ||
+      row.value_type !== "text" ||
+      row.value_bytes !== expected.bytes
+    ) {
+      throw new CorruptError(`config ${path} changed after validation`);
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = readBlob(row.value_blob);
+    } catch (error) {
+      throw new CorruptError(`config ${path} has an invalid value BLOB`, { cause: error });
+    }
+    if (bytes.byteLength !== expected.bytes) {
+      throw new CorruptError(`config ${path} changed after validation`);
+    }
+    return { kind: "single", value: decodeCanonicalConfigText(bytes, `config ${path}`) };
+  }
+
   configSet(path: string, value: string): void {
     this.#db.transactionSync(() => {
       this.#db.run("DELETE FROM git_config WHERE repo_id = ? AND path = ?", this.#repoId, path);
@@ -9026,6 +9121,9 @@ function boundedCanonicalUtf8Bytes(value: string, limit: number, label: string):
       throw new GitError("EINVAL", `${label} contains an invalid character`);
     }
     if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (index + 1 >= value.length) {
+        throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
+      }
       const low = value.charCodeAt(index + 1);
       if (low < 0xdc00 || low > 0xdfff) {
         throw new GitError("EINVAL", `${label} is not canonical UTF-16`);
@@ -9131,4 +9229,23 @@ function decodeConfigText(bytes: Uint8Array, label: string): string {
   } catch (error) {
     throw new CorruptError(`${label} is not canonical UTF-8`, { cause: error });
   }
+}
+
+function decodeCanonicalConfigText(bytes: Uint8Array, label: string): string {
+  let value: string;
+  try {
+    value = CANONICAL_CONFIG_TEXT_DECODER.decode(bytes);
+  } catch (error) {
+    throw new CorruptError(`${label} is not canonical UTF-8`, { cause: error });
+  }
+  const canonical = JSON_ENCODER.encode(value);
+  if (canonical.byteLength !== bytes.byteLength) {
+    throw new CorruptError(`${label} is not canonical UTF-8`);
+  }
+  for (let index = 0; index < canonical.byteLength; index++) {
+    if (canonical[index] !== bytes[index]) {
+      throw new CorruptError(`${label} is not canonical UTF-8`);
+    }
+  }
+  return value;
 }

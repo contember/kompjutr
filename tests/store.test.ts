@@ -2681,6 +2681,63 @@ describe("refs, config and index", () => {
     expect(store.configGet("user.email")).toBeUndefined();
   });
 
+  it("reads one config value at the exact byte bound and rejects one byte more", () => {
+    const path = "remote.origin.url";
+    const exact = open();
+    exact.store.configSet(path, "x".repeat(8_192));
+    exact.db.storage.resetCounters();
+    expect(exact.store.configGetSingleBounded(path, 8_192)).toEqual({
+      kind: "single",
+      value: "x".repeat(8_192),
+    });
+    expect(exact.db.storage.statementCount).toBe(2);
+
+    const over = open();
+    over.store.configSet(path, "x".repeat(8_193));
+    over.db.storage.resetCounters();
+    expect(() => over.store.configGetSingleBounded(path, 8_192)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(over.db.storage.statementCount).toBe(1);
+  });
+
+  it("detects a multi-valued config key after inspecting only two metadata rows", () => {
+    const { db, store } = open();
+    const path = "remote.origin.url";
+    store.configAdd(path, "one");
+    store.configAdd(path, "two");
+    store.configAdd(path, "three");
+
+    db.storage.resetCounters();
+    expect(store.configGetSingleBounded(path, 8_192)).toEqual({ kind: "multiple" });
+    expect(db.storage.statementCount).toBe(1);
+  });
+
+  it("rejects corrupt config value types and non-canonical UTF-8", () => {
+    const path = "remote.origin.url";
+    const blobValue = open();
+    blobValue.store.configSet(path, "old");
+    blobValue.db.run(
+      "UPDATE git_config SET value = zeroblob(4) WHERE repo_id = 1 AND path = ?",
+      path,
+    );
+    blobValue.db.storage.resetCounters();
+    expect(() => blobValue.store.configGetSingleBounded(path, 8_192)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(blobValue.db.storage.statementCount).toBe(1);
+
+    const invalidUtf8 = open();
+    invalidUtf8.store.configSet(path, "old");
+    invalidUtf8.db.run(
+      "UPDATE git_config SET value = CAST(x'f09080' AS TEXT) WHERE repo_id = 1 AND path = ?",
+      path,
+    );
+    expect(() => invalidUtf8.store.configGetSingleBounded(path, 8_192)).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
   it("moves an exact config section while preserving paths and sequences", () => {
     const { db, store } = open();
     store.configAdd("branch.old.merge", "refs/heads/main");

@@ -12,6 +12,7 @@ export {
   RefNotFoundError,
   UnsupportedOperationError,
 } from "../core/errors.js";
+export { MAX_REMOTE_NAME_BYTES, MAX_REMOTE_URL_BYTES } from "../core/ops/config.js";
 export type {
   CommitResult,
   DiffSummaryEntry,

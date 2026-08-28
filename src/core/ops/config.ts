@@ -3,10 +3,14 @@
 // no config file to parse and no section header to preserve.
 
 import { GitError } from "../errors.js";
+import { hasCanonicalRefSyntax } from "../ref-name.js";
 import type { Repository } from "../repository.js";
 import type { RemoteView } from "./kinds.js";
 
 const REMOTE = "remote.";
+/** Leaves `remote.<name>.url` within the shared 2,200-byte config-path ceiling. */
+export const MAX_REMOTE_NAME_BYTES = 2_189;
+export const MAX_REMOTE_URL_BYTES = 8_192;
 
 export interface ConfigGetOptions {
   /** Dotted key, e.g. "user.email" or "remote.origin.url". */
@@ -73,24 +77,96 @@ export interface RemoteSetUrlOptions {
 }
 
 export function remoteGetUrl(repo: Repository, options: RemoteGetUrlOptions): string {
-  return requireSingleRemoteUrl(repo, options.name);
+  const name = requireRemoteName(options, "remote get-url");
+  return requireSingleRemoteUrl(repo, name, `${REMOTE}${name}.url`);
 }
 
 export function remoteSetUrl(repo: Repository, options: RemoteSetUrlOptions): void {
+  const input = requireRemoteSetUrlOptions(options);
+  const path = `${REMOTE}${input.name}.url`;
   repo.store.db.transactionSync(() => {
-    requireSingleRemoteUrl(repo, options.name);
-    repo.store.configSet(`${REMOTE}${options.name}.url`, options.url);
+    requireSingleRemoteUrl(repo, input.name, path);
+    repo.store.configSet(path, input.url);
   });
 }
 
-function requireSingleRemoteUrl(repo: Repository, name: string): string {
-  const urls = repo.store.configGetAll(`${REMOTE}${name}.url`);
-  const url = urls[0];
-  if (url === undefined) throw new GitError("EREMOTEFAIL", `no such remote: ${name}`);
-  if (urls.length !== 1) {
+function requireSingleRemoteUrl(repo: Repository, name: string, path: string): string {
+  const result = repo.store.configGetSingleBounded(path, MAX_REMOTE_URL_BYTES);
+  if (result.kind === "missing") {
+    throw new GitError("EREMOTEFAIL", `no such remote: ${name}`);
+  }
+  if (result.kind === "multiple") {
     throw new GitError("EUNSUPPORTED", `multiple URLs for remote ${name} are not supported`);
   }
-  return url;
+  return result.value;
+}
+
+function requireRemoteSetUrlOptions(options: unknown): { name: string; url: string } {
+  const object = requireOptionsObject(options, "remote set-url");
+  return {
+    name: requireRemoteName(object, "remote set-url"),
+    url: requireBoundedText(Reflect.get(object, "url"), "remote URL", MAX_REMOTE_URL_BYTES, true),
+  };
+}
+
+function requireRemoteName(options: unknown, operation: string): string {
+  const object = requireOptionsObject(options, operation);
+  const name = requireBoundedText(
+    Reflect.get(object, "name"),
+    "remote name",
+    MAX_REMOTE_NAME_BYTES,
+  );
+  if (!hasCanonicalRefSyntax(name)) {
+    throw new GitError("EINVAL", `invalid remote name: ${name}`);
+  }
+  return name;
+}
+
+function requireOptionsObject(value: unknown, operation: string): object {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new GitError("EINVAL", `${operation} options must be an object`);
+  }
+  return value;
+}
+
+function requireBoundedText(
+  value: unknown,
+  label: string,
+  limit: number,
+  allowEmpty = false,
+): string {
+  if (typeof value !== "string" || (!allowEmpty && value === "")) {
+    throw new GitError(
+      "EINVAL",
+      `${label} must be ${allowEmpty ? "a string" : "a non-empty string"}`,
+    );
+  }
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit === 0 || unit === 0x0a || unit === 0x0d) {
+      throw new GitError("EINVAL", `${label} contains an invalid character`);
+    }
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      if (index + 1 >= value.length) {
+        throw new GitError("EINVAL", `${label} is not canonical text`);
+      }
+      const low = value.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) {
+        throw new GitError("EINVAL", `${label} is not canonical text`);
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new GitError("EINVAL", `${label} is not canonical text`);
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+    if (bytes > limit) {
+      throw new GitError("E2BIG", `${label} exceeds ${limit} UTF-8 bytes`);
+    }
+  }
+  return value;
 }
 
 /** Drops the config section. Remote-tracking refs are left alone. */
