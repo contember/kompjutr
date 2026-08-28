@@ -164,3 +164,4 @@ units over the same files, and a long sprint does not make that safe.
 - [60 — Consolidate operation limits and split the store](60-consolidate-limits-and-split-store.md)
 - [61 — Provide git as a synchronous shell command and the argv entry point](61-git-shell-command-and-argv-entry.md)
 - [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
+- [63 — Accept caller-supplied stdin and env for a shell run](63-shell-run-stdin-and-env.md)
