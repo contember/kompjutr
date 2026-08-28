@@ -25,6 +25,9 @@ export {
 export const SCHEMA_VERSION = 1;
 export const MAX_CHECKOUTS_PER_REPOSITORY = 1_024;
 export const MAX_CHECKOUT_ROOT_BYTES = 4_096;
+export const MAX_INDEX_PATH_BYTES = 8 * 1_024;
+export const MAX_SCRATCH_INDEXES_PER_REPOSITORY = 16;
+export const MAX_SCRATCH_INDEX_NAME_BYTES = 255;
 export const MAX_TRACKING_REF_REVISIONS = 100_000;
 export { MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 
@@ -234,7 +237,10 @@ const STATEMENTS = [
   // multi-valued keys ordered the way a config file would.
   `CREATE TABLE IF NOT EXISTS git_config (
      repo_id INTEGER NOT NULL,
-     path TEXT NOT NULL,
+     path TEXT NOT NULL CHECK (
+       typeof(path) = 'text'
+       AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+     ),
      seq INTEGER NOT NULL,
      value TEXT NOT NULL,
      PRIMARY KEY (repo_id, path, seq),
@@ -246,7 +252,10 @@ const STATEMENTS = [
   // written, so an unchanged file does not have to be re-hashed.
   `CREATE TABLE IF NOT EXISTS git_index (
      checkout_id INTEGER NOT NULL,
-     path TEXT NOT NULL,
+     path TEXT NOT NULL CHECK (
+       typeof(path) = 'text'
+       AND length(CAST(path AS BLOB)) BETWEEN 1 AND ${MAX_INDEX_PATH_BYTES}
+     ),
      stage INTEGER NOT NULL,
      mode INTEGER NOT NULL,
      oid TEXT NOT NULL,
@@ -257,6 +266,35 @@ const STATEMENTS = [
      PRIMARY KEY (checkout_id, path, stage),
      FOREIGN KEY (checkout_id) REFERENCES git_checkouts (id) ON DELETE CASCADE
    )`,
+
+  `CREATE TABLE IF NOT EXISTS git_scratch_indexes (
+     repo_id INTEGER NOT NULL CHECK (
+       typeof(repo_id) = 'integer' AND repo_id BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}
+     ),
+     name TEXT NOT NULL CHECK (
+       typeof(name) = 'text'
+       AND length(CAST(name AS BLOB)) BETWEEN 1 AND ${MAX_SCRATCH_INDEX_NAME_BYTES}
+       AND instr(name, char(0)) = 0
+     ),
+     PRIMARY KEY (repo_id, name),
+     FOREIGN KEY (repo_id) REFERENCES git_repositories (id) ON DELETE CASCADE
+   ) WITHOUT ROWID`,
+
+  `CREATE TABLE IF NOT EXISTS git_scratch_index_entries (
+     repo_id INTEGER NOT NULL,
+     name TEXT NOT NULL,
+     path TEXT NOT NULL,
+     stage INTEGER NOT NULL,
+     mode INTEGER NOT NULL,
+     oid TEXT NOT NULL,
+     size INTEGER,
+     mtime INTEGER,
+     ino INTEGER,
+     rev INTEGER,
+     PRIMARY KEY (repo_id, name, path, stage),
+     FOREIGN KEY (repo_id, name) REFERENCES git_scratch_indexes (repo_id, name)
+       ON DELETE CASCADE
+   ) WITHOUT ROWID`,
 
   `CREATE TABLE IF NOT EXISTS git_index_state (
      checkout_id INTEGER PRIMARY KEY,

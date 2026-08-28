@@ -12,7 +12,13 @@ import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/blob-id-cache.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { readMaintenanceRootEpoch } from "../src/sqlite/maintenance/control.js";
 import {
+  MAX_SCRATCH_INDEX_NAME_BYTES,
+  MAX_SCRATCH_INDEXES_PER_REPOSITORY,
+} from "../src/sqlite/schema.js";
+import {
   type IndexEntry,
+  type IndexSink,
+  type IndexStore,
   type InitialStateSession,
   SqliteGitDatabase,
 } from "../src/sqlite/store.js";
@@ -157,6 +163,63 @@ describe("indexScan", () => {
     const rest = [...store.indexScan({ after: { path: "a.txt", stage: 0 } })];
     expect(rest.map((row) => `${row.path}:${row.stage}`)).toEqual(["a.txt:2", "b.txt:0"]);
   });
+
+  it("rejects page sizes that can truncate or unbound either index store", () => {
+    const store = open();
+    store.indexPut(entry("tracked.txt"));
+    for (const pageSize of [0, -1, 2_049, 1.5, Number.NaN]) {
+      expect(() => [...store.indexScan({ pageSize })], String(pageSize)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+    }
+    expect([...store.indexScan({ pageSize: 2_048 })]).toEqual([entry("tracked.txt")]);
+
+    store.shared.withScratchIndex("page-size", (scratch) => {
+      scratch.indexReplace([entry("scratch.txt")]);
+      for (const pageSize of [0, -1, 2_049, 1.5, Number.NaN]) {
+        expect(() => [...scratch.indexScan({ pageSize })], String(pageSize)).toThrowError(
+          expect.objectContaining({ code: "EINVAL" }),
+        );
+      }
+      expect([...scratch.indexScan({ pageSize: 2_048 })]).toEqual([entry("scratch.txt")]);
+    });
+  });
+
+  it("rejects corrupt rows from checkout and scratch scans", () => {
+    const corruptions = [
+      "path = zeroblob(1)",
+      "stage = 4",
+      "mode = 0",
+      "oid = 'invalid'",
+      "size = -1",
+      "mtime = -1",
+      "ino = -1",
+      "rev = -1",
+    ];
+    for (const corruption of corruptions) {
+      const checkoutInner = new TestDatabase();
+      const checkout = open(checkoutInner);
+      checkout.indexPut(entry("corrupt.txt"));
+      checkoutInner.run("PRAGMA ignore_check_constraints = ON");
+      checkoutInner.run(`UPDATE git_index SET ${corruption}`);
+      checkoutInner.run("PRAGMA ignore_check_constraints = OFF");
+      expect(() => [...checkout.indexScan()], `checkout: ${corruption}`).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+
+      const scratchInner = new TestDatabase();
+      const scratchStore = open(scratchInner);
+      scratchStore.shared.withScratchIndex("corrupt", (scratch) => {
+        scratch.indexReplace([entry("corrupt.txt")]);
+        scratchInner.run("PRAGMA ignore_check_constraints = ON");
+        scratchInner.run(`UPDATE git_scratch_index_entries SET ${corruption}`);
+        scratchInner.run("PRAGMA ignore_check_constraints = OFF");
+        expect(() => [...scratch.indexScan()], `scratch: ${corruption}`).toThrowError(
+          expect.objectContaining({ code: "ECORRUPT" }),
+        );
+      });
+    }
+  });
 });
 
 describe("indexApply", () => {
@@ -260,9 +323,10 @@ describe("indexApply", () => {
     const inner = new TestDatabase();
     const db = new WidestDatabase(inner);
     const store = open(db);
-    const paths = Array.from({ length: 512 }, (_, index) => {
+    const paths = Array.from({ length: 1_024 }, (_, index) => {
       const prefix = `${String(index).padStart(4, "0")}-`;
-      return `${prefix}${"é".repeat(4_096 - prefix.length)}`;
+      const remaining = 2_200 - prefix.length;
+      return `${prefix}${"é".repeat(Math.floor(remaining / 2))}${remaining % 2 === 0 ? "" : "a"}`;
     });
     inner.storage.resetCounters();
     db.widestStringBytes = 0;
@@ -276,7 +340,8 @@ describe("indexApply", () => {
     const statements = inner.storage.statementCount;
     const stored = store.indexEntries();
 
-    expect(statements).toBe(10);
+    expect(statements).toBeGreaterThan(2);
+    expect(statements).toBeLessThan(10);
     expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
     expect(stored.map((row) => row.path)).toEqual(paths);
   });
@@ -333,6 +398,249 @@ describe("indexReplace", () => {
 
     expect(inner.storage.statementCount).toBe(39);
     expect(store.indexEntries()).toHaveLength(9_329);
+  });
+});
+
+describe("scratch indexes", () => {
+  it("isolates rows from the checkout index and revokes the escaped handle", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    store.indexPut(entry("checkout.txt", 0, "1".repeat(40)));
+    const rootEpoch = readMaintenanceRootEpoch(inner, store.repoId);
+    let escaped: IndexStore | undefined;
+    let escapedSink: IndexSink | undefined;
+
+    expect(
+      store.shared.withScratchIndex("snapshot", (scratch) => {
+        escaped = scratch;
+        scratch.indexReplace(
+          [entry("a.txt", 0, "2".repeat(40)), entry("conflict.txt", 2, "3".repeat(40))],
+          { flushEvery: 1 },
+        );
+        expect(scratch.hasConflicts()).toBe(true);
+        scratch.indexApply(
+          (sink) => {
+            escapedSink = sink;
+            sink.remove("conflict.txt");
+            sink.put(entry("z.txt", 0, "4".repeat(40)));
+          },
+          { flushEvery: 1 },
+        );
+        expect([...scratch.indexScan({ pageSize: 1 })]).toEqual([
+          entry("a.txt", 0, "2".repeat(40)),
+          entry("z.txt", 0, "4".repeat(40)),
+        ]);
+        return "captured";
+      }),
+    ).toBe("captured");
+
+    expect(store.indexEntries()).toEqual([entry("checkout.txt", 0, "1".repeat(40))]);
+    expect(readMaintenanceRootEpoch(inner, store.repoId)).toBe(rootEpoch);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+    const escapedHandle = escaped;
+    if (escapedHandle === undefined) throw new Error("scratch handle did not escape the callback");
+    expect(() => escapedHandle.indexScan().next()).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    const escapedMutationSink = escapedSink;
+    if (escapedMutationSink === undefined) throw new Error("index mutation sink did not escape");
+    expect(() => escapedMutationSink.put(entry("late.txt"))).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+  });
+
+  it("isolates names by repository, rejects duplicates, and enforces the session cap", () => {
+    const inner = new TestDatabase();
+    const database = new SqliteGitDatabase(inner);
+    const first = database.openCheckout(
+      database.createRepository("/first", "ref: refs/heads/main"),
+    );
+    const second = database.openCheckout(
+      database.createRepository("/second", "ref: refs/heads/main"),
+    );
+
+    first.shared.withScratchIndex("same", (firstScratch) => {
+      firstScratch.indexReplace([entry("first.txt")]);
+      second.shared.withScratchIndex("same", (secondScratch) => {
+        secondScratch.indexReplace([entry("second.txt")]);
+        expect([...firstScratch.indexScan()].map((row) => row.path)).toEqual(["first.txt"]);
+        expect([...secondScratch.indexScan()].map((row) => row.path)).toEqual(["second.txt"]);
+      });
+      expect(() => first.shared.withScratchIndex("same", () => undefined)).toThrowError(
+        expect.objectContaining({ code: "EEXIST" }),
+      );
+    });
+
+    const nest = (depth: number): void => {
+      if (depth === MAX_SCRATCH_INDEXES_PER_REPOSITORY) {
+        expect(() => first.shared.withScratchIndex(`slot-${depth}`, () => undefined)).toThrowError(
+          expect.objectContaining({ code: "E2BIG" }),
+        );
+        return;
+      }
+      first.shared.withScratchIndex(`slot-${depth}`, () => nest(depth + 1));
+    };
+    nest(0);
+
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+  });
+
+  it("poisons the outer transaction when it catches a nested callback failure", () => {
+    const inner = new TestDatabase();
+    const database = new SqliteGitDatabase(inner);
+    const first = database.openCheckout(
+      database.createRepository("/first", "ref: refs/heads/main"),
+    );
+    const second = database.openCheckout(
+      database.createRepository("/second", "ref: refs/heads/main"),
+    );
+    let thrownOid = "";
+
+    expect(() =>
+      first.shared.withScratchIndex("outer-throw", (outer) => {
+        outer.indexReplace([entry("outer.txt")]);
+        try {
+          second.shared.withScratchIndex("inner-throw", (nested) => {
+            nested.indexReplace([entry("inner.txt")]);
+            thrownOid = second.write("blob", utf8.encode("nested throw\n"));
+            throw new Error("nested failure");
+          });
+        } catch (error) {
+          expect(error).toEqual(expect.objectContaining({ message: "nested failure" }));
+        }
+        return "must not commit";
+      }),
+    ).toThrow("nested failure");
+    expect(second.read(thrownOid)).toBeNull();
+
+    let thenableOid = "";
+    expect(() =>
+      first.shared.withScratchIndex("outer-thenable", () => {
+        try {
+          first.shared.withScratchIndex("inner-thenable", (nested) => {
+            nested.indexReplace([entry("thenable.txt")]);
+            thenableOid = first.write("blob", utf8.encode("nested thenable\n"));
+            return Promise.resolve("late");
+          });
+        } catch (error) {
+          expect(error).toEqual(expect.objectContaining({ code: "EINVAL" }));
+        }
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(first.read(thenableOid)).toBeNull();
+
+    expect(inner.scalar<number>("SELECT count(*) FROM git_objects")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+    expect(first.shared.withScratchIndex("after-failure", () => 42)).toBe(42);
+  });
+
+  it("bounds UTF-8 names and parameterizes hostile text", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    const maximalName = `${"é".repeat((MAX_SCRATCH_INDEX_NAME_BYTES - 1) / 2)}a`;
+    expect(new TextEncoder().encode(maximalName)).toHaveLength(MAX_SCRATCH_INDEX_NAME_BYTES);
+    expect(store.shared.withScratchIndex(maximalName, () => 42)).toBe(42);
+
+    for (const invalid of ["", "nul\0name", "é".repeat(128)]) {
+      expect(() => store.shared.withScratchIndex(invalid, () => undefined)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+    }
+
+    const hostile = "x'); DELETE FROM git_repositories; --";
+    expect(() =>
+      store.shared.withScratchIndex(hostile, (scratch) => {
+        scratch.indexReplace([entry("hostile.txt")]);
+        throw new Error("rollback");
+      }),
+    ).toThrow("rollback");
+    expect(inner.scalar<number>("SELECT count(*) FROM git_repositories")).toBe(1);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+  });
+
+  it("rolls back rows and object caches after throw or thenable return", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    let thrownOid = "";
+    expect(() =>
+      store.shared.withScratchIndex("throw", (scratch) => {
+        scratch.indexReplace([entry("throw.txt")]);
+        thrownOid = store.write("blob", utf8.encode("throw\n"));
+        expect(store.read(thrownOid)?.data).toEqual(utf8.encode("throw\n"));
+        throw new Error("stop");
+      }),
+    ).toThrow("stop");
+    expect(store.read(thrownOid)).toBeNull();
+
+    let thenableOid = "";
+    expect(() =>
+      store.shared.withScratchIndex("thenable", (scratch) => {
+        scratch.indexReplace([entry("thenable.txt")]);
+        thenableOid = store.write("blob", utf8.encode("thenable\n"));
+        return Promise.resolve("late");
+      }),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(store.read(thenableOid)).toBeNull();
+
+    expect(() =>
+      store.shared.withScratchIndex("nested-thenable", (scratch) =>
+        scratch.indexApply((sink) => {
+          sink.put(entry("nested-thenable.txt"));
+          return Promise.resolve("late");
+        }),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+    expect(inner.scalar<number>("SELECT count(*) FROM git_objects")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
+
+    const reopenedDatabase = new SqliteGitDatabase(inner);
+    const checkout = reopenedDatabase.findCheckout("/repo");
+    if (checkout === null) throw new Error("checkout disappeared after scratch rollback");
+    const reopened = reopenedDatabase.openCheckout(checkout);
+    expect(reopened.read(thrownOid)).toBeNull();
+    expect(reopened.read(thenableOid)).toBeNull();
+  });
+
+  it("streams a maximal repository shape below the SQL and payload ceilings", () => {
+    const inner = new TestDatabase();
+    const db = new WidestDatabase(inner);
+    const store = open(db);
+    inner.storage.resetCounters();
+    db.widestBindings = 0;
+    db.widestRows = 0;
+    db.widestStringBytes = 0;
+
+    const rows = function* (): Generator<IndexEntry> {
+      for (let index = 0; index < 24_252; index++) {
+        yield entry(`dir/file-${String(index).padStart(5, "0")}.txt`);
+      }
+    };
+    const seen = store.shared.withScratchIndex("scale", (scratch) => {
+      scratch.indexReplace(rows());
+      let count = 0;
+      scratch.indexApply((sink) => {
+        for (const row of scratch.indexScan({ pageSize: 513 })) {
+          sink.remove(row.path);
+          sink.put({ ...row, size: 1 });
+          count++;
+        }
+      });
+      expect(scratch.hasConflicts()).toBe(false);
+      return count;
+    });
+
+    expect(seen).toBe(24_252);
+    expect(inner.storage.statementCount).toBeLessThan(1_000);
+    expect(db.widestRows).toBeLessThanOrEqual(513);
+    expect(db.widestBindings).toBeLessThanOrEqual(8);
+    expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
+    expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
   });
 });
 

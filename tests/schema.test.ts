@@ -27,6 +27,8 @@ const TABLE_OWNERSHIP = new Map<string, "global" | "shared" | "checkout">([
   ["git_reflog_state", "shared"],
   ["git_reflog_entries", "shared"],
   ["git_config", "shared"],
+  ["git_scratch_indexes", "shared"],
+  ["git_scratch_index_entries", "shared"],
   ["git_blob_id_state", "shared"],
   ["git_blob_ids", "shared"],
   ["git_shallow", "shared"],
@@ -114,6 +116,8 @@ const EXPECTED_SCHEMA_OBJECTS: readonly SchemaObject[] = [
   { type: "table", name: "git_reflog_state" },
   { type: "table", name: "git_refs" },
   { type: "table", name: "git_repositories" },
+  { type: "table", name: "git_scratch_index_entries" },
+  { type: "table", name: "git_scratch_indexes" },
   { type: "table", name: "git_shallow" },
   { type: "table", name: "git_tracking_ref_revisions" },
   { type: "table", name: "git_tree_effective" },
@@ -186,6 +190,11 @@ const EXPECTED_TABLE_COLUMNS: readonly (readonly [string, readonly string[]])[] 
   ],
   ["git_config", ["repo_id", "path", "seq", "value"]],
   ["git_index", ["checkout_id", "path", "stage", "mode", "oid", "size", "mtime", "ino", "rev"]],
+  ["git_scratch_indexes", ["repo_id", "name"]],
+  [
+    "git_scratch_index_entries",
+    ["repo_id", "name", "path", "stage", "mode", "oid", "size", "mtime", "ino", "rev"],
+  ],
   ["git_index_state", ["checkout_id", "baseline_tree_oid", "format", "complete"]],
   ["git_index_dirty", ["checkout_id", "path", "flags"]],
   [
@@ -509,6 +518,13 @@ describe("git schema", () => {
     expect(primaryKeyOf(db, "git_fetch_namespaces")).toEqual(["repo_id", "tracking_prefix"]);
     expect(primaryKeyOf(db, "git_tracking_ref_revisions")).toEqual(["repo_id", "ref_name"]);
     expect(primaryKeyOf(db, "git_index")).toEqual(["checkout_id", "path", "stage"]);
+    expect(primaryKeyOf(db, "git_scratch_indexes")).toEqual(["repo_id", "name"]);
+    expect(primaryKeyOf(db, "git_scratch_index_entries")).toEqual([
+      "repo_id",
+      "name",
+      "path",
+      "stage",
+    ]);
     expect(primaryKeyOf(db, "git_index_state")).toEqual(["checkout_id"]);
     expect(primaryKeyOf(db, "git_index_dirty")).toEqual(["checkout_id", "path"]);
     expect(primaryKeyOf(db, "git_operation_state")).toEqual(["checkout_id"]);
@@ -526,6 +542,13 @@ describe("git schema", () => {
     ]);
     expect(cascadeForeignKeysOf(db, "git_tracking_ref_revisions")).toEqual([
       { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_scratch_indexes")).toEqual([
+      { table: "git_repositories", from: "repo_id", to: "id" },
+    ]);
+    expect(cascadeForeignKeysOf(db, "git_scratch_index_entries")).toEqual([
+      { table: "git_scratch_indexes", from: "repo_id", to: "repo_id" },
+      { table: "git_scratch_indexes", from: "name", to: "name" },
     ]);
     for (const table of ["git_index", "git_index_state", "git_index_dirty"]) {
       expect(cascadeForeignKeysOf(db, table), table).toEqual([

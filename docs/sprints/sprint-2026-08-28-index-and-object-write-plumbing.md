@@ -227,3 +227,13 @@ git diff --check
 - 2026-08-28: WU0 pinned real Git behavior for missing and populated alternate
   indexes, empty and mixed-mode trees, unmerged stages, reset-with-update, exact
   commit messages, parent order and deduplication, and wrong-type objects.
+- 2026-08-28: WU1 added repository-scoped scratch headers and entries with a
+  16-session cap, synchronous scoped handles, bounded 2,048-row scans, shared
+  stored-row validation, and rollback-aware object-cache invalidation. A
+  24,252-row replace/mutate/scan cycle stayed below 1,000 statements and 1 MiB
+  per bound payload while leaving no scratch root or checkout-index mutation.
+- 2026-08-28: Independent WU1 review found that a caught nested callback error
+  could otherwise commit through the owning outer transaction. A per-database
+  poison coordinator now forces the outer rollback across repositories for both
+  throws and thenables; the new regression and all 149 focused store/schema
+  tests plus 37 commit tests pass.

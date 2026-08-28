@@ -103,6 +103,9 @@ import {
   initializeGitSchema,
   MAX_CHECKOUT_ROOT_BYTES,
   MAX_CHECKOUTS_PER_REPOSITORY,
+  MAX_INDEX_PATH_BYTES,
+  MAX_SCRATCH_INDEX_NAME_BYTES,
+  MAX_SCRATCH_INDEXES_PER_REPOSITORY,
   MAX_TRACKING_REF_REVISIONS,
 } from "./schema.js";
 import { indexSeededTreeSource, indexSeededTreeSources } from "./tree-index.js";
@@ -154,6 +157,7 @@ export const MAX_LOG_STATE_BYTES = 32 * 1024 * 1024;
 
 /** Index rows per round trip. This is the memory bound of a scan. */
 const DEFAULT_INDEX_PAGE = 1000;
+const MAX_INDEX_SCAN_PAGE = 2048;
 
 /** Index mutations buffered before a batch is applied. */
 const DEFAULT_INDEX_FLUSH = 512;
@@ -1383,7 +1387,7 @@ function validNullableIndexInteger(value: number | null | undefined): boolean {
   return value === null || value === undefined || (Number.isSafeInteger(value) && value >= 0);
 }
 
-function initialPathJsonBytes(path: string): number {
+function initialPathJsonBytes(path: string, maxUtf8Bytes = TREE_WALK_PATH_BYTES): number {
   if (path.length === 0 || path.charCodeAt(0) === 0x2f) {
     throw new CorruptError("initial index entry has an invalid path");
   }
@@ -1435,8 +1439,8 @@ function initialPathJsonBytes(path: string): number {
         jsonBytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
       }
     }
-    if (utf8Bytes > TREE_WALK_PATH_BYTES) {
-      throw new GitError("E2BIG", `initial index path exceeds ${TREE_WALK_PATH_BYTES} UTF-8 bytes`);
+    if (utf8Bytes > maxUtf8Bytes) {
+      throw new GitError("E2BIG", `initial index path exceeds ${maxUtf8Bytes} UTF-8 bytes`);
     }
   }
   const segmentLength = path.length - segmentStart;
@@ -1910,6 +1914,61 @@ export interface IndexSink {
   flush(): void;
 }
 
+/** The bounded ordered index operations shared by checkout and scratch rows. */
+export interface IndexStore {
+  indexScan(options?: IndexScanOptions): IterableIterator<IndexEntry>;
+  indexApply<T>(body: (sink: IndexSink) => T, options?: IndexApplyOptions): T;
+  indexReplace(entries: Iterable<IndexEntry>, options?: IndexApplyOptions): void;
+  hasConflicts(): boolean;
+}
+
+function requireIndexPageSize(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_INDEX_SCAN_PAGE) {
+    throw new GitError("EINVAL", `index scan page size must be from 1 to ${MAX_INDEX_SCAN_PAGE}`);
+  }
+  return value;
+}
+
+function requireStoredIndexFact(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new CorruptError(`stored index ${label} is invalid`);
+  }
+  return value;
+}
+
+function requireStoredIndexEntry(row: Record<string, unknown>): IndexEntry {
+  const path = row.path;
+  if (typeof path !== "string") throw new CorruptError("stored index path is invalid");
+  try {
+    initialPathJsonBytes(path, MAX_INDEX_PATH_BYTES);
+  } catch {
+    throw new CorruptError("stored index path is invalid");
+  }
+  const stage = row.stage;
+  if (typeof stage !== "number" || !Number.isSafeInteger(stage) || stage < 0 || stage > 3) {
+    throw new CorruptError("stored index stage is invalid");
+  }
+  const mode = row.mode;
+  if (mode !== 0o100644 && mode !== 0o100755 && mode !== 0o120000 && mode !== 0o160000) {
+    throw new CorruptError("stored index mode is invalid");
+  }
+  const oid = row.oid;
+  if (typeof oid !== "string" || !isOid(oid)) {
+    throw new CorruptError("stored index oid is invalid");
+  }
+  return {
+    path,
+    stage,
+    mode,
+    oid,
+    size: requireStoredIndexFact(row.size, "size"),
+    mtime: requireStoredIndexFact(row.mtime, "mtime"),
+    ino: requireStoredIndexFact(row.ino, "inode"),
+    rev: requireStoredIndexFact(row.rev, "revision"),
+  };
+}
+
 /** Canonicalise an absolute workspace path without consulting the filesystem. */
 export function normalizeRoot(path: string): string {
   const segments: string[] = [];
@@ -1919,6 +1978,20 @@ export function normalizeRoot(path: string): string {
     else segments.push(segment);
   }
   return segments.length === 0 ? "/" : `/${segments.join("/")}`;
+}
+
+function requireScratchIndexName(value: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new GitError("EINVAL", "scratch index name must be non-empty UTF-8 text");
+  }
+  const bytes = JSON_ENCODER.encode(value).byteLength;
+  if (bytes < 1 || bytes > MAX_SCRATCH_INDEX_NAME_BYTES) {
+    throw new GitError(
+      "EINVAL",
+      `scratch index name must be from 1 to ${MAX_SCRATCH_INDEX_NAME_BYTES} UTF-8 bytes`,
+    );
+  }
+  return value;
 }
 
 const checkoutTextEncoder = new TextEncoder();
@@ -2106,6 +2179,65 @@ class CheckoutStoreLifetime {
   }
 }
 
+interface ScratchStorageCache {
+  revalidateStorageCaches(): void;
+}
+
+class ScratchTransactionCoordinator {
+  #depth = 0;
+  #failed = false;
+  #failure: unknown;
+  readonly #storageWrites = new Set<ScratchStorageCache>();
+
+  enter(): boolean {
+    const outermost = this.#depth === 0;
+    this.#depth++;
+    return outermost;
+  }
+
+  fail(error: unknown): void {
+    if (this.#failed) return;
+    this.#failed = true;
+    this.#failure = error;
+  }
+
+  requireHealthy(): void {
+    if (this.#failed) throw this.#failure;
+  }
+
+  markStorageWrite(store: ScratchStorageCache): void {
+    if (this.#depth > 0) this.#storageWrites.add(store);
+  }
+
+  leave(): void {
+    if (this.#depth < 1) throw new CorruptError("scratch transaction depth underflowed");
+    this.#depth--;
+  }
+
+  finish(): { failed: boolean; failure: unknown; storageWrites: ScratchStorageCache[] } {
+    if (this.#depth !== 0) throw new CorruptError("scratch transaction depth did not close");
+    const result = {
+      failed: this.#failed,
+      failure: this.#failure,
+      storageWrites: [...this.#storageWrites],
+    };
+    this.#failed = false;
+    this.#failure = undefined;
+    this.#storageWrites.clear();
+    return result;
+  }
+}
+
+const scratchTransactionsByDatabase = new WeakMap<SqlDatabase, ScratchTransactionCoordinator>();
+
+function scratchTransactionsFor(db: SqlDatabase): ScratchTransactionCoordinator {
+  const existing = scratchTransactionsByDatabase.get(db);
+  if (existing !== undefined) return existing;
+  const created = new ScratchTransactionCoordinator();
+  scratchTransactionsByDatabase.set(db, created);
+  return created;
+}
+
 /** Canonical resources shared by every checkout view of one Git store. */
 export class SharedRepoStore {
   readonly db: SqlDatabase;
@@ -2114,6 +2246,7 @@ export class SharedRepoStore {
   readonly packRows: ByteLru<string, Uint8Array>;
   readonly memory: MemoryCoordinator;
   readonly cacheNamespace: string;
+  readonly #scratchTransactions: ScratchTransactionCoordinator;
   #packs: PackStore | null = null;
   #operations: CheckoutStore | null = null;
   #cacheGeneration = 0;
@@ -2133,6 +2266,7 @@ export class SharedRepoStore {
     this.objects = objects;
     this.packRows = packRows;
     this.memory = memory;
+    this.#scratchTransactions = scratchTransactionsFor(db);
     this.cacheNamespace = `${repoId}:${storeGeneration}`;
     const availability = db.one<{ has_loose: unknown }>(
       `SELECT
@@ -2160,6 +2294,90 @@ export class SharedRepoStore {
     if (this.#operations === null) this.#operations = operations;
   }
 
+  /** Run one named scratch index inside the caller's synchronous transaction. */
+  withScratchIndex<T>(name: string, body: (index: IndexStore) => T): T {
+    const checkedName = requireScratchIndexName(name);
+    const outermost = this.#scratchTransactions.enter();
+    let opened = false;
+    try {
+      const result = this.db.transactionSync(() => {
+        this.#scratchTransactions.requireHealthy();
+        const existing = requireBooleanProbe(
+          this.db.scalar<unknown>(
+            `SELECT EXISTS(
+               SELECT 1 FROM git_scratch_indexes WHERE repo_id = ? AND name = ? LIMIT 1
+             )`,
+            this.repoId,
+            checkedName,
+          ),
+          "scratch index existence probe",
+        );
+        if (existing) {
+          throw new GitError("EEXIST", `scratch index ${checkedName} is already active`);
+        }
+        const storedCount = this.db.scalar<unknown>(
+          `SELECT count(*) FROM (
+             SELECT 1 FROM git_scratch_indexes WHERE repo_id = ?
+             LIMIT ${MAX_SCRATCH_INDEXES_PER_REPOSITORY + 1}
+           )`,
+          this.repoId,
+        );
+        if (
+          typeof storedCount !== "number" ||
+          !Number.isSafeInteger(storedCount) ||
+          storedCount < 0 ||
+          storedCount > MAX_SCRATCH_INDEXES_PER_REPOSITORY
+        ) {
+          throw new CorruptError("scratch index count is invalid");
+        }
+        if (storedCount >= MAX_SCRATCH_INDEXES_PER_REPOSITORY) {
+          throw new GitError(
+            "E2BIG",
+            `repository already has ${MAX_SCRATCH_INDEXES_PER_REPOSITORY} active scratch indexes`,
+          );
+        }
+        this.db.run(
+          "INSERT INTO git_scratch_indexes (repo_id, name) VALUES (?, ?)",
+          this.repoId,
+          checkedName,
+        );
+        opened = true;
+        const scratch = new ScratchIndexStore(this.db, this.repoId, checkedName);
+        try {
+          const result = body(scratch);
+          if (isThenableResult(result)) {
+            void Promise.resolve(result).catch(() => {});
+            throw new GitError("EINVAL", "scratch index callback must be synchronous");
+          }
+          this.#scratchTransactions.requireHealthy();
+          const deleted = this.db.one<Record<string, unknown>>(
+            `DELETE FROM git_scratch_indexes WHERE repo_id = ? AND name = ?
+             RETURNING repo_id, name`,
+            this.repoId,
+            checkedName,
+          );
+          if (deleted?.repo_id !== this.repoId || deleted.name !== checkedName) {
+            throw new CorruptError("scratch index ownership changed before cleanup");
+          }
+          return result;
+        } finally {
+          scratch.revoke();
+        }
+      });
+      this.#scratchTransactions.leave();
+      if (outermost) this.#scratchTransactions.finish();
+      return result;
+    } catch (error) {
+      if (opened) this.#scratchTransactions.fail(error);
+      this.#scratchTransactions.leave();
+      if (!outermost) throw error;
+      const outcome = this.#scratchTransactions.finish();
+      for (const store of outcome.storageWrites) store.revalidateStorageCaches();
+      if (outcome.failed) throw outcome.failure;
+      throw error;
+    }
+  }
+
   #ops(): CheckoutStore {
     if (this.#operations === null) {
       throw new CorruptError("shared repository operations facade is unavailable");
@@ -2179,6 +2397,7 @@ export class SharedRepoStore {
   }
 
   markLoose(): void {
+    this.#scratchTransactions.markStorageWrite(this);
     this.#hasLoose = true;
   }
 
@@ -3750,8 +3969,228 @@ export class SqliteGitDatabase {
   }
 }
 
+/** Repository-scoped index rows whose lifetime is one synchronous callback. */
+class ScratchIndexStore implements IndexStore {
+  readonly #db: SqlDatabase;
+  readonly #repoId: number;
+  readonly #name: string;
+  #active = true;
+
+  constructor(db: SqlDatabase, repoId: number, name: string) {
+    this.#db = db;
+    this.#repoId = repoId;
+    this.#name = name;
+  }
+
+  revoke(): void {
+    this.#active = false;
+  }
+
+  #requireActive(): void {
+    if (!this.#active) {
+      throw new GitError("EINVAL", "scratch index session is no longer active");
+    }
+  }
+
+  #applyIndexMutations(pending: readonly BufferedIndexMutation[]): void {
+    this.#requireActive();
+    const hasRemoves = pending.some((item) => item.kind === "r");
+    const hasPuts = pending.some((item) => item.kind === "p");
+    const mutations = `[${pending.map((item) => item.json).join(",")}]`;
+    if (hasRemoves) {
+      this.#db.run(
+        `DELETE FROM git_scratch_index_entries
+          WHERE repo_id = ? AND name = ?
+            AND path IN (
+              SELECT json_extract(value, '$.p') FROM json_each(?)
+               WHERE json_extract(value, '$.k') = 'r'
+            )`,
+        this.#repoId,
+        this.#name,
+        mutations,
+      );
+    }
+    if (!hasPuts) return;
+    this.#db.run(
+      `WITH mutation AS (
+         SELECT CAST(j.key AS INTEGER) AS q,
+                json_extract(j.value, '$.k') AS kind,
+                json_extract(j.value, '$.p') AS path,
+                json_extract(j.value, '$.g') AS stage,
+                json_extract(j.value, '$.m') AS mode,
+                json_extract(j.value, '$.o') AS oid,
+                json_extract(j.value, '$.s') AS size,
+                json_extract(j.value, '$.t') AS mtime,
+                json_extract(j.value, '$.i') AS ino,
+                json_extract(j.value, '$.r') AS rev
+           FROM json_each(?) j
+       ), ranked AS (
+         SELECT mutation.*,
+                max(CASE WHEN kind = 'r' THEN q ELSE -1 END)
+                  OVER (PARTITION BY path) AS last_remove,
+                max(CASE WHEN kind = 'p' THEN q ELSE -1 END)
+                  OVER (PARTITION BY path, stage) AS last_put
+           FROM mutation
+       )
+       INSERT INTO git_scratch_index_entries
+         (repo_id, name, path, stage, mode, oid, size, mtime, ino, rev)
+       SELECT ?, ?, current.path, current.stage, current.mode, current.oid,
+              current.size, current.mtime, current.ino, current.rev
+         FROM ranked current
+        WHERE current.kind = 'p'
+          AND current.q = current.last_put
+          AND current.q > current.last_remove
+        ORDER BY current.q
+       ON CONFLICT(repo_id, name, path, stage) DO UPDATE SET
+         mode = excluded.mode, oid = excluded.oid, size = excluded.size,
+         mtime = excluded.mtime, ino = excluded.ino, rev = excluded.rev`,
+      mutations,
+      this.#repoId,
+      this.#name,
+    );
+  }
+
+  indexReplace(entries: Iterable<IndexEntry>, options: IndexApplyOptions = {}): void {
+    this.#requireActive();
+    const flushEvery = options.flushEvery ?? DEFAULT_INDEX_FLUSH;
+    let first = true;
+    const pending = new IndexMutationBuffer(flushEvery, (mutations) => {
+      this.#db.transactionSync(() => {
+        this.#requireActive();
+        if (first) {
+          this.#db.run(
+            "DELETE FROM git_scratch_index_entries WHERE repo_id = ? AND name = ?",
+            this.#repoId,
+            this.#name,
+          );
+        }
+        this.#applyIndexMutations(mutations);
+      });
+      first = false;
+    });
+    for (const entry of entries) pending.add(entry);
+    pending.flush();
+    if (first) {
+      this.#db.run(
+        "DELETE FROM git_scratch_index_entries WHERE repo_id = ? AND name = ?",
+        this.#repoId,
+        this.#name,
+      );
+    }
+  }
+
+  *indexScan(options: IndexScanOptions = {}): Generator<IndexEntry> {
+    this.#requireActive();
+    const pageSize = requireIndexPageSize(options.pageSize ?? DEFAULT_INDEX_PAGE);
+    const prefix = options.prefix;
+    let path = options.after?.path ?? "";
+    let stage = options.after?.stage ?? -1;
+
+    for (;;) {
+      this.#requireActive();
+      const page =
+        prefix === undefined || prefix === ""
+          ? this.#db.all<Record<string, unknown>>(
+              `SELECT path, stage, mode, oid, size, mtime, ino, rev
+                 FROM git_scratch_index_entries
+                WHERE repo_id = ? AND name = ?
+                  AND (path > ? OR (path = ? AND stage > ?))
+                ORDER BY path, stage LIMIT ?`,
+              this.#repoId,
+              this.#name,
+              path,
+              path,
+              stage,
+              pageSize,
+            )
+          : this.#db.all<Record<string, unknown>>(
+              `SELECT path, stage, mode, oid, size, mtime, ino, rev
+                 FROM git_scratch_index_entries
+                WHERE repo_id = ? AND name = ?
+                  AND (path > ? OR (path = ? AND stage > ?))
+                  AND (path = ? OR (path >= ? AND path < ?))
+                ORDER BY path, stage LIMIT ?`,
+              this.#repoId,
+              this.#name,
+              path,
+              path,
+              stage,
+              prefix,
+              `${prefix}/`,
+              nextPrefix(`${prefix}/`),
+              pageSize,
+            );
+      if (page.length === 0) return;
+      let last: IndexEntry | undefined;
+      for (const row of page) {
+        const entry = requireStoredIndexEntry(row);
+        last = entry;
+        yield entry;
+      }
+      if (last === undefined) throw new CorruptError("scratch index page lost its last row");
+      path = last.path;
+      stage = last.stage;
+      if (page.length < pageSize) return;
+    }
+  }
+
+  indexApply<T>(body: (sink: IndexSink) => T, options: IndexApplyOptions = {}): T {
+    this.#requireActive();
+    const flushEvery = options.flushEvery ?? DEFAULT_INDEX_FLUSH;
+    const pending = new IndexMutationBuffer(flushEvery, (mutations) => {
+      this.#db.transactionSync(() => this.#applyIndexMutations(mutations));
+    });
+    let sinkActive = true;
+    const requireSinkActive = (): void => {
+      this.#requireActive();
+      if (!sinkActive) throw new GitError("EINVAL", "index mutation sink is no longer active");
+    };
+    const sink: IndexSink = {
+      put: (entry) => {
+        requireSinkActive();
+        pending.add(entry);
+      },
+      remove: (path) => {
+        requireSinkActive();
+        pending.add(path);
+      },
+      flush: () => {
+        requireSinkActive();
+        pending.flush();
+      },
+    };
+    try {
+      const result = body(sink);
+      if (isThenableResult(result)) {
+        void Promise.resolve(result).catch(() => {});
+        throw new GitError("EINVAL", "index mutation callback must be synchronous");
+      }
+      pending.flush();
+      return result;
+    } finally {
+      sinkActive = false;
+      pending.dispose();
+    }
+  }
+
+  hasConflicts(): boolean {
+    this.#requireActive();
+    return requireBooleanProbe(
+      this.#db.scalar<unknown>(
+        `SELECT EXISTS(
+           SELECT 1 FROM git_scratch_index_entries
+            WHERE repo_id = ? AND name = ? AND stage > 0 LIMIT 1
+         )`,
+        this.#repoId,
+        this.#name,
+      ),
+      "scratch index conflict probe",
+    );
+  }
+}
+
 /** Checkout-bound storage view. */
-export class CheckoutStore {
+export class CheckoutStore implements IndexStore {
   readonly #sharedStore: SharedRepoStore;
   readonly #database: SqlDatabase;
   readonly #repoId: number;
@@ -7675,21 +8114,22 @@ export class CheckoutStore {
   }
 
   indexEntries(): IndexEntry[] {
-    return this.#db.all<IndexEntry>(
-      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id = ? ORDER BY path, stage",
-      this.#checkoutId,
-    );
+    return this.#db
+      .all<Record<string, unknown>>(
+        "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id = ? ORDER BY path, stage",
+        this.#checkoutId,
+      )
+      .map(requireStoredIndexEntry);
   }
 
   indexGet(path: string, stage = 0): IndexEntry | null {
-    return (
-      this.#db.one<IndexEntry>(
-        "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id = ? AND path = ? AND stage = ?",
-        this.#checkoutId,
-        path,
-        stage,
-      ) ?? null
+    const row = this.#db.one<Record<string, unknown>>(
+      "SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index WHERE checkout_id = ? AND path = ? AND stage = ?",
+      this.#checkoutId,
+      path,
+      stage,
     );
+    return row === undefined ? null : requireStoredIndexEntry(row);
   }
 
   indexPut(entry: IndexEntry): void {
@@ -7821,7 +8261,7 @@ export class CheckoutStore {
    * not. `indexApply` is the shape that makes obeying this the easy path.
    */
   *indexScan(options: IndexScanOptions = {}): Generator<IndexEntry> {
-    const pageSize = options.pageSize ?? DEFAULT_INDEX_PAGE;
+    const pageSize = requireIndexPageSize(options.pageSize ?? DEFAULT_INDEX_PAGE);
     const prefix = options.prefix;
     let path = options.after?.path ?? "";
     let stage = options.after?.stage ?? -1;
@@ -7829,7 +8269,7 @@ export class CheckoutStore {
     for (;;) {
       const page =
         prefix === undefined || prefix === ""
-          ? this.#db.all<IndexEntry>(
+          ? this.#db.all<Record<string, unknown>>(
               `SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index
                WHERE checkout_id = ? AND (path > ? OR (path = ? AND stage > ?))
                ORDER BY path, stage LIMIT ?`,
@@ -7839,7 +8279,7 @@ export class CheckoutStore {
               stage,
               pageSize,
             )
-          : this.#db.all<IndexEntry>(
+          : this.#db.all<Record<string, unknown>>(
               `SELECT path, stage, mode, oid, size, mtime, ino, rev FROM git_index
                WHERE checkout_id = ? AND (path > ? OR (path = ? AND stage > ?))
                  AND (path = ? OR (path >= ? AND path < ?))
@@ -7854,8 +8294,13 @@ export class CheckoutStore {
               pageSize,
             );
       if (page.length === 0) return;
-      for (const entry of page) yield entry;
-      const last = page[page.length - 1]!;
+      let last: IndexEntry | undefined;
+      for (const row of page) {
+        const entry = requireStoredIndexEntry(row);
+        last = entry;
+        yield entry;
+      }
+      if (last === undefined) throw new CorruptError("checkout index page lost its last row");
       path = last.path;
       stage = last.stage;
       if (page.length < pageSize) return;

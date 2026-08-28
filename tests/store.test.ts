@@ -117,6 +117,8 @@ describe("repository registry", () => {
       "git_reflog_state",
       "git_refs",
       "git_repositories",
+      "git_scratch_index_entries",
+      "git_scratch_indexes",
       "git_shallow",
       "git_tracking_ref_revisions",
       "git_tree_effective",
