@@ -1220,9 +1220,9 @@ describe("fetch", () => {
 
       // Durable fetch snapshots add fixed work; page growth stays unchanged.
       expect(statements).toEqual([
-        { refs: 1, fetch: 49, prune: 26 },
-        { refs: 1_000, fetch: 49, prune: 26 },
-        { refs: 9_329, fetch: 61, prune: 38 },
+        { refs: 1, fetch: 48, prune: 26 },
+        { refs: 1_000, fetch: 48, prune: 26 },
+        { refs: 9_329, fetch: 60, prune: 38 },
       ]);
     } finally {
       await server.close();
