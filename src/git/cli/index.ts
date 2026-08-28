@@ -1,4 +1,6 @@
+import type { GitContext } from "../../core/context.js";
 import { parseGitCliInput } from "./parse.js";
+import { createGitCliReadHandlers } from "./read.js";
 import { boundedGitCliResult, resolveGitCliRunOptions } from "./result.js";
 import type {
   GitCliHandlers,
@@ -10,6 +12,7 @@ import type {
   ParsedGitCliCommand,
   ResolvedGitCliRunOptions,
 } from "./types.js";
+import { createGitCliWriteHandlers } from "./write.js";
 
 export * from "./parse.js";
 export * from "./result.js";
@@ -32,6 +35,14 @@ export function createGitCliRunner(handlers: GitCliHandlers): GitCliRunner {
       return runGitCli(input, handlers, options);
     },
   };
+}
+
+/** Bind the complete argv dispatcher to one Git context. */
+export function createContextGitCliRunner(context: GitContext): GitCliRunner {
+  return createGitCliRunner({
+    ...createGitCliReadHandlers(context),
+    ...createGitCliWriteHandlers(context),
+  });
 }
 
 function dispatch(

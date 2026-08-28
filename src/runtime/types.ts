@@ -1,4 +1,7 @@
 import type { Filesystem } from "../fs/types.js";
+import type { GitCliInput, GitCliResult } from "../git/cli/types.js";
+
+export type { GitCliInput, GitCliResult } from "../git/cli/types.js";
 
 /** The async mirror. Every function returns a Promise. */
 export type Async<T> = {
@@ -42,19 +45,6 @@ export interface ProcessExecOptions {
 
 export interface ProcessHost {
   exec(command: string, options?: ProcessExecOptions): Promise<ProcessHandle>;
-}
-
-export interface GitCliInput {
-  argv: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  stdin?: string;
-}
-
-export interface GitCliResult {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
 }
 
 /** Exactly what a dynamically loaded Worker may reach. */

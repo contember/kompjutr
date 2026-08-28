@@ -67,6 +67,8 @@ import {
 } from "../../core/ops/staging.js";
 import { clean as cleanOp, status as statusOp } from "../../core/ops/status.js";
 import type { Repository } from "../../core/repository.js";
+import { createContextGitCliRunner } from "../../git/cli/index.js";
+import type { GitCliRunner } from "../../git/cli/types.js";
 import { iterateSqlCursor, type SqlDatabase } from "../../sqlite/db.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../sqlite/store.js";
 import { ComputerWorktree } from "./worktree.js";
@@ -107,6 +109,11 @@ export function createSqliteGitClient(
     };
     const at = (dir?: string): Repository => openRepository(ctx(), dir ?? "/");
     const excludeRoots = (repo: Repository): string[] => nestedRoots(ctx(), repo.root);
+    let cliRunner: GitCliRunner | undefined;
+    const cli = (): GitCliRunner => {
+      if (cliRunner === undefined) cliRunner = createContextGitCliRunner(ctx());
+      return cliRunner;
+    };
 
     const client: GitClient = {
       async clone(input) {
@@ -329,8 +336,8 @@ export function createSqliteGitClient(
       async stashPop() {
         throw new UnsupportedOperationError("stash pop");
       },
-      async cli() {
-        throw new UnsupportedOperationError("the argv entry point");
+      async cli(input) {
+        return cli().runCli(input);
       },
     };
     return client;

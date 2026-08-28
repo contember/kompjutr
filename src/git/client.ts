@@ -90,7 +90,6 @@ export type {
   RemoteTarget,
 } from "../core/ops/refspec.js";
 
-import type { LsFilesOptions } from "../core/ops/pathspec.js";
 import {
   type CatFileOptions,
   type CommitTreeOptions,
@@ -169,7 +168,8 @@ import {
 import {
   type AddOptions,
   add as addOp,
-  lsFiles as lsFilesOp,
+  type LsFilesWorktreeOptions,
+  lsFilesWithWorktree,
   type ResetOptions,
   type RmOptions,
   reset as resetOp,
@@ -203,6 +203,8 @@ import type {
 } from "../core/sparse-workspace.js";
 import type { Worktree } from "../core/worktree.js";
 import type { SqliteGitDatabase } from "../sqlite/store.js";
+import { createContextGitCliRunner } from "./cli/index.js";
+import type { GitCliInput, GitCliResult, GitCliRunner, GitCliRunOptions } from "./cli/types.js";
 
 export interface GitDirOptions {
   dir?: string;
@@ -250,7 +252,8 @@ export type GitCommitTreeOptions = CommitTreeOptions & GitDirOptions;
 export type GitUpdateRefOptions = UpdateRefOptions & GitDirOptions;
 export type GitDivergenceOptions = DivergenceOptions & GitDirOptions;
 export type GitMergeBaseOptions = MergeBaseOptions & GitDirOptions;
-export type GitLsFilesOptions = Pick<LsFilesOptions, "paths"> & GitDirOptions & { ref?: string };
+export type GitLsFilesOptions = Omit<LsFilesWorktreeOptions, "excludeRoots"> &
+  GitDirOptions & { ref?: string };
 export type GitLsTreeOptions = LsTreeOptions & GitDirOptions & { ref: string; path?: string };
 export type GitReadRefOptions = ReadRefOptions & GitDirOptions;
 export type GitRefLogOptions = RefLogReadOptions & GitDirOptions;
@@ -292,7 +295,7 @@ export interface GitScratchIndexOptions extends GitDirOptions {
 
 export type GitScratchIndexCallback<T> = (index: GitScratchIndex) => T;
 
-export interface Git {
+export interface Git extends GitCliRunner {
   clone(input: GitCloneOptions): Promise<void>;
   fetch(input?: GitFetchOptions): Promise<StructuredFetchResult>;
   lsRemote(input?: GitLsRemoteOptions): Promise<StructuredLsRemoteResult>;
@@ -366,7 +369,7 @@ export interface Git {
   stashPush(input?: GitDirOptions): Promise<never>;
   stashList(input?: GitDirOptions): Promise<never>;
   stashPop(input?: GitDirOptions): Promise<never>;
-  cli(input: GitDirOptions & { argv: string[] }): Promise<never>;
+  cli(input: GitCliInput): Promise<GitCliResult>;
 }
 
 export interface GitWorkspaceBinding {
@@ -426,6 +429,7 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
   if (binding.commitTrees !== undefined) context.commitTrees = binding.commitTrees;
   const yieldNow = options.yieldNow ?? binding.yieldNow;
   if (yieldNow !== undefined) context.yieldNow = yieldNow;
+  const cliRunner = createContextGitCliRunner(context);
 
   const at = (dir?: string): Repository => openRepository(context, dir ?? "/");
   const excludeRoots = (repo: Repository): string[] => nestedRoots(context, repo.root);
@@ -567,9 +571,14 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async lsFiles(input = {}) {
       const { dir, ref, ...lsFilesOptions } = input;
       const repo = at(dir);
-      return ref === undefined
-        ? lsFilesOp(repo, lsFilesOptions)
-        : lsFilesAtRef(repo, ref, lsFilesOptions);
+      if (ref !== undefined) {
+        rejectRefWorktreeSelection(input);
+        return lsFilesAtRef(repo, ref, lsFilesOptions);
+      }
+      return lsFilesWithWorktree(repo, context.worktree, {
+        ...lsFilesOptions,
+        excludeRoots: excludeRoots(repo),
+      });
     },
     async lsTree(input) {
       return lsTreeOp(at(input.dir), input.ref, input.path, { recursive: input.recursive });
@@ -763,10 +772,21 @@ function createGitClient(binding: GitWorkspaceBinding, options: CreateGitOptions
     async stashPop() {
       throw new UnsupportedOperationError("stash pop");
     },
-    async cli() {
-      throw new UnsupportedOperationError("the argv entry point");
+    runCli(input: GitCliInput, runOptions?: GitCliRunOptions) {
+      return cliRunner.runCli(input, runOptions);
+    },
+    async cli(input) {
+      return cliRunner.runCli(input);
     },
   };
+}
+
+function rejectRefWorktreeSelection(input: GitLsFilesOptions): void {
+  for (const key of ["cached", "others", "excludeStandard"]) {
+    if (Reflect.has(input, key)) {
+      throw new GitError("EINVAL", `ls-files ${key} is unavailable with ref`);
+    }
+  }
 }
 
 function publicStatusEntry(row: StatusDetail): StatusEntry {

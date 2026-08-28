@@ -28,11 +28,14 @@ import {
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
 const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 
-function makeWorkspace(): { workspace: Workspace; storage: SqliteTestStorage } {
+function makeWorkspace(now = 1_600_000_000_000): {
+  workspace: Workspace;
+  storage: SqliteTestStorage;
+} {
   const storage = new SqliteTestStorage();
   const workspace = new Workspace({
     storage,
-    git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
+    git: createSqliteGitClient({ now: () => now }),
     defaultGitIdentity: IDENTITY,
   });
   return { workspace, storage };
@@ -577,6 +580,55 @@ describe("createSqliteGitClient", () => {
     await expect(git.lsFiles({ dir, ref: "HEAD", paths: ["dir/*.ts"] })).resolves.toEqual([
       "dir/nested/two.ts",
       "dir/one.ts",
+    ]);
+  });
+
+  it("selects cached and non-ignored untracked builder files", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/ls-files-builder";
+    await git.init({ dir });
+    writeWorkFile(workspace, `${dir}/.gitignore`, "*.tmp\n");
+    writeWorkFile(workspace, `${dir}/tracked.ts`, "tracked\n");
+    await git.add({ dir, paths: [".gitignore", "tracked.ts"] });
+    await git.commit({ dir, message: "tracked" });
+    writeWorkFile(workspace, `${dir}/src/new.ts`, "new\n");
+    writeWorkFile(workspace, `${dir}/src/ignored.tmp`, "ignored\n");
+    writeWorkFile(workspace, `${dir}/nested/foreign.ts`, "nested\n");
+    await git.init({ dir: `${dir}/nested` });
+
+    await expect(git.lsFiles({ dir })).resolves.toEqual([".gitignore", "tracked.ts"]);
+    await expect(
+      git.lsFiles({
+        dir,
+        cached: true,
+        others: true,
+        excludeStandard: true,
+        paths: ["*.ts"],
+      }),
+    ).resolves.toEqual(["src/new.ts", "tracked.ts"]);
+    await expect(git.lsFiles({ dir, others: true })).resolves.toEqual([
+      "src/ignored.tmp",
+      "src/new.ts",
+    ]);
+    await expect(git.lsFiles({ dir, cached: false, others: false })).resolves.toEqual([]);
+  });
+
+  it("rejects worktree lsFiles selection at a ref", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/ls-files-ref-selection";
+    await git.init({ dir });
+    writeWorkFile(workspace, `${dir}/tracked.ts`, "tracked\n");
+    await git.add({ dir, paths: ["tracked.ts"] });
+    await git.commit({ dir, message: "tracked" });
+
+    await expect(git.lsFiles({ dir, ref: "HEAD", others: true })).rejects.toMatchObject({
+      code: "EINVAL",
+    });
+    await expect(git.lsFiles({ dir, ref: "HEAD", excludeStandard: false })).rejects.toMatchObject({
+      code: "EINVAL",
+    });
+    await expect(git.lsFiles({ dir, ref: "HEAD", paths: ["*.ts"] })).resolves.toEqual([
+      "tracked.ts",
     ]);
   });
 
@@ -1450,14 +1502,67 @@ describe("createSqliteGitClient", () => {
     expect(clientControlState(workspace, "/")).toEqual(beforeControl);
   });
 
+  it("routes native and Computer argv CLI through the same dispatcher", async () => {
+    const clock = 1_577_836_800_000;
+    const native = makeNativeGit();
+    const { workspace: computer } = makeWorkspace(clock);
+    const nativeGit = native.git;
+    const computerGit = computer.git;
+    const dir = "/argv-repo";
+    await nativeGit.init({ dir });
+    await computerGit.init({ dir });
+    writeWorkFile(native.workspace, `${dir}/sub/file.txt`, "one\n");
+    await computer.fs.mkdir(`${dir}/sub`, { recursive: true });
+    await computer.fs.writeFile(`${dir}/sub/file.txt`, "one\n");
+
+    const statusInput = { argv: ["status", "--porcelain"], cwd: `${dir}/sub` };
+    const nativeStatus = nativeGit.runCli(statusInput);
+    expect(await nativeGit.cli(statusInput)).toEqual(nativeStatus);
+    expect(await computerGit.cli(statusInput)).toEqual(nativeStatus);
+    expect(nativeStatus).toEqual({ stdout: "?? sub/\n", stderr: "", exitCode: 0 });
+
+    const addInput = { argv: ["add", "file.txt"], cwd: `${dir}/sub` };
+    expect(await computerGit.cli(addInput)).toEqual(await nativeGit.cli(addInput));
+    const env = {
+      GIT_AUTHOR_NAME: "CLI Author",
+      GIT_AUTHOR_EMAIL: "author@example.com",
+      GIT_COMMITTER_NAME: "CLI Committer",
+      GIT_COMMITTER_EMAIL: "committer@example.com",
+    };
+    const commitInput = { argv: ["commit", "-m", "from argv"], cwd: dir, env };
+    expect(await computerGit.cli(commitInput)).toEqual(await nativeGit.cli(commitInput));
+
+    for (const input of [
+      { argv: ["symbolic-ref", "--short", "HEAD"], cwd: `${dir}/sub` },
+      { argv: ["log", "-1", "--format=%an <%ae>%n%cn <%ce>"], cwd: dir },
+      { argv: ["status"], cwd: dir },
+      { argv: ["push"], cwd: dir },
+      { argv: ["unknown"], cwd: dir },
+      { argv: ["status", "--porcelain"], cwd: "/outside" },
+    ]) {
+      expect(await computerGit.cli(input)).toEqual(nativeGit.runCli(input));
+    }
+
+    const legacyInput = { argv: ["status", "--porcelain"], cwd: dir, dir };
+    expect(() => nativeGit.runCli(legacyInput)).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    await expect(computerGit.cli(legacyInput)).rejects.toMatchObject({ code: "EINVAL" });
+
+    const unexpected = new Error("unexpected argv getter failure");
+    const throwingInput = {
+      get argv(): string[] {
+        throw unexpected;
+      },
+    };
+    expect(() => nativeGit.runCli(throwingInput)).toThrow(unexpected);
+    await expect(nativeGit.cli(throwingInput)).rejects.toBe(unexpected);
+    await expect(computerGit.cli(throwingInput)).rejects.toBe(unexpected);
+  });
+
   it("fails explicitly for methods that remain unsupported", async () => {
     const { workspace } = makeWorkspace();
     await workspace.git.init({});
-    for (const call of [
-      () => workspace.git.stashPush({}),
-      () => workspace.git.cli({ argv: ["status"] }),
-    ]) {
-      await expect(call()).rejects.toMatchObject({ code: "EUNSUPPORTED" });
-    }
+    await expect(workspace.git.stashPush({})).rejects.toMatchObject({ code: "EUNSUPPORTED" });
   });
 });

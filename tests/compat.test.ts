@@ -7,7 +7,32 @@ import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
+function tableNames(storage: SqliteTestStorage): string[] {
+  return storage.sql
+    .exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+    .toArray()
+    .map((row) => row.name);
+}
+
 describe("Computer client operation interlocks", () => {
+  it("keeps the Computer Git context lazy until the first operation", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({
+      storage,
+      git: createSqliteGitClient({ now: () => 1_600_000_000_000 }),
+      defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
+    });
+    const git = workspace.git;
+
+    expect(tableNames(storage)).not.toContain("git_repositories");
+    await expect(git.cli({ argv: ["status", "--porcelain"] })).resolves.toEqual({
+      stdout: "",
+      stderr: "fatal: not a git repository (or any of the parent directories): .git\n",
+      exitCode: 128,
+    });
+    expect(tableNames(storage)).toContain("git_repositories");
+  });
+
   it("rejects ambiguous legacy push targets before network access", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({
