@@ -53,6 +53,18 @@ const DIFF_SUMMARY_ENTRY_FIXED_BYTES = 128;
 const DIFF_SUMMARY_MAX_ROWS = 50_000;
 /** One hundred full worktree pages plus one terminal or first-excess query. */
 export const DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS = 100_000;
+const MIB = 1024 * 1024;
+export const DIFF_COMBINED_MAX_MEMORY_BYTES = 96 * MIB;
+export const DIFF_COMBINED_MAX_LINES = 100_000;
+const DIFF_COMBINED_MAX_CHANGES = 50_000;
+const DIFF_COMBINED_MAX_ROWS = DIFF_COMBINED_MAX_LINES;
+const DIFF_COMBINED_MAX_OUTPUT_BYTES = 16 * MIB;
+// Match xmerge's per-line estimates; rows also reserve incremental render nodes.
+const DIFF_COMBINED_LINE_RECORD_BYTES = 96;
+const DIFF_COMBINED_DIFF_LINE_BYTES = 320;
+const DIFF_COMBINED_CHANGE_BYTES = 192;
+const DIFF_COMBINED_ROW_BYTES = 128;
+const DIFF_COMBINED_FIXED_BYTES = 16 * 1024;
 
 export type { DiffOptions } from "./diff-internal.js";
 
@@ -213,14 +225,30 @@ class DiffOutput {
 
   append(value: string): void {
     if (value === "") return;
-    if (this.maximum !== undefined) {
-      const bytes = diffUtf8Bytes(value);
-      if (bytes > this.maximum - this.#bytes) {
-        throw new GitError("E2BIG", `diff output exceeds ${this.maximum} UTF-8 bytes`);
-      }
-      this.#bytes += bytes;
+    const bytes = diffUtf8Bytes(value);
+    if (this.maximum !== undefined && bytes > this.maximum - this.#bytes) {
+      throw new GitError("E2BIG", `diff output exceeds ${this.maximum} UTF-8 bytes`);
     }
+    this.#bytes += bytes;
     this.#output += value;
+  }
+
+  appendCombined(value: string): void {
+    if (value === "") return;
+    const bytes = diffUtf8Bytes(value);
+    const maximum = Math.min(
+      this.maximum ?? DIFF_COMBINED_MAX_OUTPUT_BYTES,
+      DIFF_COMBINED_MAX_OUTPUT_BYTES,
+    );
+    if (bytes > maximum - this.#bytes) {
+      throw new GitError("E2BIG", `combined diff output exceeds ${maximum} UTF-8 bytes`);
+    }
+    this.#bytes += bytes;
+    this.#output += value;
+  }
+
+  combinedOutputCeiling(): number {
+    return Math.min(this.maximum ?? DIFF_COMBINED_MAX_OUTPUT_BYTES, DIFF_COMBINED_MAX_OUTPUT_BYTES);
   }
 
   finish(): string {
@@ -268,13 +296,13 @@ function appendCombinedDiff(
   ) {
     return;
   }
-  out.append(
-    combinedHunks(
-      utf8Decoder.decode(firstBytes),
-      utf8Decoder.decode(secondBytes),
-      utf8Decoder.decode(afterBytes),
-      context,
-    ),
+  preflightCombinedDiff(firstBytes, secondBytes, afterBytes, out.combinedOutputCeiling());
+  appendCombinedHunks(
+    out,
+    utf8Decoder.decode(firstBytes),
+    utf8Decoder.decode(secondBytes),
+    utf8Decoder.decode(afterBytes),
+    context,
   );
 }
 
@@ -288,61 +316,151 @@ function modeClass(mode: string): "regular" | "symlink" | "other" {
   return "other";
 }
 
+interface CombinedInputInfo {
+  bytes: number;
+  lines: number;
+}
+
+function preflightCombinedDiff(
+  first: Uint8Array,
+  second: Uint8Array,
+  result: Uint8Array,
+  outputCeiling: number,
+): void {
+  const firstInfo = combinedInputInfo(first);
+  const secondInfo = combinedInputInfo(second);
+  const resultInfo = combinedInputInfo(result);
+  const inputBytes = checkedCombinedSum(
+    [firstInfo.bytes, secondInfo.bytes, resultInfo.bytes],
+    "input bytes",
+  );
+  const lines = checkedCombinedSum(
+    [firstInfo.lines, secondInfo.lines, resultInfo.lines],
+    "line count",
+  );
+  if (lines > DIFF_COMBINED_MAX_LINES) {
+    throw new GitError("E2BIG", `combined diff exceeds ${DIFF_COMBINED_MAX_LINES} lines`);
+  }
+  const maximumPairLines = Math.max(
+    firstInfo.lines + resultInfo.lines,
+    secondInfo.lines + resultInfo.lines,
+    firstInfo.lines + secondInfo.lines,
+  );
+  const potentialChanges = Math.min(DIFF_COMBINED_MAX_CHANGES, lines * 2 + 4);
+  const retainedBytes = checkedCombinedSum(
+    [
+      inputBytes,
+      inputBytes * 2,
+      lines * DIFF_COMBINED_LINE_RECORD_BYTES,
+      maximumPairLines * DIFF_COMBINED_DIFF_LINE_BYTES,
+      potentialChanges * DIFF_COMBINED_CHANGE_BYTES,
+      lines * DIFF_COMBINED_ROW_BYTES,
+      resultInfo.lines * 2,
+      outputCeiling * 2,
+      DIFF_COMBINED_FIXED_BYTES,
+    ],
+    "retained memory",
+  );
+  if (retainedBytes > DIFF_COMBINED_MAX_MEMORY_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `combined diff retained memory exceeds ${DIFF_COMBINED_MAX_MEMORY_BYTES} bytes`,
+    );
+  }
+}
+
+function combinedInputInfo(bytes: Uint8Array): CombinedInputInfo {
+  if (bytes.length === 0) return { bytes: 0, lines: 0 };
+  let lines = bytes[bytes.length - 1] === 0x0a ? 0 : 1;
+  for (const byte of bytes) if (byte === 0x0a) lines++;
+  return { bytes: bytes.length, lines };
+}
+
+function checkedCombinedSum(values: readonly number[], label: string): number {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER - total) {
+      throw new GitError("E2BIG", `combined diff ${label} overflows a safe integer`);
+    }
+    total += value;
+  }
+  return total;
+}
+
 interface CombinedRow {
   prefix: string;
   line: string;
 }
 
 interface PairAlignment {
-  deleted: ReadonlyMap<number, readonly string[]>;
+  deleted: ReadonlyMap<number, DeletedRange>;
   present: Uint8Array;
 }
 
-function combinedHunks(
+interface DeletedRange {
+  lines: string[];
+  start: number;
+  count: number;
+}
+
+interface CombinedDiffBudget {
+  changes: number;
+}
+
+function appendCombinedHunks(
+  out: DiffOutput,
   firstText: string,
   secondText: string,
   resultText: string,
   context = 3,
-): string {
+): void {
   if (!Number.isSafeInteger(context) || context < 0) {
     throw new GitError("EINVAL", "diff context must be a non-negative safe integer");
   }
   const first = splitLines(firstText);
   const second = splitLines(secondText);
   const result = splitLines(resultText);
-  const firstAlignment = pairAlignment(first, result);
-  const secondAlignment = pairAlignment(second, result);
+  const budget = { changes: 0 };
+  const firstAlignment = pairAlignment(first, result, budget);
+  const secondAlignment = pairAlignment(second, result, budget);
   const rows: CombinedRow[] = [];
   for (let position = 0; position <= result.length; position++) {
     appendCombinedDeletions(
       rows,
-      firstAlignment.deleted.get(position) ?? [],
-      secondAlignment.deleted.get(position) ?? [],
+      firstAlignment.deleted.get(position),
+      secondAlignment.deleted.get(position),
+      budget,
     );
     const line = result[position];
     if (line === undefined) continue;
-    rows.push({
+    appendCombinedRow(rows, {
       prefix: `${firstAlignment.present[position] === 1 ? " " : "+"}${secondAlignment.present[position] === 1 ? " " : "+"}`,
       line,
     });
   }
-  return renderCombinedHunks(rows, context);
+  renderCombinedHunks(out, rows, context);
 }
 
-function pairAlignment(parent: readonly string[], result: readonly string[]): PairAlignment {
-  const changes = diffLines([...parent], [...result]);
+function pairAlignment(
+  parent: string[],
+  result: string[],
+  budget: CombinedDiffBudget,
+): PairAlignment {
+  const changes = diffLines(parent, result, { maxChanges: remainingCombinedChanges(budget) });
+  budget.changes += changes.length;
   const present = new Uint8Array(result.length);
   present.fill(1);
-  const deleted = new Map<number, readonly string[]>();
+  const deleted = new Map<number, DeletedRange>();
   for (const change of changes) {
     for (let index = change.newStart; index < change.newStart + change.newCount; index++) {
       present[index] = 0;
     }
     if (change.oldCount > 0) {
-      deleted.set(
-        change.newStart,
-        parent.slice(change.oldStart, change.oldStart + change.oldCount),
-      );
+      deleted.set(change.newStart, {
+        lines: parent,
+        start: change.oldStart,
+        count: change.oldCount,
+      });
     }
   }
   return { deleted, present };
@@ -350,60 +468,78 @@ function pairAlignment(parent: readonly string[], result: readonly string[]): Pa
 
 function appendCombinedDeletions(
   rows: CombinedRow[],
-  first: readonly string[],
-  second: readonly string[],
+  firstRange: DeletedRange | undefined,
+  secondRange: DeletedRange | undefined,
+  budget: CombinedDiffBudget,
 ): void {
-  const changes = diffLines([...first], [...second]);
+  if (firstRange === undefined && secondRange === undefined) return;
+  const first = deletedLines(firstRange);
+  const second = deletedLines(secondRange);
+  const changes = diffLines(first, second, { maxChanges: remainingCombinedChanges(budget) });
+  budget.changes += changes.length;
   let firstAt = 0;
   let secondAt = 0;
   for (const change of changes) {
     while (firstAt < change.oldStart && secondAt < change.newStart) {
-      rows.push({ prefix: "--", line: first[firstAt] ?? "" });
+      appendCombinedRow(rows, { prefix: "--", line: first[firstAt] ?? "" });
       firstAt++;
       secondAt++;
     }
     for (let index = 0; index < change.oldCount; index++) {
-      rows.push({ prefix: "- ", line: first[change.oldStart + index] ?? "" });
+      appendCombinedRow(rows, { prefix: "- ", line: first[change.oldStart + index] ?? "" });
     }
     for (let index = 0; index < change.newCount; index++) {
-      rows.push({ prefix: " -", line: second[change.newStart + index] ?? "" });
+      appendCombinedRow(rows, { prefix: " -", line: second[change.newStart + index] ?? "" });
     }
     firstAt = change.oldStart + change.oldCount;
     secondAt = change.newStart + change.newCount;
   }
   while (firstAt < first.length && secondAt < second.length) {
-    rows.push({ prefix: "--", line: first[firstAt] ?? "" });
+    appendCombinedRow(rows, { prefix: "--", line: first[firstAt] ?? "" });
     firstAt++;
     secondAt++;
   }
   while (firstAt < first.length) {
-    rows.push({ prefix: "- ", line: first[firstAt] ?? "" });
+    appendCombinedRow(rows, { prefix: "- ", line: first[firstAt] ?? "" });
     firstAt++;
   }
   while (secondAt < second.length) {
-    rows.push({ prefix: " -", line: second[secondAt] ?? "" });
+    appendCombinedRow(rows, { prefix: " -", line: second[secondAt] ?? "" });
     secondAt++;
   }
 }
 
-function renderCombinedHunks(rows: readonly CombinedRow[], context: number): string {
-  const changes: number[] = [];
-  for (let index = 0; index < rows.length; index++) {
-    if (rows[index]?.prefix !== "  ") changes.push(index);
-  }
-  if (changes.length === 0) return "";
+function deletedLines(range: DeletedRange | undefined): string[] {
+  return range === undefined ? [] : range.lines.slice(range.start, range.start + range.count);
+}
 
-  const out: string[] = [];
+function remainingCombinedChanges(budget: CombinedDiffBudget): number {
+  const remaining = DIFF_COMBINED_MAX_CHANGES - budget.changes;
+  if (remaining < 0) {
+    throw new GitError("E2BIG", `combined diff exceeds ${DIFF_COMBINED_MAX_CHANGES} changes`);
+  }
+  return remaining;
+}
+
+function appendCombinedRow(rows: CombinedRow[], row: CombinedRow): void {
+  if (rows.length >= DIFF_COMBINED_MAX_ROWS) {
+    throw new GitError("E2BIG", `combined diff exceeds ${DIFF_COMBINED_MAX_ROWS} rows`);
+  }
+  rows.push(row);
+}
+
+function renderCombinedHunks(out: DiffOutput, rows: readonly CombinedRow[], context: number): void {
   const before = { first: 0, second: 0, result: 0 };
   let countedThrough = 0;
-  let at = 0;
-  while (at < changes.length) {
-    const firstChange = changes[at]!;
+  let search = 0;
+  for (;;) {
+    const firstChange = nextCombinedChange(rows, search);
+    if (firstChange === -1) return;
     let lastChange = firstChange;
-    while (at + 1 < changes.length) {
-      const next = changes[at + 1]!;
+    for (;;) {
+      const next = nextCombinedChange(rows, lastChange + 1);
+      if (next === -1) break;
       if (next - lastChange - 1 > context * 2) break;
-      at++;
       lastChange = next;
     }
     const start = Math.max(0, firstChange - context);
@@ -411,7 +547,7 @@ function renderCombinedHunks(rows: readonly CombinedRow[], context: number): str
     const comment = combinedHunkComment(rows, countedThrough, start);
     addCombinedLineCounts(before, rows, countedThrough, start);
     const counts = combinedLineCounts(rows, start, end);
-    out.push(
+    out.appendCombined(
       `@@@ -${combinedRange(before.first, counts.first)} -${combinedRange(before.second, counts.second)} +${combinedRange(before.result, counts.result)} @@@${comment === "" ? "" : ` ${comment}`}\n`,
     );
     for (let index = start; index < end; index++) {
@@ -420,9 +556,15 @@ function renderCombinedHunks(rows: readonly CombinedRow[], context: number): str
     }
     addCombinedLineCounts(before, rows, start, end);
     countedThrough = end;
-    at++;
+    search = lastChange + 1;
   }
-  return out.join("");
+}
+
+function nextCombinedChange(rows: readonly CombinedRow[], start: number): number {
+  for (let index = start; index < rows.length; index++) {
+    if (rows[index]?.prefix !== "  ") return index;
+  }
+  return -1;
 }
 
 function combinedHunkComment(rows: readonly CombinedRow[], start: number, end: number): string {
@@ -473,9 +615,9 @@ function combinedRange(before: number, count: number): string {
   return `${count === 0 ? before : before + 1},${count}`;
 }
 
-function emitCombinedRow(out: string[], row: CombinedRow): void {
-  if (row.line.endsWith("\n")) out.push(`${row.prefix}${row.line}`);
-  else out.push(`${row.prefix}${row.line}\n\\ No newline at end of file\n`);
+function emitCombinedRow(out: DiffOutput, row: CombinedRow): void {
+  if (row.line.endsWith("\n")) out.appendCombined(`${row.prefix}${row.line}`);
+  else out.appendCombined(`${row.prefix}${row.line}\n\\ No newline at end of file\n`);
 }
 
 function diffUtf8Bytes(value: string): number {

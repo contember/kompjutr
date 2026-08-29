@@ -6,6 +6,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import {
   diff as coreDiff,
+  DIFF_COMBINED_MAX_LINES,
+  DIFF_COMBINED_MAX_MEMORY_BYTES,
   DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS,
   diffHeaderPath,
 } from "../src/core/ops/diff.js";
@@ -15,6 +17,7 @@ import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js"
 import { runGitCli } from "../src/git/cli/index.js";
 import { createGitCliReadHandlers } from "../src/git/cli/read.js";
 import type { GitCliResult } from "../src/git/cli/types.js";
+import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
@@ -64,6 +67,40 @@ async function importAt(fixture: GitFixture): Promise<TestRepository> {
   await importFixture(fixture, workspace.repo.checkout);
   checkoutTree(workspace.repo, workspace.worktree, workspace.repo.headTree());
   return workspace;
+}
+
+function conflictIndexEntry(stage: 2 | 3, oid: string): IndexEntry {
+  return {
+    path: "conflict.txt",
+    stage,
+    mode: 0o100644,
+    oid,
+    size: null,
+    mtime: null,
+    ino: null,
+    rev: null,
+  };
+}
+
+function setSyntheticConflict(
+  workspace: TestRepository,
+  first: string,
+  second: string,
+  result: string,
+): void {
+  const firstOid = workspace.repo.store.write("blob", ENCODER.encode(first));
+  const secondOid = workspace.repo.store.write("blob", ENCODER.encode(second));
+  workspace.repo.checkout.indexReplace([
+    conflictIndexEntry(2, firstOid),
+    conflictIndexEntry(3, secondOid),
+  ]);
+  writeWorkFile(workspace, "/repo/conflict.txt", result);
+}
+
+function syntheticCombinedDiff(workspace: TestRepository, maxOutputBytes?: number): string {
+  const formatOptions =
+    maxOutputBytes === undefined ? { indexBase: true } : { indexBase: true, maxOutputBytes };
+  return coreDiff(workspace.repo, workspace.worktree, {}, undefined, formatOptions);
 }
 
 describe("read-only git argv handlers", () => {
@@ -400,6 +437,63 @@ describe("plain git diff semantics and cumulative bounds", () => {
       }).outcome,
     ).toBe("conflicted");
     expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+  });
+
+  it("accepts the exact combined output limit and rejects first excess", () => {
+    const workspace = makeRepo("/repo");
+    setSyntheticConflict(workspace, "first\n", "second\n", "resolved\n");
+    const expected = syntheticCombinedDiff(workspace);
+    const bytes = ENCODER.encode(expected).byteLength;
+
+    expect(syntheticCombinedDiff(workspace, bytes)).toBe(expected);
+    expect(() => syntheticCombinedDiff(workspace, bytes - 1)).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: `combined diff output exceeds ${bytes - 1} UTF-8 bytes`,
+      }),
+    );
+  });
+
+  it("preflights the exact combined line limit before allocating line arrays", () => {
+    const workspace = makeRepo("/repo");
+    const first = "\n".repeat(33_333);
+    const second = "\n".repeat(33_333);
+    setSyntheticConflict(workspace, first, second, "\n".repeat(33_334));
+
+    expect(() => syntheticCombinedDiff(workspace, 0)).toThrowError(
+      expect.objectContaining({ code: "E2BIG", message: "diff output exceeds 0 UTF-8 bytes" }),
+    );
+    expect(syntheticCombinedDiff(workspace)).toContain("@@@");
+
+    setSyntheticConflict(workspace, first, second, "\n".repeat(33_335));
+    expect(() => syntheticCombinedDiff(workspace)).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: `combined diff exceeds ${DIFF_COMBINED_MAX_LINES} lines`,
+      }),
+    );
+  });
+
+  it("accepts the exact combined retained-memory estimate and rejects first excess", () => {
+    const workspace = makeRepo("/repo");
+    const line = `${"x".repeat(127)}\n`;
+    const exactLines = 23_314;
+    // 23,314 three-way lines cost 2,466 bytes each plus 43,170,816 fixed bytes.
+    const exactEstimate = 100_663_140;
+    expect(DIFF_COMBINED_MAX_MEMORY_BYTES - exactEstimate).toBe(156);
+
+    const exact = line.repeat(exactLines);
+    setSyntheticConflict(workspace, exact, exact, exact);
+    expect(syntheticCombinedDiff(workspace)).toContain("diff --cc conflict.txt\n");
+
+    const firstExcess = line.repeat(exactLines + 1);
+    setSyntheticConflict(workspace, firstExcess, firstExcess, firstExcess);
+    expect(() => syntheticCombinedDiff(workspace)).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: `combined diff retained memory exceeds ${DIFF_COMBINED_MAX_MEMORY_BYTES} bytes`,
+      }),
+    );
   });
 
   it("bounds index-worktree source rows at the exact limit and first excess", async () => {
