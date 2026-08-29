@@ -29,3 +29,4 @@ a commit message suffices.
 - [0014 — Make an optionless clone complete](0014-default-clone-is-complete.md) — accepted (2026-08-28)
 - [0015 — Route Git argv through one synchronous runner](0015-route-git-argv-through-one-synchronous-runner.md) — accepted (2026-08-28)
 - [0016 — Preflight mutating CLI output inside the transaction](0016-preflight-mutating-cli-output-inside-the-transaction.md) — accepted (2026-08-28)
+- [0017 — Measure query cost and bound real failures](0017-measure-query-cost-and-bound-real-failures.md) — accepted (2026-08-29)

@@ -7,6 +7,7 @@ inside a cgroup with a hard memory limit, and writes to `bench/results/`.
 npm run bench          # every scenario
 npm run bench:macro    # macro-packed, macro-loose
 npm run bench:nextjs   # the Next.js workflow
+npm run bench:statements -- --check  # deterministic SQL/row regression gate
 npm run bench:clone-storage  # SQLite bytes a clone costs, and where they go
 npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
 ```
@@ -15,6 +16,8 @@ Scenarios: `synthetic.ts` isolates one variable at a time; `macro` replays the
 reference experiment against real repositories; `shell` measures the command
 surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push;
 `clone-storage.ts` sizes the database a clone leaves behind, against real git.
+`statements.ts` checks correctness and frozen SQL/row baselines for operations
+whose runtime query barriers were removed.
 Fixtures are `express`, `tailwind`, `vue`, `eslint`, `prettier`, `nextjs`
 (218 → 24,252 files). `bench/results/` and `bench/.fixtures/` are gitignored.
 

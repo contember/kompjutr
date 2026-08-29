@@ -64,6 +64,7 @@
     "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts",
     "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose",
     "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts",
+    "bench:statements": "node --experimental-transform-types --import ./bench/register.mjs bench/statements.ts",
     "bench:clone-storage": "node --experimental-transform-types --import ./bench/register.mjs bench/clone-storage.ts",
     "bench:tree-schema": "node --experimental-transform-types --import ./bench/register.mjs bench/tree-schema.ts",
     "bench:workerd:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/workerd/run.ts",
