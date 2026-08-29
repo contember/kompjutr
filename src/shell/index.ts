@@ -30,6 +30,7 @@ export interface ShellOptions {
 
 export interface ShellRunOptions {
   readonly stdin?: Uint8Array | string;
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 export interface RunResult {
@@ -92,6 +93,7 @@ export function createShell(options: ShellOptions): Shell {
       commands,
       limits: options.limits ?? DEFAULT_LIMITS,
       stdin: runOptions?.stdin,
+      env: runOptions?.env,
     });
     if (outcome.cwd !== before) session.setCwd(outcome.cwd);
     return outcome;

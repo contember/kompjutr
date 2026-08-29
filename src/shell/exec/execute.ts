@@ -25,6 +25,8 @@ import { compileGlob, sqlGlobFor } from "./glob.js";
 const ARGUMENT_COUNT_MAX = 10_000;
 const ARGUMENT_BYTES_MAX = 1_000_000;
 const STDIN_BYTES_MAX = 1024 * 1024;
+const ENV_ENTRY_MAX = 256;
+const ENV_BYTES_MAX = 1024 * 1024;
 const PATH_PAGE_MAX = 1_000;
 // Filesystem.writeFileStream enforces this atomically before publishing a redirect.
 const ATOMIC_REDIRECT_BYTES_MAX = 96 * 1024 * 1024;
@@ -36,6 +38,7 @@ export interface ExecOptions {
   readonly commands: ReadonlyMap<string, Command>;
   readonly limits?: Limits;
   readonly stdin?: Uint8Array | string;
+  readonly env?: Readonly<Record<string, string>>;
 }
 
 export interface ExecResult {
@@ -63,7 +66,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
 
   try {
     try {
-      runInput = prepareRunInput(options.stdin, fs);
+      runInput = prepareRunInput(options.stdin, options.env, fs);
       for (const step of plan.steps) {
         const selected =
           previousConnector === null ||
@@ -76,7 +79,7 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
             commands: options.commands,
             out,
             errors,
-            stdin: runInput,
+            inputs: runInput,
             chdir: (path: string) => {
               cwd = path;
             },
@@ -113,12 +116,12 @@ interface PipelineEnvironment {
   readonly commands: ReadonlyMap<string, Command>;
   readonly out: Sink;
   readonly errors: Sink;
-  readonly stdin: RunInputOwner | null;
+  readonly inputs: RunInputOwner | null;
   chdir(path: string): void;
 }
 
 function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): number {
-  let stream: ByteStream | null = env.stdin?.borrow() ?? null;
+  let stream: ByteStream | null = env.inputs?.borrow() ?? null;
   const statuses: Array<() => number> = [];
   let settled = false;
 
@@ -230,18 +233,20 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
   }
 }
 
-/** Own caller stdin and its retained-memory reservation for one complete run. */
+/** Own caller inputs and their retained-memory reservation for one complete run. */
 export class RunInputOwner {
   #closed = false;
 
   constructor(
-    private readonly source: ByteStream,
+    private readonly source: ByteStream | null,
+    readonly env: Readonly<Record<string, string>> | undefined,
     private readonly release: () => void,
   ) {}
 
   /** A pipeline may close its borrow without closing the run-owned cursor. */
-  borrow(): ByteStream {
+  borrow(): ByteStream | null {
     const source = this.source;
+    if (source === null) return null;
     return (function* (): ByteStream {
       for (;;) {
         const next = source.next();
@@ -255,7 +260,7 @@ export class RunInputOwner {
     if (this.#closed) return;
     this.#closed = true;
     try {
-      this.source.return();
+      this.source?.return();
     } finally {
       this.release();
     }
@@ -264,18 +269,92 @@ export class RunInputOwner {
 
 function prepareRunInput(
   stdin: Uint8Array | string | undefined,
+  env: Readonly<Record<string, string>> | undefined,
   fs: BoundedFs,
 ): RunInputOwner | null {
-  if (stdin === undefined) return null;
-  const bytes = stdinBytes(stdin);
-  const release = fs.retained.retain(bytes, "caller stdin");
+  if (stdin === undefined && env === undefined) return null;
+  const stdinSize = stdin === undefined ? 0 : stdinBytes(stdin);
+  const environment = measureEnvironment(env);
+  const release = fs.retained.retain(stdinSize + environment.bytes, "caller inputs");
   try {
-    const snapshot = typeof stdin === "string" ? ENCODER.encode(stdin) : stdin.slice();
-    return new RunInputOwner(singleChunk(snapshot), release);
+    const stdinSnapshot =
+      stdin === undefined
+        ? null
+        : typeof stdin === "string"
+          ? ENCODER.encode(stdin)
+          : stdin.slice();
+    const envSnapshot = snapshotEnvironment(env, environment);
+    return new RunInputOwner(
+      stdinSnapshot === null ? null : singleChunk(stdinSnapshot),
+      envSnapshot,
+      release,
+    );
   } catch (error) {
     release();
     throw error;
   }
+}
+
+interface EnvironmentMeasurement {
+  readonly entries: number;
+  readonly bytes: number;
+}
+
+function measureEnvironment(
+  env: Readonly<Record<string, string>> | undefined,
+): EnvironmentMeasurement {
+  if (env === undefined) return { entries: 0, bytes: 0 };
+  if (typeof env !== "object" || env === null) {
+    throw new ShellLimitError("arguments", "caller env must be an object with string values");
+  }
+
+  let entries = 0;
+  let bytes = 0;
+  for (const key in env) {
+    if (!Object.hasOwn(env, key)) continue;
+    entries++;
+    if (entries > ENV_ENTRY_MAX) {
+      throw new ShellLimitError("arguments", `caller env exceeds ${ENV_ENTRY_MAX} entries`);
+    }
+    const value = env[key];
+    if (typeof value !== "string") {
+      throw new ShellLimitError("arguments", "caller env values must be strings");
+    }
+    bytes = addUtf8Bytes(bytes, key, ENV_BYTES_MAX, "caller env");
+    bytes = addUtf8Bytes(bytes, value, ENV_BYTES_MAX, "caller env");
+  }
+  return { entries, bytes };
+}
+
+function snapshotEnvironment(
+  env: Readonly<Record<string, string>> | undefined,
+  measured: EnvironmentMeasurement,
+): Readonly<Record<string, string>> | undefined {
+  if (env === undefined) return undefined;
+  const entries: Array<readonly [string, string]> = [];
+  let bytes = 0;
+  for (const key in env) {
+    if (!Object.hasOwn(env, key)) continue;
+    if (entries.length >= measured.entries) {
+      throw new ShellLimitError("arguments", "caller env changed while it was snapshotted");
+    }
+    const value = env[key];
+    if (typeof value !== "string") {
+      throw new ShellLimitError("arguments", "caller env values must be strings");
+    }
+    bytes = addUtf8Bytes(bytes, key, measured.bytes, "caller env snapshot");
+    bytes = addUtf8Bytes(bytes, value, measured.bytes, "caller env snapshot");
+    entries.push([key, value]);
+  }
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+function addUtf8Bytes(current: number, value: string, maximum: number, label: string): number {
+  const bytes = boundedUtf8Bytes(value, maximum - current);
+  if (bytes === null) {
+    throw new ShellLimitError("arguments", `${label} exceeds ${maximum} bytes`);
+  }
+  return current + bytes;
 }
 
 function stdinBytes(stdin: Uint8Array | string): number {
@@ -357,6 +436,7 @@ function commandContext(
     cwd: env.cwd,
     argv,
     stdin,
+    env: env.inputs?.env,
     limitHint,
     output,
     diagnostic,

@@ -230,3 +230,9 @@ the proportional review gates.
   typecheck passed. Tesla's T3 review found one missing exact-close witness;
   the expanded probe now covers every frozen exit path, and re-review approved
   the corrected WU1 with no remaining findings.
+- 2026-08-29 — WU2 added the frozen own-property env snapshot, one combined
+  stdin/env retained reservation, nested command inheritance and conditional
+  Git forwarding. The focused witness passed 27 tests, including a real commit
+  with caller-provided author and committer identity. Bacon's T2 review found
+  only import ordering; targeted Biome, focused tests and typecheck passed after
+  the mechanical fix, and re-review approved WU2 with no remaining findings.

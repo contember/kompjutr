@@ -110,6 +110,71 @@ describe("injected git command", () => {
 });
 
 describe("git command shell seam", () => {
+  it("forwards a supplied env snapshot and omits an absent env field", () => {
+    const inputs: GitCliInput[] = [];
+    const runner: GitCliRunner = {
+      runCli(input) {
+        inputs.push(input);
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+    const workspace = new Workspace({ storage: new SqliteTestStorage() });
+    workspace.filesystem.mkdir("/repo");
+    const shell = createShell({
+      fs: workspace.filesystem,
+      cwd: "/repo",
+      commands: new Map([["git", createGitCommand(runner)]]),
+    });
+    const env = {
+      GIT_AUTHOR_NAME: "Author",
+      GIT_AUTHOR_EMAIL: "author@example.com",
+      GIT_COMMITTER_NAME: "Committer",
+      GIT_COMMITTER_EMAIL: "committer@example.com",
+    };
+
+    shell.run("git diff");
+    shell.run("git diff", { env });
+
+    expect(inputs[0]).toEqual({ argv: ["diff"], cwd: "/repo" });
+    expect(inputs[1]).toEqual({ argv: ["diff"], cwd: "/repo", env });
+    expect(inputs[1]?.env).not.toBe(env);
+    expect(Object.isFrozen(inputs[1]?.env)).toBe(true);
+  });
+
+  it("commits with the caller's author and committer environment", async () => {
+    const workspace = new Workspace({
+      storage: new SqliteTestStorage(),
+      git: createGit(),
+      now: () => 1_577_836_800_000,
+    });
+    workspace.filesystem.mkdir("/repo");
+    await workspace.git.init({ dir: "/repo" });
+    workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("content\n"));
+    const shell = createShell({
+      fs: workspace.filesystem,
+      cwd: "/repo",
+      commands: new Map([["git", createGitCommand(workspace.git)]]),
+    });
+
+    expect(shell.run("git add file.txt").exitCode).toBe(0);
+    const committed = shell.run("git commit -m identity", {
+      env: {
+        GIT_AUTHOR_NAME: "Shell Author",
+        GIT_AUTHOR_EMAIL: "author@example.com",
+        GIT_COMMITTER_NAME: "Shell Committer",
+        GIT_COMMITTER_EMAIL: "committer@example.com",
+      },
+    });
+    expect(committed.exitCode, committed.stderr).toBe(0);
+
+    expect(
+      workspace.git.runCli({
+        argv: ["log", "-1", "--format=%an <%ae>%n%cn <%ce>"],
+        cwd: "/repo",
+      }).stdout,
+    ).toBe("Shell Author <author@example.com>\nShell Committer <committer@example.com>\n");
+  });
+
   it("passes cwd, argv, demand, and exact destination ceilings to one runner", () => {
     const calls: Array<{ input: GitCliInput; options: GitCliRunOptions | undefined }> = [];
     const runner: GitCliRunner = {

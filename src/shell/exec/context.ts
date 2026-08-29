@@ -273,6 +273,8 @@ export interface CommandContext {
   readonly argv: readonly string[];
   /** The previous stage, or null when this command is first. */
   readonly stdin: ByteStream | null;
+  /** A frozen snapshot supplied for this run; built-ins do not expand it. */
+  readonly env?: Readonly<Record<string, string>>;
   /** From a lifted `head -N`. Sizes the first discovery page. */
   readonly limitHint: number | null;
   /** Planned stream destinations and the bytes still available to this stage. */

@@ -18,7 +18,11 @@ export function createGitCommand(runner: GitCliRunner): Command {
     const options = runOptions(context);
     let cliResult: GitCliResult;
     try {
-      cliResult = runner.runCli({ argv: context.argv, cwd: context.cwd }, options);
+      const input =
+        context.env === undefined
+          ? { argv: context.argv, cwd: context.cwd }
+          : { argv: context.argv, cwd: context.cwd, env: context.env };
+      cliResult = runner.runCli(input, options);
     } catch (error) {
       const mapped = shellLimit(error);
       if (mapped === null) throw error;

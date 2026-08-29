@@ -1,9 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-
-import { createGitCommand } from "../../src/git/shell.js";
-import type { GitCliRunner } from "../../src/git/cli/types.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
+import type { GitCliRunner } from "../../src/git/cli/types.js";
+import { createGitCommand } from "../../src/git/shell.js";
 import type { ByteStream } from "../../src/shell/exec/bytes.js";
 import { type Command, result } from "../../src/shell/exec/context.js";
 import { RunInputOwner } from "../../src/shell/exec/execute.js";
@@ -12,6 +11,8 @@ import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 
 const STDIN_BYTES_MAX = 1024 * 1024;
+const ENV_ENTRY_MAX = 256;
+const ENV_BYTES_MAX = 1024 * 1024;
 const ENCODER = new TextEncoder();
 
 interface Fixture {
@@ -154,11 +155,15 @@ describe("caller stdin", () => {
   it("parses before creating or measuring a run input", () => {
     const subject = fixture();
     const close = vi.spyOn(RunInputOwner.prototype, "close");
+    const env: Record<string, string> = {};
+    for (let index = 0; index <= ENV_ENTRY_MAX; index++) env[`K${index}`] = "";
     const run = subject.shell.run("'unterminated", {
       stdin: new Uint8Array(STDIN_BYTES_MAX + 1),
+      env,
     });
 
     expect(run).toMatchObject({ exitCode: 2, operations: 0, peakRetainedBytes: 0 });
+    expect(run.stderr).toContain("unterminated single quote");
     expect(close).not.toHaveBeenCalled();
     close.mockRestore();
   });
@@ -237,5 +242,117 @@ describe("caller stdin", () => {
     const subject = fixture();
 
     expect(subject.shell.run("pwd")).toEqual(subject.shell.run("pwd", {}));
+  });
+});
+
+describe("caller environment", () => {
+  it("provides one frozen snapshot to direct and nested injected commands", () => {
+    const supplied: Record<string, string> = { VALUE: "before" };
+    Object.setPrototypeOf(supplied, { INHERITED: "excluded" });
+    let direct: Readonly<Record<string, string>> | undefined;
+    let nested: Readonly<Record<string, string>> | undefined;
+    const inspect: Command = (context) => {
+      direct = context.env;
+      supplied.VALUE = "after";
+      supplied.ADDED = "later";
+      return result(empty());
+    };
+    const inner: Command = (context) => {
+      nested = context.env;
+      return result(empty());
+    };
+    const outer: Command = (context) => context.invoke("inner", []) ?? result(empty());
+    const subject = fixture(
+      new Map([
+        ["inspect", inspect],
+        ["inner", inner],
+        ["outer", outer],
+      ]),
+    );
+
+    expect(subject.shell.run("inspect; outer", { env: supplied }).exitCode).toBe(0);
+    expect(direct).toEqual({ VALUE: "before" });
+    expect(direct?.INHERITED).toBeUndefined();
+    expect(nested).toBe(direct);
+    expect(Object.isFrozen(direct)).toBe(true);
+
+    subject.shell.run("inspect");
+    expect(direct).toBeUndefined();
+  });
+
+  it("accepts exact entry and UTF-8 byte caps and rejects their first excesses", () => {
+    let calls = 0;
+    const called: Command = () => {
+      calls++;
+      return result(empty());
+    };
+    const subject = fixture(new Map([["called", called]]));
+    const exactEntries: Record<string, string> = {};
+    const excessEntries: Record<string, string> = {};
+    for (let index = 0; index < ENV_ENTRY_MAX; index++) exactEntries[`K${index}`] = "";
+    for (let index = 0; index <= ENV_ENTRY_MAX; index++) excessEntries[`K${index}`] = "";
+
+    expect(subject.shell.run("called", { env: exactEntries }).exitCode).toBe(0);
+    expect(calls).toBe(1);
+    expect(subject.shell.run("called", { env: excessEntries })).toMatchObject({
+      exitCode: 2,
+      operations: 0,
+      peakRetainedBytes: 0,
+    });
+    expect(calls).toBe(1);
+
+    const exactBytes = { K: `${"a".repeat(ENV_BYTES_MAX - 5)}😀` };
+    expect(subject.shell.run("called", { env: exactBytes })).toMatchObject({
+      exitCode: 0,
+      peakRetainedBytes: ENV_BYTES_MAX,
+    });
+    expect(calls).toBe(2);
+    expect(subject.shell.run("called", { env: { ...exactBytes, X: "" } })).toMatchObject({
+      exitCode: 2,
+      operations: 0,
+      peakRetainedBytes: 0,
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("reserves env and stdin together before allocating either snapshot", () => {
+    const subject = fixture();
+    const withLimit = (maxRetainedBytes: number): Shell =>
+      createShell({
+        fs: subject.filesystem,
+        cwd: "/repo",
+        limits: {
+          maxOutputBytes: 100,
+          maxOperations: 10,
+          readBudget: 100,
+          maxRetainedBytes,
+        },
+      });
+    const close = vi.spyOn(RunInputOwner.prototype, "close");
+
+    try {
+      expect(withLimit(4).run("true", { env: { A: "bbb" } })).toMatchObject({
+        exitCode: 0,
+        peakRetainedBytes: 4,
+      });
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(withLimit(3).run("true", { env: { A: "bbb" } })).toMatchObject({
+        exitCode: 2,
+        peakRetainedBytes: 0,
+      });
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(withLimit(4).run("true", { stdin: "xy", env: { A: "b" } })).toMatchObject({
+        exitCode: 0,
+        peakRetainedBytes: 4,
+      });
+      expect(close).toHaveBeenCalledTimes(2);
+      expect(withLimit(3).run("true", { stdin: "xy", env: { A: "b" } })).toMatchObject({
+        exitCode: 2,
+        peakRetainedBytes: 0,
+      });
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally {
+      close.mockRestore();
+    }
   });
 });
