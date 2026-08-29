@@ -9,6 +9,7 @@ import {
   DIFF_COMBINED_MAX_LINES,
   DIFF_COMBINED_MAX_MEMORY_BYTES,
   DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS,
+  DIFF_MAX_OUTPUT_BYTES,
   diffHeaderPath,
 } from "../src/core/ops/diff.js";
 import { rebase } from "../src/core/ops/rebase.js";
@@ -69,9 +70,9 @@ async function importAt(fixture: GitFixture): Promise<TestRepository> {
   return workspace;
 }
 
-function conflictIndexEntry(stage: 2 | 3, oid: string): IndexEntry {
+function conflictIndexEntry(stage: 2 | 3, oid: string, path = "conflict.txt"): IndexEntry {
   return {
-    path: "conflict.txt",
+    path,
     stage,
     mode: 0o100644,
     oid,
@@ -88,19 +89,59 @@ function setSyntheticConflict(
   second: string,
   result: string,
 ): void {
-  const firstOid = workspace.repo.store.write("blob", ENCODER.encode(first));
-  const secondOid = workspace.repo.store.write("blob", ENCODER.encode(second));
+  setSyntheticConflictBytes(
+    workspace,
+    ENCODER.encode(first),
+    ENCODER.encode(second),
+    ENCODER.encode(result),
+  );
+}
+
+function setSyntheticConflictBytes(
+  workspace: TestRepository,
+  first: Uint8Array,
+  second: Uint8Array,
+  result: Uint8Array,
+): void {
+  const firstOid = workspace.repo.store.write("blob", first);
+  const secondOid = workspace.repo.store.write("blob", second);
   workspace.repo.checkout.indexReplace([
     conflictIndexEntry(2, firstOid),
     conflictIndexEntry(3, secondOid),
   ]);
-  writeWorkFile(workspace, "/repo/conflict.txt", result);
+  workspace.worktree.writeFiles([{ path: "/repo/conflict.txt", bytes: result, mode: 0o644 }]);
 }
 
 function syntheticCombinedDiff(workspace: TestRepository, maxOutputBytes?: number): string {
   const formatOptions =
     maxOutputBytes === undefined ? { indexBase: true } : { indexBase: true, maxOutputBytes };
   return coreDiff(workspace.repo, workspace.worktree, {}, undefined, formatOptions);
+}
+
+async function createRebaseConflict(
+  upstreamText: string,
+  currentText: string,
+): Promise<{ fixture: GitFixture; workspace: TestRepository }> {
+  const fixture = new GitFixture().init();
+  fixtures.push(fixture);
+  fixture.write("conflict.txt", "base\n");
+  const base = fixture.commit("base");
+  fixture.git("checkout", "-q", "-b", "upstream", base);
+  fixture.write("conflict.txt", upstreamText);
+  const upstream = fixture.commit("upstream");
+  fixture.git("checkout", "-q", "-b", "current", base);
+  fixture.write("conflict.txt", currentText);
+  fixture.commit("current");
+  const workspace = await importAt(fixture);
+
+  expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
+  expect(
+    rebase(workspace.context, workspace.repo, workspace.worktree, {
+      upstream,
+      committer: { name: "Fixture", email: "fixture@example.com" },
+    }).outcome,
+  ).toBe("conflicted");
+  return { fixture, workspace };
 }
 
 describe("read-only git argv handlers", () => {
@@ -350,7 +391,26 @@ describe("plain git diff semantics and cumulative bounds", () => {
 
     expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
 
-    fixture.write("conflict.txt", "resolved\n");
+    for (const { stage, parent } of [
+      { stage: 2, parent: "upstream\n" },
+      { stage: 3, parent: "current\n" },
+    ]) {
+      expect(fixture.gitBinary("show", `:${stage}:conflict.txt`).toString("utf8")).toBe(parent);
+      fixture.write("conflict.txt", parent);
+      writeWorkFile(workspace, "/repo/conflict.txt", parent);
+      const expected = gitResultAt(fixture, ["diff"]);
+      expect(expected.stdout).not.toContain("@@@");
+      expect(nativeRun(workspace, ["diff"])).toEqual(expected);
+    }
+
+    fixture.write("conflict.txt", "upstream\n").chmod("conflict.txt", 0o755);
+    writeWorkFile(workspace, "/repo/conflict.txt", "upstream\n", 0o755);
+    const modeOnly = gitResultAt(fixture, ["diff"]);
+    expect(modeOnly.stdout).toContain("mode 100644,100644..100755\n");
+    expect(modeOnly.stdout).not.toContain("@@@");
+    expect(nativeRun(workspace, ["diff"])).toEqual(modeOnly);
+
+    fixture.write("conflict.txt", "resolved\n").chmod("conflict.txt", 0o644);
     writeWorkFile(workspace, "/repo/conflict.txt", "resolved\n");
     expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
 
@@ -386,6 +446,29 @@ describe("plain git diff semantics and cumulative bounds", () => {
     }
   });
 
+  it("matches Git combined rows when either parent or the result has no final LF", async () => {
+    const cases = [
+      { stageWithoutLf: 2, upstream: "upstream", current: "current\n", result: "resolved\n" },
+      { stageWithoutLf: 3, upstream: "upstream\n", current: "current", result: "resolved\n" },
+      { stageWithoutLf: null, upstream: "upstream\n", current: "current\n", result: "resolved" },
+    ];
+    for (const texts of cases) {
+      const { fixture, workspace } = await createRebaseConflict(texts.upstream, texts.current);
+      if (texts.stageWithoutLf !== null) {
+        expect(
+          fixture.gitBinary("show", `:${texts.stageWithoutLf}:conflict.txt`).toString("utf8"),
+        ).not.toMatch(/\n$/);
+      }
+      fixture.write("conflict.txt", texts.result);
+      writeWorkFile(workspace, "/repo/conflict.txt", texts.result);
+
+      const expected = gitResultAt(fixture, ["diff"]);
+      expect(expected.stdout).toContain("@@@");
+      expect(expected.stdout).not.toContain("\\ No newline at end of file");
+      expect(nativeRun(workspace, ["diff"])).toEqual(expected);
+    }
+  });
+
   it("matches Git combined binary conflict output", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
@@ -406,7 +489,19 @@ describe("plain git diff semantics and cumulative bounds", () => {
         committer: { name: "Fixture", email: "fixture@example.com" },
       }).outcome,
     ).toBe("conflicted");
-    expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+    for (const stage of [2, 3]) {
+      const parent = fixture.gitBinary("show", `:${stage}:conflict.bin`);
+      fixture.write("conflict.bin", parent);
+      workspace.worktree.writeFiles([
+        { path: "/repo/conflict.bin", bytes: new Uint8Array(parent), mode: 0o644 },
+      ]);
+      expect(fixture.git("hash-object", "conflict.bin")).toBe(
+        fixture.git("rev-parse", `:${stage}:conflict.bin`),
+      );
+      const expected = gitResultAt(fixture, ["diff"]);
+      expect(expected.stdout).toContain("Binary files differ\n");
+      expect(nativeRun(workspace, ["diff"])).toEqual(expected);
+    }
   });
 
   it("matches Git combined hunk context for distant conflicts", async () => {
@@ -439,17 +534,76 @@ describe("plain git diff semantics and cumulative bounds", () => {
     expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
   });
 
-  it("accepts the exact combined output limit and rejects first excess", () => {
+  it("routes text, header-only and binary combined output through one sink", () => {
     const workspace = makeRepo("/repo");
-    setSyntheticConflict(workspace, "first\n", "second\n", "resolved\n");
-    const expected = syntheticCombinedDiff(workspace);
-    const bytes = ENCODER.encode(expected).byteLength;
+    const cases = [
+      () => setSyntheticConflict(workspace, "first\n", "second\n", "resolved\n"),
+      () => setSyntheticConflict(workspace, "first\n", "second\n", "first\n"),
+      () =>
+        setSyntheticConflictBytes(
+          workspace,
+          new Uint8Array([0, 1]),
+          new Uint8Array([0, 2]),
+          new Uint8Array([0, 3]),
+        ),
+    ];
+    for (const prepare of cases) {
+      prepare();
+      const expected = syntheticCombinedDiff(workspace);
+      const bytes = ENCODER.encode(expected).byteLength;
+      expect(syntheticCombinedDiff(workspace, bytes)).toBe(expected);
+      expect(() => syntheticCombinedDiff(workspace, bytes - 1)).toThrowError(
+        expect.objectContaining({
+          code: "E2BIG",
+          message: `diff output exceeds ${bytes - 1} UTF-8 bytes`,
+        }),
+      );
+    }
+  });
 
-    expect(syntheticCombinedDiff(workspace, bytes)).toBe(expected);
-    expect(() => syntheticCombinedDiff(workspace, bytes - 1)).toThrowError(
+  it("enforces the intrinsic combined output limit for the typed diff", () => {
+    const workspace = makeRepo("/repo");
+    const firstOid = workspace.repo.store.write("blob", ENCODER.encode("first\n"));
+    const secondOid = workspace.repo.store.write("blob", ENCODER.encode("second\n"));
+    const pathCount = 2_522;
+    const pathAt = (index: number): string => {
+      const prefix = `p-${index.toString().padStart(4, "0")}-`;
+      const length = index === pathCount - 1 ? 1_649 : 2_199;
+      return `${prefix}${"x".repeat(length - prefix.length)}`;
+    };
+    workspace.repo.checkout.indexReplace(
+      (function* (): Generator<IndexEntry> {
+        for (let index = 0; index < pathCount; index++) {
+          const path = pathAt(index);
+          yield conflictIndexEntry(2, firstOid, path);
+          yield conflictIndexEntry(3, secondOid, path);
+        }
+      })(),
+    );
+    const bytes = ENCODER.encode("first\n");
+    for (let start = 0; start < pathCount; start += 100) {
+      const end = Math.min(pathCount, start + 100);
+      const entries = [];
+      for (let index = start; index < end; index++) {
+        entries.push({ path: `/repo/${pathAt(index)}`, bytes, mode: 0o644 });
+      }
+      workspace.worktree.writeFiles(entries);
+    }
+
+    expect(syntheticCombinedDiff(workspace)).toHaveLength(DIFF_MAX_OUTPUT_BYTES);
+
+    const excessPath = "z.txt";
+    workspace.repo.checkout.indexApply((sink) => {
+      sink.put(conflictIndexEntry(2, firstOid, excessPath));
+      sink.put(conflictIndexEntry(3, secondOid, excessPath));
+    });
+    workspace.worktree.writeFiles([
+      { path: `/repo/${excessPath}`, bytes: ENCODER.encode("first\n"), mode: 0o644 },
+    ]);
+    expect(() => syntheticCombinedDiff(workspace)).toThrowError(
       expect.objectContaining({
         code: "E2BIG",
-        message: `combined diff output exceeds ${bytes - 1} UTF-8 bytes`,
+        message: `diff output exceeds ${DIFF_MAX_OUTPUT_BYTES} UTF-8 bytes`,
       }),
     );
   });
@@ -463,7 +617,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
     expect(() => syntheticCombinedDiff(workspace, 0)).toThrowError(
       expect.objectContaining({ code: "E2BIG", message: "diff output exceeds 0 UTF-8 bytes" }),
     );
-    expect(syntheticCombinedDiff(workspace)).toContain("@@@");
+    expect(syntheticCombinedDiff(workspace, 1024 * 1024)).toContain("@@@");
 
     setSyntheticConflict(workspace, first, second, "\n".repeat(33_335));
     expect(() => syntheticCombinedDiff(workspace)).toThrowError(
@@ -474,20 +628,42 @@ describe("plain git diff semantics and cumulative bounds", () => {
     );
   });
 
+  it("takes the parent-equality fast path before combined renderer limits", () => {
+    const workspace = makeRepo("/repo");
+    const parent = "\n".repeat(DIFF_COMBINED_MAX_LINES + 1);
+    setSyntheticConflict(workspace, parent, "different\n", parent);
+
+    const output = syntheticCombinedDiff(workspace);
+    expect(output).toContain("diff --cc conflict.txt\n");
+    expect(output).not.toContain("@@@");
+  });
+
   it("accepts the exact combined retained-memory estimate and rejects first excess", () => {
     const workspace = makeRepo("/repo");
-    const line = `${"x".repeat(127)}\n`;
-    const exactLines = 23_314;
-    // 23,314 three-way lines cost 2,466 bytes each plus 43,170,816 fixed bytes.
-    const exactEstimate = 100_663_140;
-    expect(DIFF_COMBINED_MAX_MEMORY_BYTES - exactEstimate).toBe(156);
+    const firstLine = `${"a".repeat(127)}\n`;
+    const secondLine = `${"b".repeat(127)}\n`;
+    const resultLine = `${"c".repeat(127)}\n`;
+    const exactLines = 8_399;
+    // 8,399 differing three-way lines cost 2,850 bytes each plus 43,170,816 fixed bytes.
+    const exactEstimate = 67_107_966;
+    expect(DIFF_COMBINED_MAX_MEMORY_BYTES - exactEstimate).toBe(898);
 
-    const exact = line.repeat(exactLines);
-    setSyntheticConflict(workspace, exact, exact, exact);
-    expect(syntheticCombinedDiff(workspace)).toContain("diff --cc conflict.txt\n");
+    setSyntheticConflict(
+      workspace,
+      firstLine.repeat(exactLines),
+      secondLine.repeat(exactLines),
+      resultLine.repeat(exactLines),
+    );
+    const exact = syntheticCombinedDiff(workspace);
+    expect(exact).toContain("@@@");
+    expect(exact.length).toBeGreaterThan(3 * 1024 * 1024);
 
-    const firstExcess = line.repeat(exactLines + 1);
-    setSyntheticConflict(workspace, firstExcess, firstExcess, firstExcess);
+    setSyntheticConflict(
+      workspace,
+      firstLine.repeat(exactLines + 1),
+      secondLine.repeat(exactLines + 1),
+      resultLine.repeat(exactLines + 1),
+    );
     expect(() => syntheticCombinedDiff(workspace)).toThrowError(
       expect.objectContaining({
         code: "E2BIG",

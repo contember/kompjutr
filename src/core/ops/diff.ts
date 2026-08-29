@@ -54,11 +54,12 @@ const DIFF_SUMMARY_MAX_ROWS = 50_000;
 /** One hundred full worktree pages plus one terminal or first-excess query. */
 export const DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS = 100_000;
 const MIB = 1024 * 1024;
-export const DIFF_COMBINED_MAX_MEMORY_BYTES = 96 * MIB;
+export const DIFF_MAX_OUTPUT_BYTES = 16 * MIB;
+// 64 MiB renderer + 16 MiB hydration + 12 MiB caches + 4 MiB headroom = 96 MiB.
+export const DIFF_COMBINED_MAX_MEMORY_BYTES = 64 * MIB;
 export const DIFF_COMBINED_MAX_LINES = 100_000;
 const DIFF_COMBINED_MAX_CHANGES = 50_000;
 const DIFF_COMBINED_MAX_ROWS = DIFF_COMBINED_MAX_LINES;
-const DIFF_COMBINED_MAX_OUTPUT_BYTES = 16 * MIB;
 // Match xmerge's per-line estimates; rows also reserve incremental render nodes.
 const DIFF_COMBINED_LINE_RECORD_BYTES = 96;
 const DIFF_COMBINED_DIFF_LINE_BYTES = 320;
@@ -216,39 +217,27 @@ export function diff(
 class DiffOutput {
   #bytes = 0;
   #output = "";
+  readonly #maximum: number;
 
-  constructor(private readonly maximum: number | undefined) {
+  constructor(maximum: number | undefined) {
     if (maximum !== undefined && (!Number.isSafeInteger(maximum) || maximum < 0)) {
       throw new GitError("EINVAL", "diff output ceiling must be a non-negative safe integer");
     }
+    this.#maximum = Math.min(maximum ?? DIFF_MAX_OUTPUT_BYTES, DIFF_MAX_OUTPUT_BYTES);
   }
 
   append(value: string): void {
     if (value === "") return;
     const bytes = diffUtf8Bytes(value);
-    if (this.maximum !== undefined && bytes > this.maximum - this.#bytes) {
-      throw new GitError("E2BIG", `diff output exceeds ${this.maximum} UTF-8 bytes`);
+    if (bytes > this.#maximum - this.#bytes) {
+      throw new GitError("E2BIG", `diff output exceeds ${this.#maximum} UTF-8 bytes`);
     }
     this.#bytes += bytes;
     this.#output += value;
   }
 
-  appendCombined(value: string): void {
-    if (value === "") return;
-    const bytes = diffUtf8Bytes(value);
-    const maximum = Math.min(
-      this.maximum ?? DIFF_COMBINED_MAX_OUTPUT_BYTES,
-      DIFF_COMBINED_MAX_OUTPUT_BYTES,
-    );
-    if (bytes > maximum - this.#bytes) {
-      throw new GitError("E2BIG", `combined diff output exceeds ${maximum} UTF-8 bytes`);
-    }
-    this.#bytes += bytes;
-    this.#output += value;
-  }
-
-  combinedOutputCeiling(): number {
-    return Math.min(this.maximum ?? DIFF_COMBINED_MAX_OUTPUT_BYTES, DIFF_COMBINED_MAX_OUTPUT_BYTES);
+  outputCeiling(): number {
+    return this.#maximum;
   }
 
   finish(): string {
@@ -272,6 +261,7 @@ function appendCombinedDiff(
   } else if (first.mode !== after.mode || second.mode !== after.mode) {
     header += `mode ${first.mode},${second.mode}..${after.mode}\n`;
   }
+  out.append(header);
   const firstBytes = endpointBytes(first);
   const secondBytes = endpointBytes(second);
   const afterBytes = after === null ? null : endpointBytes(after);
@@ -280,12 +270,15 @@ function appendCombinedDiff(
     isBinary(secondBytes) ||
     (afterBytes !== null && isBinary(afterBytes))
   ) {
-    out.append(header);
     out.append("Binary files differ\n");
     return;
   }
+  if (after !== null && (after.oid === first.oid || after.oid === second.oid)) {
+    out.append(`--- ${diffHeaderPath(change.path, "a/", options)}\n`);
+    out.append(`+++ ${diffHeaderPath(change.path, "b/", options)}\n`);
+    return;
+  }
 
-  out.append(header);
   out.append(`--- ${diffHeaderPath(change.path, "a/", options)}\n`);
   out.append(
     after === null ? "+++ /dev/null\n" : `+++ ${diffHeaderPath(change.path, "b/", options)}\n`,
@@ -296,7 +289,7 @@ function appendCombinedDiff(
   ) {
     return;
   }
-  preflightCombinedDiff(firstBytes, secondBytes, afterBytes, out.combinedOutputCeiling());
+  preflightCombinedDiff(firstBytes, secondBytes, afterBytes, out.outputCeiling());
   appendCombinedHunks(
     out,
     utf8Decoder.decode(firstBytes),
@@ -347,10 +340,11 @@ function preflightCombinedDiff(
     firstInfo.lines + secondInfo.lines,
   );
   const potentialChanges = Math.min(DIFF_COMBINED_MAX_CHANGES, lines * 2 + 4);
+  // Reserve decoded UTF-16 sources and worst-case copied split-line payloads.
+  const textBytes = inputBytes * 4;
   const retainedBytes = checkedCombinedSum(
     [
-      inputBytes,
-      inputBytes * 2,
+      textBytes,
       lines * DIFF_COMBINED_LINE_RECORD_BYTES,
       maximumPairLines * DIFF_COMBINED_DIFF_LINE_BYTES,
       potentialChanges * DIFF_COMBINED_CHANGE_BYTES,
@@ -547,7 +541,7 @@ function renderCombinedHunks(out: DiffOutput, rows: readonly CombinedRow[], cont
     const comment = combinedHunkComment(rows, countedThrough, start);
     addCombinedLineCounts(before, rows, countedThrough, start);
     const counts = combinedLineCounts(rows, start, end);
-    out.appendCombined(
+    out.append(
       `@@@ -${combinedRange(before.first, counts.first)} -${combinedRange(before.second, counts.second)} +${combinedRange(before.result, counts.result)} @@@${comment === "" ? "" : ` ${comment}`}\n`,
     );
     for (let index = start; index < end; index++) {
@@ -616,8 +610,7 @@ function combinedRange(before: number, count: number): string {
 }
 
 function emitCombinedRow(out: DiffOutput, row: CombinedRow): void {
-  if (row.line.endsWith("\n")) out.appendCombined(`${row.prefix}${row.line}`);
-  else out.appendCombined(`${row.prefix}${row.line}\n\\ No newline at end of file\n`);
+  out.append(`${row.prefix}${row.line}${row.line.endsWith("\n") ? "" : "\n"}`);
 }
 
 function diffUtf8Bytes(value: string): number {
