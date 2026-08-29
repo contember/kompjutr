@@ -20,5 +20,4 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [`sprint-2026-08-29-shell-run-inputs.md`](sprint-2026-08-29-shell-run-inputs.md)
-  — bounded caller stdin and env for the consumer shell integration gate.
+None.

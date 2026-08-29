@@ -77,7 +77,7 @@ Coverage of the calls that decide whether Phase 1 is usable:
 | `branch -m`, `remote set-url` | both | Served by typed native operations; [18](18-branch-and-remote-management.md) now retains only no-caller management |
 | `ls-files --cached --others --exclude-standard -- '<dir>/*-<hash>.svg'` | builder | Served by native cached/untracked selection and repository `.gitignore` filtering; [36](36-glob-pathspecs.md) now retains mutating globs only |
 | `clone --filter=blob:none` | both | [41](41-partial-clone.md) — scale, not a correctness gate; `depth: 0` serves the workflow today |
-| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict synchronous runner and the explicit `kompjutr/git/shell` adapter |
+| `git status --porcelain \| wc -l`, `git log --oneline \| head`, `add` + `rebase --continue` — the agent inside the checkout, as shell commands | both (agent side) | Served by the strict synchronous runner, bounded per-run stdin/env, and the explicit `kompjutr/git/shell` adapter |
 
 Everything else both consumers issue is served, or routes through another
 spelling listed under
@@ -92,24 +92,21 @@ units) or *long* (roughly seven to ten); an item whose acceptance scope exceeds
 one work unit is split at the WU level inside its own sprint, never across two.
 A blocked item must not move ahead of its blocker.
 
-**Phase 1** reached its integration gate. The first real adapter run confirmed
-the per-run shell input gap, so item 63 is the only package-side follow-up before
-the adapter reruns its real workflow. Everything below the gate is re-planned
-from that result.
+**Phase 1** package work is complete. The real adapter now reruns its workflow as
+the integration gate. Everything below the gate is re-planned from that result.
 **Phase 2** is production scale. **Phase 3** is Git parity that no consumer
 issues; it stays filed and unscheduled until a caller appears.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
 | **Phase 1 — a consumer can run** | | | | |
-| 1 | Shell run inputs | [63](63-shell-run-stdin-and-env.md) · [active sprint](../sprints/sprint-2026-08-29-shell-run-inputs.md) | normal | Confirmed by the real adapter: its shell port already carries stdin and env, while kompjutr drops both before injected commands. |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 2 | Budget targets and store split | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
+| 1 | Budget targets and store split | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
 | **Phase 2 — production scale** | | | | |
-| 3 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
-| 4 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
-| 5 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| 2 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
+| 3 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 4 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
 | **Phase 3 — parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
@@ -147,4 +144,3 @@ units over the same files, and a long sprint does not make that safe.
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [60 — Make the SQL budget a measured target and split the store](60-budget-targets-and-store-split.md)
 - [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
-- [63 — Accept caller-supplied stdin and env for a shell run](63-shell-run-stdin-and-env.md)

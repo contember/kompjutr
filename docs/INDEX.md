@@ -15,15 +15,14 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-29-shell-run-inputs.md`](sprints/sprint-2026-08-29-shell-run-inputs.md)
-  — bounded caller stdin and env for the consumer shell integration gate.
+None.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Active: close the per-run stdin/env seam found by the real consumer adapter,
-  then resume its integration gate —
+- Active: rerun the real consumer adapter now that per-run stdin/env is served,
+  then re-plan from that integration result —
   [`backlog/README.md`](backlog/README.md#consumer-demand).
 - The next local cleanup is the measured SQL targets, memory-limit inventory,
   and store split in [backlog 60](backlog/60-budget-targets-and-store-split.md).
@@ -59,6 +58,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-29-shell-run-inputs.md`](archive/sprint-2026-08-29-shell-run-inputs.md)
+  — bounded caller stdin, frozen injected-command env and Git identity
+  forwarding through one run-owned input lifetime.
 - [`archive/sprint-2026-08-28-agent-git-and-file-selection.md`](archive/sprint-2026-08-28-agent-git-and-file-selection.md)
   — a strict synchronous Git argv runner, injectable shell command, and bounded
   tracked plus non-ignored untracked file selection.

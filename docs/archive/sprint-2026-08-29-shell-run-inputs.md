@@ -1,3 +1,21 @@
+> **OUTCOME — shipped 2026-08-29.** `Shell.run()` and `Shell.exec()` now accept
+> bounded caller stdin and a frozen own-property environment snapshot. One
+> run-owned byte cursor preserves unread input across selected pipelines,
+> including partial `head` reads; injected commands inherit env, and the Git
+> adapter forwards it only when supplied. Commit map: plan and approval →
+> `3554cda`, `efedcb4`, `1a77f3f`; WU1 stdin → `742f29c`; WU2 env and Git →
+> `b8b7fe5`; integrated cursor correction and public reference → `7e89010`;
+> closure → this archived record. Verification: WU witnesses passed 34/34 and
+> 27/27; the stable shell slice passed 315/315 in 4.31 s; the routine gate
+> passed 148/148 in 5.76 s; the full sliced runner passed 2,926 tests with five
+> known skips and zero failures. Typecheck, Biome, build, packed-package smoke,
+> and diff validation passed. Independent WU reviews were cleaned, and the
+> integrated T3 review caught and verified the partial-chunk cursor fix before
+> closure. No projected SQL statement barrier was added. Deferred: the external
+> consumer adapter rerun remains the Phase 1 integration gate; removing existing
+> projected statement barriers remains
+> [backlog 60](../backlog/60-budget-targets-and-store-split.md).
+
 # Sprint — Shell run inputs (2026-08-29)
 
 **Goal.** Let a synchronous shell run receive bounded caller stdin and
@@ -236,3 +254,11 @@ the proportional review gates.
   with caller-provided author and committer identity. Bacon's T2 review found
   only import ordering; targeted Biome, focused tests and typecheck passed after
   the mechanical fix, and re-review approved WU2 with no remaining findings.
+- 2026-08-29 — Popper's integrated T3 review first corrected two public-doc
+  claims, then found that a single-chunk owner lost the unread suffix after a
+  partial `head` read. The run-owned borrow now restores a validated same-buffer
+  suffix in `finally`; direct byte, zero-byte and line witnesses pass, and
+  re-review approved the complete sprint with no remaining findings.
+- 2026-08-29 — Closure passed the 315-test shell slice, 148-test routine gate,
+  all static/package gates and the one final 2,926-test full run. Item 63 is
+  consumed; the consumer adapter rerun is now the Phase 1 integration gate.

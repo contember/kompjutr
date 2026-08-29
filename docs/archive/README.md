@@ -9,6 +9,9 @@ that ships — only what genuinely helps a future reader. The git log holds the 
 
 <!-- optional: group by date or theme as it grows; one line per entry -->
 
+- [Shell run inputs](sprint-2026-08-29-shell-run-inputs.md)
+  — bounded caller stdin, frozen injected-command env and Git identity
+  forwarding through one run-owned input lifetime.
 - [Agent Git and file selection](sprint-2026-08-28-agent-git-and-file-selection.md)
   — a strict synchronous Git argv runner, injectable shell command, and bounded
   tracked plus non-ignored untracked file selection.
