@@ -75,9 +75,10 @@ caught before implementation.
 4. No reviewer request may introduce a new statement constant or projected-count
    refusal. Such a finding is rejected with root invariant 5 and ADR 0017.
 5. A byte limit is classified before it changes: external format/platform
-   limit, persisted-schema validation, retained-memory/OOM guard, work counter,
-   batching threshold, or fallback heuristic. Only the first three may refuse a
-   call, and each must name its real failure or aggregate memory equation.
+   limit, persisted-schema validation, retained-memory/OOM guard, real
+   structural or algorithmic limit, work counter, batching threshold, or
+   fallback heuristic. Only the first four may refuse a call, and each must name
+   its real failure, structural invariant, or aggregate memory equation.
 6. The store split is a pure internal move. SQL text, transaction boundaries,
    validation, cache ownership, class constructors, method signatures, root
    exports and package subpaths stay unchanged. Internal table-family modules are
@@ -92,24 +93,34 @@ caught before implementation.
   arbitrary policy into another arbitrary policy.
 - **Verify first.** Recount the 28 statement constants, 24 affected source files,
   147 semantic byte constants, 333 direct statement matchers and benchmark gaps
-  from the commands recorded in the run log. Run the current Next.js benchmark
-  once under a two-vCPU no-SMT lease as the before baseline.
+  from the commands recorded in the run log. Run three clean current Next.js
+  benchmarks under the same two-vCPU no-SMT lease as the before baseline.
 - **Scope.** Add a deterministic `bench:statements` surface with correctness-
   checked rows for schema init, streamed redirect, cached and combined
-  `ls-files`, sparse prune, fetch publication, merge-base, merge, replay/rebase,
-  and maintenance repack; reuse existing clone/push/commit/checkout Next.js rows
-  instead of duplicating them. Append a 147-row TSV inventory to this sprint run
-  log with kind, owner, failure, evidence and decision. Freeze the exact byte
-  removals/replacements only after an independent evidence review. Draft ADR
-  0017 with the statement-target decision and the byte-limit classification
-  rule.
+  `ls-files`, sparse prune, fetch publication, merge-base selection, recursive
+  virtual base, merge apply/recovery/restore, replay plan/recovery, rebase
+  plan/transition, maintenance repack, and transport discovery/fetch/push;
+  reuse existing clone/commit/checkout Next.js rows where they are the exact
+  measured operation. Append a one-to-one statement-barrier ledger to this run
+  log: source site, old operation/error/fallback, focused removal witness,
+  representative benchmark row, and removal WU for all 13 thrown sites, the
+  sparse fallback and seven load assertions. The focused former-first-excess
+  witness is separate from the representative target row: an admitted stress
+  call may exceed the target without becoming a runtime error. Append the
+  147-row byte-limit TSV with kind, owner, failure, evidence and decision.
+  Freeze exact byte removals/replacements only after independent evidence
+  review. Draft ADR 0017 and register it in the decision log and docs index.
 - **Acceptance / witness.** `npm run bench:statements -- --check` emits every
   required row with validated end state and statement count; repeated output is
-  deterministic. The inventory has one stable `source + symbol` key for every
-  semantic byte constant and no duplicate or missing key under a TypeScript-AST
-  audit. The baseline and proposed byte actions are recorded before WU2/WU6.
+  deterministic. Its representative rows enforce the measured target; removal
+  witnesses only prove the runtime no longer manufactures failure. The barrier
+  ledger has one reviewed disposition per removal site. The inventory has one
+  stable `source + symbol` key for every semantic byte constant and no duplicate
+  or missing key under a TypeScript-AST audit. The baseline and proposed byte
+  actions are reviewed to clean before WU2/WU6.
 - **Touch points.** `bench/`, `package.json`, this sprint run log,
-  `docs/decisions/0017-measure-query-cost-and-bound-real-failures.md`.
+  `docs/decisions/{0017-measure-query-cost-and-bound-real-failures.md,
+  README.md}`, `docs/INDEX.md`.
 
 ### WU2 — Remove core integration and history statement models (effort L)
 
@@ -156,17 +167,23 @@ caught before implementation.
 - **Problem.** Schema initialization, atomic redirect streaming, pathspec/
   `ls-files`, sparse checkout and maintenance repack retain independent projected
   count barriers outside the shared transport/history models.
-- **Verify first.** Add direct witnesses for schema and redirect first excess,
-  sparse selected-plan fallback, maintenance selection, and both `ls-files`
-  projections where current tests cover only their calculators.
+- **Verify first.** Add direct witnesses for redirect first excess, sparse
+  selected-plan fallback, maintenance selection, and both `ls-files`
+  projections where current tests cover only their calculators. Schema has a
+  fixed initialization stream and no caller-controlled over-999 fixture; pin
+  fresh initialization, reopen and corrupt-schema behavior plus the wrapper's
+  source/API shape instead of inventing a test seam.
 - **Scope.** Delete the schema 999 wrapper, redirect 900-statement refusal,
   pathspec/staging assertions and projections, sparse SQL-driven fallback, and
   maintenance repack statement estimate/refusal. Retain transactional rollback,
   binding/page sizes, memory limits, and restartable maintenance ownership.
-- **Acceptance / witness.** Each former refusal/fallback proceeds; redirect and
-  schema remain atomic; sparse state matches the full path; maintenance resumes
-  and publishes the same objects. Run schema, filesystem redirect, pathspec/
-  staging/sparse and maintenance witnesses separately, then `npm test`.
+- **Acceptance / witness.** Caller-reachable former refusals/fallbacks proceed;
+  redirect remains atomic, sparse state matches the full path, and maintenance
+  resumes and publishes the same objects. A source/API audit proves the schema
+  counting wrapper is absent while fresh init, exact reopen, version mismatch
+  and corrupt schema retain their prior outcomes. Run schema, filesystem
+  redirect, pathspec/staging/sparse and maintenance witnesses separately, then
+  `npm test`.
 - **Touch points.** `src/{fs/store/stream-write,sqlite/schema,
   sqlite/maintenance/repack}.ts`, `src/core/ops/{pathspec,staging,
   sparse-checkout}.ts`, and matching tests.
@@ -188,7 +205,8 @@ caught before implementation.
   load assertion. `npm run bench:statements -- --check`, typecheck, docs links,
   and `npm test` pass.
 - **Touch points.** `tests/`, `tests/CLAUDE.md`, `src/core/CLAUDE.md`, `bench/`,
-  `docs/{decisions,reference}/`, this sprint file.
+  `docs/{decisions,reference}/`, `docs/decisions/README.md`, `docs/INDEX.md`,
+  this sprint file.
 
 ### WU6 — Remove only evidence-rejected byte barriers (effort L)
 
@@ -246,9 +264,10 @@ caught before implementation.
   pack engine; only its store-facing ownership seam moves. Preserve cache keys,
   memory reservation owners, transaction scope and SQL text.
 - **Acceptance / witness.** Object, pack, tree, commit-cache, shallow and
-  maintenance focused witnesses pass in bounded groups; statement and row counts
-  may change only if the move itself exposed a defect and independent review
-  approves the fix. `npm test` passes.
+  maintenance focused witnesses pass in bounded groups with identical SQL text,
+  statement/row counts, transaction boundaries and cache behavior. A discovered
+  defect stops extraction; its fix must land as a separate reviewed pre-
+  extraction WU/commit before the pure move resumes. `npm test` passes.
 - **Touch points.** `src/sqlite/store/{checkout,shared,objects}.ts`,
   `src/sqlite/packs.ts` only if an internal type import moves, matching tests.
 
@@ -296,7 +315,7 @@ caught before implementation.
 | WU1 | Evidence determines every later removal. | Independent T3 evidence review of benchmark coverage, all 147 inventory rows and proposed actions; fixes return to the same reviewer. | A constant cannot be classified or a former statement barrier lacks a measurable row. |
 | WU2 | Merge/rebase/recovery behavior and public error surface. | Independent T3 review-to-clean plus exact focused witnesses. | A projected count also encoded a real graph/memory bound. |
 | WU3 | Network publication, ownership and CAS are high blast radius. | Independent T3 review-to-clean plus fetch/push concurrency witnesses. | Atomicity, retry or memory ownership changes. |
-| WU4 | Several independent runtime barriers, including schema and maintenance. | Independent T3 review-to-clean; each subsystem has a direct former-first-excess witness. | Removing the statement gate exposes unbounded traversal or per-row SQL. |
+| WU4 | Several independent runtime barriers, including schema and maintenance. | Independent T3 review-to-clean; caller-reachable gates have direct former-first-excess witnesses, while schema uses source/API plus fresh/reopen/version/corruption witnesses. | Removing the statement gate exposes unbounded traversal or per-row SQL. |
 | WU5 | Mostly tests/docs, but a wrong classification can hide cost regressions. | T2 independent review of exact-vs-coarse assertions and source audit; integrated T3 rechecks policy. | An exact assertion has mixed correctness and cost meaning. |
 | WU6 | Memory failures are real; false removal can OOM production. | Independent T3 review-to-clean of only the WU1-approved actions plus cgroup evidence. | Evidence is test-only, high-water is unbounded, or a replacement needs architecture change. |
 | WU7–WU10 | Pure moves, but private ownership, cycles and transaction seams are fundamental. | Independent T3 review-to-clean per WU, focused family witnesses, public export snapshot and routine gate. | SQL text/ordering, transaction scope, cache owner, public type or runtime import graph changes. |
@@ -310,9 +329,20 @@ caught before implementation.
 - **Benchmarks.** Run correctness-only statement targets while iterating. Lease
   two no-SMT vCPUs for the before/final Next.js and cgroup memory measurements;
   never report unleased wall or memory numbers.
-- **Sprint closure.** After final independent review is clean, run both parity
-  harnesses, typecheck, Biome, build, packed-package smoke and `npm run
+- **Sprint closure.** After final independent review is clean, run Git parity
+  (`npx vitest run tests/git-upstream-parity.test.ts`), shell real-binary parity
+  (`npx vitest run tests/shell/parity-grep.test.ts
+  tests/shell/parity-rg.test.ts tests/shell/parity-touch.test.ts`), filesystem
+  conformance (`npx vitest run tests/fs/conformance`), `npm run typecheck`,
+  `npm run check`, `npm run build`, `npm run package:smoke`, and `npm run
   test:full` exactly once under a two-vCPU lease.
+- **Next.js comparison.** Run three clean before and three clean final
+  `npm run bench:nextjs` passes under the same two-vCPU no-SMT lease. Every phase
+  must succeed and retain exact statement counts; returned-row medians must
+  match when rounded to three significant figures. Final median wall time must
+  not exceed the before median by more than the larger of 20% or 25 ms per
+  phase. RSS/heap deltas are reported as informational because the harness
+  cannot make them deterministic.
 - **Failure loop.** Reproduce a closure failure with its exact file/domain slice.
   Rerun the exhaustive suite only after the focused witness is stable.
 
@@ -347,8 +377,9 @@ caught before implementation.
 
 ## Sequencing
 
-1. WU1 lands the benchmark and inventory evidence, then receives independent
-   evidence review. Its reviewed action table freezes WU6 scope.
+1. WU1 implements the benchmark and inventory evidence, receives independent
+   review-to-clean, and only then commits/lands. Its reviewed action table
+   freezes WU6 scope.
 2. WU2 and WU3 remove the shared core and transport models in that order; WU3
    deletes store statement constants only after WU2 consumers are gone.
 3. WU4 removes disjoint standalone gates. WU5 normalizes tests/docs and proves
@@ -365,9 +396,15 @@ An independent reviewer checks the complete proposal against HEAD, especially
 invariant 5, benchmark coverage, the two-stage memory decision gate, exact query-
 shape exceptions, store import topology and proportional per-WU review.
 
-- **Reviewer:** pending
-- **Verdict:** pending
-- **Material findings:** pending
+- **Reviewer:** Huygens (`review_budget_store_plan_t3`)
+- **Verdict:** approved after corrections
+- **Material findings:** The first proposal lacked one-to-one barrier evidence,
+  asked for an infeasible over-999 schema fixture, omitted structural byte
+  limits, allowed defect fixes inside a pure store move, and left closure gates
+  underspecified. The approved plan now maps every barrier to separate behavior
+  and benchmark witnesses, uses source/API schema evidence, reviews all 147 byte
+  limits including real structural failures, stops extraction for separate fixes,
+  and names parity/conformance plus three-run benchmark thresholds.
 
 ## Run log
 
@@ -381,3 +418,6 @@ shape exceptions, store import topology and proportional per-WU review.
 - 2026-08-29 — The store has drifted from 8,493 to 9,259 lines. Public consumers
   still converge on `src/sqlite/store.js`, so the planned internal directory
   keeps that file as an explicit facade.
+- 2026-08-29 — Huygens approved the corrected T3 proposal. Implementation may
+  start with WU1; its evidence must receive its own review-to-clean before it is
+  committed and before any runtime barrier changes.
