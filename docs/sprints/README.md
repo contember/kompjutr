@@ -20,4 +20,5 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None. Phase 1 package work is waiting at the consumer integration gate.
+- [`sprint-2026-08-29-shell-run-inputs.md`](sprint-2026-08-29-shell-run-inputs.md)
+  — bounded caller stdin and env for the consumer shell integration gate.
