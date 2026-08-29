@@ -136,11 +136,18 @@ const shell = createShell({
   fs: workspace.filesystem,
   commands: new Map([["git", createGitCommand(workspace.git)]]),
 });
-const { stdout, operations } = shell.run("git status --porcelain | wc -l");
+const { stdout, operations } = shell.run("git status --porcelain | wc -l", {
+  env: {
+    GIT_AUTHOR_NAME: "Agent",
+    GIT_AUTHOR_EMAIL: "agent@example.com",
+  },
+});
 ```
 
 Stdout, stderr, filesystem operations, and live intermediate bytes are bounded
 by the executor, so a command without `| head` still returns a bounded result.
+Each run may receive up to 1 MiB of caller stdin and a frozen, bounded env
+snapshot for injected commands. Caller input shares the retained-memory budget.
 File redirects stream atomically and roll back on an upstream failure. `git` is
 not a built-in; the explicit adapter exposes a strict local allowlist and never
 falls back to a process. See

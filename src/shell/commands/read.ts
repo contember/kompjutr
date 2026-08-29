@@ -3,7 +3,15 @@
 // read. The ones that do name a file lower to `readRange`, so `head -20` of
 // a 40 MB file is one statement over a few kilobytes.
 
-import { type ByteStream, concat, encode, lines, NEWLINE, terminated } from "../exec/bytes.js";
+import {
+  type ByteStream,
+  concat,
+  encode,
+  lines,
+  NEWLINE,
+  restoreUnused,
+  terminated,
+} from "../exec/bytes.js";
 import { type Command, type CommandContext, fail, result } from "../exec/context.js";
 import { resolve } from "../exec/execute.js";
 import { count, parseFlags, UsageError } from "./flags.js";
@@ -308,8 +316,12 @@ function* takeLines(source: ByteStream, wanted: number): ByteStream {
       if (chunk[index] !== NEWLINE) continue;
       seen++;
       if (seen < wanted) continue;
-      // Stop mid-chunk and stop pulling: the source stops here too.
-      yield chunk.subarray(0, index + 1);
+      const end = index + 1;
+      try {
+        yield chunk.subarray(0, end);
+      } finally {
+        restoreUnused(source, chunk.subarray(end));
+      }
       return;
     }
     yield chunk;
@@ -317,6 +329,7 @@ function* takeLines(source: ByteStream, wanted: number): ByteStream {
 }
 
 function* takeBytes(source: ByteStream, wanted: number): ByteStream {
+  if (wanted === 0) return;
   let sent = 0;
   for (const chunk of source) {
     const room = wanted - sent;
@@ -326,7 +339,11 @@ function* takeBytes(source: ByteStream, wanted: number): ByteStream {
       yield chunk;
       continue;
     }
-    yield chunk.subarray(0, room);
+    try {
+      yield chunk.subarray(0, room);
+    } finally {
+      restoreUnused(source, chunk.subarray(room));
+    }
     return;
   }
 }

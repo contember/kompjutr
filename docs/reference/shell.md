@@ -25,6 +25,30 @@ redirections:
 Expected usage and filesystem errors from built-ins return a `RunResult`.
 Exceptions from injected commands remain visible to the caller.
 
+`Shell.run(source, options?)` and `Shell.exec(source, options?)` accept caller
+input through `ShellRunOptions`:
+
+```ts
+const counted = shell.run("cat | wc -c", {
+  stdin: "bytes or text",
+});
+const committed = shell.run("git commit -m update", {
+  env: {
+    GIT_AUTHOR_NAME: "Agent",
+    GIT_AUTHOR_EMAIL: "agent@example.com",
+  },
+});
+```
+
+Caller stdin is one cursor for the complete run. Selected pipelines borrow its
+remaining bytes without replaying consumed input. Closing a pipeline borrow
+does not close the run cursor, and `< file` replaces input only for that stage.
+The run closes its cursor on every result or exception.
+
+Environment values are a frozen snapshot of the caller's own enumerable
+properties. Built-ins and the parser do not expand them. Injected commands read
+the snapshot through `CommandContext.env`, including nested invocations.
+
 ## Supported commands
 
 Options not listed here are rejected unless the row states otherwise. Short
@@ -83,7 +107,8 @@ The shell layer never imports the Git layer and the root entry does not install
 the command implicitly. The adapter exposes only the strict local argv subset
 listed in [Git support](git-support.md#strict-local-argv-runner). It closes an
 upstream stdin stream without reading it, because no accepted Git command reads
-stdin.
+stdin. When a run supplies env, the adapter forwards its snapshot to the Git
+runner; only the four documented Git identity variables affect commits.
 
 Git stdout remains pipeline bytes. Git stderr uses the raw diagnostic seam, so
 the adapter adds no command prefix, newline, or decoding. It therefore preserves
@@ -111,6 +136,8 @@ one logical filesystem revision per mutating call.
 | `maxOperations` | 10,000 calls | Counts shell-visible filesystem calls and fails with exit 2 before the next call. |
 | `readBudget` | 1,500,000 bytes | Caps bytes requested per bulk/range read statement. |
 | `maxRetainedBytes` | 16 MiB | Caps live shell-owned intermediate bytes across the complete pipeline; overflow fails with exit 2 and never truncates semantic input. |
+| Caller stdin | 1 MiB | UTF-8 text is measured before encoding; binary input is copied only after the combined input reservation succeeds. |
+| Caller env | 256 own entries and 1 MiB cumulative UTF-8 key/value bytes | The frozen snapshot and stdin share one `maxRetainedBytes` reservation for the complete run. |
 | Expanded argv | 10,000 entries and 1,000,000 UTF-8 bytes | The first excess entry or byte fails with an `E2BIG`-shaped result before invocation. |
 | Redirect input | 96 MiB and 900 content statements | The complete transaction rolls back on overflow or upstream failure. |
 

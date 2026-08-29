@@ -10,7 +10,7 @@ import { join, normalize } from "../../fs/path.js";
 import type { Filesystem } from "../../fs/types.js";
 import { ShellSyntaxError } from "../parse/ast.js";
 import type { Argument, Plan, PlannedCommand, PlannedPipeline } from "../plan/types.js";
-import { type ByteStream, concat, line } from "./bytes.js";
+import { type ByteStream, concat, line, withUnusedRestorer } from "./bytes.js";
 import {
   BoundedFs,
   type Command,
@@ -236,9 +236,10 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
 /** Own caller inputs and their retained-memory reservation for one complete run. */
 export class RunInputOwner {
   #closed = false;
+  #offset = 0;
 
   constructor(
-    private readonly source: ByteStream | null,
+    private readonly source: Uint8Array | null,
     readonly env: Readonly<Record<string, string>> | undefined,
     private readonly release: () => void,
   ) {}
@@ -247,23 +248,33 @@ export class RunInputOwner {
   borrow(): ByteStream | null {
     const source = this.source;
     if (source === null) return null;
-    return (function* (): ByteStream {
-      for (;;) {
-        const next = source.next();
-        if (next.done) return;
-        yield next.value;
-      }
+    const start = this.#offset;
+    const owner = this;
+    const stream = (function* (): ByteStream {
+      if (start >= source.length) return;
+      owner.#offset = source.length;
+      yield source.subarray(start);
     })();
+    let restored = false;
+    return withUnusedRestorer(stream, (unused) => {
+      if (restored) return;
+      restored = true;
+      const suffixStart = source.length - unused.length;
+      if (
+        suffixStart < start ||
+        unused.buffer !== source.buffer ||
+        unused.byteOffset !== source.byteOffset + suffixStart
+      ) {
+        throw new Error("caller stdin restorer received a non-suffix view");
+      }
+      owner.#offset = suffixStart;
+    });
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    try {
-      this.source?.return();
-    } finally {
-      this.release();
-    }
+    this.release();
   }
 }
 
@@ -284,11 +295,7 @@ function prepareRunInput(
           ? ENCODER.encode(stdin)
           : stdin.slice();
     const envSnapshot = snapshotEnvironment(env, environment);
-    return new RunInputOwner(
-      stdinSnapshot === null ? null : singleChunk(stdinSnapshot),
-      envSnapshot,
-      release,
-    );
+    return new RunInputOwner(stdinSnapshot, envSnapshot, release);
   } catch (error) {
     release();
     throw error;
@@ -392,10 +399,6 @@ function boundedUtf8Bytes(value: string, maximum: number): number | null {
     if (bytes > maximum) return null;
   }
   return bytes;
-}
-
-function* singleChunk(bytes: Uint8Array): ByteStream {
-  if (bytes.length > 0) yield bytes;
 }
 
 class UpstreamError extends Error {

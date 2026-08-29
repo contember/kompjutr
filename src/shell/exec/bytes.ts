@@ -11,6 +11,24 @@ import type { RetainedBudget } from "./context.js";
 /** A stage's output. Sync because the whole filesystem API is sync. */
 export type ByteStream = Generator<Uint8Array, void, undefined>;
 
+const RESTORE_UNUSED = Symbol("kompjutr.shell.restore-unused");
+
+/** Attach a private pushback seam used by a run-owned stdin borrow. */
+export function withUnusedRestorer(
+  stream: ByteStream,
+  restore: (bytes: Uint8Array) => void,
+): ByteStream {
+  Object.defineProperty(stream, RESTORE_UNUSED, { value: restore });
+  return stream;
+}
+
+/** Return a suffix when a consumer stops inside one chunk. */
+export function restoreUnused(stream: ByteStream, bytes: Uint8Array): void {
+  if (bytes.length === 0 || !(RESTORE_UNUSED in stream)) return;
+  const restore = stream[RESTORE_UNUSED];
+  if (typeof restore === "function") restore(bytes);
+}
+
 export const NEWLINE = 0x0a;
 
 const ENCODER = new TextEncoder();

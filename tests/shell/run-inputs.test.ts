@@ -56,6 +56,16 @@ describe("caller stdin", () => {
     );
   });
 
+  it("preserves a partially consumed byte or line suffix for a later pipeline", () => {
+    const subject = fixture();
+
+    expect(subject.shell.run("head -c 1; cat", { stdin: "abc" }).stdout).toBe("abc");
+    expect(subject.shell.run("head -c 0; cat", { stdin: "abc" }).stdout).toBe("abc");
+    expect(subject.shell.run("head -n 1; cat", { stdin: "first\nsecond\n" }).stdout).toBe(
+      "first\nsecond\n",
+    );
+  });
+
   it("keeps caller stdin after a redirect, command miss, and early downstream close", () => {
     const subject = fixture();
 
