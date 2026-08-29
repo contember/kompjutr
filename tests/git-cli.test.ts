@@ -412,6 +412,55 @@ describe("git CLI runtime validation and bounds", () => {
     );
   });
 
+  it("rejects inherited input fields", () => {
+    for (const input of [
+      recordWithPrototype({ argv: [] }, {}),
+      recordWithPrototype({ cwd: "/inherited" }, { argv: [] }),
+      recordWithPrototype({ dir: "/inherited" }, { argv: [] }),
+      recordWithPrototype({ unknown: true }, { argv: [] }),
+    ]) {
+      expect(() => validateGitCliInput(input)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+    }
+  });
+
+  it("rejects inherited environment fields", () => {
+    for (const env of [
+      recordWithPrototype({ GIT_AUTHOR_NAME: "Inherited" }, {}),
+      recordWithPrototype({ UNKNOWN: "inherited" }, {}),
+    ]) {
+      expect(() => validateGitCliInput({ argv: [], env })).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+    }
+  });
+
+  it("accepts null-prototype input and environment records", () => {
+    const env = recordWithPrototype(null, {
+      GIT_AUTHOR_NAME: "Author",
+      UNUSED: "ignored",
+    });
+    const input = recordWithPrototype(null, {
+      argv: ["commit", "-m", "message"],
+      cwd: "/repo",
+      env,
+      stdin: "ignored",
+    });
+
+    expect(validateGitCliInput(input)).toEqual({
+      argv: ["commit", "-m", "message"],
+      cwd: "/repo",
+      env: {
+        GIT_AUTHOR_NAME: "Author",
+        GIT_AUTHOR_EMAIL: undefined,
+        GIT_COMMITTER_NAME: undefined,
+        GIT_COMMITTER_EMAIL: undefined,
+      },
+      stdin: "ignored",
+    });
+  });
+
   it("retains only the four recognized bounded environment entries", () => {
     const parsedInput = parseGitCliInput({
       argv: ["commit", "-m", "m"],
@@ -496,6 +545,23 @@ describe("git CLI runtime validation and bounds", () => {
         expect.objectContaining({ code: "EINVAL" }),
       );
     }
+  });
+
+  it("rejects inherited run options and accepts a null-prototype options record", () => {
+    for (const options of [
+      recordWithPrototype({ maxStdoutBytes: 1 }, {}),
+      recordWithPrototype({ unknown: true }, {}),
+    ]) {
+      expect(() => resolveGitCliRunOptions(options)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+    }
+
+    expect(
+      resolveGitCliRunOptions(
+        recordWithPrototype(null, { maxStdoutBytes: 1, discardStderr: true }),
+      ),
+    ).toMatchObject({ maxStdoutBytes: 1, discardStderr: true });
   });
 });
 
@@ -777,4 +843,15 @@ function rejected(argv: readonly string[]): GitCliResult {
   if (result.ok)
     throw new Error(`expected rejected argv, received ${result.invocation.command.kind}`);
   return result.result;
+}
+
+function recordWithPrototype(
+  prototype: object | null,
+  properties: Readonly<Record<string, unknown>>,
+): unknown {
+  const descriptors: PropertyDescriptorMap = {};
+  for (const [key, value] of Object.entries(properties)) {
+    descriptors[key] = { value, enumerable: true, configurable: true, writable: true };
+  }
+  return Object.create(prototype, descriptors);
 }

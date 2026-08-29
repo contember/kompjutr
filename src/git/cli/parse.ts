@@ -54,19 +54,23 @@ export function parseGitCliInput(input: unknown, logLimitHint?: number): GitCliP
 }
 
 export function validateGitCliInput(input: unknown): ValidatedGitCliInput {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    throw new GitError("EINVAL", "git CLI input must be an object");
+  if (!isPlainRecord(input)) {
+    throw new GitError("EINVAL", "git CLI input must be a plain object");
   }
   validateInputKeys(input);
-  if (!("argv" in input) || !Array.isArray(input.argv)) {
+  if (!Object.hasOwn(input, "argv")) {
     throw new GitError("EINVAL", "git CLI argv must be an array");
   }
-  if (input.argv.length > GIT_CLI_MAX_ARGV_ENTRIES) {
+  const inputArgv: unknown = Reflect.get(input, "argv");
+  if (!Array.isArray(inputArgv)) {
+    throw new GitError("EINVAL", "git CLI argv must be an array");
+  }
+  if (inputArgv.length > GIT_CLI_MAX_ARGV_ENTRIES) {
     throw new GitError("E2BIG", `git CLI argv exceeds ${GIT_CLI_MAX_ARGV_ENTRIES} entries`);
   }
   const argv: string[] = [];
   let argvBytes = 0;
-  for (const argument of input.argv) {
+  for (const argument of inputArgv) {
     if (typeof argument !== "string") {
       throw new GitError("EINVAL", "git CLI argv entries must be strings");
     }
@@ -80,15 +84,18 @@ export function validateGitCliInput(input: unknown): ValidatedGitCliInput {
   const cwd = validateCwd(input);
   const env = validateEnvironment(input);
   let stdin: string | undefined;
-  if ("stdin" in input && input.stdin !== undefined) {
-    if (typeof input.stdin !== "string") {
+  if (Object.hasOwn(input, "stdin")) {
+    const inputStdin: unknown = Reflect.get(input, "stdin");
+    if (inputStdin !== undefined && typeof inputStdin !== "string") {
       throw new GitError("EINVAL", "git CLI stdin must be a string");
     }
-    const bytes = gitCliUtf8ByteLength(input.stdin, "git CLI stdin", false);
-    if (bytes > GIT_CLI_MAX_STDIN_BYTES) {
-      throw new GitError("E2BIG", `git CLI stdin exceeds ${GIT_CLI_MAX_STDIN_BYTES} bytes`);
+    if (inputStdin !== undefined) {
+      const bytes = gitCliUtf8ByteLength(inputStdin, "git CLI stdin", false);
+      if (bytes > GIT_CLI_MAX_STDIN_BYTES) {
+        throw new GitError("E2BIG", `git CLI stdin exceeds ${GIT_CLI_MAX_STDIN_BYTES} bytes`);
+      }
+      stdin = inputStdin;
     }
-    stdin = input.stdin;
   }
   return { argv, cwd, env, stdin };
 }
@@ -369,23 +376,27 @@ function validateInputKeys(input: object): void {
 }
 
 function validateCwd(input: object): string {
-  if (!("cwd" in input) || input.cwd === undefined) return "/";
-  if (typeof input.cwd !== "string" || input.cwd.length === 0 || !input.cwd.startsWith("/")) {
+  if (!Object.hasOwn(input, "cwd")) return "/";
+  const inputCwd: unknown = Reflect.get(input, "cwd");
+  if (inputCwd === undefined) return "/";
+  if (typeof inputCwd !== "string" || inputCwd.length === 0 || !inputCwd.startsWith("/")) {
     throw new GitError("EINVAL", "git CLI cwd must be a non-empty absolute path");
   }
-  const bytes = gitCliUtf8ByteLength(input.cwd, "git CLI cwd", true);
+  const bytes = gitCliUtf8ByteLength(inputCwd, "git CLI cwd", true);
   if (bytes > GIT_CLI_MAX_CWD_BYTES) {
     throw new GitError("E2BIG", `git CLI cwd exceeds ${GIT_CLI_MAX_CWD_BYTES} bytes`);
   }
-  return input.cwd;
+  return inputCwd;
 }
 
 function validateEnvironment(input: object): GitCliEnvironment {
-  if (!("env" in input) || input.env === undefined) return {};
-  if (typeof input.env !== "object" || input.env === null || Array.isArray(input.env)) {
-    throw new GitError("EINVAL", "git CLI env must be an object");
+  if (!Object.hasOwn(input, "env")) return {};
+  const inputEnv: unknown = Reflect.get(input, "env");
+  if (inputEnv === undefined) return {};
+  if (!isPlainRecord(inputEnv)) {
+    throw new GitError("EINVAL", "git CLI env must be a plain object");
   }
-  const keys = Reflect.ownKeys(input.env);
+  const keys = Reflect.ownKeys(inputEnv);
   if (keys.length > GIT_CLI_MAX_ENV_ENTRIES) {
     throw new GitError("E2BIG", `git CLI env exceeds ${GIT_CLI_MAX_ENV_ENTRIES} entries`);
   }
@@ -398,7 +409,7 @@ function validateEnvironment(input: object): GitCliEnvironment {
     if (typeof key !== "string" || key.length === 0 || key.includes("=")) {
       throw new GitError("EINVAL", "git CLI env names must be non-empty strings without '='");
     }
-    const value: unknown = Reflect.get(input.env, key);
+    const value: unknown = Reflect.get(inputEnv, key);
     if (typeof value !== "string")
       throw new GitError("EINVAL", "git CLI env values must be strings");
     const entryBytes =
@@ -419,4 +430,10 @@ function validateEnvironment(input: object): GitCliEnvironment {
     GIT_COMMITTER_NAME: committerName,
     GIT_COMMITTER_EMAIL: committerEmail,
   };
+}
+
+function isPlainRecord(value: unknown): value is object {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === null || prototype === Object.prototype;
 }

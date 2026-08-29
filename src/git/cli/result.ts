@@ -95,8 +95,8 @@ export function resolveGitCliRunOptions(value: unknown): ResolvedGitCliRunOption
       discardStderr: false,
     };
   }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new GitError("EINVAL", "git CLI run options must be an object");
+  if (!isPlainRecord(value)) {
+    throw new GitError("EINVAL", "git CLI run options must be a plain object");
   }
   validateOptionKeys(value);
   const maxStdoutBytes = optionalCeiling(value, "maxStdoutBytes", GIT_CLI_MAX_STDOUT_BYTES);
@@ -107,15 +107,20 @@ export function resolveGitCliRunOptions(value: unknown): ResolvedGitCliRunOption
     GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
   );
   let discardStderr = false;
-  if ("discardStderr" in value) {
-    if (typeof value.discardStderr !== "boolean") {
+  if (Object.hasOwn(value, "discardStderr")) {
+    const option: unknown = Reflect.get(value, "discardStderr");
+    if (typeof option !== "boolean") {
       throw new GitError("EINVAL", "git CLI discardStderr must be a boolean");
     }
-    discardStderr = value.discardStderr;
+    discardStderr = option;
   }
   let logLimitHint: number | undefined;
-  if ("logLimitHint" in value) {
-    logLimitHint = ceiling(value.logLimitHint, "logLimitHint", GIT_CLI_MAX_LOG_COUNT);
+  if (Object.hasOwn(value, "logLimitHint")) {
+    logLimitHint = ceiling(
+      Reflect.get(value, "logLimitHint"),
+      "logLimitHint",
+      GIT_CLI_MAX_LOG_COUNT,
+    );
   }
   return {
     maxStdoutBytes,
@@ -197,17 +202,8 @@ function validateOptionKeys(value: object): void {
 }
 
 function optionalCeiling(value: object, key: string, maximum: number): number {
-  if (!(key in value)) return maximum;
-  if (key === "maxStdoutBytes" && "maxStdoutBytes" in value) {
-    return ceiling(value.maxStdoutBytes, key, maximum);
-  }
-  if (key === "maxStderrBytes" && "maxStderrBytes" in value) {
-    return ceiling(value.maxStderrBytes, key, maximum);
-  }
-  if (key === "maxCombinedOutputBytes" && "maxCombinedOutputBytes" in value) {
-    return ceiling(value.maxCombinedOutputBytes, key, maximum);
-  }
-  throw new GitError("EINVAL", `unknown git CLI run option: ${key}`);
+  if (!Object.hasOwn(value, key)) return maximum;
+  return ceiling(Reflect.get(value, key), key, maximum);
 }
 
 function ceiling(value: unknown, label: string, maximum: number): number {
@@ -218,4 +214,10 @@ function ceiling(value: unknown, label: string, maximum: number): number {
     );
   }
   return value;
+}
+
+function isPlainRecord(value: unknown): value is object {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === null || prototype === Object.prototype;
 }
