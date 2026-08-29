@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { checkoutTree } from "../src/core/ops/checkout.js";
-import { diff as coreDiff, diffHeaderPath } from "../src/core/ops/diff.js";
+import {
+  diff as coreDiff,
+  DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS,
+  diffHeaderPath,
+} from "../src/core/ops/diff.js";
+import { rebase } from "../src/core/ops/rebase.js";
 import { add } from "../src/core/ops/staging.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import { runGitCli } from "../src/git/cli/index.js";
@@ -283,6 +288,155 @@ describe("plain git diff semantics and cumulative bounds", () => {
     expect(() =>
       runGitCli({ argv: ["diff"], cwd: "/repo" }, handlers, { maxStdoutBytes: bytes - 1 }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+  });
+
+  it("matches Git combined diff while a rebase conflict is unresolved", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("conflict.txt", "base\n");
+    const base = fixture.commit("base");
+    fixture.git("checkout", "-q", "-b", "upstream", base);
+    fixture.write("conflict.txt", "upstream\n");
+    const upstream = fixture.commit("upstream");
+    fixture.git("checkout", "-q", "-b", "current", base);
+    fixture.write("conflict.txt", "current\n");
+    fixture.commit("current");
+    const workspace = await importAt(fixture);
+
+    expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, {
+        upstream,
+        committer: { name: "Fixture", email: "fixture@example.com" },
+      }).outcome,
+    ).toBe("conflicted");
+
+    expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+
+    fixture.write("conflict.txt", "resolved\n");
+    writeWorkFile(workspace, "/repo/conflict.txt", "resolved\n");
+    expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+
+    fixture.remove("conflict.txt");
+    workspace.worktree.removeFiles(["/repo/conflict.txt"]);
+    expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+  });
+
+  it("matches Git's unmerged fallback when either conflict side is absent", async () => {
+    for (const upstreamDeletes of [false, true]) {
+      const fixture = new GitFixture().init();
+      fixtures.push(fixture);
+      fixture.write("conflict.txt", "base\n");
+      const base = fixture.commit("base");
+      fixture.git("checkout", "-q", "-b", "upstream", base);
+      if (upstreamDeletes) fixture.git("rm", "-q", "conflict.txt");
+      else fixture.write("conflict.txt", "upstream\n");
+      const upstream = fixture.commit("upstream");
+      fixture.git("checkout", "-q", "-b", "current", base);
+      if (upstreamDeletes) fixture.write("conflict.txt", "current\n");
+      else fixture.git("rm", "-q", "conflict.txt");
+      fixture.commit("current");
+      const workspace = await importAt(fixture);
+
+      expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
+      expect(
+        rebase(workspace.context, workspace.repo, workspace.worktree, {
+          upstream,
+          committer: { name: "Fixture", email: "fixture@example.com" },
+        }).outcome,
+      ).toBe("conflicted");
+      expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+    }
+  });
+
+  it("matches Git combined binary conflict output", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("conflict.bin", new Uint8Array([0, 1]));
+    const base = fixture.commit("base");
+    fixture.git("checkout", "-q", "-b", "upstream", base);
+    fixture.write("conflict.bin", new Uint8Array([0, 2]));
+    const upstream = fixture.commit("upstream");
+    fixture.git("checkout", "-q", "-b", "current", base);
+    fixture.write("conflict.bin", new Uint8Array([0, 3]));
+    fixture.commit("current");
+    const workspace = await importAt(fixture);
+
+    expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, {
+        upstream,
+        committer: { name: "Fixture", email: "fixture@example.com" },
+      }).outcome,
+    ).toBe("conflicted");
+    expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+  });
+
+  it("matches Git combined hunk context for distant conflicts", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    const lines = Array.from({ length: 20 }, (_, index) => `line ${index}`);
+    fixture.write("conflict.txt", `${lines.join("\n")}\n`);
+    const base = fixture.commit("base");
+    fixture.git("checkout", "-q", "-b", "upstream", base);
+    const upstreamLines = [...lines];
+    upstreamLines[1] = "upstream one";
+    upstreamLines[15] = "upstream fifteen";
+    fixture.write("conflict.txt", `${upstreamLines.join("\n")}\n`);
+    const upstream = fixture.commit("upstream");
+    fixture.git("checkout", "-q", "-b", "current", base);
+    const currentLines = [...lines];
+    currentLines[1] = "current one";
+    currentLines[15] = "current fifteen";
+    fixture.write("conflict.txt", `${currentLines.join("\n")}\n`);
+    fixture.commit("current");
+    const workspace = await importAt(fixture);
+
+    expect(gitResultAt(fixture, ["rebase", "upstream"]).exitCode).toBe(1);
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, {
+        upstream,
+        committer: { name: "Fixture", email: "fixture@example.com" },
+      }).outcome,
+    ).toBe("conflicted");
+    expect(nativeRun(workspace, ["diff"])).toEqual(gitResultAt(fixture, ["diff"]));
+  });
+
+  it("bounds index-worktree source rows at the exact limit and first excess", async () => {
+    const fixture = new GitFixture().init();
+    fixtures.push(fixture);
+    fixture.write("z-tracked.txt", "tracked\n").commit("base");
+    const workspace = await importAt(fixture);
+    const untracked = DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS - 1;
+    workspace.storage.db.exec(`
+      WITH RECURSIVE sequence(i) AS (
+        VALUES (0) UNION ALL SELECT i + 1 FROM sequence WHERE i + 1 < ${untracked}
+      )
+      INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
+      SELECT 2000000 + i, 'file', 420, 1577836800000, 0, 1, 1 FROM sequence;
+      WITH RECURSIVE sequence(i) AS (
+        VALUES (0) UNION ALL SELECT i + 1 FROM sequence WHERE i + 1 < ${untracked}
+      )
+      INSERT INTO fs_paths (path, parent, inode)
+      SELECT printf('/repo/u-%06d.txt', i), '/repo', 2000000 + i FROM sequence;
+    `);
+
+    workspace.storage.resetCounters();
+    expect(nativeRun(workspace, ["diff"])).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+    const exactStatements = workspace.storage.statementCount;
+    expect(exactStatements).toBe(108);
+
+    workspace.storage.db.exec(`
+      INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
+      VALUES (2100000, 'file', 420, 1577836800000, 0, 1, 1);
+      INSERT INTO fs_paths (path, parent, inode)
+      VALUES ('/repo/u-999999.txt', '/repo', 2100000);
+    `);
+    workspace.storage.resetCounters();
+    expect(() => nativeRun(workspace, ["diff"])).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(workspace.storage.statementCount).toBe(107);
   });
 });
 

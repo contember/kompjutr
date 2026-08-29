@@ -113,7 +113,9 @@ entries and 1 MiB of environment key/value bytes, 1 MiB of stdin, 4,096 cwd
 bytes, 1 MiB per commit message, and 64 KiB per log format. Default output
 ceilings are 16 MiB stdout, 1 MiB stderr, and 16 MiB combined. Run options can
 only tighten those ceilings, discard stderr, or provide a log count hint up to
-50,000. The first excess fails with `E2BIG`; semantic output is never truncated.
+50,000. Plain `diff` scans at most 100,000 worktree source rows, including
+untracked rows it must discard, and renders unmerged paths in Git's combined
+format. The first excess fails with `E2BIG`; semantic output is never truncated.
 
 `add`, `commit`, and both rebase actions execute their mutation, format their
 success output, and preflight all retained output inside one database

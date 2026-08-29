@@ -7,7 +7,7 @@
 
 import type { BlobIdMapping, BlobReadBatch, IndexEntry } from "../../sqlite/store.js";
 import { utf8, utf8Decoder, ZERO_OID } from "../bytes.js";
-import { diffText } from "../diff/index.js";
+import { diffLines, diffText, splitLines } from "../diff/index.js";
 import { isBinary } from "../diff/lines.js";
 import { CorruptError, GitError } from "../errors.js";
 import { joinPath } from "../paths.js";
@@ -33,6 +33,7 @@ import {
   renameDetectionEnabled,
 } from "./rename-detection.js";
 import { sparseCommitPair, sparseWorkingCandidates } from "./sparse-diff.js";
+import { type StatusIndexGroup, statusIndexGroups } from "./status-rows.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
   hashExactWorktreePaths,
@@ -50,6 +51,8 @@ const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
 const DIFF_PATH_BYTES = 2_200;
 const DIFF_SUMMARY_ENTRY_FIXED_BYTES = 128;
 const DIFF_SUMMARY_MAX_ROWS = 50_000;
+/** One hundred full worktree pages plus one terminal or first-excess query. */
+export const DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS = 100_000;
 
 export type { DiffOptions } from "./diff-internal.js";
 
@@ -79,6 +82,28 @@ interface FileChange {
   after: Endpoint | null;
 }
 
+interface CombinedFileChange {
+  kind: "combined";
+  path: string;
+  parents: readonly [Endpoint, Endpoint];
+  after: Endpoint | null;
+}
+
+interface UnmergedPathChange {
+  kind: "unmerged";
+  path: string;
+}
+
+type PatchChange = FileChange | CombinedFileChange | UnmergedPathChange;
+
+function isCombinedFileChange(change: PatchChange): change is CombinedFileChange {
+  return "kind" in change && change.kind === "combined";
+}
+
+function isUnmergedFileChange(change: PatchChange): change is UnmergedPathChange {
+  return "kind" in change && change.kind === "unmerged";
+}
+
 export function diff(
   repo: Repository,
   worktree: Worktree,
@@ -95,6 +120,14 @@ export function diff(
     sparseWorkspace,
     formatOptions.indexBase === true,
   )) {
+    if (isUnmergedFileChange(change)) {
+      out.append(`* Unmerged path ${diffHeaderPath(change.path, "", formatOptions)}\n`);
+      continue;
+    }
+    if (isCombinedFileChange(change)) {
+      appendCombinedDiff(out, change, abbrev, options.context, formatOptions);
+      continue;
+    }
     const before = change.before;
     const after = change.after;
     if (
@@ -193,6 +226,256 @@ class DiffOutput {
   finish(): string {
     return this.#output;
   }
+}
+
+function appendCombinedDiff(
+  out: DiffOutput,
+  change: CombinedFileChange,
+  abbrev: number,
+  context: number | undefined,
+  options: DiffFormatOptions,
+): void {
+  const [first, second] = change.parents;
+  const after = change.after;
+  let header = `diff --cc ${diffHeaderPath(change.path, "", options)}\n`;
+  header += `index ${first.oid.slice(0, abbrev)},${second.oid.slice(0, abbrev)}..${ZERO_OID.slice(0, abbrev)}\n`;
+  if (after === null) {
+    header += `deleted file mode ${first.mode},${second.mode}\n`;
+  } else if (first.mode !== after.mode || second.mode !== after.mode) {
+    header += `mode ${first.mode},${second.mode}..${after.mode}\n`;
+  }
+  const firstBytes = endpointBytes(first);
+  const secondBytes = endpointBytes(second);
+  const afterBytes = after === null ? null : endpointBytes(after);
+  if (
+    isBinary(firstBytes) ||
+    isBinary(secondBytes) ||
+    (afterBytes !== null && isBinary(afterBytes))
+  ) {
+    out.append(header);
+    out.append("Binary files differ\n");
+    return;
+  }
+
+  out.append(header);
+  out.append(`--- ${diffHeaderPath(change.path, "a/", options)}\n`);
+  out.append(
+    after === null ? "+++ /dev/null\n" : `+++ ${diffHeaderPath(change.path, "b/", options)}\n`,
+  );
+  if (
+    afterBytes === null ||
+    !combinedModesCanDiff(first.mode, second.mode, after?.mode ?? first.mode)
+  ) {
+    return;
+  }
+  out.append(
+    combinedHunks(
+      utf8Decoder.decode(firstBytes),
+      utf8Decoder.decode(secondBytes),
+      utf8Decoder.decode(afterBytes),
+      context,
+    ),
+  );
+}
+
+function combinedModesCanDiff(first: string, second: string, after: string): boolean {
+  return modeClass(first) === modeClass(second) && modeClass(first) === modeClass(after);
+}
+
+function modeClass(mode: string): "regular" | "symlink" | "other" {
+  if (mode === "100644" || mode === "100755") return "regular";
+  if (mode === "120000") return "symlink";
+  return "other";
+}
+
+interface CombinedRow {
+  prefix: string;
+  line: string;
+}
+
+interface PairAlignment {
+  deleted: ReadonlyMap<number, readonly string[]>;
+  present: Uint8Array;
+}
+
+function combinedHunks(
+  firstText: string,
+  secondText: string,
+  resultText: string,
+  context = 3,
+): string {
+  if (!Number.isSafeInteger(context) || context < 0) {
+    throw new GitError("EINVAL", "diff context must be a non-negative safe integer");
+  }
+  const first = splitLines(firstText);
+  const second = splitLines(secondText);
+  const result = splitLines(resultText);
+  const firstAlignment = pairAlignment(first, result);
+  const secondAlignment = pairAlignment(second, result);
+  const rows: CombinedRow[] = [];
+  for (let position = 0; position <= result.length; position++) {
+    appendCombinedDeletions(
+      rows,
+      firstAlignment.deleted.get(position) ?? [],
+      secondAlignment.deleted.get(position) ?? [],
+    );
+    const line = result[position];
+    if (line === undefined) continue;
+    rows.push({
+      prefix: `${firstAlignment.present[position] === 1 ? " " : "+"}${secondAlignment.present[position] === 1 ? " " : "+"}`,
+      line,
+    });
+  }
+  return renderCombinedHunks(rows, context);
+}
+
+function pairAlignment(parent: readonly string[], result: readonly string[]): PairAlignment {
+  const changes = diffLines([...parent], [...result]);
+  const present = new Uint8Array(result.length);
+  present.fill(1);
+  const deleted = new Map<number, readonly string[]>();
+  for (const change of changes) {
+    for (let index = change.newStart; index < change.newStart + change.newCount; index++) {
+      present[index] = 0;
+    }
+    if (change.oldCount > 0) {
+      deleted.set(
+        change.newStart,
+        parent.slice(change.oldStart, change.oldStart + change.oldCount),
+      );
+    }
+  }
+  return { deleted, present };
+}
+
+function appendCombinedDeletions(
+  rows: CombinedRow[],
+  first: readonly string[],
+  second: readonly string[],
+): void {
+  const changes = diffLines([...first], [...second]);
+  let firstAt = 0;
+  let secondAt = 0;
+  for (const change of changes) {
+    while (firstAt < change.oldStart && secondAt < change.newStart) {
+      rows.push({ prefix: "--", line: first[firstAt] ?? "" });
+      firstAt++;
+      secondAt++;
+    }
+    for (let index = 0; index < change.oldCount; index++) {
+      rows.push({ prefix: "- ", line: first[change.oldStart + index] ?? "" });
+    }
+    for (let index = 0; index < change.newCount; index++) {
+      rows.push({ prefix: " -", line: second[change.newStart + index] ?? "" });
+    }
+    firstAt = change.oldStart + change.oldCount;
+    secondAt = change.newStart + change.newCount;
+  }
+  while (firstAt < first.length && secondAt < second.length) {
+    rows.push({ prefix: "--", line: first[firstAt] ?? "" });
+    firstAt++;
+    secondAt++;
+  }
+  while (firstAt < first.length) {
+    rows.push({ prefix: "- ", line: first[firstAt] ?? "" });
+    firstAt++;
+  }
+  while (secondAt < second.length) {
+    rows.push({ prefix: " -", line: second[secondAt] ?? "" });
+    secondAt++;
+  }
+}
+
+function renderCombinedHunks(rows: readonly CombinedRow[], context: number): string {
+  const changes: number[] = [];
+  for (let index = 0; index < rows.length; index++) {
+    if (rows[index]?.prefix !== "  ") changes.push(index);
+  }
+  if (changes.length === 0) return "";
+
+  const out: string[] = [];
+  const before = { first: 0, second: 0, result: 0 };
+  let countedThrough = 0;
+  let at = 0;
+  while (at < changes.length) {
+    const firstChange = changes[at]!;
+    let lastChange = firstChange;
+    while (at + 1 < changes.length) {
+      const next = changes[at + 1]!;
+      if (next - lastChange - 1 > context * 2) break;
+      at++;
+      lastChange = next;
+    }
+    const start = Math.max(0, firstChange - context);
+    const end = Math.min(rows.length, lastChange + context + 1);
+    const comment = combinedHunkComment(rows, countedThrough, start);
+    addCombinedLineCounts(before, rows, countedThrough, start);
+    const counts = combinedLineCounts(rows, start, end);
+    out.push(
+      `@@@ -${combinedRange(before.first, counts.first)} -${combinedRange(before.second, counts.second)} +${combinedRange(before.result, counts.result)} @@@${comment === "" ? "" : ` ${comment}`}\n`,
+    );
+    for (let index = start; index < end; index++) {
+      const row = rows[index];
+      if (row !== undefined) emitCombinedRow(out, row);
+    }
+    addCombinedLineCounts(before, rows, start, end);
+    countedThrough = end;
+    at++;
+  }
+  return out.join("");
+}
+
+function combinedHunkComment(rows: readonly CombinedRow[], start: number, end: number): string {
+  let candidate = "";
+  for (let index = start; index < end; index++) {
+    const row = rows[index];
+    if (row === undefined || row.prefix.includes("-")) continue;
+    const first = row.line[0];
+    if (first !== undefined && /[A-Za-z_$]/.test(first)) candidate = row.line;
+  }
+  let commentEnd = 0;
+  for (let index = 0; index < Math.min(40, candidate.length); index++) {
+    const character = candidate[index];
+    if (character === undefined || character === "\n") break;
+    if (!/\s/.test(character)) commentEnd = index;
+  }
+  // Git's combined-diff formatter treats the last non-space index as exclusive.
+  return commentEnd === 0 ? "" : candidate.slice(0, commentEnd);
+}
+
+function combinedLineCounts(
+  rows: readonly CombinedRow[],
+  start: number,
+  end: number,
+): { first: number; second: number; result: number } {
+  const counts = { first: 0, second: 0, result: 0 };
+  addCombinedLineCounts(counts, rows, start, end);
+  return counts;
+}
+
+function addCombinedLineCounts(
+  counts: { first: number; second: number; result: number },
+  rows: readonly CombinedRow[],
+  start: number,
+  end: number,
+): void {
+  for (let index = start; index < end; index++) {
+    const prefix = rows[index]?.prefix;
+    if (prefix === undefined) continue;
+    const resultPresent = !prefix.includes("-");
+    if (prefix[0] === "-" || (prefix[0] === " " && resultPresent)) counts.first++;
+    if (prefix[1] === "-" || (prefix[1] === " " && resultPresent)) counts.second++;
+    if (resultPresent) counts.result++;
+  }
+}
+
+function combinedRange(before: number, count: number): string {
+  return `${count === 0 ? before : before + 1},${count}`;
+}
+
+function emitCombinedRow(out: string[], row: CombinedRow): void {
+  if (row.line.endsWith("\n")) out.push(`${row.prefix}${row.line}`);
+  else out.push(`${row.prefix}${row.line}\n\\ No newline at end of file\n`);
 }
 
 function diffUtf8Bytes(value: string): number {
@@ -347,6 +630,9 @@ function* diffSummaryEntries(
   sparseWorkspace: SparseWorkspaceSource | undefined,
 ): Generator<DiffSummaryEntry> {
   for (const change of collect(repo, worktree, options, sparseWorkspace)) {
+    if (isCombinedFileChange(change) || isUnmergedFileChange(change)) {
+      throw new CorruptError("tree-based diff summary produced an index conflict");
+    }
     if (change.originalPath !== undefined && change.similarity !== undefined) {
       yield {
         path: change.path,
@@ -422,10 +708,12 @@ function* collect(
   options: DiffOptions,
   sparseWorkspace: SparseWorkspaceSource | undefined,
   indexBase = false,
-): Generator<FileChange> {
-  const sparse = indexBase
-    ? null
-    : boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
+): Generator<PatchChange> {
+  if (indexBase) {
+    yield* indexWorktreePatchChanges(repo, worktree, options);
+    return;
+  }
+  const sparse = boundedSparsePendingChanges(repo, worktree, options, sparseWorkspace);
   if (sparse !== null) {
     yield* collectPendingChanges(
       repo,
@@ -438,12 +726,12 @@ function* collect(
   const classification = classifyDiffRenames(
     repo,
     options,
-    pendingChanges(repo, worktree, options, true, indexBase),
+    pendingChanges(repo, worktree, options, true),
   );
   yield* collectPendingChanges(
     repo,
     worktree,
-    pendingChanges(repo, worktree, options, false, indexBase),
+    pendingChanges(repo, worktree, options, false),
     classification,
   );
 }
@@ -525,12 +813,7 @@ function* pendingChanges(
   worktree: Worktree,
   options: DiffOptions,
   renameCandidatesOnly = false,
-  indexBase = false,
 ): Generator<PendingChange> {
-  if (indexBase) {
-    yield* indexWorktreeChanges(repo, worktree, options, renameCandidatesOnly);
-    return;
-  }
   const fromTreeOid = resolveFrom(repo, options);
   const byPath = { left: (entry: TargetEntry) => entry.path };
 
@@ -595,46 +878,299 @@ function* pendingChanges(
   yield* resolveWorkingCandidateIdentities(repo, worktree, candidates, false, renameCandidatesOnly);
 }
 
-function* indexWorktreeChanges(
+type IndexPatchCandidate =
+  | { kind: "tracked"; row: WorkingCandidate }
+  | {
+      kind: "combined";
+      path: string;
+      parents: readonly [IndexEntry, IndexEntry];
+      worktree: WorktreePath | undefined;
+    }
+  | UnmergedPathChange;
+
+interface PendingCombinedChange {
+  kind: "combined";
+  path: string;
+  parents: readonly [EndpointIdentity, EndpointIdentity];
+  after: EndpointIdentity | null;
+}
+
+type PendingIndexPatchChange = PendingChange | PendingCombinedChange | UnmergedPathChange;
+
+function isPendingCombinedChange(change: PendingIndexPatchChange): change is PendingCombinedChange {
+  return "kind" in change && change.kind === "combined";
+}
+
+function isPendingUnmergedChange(change: PendingIndexPatchChange): change is UnmergedPathChange {
+  return "kind" in change && change.kind === "unmerged";
+}
+
+function* indexWorktreePatchChanges(
   repo: Repository,
   worktree: Worktree,
   options: DiffOptions,
-  renameCandidatesOnly: boolean,
-): Generator<PendingChange> {
-  const candidates: WorkingCandidate[] = [];
+): Generator<PatchChange> {
+  const candidates: IndexPatchCandidate[] = [];
   for (const row of joinSorted(
-    stageZero(repo.checkout.indexScan()),
+    statusIndexGroups(repo.checkout.indexScan()),
     walkWorktreeEntriesStream(
       worktree,
       repo.root,
       options.paths === undefined || options.paths.length === 0
-        ? { filesOnly: true }
-        : { paths: options.paths },
+        ? { filesOnly: true, maxScanRows: DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS }
+        : { paths: options.paths, maxScanRows: DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS },
     ),
-    { left: (entry) => entry.path, right: (entry) => entry.path },
+    { left: (group) => group.path, right: (entry) => entry.path },
   )) {
-    const index = row.left;
-    if (index === undefined || index.mode === 0o160000 || !matchesPaths(row.path, options.paths)) {
-      continue;
-    }
-    const worktreeEntry = row.right;
-    candidates.push({
-      path: row.path,
-      before: indexTarget(index),
-      index,
-      worktree: worktreeEntry,
-    });
+    const group = row.left;
+    if (group === undefined || !matchesPaths(row.path, options.paths)) continue;
+    if (group.kind === "tracked" && group.entry.mode === 0o160000) continue;
+    candidates.push(indexPatchCandidate(group, row.right));
     if (candidates.length >= DIFF_WINDOW_ROWS) {
-      yield* resolveWorkingCandidateIdentities(
-        repo,
-        worktree,
-        candidates,
-        false,
-        renameCandidatesOnly,
-      );
+      yield* hydrateIndexPatchCandidates(repo, worktree, candidates);
     }
   }
-  yield* resolveWorkingCandidateIdentities(repo, worktree, candidates, false, renameCandidatesOnly);
+  yield* hydrateIndexPatchCandidates(repo, worktree, candidates);
+}
+
+function indexPatchCandidate(
+  group: StatusIndexGroup,
+  worktree: WorktreePath | undefined,
+): IndexPatchCandidate {
+  if (group.kind === "tracked") {
+    return {
+      kind: "tracked",
+      row: {
+        path: group.path,
+        before: indexTarget(group.entry),
+        index: group.entry,
+        worktree,
+      },
+    };
+  }
+  const current = group.current;
+  const incoming = group.incoming;
+  if (
+    current === undefined ||
+    incoming === undefined ||
+    current.mode === 0o160000 ||
+    incoming.mode === 0o160000
+  ) {
+    return { kind: "unmerged", path: group.path };
+  }
+  return { kind: "combined", path: group.path, parents: [current, incoming], worktree };
+}
+
+function* hydrateIndexPatchCandidates(
+  repo: Repository,
+  worktree: Worktree,
+  candidates: IndexPatchCandidate[],
+): Generator<PatchChange> {
+  if (candidates.length === 0) return;
+  const source = candidates.splice(0);
+  const working: WorkingCandidate[] = [];
+  for (const candidate of source) {
+    if (candidate.kind === "tracked") {
+      working.push(candidate.row);
+    } else if (candidate.kind === "combined") {
+      working.push({
+        path: candidate.path,
+        before: indexTarget(candidate.parents[0]),
+        index: undefined,
+        worktree: candidate.worktree,
+      });
+    }
+  }
+  const afters = resolveWorkingCandidateAfters(repo, worktree, working, true);
+  const pending: PendingIndexPatchChange[] = [];
+  for (const candidate of source) {
+    if (candidate.kind === "unmerged") {
+      pending.push(candidate);
+      continue;
+    }
+    const after = afters.get(candidate.kind === "tracked" ? candidate.row.path : candidate.path);
+    if (after === undefined) throw new CorruptError("diff lost a working-tree candidate");
+    if (candidate.kind === "tracked") {
+      const change = compareIdentities(
+        candidate.row.path,
+        treeIdentity(candidate.row.before),
+        after,
+      );
+      if (change !== null) pending.push(change);
+      continue;
+    }
+    pending.push({
+      kind: "combined",
+      path: candidate.path,
+      parents: [
+        treeIdentity(indexTarget(candidate.parents[0])) ?? missingConflictParent(candidate.path),
+        treeIdentity(indexTarget(candidate.parents[1])) ?? missingConflictParent(candidate.path),
+      ],
+      after,
+    });
+  }
+  yield* hydrateIndexPatchChanges(repo, worktree, pending);
+}
+
+function missingConflictParent(path: string): never {
+  throw new CorruptError(`diff conflict parent disappeared at ${path}`);
+}
+
+function* hydrateIndexPatchChanges(
+  repo: Repository,
+  worktree: Worktree,
+  changes: readonly PendingIndexPatchChange[],
+): Generator<PatchChange> {
+  if (changes.length === 0) return;
+  const root = worktree.realpath(repo.root);
+  let offset = 0;
+  while (offset < changes.length) {
+    let end = offset;
+    let worktreeBytes = 0;
+    while (end < changes.length && end - offset < DIFF_WINDOW_ROWS) {
+      const change = changes[end]!;
+      const size = indexPatchWorktreeBytes(change);
+      if (size > DIFF_WORKTREE_BYTES) {
+        throw new GitError("EFBIG", `diff path ${change.path} exceeds the working-tree byte limit`);
+      }
+      if (end > offset && worktreeBytes + size > DIFF_WORKTREE_BYTES) break;
+      worktreeBytes += size;
+      end++;
+    }
+
+    const proposed = changes.slice(offset, end);
+    const wanted = indexPatchRepositoryOids(proposed);
+    const stored = new Map<string, Uint8Array>();
+    let remaining = wanted;
+    let storedBytes = 0;
+    while (remaining.length > 0 && storedBytes < DIFF_REPOSITORY_BYTES) {
+      const budget = Math.min(4 * 1024 * 1024, DIFF_REPOSITORY_BYTES - storedBytes);
+      let batch: BlobReadBatch;
+      try {
+        batch = repo.readBlobs(remaining, { budgetBytes: budget });
+      } catch (error) {
+        if (error instanceof GitError && error.code === "EFBIG") break;
+        throw error;
+      }
+      for (const [oid, bytes] of batch.blobs) stored.set(oid, bytes);
+      storedBytes += batch.bytes;
+      if (batch.remaining.length >= remaining.length) {
+        throw new CorruptError("bulk blob reader did not make progress");
+      }
+      remaining = batch.remaining;
+    }
+
+    let ready = 0;
+    for (const change of proposed) {
+      if (!indexPatchRepositoryOids([change]).every((oid) => stored.has(oid))) break;
+      ready++;
+    }
+    if (ready === 0) {
+      throw new GitError(
+        "EFBIG",
+        `diff path ${changes[offset]?.path ?? ""} exceeds the blob limit`,
+      );
+    }
+    const group = proposed.slice(0, ready);
+    const worktreeContents = readIndexPatchWorktreeContents(worktree, root, group);
+    for (const change of group) {
+      if (isPendingUnmergedChange(change)) {
+        yield change;
+      } else if (isPendingCombinedChange(change)) {
+        yield {
+          kind: "combined",
+          path: change.path,
+          parents: [
+            hydrateEndpoint(change.parents[0], stored, worktreeContents) ??
+              missingHydratedConflictParent(change.path),
+            hydrateEndpoint(change.parents[1], stored, worktreeContents) ??
+              missingHydratedConflictParent(change.path),
+          ],
+          after: hydrateEndpoint(change.after, stored, worktreeContents),
+        };
+      } else {
+        yield {
+          path: change.path,
+          before: hydrateEndpoint(change.before, stored, worktreeContents),
+          after: hydrateEndpoint(change.after, stored, worktreeContents),
+        };
+      }
+    }
+    offset += ready;
+  }
+}
+
+function missingHydratedConflictParent(path: string): never {
+  throw new CorruptError(`diff conflict parent bytes disappeared at ${path}`);
+}
+
+function indexPatchWorktreeBytes(change: PendingIndexPatchChange): number {
+  if (isPendingUnmergedChange(change)) return 0;
+  if (isPendingCombinedChange(change)) {
+    if (change.after === null) return 0;
+    return change.after.worktree?.stat.size ?? 0;
+  }
+  return requiredWorktreeBytes(change);
+}
+
+function indexPatchRepositoryOids(changes: readonly PendingIndexPatchChange[]): string[] {
+  const oids = new Set<string>();
+  for (const change of changes) {
+    if (isPendingUnmergedChange(change)) continue;
+    if (isPendingCombinedChange(change)) {
+      for (const parent of change.parents) oids.add(parent.oid);
+      continue;
+    }
+    for (const oid of repositoryOids([change])) oids.add(oid);
+  }
+  return [...oids];
+}
+
+function readIndexPatchWorktreeContents(
+  worktree: Worktree,
+  root: string,
+  changes: readonly PendingIndexPatchChange[],
+): Map<string, Uint8Array> {
+  const contents = new Map<string, Uint8Array>();
+  const files: string[] = [];
+  for (const change of changes) {
+    if (isPendingUnmergedChange(change)) continue;
+    const endpoint = change.after;
+    if (endpoint === null || endpoint.worktree === null) continue;
+    if (!isPendingCombinedChange(change) && !contentDiffers(change)) continue;
+    if (endpoint.worktree.stat.type === "symlink") {
+      const target = endpoint.worktree.stat.target;
+      if (target === null) throw new CorruptError(`symlink ${change.path} has no target`);
+      contents.set(change.path, utf8.encode(target));
+    } else {
+      files.push(joinPath(root, change.path));
+    }
+  }
+  readWorktreeFileContents(worktree, root, files, contents);
+  return contents;
+}
+
+function readWorktreeFileContents(
+  worktree: Worktree,
+  root: string,
+  files: string[],
+  contents: Map<string, Uint8Array>,
+): void {
+  let remaining = files;
+  while (remaining.length > 0) {
+    const batch = worktree.readFiles(remaining);
+    for (const [absolute, bytes] of batch.files) {
+      const prefix = root === "/" ? "/" : `${root}/`;
+      if (!absolute.startsWith(prefix)) {
+        throw new CorruptError(`worktree read returned a path outside ${root}`);
+      }
+      contents.set(absolute.slice(prefix.length), bytes);
+    }
+    if (batch.remaining.length >= remaining.length) {
+      throw new CorruptError("bulk worktree reader did not make progress");
+    }
+    remaining = batch.remaining;
+  }
 }
 
 function indexTarget(entry: IndexEntry): TargetEntry {
@@ -657,6 +1193,26 @@ function* resolveWorkingCandidateIdentities(
       })
     : sourceRows;
   if (rows.length === 0) return;
+  const afters = resolveWorkingCandidateAfters(repo, worktree, rows, exact);
+  for (const row of rows) {
+    const after = afters.get(row.path);
+    if (after === undefined) throw new CorruptError("diff lost a working-tree identity");
+    const change = compareIdentities(row.path, treeIdentity(row.before), after);
+    if (
+      change !== null &&
+      (!renameCandidatesOnly || (change.before === null) !== (change.after === null))
+    ) {
+      yield change;
+    }
+  }
+}
+
+function resolveWorkingCandidateAfters(
+  repo: Repository,
+  worktree: Worktree,
+  rows: readonly WorkingCandidate[],
+  exact: boolean,
+): Map<string, EndpointIdentity | null> {
   const expected: BlobIdMapping[] = [];
   for (const row of rows) {
     const mapping = expectedWorktreeMapping(row);
@@ -692,6 +1248,7 @@ function* resolveWorkingCandidateIdentities(
     }),
   );
 
+  const afters = new Map<string, EndpointIdentity | null>();
   for (const row of rows) {
     const cached = cachedWorktreeOid(row.index, row.worktree);
     const hashed = hashes.get(row.path);
@@ -704,14 +1261,9 @@ function* resolveWorkingCandidateIdentities(
             oid,
             worktree: row.worktree,
           };
-    const change = compareIdentities(row.path, treeIdentity(row.before), after);
-    if (
-      change !== null &&
-      (!renameCandidatesOnly || (change.before === null) !== (change.after === null))
-    ) {
-      yield change;
-    }
+    afters.set(row.path, after);
   }
+  return afters;
 }
 
 function exactRenameChange(rename: ExactRename, destination: PendingChange): FileChange {
@@ -862,21 +1414,7 @@ function readWorktreeContents(
     }
   }
 
-  let remaining = files;
-  while (remaining.length > 0) {
-    const batch = worktree.readFiles(remaining);
-    for (const [absolute, bytes] of batch.files) {
-      const prefix = root === "/" ? "/" : `${root}/`;
-      if (!absolute.startsWith(prefix)) {
-        throw new CorruptError(`worktree read returned a path outside ${root}`);
-      }
-      contents.set(absolute.slice(prefix.length), bytes);
-    }
-    if (batch.remaining.length >= remaining.length) {
-      throw new CorruptError("bulk worktree reader did not make progress");
-    }
-    remaining = batch.remaining;
-  }
+  readWorktreeFileContents(worktree, root, files, contents);
   return contents;
 }
 
