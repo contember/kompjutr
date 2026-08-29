@@ -14,12 +14,17 @@ import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
 import { realpath } from "../../src/fs/store/resolve.js";
 import {
+  DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
+  DISCOVERY_EXCLUDE_ROOTS_MAX,
+  DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES,
+  DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES,
   discoverFiles,
   glob,
   globPage,
   listEntries,
   scan,
+  validateDiscoveryExcludeRoots,
 } from "../../src/fs/store/scan.js";
 import { writeFiles } from "../../src/fs/store/write.js";
 import {
@@ -761,6 +766,43 @@ describe("discoverFiles", () => {
     );
     expect(recorder.maxResultRows).toBe(1);
     expect(recorder.maxResultBytes).toBe(0);
+  });
+
+  it("derives exact exclusion cardinality and memory bounds from global routing", () => {
+    const { root } = nested(1);
+    const roots = Array.from(
+      { length: DISCOVERY_EXCLUDE_ROOTS_MAX },
+      (_, index) => `/repo/routing-${index.toString().padStart(4, "0")}`,
+    );
+
+    expect(validateDiscoveryExcludeRoots(root, roots.slice(0, 1_025))).toHaveLength(1_025);
+    expect(validateDiscoveryExcludeRoots(root, roots)).toHaveLength(8_192);
+    expect(() =>
+      validateDiscoveryExcludeRoots(root, [...roots, "/repo/routing-first-excess"]),
+    ).toThrow(/8192 effective excluded roots/);
+    expect(
+      validateDiscoveryExcludeRoots(
+        root,
+        Array.from({ length: DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX }, () => "/repo/parent"),
+      ),
+    ).toEqual(["/repo/parent"]);
+
+    expect(DISCOVERY_EXCLUDE_ROOTS_MAX).toBe(8_192);
+    expect(DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX).toBe(8_193);
+    expect(DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES).toBe(6 * 1024 * 1024);
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES).toBe(
+      DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2,
+    );
+    expect(DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES).toBeLessThan(100 * 1024 * 1024);
+
+    const exactBytes = Array.from({ length: 1_536 }, (_, index) => {
+      const prefix = `/repo/long-${index.toString().padStart(4, "0")}-`;
+      return `${prefix}${"x".repeat(4_096 - prefix.length)}`;
+    });
+    expect(validateDiscoveryExcludeRoots(root, exactBytes)).toHaveLength(1_536);
+    expect(() =>
+      validateDiscoveryExcludeRoots(root, [...exactBytes, "/repo/utf8-first-excess"]),
+    ).toThrow(/6291456 UTF-8 bytes/);
   });
 
   it("materializes the bounded candidate page before touching chunks", () => {

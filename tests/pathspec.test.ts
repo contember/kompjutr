@@ -608,8 +608,44 @@ describe("ls-files selection", () => {
     expect(measured.discoveryCalls).toBe(1);
     expect(measured.discoveryStatements).toBe(1);
     expect(measured.discoverySourceRows).toBe(1);
-    expect(MAX_LS_FILES_EXCLUDE_ROOTS).toBe(1_024);
-    expect(MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES).toBe(4 * 1024 * 1024);
+    expect(MAX_LS_FILES_EXCLUDE_ROOTS).toBe(8_192);
+    expect(MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES).toBe(6 * 1024 * 1024);
+  });
+
+  it("accepts the global routing ceiling and applies the limit after coalescing", () => {
+    const workspace = makeRepo("/");
+    const roots = Array.from(
+      { length: MAX_LS_FILES_EXCLUDE_ROOTS },
+      (_, index) => `/routing-${index.toString().padStart(4, "0")}`,
+    );
+
+    expect(
+      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
+        others: true,
+        excludeRoots: roots.slice(0, 1_025),
+      }),
+    ).toEqual([]);
+    expect(
+      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
+        others: true,
+        excludeRoots: roots,
+      }),
+    ).toEqual([]);
+    expect(() =>
+      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
+        others: true,
+        excludeRoots: [...roots, "/routing-first-excess"],
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(
+      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
+        others: true,
+        excludeRoots: Array.from(
+          { length: MAX_LS_FILES_EXCLUDE_ROOTS + 1 },
+          () => "/routing-parent",
+        ),
+      }),
+    ).toEqual([]);
   });
 
   it("validates selection combinations and enforces the combined pattern cap", () => {

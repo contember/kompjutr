@@ -12,6 +12,9 @@ import { blob, readBlob } from "../src/sqlite/db.js";
 import {
   MAX_BLOB_ID_CACHE_ROWS,
   MAX_INDEX_PATH_BYTES,
+  MAX_ROUTING_CHECKOUTS,
+  MAX_ROUTING_CHECKOUTS_RETAINED_BYTES,
+  MAX_ROUTING_ROOTS_UTF8_BYTES,
   MAX_TRACKING_REF_REVISIONS,
 } from "../src/sqlite/schema.js";
 import {
@@ -289,22 +292,27 @@ describe("repository registry", () => {
     const database = new SqliteGitDatabase(db);
     db.run(
       `WITH RECURSIVE sequence(id) AS (
-         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1025
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < ?
        )
        INSERT INTO git_repositories (id) SELECT id FROM sequence`,
+      MAX_ROUTING_CHECKOUTS,
     );
     db.run(
       `WITH RECURSIVE sequence(id) AS (
-         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 1025
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < ?
        )
        INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
        SELECT id + 2000, id, '/repo-' || printf('%04d', id), ?, 1 FROM sequence`,
+      MAX_ROUTING_CHECKOUTS,
       "1".repeat(40),
     );
 
     const checkouts = database.listRoutingCheckouts();
-    expect(checkouts).toHaveLength(1_025);
+    expect(checkouts).toHaveLength(MAX_ROUTING_CHECKOUTS);
     expect(checkouts.every((checkout) => checkout.id !== checkout.repoId)).toBe(true);
+    expect(database.listRoutingRoots()).toHaveLength(MAX_ROUTING_CHECKOUTS);
+    expect(MAX_ROUTING_CHECKOUTS_RETAINED_BYTES).toBe(16 * 1024 * 1024);
+    expect(MAX_ROUTING_ROOTS_UTF8_BYTES).toBe(6 * 1024 * 1024);
   });
 
   it("shares one 8 MiB object cache across repositories", () => {

@@ -104,6 +104,9 @@ import {
   MAX_CHECKOUT_ROOT_BYTES,
   MAX_CHECKOUTS_PER_REPOSITORY,
   MAX_INDEX_PATH_BYTES,
+  MAX_ROUTING_CHECKOUTS,
+  MAX_ROUTING_CHECKOUTS_RETAINED_BYTES,
+  MAX_ROUTING_ROOTS_UTF8_BYTES,
   MAX_SCRATCH_INDEX_NAME_BYTES,
   MAX_SCRATCH_INDEXES_PER_REPOSITORY,
   MAX_TRACKING_REF_REVISIONS,
@@ -193,7 +196,6 @@ export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
 const MAX_REF_MUTATION_INPUTS = 100_000;
 const MAX_FETCH_NAMESPACES = 1_024;
 const MAX_FETCH_PUBLICATION_INPUTS = 100_000;
-const MAX_GLOBAL_CHECKOUT_LIST = 8_192;
 const CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES = 1_024;
 export const MAX_CHECKOUT_LIST_RETAINED_BYTES = 6 * 1024 * 1024;
 export const MAX_CONFIG_SECTION_MOVE_ROWS = 1_024;
@@ -3317,7 +3319,7 @@ export class SqliteGitDatabase {
               ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
          FROM git_checkouts checkout
          JOIN git_repositories repository ON repository.id = checkout.repo_id
-        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_GLOBAL_CHECKOUT_LIST + 1}`,
+        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_ROUTING_CHECKOUTS + 1}`,
     )) {
       const stored = requireStoredCheckoutLifecycle(raw);
       requireCheckoutLifecycleCardinality(raw, stored);
@@ -3331,8 +3333,8 @@ export class SqliteGitDatabase {
         CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
         checkoutTextEncoder.encode(row.root).byteLength +
         boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
-      if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
-        throw new GitError("E2BIG", "checkout routing exceeds its 6 MiB retained bound");
+      if (retainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
+        throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
       }
       if (stored.lifecycle === "ready") rows.push(this.#rememberCheckout(row));
       primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
@@ -3341,7 +3343,7 @@ export class SqliteGitDatabase {
         throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
       }
       checkoutCounts.set(row.repoId, checkoutCount);
-      if (routingCount > MAX_GLOBAL_CHECKOUT_LIST) {
+      if (routingCount > MAX_ROUTING_CHECKOUTS) {
         throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
       }
     }
@@ -3358,6 +3360,7 @@ export class SqliteGitDatabase {
     const checkoutCounts = new Map<number, number>();
     let previousRoot: string | null = null;
     let retainedBytes = 0;
+    let rootUtf8Bytes = 0;
     for (const raw of this.#db.iterate(
       `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
               checkout.head, checkout.is_primary, repository.lifecycle,
@@ -3365,7 +3368,7 @@ export class SqliteGitDatabase {
               ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
          FROM git_checkouts checkout
          JOIN git_repositories repository ON repository.id = checkout.repo_id
-        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_GLOBAL_CHECKOUT_LIST + 1}`,
+        ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_ROUTING_CHECKOUTS + 1}`,
     )) {
       const stored = requireStoredCheckoutLifecycle(raw);
       requireCheckoutLifecycleCardinality(raw, stored);
@@ -3380,15 +3383,20 @@ export class SqliteGitDatabase {
         throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
       }
       checkoutCounts.set(row.repoId, checkoutCount);
+      const rowRootBytes = checkoutTextEncoder.encode(row.root).byteLength;
+      rootUtf8Bytes += rowRootBytes;
+      if (rootUtf8Bytes > MAX_ROUTING_ROOTS_UTF8_BYTES) {
+        throw new GitError("E2BIG", "checkout routing roots exceed their 6 MiB UTF-8 bound");
+      }
       retainedBytes +=
         CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
-        checkoutTextEncoder.encode(row.root).byteLength +
+        rowRootBytes +
         boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
-      if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
-        throw new GitError("E2BIG", "checkout routing exceeds its 6 MiB retained bound");
+      if (retainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
+        throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
       }
       roots.push(row.root);
-      if (roots.length > MAX_GLOBAL_CHECKOUT_LIST) {
+      if (roots.length > MAX_ROUTING_CHECKOUTS) {
         throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
       }
     }

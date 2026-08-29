@@ -8,6 +8,7 @@
 // nothing.
 
 import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
+import { MAX_ROUTING_CHECKOUTS, MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../sqlite/schema.js";
 import { comparePaths, dirname, normalize, subtreeSuccessor } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import {
@@ -31,10 +32,23 @@ import {
 /** The DO SQLite ceiling on a GLOB/LIKE pattern. */
 export const GLOB_PATTERN_MAX_BYTES = 50;
 export const DISCOVERY_PAGE_MAX = 1_000;
-export const DISCOVERY_EXCLUDE_ROOTS_MAX = 1_024;
-export const DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX = 8_192;
-/** 1,024 roots at six JSON bytes per 4,096-code-unit path, rounded up. */
-export const DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES = 25 * 1024 * 1024;
+export const DISCOVERY_EXCLUDE_ROOTS_MAX = MAX_ROUTING_CHECKOUTS;
+export const DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX = MAX_ROUTING_CHECKOUTS + 1;
+export const DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES = MAX_ROUTING_ROOTS_UTF8_BYTES;
+/** Every input byte can expand to a six-byte JSON escape, plus quotes and separators. */
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES =
+  DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2;
+const DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES = 64;
+const DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES = 8;
+const DISCOVERY_EXCLUDE_STRING_FIXED_BYTES = 48;
+export const DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES =
+  2 * DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES +
+  DISCOVERY_EXCLUDE_ROOTS_MAX * DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
+  DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
+  2 * DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES +
+  2 *
+    (DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES +
+      DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX * DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES);
 const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
 
 const PERMISSION_BITS = 0o7777;
@@ -46,6 +60,30 @@ const TYPE_BITS: Record<EntryType, number> = {
 };
 
 const ENCODER = new TextEncoder();
+
+if (DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES >= 100 * 1024 * 1024) {
+  throw new Error("discovery excluded-root retained bound exceeds 100 MiB");
+}
+
+function boundedUtf8Bytes(value: string, limit: number): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) bytes++;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next !== undefined && next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 3;
+      }
+    } else bytes += 3;
+    if (bytes > limit) return limit + 1;
+  }
+  return bytes;
+}
 
 // Written without table aliases on purpose: the query plan then names the
 // tables, so the gate can assert on the plan the design specifies.
@@ -223,14 +261,28 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
   }
   ordered.sort(comparePaths);
   const coalesced: string[] = [];
+  let retainedUtf8Bytes = 0;
   for (const path of ordered) {
     const parent = coalesced[coalesced.length - 1];
     if (parent !== undefined && (path === parent || path.startsWith(`${parent}/`))) continue;
     coalesced.push(path);
+    if (retainedUtf8Bytes <= DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES) {
+      const remaining = DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES - retainedUtf8Bytes;
+      const pathBytes = boundedUtf8Bytes(path, remaining);
+      retainedUtf8Bytes =
+        pathBytes > remaining
+          ? DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES + 1
+          : retainedUtf8Bytes + pathBytes;
+    }
   }
   if (coalesced.length > DISCOVERY_EXCLUDE_ROOTS_MAX) {
     throw new Error(
       `discoverFiles: at most ${DISCOVERY_EXCLUDE_ROOTS_MAX} effective excluded roots may be supplied`,
+    );
+  }
+  if (retainedUtf8Bytes > DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES) {
+    throw new Error(
+      `discoverFiles: excluded roots exceed ${DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES} UTF-8 bytes`,
     );
   }
   return coalesced;
@@ -238,7 +290,10 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
 
 function discoveryExcludeRootsJson(excludeRoots: readonly string[]): string {
   const json = JSON.stringify(excludeRoots);
-  if (ENCODER.encode(json).byteLength > DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES) {
+  if (
+    boundedUtf8Bytes(json, DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES) >
+    DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES
+  ) {
     throw new Error(
       `discoverFiles: excluded roots exceed ${DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES} JSON bytes`,
     );
