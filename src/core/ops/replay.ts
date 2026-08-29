@@ -1,7 +1,7 @@
 // Pure one-commit replay planning shared by cherry-pick and revert.
 
+import type { MemoryReservation } from "../../memory.js";
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
-import type { MemoryReservation } from "../../sqlite/memory.js";
 import { type IndexEntry, type IndexStore, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "../bytes.js";
 import type { TextMergeOptions } from "../diff/xmerge.js";

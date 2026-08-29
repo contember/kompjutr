@@ -8,12 +8,12 @@
 
 import { utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
+import { MAX_PKT_FRAME_BYTES } from "./pktline.js";
+
+export { MAX_PKT_FRAME_BYTES } from "./pktline.js";
 
 /** Caller-owned chunks may be larger; the reader rejects them before retention. */
 export const MAX_PROTOCOL_SOURCE_CHUNK_BYTES = 1024 * 1024;
-
-/** Four-byte prefix included. Git's pkt-line payload ceiling is 65,516 bytes. */
-export const MAX_PKT_FRAME_BYTES = 65_520;
 
 export type PktKind = "line" | "flush" | "delim";
 

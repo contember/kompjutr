@@ -6,7 +6,7 @@
 // refs move, in one transaction. An interrupted fetch leaves every
 // existing ref valid and one reclaimable pending pack.
 
-import type { MemoryReservation } from "../../sqlite/memory.js";
+import type { MemoryReservation } from "../../memory.js";
 import {
   type CheckoutStore,
   type FetchPublicationToken,

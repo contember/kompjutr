@@ -4,8 +4,8 @@ import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
 import {
   type CompletePackObject,
   PACK_INGEST_LEASE_MS,

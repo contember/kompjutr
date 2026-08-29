@@ -21,7 +21,6 @@ import {
   DISCOVERY_EXCLUDE_ROOTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES,
   DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS,
-  DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES,
   discoverFiles,
   discoveryExcludeRootsJsonSegments,
   glob,
@@ -42,6 +41,7 @@ import {
   type ScanEntry,
 } from "../../src/fs/types.js";
 import type { SqlDatabase } from "../../src/sqlite/db.js";
+import { MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../src/sqlite/schema.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const MTIME_BASE = 1_700_000_000_000;
@@ -824,9 +824,9 @@ describe("discoverFiles", () => {
 
     expect(DISCOVERY_EXCLUDE_ROOTS_MAX).toBe(8_192);
     expect(DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX).toBe(8_193);
-    expect(DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES).toBe(6 * 1024 * 1024);
+    expect(MAX_ROUTING_ROOTS_UTF8_BYTES).toBe(6 * 1024 * 1024);
     expect(DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES).toBe(
-      DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 +
+      MAX_ROUTING_ROOTS_UTF8_BYTES * 6 +
         DISCOVERY_EXCLUDE_ROOTS_MAX * 3 +
         2 +
         DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS -

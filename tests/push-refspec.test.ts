@@ -26,7 +26,7 @@ import { receivePack, ZERO_OID } from "../src/core/protocol/receive-pack.js";
 import { discover } from "../src/core/protocol/remote.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
 import type { Repository } from "../src/core/repository.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { makeRepo, makeWorkspace } from "./helpers/workspace.js";

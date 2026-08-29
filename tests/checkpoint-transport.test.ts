@@ -3,7 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { openRepository } from "../src/core/context.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
 import { createGit, type Git } from "../src/index.js";
-import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

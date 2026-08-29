@@ -62,6 +62,7 @@
     "format": "biome format --write .",
     "check": "biome check .",
     "bench": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts",
+    "bench:memory": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --memory",
     "bench:macro": "node --experimental-transform-types --import ./bench/register.mjs bench/run.ts --scenarios=macro-packed,macro-loose",
     "bench:nextjs": "node --experimental-transform-types --import ./bench/register.mjs bench/nextjs-run.ts",
     "bench:statements": "node --experimental-transform-types --import ./bench/register.mjs bench/statements.ts",

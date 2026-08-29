@@ -91,8 +91,10 @@ function markdown(results: readonly Result[]): string {
 }
 
 const databaseDir = mkdtempSync(join(tmpdir(), "kompjutr-nextjs-bench-"));
+const databasePath = join(databaseDir, "workspace.sqlite");
 const context: ScenarioContext = {
-  harness: harness("sqlite", join(databaseDir, "workspace.sqlite")),
+  harness: harness("sqlite", databasePath),
+  databasePath,
   count: 0,
   variant: "nextjs",
 };

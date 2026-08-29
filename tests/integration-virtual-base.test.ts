@@ -17,7 +17,7 @@ import {
 import { buildTree } from "../src/core/ops/tree-build.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { type CheckoutStore, type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

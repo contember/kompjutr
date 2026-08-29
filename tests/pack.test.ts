@@ -20,9 +20,9 @@ import {
   streamFullObjectPack,
 } from "../src/core/pack/full-object-stream.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { MAX_INDEXED_COMMIT_BYTES, prepareCommitCache } from "../src/sqlite/commits.js";
 import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
 import {
   type CompletePackObject,
   MAX_DELTA_DEPTH,

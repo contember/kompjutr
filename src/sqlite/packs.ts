@@ -20,9 +20,9 @@ import { type ByteSource, type ChunkedBytes, ChunkPool } from "../core/pack/chun
 import { applyDelta, DeltaApplier } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
 import { InflateInto, InflateSizeError, InflateStream, inflatePrefix } from "../core/zlib.js";
+import type { MemoryCoordinator, MemoryReservation } from "../memory.js";
 import { MAX_COMMIT_CACHE_BYTES, MAX_INDEXED_COMMIT_BYTES } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
-import type { MemoryCoordinator, MemoryReservation } from "./memory.js";
 import {
   PACK_COMMIT_PAYLOAD_BYTES,
   PACK_INDEX_MEMORY_BYTES,

@@ -1,3 +1,4 @@
+import { GitError } from "../core/errors.js";
 import { rethrowMaintenanceRootEpochError } from "./maintenance/control.js";
 
 /** A structural subset of the Durable Object SQL cursor. */
@@ -57,6 +58,37 @@ function requireSynchronous<T>(value: T): T {
   throw new Error("transactionSync closure returned an asynchronous result");
 }
 
+function sqliteValueTooLarge(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = Reflect.get(error, "code");
+  const sqliteCode = Reflect.get(error, "sqliteCode");
+  const errcode = Reflect.get(error, "errcode");
+  return (
+    code === "SQLITE_TOOBIG" ||
+    code === 18 ||
+    sqliteCode === "SQLITE_TOOBIG" ||
+    sqliteCode === 18 ||
+    errcode === "SQLITE_TOOBIG" ||
+    errcode === 18
+  );
+}
+
+/** Normalize engine-reported value limits without projecting a package-side ceiling. */
+export function rethrowSqliteError(error: unknown): never {
+  if (sqliteValueTooLarge(error)) {
+    throw new GitError("E2BIG", "SQLite rejected a value as too large", { cause: error });
+  }
+  rethrowMaintenanceRootEpochError(error);
+}
+
+function* normalizeSqlRows(cursor: unknown): Generator<Record<string, unknown>> {
+  try {
+    yield* iterateSqlCursor(cursor);
+  } catch (error) {
+    rethrowSqliteError(error);
+  }
+}
+
 /** Refine a platform SQL cursor into a lazy iterable without trusting its type. */
 export function* iterateSqlCursor(cursor: unknown): Generator<Record<string, unknown>> {
   if (typeof cursor !== "object" || cursor === null) {
@@ -107,15 +139,19 @@ export class Database implements SqlDatabase {
     try {
       this.sql.exec(query, ...bindings);
     } catch (error) {
-      rethrowMaintenanceRootEpochError(error);
+      rethrowSqliteError(error);
     }
   }
 
   all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    return this.sql
-      .exec<Row>(query, ...bindings)
-      .toArray()
-      .map(normalizeRow<Row>);
+    try {
+      return this.sql
+        .exec<Row>(query, ...bindings)
+        .toArray()
+        .map(normalizeRow<Row>);
+    } catch (error) {
+      rethrowSqliteError(error);
+    }
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
@@ -128,7 +164,11 @@ export class Database implements SqlDatabase {
   }
 
   iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    return iterateSqlCursor(this.sql.exec(query, ...bindings));
+    try {
+      return normalizeSqlRows(this.sql.exec(query, ...bindings));
+    } catch (error) {
+      rethrowSqliteError(error);
+    }
   }
 
   transactionSync<T>(closure: () => T): T {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 

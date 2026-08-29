@@ -6,14 +6,14 @@ import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import type { TransportOperationBudget } from "../ops/transport-budget.js";
 import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
 import { retainedStringBytes } from "../retained.js";
-import { FLUSH, pkt } from "./pktline.js";
+import { FLUSH, MAX_PKT_PAYLOAD_BYTES, pkt } from "./pktline.js";
 import {
   baseHeaders,
   normalizeRemoteUrl,
   type ProtocolMemoryLimits,
   type ProtocolRequestOptions,
 } from "./remote.js";
-import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt } from "./stream.js";
+import { ByteReader, type Pkt } from "./stream.js";
 import { type GitAuth, type GitHttpResponse, HttpError, requestWithAuth } from "./transport.js";
 
 export const MAX_RECEIVE_PACK_COMMANDS = 1_024;
@@ -169,7 +169,7 @@ function resolvedStatusLimits(overrides: ProtocolMemoryLimits | undefined): Reso
     retainedBytes: boundedLimit(overrides?.retainedBytes, MAX_RECEIVE_PACK_RESULT_BYTES),
     inputBytes: boundedLimit(overrides?.inputBytes, MAX_RECEIVE_PACK_STATUS_INPUT_BYTES),
     entries: boundedLimit(overrides?.entries, MAX_RECEIVE_PACK_STATUS_PACKETS),
-    lineBytes: boundedLimit(overrides?.lineBytes, MAX_PKT_FRAME_BYTES - 4),
+    lineBytes: boundedLimit(overrides?.lineBytes, MAX_PKT_PAYLOAD_BYTES),
   };
 }
 

@@ -10,8 +10,8 @@ import { CorruptError, GitError } from "../errors.js";
 import type { TransportOperationBudget } from "../ops/transport-budget.js";
 import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
 import { retainedStringBytes } from "../retained.js";
-import { FLUSH, pkt } from "./pktline.js";
-import { ByteReader, MAX_PKT_FRAME_BYTES, type Pkt, pktText } from "./stream.js";
+import { FLUSH, MAX_PKT_PAYLOAD_BYTES, pkt } from "./pktline.js";
+import { ByteReader, type Pkt, pktText } from "./stream.js";
 import {
   type GitHttpResponse,
   HttpError,
@@ -42,7 +42,7 @@ const ZERO = "0".repeat(40);
 export const MAX_PROTOCOL_RETAINED_BYTES = 4 * 1024 * 1024;
 export const MAX_PROTOCOL_NEGOTIATION_INPUT_BYTES = 16 * 1024 * 1024;
 export const MAX_PROTOCOL_NEGOTIATION_ENTRIES = 16_384;
-export const MAX_PROTOCOL_TEXT_BYTES = MAX_PKT_FRAME_BYTES - 4;
+export const MAX_PROTOCOL_TEXT_BYTES = MAX_PKT_PAYLOAD_BYTES;
 
 const ADVERTISEMENT_FIXED_BYTES = 256;
 const UPLOAD_RESULT_FIXED_BYTES = 192;

@@ -5,9 +5,9 @@ import { initializeFsSchema } from "../../src/fs/schema.js";
 import {
   createInitialWorktreeWriter,
   type InitialWorktreeSession,
-  MAX_INITIAL_WORKTREE_SESSION_BYTES,
 } from "../../src/fs/store/initial-write.js";
 import { writeFiles } from "../../src/fs/store/write.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../../src/memory.js";
 import { readBlob, type SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
@@ -180,7 +180,7 @@ describe("InitialWorktreeWriter", () => {
     expect(entryAt(absent, "/repo/link")?.mode).toBe(0o777);
   });
 
-  it("owns and bounds symlink content ids", () => {
+  it("owns content ids and admits the former 1 MiB first excess", () => {
     const accepted = setup();
     const contentId = new Uint8Array([1, 2, 3, 4]);
     let captured: InitialWorktreeSession | undefined;
@@ -196,27 +196,41 @@ describe("InitialWorktreeWriter", () => {
       1, 2, 3, 4,
     ]);
     expect(requiredSession(captured).highWaterBytes).toBeLessThanOrEqual(
-      MAX_INITIAL_WORKTREE_SESSION_BYTES,
+      MAX_OPERATION_MEMORY_BYTES,
     );
 
-    const rejected = setup();
-    let rejectedSession: InitialWorktreeSession | undefined;
-    let rejectedInitialHighWater = 0;
-    expect(() =>
-      createInitialWorktreeWriter(rejected).tryRun("/repo", (session) => {
-        rejectedSession = session;
-        rejectedInitialHighWater = session.highWaterBytes;
+    const formerExcess = setup();
+    const largeContentId = new Uint8Array(1024 * 1024 + 1).fill(0x5a);
+    expect(
+      createInitialWorktreeWriter(formerExcess).tryRun("/repo", (session) => {
         session.writeSymlink("link", "target", {
-          contentId: new Uint8Array(1024 * 1024 + 1),
+          contentId: largeContentId,
         });
       }),
-    ).toThrow(/content id exceeds the payload limit/);
-    expect(rejected.scalar<number>("SELECT count(*) FROM fs_paths")).toBe(1);
-    expect(rejected.scalar<number>("SELECT count(*) FROM fs_nodes")).toBe(1);
-    expect(rejected.scalar<number>("SELECT count(*) FROM fs_chunks")).toBe(0);
-    expect(rejected.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'")).toBe(0);
-    expect(rejected.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'")).toBe(2);
-    expect(requiredSession(rejectedSession).highWaterBytes).toBe(rejectedInitialHighWater);
+    ).toEqual({ kind: "committed", value: undefined });
+    const largeStored = entryAt(formerExcess, "/repo/link")?.content_id;
+    expect(
+      largeStored === null || largeStored === undefined ? largeStored : readBlob(largeStored),
+    ).toEqual(largeContentId);
+  });
+
+  it("writes former size/path excesses and a symlink above the JSON page target", () => {
+    const db = setup();
+    const bytes = new Uint8Array(1024 * 1024 + 1).fill(0x33);
+    const longPath = "p".repeat(4_097);
+    const target = "t".repeat(1_500_001);
+
+    expect(
+      createInitialWorktreeWriter(db).tryRun("/repo", (session) => {
+        session.writeFile("large.bin", bytes);
+        session.writeFile(longPath, new Uint8Array([7]));
+        session.writeSymlink("zz-link", target);
+      }),
+    ).toEqual({ kind: "committed", value: undefined });
+
+    expect(bytesAt(db, "/repo/large.bin")).toEqual(bytes);
+    expect(bytesAt(db, `/repo/${longPath}`)).toEqual(new Uint8Array([7]));
+    expect(entryAt(db, "/repo/zz-link")).toMatchObject({ size: target.length, target });
   });
 
   it("bumps revision once and commits one contiguous inode range", () => {
@@ -291,7 +305,7 @@ describe("InitialWorktreeWriter", () => {
     expect(db.widestBlob).toBe(1024 * 1024);
     expect(db.widestString).toBeLessThanOrEqual(1_500_000);
     expect(requiredSession(captured).highWaterBytes).toBeLessThanOrEqual(
-      MAX_INITIAL_WORKTREE_SESSION_BYTES,
+      MAX_OPERATION_MEMORY_BYTES,
     );
   });
 
@@ -372,17 +386,131 @@ describe("InitialWorktreeWriter", () => {
   it("rolls back rows and counters after an injected mid-flush failure", () => {
     const inner = setup();
     const db = new RecordingDatabase(inner, 2);
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
     const size = 3 * 1024 * 1024;
     expect(() =>
-      createInitialWorktreeWriter(db).tryRun("/repo", (session) => {
-        session.writeFileStream("large", size, generatedChunks(size));
-      }),
+      createInitialWorktreeWriter(db).tryRun(
+        "/repo",
+        (session) => {
+          session.writeFileStream("large", size, generatedChunks(size));
+        },
+        undefined,
+        reservation,
+      ),
     ).toThrow(/injected content failure/);
     expect(inner.scalar<number>("SELECT count(*) FROM fs_paths")).toBe(1);
     expect(inner.scalar<number>("SELECT count(*) FROM fs_nodes")).toBe(1);
     expect(inner.scalar<number>("SELECT count(*) FROM fs_chunks")).toBe(0);
     expect(inner.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'")).toBe(0);
     expect(inner.scalar<number>("SELECT v FROM fs_meta WHERE k = 'next_inode'")).toBe(2);
+    expect(reservation.currentBytes).toBe(0);
+    reservation.dispose();
+    coordinator.assertIdle();
+  });
+
+  it("precharges the independently calculated root-preflight aggregate", () => {
+    const root = "/missing/child";
+    const ancestors = ["/", "/missing", root];
+    const stringBytes = (value: string): number => 48 + 2 * value.length;
+    const rootBytes =
+      64 +
+      ancestors.length * 8 +
+      stringBytes(ancestors[1]!) +
+      stringBytes(JSON.stringify(ancestors)) +
+      stringBytes(`${root}/`) +
+      stringBytes(`${root}0`) +
+      64 +
+      ancestors.length * (8 + 256) +
+      ancestors.reduce(
+        (total, ancestor) => total + 2 * stringBytes(ancestor) + stringBytes("dir"),
+        0,
+      );
+
+    const exactCoordinator = new MemoryCoordinator();
+    const exactBlocker = exactCoordinator.reserve();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - rootBytes);
+    const exactRoot = exactCoordinator.reserve();
+    let called = false;
+    expect(
+      createInitialWorktreeWriter(setup()).tryRun(
+        root,
+        () => {
+          called = true;
+        },
+        undefined,
+        exactRoot,
+      ),
+    ).toEqual({ kind: "unavailable" });
+    expect(called).toBe(false);
+    expect(exactCoordinator.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(exactRoot.currentBytes).toBe(0);
+    exactRoot.dispose();
+    exactBlocker.dispose();
+    exactCoordinator.assertIdle();
+
+    const excessCoordinator = new MemoryCoordinator();
+    const excessBlocker = excessCoordinator.reserve();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - rootBytes + 1);
+    const excessRoot = excessCoordinator.reserve();
+    expect(() =>
+      createInitialWorktreeWriter(setup()).tryRun(root, () => {}, undefined, excessRoot),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(excessRoot.currentBytes).toBe(0);
+    excessRoot.dispose();
+    excessBlocker.dispose();
+    excessCoordinator.assertIdle();
+  });
+
+  it("admits the independently calculated path/row/JSON aggregate and rejects +1", () => {
+    const rootRetainedBytes = 2;
+    const path = "/x";
+    const parent = "/";
+    const metadataRetainedBytes = 2 * 256 + 2 * path.length + 2 * parent.length;
+    const pathStateBytes = 2 + 64;
+    const nodeJsonBytes = 2 + 384 + 2 * 2;
+    const pathJsonBytes = 2 + 128 + 2 * (path.length + 2) + 2 * (parent.length + 2);
+    const flushCopyBytes = 2 * (nodeJsonBytes + pathJsonBytes);
+    const operationBytes =
+      rootRetainedBytes + metadataRetainedBytes + pathStateBytes + flushCopyBytes;
+
+    const exactCoordinator = new MemoryCoordinator();
+    const exactBlocker = exactCoordinator.reserve();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactRoot = exactCoordinator.reserve();
+    expect(
+      createInitialWorktreeWriter(setup()).tryRun(
+        "/",
+        (session) => session.writeSymlink("x", ""),
+        undefined,
+        exactRoot,
+      ),
+    ).toEqual({ kind: "committed", value: undefined });
+    expect(exactCoordinator.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(exactRoot.currentBytes).toBe(0);
+    exactRoot.dispose();
+    exactBlocker.dispose();
+    exactCoordinator.assertIdle();
+
+    const excessDb = setup();
+    const excessCoordinator = new MemoryCoordinator();
+    const excessBlocker = excessCoordinator.reserve();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessRoot = excessCoordinator.reserve();
+    expect(() =>
+      createInitialWorktreeWriter(excessDb).tryRun(
+        "/",
+        (session) => session.writeSymlink("x", ""),
+        undefined,
+        excessRoot,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(excessRoot.currentBytes).toBe(0);
+    expect(excessDb.scalar<number>("SELECT count(*) FROM fs_paths")).toBe(1);
+    expect(excessDb.scalar<number>("SELECT v FROM fs_meta WHERE k = 'rev'")).toBe(0);
+    excessRoot.dispose();
+    excessBlocker.dispose();
+    excessCoordinator.assertIdle();
   });
 
   it("invalidates a captured session after a thrown or asynchronous body", () => {
@@ -530,7 +658,7 @@ describe("InitialWorktreeWriter", () => {
     expect(db.widestBlob).toBeLessThanOrEqual(1024 * 1024);
     expect(db.widestString).toBeLessThanOrEqual(1_500_000);
     expect(requiredSession(captured).highWaterBytes).toBeLessThanOrEqual(
-      MAX_INITIAL_WORKTREE_SESSION_BYTES,
+      MAX_OPERATION_MEMORY_BYTES,
     );
   });
 

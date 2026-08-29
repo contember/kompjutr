@@ -34,12 +34,11 @@ export const GLOB_PATTERN_MAX_BYTES = 50;
 export const DISCOVERY_PAGE_MAX = 1_000;
 export const DISCOVERY_EXCLUDE_ROOTS_MAX = MAX_ROUTING_CHECKOUTS;
 export const DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX = MAX_ROUTING_CHECKOUTS + 1;
-export const DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES = MAX_ROUTING_ROOTS_UTF8_BYTES;
 const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
 const DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES = DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX * 6 + 2;
 /** Every input byte can expand to a six-byte JSON escape, plus quotes and separators. */
 const DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES =
-  DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2;
+  MAX_ROUTING_ROOTS_UTF8_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2;
 export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES = 1_500_000;
 /** A completed segment can leave less than one maximum-sized item of slack. */
 export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS = Math.ceil(
@@ -54,7 +53,7 @@ const DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES = 64;
 const DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES = 8;
 const DISCOVERY_EXCLUDE_STRING_FIXED_BYTES = 48;
 export const DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES =
-  2 * DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES +
+  2 * MAX_ROUTING_ROOTS_UTF8_BYTES +
   3 * DISCOVERY_EXCLUDE_ROOTS_MAX * DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
   DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS * DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
   2 * DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES +
@@ -292,13 +291,11 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
     const parent = coalesced[coalesced.length - 1];
     if (parent !== undefined && (path === parent || path.startsWith(`${parent}/`))) continue;
     coalesced.push(path);
-    if (retainedUtf8Bytes <= DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES) {
-      const remaining = DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES - retainedUtf8Bytes;
+    if (retainedUtf8Bytes <= MAX_ROUTING_ROOTS_UTF8_BYTES) {
+      const remaining = MAX_ROUTING_ROOTS_UTF8_BYTES - retainedUtf8Bytes;
       const pathBytes = boundedUtf8Bytes(path, remaining);
       retainedUtf8Bytes =
-        pathBytes > remaining
-          ? DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES + 1
-          : retainedUtf8Bytes + pathBytes;
+        pathBytes > remaining ? MAX_ROUTING_ROOTS_UTF8_BYTES + 1 : retainedUtf8Bytes + pathBytes;
     }
   }
   if (coalesced.length > DISCOVERY_EXCLUDE_ROOTS_MAX) {
@@ -306,9 +303,9 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
       `discoverFiles: at most ${DISCOVERY_EXCLUDE_ROOTS_MAX} effective excluded roots may be supplied`,
     );
   }
-  if (retainedUtf8Bytes > DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES) {
+  if (retainedUtf8Bytes > MAX_ROUTING_ROOTS_UTF8_BYTES) {
     throw new Error(
-      `discoverFiles: excluded roots exceed ${DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES} UTF-8 bytes`,
+      `discoverFiles: excluded roots exceed ${MAX_ROUTING_ROOTS_UTF8_BYTES} UTF-8 bytes`,
     );
   }
   return coalesced;

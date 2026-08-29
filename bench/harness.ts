@@ -8,6 +8,7 @@
 import { createGit, type Git, Workspace } from "../src/index.js";
 import { SqliteTestStorage } from "../tests/helpers/storage.js";
 import { type FixtureName, isFixtureName } from "./fixtures.js";
+import type { MemoryPhaseEvidence } from "./memory-protocol.js";
 
 export type Backend = "sqlite";
 /** Flat puts every file in one directory; deep fans out, 20 per directory. */
@@ -37,6 +38,8 @@ export function harness(_backend: Backend, databasePath = ":memory:"): Harness {
 
 export interface ScenarioContext {
   harness: Harness;
+  /** File-backed SQLite path for memory scenarios; null for ordinary cells. */
+  databasePath: string | null;
   /** Files for a synthetic tree; a cap on tracked files for a fixture, 0 for all. */
   count: number;
   variant: Variant;
@@ -49,11 +52,17 @@ export interface Phase {
   before?(context: ScenarioContext): Promise<void>;
   /** The region that is measured. */
   run(context: ScenarioContext): Promise<void>;
+  /** Strong end-state verification. Runs after the memory peak is captured. */
+  verify?(context: ScenarioContext): Promise<void>;
+  /** Memory-owner evidence captured by the measured operation. */
+  memoryEvidence?(): MemoryPhaseEvidence;
 }
 
 export interface Scenario {
   name: string;
-  kind: "synthetic" | "macro";
+  kind: "synthetic" | "macro" | "memory";
+  /** Keep SQLite pages and WAL bytes outside the Node heap for cgroup evidence. */
+  fileBacked?: boolean;
   /** Builds the fixture. Not measured. */
   setup(context: ScenarioContext): Promise<void>;
   phases: Phase[];

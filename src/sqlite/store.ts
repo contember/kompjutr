@@ -53,6 +53,7 @@ import {
 import { Sha1 } from "../core/sha1.js";
 import { comparePaths } from "../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
+import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import {
   type CommitCacheEntry,
   type CommitCacheWriteResult,
@@ -71,7 +72,6 @@ import {
   type MaintenanceRootSnapshotProgress,
   validatedOperationJournalRoots,
 } from "./maintenance/roots.js";
-import { MemoryCoordinator, type MemoryReservation } from "./memory.js";
 import {
   MAX_PACK_BLOB_BATCH_BYTES,
   MAX_PACK_DELTA_WORKING_BYTES,
@@ -116,7 +116,6 @@ import {
   iterateTree,
   iterateTreeDiff,
   iterateTreeDiffObjects,
-  TREE_WALK_PATH_BYTES,
   type WalkTreeDiffEntry,
   type WalkTreeDiffObject,
   type WalkTreeEntry,
@@ -165,12 +164,17 @@ const MAX_INDEX_SCAN_PAGE = 2048;
 /** Index mutations buffered before a batch is applied. */
 const DEFAULT_INDEX_FLUSH = 512;
 
-/** Bound JSON stays below the Durable Object SQLite 2 MiB value ceiling. */
-const INDEX_MUTATION_PAYLOAD = 1024 * 1024;
+/** Non-refusing JSON page target with framing headroom below 2 MiB. */
+const INDEX_MUTATION_JSON_FLUSH_BYTES = 1_500_000;
 const INDEX_MUTATION_ROW_BYTES = 192;
-const INITIAL_STATE_MEMORY_BYTES = 4 * 1024 * 1024;
 const INITIAL_STATE_FIXED_BYTES = 64 * 1024;
 const INITIAL_BLOB_ROW_JSON_BYTES = 96;
+const INITIAL_INDEX_EMPTY_RESERVED_BYTES = 8;
+const INITIAL_BLOB_EMPTY_RESERVED_BYTES = 32;
+const INITIAL_STATE_CONSTRUCTOR_BYTES =
+  INITIAL_STATE_FIXED_BYTES +
+  INITIAL_INDEX_EMPTY_RESERVED_BYTES +
+  INITIAL_BLOB_EMPTY_RESERVED_BYTES;
 
 /** Parsed commits staged beside encoded object bytes before a batch flush. */
 const COMMIT_STAGE_CACHE_BYTES = 16 * 1024 * 1024;
@@ -819,9 +823,9 @@ const CANONICAL_CONFIG_TEXT_DECODER = new TextDecoder("utf-8", {
   ignoreBOM: true,
 });
 const JSON_BATCH_ROWS = 2_048;
-const JSON_BATCH_BYTES = 1024 * 1024;
+const JSON_BATCH_BYTES = 1_500_000;
 
-function* jsonPages<T>(items: Iterable<T>, label: string): Generator<string> {
+function* jsonPages<T>(items: Iterable<T>, _label: string): Generator<string> {
   let rows: string[] = [];
   let bytes = 2;
   for (const item of items) {
@@ -836,11 +840,13 @@ function* jsonPages<T>(items: Iterable<T>, label: string): Generator<string> {
       rows = [];
       bytes = 2;
     }
-    if (2 + rowBytes > JSON_BATCH_BYTES) {
-      throw new GitError("E2BIG", `one ${label} exceeds the 1 MiB JSON batch limit`);
-    }
     bytes += (rows.length === 0 ? 0 : 1) + rowBytes;
     rows.push(row);
+    if (bytes >= JSON_BATCH_BYTES) {
+      yield `[${rows.join(",")}]`;
+      rows = [];
+      bytes = 2;
+    }
   }
   if (rows.length > 0) yield `[${rows.join(",")}]`;
 }
@@ -1468,17 +1474,16 @@ class IndexMutationBuffer {
     const separator = this.#pending.length === 0 ? 0 : 1;
     if (
       this.#pending.length > 0 &&
-      this.#bytes + separator + mutation.bytes > INDEX_MUTATION_PAYLOAD
+      this.#bytes + separator + mutation.bytes > INDEX_MUTATION_JSON_FLUSH_BYTES
     ) {
       this.flush();
       mutation = serializeIndexMutation(item, 0);
     }
-    if (2 + mutation.bytes > INDEX_MUTATION_PAYLOAD) {
-      throw new GitError("E2BIG", "one index mutation exceeds the 1 MiB JSON batch limit");
-    }
     this.#bytes += (this.#pending.length === 0 ? 0 : 1) + mutation.bytes;
     this.#pending.push(mutation);
-    if (this.#pending.length >= this.flushEvery) this.flush();
+    if (this.#pending.length >= this.flushEvery || this.#bytes >= INDEX_MUTATION_JSON_FLUSH_BYTES) {
+      this.flush();
+    }
   }
 
   flush(): void {
@@ -1498,7 +1503,7 @@ function validNullableIndexInteger(value: number | null | undefined): boolean {
   return value === null || value === undefined || (Number.isSafeInteger(value) && value >= 0);
 }
 
-function initialPathJsonBytes(path: string, maxUtf8Bytes = TREE_WALK_PATH_BYTES): number {
+function initialPathJsonBytes(path: string, maxUtf8Bytes?: number): number {
   if (path.length === 0 || path.charCodeAt(0) === 0x2f) {
     throw new CorruptError("initial index entry has an invalid path");
   }
@@ -1550,7 +1555,7 @@ function initialPathJsonBytes(path: string, maxUtf8Bytes = TREE_WALK_PATH_BYTES)
         jsonBytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
       }
     }
-    if (utf8Bytes > maxUtf8Bytes) {
+    if (maxUtf8Bytes !== undefined && utf8Bytes > maxUtf8Bytes) {
       throw new GitError("E2BIG", `initial index path exceeds ${maxUtf8Bytes} UTF-8 bytes`);
     }
   }
@@ -1938,7 +1943,7 @@ function requireBooleanProbe(value: unknown, label: string): boolean {
 }
 
 class InitialBlobIdBuffer {
-  #payload: Uint8Array | null = new Uint8Array(CONTENT_ID_PAYLOAD);
+  #payload: Uint8Array | null = null;
   #rows: BlobIdWriteRow[] = [];
   #length = 0;
 
@@ -1956,7 +1961,11 @@ class InitialBlobIdBuffer {
   }
 
   additionalReservedBytes(): number {
-    return BLOB_ID_MISMATCH_ROW_BYTES + INITIAL_BLOB_ROW_JSON_BYTES * 2;
+    return (
+      (this.#payload === null ? CONTENT_ID_PAYLOAD : 0) +
+      BLOB_ID_MISMATCH_ROW_BYTES +
+      INITIAL_BLOB_ROW_JSON_BYTES * 2
+    );
   }
 
   willCache(mapping: BlobIdMapping): boolean {
@@ -1985,8 +1994,8 @@ class InitialBlobIdBuffer {
     ) {
       this.flush();
     }
+    if (this.#payload === null) this.#payload = new Uint8Array(CONTENT_ID_PAYLOAD);
     const payload = this.#payload;
-    if (payload === null) throw new Error("initial blob id buffer is disposed");
     payload.set(mapping.contentId, this.#length);
     this.#rows.push({ a: this.#length + 1, n: mapping.contentId.length, o: mapping.oid });
     this.#length += mapping.contentId.length;
@@ -8518,85 +8527,102 @@ export class CheckoutStore implements IndexStore {
       }
       if (exists === 1) return { available: false };
 
+      const reservation = this.reserveMemory();
       let active = true;
       let failed = false;
       let failure: unknown;
       let previousPath: string | null = null;
-      const pending = new IndexMutationBuffer(DEFAULT_INDEX_FLUSH, (mutations) => {
-        this.#applyIndexMutations(mutations);
-      });
-      const blobIds = new InitialBlobIdBuffer(this.#db, this.#repoId);
-      const requireActive = (): void => {
-        if (!active) throw new Error("initial state session is no longer active");
-        if (failed) throw failure;
-      };
-      const attempt = (operation: () => void): void => {
-        requireActive();
-        try {
-          operation();
-        } catch (error) {
-          failed = true;
-          failure = error;
-          throw error;
-        }
-      };
-      const reservedBytes = (): number =>
-        INITIAL_STATE_FIXED_BYTES +
-        pending.reservedBytes +
-        blobIds.reservedBytes +
-        (previousPath?.length ?? 0) * 2;
-      const requireRoom = (additional: number, first: "index" | "blob"): void => {
-        if (reservedBytes() + additional <= INITIAL_STATE_MEMORY_BYTES) return;
-        if (first === "index") pending.flush();
-        else blobIds.flush();
-        if (reservedBytes() + additional <= INITIAL_STATE_MEMORY_BYTES) return;
-        if (first === "index") blobIds.flush();
-        else pending.flush();
-        if (reservedBytes() + additional > INITIAL_STATE_MEMORY_BYTES) {
-          throw new GitError("E2BIG", "initial state session exceeds its 4 MiB memory limit");
-        }
-      };
-      const session: InitialStateSession = {
-        get retainedBytes() {
-          return active ? reservedBytes() : 0;
-        },
-        put: (entry) => {
-          attempt(() => {
-            const pathJsonBytes = validateInitialIndexEntry(entry);
-            if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
-              throw new CorruptError("initial index entries are not in strict Git path order");
-            }
-            const mutationJsonBytes = pathJsonBytes + 512;
-            requireRoom(
-              mutationJsonBytes * 4 + INDEX_MUTATION_ROW_BYTES + entry.path.length * 2,
-              "index",
-            );
-            pending.add(entry);
-            previousPath = entry.path;
-            if (reservedBytes() > INITIAL_STATE_MEMORY_BYTES) {
-              throw new CorruptError("initial index reservation exceeded its preflight");
-            }
-          });
-        },
-        addBlobId: (mapping) => {
-          attempt(() => {
-            blobIds.validate(mapping);
-            if (!blobIds.willCache(mapping)) return;
-            if (blobIds.needsFlush(mapping)) blobIds.flush();
-            requireRoom(blobIds.additionalReservedBytes(), "blob");
-            blobIds.add(mapping);
-            if (reservedBytes() > INITIAL_STATE_MEMORY_BYTES) {
-              throw new CorruptError("initial blob reservation exceeded its preflight");
-            }
-          });
-        },
-      };
-      const finish = (): void => {
-        attempt(() => pending.flush());
-        attempt(() => blobIds.finish());
-      };
-
+      let pending: IndexMutationBuffer | null = null;
+      let blobIds: InitialBlobIdBuffer | null = null;
       try {
+        reservation.set("other", INITIAL_STATE_CONSTRUCTOR_BYTES);
+        pending = new IndexMutationBuffer(DEFAULT_INDEX_FLUSH, (mutations) => {
+          this.#applyIndexMutations(mutations);
+        });
+        blobIds = new InitialBlobIdBuffer(this.#db, this.#repoId);
+        const mutationBuffer = pending;
+        const blobBuffer = blobIds;
+        const requireActive = (): void => {
+          if (!active) throw new Error("initial state session is no longer active");
+          if (failed) throw failure;
+        };
+        const attempt = (operation: () => void): void => {
+          requireActive();
+          try {
+            operation();
+          } catch (error) {
+            failed = true;
+            failure = error;
+            throw error;
+          }
+        };
+        const reservedBytes = (): number =>
+          INITIAL_STATE_FIXED_BYTES +
+          mutationBuffer.reservedBytes +
+          blobBuffer.reservedBytes +
+          (previousPath?.length ?? 0) * 2;
+        const reserve = (bytes: number): boolean => {
+          try {
+            reservation.set("other", bytes);
+            return true;
+          } catch (error) {
+            if (
+              typeof error === "object" &&
+              error !== null &&
+              Reflect.get(error, "code") === "E2BIG"
+            ) {
+              return false;
+            }
+            throw error;
+          }
+        };
+        const requireRoom = (additional: number, first: "index" | "blob"): void => {
+          if (reserve(reservedBytes() + additional)) return;
+          if (first === "index") mutationBuffer.flush();
+          else blobBuffer.flush();
+          if (reserve(reservedBytes() + additional)) return;
+          if (first === "index") blobBuffer.flush();
+          else mutationBuffer.flush();
+          reservation.set("other", reservedBytes() + additional);
+        };
+        const session: InitialStateSession = {
+          get retainedBytes() {
+            return active ? reservedBytes() : 0;
+          },
+          put: (entry) => {
+            attempt(() => {
+              const pathJsonBytes = validateInitialIndexEntry(entry);
+              if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
+                throw new CorruptError("initial index entries are not in strict Git path order");
+              }
+              const mutationJsonBytes = pathJsonBytes + 512;
+              requireRoom(
+                mutationJsonBytes * 4 + INDEX_MUTATION_ROW_BYTES + entry.path.length * 2,
+                "index",
+              );
+              mutationBuffer.add(entry);
+              previousPath = entry.path;
+              reservation.set("other", reservedBytes());
+            });
+          },
+          addBlobId: (mapping) => {
+            attempt(() => {
+              blobBuffer.validate(mapping);
+              if (!blobBuffer.willCache(mapping)) return;
+              if (blobBuffer.needsFlush(mapping)) blobBuffer.flush();
+              requireRoom(blobBuffer.additionalReservedBytes(), "blob");
+              blobBuffer.add(mapping);
+              reservation.set("other", reservedBytes());
+            });
+          },
+        };
+        const finish = (): void => {
+          attempt(() => mutationBuffer.flush());
+          reservation.set("other", reservedBytes());
+          attempt(() => blobBuffer.finish());
+          reservation.set("other", reservedBytes());
+        };
+
         const value = body(session);
         requireActive();
         if (isThenableResult(value)) {
@@ -8609,10 +8635,11 @@ export class CheckoutStore implements IndexStore {
         return { available: true, value };
       } finally {
         active = false;
-        pending.dispose();
-        blobIds.dispose();
+        pending?.dispose();
+        blobIds?.dispose();
         previousPath = null;
         failure = undefined;
+        reservation.dispose();
       }
     });
   }

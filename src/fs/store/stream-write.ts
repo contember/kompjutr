@@ -9,7 +9,6 @@ import type { RealPath } from "../types.js";
 import { allocateInodes, bumpRev } from "./meta.js";
 
 const DEFAULT_FILE_MODE = 0o644;
-const MAX_STREAM_BYTES = 96 * 1024 * 1024;
 
 interface TargetRow {
   inode: unknown;
@@ -128,16 +127,9 @@ export function writeFileStream(
     }
 
     let offset = append ? (existing?.size ?? 0) : 0;
-    let streamed = 0;
     for (const chunk of chunks) {
       if (!(chunk instanceof Uint8Array)) {
         throw fsError("EINVAL", "redirect stream yielded a non-byte chunk", path);
-      }
-      if (
-        !Number.isSafeInteger(streamed + chunk.length) ||
-        streamed + chunk.length > MAX_STREAM_BYTES
-      ) {
-        throw fsError("EFBIG", `redirect exceeds ${MAX_STREAM_BYTES} bytes`, path);
       }
       let at = 0;
       while (at < chunk.length) {
@@ -161,7 +153,6 @@ export function writeFileStream(
             within,
           );
         }
-        streamed += length;
         offset += length;
         at += length;
       }

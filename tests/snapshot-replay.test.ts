@@ -4,12 +4,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git } from "../src/git/client.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
 } from "../src/sqlite/index-tracker.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

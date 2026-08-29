@@ -12,9 +12,9 @@ import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit } from "../src/git/client.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { initializeIndexTracker } from "../src/sqlite/index-tracker.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
 import {
   type CheckoutStore,
   PROVISIONAL_CLONE_LEASE_MS,

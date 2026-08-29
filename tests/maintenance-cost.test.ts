@@ -11,9 +11,9 @@ import {
 } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { createGit, type GitFactory, type GitMaintenanceResult } from "../src/git/client.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { GC_GRACE_MS } from "../src/sqlite/maintenance/sweep.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";

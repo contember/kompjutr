@@ -70,9 +70,9 @@ function observingWriter(
 ): InitialWorktreeWriter {
   return {
     supportsDatabase,
-    tryRun(root, body, afterClose) {
+    tryRun(root, body, afterClose, reservation) {
       onAttempt();
-      const result = writer.tryRun(root, body, afterClose);
+      const result = writer.tryRun(root, body, afterClose, reservation);
       if (result.kind === "committed") onCommit?.();
       return result;
     },
@@ -80,6 +80,36 @@ function observingWriter(
 }
 
 describe("initial standalone checkout", () => {
+  it("writes the former 2,201-byte initial-index path without a tree-walk refusal", () => {
+    const runtime = makeInitialRepository();
+    const path = "p".repeat(2_201);
+    const oid = "1".repeat(40);
+
+    expect(
+      runtime.repo.checkout.tryCreateInitialState((session) => {
+        session.put({
+          path,
+          stage: 0,
+          mode: 0o100644,
+          oid,
+          size: 1,
+          mtime: null,
+          ino: null,
+        });
+      }),
+    ).toEqual({ available: true, value: undefined });
+    expect(runtime.repo.checkout.indexGet(path)).toEqual({
+      path,
+      stage: 0,
+      mode: 0o100644,
+      oid,
+      size: 1,
+      mtime: null,
+      ino: null,
+      rev: null,
+    });
+  });
+
   it("atomically writes exact files, symlinks, index, HEAD, reflog, and tracker state", async () => {
     const fixture = new GitFixture().init("main");
     const readme = "hello\n";

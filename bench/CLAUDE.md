@@ -9,6 +9,8 @@ npm run bench:macro    # macro-packed, macro-loose
 npm run bench:nextjs   # the Next.js workflow
 npm run bench:statements -- --check  # deterministic SQL/row regression gate
 npm run bench:clone-storage  # SQLite bytes a clone costs, and where they go
+npm run bench:memory         # cgroup-backed bounded-memory evidence under cpu-lease
+npm run bench:memory -- --runtime-check  # focused lease/cgroup wiring witness
 npm run bench:workerd:nextjs # clone inside a real SQLite Durable Object
 ```
 
@@ -21,6 +23,12 @@ whose runtime query barriers were removed. It reports whether each row meets the
 at-most-1,000-statement target. A target miss alone does not fail `--check` and
 never licenses a runtime refusal; missing rows, invalid end states, and frozen-
 baseline regressions do fail.
+`memory.ts` exercises streamed operations above retired cumulative byte limits.
+Its SQL target is report-only; semantic, coordinator, CPU-lease, and cgroup
+validation failures are hard failures. The runner reserves its own CPU lease.
+The <100 MiB process target is reset `VmHWM` minus its same-run baseline. The
+independent 512 MiB cgroup cap includes SQLite page cache and is only a hard
+runaway witness; raw cgroup totals are never presented as process memory.
 Fixtures are `express`, `tailwind`, `vue`, `eslint`, `prettier`, `nextjs`
 (218 → 24,252 files). `bench/results/` and `bench/.fixtures/` are gitignored.
 

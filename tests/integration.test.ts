@@ -9,7 +9,7 @@ import { reserveIntegrationPlan } from "../src/core/ops/integration-worktree.js"
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";

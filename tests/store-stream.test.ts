@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { concat, toHex, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { Sha1 } from "../src/core/sha1.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { MAX_BLOB_ID_CACHE_ROWS } from "../src/sqlite/blob-id-cache.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { readMaintenanceRootEpoch } from "../src/sqlite/maintenance/control.js";
@@ -341,7 +342,7 @@ describe("indexApply", () => {
 
     expect(statements).toBeGreaterThan(2);
     expect(statements).toBeLessThan(1_000);
-    expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(db.widestStringBytes).toBeLessThanOrEqual(1_500_000);
     expect(stored.map((row) => row.path)).toEqual(paths);
   });
 });
@@ -605,7 +606,7 @@ describe("scratch indexes", () => {
     expect(reopened.read(thenableOid)).toBeNull();
   });
 
-  it("streams a maximal repository shape below the SQL and payload ceilings", () => {
+  it("streams a maximal repository shape through bounded SQL and 1.5 MB JSON pages", () => {
     const inner = new TestDatabase();
     const db = new WidestDatabase(inner);
     const store = open(db);
@@ -637,7 +638,7 @@ describe("scratch indexes", () => {
     expect(inner.storage.statementCount).toBeLessThan(1_000);
     expect(db.widestRows).toBeLessThanOrEqual(513);
     expect(db.widestBindings).toBeLessThanOrEqual(8);
-    expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
+    expect(db.widestStringBytes).toBeLessThanOrEqual(1_500_000);
     expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(0);
     expect(inner.scalar<number>("SELECT count(*) FROM git_scratch_index_entries")).toBe(0);
   });
@@ -716,6 +717,72 @@ describe("tryCreateInitialState", () => {
     expect(store.lookupBlobIds([mapping])).toEqual(new Map([[toHex(mapping), objectId]]));
   });
 
+  it("constructs initial buffers at the exact aggregate and cleans up the first excess", () => {
+    const constructorBytes = 64 * 1024 + 8 + 32;
+    const exact = open();
+    const exactBlocker = exact.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - constructorBytes);
+    expect(exact.tryCreateInitialState(() => "exact")).toEqual({
+      available: true,
+      value: "exact",
+    });
+    expect(exactBlocker.remainingBytes).toBe(constructorBytes);
+    exactBlocker.dispose();
+
+    const excess = open();
+    const excessBlocker = excess.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - constructorBytes + 1);
+    expect(() => excess.tryCreateInitialState(() => "unreachable")).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(excessBlocker.remainingBytes).toBe(constructorBytes - 1);
+    expect(excess.indexEntries()).toEqual([]);
+    excessBlocker.dispose();
+  });
+
+  it("admits the lazy blob payload at the exact aggregate and cleans up the first excess", () => {
+    const fixedSessionBytes = 64 * 1024;
+    const emptyIndexJsonBytes = 8;
+    const blobBufferFixedBytes = 32;
+    const blobPayloadBytes = 1024 * 1024;
+    const blobRowBytes = 384;
+    const blobRowJsonCopies = 96 * 2;
+    const coexistenceBytes =
+      fixedSessionBytes +
+      emptyIndexJsonBytes +
+      blobBufferFixedBytes +
+      blobPayloadBytes +
+      blobRowBytes +
+      blobRowJsonCopies;
+
+    const exact = open();
+    const exactBlocker = exact.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - coexistenceBytes);
+    let exactRetainedBytes = 0;
+    expect(
+      exact.tryCreateInitialState((session) => {
+        session.addBlobId({ contentId: new Uint8Array(0), oid: oid(1) });
+        exactRetainedBytes = session.retainedBytes;
+      }),
+    ).toEqual({ available: true, value: undefined });
+    expect(exactRetainedBytes).toBe(coexistenceBytes);
+    expect(exactBlocker.remainingBytes).toBe(coexistenceBytes);
+    exactBlocker.dispose();
+
+    const excess = open();
+    const excessBlocker = excess.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - coexistenceBytes + 1);
+    expect(() =>
+      excess.tryCreateInitialState((session) => {
+        session.addBlobId({ contentId: new Uint8Array(0), oid: oid(1) });
+      }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(excessBlocker.remainingBytes).toBe(coexistenceBytes - 1);
+    expect(excess.indexEntries()).toEqual([]);
+    expect(excess.lookupBlobIds([new Uint8Array(0)])).toEqual(new Map());
+    excessBlocker.dispose();
+  });
+
   it("orders paths by Git UTF-8 bytes rather than JavaScript UTF-16 units", () => {
     const store = open();
     expect(
@@ -736,50 +803,24 @@ describe("tryCreateInitialState", () => {
     expect(reversed.indexEntries()).toEqual([]);
   });
 
-  it("reserves one shared budget at the exact 2,200-byte path boundary", () => {
-    const acceptedInner = new TestDatabase();
-    const acceptedDb = new WidestDatabase(acceptedInner);
-    const accepted = open(acceptedDb);
-    acceptedInner.storage.resetCounters();
-    let acceptedHighWater = 0;
-    const emptyContentId = new Uint8Array(0);
+  it("writes and reopens the former 2,201-byte initial-path excess exactly", () => {
+    const inner = new TestDatabase();
+    const store = open(inner);
+    const first = entry("a".repeat(2_200), 0, oid(1));
+    const formerExcess = { ...entry("b".repeat(2_201), 0, oid(2)), size: 7 };
 
     expect(
-      accepted.tryCreateInitialState((session) => {
-        for (let index = 0; index < 4_095; index++) {
-          session.addBlobId({ contentId: emptyContentId, oid: oid(1) });
-          acceptedHighWater = Math.max(acceptedHighWater, session.retainedBytes);
-        }
-        session.put(entry("a".repeat(2_200), 0, oid(1)));
-        acceptedHighWater = Math.max(acceptedHighWater, session.retainedBytes);
+      store.tryCreateInitialState((session) => {
+        session.put(first);
+        session.put(formerExcess);
       }),
     ).toEqual({ available: true, value: undefined });
-    expect(acceptedHighWater).toBeLessThanOrEqual(4 * 1024 * 1024);
-    expect(acceptedInner.storage.statementCount).toBeLessThan(1_000);
+    expect(store.indexEntries()).toEqual([first, formerExcess]);
 
-    const rejectedInner = new TestDatabase();
-    const rejectedDb = new WidestDatabase(rejectedInner);
-    const rejected = open(rejectedDb);
-    rejectedInner.storage.resetCounters();
-    let rejectedHighWater = 0;
-    expect(() =>
-      rejected.tryCreateInitialState((session) => {
-        for (let index = 0; index < 4_095; index++) {
-          session.addBlobId({ contentId: emptyContentId, oid: oid(1) });
-          rejectedHighWater = Math.max(rejectedHighWater, session.retainedBytes);
-        }
-        session.put(entry("a".repeat(2_201), 0, oid(1)));
-      }),
-    ).toThrow("exceeds 2200 UTF-8 bytes");
-    expect(rejectedHighWater).toBeLessThanOrEqual(4 * 1024 * 1024);
-    expect(rejectedDb.initialStateWrites).toBe(0);
-    expect(rejected.indexEntries()).toEqual([]);
-    expect(
-      rejected.db.scalar<number>(
-        "SELECT COUNT(*) FROM git_blob_ids WHERE repo_id = ?",
-        rejected.repoId,
-      ),
-    ).toBe(0);
+    const reopenedDatabase = new SqliteGitDatabase(inner);
+    const checkout = reopenedDatabase.findCheckout("/repo");
+    if (checkout === null) throw new Error("initial checkout disappeared");
+    expect(reopenedDatabase.openCheckout(checkout).indexEntries()).toEqual([first, formerExcess]);
   });
 
   it("returns unavailable before calling the body for every existing stage", () => {
@@ -830,8 +871,8 @@ describe("tryCreateInitialState", () => {
     expect(db.deleteStatements).toBe(0);
     expect(db.widestBindings).toBeLessThanOrEqual(3);
     expect(db.widestBlob).toBeLessThanOrEqual(1024 * 1024);
-    expect(db.widestStringBytes).toBeLessThanOrEqual(1024 * 1024);
-    expect(maxRetainedBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(db.widestStringBytes).toBeLessThanOrEqual(1_500_000);
+    expect(maxRetainedBytes).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
     expect(
       store.db.scalar<number>(
         "SELECT COUNT(*) FROM git_index WHERE checkout_id = ?",

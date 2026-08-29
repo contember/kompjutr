@@ -1,6 +1,7 @@
 // The repository: everything reachable from the object store and the refs,
 // with no knowledge of Computer, DOFS or HTTP.
 
+import type { MemoryReservation } from "../memory.js";
 import {
   type CommitCacheEntry,
   type CommitGraphLimits,
@@ -8,7 +9,6 @@ import {
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
 } from "../sqlite/commits.js";
-import type { MemoryReservation } from "../sqlite/memory.js";
 import type {
   BlobReadBatch,
   CheckoutStore,

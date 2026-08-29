@@ -127,11 +127,89 @@ class PlatformStorage implements DurableObjectStorageLike {
   }
 }
 
+class TooBigStorage implements DurableObjectStorageLike {
+  readonly sql: SQLStorageLike = {
+    exec<Row extends object>(): SQLCursorLike<Row> {
+      throw Object.assign(new Error("SQLITE_TOOBIG: string or blob too big"), {
+        code: "SQLITE_TOOBIG",
+      });
+    },
+  };
+}
+
+class MessageOnlyTooBigStorage implements DurableObjectStorageLike {
+  readonly sql: SQLStorageLike = {
+    exec<Row extends object>(): SQLCursorLike<Row> {
+      throw new Error("SQLITE_TOOBIG: string or blob too big");
+    },
+  };
+}
+
+class TransactionalTooBigStorage implements DurableObjectStorageLike {
+  readonly #platform = new PlatformStorage();
+  readonly sql: SQLStorageLike = {
+    exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
+      if (query.includes("coded-failure")) {
+        throw Object.assign(new Error("coded value failure"), { code: 18 });
+      }
+      return this.#platform.sql.exec<Row>(query, ...bindings);
+    },
+  };
+
+  transactionSync<T>(closure: () => T): T {
+    return this.#platform.transactionSync(closure);
+  }
+}
+
 function openDatabase(): Database {
   return new Database(new PlatformStorage());
 }
 
 describe("Database", () => {
+  it("normalizes engine-reported SQLite value limits without a projected ceiling", () => {
+    const db = new Database(new TooBigStorage());
+    for (const operation of [
+      () => db.run("INSERT INTO values (?)", "value"),
+      () => db.all("SELECT ?", "value"),
+      () => [...db.iterate("SELECT ?", "value")],
+    ]) {
+      expect(operation).toThrowError(
+        expect.objectContaining({
+          name: "GitError",
+          code: "E2BIG",
+          message: "SQLite rejected a value as too large",
+        }),
+      );
+    }
+  });
+
+  it("does not infer SQLITE_TOOBIG from message text", () => {
+    const db = new Database(new MessageOnlyTooBigStorage());
+    let thrown: unknown;
+    try {
+      db.run("SELECT 1");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toEqual(new Error("SQLITE_TOOBIG: string or blob too big"));
+    expect(typeof thrown === "object" && thrown !== null ? Reflect.get(thrown, "code") : null).toBe(
+      undefined,
+    );
+  });
+
+  it("normalizes a coded value failure and rolls back its transaction", () => {
+    const db = new Database(new TransactionalTooBigStorage());
+    db.run("CREATE TABLE items (value TEXT PRIMARY KEY)");
+
+    expect(() =>
+      db.transactionSync(() => {
+        db.run("INSERT INTO items VALUES ('before')");
+        db.run("INSERT INTO items VALUES ('coded-failure')");
+      }),
+    ).toThrowError(expect.objectContaining({ name: "GitError", code: "E2BIG" }));
+    expect(db.all("SELECT value FROM items")).toEqual([]);
+  });
+
   it("commits nested savepoints", () => {
     const storage = new PlatformStorage();
     const db = new Database(storage);

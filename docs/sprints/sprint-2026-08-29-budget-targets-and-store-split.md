@@ -527,6 +527,21 @@ shape exceptions, store import topology and proportional per-WU review.
   the report-only Next.js clone miss at 1,586 SQL. Typecheck and Biome passed,
   and the routine smoke gate passed 150/150 in 11.81 s under a two-vCPU lease.
   Agent-docs lint reports only the pre-existing `docs/AGENTS.md` root file.
+- 2026-08-29 — WU6a established the import-free `src/memory.ts` coordinator
+  leaf, exact remaining-capacity API, authoritative SQLite `TOOBIG`
+  normalization, and pkt-line constants seam. Initial worktree/index writers
+  now charge every coexisting path, SQL-result, JSON, payload, and constructor
+  allocation before it is created; 1.5 MB JSON and 1 MiB payload values are
+  non-refusing batch targets. A 96 MiB + 1 streamed redirect commits exactly,
+  and late source/SQL failures still roll back. Three source review rounds
+  removed allocation-before-admission gaps and one false memory charge; Ohm
+  approved the final source diff. The new `bench:memory` runner also fixes the
+  prior `systemd-run` CPU-affinity escape, reports the `<100 MiB` same-process
+  transient target separately from raw cgroup/page-cache evidence, and uses a
+  fixed 512 MiB cgroup safety cap. Its independent review approved both WU6a
+  rows: initial write used 23,666,688 transient bytes and redirect used
+  3,661,824. Typecheck and Biome passed, and the routine smoke gate passed
+  153/153 in 12.19 s under a two-vCPU lease.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

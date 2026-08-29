@@ -1,4 +1,4 @@
-import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../../sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../../memory.js";
 import { GitError } from "../errors.js";
 
 export const MAX_TRANSPORT_MEMORY_BYTES = MAX_OPERATION_MEMORY_BYTES;

@@ -259,9 +259,9 @@ describe("clone initial-state fast path", () => {
         if (initial === undefined) throw new Error("workspace did not bind its initial writer");
         const observed: InitialWorktreeWriter = {
           supportsDatabase: (database) => initial.supportsDatabase?.(database) === true,
-          tryRun(root, body) {
+          tryRun(root, body, afterClose, reservation) {
             pathAttempts++;
-            return initial.tryRun(root, body);
+            return initial.tryRun(root, body, afterClose, reservation);
           },
         };
         return createGit()({ ...binding, initialWorktree: observed });
@@ -291,9 +291,9 @@ describe("clone initial-state fast path", () => {
         if (initial === undefined) throw new Error("workspace did not bind its initial writer");
         const observed: InitialWorktreeWriter = {
           supportsDatabase: (database) => initial.supportsDatabase?.(database) === true,
-          tryRun(root, body) {
+          tryRun(root, body, afterClose, reservation) {
             unavailableAttempts++;
-            return initial.tryRun(root, body);
+            return initial.tryRun(root, body, afterClose, reservation);
           },
         };
         return createGit()({ ...binding, initialWorktree: observed });

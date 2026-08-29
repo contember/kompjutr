@@ -1,6 +1,6 @@
 // Pure content resolution for a bounded three-tree integration plan.
 
-import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../../sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../../memory.js";
 import { MAX_BLOB_BATCH_BYTES, PACK_BLOB_CALLER_HEADROOM_BYTES } from "../../sqlite/store.js";
 import {
   DEFAULT_TEXT_MERGE_LIMITS,

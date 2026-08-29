@@ -1,6 +1,6 @@
 // Restart-safe execution of one authenticated linear rebase sequence.
 
-import { MAX_OPERATION_MEMORY_BYTES } from "../../sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../../memory.js";
 import type { IndexEntry } from "../../sqlite/store.js";
 import { utf8 } from "../bytes.js";
 import type { GitContext, GitIdentity } from "../context.js";

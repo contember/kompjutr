@@ -4,7 +4,7 @@ import {
   MAX_OPERATION_MEMORY_BYTES,
   MemoryCoordinator,
   type MemoryReservation,
-} from "../src/sqlite/memory.js";
+} from "../src/memory.js";
 
 function errorCode(error: unknown): string | undefined {
   if (typeof error !== "object" || error === null) return undefined;
@@ -20,9 +20,13 @@ describe("MemoryCoordinator", () => {
   it("admits exactly 64 MiB and rejects the next byte without mutation", () => {
     const coordinator = new MemoryCoordinator();
     const reservation = coordinator.reserve();
+    expect(coordinator.remainingBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(reservation.remainingBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
     reservation.set("pool", MAX_OPERATION_MEMORY_BYTES);
     expect(reservation.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
     expect(coordinator.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(coordinator.remainingBytes).toBe(0);
+    expect(reservation.remainingBytes).toBe(0);
 
     let thrown: unknown;
     try {

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
 import { createGit, type Git, type GitLsRemoteOptions, type LsRemoteResult } from "../src/index.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, type RequestRecord, startGitServer } from "./helpers/http-backend.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";

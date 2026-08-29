@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { concat, utf8 } from "../src/core/bytes.js";
 import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
-import { FLUSH, pkt, pktLines } from "../src/core/protocol/pktline.js";
+import {
+  FLUSH,
+  MAX_PKT_FRAME_BYTES,
+  MAX_PKT_PAYLOAD_BYTES,
+  pkt,
+  pktLines,
+} from "../src/core/protocol/pktline.js";
 import { receivePack } from "../src/core/protocol/receive-pack.js";
 import {
   discover,
@@ -12,12 +18,11 @@ import {
 } from "../src/core/protocol/remote.js";
 import {
   ByteReader,
-  MAX_PKT_FRAME_BYTES,
   MAX_PROTOCOL_SOURCE_CHUNK_BYTES,
   pktText,
 } from "../src/core/protocol/stream.js";
 import type { GitHttpClient, GitHttpResponse } from "../src/core/protocol/transport.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 
@@ -106,7 +111,8 @@ describe("pkt-lines", () => {
   });
 
   it("accepts the maximum frame and rejects the next byte", async () => {
-    const payload = new Uint8Array(MAX_PKT_FRAME_BYTES - 4);
+    expect(MAX_PKT_PAYLOAD_BYTES).toBe(MAX_PKT_FRAME_BYTES - 4);
+    const payload = new Uint8Array(MAX_PKT_PAYLOAD_BYTES);
     const accepted = new ByteReader(once(pkt(payload)));
     expect((await accepted.readPkt())?.payload).toHaveLength(payload.length);
 

@@ -7,6 +7,12 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { FIXTURE_NAMES, FIXTURES } from "./fixtures.js";
+import {
+  alignCgroupBytes,
+  memoryScopeCommand,
+  requireParentLeaseCpus,
+  runMemoryBenchmark,
+} from "./memory-run.js";
 import { asVariant, type Backend, isShape, SCENARIOS, type Variant } from "./scenarios.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -41,6 +47,8 @@ interface Cell {
 }
 
 interface Options {
+  memory: boolean;
+  runtimeCheck: boolean;
   smoke: boolean;
   /** Working memory allowed above the runner's own footprint, in MB. 0 disables the cap. */
   budgetMb: number;
@@ -70,6 +78,8 @@ function parseOptions(argv: string[]): Options {
   const counts = listOption(argv, "counts");
   const variants = listOption(argv, "variants") ?? listOption(argv, "fixtures");
   return {
+    memory: argv.includes("--memory"),
+    runtimeCheck: argv.includes("--runtime-check"),
     smoke: argv.includes("--smoke"),
     budgetMb: budgetArg === undefined ? 0 : Number(budgetArg.split("=")[1]),
     counts: counts === null ? null : counts.map(Number),
@@ -108,18 +118,13 @@ function command(
     ...args,
   ];
   if (capBytes === null) return { file: process.execPath, argv: node };
+  const parentCpus = requireParentLeaseCpus(null);
+  const scoped = memoryScopeCommand(args, parentCpus, alignCgroupBytes(capBytes));
+  const file = scoped[0];
+  if (file === undefined) throw new Error("memory scope command is empty");
   return {
-    file: "systemd-run",
-    argv: [
-      "--user",
-      "--scope",
-      "-p",
-      `MemoryMax=${Math.round(capBytes / 1024 / 1024)}M`,
-      "--quiet",
-      "--",
-      process.execPath,
-      ...node,
-    ],
+    file,
+    argv: scoped.slice(1),
   };
 }
 
@@ -279,94 +284,109 @@ function table(outcomes: Outcome[]): string {
 }
 
 const options = parseOptions(process.argv.slice(2));
-const backends: Backend[] = options.backends ?? ["sqlite"];
-const scenarios =
-  options.scenarios ??
-  (options.smoke
-    ? ["add-commit", "status-clean"]
-    : ["add-commit", "status-clean", "status-dirty", "checkout", "log"]);
-
-/** Synthetic cells vary the tree shape; macro cells vary the repository. */
-function variantsFor(kind: "synthetic" | "macro"): Variant[] {
-  const chosen = options.variants?.filter((variant) =>
-    kind === "synthetic" ? isShape(variant) : !isShape(variant),
-  );
-  if (chosen !== undefined && chosen.length > 0) return chosen;
-  if (kind === "synthetic") return ["flat", "deep"];
-  return options.smoke ? ["express"] : ["prettier"];
+if (options.runtimeCheck && !options.memory) {
+  throw new Error("--runtime-check is only valid with --memory");
 }
+if (options.memory) {
+  runMemoryBenchmark({
+    runtimeCheck: options.runtimeCheck,
+    originalArgs: process.argv.slice(2),
+    scenarios: options.scenarios,
+  });
+} else {
+  const backends: Backend[] = options.backends ?? ["sqlite"];
+  const scenarios =
+    options.scenarios ??
+    (options.smoke
+      ? ["add-commit", "status-clean"]
+      : ["add-commit", "status-clean", "status-dirty", "checkout", "log"]);
 
-/** For a macro cell `count` caps the tracked files; 0 means the whole tree. */
-function countsFor(kind: "synthetic" | "macro"): number[] {
-  if (options.counts !== null) return options.counts;
-  if (kind === "macro") return [0];
-  return options.smoke ? [50, 200] : [100, 250, 500, 1000, 2500, 5000, 10000];
-}
+  /** Synthetic cells vary the tree shape; macro cells vary the repository. */
+  function variantsFor(kind: "synthetic" | "macro"): Variant[] {
+    const chosen = options.variants?.filter((variant) =>
+      kind === "synthetic" ? isShape(variant) : !isShape(variant),
+    );
+    if (chosen !== undefined && chosen.length > 0) return chosen;
+    if (kind === "synthetic") return ["flat", "deep"];
+    return options.smoke ? ["express"] : ["prettier"];
+  }
 
-const outcomes: Outcome[] = [];
-for (const scenario of scenarios) {
-  const kind = SCENARIOS.find((candidate) => candidate.name === scenario)?.kind ?? "synthetic";
-  for (const variant of variantsFor(kind)) {
-    for (const count of countsFor(kind)) {
-      for (const backend of backends) {
-        // The cap needs the runner's own footprint, which only a real run knows.
-        // The uncapped pass supplies it; the capped pass then means something.
-        const probe = repeated(scenario, backend, count, variant, options.repeat);
-        if (options.minHeap && probe.complete) {
-          const found = minimumHeapMb(scenario, backend, count, variant);
-          for (const outcome of probe.outcomes) {
-            if (found !== null && outcome.status === "ok") outcome.minHeapMb = found;
+  /** For a macro cell `count` caps the tracked files; 0 means the whole tree. */
+  function countsFor(kind: "synthetic" | "macro"): number[] {
+    if (options.counts !== null) return options.counts;
+    if (kind === "macro") return [0];
+    return options.smoke ? [50, 200] : [100, 250, 500, 1000, 2500, 5000, 10000];
+  }
+
+  const outcomes: Outcome[] = [];
+  for (const scenario of scenarios) {
+    const registered = SCENARIOS.find((candidate) => candidate.name === scenario);
+    if (registered?.kind === "memory") {
+      throw new Error(`${scenario} must run through npm run bench:memory`);
+    }
+    const kind = registered?.kind ?? "synthetic";
+    for (const variant of variantsFor(kind)) {
+      for (const count of countsFor(kind)) {
+        for (const backend of backends) {
+          // The cap needs the runner's own footprint, which only a real run knows.
+          // The uncapped pass supplies it; the capped pass then means something.
+          const probe = repeated(scenario, backend, count, variant, options.repeat);
+          if (options.minHeap && probe.complete) {
+            const found = minimumHeapMb(scenario, backend, count, variant);
+            for (const outcome of probe.outcomes) {
+              if (found !== null && outcome.status === "ok") outcome.minHeapMb = found;
+            }
           }
-        }
-        outcomes.push(...probe.outcomes);
-        if (options.budgetMb > 0 && probe.complete) {
-          const first = probe.outcomes[0];
-          const floor = first !== undefined && first.status === "ok" ? first.baselineRssBytes : 0;
-          const capped = once(
-            scenario,
-            backend,
-            count,
-            variant,
-            floor + options.budgetMb * 1024 * 1024,
+          outcomes.push(...probe.outcomes);
+          if (options.budgetMb > 0 && probe.complete) {
+            const first = probe.outcomes[0];
+            const floor = first !== undefined && first.status === "ok" ? first.baselineRssBytes : 0;
+            const capped = once(
+              scenario,
+              backend,
+              count,
+              variant,
+              floor + options.budgetMb * 1024 * 1024,
+            );
+            if (!capped.complete)
+              outcomes.push(...capped.outcomes.filter((row) => row.status !== "ok"));
+          }
+          process.stderr.write(
+            `${scenario} ${variant} ${count} ${backend}: ${probe.complete ? "ok" : "failed"}\n`,
           );
-          if (!capped.complete)
-            outcomes.push(...capped.outcomes.filter((row) => row.status !== "ok"));
         }
-        process.stderr.write(
-          `${scenario} ${variant} ${count} ${backend}: ${probe.complete ? "ok" : "failed"}\n`,
-        );
       }
     }
   }
-}
 
-mkdirSync(RESULTS, { recursive: true });
-const stamp = process.env.BENCH_STAMP ?? "latest";
-writeFileSync(join(RESULTS, `${stamp}.json`), `${JSON.stringify(outcomes, null, 2)}\n`);
-const macroVariants = variantsFor("macro").filter((variant) => !isShape(variant));
-const header = [
-  `# kompjutr benchmark — ${options.smoke ? "smoke" : "full"} sweep`,
-  "",
-  'Synthetic files are 4096 bytes each. "peak RSS added" is the kernel\'s VmHWM',
-  "after the measured operation minus VmHWM after setup, so the fixture's cost is",
-  "excluded.",
-  "",
-  ...macroVariants.map((variant) => {
-    if (isShape(variant)) return "";
-    const fixture = FIXTURES[variant];
-    return `Fixture \`${variant}\`: ${fixture.url} at \`${fixture.ref}\`, ${fixture.files} tracked files upstream.`;
-  }),
-  "",
-  options.budgetMb > 0
-    ? `Ceiling runs used a cgroup MemoryMax of the runner's own footprint plus ${options.budgetMb} MB of`
-    : "No memory cap was applied; pass --budget=<MB> for ceiling runs.",
-  options.budgetMb > 0 ? "working memory. Only failures are listed for the capped pass." : "",
-  "",
-  "**This is node:sqlite, not Durable Object SQL.** The curve and the statement",
-  "counts transfer; an absolute Durable Object ceiling does not. Nothing here",
-  "claims one.",
-  "",
-];
-writeFileSync(join(RESULTS, `${stamp}.md`), `${header.join("\n")}\n${table(outcomes)}\n`);
-process.stderr.write(`\nwrote ${join(RESULTS, `${stamp}.md`)}\n`);
-process.stderr.write(`fixtures available: ${FIXTURE_NAMES.join(", ")}\n`);
+  mkdirSync(RESULTS, { recursive: true });
+  const stamp = process.env.BENCH_STAMP ?? "latest";
+  writeFileSync(join(RESULTS, `${stamp}.json`), `${JSON.stringify(outcomes, null, 2)}\n`);
+  const macroVariants = variantsFor("macro").filter((variant) => !isShape(variant));
+  const header = [
+    `# kompjutr benchmark — ${options.smoke ? "smoke" : "full"} sweep`,
+    "",
+    'Synthetic files are 4096 bytes each. "peak RSS added" is the kernel\'s VmHWM',
+    "after the measured operation minus VmHWM after setup, so the fixture's cost is",
+    "excluded.",
+    "",
+    ...macroVariants.map((variant) => {
+      if (isShape(variant)) return "";
+      const fixture = FIXTURES[variant];
+      return `Fixture \`${variant}\`: ${fixture.url} at \`${fixture.ref}\`, ${fixture.files} tracked files upstream.`;
+    }),
+    "",
+    options.budgetMb > 0
+      ? `Ceiling runs used a cgroup MemoryMax of the runner's own footprint plus ${options.budgetMb} MB of`
+      : "No memory cap was applied; pass --budget=<MB> for ceiling runs.",
+    options.budgetMb > 0 ? "working memory. Only failures are listed for the capped pass." : "",
+    "",
+    "**This is node:sqlite, not Durable Object SQL.** The curve and the statement",
+    "counts transfer; an absolute Durable Object ceiling does not. Nothing here",
+    "claims one.",
+    "",
+  ];
+  writeFileSync(join(RESULTS, `${stamp}.md`), `${header.join("\n")}\n${table(outcomes)}\n`);
+  process.stderr.write(`\nwrote ${join(RESULTS, `${stamp}.md`)}\n`);
+  process.stderr.write(`fixtures available: ${FIXTURE_NAMES.join(", ")}\n`);
+}

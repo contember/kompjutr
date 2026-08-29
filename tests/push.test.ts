@@ -4,7 +4,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
 import { openRepository } from "../src/core/context.js";
 import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";

@@ -1,5 +1,3 @@
-import { GitError } from "../core/errors.js";
-
 export const MAX_OPERATION_MEMORY_BYTES = 64 * 1024 * 1024;
 
 export type MemoryCategory =
@@ -18,12 +16,23 @@ type Resize = (previous: number, next: number) => void;
 type Release = (bytes: number) => void;
 const RESERVATION_TOKEN = Symbol("MemoryReservation");
 
-function invalidBytes(): GitError {
-  return new GitError("EINVAL", "operation memory bytes must be a safe nonnegative integer");
+class MemoryError extends Error {
+  override readonly name = "GitError";
+
+  constructor(
+    readonly code: "EINVAL" | "E2BIG",
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
-function memoryLimit(): GitError {
-  return new GitError(
+function invalidBytes(): MemoryError {
+  return new MemoryError("EINVAL", "operation memory bytes must be a safe nonnegative integer");
+}
+
+function memoryLimit(): MemoryError {
+  return new MemoryError(
     "E2BIG",
     `operation memory exceeds the ${MAX_OPERATION_MEMORY_BYTES}-byte limit`,
   );
@@ -37,6 +46,11 @@ export class MemoryCoordinator {
 
   get totalBytes(): number {
     return this.#totalBytes;
+  }
+
+  /** Exact unused capacity shared by every active reservation. */
+  get remainingBytes(): number {
+    return MAX_OPERATION_MEMORY_BYTES - this.#totalBytes;
   }
 
   get highWaterBytes(): number {
@@ -129,6 +143,11 @@ export class MemoryReservation {
 
   get highWaterBytes(): number {
     return this.#highWaterBytes;
+  }
+
+  /** Exact capacity still available from the shared coordinator. */
+  get remainingBytes(): number {
+    return this.#coordinator.remainingBytes;
   }
 
   get disposed(): boolean {
@@ -264,7 +283,7 @@ export class MemoryReservation {
       case "other":
         return this.#other;
       default:
-        throw new GitError("EINVAL", "operation memory category is invalid");
+        throw new MemoryError("EINVAL", "operation memory category is invalid");
     }
   }
 

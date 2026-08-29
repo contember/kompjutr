@@ -13,7 +13,7 @@ import {
   MAX_TRANSPORT_MEMORY_BYTES,
   TransportOperationBudget,
 } from "../src/core/ops/transport-budget.js";
-import { MemoryCoordinator } from "../src/sqlite/memory.js";
+import { MemoryCoordinator } from "../src/memory.js";
 import { requireRefName } from "../src/sqlite/ref-validation.js";
 
 const OID = "1".repeat(40);

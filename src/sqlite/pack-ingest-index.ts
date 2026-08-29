@@ -2,6 +2,7 @@ import { isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
 import type { ObjectType } from "../core/objects.js";
 import { type ChunkedBytes, PACK_CHUNK_BYTES } from "../core/pack/chunks.js";
+import type { MemoryReservation } from "../memory.js";
 import {
   type CommitCacheEntry,
   type CommitCacheSource,
@@ -11,7 +12,6 @@ import {
   prepareCommitCache,
 } from "./commits.js";
 import type { SqlDatabase } from "./db.js";
-import type { MemoryReservation } from "./memory.js";
 import {
   createTreeIndexSink,
   indexTreeSource,

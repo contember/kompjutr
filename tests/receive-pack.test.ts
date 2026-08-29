@@ -21,7 +21,7 @@ import {
   type GitHttpClient,
   type GitHttpResponse,
 } from "../src/core/protocol/transport.js";
-import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/sqlite/memory.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
 
