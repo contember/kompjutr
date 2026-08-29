@@ -8,11 +8,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem, ScanEntry } from "../../src/fs/types.js";
+import { createGit } from "../../src/git/client.js";
+import { createGitCommand } from "../../src/git/shell.js";
+import { Workspace } from "../../src/runtime/workspace.js";
 import { encode } from "../../src/shell/exec/bytes.js";
 import { type Command, result } from "../../src/shell/exec/context.js";
 import { sqlGlobFor } from "../../src/shell/exec/glob.js";
 import { createShell, type Shell } from "../../src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
+import { SqliteTestStorage } from "../helpers/storage.js";
 
 const ENCODER = new TextEncoder();
 
@@ -417,3 +421,136 @@ describe("retained-memory bounds", () => {
     expect(new TextDecoder().decode(fs.readFile("/repo/target"))).toBe("old");
   });
 });
+
+describe("git destination preflight", () => {
+  it("rolls a commit back before direct terminal output overflows", async () => {
+    const subject = await stagedGit();
+    const bounded = gitShell(subject.workspace, {
+      maxOutputBytes: 1,
+      maxOperations: 100,
+      readBudget: 100,
+      maxRetainedBytes: 1_000,
+    });
+
+    const run = bounded.run("git commit -m overflow");
+
+    expect(run).toMatchObject({ stdout: "", exitCode: 2 });
+    await expectUnchanged(subject);
+  });
+
+  it("rolls a commit back before an upstream pipeline output overflows", async () => {
+    const subject = await stagedGit();
+    const bounded = gitShell(subject.workspace, {
+      maxOutputBytes: 1_000,
+      maxOperations: 100,
+      readBudget: 100,
+      maxRetainedBytes: 64,
+    });
+
+    const run = bounded.run("git commit -m overflow | head -1");
+
+    expect(run).toMatchObject({ stdout: "", exitCode: 2 });
+    await expectUnchanged(subject);
+  });
+
+  it("rolls a commit and redirect back before redirected output overflows", async () => {
+    const subject = await stagedGit();
+    subject.workspace.filesystem.writeFile("/repo/result", ENCODER.encode("old"));
+    const expectedStatus = await subject.workspace.git.status({ dir: "/repo" });
+    const bounded = gitShell(subject.workspace, {
+      maxOutputBytes: 1_000,
+      maxOperations: 100,
+      readBudget: 100,
+      maxRetainedBytes: 64,
+    });
+
+    const run = bounded.run("git commit -m overflow > result");
+
+    expect(run).toMatchObject({ stdout: "", exitCode: 2 });
+    expect(new TextDecoder().decode(subject.workspace.filesystem.readFile("/repo/result"))).toBe(
+      "old",
+    );
+    expect(await subject.workspace.git.log({ dir: "/repo" })).toEqual(subject.log);
+    expect(await subject.workspace.git.status({ dir: "/repo" })).toEqual(expectedStatus);
+  });
+
+  it("publishes no partial Git refusal when direct stderr exceeds the sink", async () => {
+    const subject = await stagedGit();
+    const bounded = gitShell(subject.workspace, {
+      maxOutputBytes: 12,
+      maxOperations: 100,
+      readBudget: 100,
+      maxRetainedBytes: 1_000,
+    });
+
+    const run = bounded.run("git push");
+
+    expect(run).toMatchObject({ stdout: "", exitCode: 2, truncated: true });
+    expect(run.stderr).not.toContain("No configured push destination");
+    await expectUnchanged(subject);
+  });
+
+  it("does not charge dropped Git stderr to a zero-byte sink", async () => {
+    const subject = await stagedGit();
+    const bounded = gitShell(subject.workspace, {
+      maxOutputBytes: 0,
+      maxOperations: 100,
+      readBudget: 100,
+      maxRetainedBytes: 1_000,
+    });
+
+    const run = bounded.run("git push 2>/dev/null");
+
+    expect(run).toMatchObject({
+      stdout: "",
+      stderr: "",
+      exitCode: 128,
+      truncated: false,
+    });
+    await expectUnchanged(subject);
+  });
+});
+
+interface StagedGit {
+  readonly workspace: Workspace;
+  readonly log: Awaited<ReturnType<Workspace["git"]["log"]>>;
+  readonly status: Awaited<ReturnType<Workspace["git"]["status"]>>;
+}
+
+async function stagedGit(): Promise<StagedGit> {
+  const workspace = new Workspace({
+    storage: new SqliteTestStorage(),
+    git: createGit(),
+    defaultGitIdentity: { name: "Agent", email: "agent@example.com" },
+    now: () => 1_577_836_800_000,
+  });
+  workspace.filesystem.mkdir("/repo");
+  await workspace.git.init({ dir: "/repo" });
+  workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("base\n"));
+  await workspace.git.add({ dir: "/repo", paths: ["file.txt"] });
+  await workspace.git.commit({ dir: "/repo", message: "base" });
+  workspace.filesystem.writeFile("/repo/file.txt", ENCODER.encode("changed\n"));
+  await workspace.git.add({ dir: "/repo", paths: ["file.txt"] });
+  return {
+    workspace,
+    log: await workspace.git.log({ dir: "/repo" }),
+    status: await workspace.git.status({ dir: "/repo" }),
+  };
+}
+
+function gitShell(
+  workspace: Workspace,
+  limits: Parameters<typeof createShell>[0]["limits"],
+): Shell {
+  return createShell({
+    fs: workspace.filesystem,
+    cwd: "/repo",
+    commands: new Map([["git", createGitCommand(workspace.git)]]),
+    limits,
+  });
+}
+
+async function expectUnchanged(subject: StagedGit): Promise<void> {
+  expect(await subject.workspace.git.log({ dir: "/repo" })).toEqual(subject.log);
+  expect(await subject.workspace.git.status({ dir: "/repo" })).toEqual(subject.status);
+}

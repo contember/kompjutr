@@ -275,6 +275,10 @@ export interface CommandContext {
   readonly stdin: ByteStream | null;
   /** From a lifted `head -N`. Sizes the first discovery page. */
   readonly limitHint: number | null;
+  /** Planned stream destinations and the bytes still available to this stage. */
+  readonly output: CommandOutput;
+  /** Write exact diagnostic bytes without a command prefix or newline. */
+  diagnostic(bytes: Uint8Array): void;
   /** Write a diagnostic. Already honours `2>/dev/null` and `2>&1`. */
   warn(message: string): void;
   /** Change the session's working directory. Only `cd` uses it. */
@@ -291,6 +295,14 @@ export interface CommandContext {
    * Returns null when no such command is registered.
    */
   invoke(name: string, argv: readonly string[]): CommandResult | null;
+}
+
+export interface CommandOutput {
+  readonly destination: "terminal" | "pipeline" | "redirect";
+  readonly maxStdoutBytes: number;
+  readonly maxStderrBytes: number;
+  readonly maxCombinedOutputBytes: number;
+  readonly discardStderr: boolean;
 }
 
 export interface CommandResult {

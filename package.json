@@ -22,6 +22,10 @@
       "types": "./dist/git/index.d.ts",
       "import": "./dist/git/index.js"
     },
+    "./git/shell": {
+      "types": "./dist/git/shell.d.ts",
+      "import": "./dist/git/shell.js"
+    },
     "./shell": {
       "types": "./dist/shell/index.d.ts",
       "import": "./dist/shell/index.js"

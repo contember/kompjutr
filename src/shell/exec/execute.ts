@@ -25,6 +25,8 @@ import { compileGlob, sqlGlobFor } from "./glob.js";
 const ARGUMENT_COUNT_MAX = 10_000;
 const ARGUMENT_BYTES_MAX = 1_000_000;
 const PATH_PAGE_MAX = 1_000;
+// Filesystem.writeFileStream enforces this atomically before publishing a redirect.
+const ATOMIC_REDIRECT_BYTES_MAX = 96 * 1024 * 1024;
 const ENCODER = new TextEncoder();
 
 export interface ExecOptions {
@@ -125,17 +127,39 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
       const argv = expanded.argv;
 
       if (planned.stdin !== null) {
+        const priorInput = stream;
+        stream = null;
+        let priorClosed = false;
+        const closePrior = (): void => {
+          if (priorClosed) return;
+          priorClosed = true;
+          priorInput?.return();
+        };
         try {
           const path = resolve(env.cwd, single(planned.stdin, env.fs, env.cwd));
+          closePrior();
           stream = readWholeFile(env.fs, path);
         } catch (error) {
-          expanded.release();
+          try {
+            closePrior();
+          } finally {
+            expanded.release();
+          }
           throw error;
         }
       }
 
       const mergedErrors: HeldChunk[] = [];
-      const context = commandContext(planned, argv, stream, pipeline.limitHint, env, mergedErrors);
+      const stageInput = stream;
+      const context = commandContext(
+        planned,
+        index === pipeline.commands.length - 1,
+        argv,
+        stageInput,
+        pipeline.limitHint,
+        env,
+        mergedErrors,
+      );
       let produced: CommandResult;
       try {
         produced = command(context);
@@ -143,7 +167,13 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
         expanded.release();
         throw error;
       }
-      const output = stageOutput(produced.stdout, mergedErrors, expanded.release);
+      const output = stageOutput(produced.stdout, mergedErrors, () => {
+        try {
+          stageInput?.return();
+        } finally {
+          expanded.release();
+        }
+      });
       if (planned.stdout === null) {
         stream = output;
       } else {
@@ -206,28 +236,35 @@ function* protectUpstream(stream: ByteStream): ByteStream {
 
 function commandContext(
   planned: PlannedCommand,
+  lastStage: boolean,
   argv: readonly string[],
   stdin: ByteStream | null,
   limitHint: number | null,
   env: PipelineEnvironment,
   mergedErrors: HeldChunk[],
 ): CommandContext {
+  const output = commandOutput(planned, lastStage, env);
+  const diagnostic = (bytes: Uint8Array): void => {
+    if (planned.stderr === "drop" || bytes.length === 0) return;
+    if (planned.stderr === "merge") {
+      mergedErrors.push({
+        bytes,
+        release: env.fs.retained.retain(bytes.length, "merged stderr"),
+      });
+    } else env.errors.writeBytes(bytes);
+  };
   const context: CommandContext = {
     fs: env.fs,
     cwd: env.cwd,
     argv,
     stdin,
     limitHint,
+    output,
+    diagnostic,
     warn: (message: string) => {
       if (planned.stderr === "drop") return;
       const bytes = line(`${planned.name}: ${message}`);
-      // `2>&1` joins this stage before any downstream pipe consumes it.
-      if (planned.stderr === "merge") {
-        mergedErrors.push({
-          bytes,
-          release: env.fs.retained.retain(bytes.length, "merged stderr"),
-        });
-      } else env.errors.writeBytes(bytes);
+      diagnostic(bytes);
     },
     chdir: env.chdir,
     invoke: (name: string, subArgv: readonly string[]): CommandResult | null => {
@@ -241,44 +278,128 @@ function commandContext(
   return context;
 }
 
+function commandOutput(
+  planned: PlannedCommand,
+  lastStage: boolean,
+  env: PipelineEnvironment,
+): CommandContext["output"] {
+  const destination = planned.stdout !== null ? "redirect" : lastStage ? "terminal" : "pipeline";
+  const destinationBytes =
+    destination === "terminal"
+      ? env.out.remaining
+      : destination === "redirect"
+        ? ATOMIC_REDIRECT_BYTES_MAX
+        : Number.MAX_SAFE_INTEGER;
+  const maxStdoutBytes = Math.min(destinationBytes, env.fs.retained.available);
+  const discardStderr = planned.stderr === "drop";
+  const maxStderrBytes = discardStderr
+    ? 0
+    : planned.stderr === "merge"
+      ? maxStdoutBytes
+      : env.errors.remaining;
+  const maxCombinedOutputBytes =
+    discardStderr || planned.stderr === "merge"
+      ? maxStdoutBytes
+      : safeSum(maxStdoutBytes, maxStderrBytes);
+  return {
+    destination,
+    maxStdoutBytes,
+    maxStderrBytes,
+    maxCombinedOutputBytes,
+    discardStderr,
+  };
+}
+
+function safeSum(left: number, right: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, left + right);
+}
+
 interface HeldChunk {
   readonly bytes: Uint8Array;
   release(): void;
 }
 
 /** Interleave diagnostics emitted while pulling a command with its stdout. */
-function* stageOutput(
+function stageOutput(
   stdout: ByteStream,
   mergedErrors: HeldChunk[],
   releaseStage: () => void,
 ): ByteStream {
-  let warningIndex = 0;
-  let done = false;
-  try {
-    for (;;) {
-      const next = stdout.next();
-      while (warningIndex < mergedErrors.length) {
-        const warning = mergedErrors[warningIndex];
-        warningIndex++;
-        if (warning === undefined) continue;
-        try {
-          yield warning.bytes;
-        } finally {
-          warning.release();
-        }
+  return new StageOutput(stdout, mergedErrors, releaseStage);
+}
+
+/** A generator whose unstarted `return()` still closes its source and reservations. */
+class StageOutput implements ByteStream {
+  #warningIndex = 0;
+  #pending: IteratorResult<Uint8Array, void> | null = null;
+  #releaseYielded: (() => void) | null = null;
+  #closed = false;
+
+  constructor(
+    private readonly stdout: ByteStream,
+    private readonly mergedErrors: HeldChunk[],
+    private readonly releaseStage: () => void,
+  ) {}
+
+  [Symbol.iterator](): ByteStream {
+    return this;
+  }
+
+  [Symbol.dispose](): void {
+    this.#finish(true);
+  }
+
+  next(..._args: [] | [undefined]): IteratorResult<Uint8Array, void> {
+    this.#releaseLastYield();
+    if (this.#closed) return { done: true, value: undefined };
+    try {
+      if (this.#pending === null) this.#pending = this.stdout.next();
+      const warning = this.mergedErrors[this.#warningIndex];
+      if (warning !== undefined) {
+        this.#warningIndex++;
+        this.#releaseYielded = warning.release;
+        return { done: false, value: warning.bytes };
       }
-      if (next.done) {
-        done = true;
-        return;
+      const pending = this.#pending;
+      this.#pending = null;
+      if (pending.done) {
+        this.#finish(false);
+        return { done: true, value: undefined };
       }
-      yield next.value;
+      return pending;
+    } catch (error) {
+      this.#finish(true);
+      throw error;
     }
-  } finally {
-    for (; warningIndex < mergedErrors.length; warningIndex++) {
-      mergedErrors[warningIndex]?.release();
+  }
+
+  return(_value: undefined): IteratorResult<Uint8Array, void> {
+    this.#finish(true);
+    return { done: true, value: undefined };
+  }
+
+  throw(error: unknown): IteratorResult<Uint8Array, void> {
+    this.#finish(true);
+    throw error;
+  }
+
+  #releaseLastYield(): void {
+    this.#releaseYielded?.();
+    this.#releaseYielded = null;
+  }
+
+  #finish(closeSource: boolean): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#releaseLastYield();
+    try {
+      if (closeSource) this.stdout.return();
+    } finally {
+      for (; this.#warningIndex < this.mergedErrors.length; this.#warningIndex++) {
+        this.mergedErrors[this.#warningIndex]?.release();
+      }
+      this.releaseStage();
     }
-    if (!done) stdout.return();
-    releaseStage();
   }
 }
 
@@ -446,6 +567,10 @@ class Sink {
   truncated = false;
 
   constructor(private readonly max: number) {}
+
+  get remaining(): number {
+    return this.max - this.#size;
+  }
 
   writeBytes(chunk: Uint8Array): void {
     if (this.truncated) return;
