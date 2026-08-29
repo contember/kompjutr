@@ -566,7 +566,7 @@ describe("diffSummary", () => {
     const worktree = new BulkOnlyWorktree(workspace.worktree);
     workspace.storage.resetCounters();
     expect(diffSummary(workspace.repo, worktree)).toEqual([]);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(180);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(worktree.bulkReadPaths).toEqual([]);
 
     workspace.tick(60_000);
@@ -580,7 +580,7 @@ describe("diffSummary", () => {
 
     expect(summary).toHaveLength(1_000);
     expect(summary.every((entry) => entry.status === "M")).toBe(true);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(180);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     const reads = new Map<string, number>();
     for (const path of worktree.bulkReadPaths) reads.set(path, (reads.get(path) ?? 0) + 1);
     expect(reads).toEqual(new Map(changed.map((entry) => [`/${entry.path}`, 2])));
@@ -598,7 +598,7 @@ describe("diffSummary", () => {
     workspace.storage.resetCounters();
     expect(diffSummary(workspace.repo, worktree)).toEqual([]);
     // The exact-rename identity prepass adds one bounded traversal.
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(160);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(workspace.storage.rowCount).toBeLessThanOrEqual(150_000);
     expect(worktree.bulkReadPaths).toEqual([]);
 
@@ -613,7 +613,7 @@ describe("diffSummary", () => {
     const summary = diffSummary(workspace.repo, worktree);
     expect(summary.map((entry) => entry.path)).toEqual(changed.map((entry) => entry.path));
     expect(summary.every((entry) => entry.status === "M")).toBe(true);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(160);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(workspace.storage.rowCount).toBeLessThanOrEqual(150_000);
     const reads = new Map<string, number>();
     for (const path of worktree.bulkReadPaths) reads.set(path, (reads.get(path) ?? 0) + 1);
@@ -633,7 +633,7 @@ describe("diffSummary", () => {
     expect(summary.filter((entry) => entry.status === "D")).toHaveLength(5_001);
     expect(summary.some((entry) => entry.status === "R")).toBe(false);
     expect(summary.every((entry) => entry.originalPath === undefined)).toBe(true);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(worktree.bulkReadPaths).toEqual([]);
   });
 });

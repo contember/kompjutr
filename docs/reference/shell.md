@@ -139,7 +139,7 @@ one logical filesystem revision per mutating call.
 | Caller stdin | 1 MiB | UTF-8 text is measured before encoding; binary input is copied only after the combined input reservation succeeds. |
 | Caller env | 256 own entries and 1 MiB cumulative UTF-8 key/value bytes | The frozen snapshot and stdin share one `maxRetainedBytes` reservation for the complete run. |
 | Expanded argv | 10,000 entries and 1,000,000 UTF-8 bytes | The first excess entry or byte fails with an `E2BIG`-shaped result before invocation. |
-| Redirect input | 96 MiB and 900 content statements | The complete transaction rolls back on overflow or upstream failure. |
+| Redirect input | 96 MiB | Content streams in bounded batches. The complete transaction rolls back on byte overflow or upstream failure; accumulated statement count does not reject it. |
 
 `RunResult.operations` reports the shell-visible filesystem call count.
 `RunResult.peakRetainedBytes` reports the measured peak intermediate-byte

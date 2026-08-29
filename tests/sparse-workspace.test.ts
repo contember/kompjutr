@@ -2213,7 +2213,7 @@ describe("SQLite sparse workspace source", () => {
         paths,
       }),
     ).toEqual({ available: false });
-    expect(workspace.storage.statementCount).toBeLessThan(64);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 
   it("falls back for valid paths deeper than the sparse traversal budget", () => {

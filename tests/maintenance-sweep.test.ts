@@ -101,7 +101,7 @@ function advance(
 ): MaintenanceSweepProgress {
   db.storage.resetCounters();
   const result = advanceMaintenanceSweep(shared, { nowMs, pageRows });
-  expect(db.storage.statementCount).toBeLessThan(100);
+  expect(db.storage.statementCount).toBeLessThan(1_000);
   expect(db.storage.rowCount).toBeLessThan(300);
   return result;
 }
@@ -944,7 +944,7 @@ describe("maintenance sweep", () => {
     }
   });
 
-  it("keeps every stateless loose page within a fixed statement and memory envelope", () => {
+  it("keeps every stateless loose page within the statement target and memory envelope", () => {
     const db = new TestDatabase();
     const { checkout, store } = open(db);
     for (let index = 0; index < 257; index++) {

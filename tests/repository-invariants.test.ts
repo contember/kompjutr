@@ -191,7 +191,7 @@ describe("repository interleaving invariants", () => {
     expect(() => assertRepositoryReadable(cold.repo)).toThrow();
   });
 
-  it("streams its bounded row checks within the operation statement limit", () => {
+  it("streams its bounded row checks within the statement target", () => {
     const workspace = addReadableState();
     const oid = workspace.repo.store.getRef("refs/tags/durable");
     if (oid === null) throw new Error("missing durable fixture ref");
@@ -213,7 +213,7 @@ describe("repository interleaving invariants", () => {
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("bounds worst-case symbolic ref resolution below the statement limit", () => {
+  it("keeps worst-case symbolic ref resolution within the statement target", () => {
     const workspace = addReadableState();
     const oid = workspace.repo.store.getRef("refs/tags/durable");
     if (oid === null) throw new Error("missing durable fixture ref");

@@ -21,8 +21,8 @@ import {
   PROBE_FIXTURE_URL,
   PROBE_HTTP_BODY_LIMIT,
   PROBE_RESPONSE_LIMIT,
-  PROBE_STATEMENT_LIMIT,
   type ProbeMetrics,
+  probeStatementTarget,
 } from "./protocol.js";
 
 const PRIMARY_DIR = "/repo";
@@ -282,6 +282,10 @@ function databaseBytes(storage: PlatformStorage): number {
   return nonnegativeInteger(storage.sql.databaseSize, "SqlStorage.databaseSize");
 }
 
+function probeMetrics(statements: number, rows: number): ProbeMetrics {
+  return { statements, rows, statementTarget: probeStatementTarget(statements) };
+}
+
 function errorCode(error: unknown): string | undefined {
   if ((typeof error !== "object" || error === null) && typeof error !== "function") {
     return undefined;
@@ -365,7 +369,7 @@ export class ProductionProbe {
     if (action === "storage-reset") {
       await this.#storage.deleteAll();
       return this.#success(action, {
-        metrics: { statements: 0, rows: 0 },
+        metrics: probeMetrics(0, 0),
         facts: { deleted: true },
       });
     }
@@ -373,7 +377,7 @@ export class ProductionProbe {
     try {
       switch (action) {
         case "meta":
-          return this.#success(action, { metrics: { statements: 0, rows: 0 }, facts: {} });
+          return this.#success(action, { metrics: probeMetrics(0, 0), facts: {} });
         case "clone":
           return this.#success(action, await this.#measure(() => this.#clone()));
         case "fetch":
@@ -461,13 +465,7 @@ export class ProductionProbe {
   async #measure(operation: () => unknown | Promise<unknown>): Promise<OperationResult> {
     this.#counting.sql.reset();
     const facts = await operation();
-    const metrics = {
-      statements: this.#counting.sql.statements,
-      rows: this.#counting.sql.rows,
-    };
-    if (metrics.statements > PROBE_STATEMENT_LIMIT) {
-      throw new Error(`${metrics.statements} SQL statements exceed ${PROBE_STATEMENT_LIMIT}`);
-    }
+    const metrics = probeMetrics(this.#counting.sql.statements, this.#counting.sql.rows);
     return { metrics, facts };
   }
 
@@ -495,10 +493,7 @@ export class ProductionProbe {
       constructorOrdinal: this.#constructorOrdinal,
       error: errorMessage(error),
       code: errorCode(error),
-      metrics: {
-        statements: this.#counting.sql.statements,
-        rows: this.#counting.sql.rows,
-      },
+      metrics: probeMetrics(this.#counting.sql.statements, this.#counting.sql.rows),
     };
     console.error(JSON.stringify({ event: "production-probe-failure", ...value }));
     return checkedResponse(value, 500);

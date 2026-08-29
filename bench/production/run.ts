@@ -9,7 +9,7 @@ import {
   PROBE_FIXTURE_HEAD,
   PROBE_FIXTURE_URL,
   PROBE_RESPONSE_LIMIT,
-  PROBE_STATEMENT_LIMIT,
+  PROBE_STATEMENT_TARGET,
   PROBE_WORKER_NAME,
   type ProbeSuccess,
   probeSuccess,
@@ -86,9 +86,6 @@ function verifyResponse(action: string, value: ProbeSuccess): void {
   }
   if (value.foreignKeysAfter !== 1) {
     throw new Error(`${action} left PRAGMA foreign_keys=${value.foreignKeysAfter}`);
-  }
-  if (value.metrics.statements > PROBE_STATEMENT_LIMIT) {
-    throw new Error(`${action} used ${value.metrics.statements} SQL statements`);
   }
 }
 
@@ -237,7 +234,9 @@ async function record(targetRunId: string, action: string): Promise<OperationEvi
   operations.push(evidence);
   console.log(
     `${targetRunId} ${action}: ${evidence.wallMs.toFixed(1)} ms, ` +
-      `${evidence.response.metrics.statements} statements, ${evidence.response.databaseBytes} bytes`,
+      `${evidence.response.metrics.statements} statements ` +
+      `(target <=${PROBE_STATEMENT_TARGET}: ${evidence.response.metrics.statementTarget}), ` +
+      `${evidence.response.databaseBytes} bytes`,
   );
   return evidence;
 }

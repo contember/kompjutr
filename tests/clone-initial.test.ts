@@ -22,6 +22,7 @@ import { SqliteTestStorage } from "./helpers/storage.js";
 class RecordingStorage implements DurableObjectStorageLike {
   readonly inner = new SqliteTestStorage();
   readonly sql: SQLStorageLike;
+  // These counters distinguish fast-path and fallback query shapes, not total SQL cost.
   walkStatements = 0;
   blobReadStatements = 0;
   maxBlobReadOids = 0;
@@ -413,7 +414,7 @@ describe("clone initial-state fast path", () => {
     }
   });
 
-  it("keeps a 24,252-file fallback clone below 1,000 statements with 1,000-oid windows", async () => {
+  it("keeps a 24,252-file fallback clone within the statement target", async () => {
     const fixture = new GitFixture().init();
     for (let index = 0; index < 24_252; index++) {
       fixture.write(`file-${String(index).padStart(5, "0")}.txt`, `content-${index}\n`);

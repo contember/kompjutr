@@ -10,6 +10,8 @@ import { Miniflare } from "miniflare";
 import { startGitServer } from "../../tests/helpers/http-backend.js";
 import { FIXTURES, ORIGIN_BRANCH, prepareFixture, trackedEntries } from "../fixtures.js";
 
+const STATEMENT_TARGET = 1_000;
+
 interface CloneResult {
   statements: number;
   rows: number;
@@ -23,6 +25,10 @@ interface CloneResult {
 interface WorkerdMemory {
   baselineRssBytes: number;
   peakRssBytes: number;
+}
+
+function statementTarget(statements: number): "pass" | "miss" {
+  return statements <= STATEMENT_TARGET ? "pass" : "miss";
 }
 
 function cloneResult(value: unknown): CloneResult {
@@ -205,13 +211,16 @@ try {
           workerdBaselineRssBytes: memory.baselineRssBytes,
           workerdPeakRssBytes: memory.peakRssBytes,
           workerdAddedPeakRssBytes: addedPeakRssBytes,
+          statementTarget: {
+            atMost: STATEMENT_TARGET,
+            status: statementTarget(result.statements),
+          },
         },
         null,
         2,
       )}\n`,
     );
     const failures: string[] = [];
-    if (result.statements > 1_000) failures.push(`${result.statements} SQL statements > 1000`);
     // Local workerd has no isolate limit; this is a process-level regression gate.
     if (addedPeakRssBytes > 100 * 1024 * 1024) {
       failures.push(`${addedPeakRssBytes} added workerd RSS bytes > 100 MiB`);

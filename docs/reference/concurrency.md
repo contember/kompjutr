@@ -89,11 +89,11 @@ promotes one complete fallback entry atomically, and hashes the promoted object
 before the old pack disappears. The closure check covers canonical and
 non-canonical physical delta entries and hashes any surviving loose base.
 Oversized full entries are authenticated through bounded uncached inflate
-windows instead of the bulk compressed-byte buffer. The uncached-row budget is
-shared across pages and recursively discovered delta bases, so repeated access
-to one oversized dependency cannot cross the statement ceiling. Deletion
-rejects when any surviving delta chain would lose its base or when the bounded
-pack, page, statement, or memory budget is exhausted.
+windows instead of the bulk compressed-byte buffer. Page and read sizes shape
+the work, but accumulated pages or projected uncached reads do not reject it.
+Deletion rejects when any surviving delta chain would lose its base or when a
+real pack-cardinality, compressed-size, delta, corruption, or retained-memory
+bound is exhausted.
 
 ## Current compatibility matrix
 
@@ -124,16 +124,21 @@ Every supported matrix row has a deterministic witness. Test names below are
 part of the qualification contract; a renamed or replaced test must preserve
 the named schedule, cold checks, and bounds.
 
+Statement figures in focused tests are coarse regression alarms. Representative
+SQL and returned-row cost lives in `bench/`, where at most 1,000 statements is a
+target. A target miss is optimization evidence, not a runtime refusal or a
+reason to invalidate an otherwise correct durable outcome.
+
 | Durable seam | Direct evidence | Cold and cost evidence |
 |---|---|---|
-| Repository route and readiness | [`concurrency-clone.test.ts`](../../tests/concurrency-clone.test.ts): “fences the real clone flow at every durable publication checkpoint”, “keeps reservation, complete pack, refs, and worktree private until the ready CAS”, and exact-expiry/collision/identity witnesses. | The real-flow witness replaces the evicted owner with a fresh `Workspace`; publication directly asserts fewer than 1,000 statements and the pack memory high-water ceiling. |
-| Ordinary pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): same-store overlap, separate-store active rejection, failed-owner retry, exact-expiry takeover, and duplicate/canonical ownership witnesses. | Each owner/retry segment asserts fewer than 1,000 statements and at most the shared operation-memory ceiling; reopened stores prove readable winner and fallback objects. |
-| Maintenance pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): pending dependency rejection; [`maintenance-repack.test.ts`](../../tests/maintenance-repack.test.ts): ordinary-winner finalization and selected/pending/published settlement; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): pending fetch preservation. | Cold finalization tests authenticate every retained object and counter transition; maintenance cost qualification exercises the maximal batch below the SQL and memory ceilings. |
-| Tracking refs, tags, prune, and shallow boundaries | [`concurrency-fetch.test.ts`](../../tests/concurrency-fetch.test.ts): both same-remote orders, prune, local tracking ABA, response loss, disjoint namespaces, selected tags, and both shallow orders. | Every terminal schedule reopens and runs the shared repository oracle. [`store.test.ts`](../../tests/store.test.ts) publishes 9,329 tracking refs below 1,000 statements and directly exhausts the shared memory/input bounds. |
-| Remote push CAS and local tracking | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): both push/fetch orders, same-OID fetch ABA, a buffered refresh losing to a post-snapshot fetch, a no-op push fencing an older fetch, both same-ref push orders, authoritative refreshed/no-op commit reads, refresh failure, and preservation of HEAD/index/journal/maintenance state; [`push.test.ts`](../../tests/push.test.ts): rejection, response loss, delete, no-op, and explicit URL. | Every concurrency schedule cold-reopens through the shared oracle; [`store.test.ts`](../../tests/store.test.ts) directly proves exact revision creation, prefix-scoped fetch observations, idempotent fencing, historical narrow/broad disjointness, maximal namespaces, and token ownership. Full configured and no-op pushes are measured below 1,000 statements; planning reserves 64 fixed statements before admitting pack work. |
+| Repository route and readiness | [`concurrency-clone.test.ts`](../../tests/concurrency-clone.test.ts): “fences the real clone flow at every durable publication checkpoint”, “keeps reservation, complete pack, refs, and worktree private until the ready CAS”, and exact-expiry/collision/identity witnesses. | The real-flow witness replaces the evicted owner with a fresh `Workspace` and asserts the pack memory high-water ceiling; clone statement cost is measured separately. |
+| Ordinary pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): same-store overlap, separate-store active rejection, failed-owner retry, exact-expiry takeover, and duplicate/canonical ownership witnesses. | Reopened stores prove readable winner and fallback objects while focused tests retain the shared operation-memory boundary; pack statement cost is measured separately. |
+| Maintenance pack ownership | [`concurrency-pack.test.ts`](../../tests/concurrency-pack.test.ts): pending dependency rejection; [`maintenance-repack.test.ts`](../../tests/maintenance-repack.test.ts): ordinary-winner finalization and selected/pending/published settlement; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): pending fetch preservation. | Cold finalization tests authenticate every retained object and counter transition; the maintenance benchmark reports statement-target status and retained-memory evidence. |
+| Tracking refs, tags, prune, and shallow boundaries | [`concurrency-fetch.test.ts`](../../tests/concurrency-fetch.test.ts): both same-remote orders, prune, local tracking ABA, response loss, disjoint namespaces, selected tags, and both shallow orders. | Every terminal schedule reopens and runs the shared repository oracle. [`store.test.ts`](../../tests/store.test.ts) exercises 9,329 tracking refs and the real memory/input bounds; `fetch.publication` owns representative query cost. |
+| Remote push CAS and local tracking | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): both push/fetch orders, same-OID fetch ABA, a buffered refresh losing to a post-snapshot fetch, a no-op push fencing an older fetch, both same-ref push orders, authoritative refreshed/no-op commit reads, refresh failure, and preservation of HEAD/index/journal/maintenance state; [`push.test.ts`](../../tests/push.test.ts): rejection, response loss, delete, no-op, and explicit URL. | Every concurrency schedule cold-reopens through the shared oracle; [`store.test.ts`](../../tests/store.test.ts) directly proves exact revision creation, prefix-scoped fetch observations, idempotent fencing, historical narrow/broad disjointness, maximal namespaces, and token ownership. `transport.push` measures configured and no-op push query cost without reserving a statement currency. |
 | Pull snapshot | [`concurrency-network.test.ts`](../../tests/concurrency-network.test.ts): overlapping staged/dirty rejection and unrelated negative control; [`pull.test.ts`](../../tests/pull.test.ts): HEAD, branch OID, upstream, and journal drift. | Concurrency schedules retain the fetch then cold-reopen through the shared oracle. The fetched pack and synchronous integration use the pack and checkout publication bounds. |
-| Local refs, index, worktree, and journals | [`concurrency-operations.test.ts`](../../tests/concurrency-operations.test.ts): every directed active merge/cherry-pick/revert cell and stale branch CAS; [`restart-conformance.test.ts`](../../tests/restart-conformance.test.ts): interrupted add, path reset, full index replacement, and immediate checkout reopen. | Every schedule runs the shared oracle after reopen and measures each public mutation below 1,000 statements. |
-| Maintenance roots | [`maintenance-roots.test.ts`](../../tests/maintenance-roots.test.ts): every public root mutation shape; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): index, journal, commit, and fetch drift; [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): push, exact ref, and sibling checkout drift. | Each principal concurrent schedule ends with cold `cat-file` and `status`; measured calls stay below 1,000 statements. [`maintenance-cost.test.ts`](../../tests/maintenance-cost.test.ts) supplies the large-input memory envelope. |
+| Local refs, index, worktree, and journals | [`concurrency-operations.test.ts`](../../tests/concurrency-operations.test.ts): every directed active merge/cherry-pick/revert cell and stale branch CAS; [`restart-conformance.test.ts`](../../tests/restart-conformance.test.ts): interrupted add, path reset, full index replacement, and immediate checkout reopen. | Every schedule runs the shared oracle after reopen; merge, replay, rebase, and ref benchmark rows own representative query cost. |
+| Maintenance roots | [`maintenance-roots.test.ts`](../../tests/maintenance-roots.test.ts): every public root mutation shape; [`maintenance-qualification.test.ts`](../../tests/maintenance-qualification.test.ts): index, journal, commit, and fetch drift; [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): push, exact ref, and sibling checkout drift. | Each principal concurrent schedule ends with cold `cat-file` and `status`; [`maintenance-cost.test.ts`](../../tests/maintenance-cost.test.ts) supplies the large-input memory envelope and the maintenance benchmark owns query cost. |
 | Concurrent maintenance | [`concurrency-maintenance.test.ts`](../../tests/concurrency-maintenance.test.ts): selected owner to pending barrier, same-runtime `EBUSY`, once-only finalization, and cold selected/pending/published settlement. | Owner prefix/tail and rival calls are measured separately; every settled state is read through a fresh `Workspace`. |
 
 The implementation seams are
@@ -189,8 +194,9 @@ after a cold reopen:
   owner.
 - Maintenance state is resumable, and a stale root snapshot never authorizes
   deletion of a newer root.
-- Each public call uses fewer than 1,000 SQL statements and stays below the
-  64 MiB operation memory limit.
+- Statement cost is observable in benchmarks against the at-most-1,000 target;
+  a miss does not change the durable outcome or authorize a runtime refusal.
+- Each public call remains subject to the real 64 MiB operation memory limit.
 
 The qualification record and direct witness map are maintained in the archived
 [concurrency and restart sprint](../archive/sprint-2026-08-27-concurrency-and-restart-conformance.md).

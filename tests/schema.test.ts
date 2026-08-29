@@ -872,7 +872,7 @@ describe("git schema", () => {
     expect(schemaObjects(inner)).toEqual([]);
   });
 
-  it("stays below the guarded 1,000-statement initialization ceiling", () => {
+  it("keeps schema initialization within the statement target", () => {
     const db = new TestDatabase();
     db.storage.resetCounters();
 

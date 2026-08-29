@@ -403,7 +403,7 @@ describe("exact fetch publication", () => {
     expectIdle(store);
   });
 
-  it("shares the caller reservation and bounds exact candidates and publication SQL", () => {
+  it("shares the caller reservation and publishes exact candidates within the statement target", () => {
     const { db, store } = open();
     const reservation = store.reserveMemory();
     reservation.set("protocol", 4_096);
@@ -436,7 +436,7 @@ describe("exact fetch publication", () => {
           metadata,
         ),
       ).toBe(true);
-      expect(db.storage.statementCount).toBeLessThanOrEqual(1_000);
+      expect(db.storage.statementCount).toBeLessThan(1_000);
       expect(reservation.highWaterBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
     } finally {
       token.dispose();

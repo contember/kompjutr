@@ -267,10 +267,16 @@ describe("read-only git argv handlers", () => {
 
   it("proves a linear range with one bounded indexed graph read", () => {
     workspace.repo.checkout.setHead(fixture.git("rev-parse", "HEAD"));
+    workspace.storage.histogram = new Map();
     workspace.storage.resetCounters();
 
     expect(nativeRun(workspace, ["log", "--oneline", `${base}..HEAD`]).exitCode).toBe(0);
-    expect(workspace.storage.statementCount).toBeLessThan(30);
+    expect(
+      [...workspace.storage.histogram].filter(([query]) =>
+        query.startsWith("WITH RECURSIVE params(repo_id, root_oid"),
+      ),
+    ).toEqual([[expect.any(String), 1]]);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 });
 

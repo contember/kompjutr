@@ -41,7 +41,9 @@ const LEASE_MARKER = "KOMPJUTR_CLONE_STORAGE_LEASED";
 const LEASE_VCPUS = 4;
 const LEASE_LOGICAL_CPUS = 2;
 const REPO = "/repo";
-const INITIAL_CHECKOUT_STATEMENT_BUDGET = 1_000;
+const STATEMENT_TARGET = 1_000;
+
+type StatementTarget = "pass" | "miss";
 
 /**
  * Every table the runtime may create, mapped to the cost it belongs to.
@@ -117,6 +119,7 @@ interface Sample {
   wallMs: number;
   statements: number;
   rows: number;
+  statementTarget: StatementTarget;
   /** `page_count * page_size` once the operation returned. */
   databaseBytes: number;
 }
@@ -246,11 +249,13 @@ async function measure(instance: Harness, name: string, run: () => Promise<void>
   const started = performance.now();
   await run();
   const wallMs = performance.now() - started;
+  const statements = instance.storage.statementCount;
   return {
     name,
     wallMs,
-    statements: instance.storage.statementCount,
+    statements,
     rows: instance.storage.rowCount,
+    statementTarget: statements <= STATEMENT_TARGET ? "pass" : "miss",
     databaseBytes: instance.storage.databaseSize(),
   };
 }
@@ -470,12 +475,6 @@ async function runPhases(
     const checkout = await measure(instance, "git.checkout", async () => {
       await instance.git.checkout({ dir: REPO, ref: ORIGIN_BRANCH });
     });
-    if (fixture.name === "nextjs" && checkout.statements >= INITIAL_CHECKOUT_STATEMENT_BUDGET) {
-      throw new Error(
-        `nextjs initial checkout used ${checkout.statements} statements, ` +
-          `expected fewer than ${INITIAL_CHECKOUT_STATEMENT_BUDGET}`,
-      );
-    }
     samples.push(checkout);
     return { samples, facts: await checkoutFacts(instance) };
   } finally {
@@ -639,8 +638,8 @@ function integer(value: number): string {
 
 function summaryTable(results: readonly FixtureResult[]): string[] {
   const lines = [
-    "| Fixture | Files | SQLite DB | After VACUUM | git `.git` | git worktree | git total | DB / git | `git.clone` | `git clone` | SQL | Rows |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Fixture | Files | SQLite DB | After VACUUM | git `.git` | git worktree | git total | DB / git | `git.clone` | `git clone` | SQL | Rows | Target |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
   ];
   for (const result of results) {
     const gitTotal = result.git.gitDirBytes + result.git.worktreeBytes;
@@ -650,7 +649,8 @@ function summaryTable(results: readonly FixtureResult[]): string[] {
         `${size(result.git.gitDirBytes)} | ${size(result.git.worktreeBytes)} | ` +
         `${size(gitTotal)} | ${ratio(result.storage.databaseBytes, gitTotal)} | ` +
         `${result.clone.wallMs.toFixed(0)} ms | ${result.git.wallMs.toFixed(0)} ms | ` +
-        `${integer(result.clone.statements)} | ${integer(result.clone.rows)} |`,
+        `${integer(result.clone.statements)} | ${integer(result.clone.rows)} | ` +
+        `${result.clone.statementTarget} |`,
     );
   }
   return lines;
@@ -708,14 +708,14 @@ function objectTable(result: FixtureResult): string[] {
 
 function phaseTable(result: FixtureResult): string[] {
   const lines = [
-    "| Phase | Wall | SQL | Rows | DB after | Added |",
-    "| --- | ---: | ---: | ---: | ---: | ---: |",
+    "| Phase | Wall | SQL | Rows | Target | DB after | Added |",
+    "| --- | ---: | ---: | ---: | --- | ---: | ---: |",
   ];
   let previous = 0;
   for (const phase of result.phases) {
     lines.push(
       `| \`${phase.name}\` | ${phase.wallMs.toFixed(1)} ms | ${integer(phase.statements)} | ` +
-        `${integer(phase.rows)} | ${size(phase.databaseBytes)} | ` +
+        `${integer(phase.rows)} | ${phase.statementTarget} | ${size(phase.databaseBytes)} | ` +
         `${size(phase.databaseBytes - previous)} |`,
     );
     previous = phase.databaseBytes;
@@ -768,7 +768,8 @@ function markdown(results: readonly FixtureResult[], environment: object): strin
       "",
       "`init` → `fetch` → `updateRef` → `checkout`, in a separate database. The final",
       "phase exercises standalone initial checkout because its root and every index stage",
-      "are still empty; `nextjs` must complete it in fewer than 1,000 SQL statements.",
+      "are still empty. Each phase reports pass or miss against the at-most-1,000-statement",
+      "optimization target; a miss does not fail the benchmark.",
       "",
       ...phaseTable(result),
       "",
@@ -959,7 +960,9 @@ async function main(): Promise<void> {
         `${result.fixture}: ${integer(result.trackedFiles)} files, ` +
           `${size(result.storage.databaseBytes)} database, ` +
           `${ratio(result.storage.databaseBytes, gitTotal)} git, ` +
-          `clone ${result.clone.wallMs.toFixed(0)} ms in ${integer(result.clone.statements)} statements\n`,
+          `clone ${result.clone.wallMs.toFixed(0)} ms in ` +
+          `${integer(result.clone.statements)} statements ` +
+          `(target <=${STATEMENT_TARGET}: ${result.clone.statementTarget})\n`,
       );
       rmSync(join(directory, `${fixture.name}-clone.sqlite`), { force: true });
       rmSync(join(directory, `${fixture.name}-phases.sqlite`), { force: true });

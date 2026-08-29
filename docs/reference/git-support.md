@@ -418,12 +418,11 @@ Any presence of `cached`, `others`, or `excludeStandard`, including `false`, is
 rejected with `{ ref }`. Native client calls prune registered nested checkout
 roots instead of returning Git's ordinary directory row for them. Combined
 worktree selection accepts at most 64 pathspecs and scans at most 100,000 merged
-source rows. Its tested worst-case allocation is 700 SQL statements; cached-only
-selection retains its separate 903-statement allocation. Result and matcher
-state remain byte-bounded, and structural or memory excess fails instead of
-truncating. Projected statement-count barriers that predate invariant 5 remain
-compatibility behavior isolated for removal in
-[backlog 60](../backlog/60-budget-targets-and-store-split.md).
+source rows. The `ls-files.cached` and `ls-files.combined` benchmark rows report
+statement and returned-row cost against the at-most-1,000 target. Result and
+matcher state remain byte-bounded, and structural or memory excess fails instead
+of truncating. A target miss is optimization evidence and does not reject the
+selection.
 
 ## Branches, tags and refs
 
@@ -812,12 +811,12 @@ differences:
 
 ## Limits
 
-Accepted operations currently enforce at most 1,000 SQL statements and less
-than 100 MiB. An operation that would exceed a structural or projected-count
-limit throws a stable error instead of truncating. Backlog 60 tracks replacing
-the projected statement barrier with a measured target. The per-operation caps
-(integration plan entries, tree bytes, worktree scan rows, path length, journal
-steps) are listed in
+At most 1,000 SQL statements is a benchmark target. Representative statement
+and returned-row costs live in `bench/`; a miss is optimization evidence and
+never a runtime rejection. Operations fail only for real memory, format,
+platform, corruption, CAS, or structural limits instead of truncating. The
+per-operation caps (integration plan entries, tree bytes, worktree scan rows,
+path length, journal steps) are listed in
 [`architecture.md`](architecture.md).
 
 Two limits bite most often in ordinary use: the 2,200-byte cap on an emitted

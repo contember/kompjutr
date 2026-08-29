@@ -70,9 +70,10 @@ v2 text, worktree bytes and modes, the log, and which integration is pending.
   a stream — it is faster and the failure points at the right layer.
 - Test Smart HTTP success paths against `helpers/http-backend.ts`. Reserve mocks
   for malformed frames and transport failures that real Git cannot produce.
-- Cost is behaviour: assert statement and operation counts where the suite
-  already does (`tests/shell/cost.test.ts`, `tests/shell/bounds.test.ts`). A change that
-  keeps outputs identical and raises the counts must fail a test.
+- Exact zero- or one-statement assertions must prove a named semantic query
+  shape. Vitest may use a coarse `<1,000` operation-cost alarm, but representative
+  SQL and returned-row cost belongs in `bench/`. A target miss is optimization
+  evidence; it never authorizes a runtime refusal.
 - Agent PTYs must set `GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true` for the full
   suite. Real-Git rebase continuations otherwise wait for an editor.
 - Timeouts are 60 s for tests and hooks. A test needing more is measuring the

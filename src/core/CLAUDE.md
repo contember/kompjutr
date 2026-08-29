@@ -36,6 +36,11 @@ so a repeated `status` over an untouched tree reads no content at all. Adding a
 per-path `readFile` or a scalar SQL lookup inside a loop is the regression this
 module exists to prevent.
 
+SQL cost is measured in `bench/`. At most 1,000 statements is a performance
+target, not admission: a miss is optimization evidence and never a reason to
+project, reserve, or refuse query work. Runtime failures protect only real
+memory, format, platform, corruption, or structural limits.
+
 ## Rules
 
 - **Tree traversal reads no object BLOBs.** `ops/tree-stream.ts` walks the parsed

@@ -1,6 +1,6 @@
 // P1 from §7.0 — the bulk reads.
 //
-// Every gate here has two halves. A statement ceiling on its own is beaten by
+// Every gate here has two halves. A statement target alarm on its own is beaten by
 // an implementation that returns nothing, so each count is paired with an
 // assertion on the rows it produced.
 //

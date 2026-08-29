@@ -30,10 +30,11 @@ One run executes these bounded requests:
    reset the isolate in a separate request, and require the marker to be absent
    after schema reconstruction.
 
-The Worker counts SQL statements and returned rows per operation. It rejects an
-operation above 1,000 SQL statements and a response above 1 MiB. The Node runner
-measures wall time externally because Worker timers do not measure synchronous
-SQLite work reliably.
+The Worker counts SQL statements and returned rows per operation and reports the
+at-most-1,000-statement optimization target. A target miss is evidence to
+optimize, not a package runtime refusal. Responses still fail above the real
+1 MiB probe transport bound. The Node runner measures wall time externally
+because Worker timers do not measure synchronous SQLite work reliably.
 
 ## Operator commands
 

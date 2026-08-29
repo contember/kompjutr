@@ -461,11 +461,17 @@ describe("multi-ref push planning", () => {
       update(`refs/checkpoints/source-${index}`, `refs/checkpoints/destination-${index}`, blob),
     );
     const exact = operation(workspace.repo);
+    workspace.storage.histogram = new Map();
     const statementStart = workspace.storage.statementCount;
     const plan = requirePlan(planPushUpdates(workspace.repo, updates, exact.budget));
     const observedStatements = workspace.storage.statementCount - statementStart;
     expect(pushPlanObjectCount(plan)).toBe(1);
-    expect(observedStatements).toBeLessThan(100);
+    expect(
+      [...workspace.storage.histogram].filter(([query]) =>
+        query.startsWith("SELECT target FROM git_refs WHERE repo_id = ? AND name = ?"),
+      ),
+    ).toEqual([]);
+    expect(observedStatements).toBeLessThan(1_000);
     disposePushPlan(plan);
     exact.reservation.dispose();
     workspace.repo.store.memory.assertIdle();

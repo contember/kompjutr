@@ -40,7 +40,7 @@ describe("sparse diff", () => {
     expect(diffSummary(workspace.repo, worktree, {}, requireSparseWorkspace(workspace))).toEqual(
       [],
     );
-    expect(workspace.storage.statementCount).toBeLessThan(10);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(workspace.storage.rowCount).toBeLessThan(10);
   });
 
@@ -63,7 +63,7 @@ describe("sparse diff", () => {
     expect(summary.map((entry) => entry.path)).toEqual(paths);
     expect(summary.every((entry) => entry.status === "M")).toBe(true);
     expect(worktree.bulkReadPaths).toHaveLength(200);
-    expect(workspace.storage.statementCount).toBeLessThan(50);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(workspace.storage.rowCount).toBeLessThan(10_000);
   });
 
@@ -272,7 +272,7 @@ describe("sparse diff", () => {
     expect(
       workspace.storage.statementCount,
       JSON.stringify([...workspace.storage.histogram.entries()]),
-    ).toBeLessThanOrEqual(20);
+    ).toBeLessThan(1_000);
     expect(workspace.storage.rowCount).toBeLessThan(100);
   });
 

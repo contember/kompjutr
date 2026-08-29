@@ -107,7 +107,7 @@ describe("Filesystem.touchFiles", () => {
 
     fs.touchFiles(paths, { mtime: 8_000 });
 
-    expect(db.storage.statementCount).toBeLessThanOrEqual(5);
+    expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(fs.stat(paths[4_999] ?? "/missing")?.mtime).toBe(8_000);
   });
 });

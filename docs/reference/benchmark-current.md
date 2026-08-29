@@ -42,8 +42,9 @@ proof of a production isolate limit.
 | `git.checkout bench-work --force` | 78.531 ms | 59 | 1,018 |
 | `git.status` — clean work | 0.791 ms | 9 | 7 |
 
-Every phase stayed below the 1,000-statement operation ceiling in all three
-runs, and every operation and status assertion passed. Every one of the three
+Every phase met the at-most-1,000-statement benchmark target in all three runs,
+and every operation and status assertion passed. Target status is performance
+evidence, not a runtime admission rule. Every one of the three
 runs for each required row was below 100 ms: maxima were 76.957 ms for add,
 58.832 ms for commit, 29.558 ms for clean post-commit status, 89.446 ms for
 checkout to main, and 79.682 ms for checkout to bench-work. Both real force
@@ -172,7 +173,8 @@ separate initialization, fetch, and ref publication phases. Clone uses 824
 statements; the standalone checkout itself uses 608. Both materialize exactly
 24,252 index entries and worktree leaves at the expected HEAD. Each final state
 has the same 228,667,392-byte allocated database size. Both stay below the
-1,000-statement operation budget.
+at-most-1,000-statement benchmark target; a future miss would be optimization
+evidence rather than a runtime refusal.
 
 Generated output goes to `bench/results/clone-storage.{json,md}`, which is
 gitignored. Update this curated snapshot only from a CPU-leased run.

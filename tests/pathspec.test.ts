@@ -242,6 +242,7 @@ describe("ls-files pathspec", () => {
 
   it("uses one bounded derived-tree traversal for literal ref selectors", async () => {
     const { workspace } = await parityRepo();
+    workspace.storage.histogram = new Map();
     workspace.storage.resetCounters();
 
     expect(
@@ -249,7 +250,12 @@ describe("ls-files pathspec", () => {
         paths: ["dir", "dir/sub/b.ts", "./dir//sub/../a.ts"],
       }),
     ).toEqual(["dir/a.ts", "dir/sub/b.ts", "dir/sub/c.js"]);
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(10);
+    expect(
+      [...workspace.storage.histogram].filter(([query]) =>
+        query.startsWith("WITH RECURSIVE params(repo_id, root_oid"),
+      ),
+    ).toEqual([[expect.any(String), 1]]);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 
   it("rejects unsupported leading root and magic forms", () => {

@@ -330,12 +330,14 @@ byte-oriented xdiff port handles merge, diff3, and zdiff3 markers without UTF-8
 decoding; NUL-bearing inputs become binary conflicts.
 
 An integration plan admits at most 1,000 entries, 200,000 source rows, 4 MiB of
-structural state, 32 MiB of retained plan state, and 16 bulk blob-read calls.
-The SQL model is at most 134 statements: six tree statements plus eight for each
-bulk read. Caller-owned state stays within the packed reader's 8 MiB headroom.
-A shared 64 MiB exclusion reservation is acquired before any tree cursor opens,
+structural state, and 32 MiB of retained plan state. Blob reads continue through
+progressing bounded batches; their accumulated call count does not reject the
+plan. Caller-owned state stays within the packed reader's 8 MiB headroom. A
+shared 64 MiB exclusion reservation is acquired before any tree cursor opens,
 then reduced to conservative live-state and xdiff peaks. Capacity and corruption
-fail closed before exposing a partial plan.
+fail closed before exposing a partial plan. The `merge.apply` benchmark records
+statement cost against the at-most-1,000 target without turning a miss into a
+runtime error.
 
 ## Merge lifecycle
 
@@ -350,16 +352,19 @@ Text and binary conflicts write stages 1–3 and marker/current bytes. Structura
 file/directory conflicts relocate the file side to a collision-checked
 `~<label>` path. One outer `transactionSync()` covers temporary objects, output
 objects, worktree changes, index stages, merge state, and the final ref update.
-The composed SQL estimate includes graph selection, virtual-base work, final
-planning, and apply; an operation that cannot remain below 1,000 statements
-fails before its transaction becomes visible.
+There is no projected SQL admission across graph selection, virtual-base work,
+planning, or apply. Benchmarks measure those operations against the
+at-most-1,000-statement target; a miss is optimization evidence. The transaction
+fails only for its real memory, format, corruption, CAS, or structural bounds.
 
 Merge preflights the current, projected, and final index shape before tree
 construction. The operation accepts at most 10,000 leaf paths, 4 MiB of full
 path bytes, 4,096 tree objects, and 16 MiB of serialized tree data. Worktree
-overwrite checks scan at most 50,000 rows and hash at most one 1,000-path batch
-or 30 large-file range reads. The retained integration plan stays reserved with
-24 MiB of execution headroom through projection, application, and commit.
+overwrite checks scan at most 50,000 source rows and retain bounded candidate
+and hash state. Hash batches and large-file range reads may continue while they
+make progress; their accumulated count does not reject the operation. The
+retained integration plan stays reserved with 24 MiB of execution headroom
+through projection, application, and commit.
 
 Clean divergent merges create a commit with ordered current/incoming parents.
 `commit: false` and conflicts persist authenticated merge metadata plus bounded
@@ -402,8 +407,10 @@ pending replay.
 `result` means the projected integration tree equals the current tree.
 Cherry-pick suspends both empty outcomes for explicit cancellation, matching
 Git's active empty-pick state. Revert completes an empty operation immediately.
-All planning, apply, recovery, and journal-transition statements are composed
-into the fail-closed operation limit before writes become visible.
+Planning, apply, recovery, and journal transitions have no projected query-work
+admission. Their representative costs live in the replay and rebase benchmark
+rows; runtime still fails closed on authenticated journal ownership, CAS,
+corruption, memory, and structural limits.
 
 ## Rebase lifecycle
 
@@ -516,8 +523,8 @@ Hydration admits at most 1,000 strict Git-ordered paths, 2,200 UTF-8 bytes per
 path, 1 MiB of request JSON, and 8 MiB of retained result state. Tree depth,
 edge work, parsed-source entries, source bytes, and worktree payloads have
 separate caps. Sparse checkout budgets candidate, guard, and plan state within
-the retained-state allowance. It separately rejects a conservative SQL estimate
-that would exceed the 1,000-statement operation ceiling. Its retained caller
+the retained-state allowance. It does not reject a projected statement count;
+the `sparse.prune` benchmark reports target status instead. Its retained caller
 state fits the packed-blob reader's 8 MiB headroom; the complete packed-read
 model remains below 100 MiB.
 
@@ -579,10 +586,12 @@ with existing clone targets, then changes the index and SQLite worktree in one
 transaction, so failed writes cannot leave unindexed clone paths while unrelated
 untracked paths remain caller-owned.
 
-The outbound planner reserves the worst-case two-pass SQL cost before starting
-the POST. Every command includes the freshly advertised old OID, so a concurrent
-remote update is rejected by the server. After complete status, push performs
-one best-effort rediscovery and atomically reconciles successful branch tracking
+The outbound planner preflights both deterministic pack passes before starting
+the POST and retains their live state under the transport memory owner. It does
+not reserve a projected SQL currency; `transport.push` measures the query cost.
+Every command includes the freshly advertised old OID, so a concurrent remote
+update is rejected by the server. After complete status, push performs one
+best-effort rediscovery and atomically reconciles successful branch tracking
 refs through the same fenced publication seam as fetch. A hook-changed target
 must be locally authenticated; otherwise reconciliation is deferred. Stale or
 failed local reconciliation is returned separately and never hides the
@@ -607,16 +616,19 @@ Initialization creates the complete current shape in one `transactionSync()`.
 Reopen accepts only version 1 and validates the exact name, type, and SQL of every
 Git schema object before returning. Partial, aliased, oversized, unexpected, or
 unsupported schemas fail closed before creation can mask them. Fresh
-initialization is guarded below 1,000 statements; exact reopen uses two.
-Untrusted schema metadata is projected through byte bounds and retains less than
-100 MiB.
+initialization is measured by `schema.init` against the statement target and is
+never refused from that count; exact reopen keeps its named two-query validation
+shape. Untrusted schema metadata is projected through byte bounds and retains
+less than 100 MiB.
 
 ## Resource limits and performance paths
 
-Operations have explicit statement, binding, BLOB-result, retained-state, and
-cache gates. The target is at most 1,000 SQL statements and less than 100 MiB for
-every accepted operation. Operations that exceed an accepted structural limit
-throw a stable error instead of truncating or continuing unbounded.
+At most 1,000 SQL statements is a benchmark target, not a runtime gate.
+Representative statement and returned-row costs live in `bench/`; a miss is
+optimization evidence and never manufactures a refusal. Runtime gates protect
+real binding, BLOB-result, retained-memory, cache, format, platform, corruption,
+and structural limits. They throw a stable error instead of truncating or
+continuing unbounded.
 
 The separate wall target is below 0.1 seconds for operations touching at most
 1,000 changed paths. Native selected-path lookups, authenticated commit

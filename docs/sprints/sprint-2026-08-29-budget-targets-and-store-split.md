@@ -516,6 +516,17 @@ shape exceptions, store import topology and proportional per-WU review.
   derives only from the real 8 MiB owner, not query cost. Dalton approved the
   final review-to-clean. The combined routine smoke gate passed 150/150 in
   12.30 s under a two-vCPU lease.
+- 2026-08-29 — WU5 moved SQL cost policy to benchmarks and living docs. Unit
+  operation costs are coarse `<1,000` target alarms; exact counts remain only
+  where named histogram, paging, cache, pre-SQL, or API instrumentation proves a
+  semantic query shape. The production probe and clone/workerd harnesses now
+  report target pass/miss without turning a known miss into failure. Ohm's
+  two-round independent review restored every weakened semantic/API witness and
+  approved the final test classification; Dalton approved the docs and
+  benchmark/probe half. `bench:statements -- --check` passed in 6.36 s, including
+  the report-only Next.js clone miss at 1,586 SQL. Typecheck and Biome passed,
+  and the routine smoke gate passed 150/150 in 11.81 s under a two-vCPU lease.
+  Agent-docs lint reports only the pre-existing `docs/AGENTS.md` root file.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

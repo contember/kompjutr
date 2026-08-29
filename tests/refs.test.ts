@@ -826,6 +826,69 @@ describe("checkout", () => {
     }
   });
 
+  it("removes exact paths through the former 17th JSON batch", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Fixture");
+    workspace.repo.store.configSet("user.email", "fixture@example.com");
+    const bytes = utf8.encode("x\n");
+    const oid = workspace.repo.store.write("blob", bytes);
+    const suffix = "\u0001".repeat(2_100);
+    const paths = Array.from(
+      { length: 1_300 },
+      (_, index) => `f${index.toString().padStart(4, "0")}-${suffix}`,
+    );
+    const writes = paths.map((path) => ({
+      path: `/${path}`,
+      bytes,
+      contentId: fromHex(oid),
+    }));
+    workspace.worktree.writeFiles(writes);
+    const stats = new Map(
+      workspace.worktree
+        .scan("/", { filesOnly: true, limit: paths.length + 1 })
+        .map((entry) => [entry.path.slice(1), entry]),
+    );
+    const originalIndex = paths.map((path): IndexEntry => {
+      const stat = stats.get(path);
+      if (stat === undefined) throw new Error("long checkout path was not written");
+      return {
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: stat.size,
+        mtime: stat.mtime,
+        ino: stat.ino,
+      };
+    });
+    workspace.repo.checkout.indexReplace(originalIndex);
+    const base = commit(workspace.context, workspace.repo, { message: "base" });
+    workspace.worktree.removeFiles(paths.map((path) => `/${path}`));
+    workspace.repo.checkout.indexClear();
+    const target = commit(workspace.context, workspace.repo, { message: "delete" });
+    workspace.repo.store.setRef("refs/heads/target", target.oid);
+    workspace.worktree.writeFiles(writes);
+    workspace.repo.checkout.indexReplace(originalIndex);
+    workspace.repo.checkout.setHead(base.oid);
+
+    class RemovalWorktree extends CountingWorktree {
+      batches: string[][] = [];
+
+      override removeFiles(removals: readonly string[], options?: RemoveOptions): void {
+        this.batches.push([...removals]);
+        super.removeFiles(removals, options);
+      }
+    }
+
+    const worktree = new RemovalWorktree(workspace.worktree);
+    checkout(workspace.context, workspace.repo, worktree, { ref: "target", force: true });
+
+    expect(worktree.batches).toHaveLength(17);
+    expect(worktree.batches.flat()).toEqual(paths.map((path) => `/${path}`));
+    expect(paths.every((path) => workspace.worktree.stat(`/${path}`) === null)).toBe(true);
+    expect(workspace.repo.head().oid).toBe(target.oid);
+  });
+
   it("updates only the given paths and leaves HEAD alone", () => {
     checkout(ws.context, ws.repo, ws.worktree, { ref: "side" });
     fixture.git("checkout", "-q", "side");
@@ -1298,7 +1361,7 @@ describe("checkout", () => {
     workspace.storage.resetCounters();
     checkout(workspace.context, workspace.repo, worktree, { ref: "changed" });
 
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(200);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(worktree.writes).toHaveLength(1_000);
     expect(new Set(worktree.writes)).toEqual(
       new Set(paths.slice(0, 1_000).map((path) => `/${path}`)),
@@ -1385,7 +1448,7 @@ describe("checkout", () => {
     workspace.storage.resetCounters();
     checkout(workspace.context, workspace.repo, worktree, { ref: "changed" });
 
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(worktree.writes).toHaveLength(changedFiles);
     expect(worktree.writes).toEqual(paths.slice(0, changedFiles).map((path) => `/${path}`));
     expect(worktree.reads).toBe(0);
@@ -1402,7 +1465,7 @@ describe("checkout", () => {
     workspace.storage.resetCounters();
     checkout(workspace.context, workspace.repo, worktree, { ref: base.oid, force: true });
 
-    expect(workspace.storage.statementCount).toBeLessThanOrEqual(1_000);
+    expect(workspace.storage.statementCount).toBeLessThan(1_000);
     expect(worktree.writes).toHaveLength(changedFiles);
     expect(worktree.writes).toEqual(paths.slice(0, changedFiles).map((path) => `/${path}`));
     expect(worktree.reads).toBe(0);

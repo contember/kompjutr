@@ -17,7 +17,10 @@ reference experiment against real repositories; `shell` measures the command
 surface; `nextjs-workflow.ts` runs clone through a 100-file commit and push;
 `clone-storage.ts` sizes the database a clone leaves behind, against real git.
 `statements.ts` checks correctness and frozen SQL/row baselines for operations
-whose runtime query barriers were removed.
+whose runtime query barriers were removed. It reports whether each row meets the
+at-most-1,000-statement target. A target miss alone does not fail `--check` and
+never licenses a runtime refusal; missing rows, invalid end states, and frozen-
+baseline regressions do fail.
 Fixtures are `express`, `tailwind`, `vue`, `eslint`, `prettier`, `nextjs`
 (218 → 24,252 files). `bench/results/` and `bench/.fixtures/` are gitignored.
 

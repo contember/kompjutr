@@ -219,14 +219,14 @@ function corruptPackEntryBytes(
   );
 }
 
-async function advanceBelowStatementLimit(
+async function advanceWithinStatementTarget(
   db: TestDatabase,
   shared: ReturnType<typeof open>["store"]["shared"],
   options: MaintenanceRepackOptions = REPACK_OPTIONS,
 ) {
   db.storage.resetCounters();
   const result = await advanceMaintenanceRepack(shared, options);
-  expect(db.storage.statementCount).toBeLessThan(900);
+  expect(db.storage.statementCount).toBeLessThan(1_000);
   return result;
 }
 
@@ -249,7 +249,7 @@ describe("maintenance repack", () => {
       checkout.repoId,
     );
 
-    expect(await advanceBelowStatementLimit(db, store.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, store.shared)).toMatchObject({
       status: "progress",
       boundary: "selected",
       objectCount: 3,
@@ -261,7 +261,7 @@ describe("maintenance repack", () => {
         checkout.repoId,
       ),
     ).toEqual(binaryOrder);
-    expect(await advanceBelowStatementLimit(db, store.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, store.shared)).toMatchObject({
       status: "progress",
       boundary: "published",
       objectCount: 3,
@@ -272,7 +272,7 @@ describe("maintenance repack", () => {
 
     const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 8 * 1024 * 1024 });
     const cold = reopened.openCheckout(checkout.id);
-    const finalized = await advanceBelowStatementLimit(db, cold.shared);
+    const finalized = await advanceWithinStatementTarget(db, cold.shared);
     expect(finalized).toMatchObject({
       status: "progress",
       boundary: "finalized",
@@ -314,7 +314,7 @@ describe("maintenance repack", () => {
         checkout.repoId,
       ),
     ).toEqual({ repacked_objects: 3, reachable_objects: 2, queued_objects: 0 });
-    expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, cold.shared)).toMatchObject({
       status: "complete",
       boundary: null,
     });
@@ -350,18 +350,18 @@ describe("maintenance repack", () => {
 
     const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
     const cold = reopened.openCheckout(checkout.id);
-    expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, cold.shared)).toMatchObject({
       boundary: "selected",
       packId: null,
     });
     expect(
       db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE repo_id = ?", checkout.repoId),
     ).toBe(0);
-    expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, cold.shared)).toMatchObject({
       boundary: "published",
       packId: 2,
     });
-    expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, cold.shared)).toMatchObject({
       boundary: "finalized",
       packId: 2,
     });
@@ -375,7 +375,7 @@ describe("maintenance repack", () => {
     const packed = await store.packs.ingest(slices(fullObjectPack("blob", data), 11));
     seedRepack(db, checkout.repoId, [{ oid }]);
 
-    const finalized = await advanceBelowStatementLimit(db, store.shared);
+    const finalized = await advanceWithinStatementTarget(db, store.shared);
 
     expect(finalized).toMatchObject({
       boundary: "finalized",
@@ -397,14 +397,14 @@ describe("maintenance repack", () => {
     const interleavedOid = interleaved.store.write("blob", interleavedData);
     seedRepack(interleaved.db, interleaved.checkout.repoId, [{ oid: interleavedOid }]);
     expect(
-      await advanceBelowStatementLimit(interleaved.db, interleaved.store.shared),
+      await advanceWithinStatementTarget(interleaved.db, interleaved.store.shared),
     ).toMatchObject({
       boundary: "selected",
     });
     await interleaved.store.packs.ingest(slices(fullObjectPack("blob", interleavedData), 11));
 
     expect(
-      await advanceBelowStatementLimit(interleaved.db, interleaved.store.shared),
+      await advanceWithinStatementTarget(interleaved.db, interleaved.store.shared),
     ).toMatchObject({
       boundary: "finalized",
       objectCount: 1,
@@ -421,7 +421,7 @@ describe("maintenance repack", () => {
     const data = utf8.encode("ordinary owner during maintenance publication\n");
     const oid = store.write("blob", data);
     seedRepack(db, checkout.repoId, [{ oid }]);
-    expect(await advanceBelowStatementLimit(db, store.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, store.shared)).toMatchObject({
       boundary: "selected",
       objectCount: 1,
     });
@@ -456,7 +456,7 @@ describe("maintenance repack", () => {
     const reopenedCheckout = reopened.findCheckout("/repo");
     if (reopenedCheckout === null) throw new Error("maintenance checkout disappeared on restart");
     const cold = reopened.openCheckout(reopenedCheckout);
-    expect(await advanceBelowStatementLimit(db, cold.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, cold.shared)).toMatchObject({
       boundary: "finalized",
       packId: pendingPackId,
       objectCount: 1,
@@ -649,14 +649,14 @@ describe("maintenance repack", () => {
       data.length,
     );
 
-    expect(await advanceBelowStatementLimit(db, store.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, store.shared)).toMatchObject({
       boundary: "finalized",
       packId: 0,
     });
     expect(store.read(oid)?.data).toEqual(data);
   });
 
-  it("enforces count, inflated, stored-output, and statement bounds", async () => {
+  it("enforces count, inflated, and stored-output bounds within the statement target", async () => {
     const { db, checkout, store } = open();
     const oids: string[] = [];
     store.writeObjects(
@@ -672,9 +672,9 @@ describe("maintenance repack", () => {
       checkout.repoId,
       oids.map((oid) => ({ oid })),
     );
-    const selected = await advanceBelowStatementLimit(db, store.shared);
+    const selected = await advanceWithinStatementTarget(db, store.shared);
     expect(selected).toMatchObject({ boundary: "selected", objectCount: 2_048 });
-    const published = await advanceBelowStatementLimit(db, store.shared);
+    const published = await advanceWithinStatementTarget(db, store.shared);
     expect(published).toMatchObject({ boundary: "published", objectCount: 2_048 });
     expect(
       db.scalar<number>(
@@ -689,7 +689,7 @@ describe("maintenance repack", () => {
         published.packId,
       ),
     ).toBeLessThanOrEqual(64 * 1024 * 1024);
-    expect(await advanceBelowStatementLimit(db, store.shared)).toMatchObject({
+    expect(await advanceWithinStatementTarget(db, store.shared)).toMatchObject({
       boundary: "finalized",
       objectCount: 2_048,
     });
@@ -998,8 +998,8 @@ describe("maintenance repack", () => {
     const data = deterministicBytes(MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024);
     const oid = store.write("blob", data);
     seedRepack(db, checkout.repoId, [{ oid }]);
-    await advanceBelowStatementLimit(db, store.shared);
-    const published = await advanceBelowStatementLimit(db, store.shared);
+    await advanceWithinStatementTarget(db, store.shared);
+    const published = await advanceWithinStatementTarget(db, store.shared);
     if (published.packId === null) throw new Error("oversized maintenance pack was not published");
     expect(
       db.scalar<number>(
@@ -1012,7 +1012,7 @@ describe("maintenance repack", () => {
 
     const reopened = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
     const cold = reopened.openCheckout(checkout.id);
-    const finalized = await advanceBelowStatementLimit(db, cold.shared);
+    const finalized = await advanceWithinStatementTarget(db, cold.shared);
     expect(finalized).toMatchObject({ boundary: "finalized", packId: published.packId });
     expect(
       db.scalar<number>(
@@ -1024,7 +1024,7 @@ describe("maintenance repack", () => {
     expect(cold.packs.read(oid)?.data).toEqual(data);
   });
 
-  it("shares the cold dependency-read budget across maintenance shadow pages", async () => {
+  it("finalizes cold dependency reads beyond the former maintenance query budget", async () => {
     const { db, checkout, store } = open();
     const fixture = await sharedOversizedDeltaFixture(store);
     for (const target of fixture.targets) {
@@ -1061,25 +1061,27 @@ describe("maintenance repack", () => {
     );
     db.storage.resetCounters();
 
-    await expect(advanceMaintenanceRepack(store.shared, REPACK_OPTIONS)).rejects.toMatchObject({
-      code: "E2BIG",
+    expect(await advanceMaintenanceRepack(store.shared, REPACK_OPTIONS)).toMatchObject({
+      status: "progress",
+      boundary: "finalized",
+      objectCount: 22,
     });
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(
       db.scalar<number>("SELECT count(*) FROM git_objects WHERE repo_id = ?", checkout.repoId),
-    ).toBe(fixture.targets.length);
+    ).toBe(0);
     expect(
       db.scalar<number>(
         "SELECT count(*) FROM git_loose_object_lifecycle WHERE repo_id = ?",
         checkout.repoId,
       ),
-    ).toBe(fixture.targets.length);
+    ).toBe(0);
     expect(
       db.scalar<number>(
         "SELECT repacked_objects FROM git_maintenance_runs WHERE repo_id = ?",
         checkout.repoId,
       ),
-    ).toBe(0);
+    ).toBe(22);
     expect(db.scalar<number>("SELECT count(*) FROM git_maintenance_repack_batches")).toBe(0);
     expect(
       db.scalar<string>(
@@ -1095,6 +1097,17 @@ describe("maintenance repack", () => {
         fixture.deltaPackId,
       ),
     ).toBe("complete");
+    for (const target of fixture.targets) {
+      const object = store.read(target.oid);
+      expect(object?.type).toBe("blob");
+      expect(object?.data).toHaveLength(target.size);
+      if (object === null) throw new Error(`finalized target ${target.oid} is missing`);
+      expect(hashObject(object.type, object.data)).toBe(target.oid);
+    }
+    expect(await advanceMaintenanceRepack(store.shared, REPACK_OPTIONS)).toMatchObject({
+      status: "complete",
+      boundary: null,
+    });
   });
 
   it("returns root-changed without touching selected, pending, or published state", async () => {

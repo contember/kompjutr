@@ -458,7 +458,7 @@ describe("maintenance crash and restart qualification", () => {
       boundary: "selected",
       packId: null,
     });
-    expect(db.storage.statementCount).toBeLessThan(900);
+    expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_pack_data")).toBe(0);
     expect(db.scalar<number>("SELECT count(*) FROM git_pack_objects")).toBe(0);
@@ -467,13 +467,13 @@ describe("maintenance crash and restart qualification", () => {
       boundary: "published",
       objectCount: 1_024,
     });
-    expect(db.storage.statementCount).toBeLessThan(900);
+    expect(db.storage.statementCount).toBeLessThan(1_000);
     db.storage.resetCounters();
     expect(await advanceMaintenanceRepack(reopened.shared, { nowMs: 1 })).toMatchObject({
       boundary: "finalized",
       objectCount: 1_024,
     });
-    expect(db.storage.statementCount).toBeLessThan(900);
+    expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(
       db.scalar<number>(
         "SELECT repacked_objects FROM git_maintenance_runs WHERE repo_id = ?",
