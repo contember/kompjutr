@@ -42,7 +42,7 @@ for (const slice of slices) {
   process.stdout.write(`\n=== ${slice.name} ===\n`);
   const result = spawnSync(
     process.execPath,
-    [vitest, "run", `--maxWorkers=${slice.workers ?? 4}`, ...slice.args],
+    [vitest, "run", `--maxWorkers=${slice.workers ?? 2}`, ...slice.args],
     {
       cwd: root,
       stdio: "inherit",
