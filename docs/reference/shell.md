@@ -67,8 +67,28 @@ repeated `-e`/`--regexp`, `-g`/`--glob`, and `-t`/`--type`. Known types are
 `ts`, `js`, `md`, `json`, `css`, `html`, `py`, `go`, `rust`, `sh`, `yaml`,
 `toml`, and `sql`. Ignore files are deliberately not read.
 
-`git` is not built in. Consumers inject it or another command through
-`ShellOptions.commands`; the shell layer never imports the Git layer.
+`git` is not built in. Register the explicit adapter from `kompjutr/git/shell`:
+
+```ts
+import { createGitCommand } from "kompjutr/git/shell";
+import { createShell } from "kompjutr/shell";
+
+const shell = createShell({
+  fs: workspace.filesystem,
+  commands: new Map([["git", createGitCommand(workspace.git)]]),
+});
+```
+
+The shell layer never imports the Git layer and the root entry does not install
+the command implicitly. The adapter exposes only the strict local argv subset
+listed in [Git support](git-support.md#strict-local-argv-runner). It closes an
+upstream stdin stream without reading it, because no accepted Git command reads
+stdin.
+
+Git stdout remains pipeline bytes. Git stderr uses the raw diagnostic seam, so
+the adapter adds no command prefix, newline, or decoding. It therefore preserves
+Git's command-specific bytes under direct stderr, `2>&1`, and `2>/dev/null`.
+Existing built-ins keep using the prefixed `warn()` seam.
 
 ## Query and mutation shapes
 
@@ -97,8 +117,24 @@ one logical filesystem revision per mutating call.
 `RunResult.operations` reports the shell-visible filesystem call count.
 `RunResult.peakRetainedBytes` reports the measured peak intermediate-byte
 reservation for the run. It excludes public stdout and stderr, because those
-have their own caps. All structural operations remain subject to the project
-limits of at most 1,000 SQL statements and less than 100 MiB per operation.
+have their own caps. An injected Git command performs separately bounded SQL
+work through its runner, so that SQL is deliberately excluded from
+`RunResult.operations`.
+
+Before Git runs, the adapter derives output ceilings from the planned
+destination. Terminal output gets the bytes remaining in the public sink; a
+redirect gets the atomic redirect ceiling; an upstream pipeline gets Git's
+intrinsic ceiling and any trailing-`head` demand hint. Direct stderr gets the
+remaining stderr sink, merged stderr shares the stage-output budget, and dropped
+stderr retains and charges nothing. The Git runner then applies its intrinsic
+16 MiB stdout, 1 MiB stderr, and 16 MiB combined maxima. The first excess fails
+with an output limit instead of publishing a partial semantic result.
+
+For `git add`, `git commit`, and both admitted rebase actions, mutation and
+output preflight share one database transaction. A terminal, pipeline, merged,
+or redirect overflow therefore leaves no partial index, worktree, ref, or
+operation-state change. Redirect publication remains atomic as for every other
+command.
 
 ## Deliberate boundaries
 

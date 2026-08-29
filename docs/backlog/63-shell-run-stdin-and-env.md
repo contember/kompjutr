@@ -9,8 +9,9 @@ blocked-by: []
 **Summary.** Surface, not parity. `run(source)` takes a source string and
 nothing else, so a consumer cannot give a command its stdin or its environment.
 Both are inputs the agent-session orchestrator's shell tool already carries, and
-[61](61-git-shell-command-and-argv-entry.md) assumes env reaches a command.
-Small: neither touches a deliberate parser boundary.
+[ADR 0015](../decisions/0015-route-git-argv-through-one-synchronous-runner.md)
+lets the Git runner read identity env that an injected shell command cannot yet
+receive. Small: neither touches a deliberate parser boundary.
 
 ## Problem
 
@@ -22,10 +23,9 @@ Small: neither touches a deliberate parser boundary.
   command is first". What a command reads from is there; what is missing is a
   way for the caller to seed the first stage.
 - `src/shell/exec/context.ts:268` — `CommandContext` has no `env` field.
-  [61](61-git-shell-command-and-argv-entry.md) states that identity defaults
-  "read `env` the way `commit()` does", which no injected command can do today.
-  61 does not list this as a dependency and its touch points do not include the
-  context; whichever of the two ships first has to add it.
+  [ADR 0015](../decisions/0015-route-git-argv-through-one-synchronous-runner.md)
+  gives the strict Git runner four identity variables, but the shell adapter
+  cannot supply them until a run can pass env to an injected command.
 - The workaround for stdin is a temp file and a `<` redirect — `cat < in.txt`
   works today. It costs a write, plus a path the caller has to name, own and
   clean up on every invocation, in a session whose filesystem is shared.

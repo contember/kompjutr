@@ -5,14 +5,16 @@ matter.
 
 ## How to read this
 
-kompjutr has **no command line**. Git is a typed method surface — the `Git`
-interface from `kompjutr/git` (and the narrower `GitClient` from
-`kompjutr/compat/computer`). `cli({ argv })` always throws
-`UnsupportedOperationError`; there is no argv parser to add flags to.
+kompjutr has no external process or general Git command line. Its primary API is
+the typed `Git` interface from `kompjutr/git` (and the narrower `GitClient` from
+`kompjutr/compat/computer`). A strict local argv runner covers the agent command
+subset described below. It never falls back to a binary or admits an unlisted
+command.
 
 The tables therefore map the familiar command-line spelling to the option that
-provides it. **A flag that is not listed is not supported.** Unsupported input
-fails with a stable `error.code`; nothing silently degrades.
+provides it. **A flag that is not listed is not supported.** Unsupported typed
+input fails with a stable `error.code`; the argv runner returns its frozen
+command-specific refusal. Nothing silently degrades.
 
 | Mark | Meaning |
 |---|---|
@@ -58,6 +60,66 @@ atomic checkpoint transport, and remote ref discovery. A consumer adapter
 belongs to the consumer repository, not this package. Partial clone remains the
 main network gap. Local snapshot replay is available without textual patch
 interchange.
+
+## Strict local argv runner
+
+Native `Git` implements synchronous
+`runCli(input, options?): GitCliResult`; `cli(input)` is its asynchronous wrapper.
+The Computer compatibility client's `cli(input)` invokes the same dispatcher.
+`GitCliRunner`, `GitCliInput`, `GitCliResult`, and `GitCliRunOptions` are public
+types from `kompjutr` and `kompjutr/git`.
+
+The accepted argv grammar is exact:
+
+| Command | Accepted argv |
+|---|---|
+| `status` | Exactly one of `--porcelain`, `--porcelain=v1`, `--short`, `-s` |
+| `diff` | No operands or options |
+| `log` | At most one of `-1`, `-n <count>`, `--max-count=<count>`; at most one of `--oneline`, `--format=<template>`; then at most one ref or admitted `<a>..<b>` range |
+| `rev-list` | Exactly `--count <a>..<b>` |
+| `symbolic-ref` | Exactly `--short <ref>` |
+| `add` | One or more literal paths; an optional `--` ends option parsing |
+| `commit` | Exactly `-m <message>` or `--message=<message>` |
+| `rebase` | Exactly `--continue` or `--abort` |
+
+`log` counts are ASCII decimals from 0 through 50,000; `-1` is the only joined
+shorthand. Custom log formats accept literal UTF-8 plus `%H`, `%h`, `%P`, `%s`,
+`%B`, `%an`, `%ae`, `%at`, `%cn`, `%ce`, `%ct`, `%n`, and `%%`. A log range is
+admitted only when the right tip reaches the left OID through a single-parent
+chain. Merge, divergent, unrelated, and shallow-boundary ranges fail closed.
+`rev-list --count` retains its bounded two-sided graph semantics and therefore
+also handles merge and divergent histories.
+
+Expected command and Git-domain failures are returned as a command-specific
+`{ stdout, stderr, exitCode }` triplet. They are not collapsed into one generic
+usage result. For example, unknown `status` and `diff` options exit 129 with
+usage on stderr; invalid `log` options and counts exit 128 with a fatal line; an
+unknown subcommand exits 1; and `fetch`, `push`, `pull`, `clone`, and `ls-remote`
+exit 128 without reaching transport. Commit refusals may report status on
+stdout. A successful rebase continuation places the commit summary on stdout
+and completion text on stderr. Unexpected implementation errors still throw.
+
+`cwd` is an absolute checkout path and defaults to `/`; the input does not
+accept the typed API's `dir` field. Paths resolve from `cwd`, cannot escape the
+selected checkout, and keep repository-root-relative output. Accepted commands
+do not read stdin; a supplied string is validated and ignored. Only
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
+`GIT_COMMITTER_EMAIL` affect commit identity. Complete environment identities
+win over repository config and the binding default. Unlike Git, a partial
+environment identity is not completed field-by-field from config.
+
+Input limits are 256 argv entries and 1 MiB of argv bytes, 256 environment
+entries and 1 MiB of environment key/value bytes, 1 MiB of stdin, 4,096 cwd
+bytes, 1 MiB per commit message, and 64 KiB per log format. Default output
+ceilings are 16 MiB stdout, 1 MiB stderr, and 16 MiB combined. Run options can
+only tighten those ceilings, discard stderr, or provide a log count hint up to
+50,000. The first excess fails with `E2BIG`; semantic output is never truncated.
+
+`add`, `commit`, and both rebase actions execute their mutation, format their
+success output, and preflight all retained output inside one database
+transaction. An output failure therefore rolls back index, worktree, refs, and
+operation state. Expected operation failures are mapped only after rollback and
+cache revalidation.
 
 ## Repository creation
 
@@ -327,9 +389,12 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 
 | Git | kompjutr | |
 |---|---|---|
-| `git ls-files` | `lsFiles()` | ★ ~ index paths; `{ ref }` lists a tree instead |
-| `git ls-files -- <pathspecs>` | `lsFiles({ paths })` | ★ ~ bounded literals and default `*`, `?`, bracket-class, and `**` globs; wildcards cross `/`. Leading `/` and all leading-`:` magic are rejected; bare leading `!` and `^` are literals |
-| `--stage`, `--others`, `--exclude-standard`, `--error-unmatch` | — | ✘ |
+| `git ls-files` / `--cached` | `lsFiles()` / `{ cached: true }` | ★ ~ returns each index path once, even when conflict stages repeat it; `{ ref }` lists one authenticated tree instead |
+| `--others` | `lsFiles({ others: true })` | ★ ✔ returns files and symlinks absent from every index stage; explicit `others` defaults `cached` to false |
+| `--cached --others` | `lsFiles({ cached: true, others: true })` | ★ ✔ merges unique cached and untracked paths in Git byte order |
+| `--exclude-standard` | `excludeStandard: true` with `others: true` | ★ ~ reads the repository `.gitignore` hierarchy only; no `.git/info/exclude` or global excludes exist |
+| `-- <pathspecs>` | `lsFiles({ paths })` | ★ ~ bounded literals and default `*`, `?`, bracket-class, and `**` globs; wildcards cross `/`. Leading `/` and all leading-`:` magic are rejected; bare leading `!` and `^` are literals |
+| `--stage`, `--error-unmatch` | — | ✘ |
 | `git ls-tree <ref> [<path>]` | `lsTree()` | ★ ~ one level by default; `recursive: true` returns bounded recursive mode/type/oid/path rows; a `<path>` naming a blob returns that single entry |
 | `git cat-file <oid>` | `catFile()` | ★ ~ returns `{ oid, bytes }`; `filepath` or the `<oid>:<path>` shorthand reads inside a tree. ✘ `-t`, `-s`, `-p`, ✘ `-e` (a missing path throws instead of exiting non-zero) |
 | `git hash-object [-w]` | `hashObject()` | ~ blobs only; `write` stores it. ✘ `-t commit\|tree\|tag`, ✘ stdin batching |
@@ -342,6 +407,15 @@ committer). ✘ no patch output, ✘ no tree/blob display.
 | `GIT_INDEX_FILE=<throwaway>` around those commands | `withScratchIndex({ name }, callback)` | ★ ~ the synchronous callback receives `readTree`, `add`, `writeTree`, `commitTree`, and `replaySnapshot`; all scratch rows are transaction-scoped and no index file or persistent alternate index exists |
 | `git diff --binary --full-index <snap>^ <snap>` then `git apply --3way --cached` | `scratch.replaySnapshot({ snapshot, onto })` | ★ ~ index-only replay while all objects share one store; clean results return a tree, conflicts return physical stage rows and write nothing. ✘ textual patch interchange |
 | general `git rev-list`, ref enumeration through `git for-each-ref` | — | ✘ the bounded reads above do not expose general enumeration |
+
+Omitted selection remains cached-only. `excludeStandard` requires `others`.
+Any presence of `cached`, `others`, or `excludeStandard`, including `false`, is
+rejected with `{ ref }`. Native client calls prune registered nested checkout
+roots instead of returning Git's ordinary directory row for them. Combined
+worktree selection accepts at most 64 pathspecs and scans at most 100,000 merged
+source rows. Its tested worst-case allocation is 700 SQL statements; cached-only
+selection retains its separate 903-statement allocation. Result and matcher
+state remain byte-bounded and the first excess fails instead of truncating.
 
 ## Branches, tags and refs
 
@@ -673,8 +747,9 @@ under `gc.*`. The reference workload also sets `safe.directory`,
 
 ## Not implemented
 
-These have no method and no equivalent. `stash` and the argv entry point throw
-`UnsupportedOperationError`; the rest simply do not exist on the surface.
+These have no typed method, no admitted local argv form, and no equivalent.
+`stash` methods throw `UnsupportedOperationError`; the rest simply do not exist
+on the surface.
 
 - **State:** `stash` (push/list/pop throw), `rerere`, `notes`
 - **Layout:** worktree `move`, `repair`, `lock`, `unlock`, worktree-local config,
@@ -701,7 +776,8 @@ These have no method and no equivalent. `stash` and the argv entry point throw
 covers clone, fetch, init, status, diff, diffSummary, clean, add, rm, reset,
 commit, log, show, revParse, repoRoot, currentBranch, lsFiles, lsTree, branch,
 tag, checkout, remote, config, hashObject, catFile, updateRef, push, pull and
-merge — with these differences:
+merge. Its `cli()` uses the strict runner above. The typed methods retain these
+differences:
 
 - ✘ no `cherryPick`, `revert` or `rebase`;
 - ✘ no `reflog` or `recoverRef` surface;
@@ -728,10 +804,12 @@ merge — with these differences:
 
 ## Limits
 
-Every accepted operation stays inside ≤1,000 SQL statements and <100 MiB. An
-operation that would exceed a structural limit throws a stable error instead of
-truncating. The per-operation caps (integration plan entries, tree bytes,
-worktree scan rows, path length, journal steps) are listed in
+Accepted operations currently enforce at most 1,000 SQL statements and less
+than 100 MiB. An operation that would exceed a structural or projected-count
+limit throws a stable error instead of truncating. Backlog 60 tracks replacing
+the projected statement barrier with a measured target. The per-operation caps
+(integration plan entries, tree bytes, worktree scan rows, path length, journal
+steps) are listed in
 [`architecture.md`](architecture.md).
 
 Two limits bite most often in ordinary use: the 2,200-byte cap on an emitted
@@ -761,8 +839,9 @@ plan, and shared 64 MiB memory bounds of the integration engine.
 
 ## Path and ordering rules
 
-- Pathspecs everywhere are **exact path or directory prefix**. No globs, no
-  `:(exclude)`, no `:(icase)`, no leading `:/`.
+- Mutating pathspecs are **exact path or directory prefix**. Read-only
+  `lsFiles({ paths })` additionally supports its bounded default glob subset.
+  No operation accepts `:(exclude)`, `:(icase)`, or leading `:/` magic.
 - Paths order by UTF-8 bytes, matching Git and SQLite `BINARY` — never by
   JavaScript string comparison.
 

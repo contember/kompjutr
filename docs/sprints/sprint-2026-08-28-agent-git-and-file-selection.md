@@ -530,3 +530,28 @@ catches every cross-layer wiring failure.
   mapping, database-affinity checks, internal rollback witnesses, and
   discard-stderr commit semantics are now binding; ADR 0016 is accepted and WU4
   may resume.
+- 2026-08-29 — WU1 shipped as `2376745`. T3 independent review was clean after
+  fixes; the cached/others/ignore/pathspec witness passed 34/34.
+- 2026-08-29 — WU2 shipped as `b2d0786`. T3 independent review was clean; the
+  parser, runtime-validation, and output-bound witness passed 104/104.
+- 2026-08-29 — WU3 shipped as `361fa0f`. Independent review closed clean at T3;
+  focused CLI reads passed 13/13, diff passed 17/17, and core reads passed 53/53.
+- 2026-08-29 — WU4 shipped as `5a907cb` after multi-pass T3 review-to-clean.
+  Fixes covered transaction/output atomicity, mixed ignored adds, nested-root
+  rebase exclusion, dirty clean-index status, and rollback/cache/OID witnesses.
+  The final CLI mutation witness passed 16/16 in 12.7 seconds; relevant core and
+  E2E slices were clean.
+- 2026-08-29 — WU5 shipped as `b12ef8d`. T2 review approved after correcting a
+  test name/filter; native client and Computer facade witnesses passed 44/44 in
+  5.66 seconds.
+- 2026-08-29 — WU6 shipped as `7f4ee68` after T3 review-to-clean. Fixes closed a
+  suspended-start iterator leak, structural `E2BIG` mapping, upstream closure,
+  and replaced-stdin closure. Final focused tests passed 36/36 in 2.78 seconds,
+  the shell slice passed 299/299 in 10.30 seconds, and typecheck, build, import,
+  Biome, and diff gates were clean.
+- 2026-08-29 — WU7 source exports and deterministic CLI/shell smoke passed
+  15/15. The routine gate passed 148/148 in 7.01 seconds. Typecheck, Biome,
+  build, packed-package imports (including `kompjutr/git/shell`), and diff checks
+  are clean. Agent-docs lint reports only the pre-existing unrelated
+  `docs/AGENTS.md` stray-root error; it found no broken link from the backlog 61
+  deletion.

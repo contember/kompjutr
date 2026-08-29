@@ -55,8 +55,11 @@ plumbing operations exposed by `Git`. Pull fetches the configured upstream and
 delegates fast-forward or divergent integration to the native merge lifecycle.
 Merge supports fast-forward, forced merge commits, clean and conflicted
 integration, `commit: false`, restart-safe continue, and path-scoped abort for
-the checked-out branch. Unsupported commands fail with `EUNSUPPORTED` instead
-of falling back to another implementation.
+the checked-out branch. `runCli()` and async `cli()` expose a strict local subset
+for status, diff, log, rev-list count, symbolic-ref reads, add, commit, and
+rebase continue/abort. Unsupported typed operations throw `EUNSUPPORTED`; the
+argv runner returns command-specific Git-shaped results. Neither surface falls
+back to another implementation.
 
 ```ts
 await workspace.git.init({ dir: "/" });
@@ -126,16 +129,21 @@ recursive listings, path expansion, copy, and touch use set-based filesystem
 operations. It is a separate entry point, not part of `Workspace`.
 
 ```ts
+import { createGitCommand } from "kompjutr/git/shell";
 import { createShell } from "kompjutr/shell";
 
-const shell = createShell({ fs: workspace.filesystem });
-const { stdout, operations, peakRetainedBytes } = shell.run("grep -rl createShell /src");
+const shell = createShell({
+  fs: workspace.filesystem,
+  commands: new Map([["git", createGitCommand(workspace.git)]]),
+});
+const { stdout, operations } = shell.run("git status --porcelain | wc -l");
 ```
 
 Stdout, stderr, filesystem operations, and live intermediate bytes are bounded
 by the executor, so a command without `| head` still returns a bounded result.
 File redirects stream atomically and roll back on an upstream failure. `git` is
-not a built-in; a consumer injects it through `commands`. See
+not a built-in; the explicit adapter exposes a strict local allowlist and never
+falls back to a process. See
 [the shell reference](docs/reference/shell.md) for the exact command set,
 limits, and deliberate divergences from Bash.
 
