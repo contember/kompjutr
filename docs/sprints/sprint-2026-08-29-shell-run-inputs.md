@@ -201,7 +201,7 @@ ownership, bounds, witness strength, out-of-scope consumer contract clauses and
 the proportional review gates.
 
 - **Reviewer:** Peirce (`review_shell_inputs_plan_fast`)
-- **Verdict:** blocked pending re-review
+- **Verdict:** approved after retained-memory and close-path corrections
 - **Material findings:** The initial plan encoded stdin before its retained
   reservation and did not charge env snapshot bytes, so caller input could
   allocate outside a smaller configured memory ceiling. It also promised exact
@@ -210,7 +210,7 @@ the proportional review gates.
   any input owner exists, measures stdin and env without encoded copies,
   reserves their combined lifetime before allocation, releases in the outermost
   execution `finally`, and adds direct boundary/close-path witnesses. Independent
-  re-review is required before WU1 starts.
+  re-review approved those corrections before WU1 started.
 
 ## Run log
 
@@ -222,3 +222,6 @@ the proportional review gates.
   retained-memory preflight and unobserved close paths. Both findings are
   corrected in the frozen contract and witnesses; implementation remains
   stopped pending re-review.
+- 2026-08-29 — Peirce approved the corrected proposal. The combined
+  pre-allocation reservation, parse precedence and direct close-path witnesses
+  resolve both blockers; WU1 may start.
