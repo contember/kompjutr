@@ -52,7 +52,7 @@
     "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run test:smoke",
-    "test:smoke": "vitest run --maxWorkers=4 tests/schema.test.ts tests/database.test.ts tests/transactions.test.ts tests/fs/filesystem.test.ts tests/shell/journey.test.ts tests/plumbing-git-contract.test.ts tests/integration.test.ts tests/runtime.test.ts tests/workspace.test.ts tests/client.test.ts tests/operation-state.test.ts tests/compat.test.ts tests/public-exports.test.ts tests/production-probe-protocol.test.ts",
+    "test:smoke": "vitest run --maxWorkers=4 tests/schema.test.ts tests/database.test.ts tests/transactions.test.ts tests/fs/filesystem.test.ts tests/shell/journey.test.ts tests/plumbing-git-contract.test.ts tests/integration.test.ts tests/runtime.test.ts tests/workspace.test.ts tests/client.test.ts tests/operation-state.test.ts tests/compat.test.ts tests/public-exports.test.ts tests/git-cli-smoke.test.ts tests/production-probe-protocol.test.ts",
     "test:fs": "vitest run --maxWorkers=4 tests/fs",
     "test:shell": "vitest run --maxWorkers=4 tests/shell",
     "test:e2e": "vitest run --maxWorkers=4 tests/e2e",

@@ -139,6 +139,12 @@ export type {
   WriteEntry,
   WriteOptions,
 } from "./fs/types.js";
+export type {
+  GitCliInput,
+  GitCliResult,
+  GitCliRunner,
+  GitCliRunOptions,
+} from "./git/cli/types.js";
 export {
   type CreateGitOptions,
   createGit,
@@ -190,8 +196,6 @@ export {
   type Async,
   type AsyncFilesystem,
   type ExitStatus,
-  type GitCliInput,
-  type GitCliResult,
   type ProcessEvent,
   type ProcessExecOptions,
   type ProcessHandle,

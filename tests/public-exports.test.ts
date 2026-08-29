@@ -26,6 +26,10 @@ import type {
   GitDivergenceOptions,
   DivergenceRelationship as GitDivergenceRelationship,
   DivergenceResult as GitDivergenceResult,
+  GitCliInput as GitEntrypointCliInput,
+  GitCliResult as GitEntrypointCliResult,
+  GitCliRunner as GitEntrypointCliRunner,
+  GitCliRunOptions as GitEntrypointCliRunOptions,
   Git as GitEntrypointGit,
   GitStatusOptions as GitEntrypointStatusOptions,
   GitStatusReport as GitEntrypointStatusReport,
@@ -103,6 +107,7 @@ import {
   worktreeRemove as gitWorktreeRemove,
   writeTree as gitWriteTree,
 } from "../src/git/index.js";
+import { createGitCommand } from "../src/git/shell.js";
 import type {
   GitBranchRenameOptions as RootBranchRenameOptions,
   GitCherryPickContinueOptions as RootCherryPickContinueOptions,
@@ -132,6 +137,10 @@ import type {
   FetchRefspec as RootFetchRefspec,
   FetchRefUpdate as RootFetchRefUpdate,
   Git as RootGit,
+  GitCliInput as RootGitCliInput,
+  GitCliResult as RootGitCliResult,
+  GitCliRunner as RootGitCliRunner,
+  GitCliRunOptions as RootGitCliRunOptions,
   GitDivergenceOptions as RootGitDivergenceOptions,
   GitFetchOptions as RootGitFetchOptions,
   GitLsRemoteOptions as RootGitLsRemoteOptions,
@@ -945,5 +954,27 @@ describe("public remote URL exports", () => {
       2_189,
       8_192,
     ]);
+  });
+});
+
+describe("public Git CLI exports", () => {
+  it("exposes one runner contract and the explicit shell adapter subpath", () => {
+    const rootInput: RootGitCliInput = { argv: ["status", "--porcelain"], cwd: "/repo" };
+    const gitInput: GitEntrypointCliInput = rootInput;
+    const rootOptions: RootGitCliRunOptions = { logLimitHint: 3 };
+    const gitOptions: GitEntrypointCliRunOptions = rootOptions;
+    const rootResult: RootGitCliResult = { stdout: "", stderr: "", exitCode: 0 };
+    const gitResult: GitEntrypointCliResult = rootResult;
+    const rootRunner: RootGitCliRunner = {
+      runCli(input, options) {
+        expect(input).toBe(rootInput);
+        expect(options).toBe(rootOptions);
+        return rootResult;
+      },
+    };
+    const gitRunner: GitEntrypointCliRunner = rootRunner;
+
+    expect(gitRunner.runCli(gitInput, gitOptions)).toBe(gitResult);
+    expect(typeof createGitCommand).toBe("function");
   });
 });

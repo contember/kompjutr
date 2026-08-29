@@ -126,6 +126,12 @@ export {
   SqliteGitDatabase,
   type StoreOptions,
 } from "../sqlite/store.js";
+export type {
+  GitCliInput,
+  GitCliResult,
+  GitCliRunner,
+  GitCliRunOptions,
+} from "./cli/types.js";
 export {
   type CreateGitOptions,
   createGit,
