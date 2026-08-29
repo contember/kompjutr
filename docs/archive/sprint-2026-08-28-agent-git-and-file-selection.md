@@ -1,3 +1,25 @@
+> **OUTCOME — shipped 2026-08-29.** Native and Computer clients now share one
+> strict synchronous local Git argv runner, `kompjutr/git/shell` exposes it as
+> an injectable shell command, and `lsFiles()` can merge tracked and
+> non-ignored untracked paths in Git byte order. Commit map: plan and contract →
+> `737e042`, `c532445`, `a4fc714`, `b829b5d`, `316d489`; WU1 → `2376745`; WU2 →
+> `b2d0786`, `906edfe`; WU3 → `361fa0f`; WU4 → `5a907cb`; WU5 → `b12ef8d`;
+> WU6 → `7f4ee68`; WU7 → `b763c38`, `d2b1263`; integrated correctness fixes →
+> `f7d57a1`, `3ddafd2`, `0bff9cb`, `28a7463`, `9509d38`, `d0b2332`,
+> `3e36283`; stable full-suite workers → `646ad67`; closure → this archived
+> record. Verification: the routine gate passed 148/148 in 5.62 s; the focused
+> integration gate passed 280/280 in 29.92 s; the complete sliced runner passed
+> 2,910 tests with five known skips and zero failures. Typecheck, Biome, build,
+> packed-package smoke, and diff validation passed. Independent T3 integration
+> review closed every correctness finding after fixes. Its remaining Computer
+> traversal result — 10,019 statements for a 1,001-file plain diff — is a
+> benchmark target miss under invariant 5, not a runtime refusal: no projected
+> statement `E2BIG` was added, existing barriers were left unchanged, and their
+> removal remains [backlog 60](../backlog/60-budget-targets-and-store-split.md).
+> Deferred: wiring one real consumer adapter is the external Phase 1 integration
+> gate; commands outside the frozen allowlist and mutating glob pathspecs remain
+> separately filed.
+
 # Sprint — Agent Git and file selection (2026-08-28)
 
 **Goal.** Let an agent run the required local Git subset inside the synchronous
@@ -555,3 +577,16 @@ catches every cross-layer wiring failure.
   are clean. Agent-docs lint reports only the pre-existing unrelated
   `docs/AGENTS.md` stray-root error; it found no broken link from the backlog 61
   deletion.
+- 2026-08-29 — Integrated T3 review closed record validation, nested checkout
+  discovery, combined conflict diff parity, no-final-newline rendering, output
+  accounting, and retained-memory findings. The final projected statement-count
+  finding is not a release blocker under the corrected invariant 5. It is
+  retained as benchmark evidence for backlog 60; no new runtime refusal was
+  added and existing statement barriers were not removed in this sprint.
+- 2026-08-29 — The closure-focused CLI, Computer, shell, pathspec, and export
+  set passed 280/280 in 29.92 seconds. The routine gate passed 148/148 in 5.62
+  seconds. Typecheck, Biome, build, packed-package smoke, and diff checks passed.
+  The first full-suite attempt completed its 365 tests but hit Vitest worker RPC
+  timeouts because four workers ran under a two-vCPU lease. The runner was
+  aligned to two workers as `646ad67`; the affected shard then passed 365/365,
+  and the complete sliced gate passed 2,910 tests with five known skips.

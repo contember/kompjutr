@@ -116,6 +116,9 @@ only tighten those ceilings, discard stderr, or provide a log count hint up to
 50,000. Plain `diff` scans at most 100,000 worktree source rows, including
 untracked rows it must discard, and renders unmerged paths in Git's combined
 format. The first excess fails with `E2BIG`; semantic output is never truncated.
+The installed Computer interface still exposes scalar worktree metadata reads:
+a 1,001-file plain-diff probe uses 10,019 statements. That is a measured target
+miss, not a runtime rejection, and the runner adds no projected-count refusal.
 
 `add`, `commit`, and both rebase actions execute their mutation, format their
 success output, and preflight all retained output inside one database
@@ -417,7 +420,10 @@ roots instead of returning Git's ordinary directory row for them. Combined
 worktree selection accepts at most 64 pathspecs and scans at most 100,000 merged
 source rows. Its tested worst-case allocation is 700 SQL statements; cached-only
 selection retains its separate 903-statement allocation. Result and matcher
-state remain byte-bounded and the first excess fails instead of truncating.
+state remain byte-bounded, and structural or memory excess fails instead of
+truncating. Projected statement-count barriers that predate invariant 5 remain
+compatibility behavior isolated for removal in
+[backlog 60](../backlog/60-budget-targets-and-store-split.md).
 
 ## Branches, tags and refs
 

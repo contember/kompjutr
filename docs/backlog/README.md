@@ -92,23 +92,22 @@ units) or *long* (roughly seven to ten); an item whose acceptance scope exceeds
 one work unit is split at the WU level inside its own sprint, never across two.
 A blocked item must not move ahead of its blocker.
 
-**Phase 1** closes every remaining row of the table above and ends at an
-integration gate: one consumer adapter runs its real workflow against the
-package, and everything below the gate is re-planned from what that run finds.
+**Phase 1** package work is complete and waits at an integration gate: one
+consumer adapter runs its real workflow against the package, and everything
+below the gate is re-planned from what that run finds.
 **Phase 2** is production scale. **Phase 3** is Git parity that no consumer
 issues; it stays filed and unscheduled until a caller appears.
 
 | # | Sprint | Items | Length | Why here |
 |---|---|---|---|---|
 | **Phase 1 — a consumer can run** | | | | |
-| 1 | Agent shell git and builder file selection | [active sprint](../sprints/sprint-2026-08-28-agent-git-and-file-selection.md) | long | Package-side implementation is complete; closure and the external integration gate remain. |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 2 | Budget targets and store split | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
+| 1 | Budget targets and store split | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
 | **Phase 2 — production scale** | | | | |
-| 3 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
-| 4 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
-| 5 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
+| 2 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
+| 3 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
+| 4 | Integrity audit and snapshots | [17](17-integrity-audit-and-snapshots.md) | long | After 41 settles the storage shapes it audits. |
 | **Phase 3 — parity without a caller (unscheduled)** | | | | |
 | — | Stash | [06](06-stash-operations.md) | normal | No consumer stashes; checkpoints cover "save and restore". |
 | — | Everyday reads | [35](35-staged-diff.md), [37](37-history-reads-patch-and-paths.md) | long | Staged diff and log path filters; both consumers route through `diffSummary({ ref })` and `log` with a stop oid today. |
