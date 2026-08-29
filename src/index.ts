@@ -15,7 +15,6 @@ export {
   RefNotFoundError,
   UnsupportedOperationError,
 } from "./core/errors.js";
-export { MAX_REMOTE_NAME_BYTES, MAX_REMOTE_URL_BYTES } from "./core/ops/config.js";
 export type {
   CommitResult,
   DiffSummaryEntry,
@@ -28,7 +27,6 @@ export type {
   StatusRow,
 } from "./core/ops/kinds.js";
 export {
-  MAX_LS_REMOTE_PATTERN_BYTES,
   MAX_LS_REMOTE_PATTERNS,
   MAX_LS_REMOTE_REFS,
 } from "./core/ops/ls-remote.js";
@@ -74,7 +72,6 @@ export {
   type LsRemoteResult,
   MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS,
-  MAX_REFSPEC_REF_BYTES,
   type PushRefStatus,
   type PushRefspec,
   type PushResult,

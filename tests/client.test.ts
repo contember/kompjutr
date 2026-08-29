@@ -8,11 +8,17 @@ import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
-import { MAX_REMOTE_NAME_BYTES, MAX_REMOTE_URL_BYTES } from "../src/core/ops/config.js";
 import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
 import { createGit, type Git, type GitScratchIndex } from "../src/git/client.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import {
+  Database,
+  type DurableObjectStorageLike,
+  type SQLCursorLike,
+  type SQLStorageLike,
+} from "../src/sqlite/db.js";
 import { iterateIndexTrackerDirty, readIndexTrackerState } from "../src/sqlite/index-tracker.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -27,6 +33,44 @@ import {
 
 const IDENTITY = { name: "Agent", email: "agent@example.com" };
 const FIXTURE_IDENTITY = { name: "Fixture", email: "fixture@example.com" };
+
+class CodedTooBigStorage implements DurableObjectStorageLike {
+  readonly sql: SQLStorageLike;
+  #queryFragment: string | null = null;
+  #binding: unknown;
+  writesBeforeFailure = 0;
+
+  constructor(private readonly inner: SqliteTestStorage) {
+    this.sql = {
+      exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
+        if (
+          this.#queryFragment !== null &&
+          query.includes(this.#queryFragment) &&
+          bindings.includes(this.#binding)
+        ) {
+          this.#queryFragment = null;
+          throw Object.assign(new Error("injected coded SQLite value failure"), {
+            code: "SQLITE_TOOBIG",
+          });
+        }
+        if (this.#queryFragment !== null && /^\s*(?:DELETE|INSERT|UPDATE)\b/.test(query)) {
+          this.writesBeforeFailure++;
+        }
+        return this.inner.sql.exec<Row>(query, ...bindings);
+      },
+    };
+  }
+
+  arm(queryFragment: string, binding: unknown): void {
+    this.#queryFragment = queryFragment;
+    this.#binding = binding;
+    this.writesBeforeFailure = 0;
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
 
 function makeWorkspace(now = 1_600_000_000_000): {
   workspace: Workspace;
@@ -769,50 +813,138 @@ describe("createSqliteGitClient", () => {
     ]);
   });
 
-  it("bounds remote URL input and stored values without changing the remote", async () => {
-    const { git } = makeNativeGit();
+  it("fails closed on a non-canonical persisted remote URL across a cold reopen", async () => {
+    const { git, workspace } = makeNativeGit();
+    const dir = "/corrupt-url-remote";
+    const path = "remote.origin.url";
+    const replacement = "https://example.invalid/replacement.git";
+    await git.init({ dir });
+    await git.remoteAdd({ dir, name: "origin", url: "https://example.invalid/original.git" });
+
+    const checkout = workspace.database.findCheckout(dir);
+    if (checkout === null) throw new Error("corrupt remote checkout is missing");
+    const persistedValue = (database: SqliteGitDatabase): Record<string, unknown> | undefined =>
+      database.db.one<Record<string, unknown>>(
+        `SELECT typeof(value) AS value_type, hex(CAST(value AS BLOB)) AS value_hex
+           FROM git_config
+          WHERE repo_id = ? AND path = ?`,
+        checkout.repoId,
+        path,
+      );
+    workspace.database.db.run(
+      "UPDATE git_config SET value = CAST(x'f09080' AS TEXT) WHERE repo_id = ? AND path = ?",
+      checkout.repoId,
+      path,
+    );
+    const corrupt = { value_type: "text", value_hex: "F09080" };
+    expect(persistedValue(workspace.database)).toEqual(corrupt);
+
+    await expect(git.remoteSetUrl({ dir, name: "origin", url: replacement })).rejects.toMatchObject(
+      { code: "ECORRUPT" },
+    );
+    expect(persistedValue(workspace.database)).toEqual(corrupt);
+
+    const coldDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+    const coldGit = bindNativeGitDatabase(workspace, coldDatabase);
+    expect(persistedValue(coldDatabase)).toEqual(corrupt);
+    await expect(coldGit.remoteGetUrl({ dir, name: "origin" })).rejects.toMatchObject({
+      code: "ECORRUPT",
+    });
+  });
+
+  it("rolls remote config back after coded SQLite value failures", async () => {
+    const workspace = makeTestWorkspace();
+    const faultStorage = new CodedTooBigStorage(workspace.storage);
+    const database = new SqliteGitDatabase(new Database(faultStorage));
+    const git = bindNativeGitDatabase(workspace, database);
+    const dir = "/remote-sqlite-too-big";
+    await git.init({ dir });
+    const configState = (): Record<string, unknown>[] =>
+      database.db.all<Record<string, unknown>>(
+        "SELECT path, seq, value FROM git_config WHERE repo_id = 1 ORDER BY path, seq",
+      );
+
+    const beforeAdd = configState();
+    faultStorage.arm("INSERT INTO git_config", "remote.origin.fetch");
+    await expect(
+      git.remoteAdd({ dir, name: "origin", url: "https://example.invalid/original.git" }),
+    ).rejects.toMatchObject({ name: "GitError", code: "E2BIG" });
+    expect(faultStorage.writesBeforeFailure).toBeGreaterThan(0);
+    expect(configState()).toEqual(beforeAdd);
+
+    const original = "https://example.invalid/original.git";
+    await git.remoteAdd({ dir, name: "origin", url: original });
+    const beforeSet = configState();
+    faultStorage.arm("INSERT INTO git_config", "remote.origin.url");
+    await expect(
+      git.remoteSetUrl({ dir, name: "origin", url: "https://example.invalid/replacement.git" }),
+    ).rejects.toMatchObject({ name: "GitError", code: "E2BIG" });
+    expect(faultStorage.writesBeforeFailure).toBeGreaterThan(0);
+    expect(configState()).toEqual(beforeSet);
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(original);
+
+    const coldDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+    const coldGit = bindNativeGitDatabase(workspace, coldDatabase);
+    await expect(coldGit.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(original);
+    await expect(coldGit.configGet({ dir, path: "remote.origin.fetch" })).resolves.toBe(
+      "+refs/heads/*:refs/remotes/origin/*",
+    );
+    for (const candidate of [database, coldDatabase]) {
+      const checkout = candidate.findCheckout(dir);
+      if (checkout === null) throw new Error("remote rollback checkout is missing");
+      const probe = candidate.openCheckout(checkout).reserveMemory();
+      try {
+        probe.set("other", MAX_OPERATION_MEMORY_BYTES);
+      } finally {
+        probe.dispose();
+      }
+    }
+  });
+
+  it("round-trips the former remote URL first excess through a cold reopen", async () => {
+    const { git, workspace } = makeNativeGit();
     const dir = "/bounded-url-remote";
     const original = "https://example.invalid/original.git";
     await git.init({ dir });
     await git.remoteAdd({ dir, name: "origin", url: original });
 
-    const boundary = "x".repeat(MAX_REMOTE_URL_BYTES);
-    await expect(git.remoteSetUrl({ dir, name: "origin", url: boundary })).resolves.toBeUndefined();
-    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(boundary);
-
+    const formerFirstExcess = "x".repeat(8_193);
     await expect(
-      git.remoteSetUrl({ dir, name: "origin", url: "x".repeat(MAX_REMOTE_URL_BYTES + 1) }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(boundary);
+      git.remoteSetUrl({ dir, name: "origin", url: formerFirstExcess }),
+    ).resolves.toBeUndefined();
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(formerFirstExcess);
+
+    const coldGit = bindNativeGitDatabase(workspace, new SqliteGitDatabase(workspace.database.db));
+    await expect(coldGit.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(formerFirstExcess);
 
     await git.configSet({
       dir,
       path: "remote.origin.url",
-      value: "x".repeat(MAX_REMOTE_URL_BYTES + 1),
+      value: formerFirstExcess,
     });
-    await expect(git.remoteGetUrl({ dir, name: "origin" })).rejects.toMatchObject({
-      code: "E2BIG",
-    });
-    await expect(git.remoteSetUrl({ dir, name: "origin", url: original })).rejects.toMatchObject({
-      code: "E2BIG",
-    });
-    await expect(git.configGet({ dir, path: "remote.origin.url" })).resolves.toBe(
-      "x".repeat(MAX_REMOTE_URL_BYTES + 1),
-    );
+    await expect(git.remoteGetUrl({ dir, name: "origin" })).resolves.toBe(formerFirstExcess);
+    await expect(git.remoteSetUrl({ dir, name: "origin", url: original })).resolves.toBeUndefined();
+    await expect(git.configGet({ dir, path: "remote.origin.url" })).resolves.toBe(original);
   });
 
   it("preserves long remote names and empty URL values accepted by real Git", async () => {
-    const { git } = makeNativeGit();
+    const { git, workspace } = makeNativeGit();
     const dir = "/long-name-remote";
-    const name = "r".repeat(256);
+    const name = "r".repeat(2_190);
     await git.init({ dir });
     await git.remoteAdd({ dir, name, url: "https://example.invalid/original.git" });
 
+    await expect(git.remoteList({ dir })).resolves.toEqual([
+      { name, url: "https://example.invalid/original.git" },
+    ]);
     await expect(git.remoteGetUrl({ dir, name })).resolves.toBe(
       "https://example.invalid/original.git",
     );
     await expect(git.remoteSetUrl({ dir, name, url: "" })).resolves.toBeUndefined();
     await expect(git.remoteGetUrl({ dir, name })).resolves.toBe("");
+    const coldGit = bindNativeGitDatabase(workspace, new SqliteGitDatabase(workspace.database.db));
+    await expect(coldGit.remoteList({ dir })).resolves.toEqual([{ name, url: "" }]);
+    await expect(coldGit.remoteGetUrl({ dir, name })).resolves.toBe("");
   });
 
   it("validates remote URL options before constructing config paths", async () => {
@@ -821,8 +953,8 @@ describe("createSqliteGitClient", () => {
     await git.init({ dir });
 
     await expect(
-      Reflect.apply(git.remoteGetUrl, git, [{ dir, name: "x".repeat(MAX_REMOTE_NAME_BYTES + 1) }]),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+      Reflect.apply(git.remoteGetUrl, git, [{ dir, name: "invalid\ud800" }]),
+    ).rejects.toMatchObject({ code: "EINVAL" });
     await expect(
       Reflect.apply(git.remoteSetUrl, git, [{ dir, name: "origin", url: "\ud800" }]),
     ).rejects.toMatchObject({ code: "EINVAL" });

@@ -85,14 +85,10 @@ import type {
   GitWriteTreeOptions,
 } from "../src/git/index.js";
 import {
-  MAX_LS_REMOTE_PATTERN_BYTES as GIT_MAX_LS_REMOTE_PATTERN_BYTES,
   MAX_LS_REMOTE_PATTERNS as GIT_MAX_LS_REMOTE_PATTERNS,
   MAX_LS_REMOTE_REFS as GIT_MAX_LS_REMOTE_REFS,
   MAX_REFSPEC_EXPANDED_DESTINATIONS as GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS as GIT_MAX_REFSPEC_MAPPINGS,
-  MAX_REFSPEC_REF_BYTES as GIT_MAX_REFSPEC_REF_BYTES,
-  MAX_REMOTE_NAME_BYTES as GIT_MAX_REMOTE_NAME_BYTES,
-  MAX_REMOTE_URL_BYTES as GIT_MAX_REMOTE_URL_BYTES,
   commitTree as gitCommitTree,
   divergence as gitDivergence,
   mergeBase as gitMergeBase,
@@ -194,14 +190,10 @@ import type {
   GitWriteTreeOptions as RootWriteTreeOptions,
 } from "../src/index.js";
 import {
-  MAX_LS_REMOTE_PATTERN_BYTES as ROOT_MAX_LS_REMOTE_PATTERN_BYTES,
   MAX_LS_REMOTE_PATTERNS as ROOT_MAX_LS_REMOTE_PATTERNS,
   MAX_LS_REMOTE_REFS as ROOT_MAX_LS_REMOTE_REFS,
   MAX_REFSPEC_EXPANDED_DESTINATIONS as ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS as ROOT_MAX_REFSPEC_MAPPINGS,
-  MAX_REFSPEC_REF_BYTES as ROOT_MAX_REFSPEC_REF_BYTES,
-  MAX_REMOTE_NAME_BYTES as ROOT_MAX_REMOTE_NAME_BYTES,
-  MAX_REMOTE_URL_BYTES as ROOT_MAX_REMOTE_URL_BYTES,
   commitTree as rootCommitTree,
   divergence as rootDivergence,
   mergeBase as rootMergeBase,
@@ -879,15 +871,11 @@ describe("public structured refspec exports", () => {
       typeof gitPushMethod,
       GIT_MAX_REFSPEC_MAPPINGS,
       GIT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
-      GIT_MAX_REFSPEC_REF_BYTES,
       ROOT_MAX_REFSPEC_MAPPINGS,
       ROOT_MAX_REFSPEC_EXPANDED_DESTINATIONS,
-      ROOT_MAX_REFSPEC_REF_BYTES,
       GIT_MAX_LS_REMOTE_PATTERNS,
-      GIT_MAX_LS_REMOTE_PATTERN_BYTES,
       GIT_MAX_LS_REMOTE_REFS,
       ROOT_MAX_LS_REMOTE_PATTERNS,
-      ROOT_MAX_LS_REMOTE_PATTERN_BYTES,
       ROOT_MAX_LS_REMOTE_REFS,
     ]).toEqual([
       "refs/remotes/origin/*",
@@ -913,14 +901,28 @@ describe("public structured refspec exports", () => {
       1_024,
       1_024,
       1_024,
-      1_024,
-      1_024,
-      1_024,
       16_384,
-      1_024,
       1_024,
       16_384,
     ]);
+  });
+});
+
+describe("retired fixed policy exports", () => {
+  it("does not expose retired fixed ref and config policies", async () => {
+    const [gitEntrypoint, rootEntrypoint] = await Promise.all([
+      import("../src/git/index.js"),
+      import("../src/index.js"),
+    ]);
+    for (const name of [
+      "MAX_LS_REMOTE_PATTERN_BYTES",
+      "MAX_REFSPEC_REF_BYTES",
+      "MAX_REMOTE_NAME_BYTES",
+      "MAX_REMOTE_URL_BYTES",
+    ]) {
+      expect(gitEntrypoint).not.toHaveProperty(name);
+      expect(rootEntrypoint).not.toHaveProperty(name);
+    }
   });
 });
 
@@ -937,22 +939,10 @@ describe("public remote URL exports", () => {
     const rootMethods: readonly (keyof RootGit)[] = ["remoteGetUrl", "remoteSetUrl"];
     const gitMethods: readonly (keyof GitEntrypointGit)[] = rootMethods;
 
-    expect([
-      gitGet.name,
-      gitSet.url,
-      gitMethods,
-      GIT_MAX_REMOTE_NAME_BYTES,
-      GIT_MAX_REMOTE_URL_BYTES,
-      ROOT_MAX_REMOTE_NAME_BYTES,
-      ROOT_MAX_REMOTE_URL_BYTES,
-    ]).toEqual([
+    expect([gitGet.name, gitSet.url, gitMethods]).toEqual([
       "origin",
       "https://example.test/repo.git",
       rootMethods,
-      2_189,
-      8_192,
-      2_189,
-      8_192,
     ]);
   });
 });

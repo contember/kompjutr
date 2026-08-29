@@ -13,10 +13,6 @@ import {
 } from "../../src/sqlite/index-tracker.js";
 import { readMaintenanceRunView } from "../../src/sqlite/maintenance/state.js";
 import { requireRawRefTarget, requireRefName } from "../../src/sqlite/ref-validation.js";
-import {
-  MAX_REFLOG_RAW_TARGET_BYTES,
-  MAX_REFLOG_REF_BYTES,
-} from "../../src/sqlite/reflog-schema.js";
 import { createSqliteSparseWorkspaceSource } from "../../src/sqlite/sparse-workspace.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../src/sqlite/store.js";
 import { TREE_WALK_PATH_BYTES } from "../../src/sqlite/tree-walk.js";
@@ -146,13 +142,7 @@ function assertRefsReadable(repo: Repository, budget: { bytes: number }): void {
   const objects: string[] = [];
   const symbolic: string[] = [];
   for (const row of repo.store.db.iterate(
-    `SELECT CASE WHEN typeof(name) = 'text' AND length(CAST(name AS BLOB)) <= ?
-                 THEN name END AS name,
-            CASE WHEN typeof(target) = 'text' AND length(CAST(target AS BLOB)) <= ?
-                 THEN target END AS target
-       FROM git_refs WHERE repo_id = ? ORDER BY name`,
-    MAX_REFLOG_REF_BYTES,
-    MAX_REFLOG_RAW_TARGET_BYTES,
+    `SELECT name, target FROM git_refs WHERE repo_id = ? ORDER BY name`,
     repo.store.repoId,
   )) {
     rows++;

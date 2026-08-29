@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import {
+  Database,
+  type DurableObjectStorageLike,
+  type SQLCursorLike,
+  type SQLStorageLike,
+} from "../src/sqlite/db.js";
 import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 
 const MAPPED_CANDIDATE_COUNT = 1_024;
 
@@ -12,6 +19,53 @@ const metadata = {
   timestamp: 1_800_000_000,
   timezoneOffset: 0,
 };
+
+class CodedTooBigStorage implements DurableObjectStorageLike {
+  readonly sql: SQLStorageLike;
+  #queryFragment: string | null = null;
+  #queryObserver: ((query: string) => void) | null = null;
+  writesBeforeFailure = 0;
+
+  constructor(private readonly inner: SqliteTestStorage) {
+    this.sql = {
+      exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
+        this.#queryObserver?.(query);
+        if (this.#queryFragment !== null && query.includes(this.#queryFragment)) {
+          this.#queryFragment = null;
+          throw Object.assign(new Error("injected coded SQLite value failure"), {
+            code: "SQLITE_TOOBIG",
+          });
+        }
+        if (this.#queryFragment !== null && /^\s*(?:DELETE|INSERT|UPDATE)\b/.test(query)) {
+          this.writesBeforeFailure++;
+        }
+        return this.inner.sql.exec<Row>(query, ...bindings);
+      },
+    };
+  }
+
+  arm(queryFragment: string): void {
+    this.#queryFragment = queryFragment;
+    this.writesBeforeFailure = 0;
+  }
+
+  observeQueries(observer: ((query: string) => void) | null): void {
+    this.#queryObserver = observer;
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+function openCodedTooBig() {
+  const storage = new SqliteTestStorage();
+  const db = new TestDatabase(storage);
+  const faultStorage = new CodedTooBigStorage(storage);
+  const database = new SqliteGitDatabase(new Database(faultStorage));
+  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+  return { db, faultStorage, store: database.openCheckout(checkout) };
+}
 
 function open(options: StoreOptions = {}) {
   const db = new TestDatabase();
@@ -57,6 +111,182 @@ function durablePublicationState(db: TestDatabase) {
 }
 
 describe("exact fetch publication", () => {
+  it("publishes the former tracking-prefix first excess across a cold reopen", () => {
+    const { db, store } = open();
+    const base = "refs/remotes/";
+    const prefix = `${base}${"r".repeat(1_025 - base.length - 1)}/`;
+    const tracking = `${prefix}main`;
+    const target = "1".repeat(40);
+    expect(prefix).toHaveLength(1_025);
+    const token = store.beginFetchPublication(prefix);
+    try {
+      expect(
+        store.publishFetchRefs(token, { trackingPuts: [{ name: tracking, target }] }, metadata),
+      ).toBe(true);
+    } finally {
+      token.dispose();
+    }
+    expect(store.getRef(tracking)).toBe(target);
+    expect(
+      db.scalar<string>("SELECT tracking_prefix FROM git_fetch_namespaces WHERE repo_id = 1"),
+    ).toBe(prefix);
+
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
+    const reopenedCheckout = reopenedDatabase.checkoutAt("/repo");
+    if (reopenedCheckout === null) throw new Error("reopened checkout is missing");
+    const reopened = reopenedDatabase.openCheckout(reopenedCheckout);
+    expect(reopened.getRef(tracking)).toBe(target);
+    expectIdle(store);
+    expectIdle(reopened);
+  });
+
+  it("owns a long singleton namespace JSON aggregate at the exact shared boundary", () => {
+    const prefix = `refs/remotes/${"p".repeat(1_500_001)}/`;
+    const prepare = (): ReturnType<typeof open> => {
+      const opened = open();
+      const seed = opened.store.beginFetchPublication(prefix);
+      seed.dispose();
+      return opened;
+    };
+    const fenceState = (db: TestDatabase): Record<string, unknown> => ({
+      repository: db.all<Record<string, unknown>>(
+        "SELECT fetch_generation FROM git_repositories WHERE id = 1",
+      ),
+      namespaces: db.all<Record<string, unknown>>(
+        `SELECT length(CAST(tracking_prefix AS BLOB)) AS prefix_bytes,
+                latest_generation, revision
+           FROM git_fetch_namespaces WHERE repo_id = 1`,
+      ),
+    });
+
+    const measured = prepare();
+    const measuredToken = measured.store.beginFetchPublication(prefix);
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    measuredToken.dispose();
+    expect(operationBytes).toBeGreaterThan(12 * 1024 * 1024);
+    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+    expectIdle(measured.store);
+
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
+    const exact = prepare();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", externalBytes);
+    try {
+      const token = exact.store.beginFetchPublication(prefix);
+      try {
+        expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      } finally {
+        token.dispose();
+      }
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+    expectIdle(exact.store);
+
+    const over = prepare();
+    const before = fenceState(over.db);
+    const overBlocker = over.store.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
+    try {
+      expect(() => over.store.beginFetchPublication(prefix)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(fenceState(over.db)).toEqual(before);
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      overBlocker.dispose();
+    }
+    expectIdle(over.store);
+  });
+
+  it("owns a long tracking target row at the exact boundary and rolls back one byte over", () => {
+    const prefix = "refs/remotes/origin/";
+    const name = `${prefix}main`;
+    const target = `ref: refs/heads/${"t".repeat(1_500_001)}`;
+    const operationBytes = 1_168 + 2 * prefix.length + 2 * name.length + 3 * target.length;
+    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+    const prepare = (): ReturnType<typeof open> => {
+      const opened = open();
+      opened.db.run("INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)", name, target);
+      return opened;
+    };
+
+    const exact = prepare();
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", externalBytes);
+    try {
+      const token = exact.store.beginTrackingRefPublication(prefix, name);
+      try {
+        expect(token.target).toBe(target);
+        expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      } finally {
+        token.dispose();
+      }
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+    expectIdle(exact.store);
+
+    const over = prepare();
+    const overBlocker = over.store.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
+    try {
+      expect(() => over.store.beginTrackingRefPublication(prefix, name)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(
+        over.db.scalar<number>("SELECT count(*) FROM git_tracking_ref_revisions WHERE repo_id = 1"),
+      ).toBe(0);
+      expect(over.store.getRef(name)).toBe(target);
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      overBlocker.dispose();
+    }
+    expectIdle(over.store);
+  });
+
+  it("adds the exact selected tracking revision row charge before decode", () => {
+    const prefix = "refs/remotes/origin/";
+    const name = `${prefix}${"n".repeat(1_000_001)}`;
+    const initial = "1".repeat(40);
+    const updated = "2".repeat(40);
+    const { db, faultStorage, store } = openCodedTooBig();
+    db.run("INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)", name, initial);
+    db.run(
+      "INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision) VALUES (1, ?, 0)",
+      name,
+    );
+    let metadataBytes: number | null = null;
+    let payloadBytes: number | null = null;
+    faultStorage.observeQueries((query) => {
+      if (query.includes("AS max_ref_name_bytes")) {
+        metadataBytes = store.shared.memory.totalBytes;
+      } else if (query.includes("AS ref_name_bytes")) {
+        payloadBytes = store.shared.memory.totalBytes;
+      }
+    });
+    try {
+      store.setRef(name, updated);
+    } finally {
+      faultStorage.observeQueries(null);
+    }
+    if (metadataBytes === null || payloadBytes === null) {
+      throw new Error("tracking revision scan did not execute both phases");
+    }
+    expect(payloadBytes - metadataBytes).toBe(304 + 3 * name.length);
+    expect(store.getRef(name)).toBe(updated);
+    expect(
+      db.scalar<number>(
+        "SELECT revision FROM git_tracking_ref_revisions WHERE repo_id = 1 AND ref_name = ?",
+        name,
+      ),
+    ).toBe(1);
+    expectIdle(store);
+  });
+
   it("publishes several namespaces with legacy tracking, tags, shallow state, and reflogs", () => {
     const { db, store } = open();
     const branch = "refs/heads/release";
@@ -191,6 +421,42 @@ describe("exact fetch publication", () => {
       expect(store.getRef("refs/remotes/origin/main")).toBeNull();
       expect(store.shallow()).toEqual(new Set());
       expect(store.reflog(first)).toEqual(firstLog);
+    } finally {
+      token.dispose();
+    }
+    expectIdle(store);
+  });
+
+  it("rolls tracking rows and namespace revisions back after coded SQLite value failure", () => {
+    const { db, faultStorage, store } = openCodedTooBig();
+    const tracking = "refs/remotes/origin/main";
+    const token = store.beginFetchPublication("refs/remotes/origin/");
+    const before = durablePublicationState(db);
+    expect(before.repositoryRevisions).toEqual([
+      { repo_id: 1, fetch_generation: 1, shallow_revision: 0, checkout_revision: 1 },
+    ]);
+
+    faultStorage.arm("UPDATE git_fetch_namespaces SET revision = revision + 1");
+    try {
+      expect(() =>
+        store.publishFetchRefs(
+          token,
+          { trackingPuts: [{ name: tracking, target: "1".repeat(40) }] },
+          metadata,
+        ),
+      ).toThrowError(expect.objectContaining({ name: "GitError", code: "E2BIG" }));
+      expect(faultStorage.writesBeforeFailure).toBeGreaterThan(0);
+      expect(durablePublicationState(db)).toEqual(before);
+      expect(store.getRef(tracking)).toBeNull();
+
+      const coldDb = new TestDatabase(db.storage);
+      const coldDatabase = new SqliteGitDatabase(coldDb);
+      const coldCheckout = coldDatabase.checkoutAt("/repo");
+      if (coldCheckout === null) throw new Error("reopened fetch rollback checkout is missing");
+      const coldStore = coldDatabase.openCheckout(coldCheckout);
+      expect(durablePublicationState(coldDb)).toEqual(before);
+      expect(coldStore.getRef(tracking)).toBeNull();
+      expectIdle(coldStore);
     } finally {
       token.dispose();
     }

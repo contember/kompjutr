@@ -1,9 +1,3 @@
-import { MAX_REF_NAME_BYTES } from "../core/ref-name.js";
-
-export const MAX_REFLOG_REF_BYTES = MAX_REF_NAME_BYTES;
-export const MAX_REFLOG_RAW_TARGET_BYTES = 1_024;
-export const MAX_REFLOG_IDENTITY_BYTES = 1_024;
-export const MAX_REFLOG_REASON_BYTES = 256;
 export const MAX_REFLOG_TIMEZONE_MINUTES = 24 * 60;
 export const MAX_REFLOG_ORDINAL = Number.MAX_SAFE_INTEGER;
 export const MAX_REFLOG_STATE_ROWS = 100_000;
@@ -41,7 +35,7 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
      ref_name TEXT NOT NULL CHECK (
        typeof(ref_name) = 'text'
-       AND length(CAST(ref_name AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_REF_BYTES}
+       AND length(CAST(ref_name AS BLOB)) >= 1
      ),
      ordinal INTEGER NOT NULL CHECK (
        typeof(ordinal) = 'integer'
@@ -51,13 +45,13 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      old_raw TEXT CHECK (
        old_raw IS NULL OR (
          typeof(old_raw) = 'text'
-         AND length(CAST(old_raw AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_RAW_TARGET_BYTES}
+         AND length(CAST(old_raw AS BLOB)) >= 1
        )
      ),
      new_raw TEXT CHECK (
        new_raw IS NULL OR (
          typeof(new_raw) = 'text'
-         AND length(CAST(new_raw AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_RAW_TARGET_BYTES}
+         AND length(CAST(new_raw AS BLOB)) >= 1
        )
      ),
      old_oid TEXT CHECK (
@@ -73,13 +67,13 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      actor_name TEXT CHECK (
        actor_name IS NULL OR (
          typeof(actor_name) = 'text'
-         AND length(CAST(actor_name AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_IDENTITY_BYTES}
+         AND length(CAST(actor_name AS BLOB)) >= 1
        )
      ),
      actor_email TEXT CHECK (
        actor_email IS NULL OR (
          typeof(actor_email) = 'text'
-         AND length(CAST(actor_email AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_IDENTITY_BYTES}
+         AND length(CAST(actor_email AS BLOB)) >= 1
        )
      ),
      timestamp INTEGER NOT NULL CHECK (
@@ -93,7 +87,7 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      ),
      reason TEXT NOT NULL CHECK (
        typeof(reason) = 'text'
-       AND length(CAST(reason AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_REASON_BYTES}
+       AND length(CAST(reason AS BLOB)) >= 1
      ),
      PRIMARY KEY (repo_id, ordinal),
      CHECK ((actor_name IS NULL) = (actor_email IS NULL)),
@@ -132,13 +126,13 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      old_raw TEXT CHECK (
        old_raw IS NULL OR (
          typeof(old_raw) = 'text'
-         AND length(CAST(old_raw AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_RAW_TARGET_BYTES}
+         AND length(CAST(old_raw AS BLOB)) >= 1
        )
      ),
      new_raw TEXT CHECK (
        new_raw IS NULL OR (
          typeof(new_raw) = 'text'
-         AND length(CAST(new_raw AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_RAW_TARGET_BYTES}
+         AND length(CAST(new_raw AS BLOB)) >= 1
        )
      ),
      old_oid TEXT CHECK (
@@ -150,13 +144,13 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      actor_name TEXT CHECK (
        actor_name IS NULL OR (
          typeof(actor_name) = 'text'
-         AND length(CAST(actor_name AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_IDENTITY_BYTES}
+         AND length(CAST(actor_name AS BLOB)) >= 1
        )
      ),
      actor_email TEXT CHECK (
        actor_email IS NULL OR (
          typeof(actor_email) = 'text'
-         AND length(CAST(actor_email AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_IDENTITY_BYTES}
+         AND length(CAST(actor_email AS BLOB)) >= 1
        )
      ),
      timestamp INTEGER NOT NULL CHECK (
@@ -170,7 +164,7 @@ export const REFLOG_SCHEMA_STATEMENTS = [
      ),
      reason TEXT NOT NULL CHECK (
        typeof(reason) = 'text'
-       AND length(CAST(reason AS BLOB)) BETWEEN 1 AND ${MAX_REFLOG_REASON_BYTES}
+       AND length(CAST(reason AS BLOB)) >= 1
      ),
      PRIMARY KEY (checkout_id, ordinal),
      CHECK ((actor_name IS NULL) = (actor_email IS NULL)),

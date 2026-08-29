@@ -6,7 +6,7 @@ import { makeRepo } from "./helpers/workspace.js";
 const OID = "0123456789abcdef0123456789abcdef01234567";
 
 describe("branch upstream resolver", () => {
-  it("requires a bounded branch ref before reading config", () => {
+  it("requires a canonical branch ref before reading config", () => {
     const { repo } = makeRepo("/");
 
     for (const ref of ["refs/tags/main", "refs/heads/bad..name"]) {
@@ -14,9 +14,9 @@ describe("branch upstream resolver", () => {
         expect.objectContaining({ code: "EINVALIDREF" }),
       );
     }
-    expect(() => resolveBranchUpstream(repo, `refs/heads/${"a".repeat(1_014)}`)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    const formerFirstExcess = `refs/heads/${"a".repeat(1_014)}`;
+    expect(formerFirstExcess).toHaveLength(1_025);
+    expect(resolveBranchUpstream(repo, formerFirstExcess)).toBeUndefined();
   });
 
   it("returns undefined without complete config and null for a missing upstream ref", () => {
@@ -44,6 +44,7 @@ describe("branch upstream resolver", () => {
       ref: "refs/heads/release",
       oid: OID,
     });
+    expect(repo.store.memory.totalBytes).toBe(0);
   });
 
   it("returns the remote-tracking ref only for the supported direct fetch mapping", () => {
@@ -63,7 +64,7 @@ describe("branch upstream resolver", () => {
     expect(resolveBranchUpstream(repo, "refs/heads/main")).toBeUndefined();
   });
 
-  it("rejects invalid and oversized upstream config", () => {
+  it("rejects invalid upstream config and accepts the former ref first excess", () => {
     const { repo } = makeRepo("/");
     repo.store.configSet("branch.main.remote", ".");
     repo.store.configSet("branch.main.merge", "refs/tags/release");
@@ -71,10 +72,13 @@ describe("branch upstream resolver", () => {
       expect.objectContaining({ code: "EINVALIDREF" }),
     );
 
-    repo.store.configSet("branch.main.merge", "a".repeat(1_025));
-    expect(() => resolveBranchUpstream(repo, "refs/heads/main")).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    const formerFirstExcess = "a".repeat(1_025);
+    repo.store.configSet("branch.main.merge", formerFirstExcess);
+    expect(resolveBranchUpstream(repo, "refs/heads/main")).toEqual({
+      name: formerFirstExcess,
+      ref: `refs/heads/${formerFirstExcess}`,
+      oid: null,
+    });
 
     repo.store.configSet("branch.main.merge", "refs/heads/release");
     repo.store.configSet("branch.main.remote", "bad..remote");
@@ -98,5 +102,6 @@ describe("branch upstream resolver", () => {
     expect(() => resolveBranchUpstream(workspace.repo, "refs/heads/main")).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
+    expect(workspace.repo.store.memory.totalBytes).toBe(0);
   });
 });

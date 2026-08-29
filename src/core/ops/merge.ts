@@ -224,6 +224,7 @@ function synthesizeVirtualPair(
   incomingOid: string,
   state: VirtualState,
   depth: number,
+  callerRetainedBytes: number,
 ): string {
   const selection = selectMergeBases(repo, { currentOid, incomingOid });
   if (selection.kind === "already-merged") return currentOid;
@@ -241,13 +242,20 @@ function synthesizeVirtualPair(
       `recursive merge-base synthesis exceeds ${MAX_VIRTUAL_COMMITS} temporary commits`,
     );
   }
-  const baseCommit = synthesizeVirtualBases(repo, selection.bases, state, depth + 1);
+  const baseCommit = synthesizeVirtualBases(
+    repo,
+    selection.bases,
+    state,
+    depth + 1,
+    callerRetainedBytes,
+  );
   const plan = planVirtualAncestorIntegration(repo, {
     baseTreeOid: commitTree(repo, baseCommit),
     currentTreeOid: commitTree(repo, currentOid),
     incomingTreeOid: commitTree(repo, incomingOid),
     labels: { current: "Temporary merge branch 1", incoming: "Temporary merge branch 2" },
     depth,
+    callerRetainedBytes,
   });
   const reservation = reserveIntegrationPlan(repo, plan);
   try {
@@ -263,6 +271,7 @@ function synthesizeVirtualBases(
   bases: readonly string[],
   state: VirtualState,
   depth: number,
+  callerRetainedBytes: number,
 ): string {
   const first = bases[0];
   if (first === undefined) throw new GitError("EUNRELATED", "merge base list is empty");
@@ -270,13 +279,18 @@ function synthesizeVirtualBases(
   for (let index = 1; index < bases.length; index++) {
     const incoming = bases[index];
     if (incoming === undefined) throw new GitError("ECORRUPT", "merge base list has a hole");
-    current = synthesizeVirtualPair(repo, current, incoming, state, depth);
+    current = synthesizeVirtualPair(repo, current, incoming, state, depth, callerRetainedBytes);
   }
   return current;
 }
 
-function selectedBaseTree(repo: Repository, bases: readonly string[], state: VirtualState): string {
-  return commitTree(repo, synthesizeVirtualBases(repo, bases, state, 1));
+function selectedBaseTree(
+  repo: Repository,
+  bases: readonly string[],
+  state: VirtualState,
+  callerRetainedBytes = 0,
+): string {
+  return commitTree(repo, synthesizeVirtualBases(repo, bases, state, 1, callerRetainedBytes));
 }
 
 function snapshotMode(entry: MergeTouchedPath): string | null {
@@ -455,8 +469,20 @@ export function merge(
   options: MergeOptions,
   behavior: MergeBehavior = {},
 ): MergeResult {
+  return mergeOwned(context, repo, worktree, options, behavior, 0);
+}
+
+/** Internal merge seam for a caller retaining independently charged inputs. */
+export function mergeOwned(
+  context: GitContext,
+  repo: Repository,
+  worktree: Worktree,
+  options: MergeOptions,
+  behavior: MergeBehavior,
+  callerRetainedBytes: number,
+): MergeResult {
   return repo.store.db.transactionSync(() =>
-    mergeInTransaction(context, repo, worktree, options, behavior),
+    mergeInTransaction(context, repo, worktree, options, behavior, callerRetainedBytes),
   );
 }
 
@@ -466,6 +492,7 @@ function mergeInTransaction(
   worktree: Worktree,
   options: MergeOptions,
   behavior: MergeBehavior,
+  callerRetainedBytes: number,
 ): MergeResult {
   const theirs = requireMergeRevision(options.theirs, "incoming");
   const ours =
@@ -508,12 +535,13 @@ function mergeInTransaction(
   }
   const baseTree = isFastForward
     ? currentTree
-    : selectedBaseTree(repo, selection.bases, virtualState);
+    : selectedBaseTree(repo, selection.bases, virtualState, callerRetainedBytes);
   const plan = planIntegration(repo, {
     baseTreeOid: baseTree,
     currentTreeOid: currentTree,
     incomingTreeOid: nextTree,
     text: { labels: { current: currentLabel, base: "base", incoming: nextLabel } },
+    callerRetainedBytes,
   });
   const reservation = reserveIntegrationPlan(repo, plan);
   try {

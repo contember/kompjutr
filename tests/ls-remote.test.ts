@@ -260,7 +260,7 @@ describe("lsRemote", () => {
     expect(requestTail(beforeRequests)).toHaveLength(0);
   });
 
-  it("rejects malformed patterns and each first excess before a request", async () => {
+  it("rejects malformed patterns and the pattern-count first excess", async () => {
     const workspace = configuredWorkspace();
     const git = gitFor(workspace);
     const beforeMalformed = server.requests.length;
@@ -284,17 +284,11 @@ describe("lsRemote", () => {
     );
     expect(requestTail(beforeCountExcess)).toHaveLength(0);
 
-    const beforeByteLimit = server.requests.length;
-    await expect(git.lsRemote({ patterns: ["x".repeat(1_024)] })).resolves.toMatchObject({
+    const beforeFormerByteExcess = server.requests.length;
+    await expect(git.lsRemote({ patterns: ["x".repeat(1_025)] })).resolves.toMatchObject({
       refs: [],
     });
-    expectDiscoveryOnly(requestTail(beforeByteLimit));
-
-    const beforeByteExcess = server.requests.length;
-    await expect(git.lsRemote({ patterns: ["x".repeat(1_025)] })).rejects.toMatchObject({
-      code: "E2BIG",
-    });
-    expect(requestTail(beforeByteExcess)).toHaveLength(0);
+    expectDiscoveryOnly(requestTail(beforeFormerByteExcess));
   });
 
   it("shares the aggregate operation memory ceiling and releases a failed reservation", async () => {
@@ -314,5 +308,38 @@ describe("lsRemote", () => {
     }
     expect(workspace.repo.store.memory.activeCount).toBe(0);
     expect(workspace.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("charges a long compiled pattern once at the exact shared memory ceiling", async () => {
+    const pattern = "x".repeat(1_025);
+    const run = async (workspace: TestRepository): Promise<void> => {
+      await gitFor(workspace).lsRemote({ patterns: [pattern] });
+    };
+
+    const measured = configuredWorkspace();
+    await run(measured);
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(0);
+
+    const exact = configuredWorkspace();
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      await run(exact);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+
+    const over = configuredWorkspace();
+    const overBlocker = over.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      await expect(run(over)).rejects.toMatchObject({ code: "E2BIG" });
+    } finally {
+      overBlocker.dispose();
+    }
+    expect(over.repo.store.memory.activeCount).toBe(0);
+    expect(over.repo.store.memory.totalBytes).toBe(0);
   });
 });

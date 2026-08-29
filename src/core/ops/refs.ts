@@ -2,12 +2,18 @@
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
 // repository row, so nothing here writes a file.
 
-import { contentIdKey, type IndexEntry } from "../../sqlite/store.js";
+import {
+  contentIdKey,
+  createRefMutationMemoryOwner,
+  type IndexEntry,
+  mutateRefsOwned,
+  type RefMutationMemoryOwner,
+} from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
-import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
-import type { Repository } from "../repository.js";
+import { checkRefText, hasCanonicalRefSyntax } from "../ref-name.js";
+import { expandRefOwned, type Repository, resolveHeadOwned } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
@@ -47,9 +53,23 @@ export interface BranchOptions {
 }
 
 export function branch(context: GitContext, repo: Repository, options: BranchOptions): void {
-  const full = branchRef(options.name);
-  const current = repo.store.getRef(full);
-  if (options.force !== true && current !== null) {
+  const owner = new RefOperationOwner(repo);
+  try {
+    branchOwned(context, repo, options, owner);
+  } finally {
+    owner.dispose();
+  }
+}
+
+function branchOwned(
+  context: GitContext,
+  repo: Repository,
+  options: BranchOptions,
+  owner: RefOperationOwner,
+): void {
+  const full = branchRef(owner, options.name);
+  const exists = refExists(repo, full);
+  if (options.force !== true && exists) {
     throw new GitError("EBRANCHFAIL", `a branch named '${options.name}' already exists`);
   }
   // A branch names a commit, so an annotated tag start point is peeled.
@@ -57,11 +77,19 @@ export function branch(context: GitContext, repo: Repository, options: BranchOpt
   repo.store.db.transactionSync(() => {
     const mutation =
       options.checkout === true
-        ? { puts: [{ name: full, target: oid }], head: `ref: ${full}` }
+        ? { puts: [{ name: full, target: oid }], head: symbolicRef(owner, full) }
         : { puts: [{ name: full, target: oid }] };
-    repo.mutateRefs(
+    mutateRefsOwned(
+      repo.checkout,
       mutation,
-      operationRefLogMetadata(context, repo, current === null ? "branch: create" : "branch: reset"),
+      operationRefLogMetadata(
+        context,
+        repo,
+        exists ? "branch: reset" : "branch: create",
+        {},
+        owner.mutationOwner,
+      ),
+      owner.mutationOwner,
     );
   });
 }
@@ -83,22 +111,44 @@ export function branchRename(
   repo: Repository,
   options: BranchRenameOptions,
 ): void {
+  const owner = new RefOperationOwner(repo);
+  try {
+    branchRenameOwned(context, repo, options, owner);
+  } finally {
+    owner.dispose();
+  }
+}
+
+function branchRenameOwned(
+  context: GitContext,
+  repo: Repository,
+  options: BranchRenameOptions,
+  owner: RefOperationOwner,
+): void {
   const runtimeOptions: unknown = options;
   const optionObject =
     typeof runtimeOptions === "object" && runtimeOptions !== null ? runtimeOptions : null;
   const newName = optionObject === null ? undefined : Reflect.get(optionObject, "newName");
   const oldName = optionObject === null ? undefined : Reflect.get(optionObject, "oldName");
-  const destination = branchRenameRef(newName, "new branch name");
+  const destination = branchRenameRef(owner, newName, "new branch name");
   const requestedSource =
-    oldName === undefined ? null : branchRenameRef(oldName, "old branch name");
-  const metadata = operationRefLogMetadata(context, repo, "branch: rename");
+    oldName === undefined ? null : branchRenameRef(owner, oldName, "old branch name");
+  const metadata = operationRefLogMetadata(
+    context,
+    repo,
+    "branch: rename",
+    {},
+    owner.mutationOwner,
+  );
 
   repo.store.db.transactionSync(() => {
     repo.checkout.requireNoOperationState();
-    const oldHead = repo.checkout.head();
+    const oldHead = owner.retain(repo.checkout.head());
     let source: string;
     if (requestedSource === null) {
-      const selected = oldHead.startsWith("ref: ") ? oldHead.slice(5) : null;
+      const selected = oldHead.startsWith("ref: ")
+        ? owner.construct(oldHead.length - 5, () => oldHead.slice(5))
+        : null;
       if (selected?.startsWith(HEADS) !== true) {
         throw new GitError("EBRANCHFAIL", "cannot rename branch from detached HEAD");
       }
@@ -122,43 +172,41 @@ export function branchRename(
       );
     }
 
-    const sourceHead = `ref: ${source}`;
-    const owner = context.database
+    const sourceHead = symbolicRef(owner, source);
+    const checkoutOwner = context.database
       .listCheckouts(repo.store.repoId)
       .find((checkout) => checkout.head === sourceHead);
-    if (owner !== undefined && owner.id !== repo.checkout.checkoutId) {
+    if (checkoutOwner !== undefined && checkoutOwner.id !== repo.checkout.checkoutId) {
       throw new GitError(
         "EBRANCHFAIL",
-        `cannot rename branch '${source.slice(HEADS.length)}': it is checked out at ${owner.root}`,
+        `cannot rename branch '${source.slice(HEADS.length)}': it is checked out at ${checkoutOwner.root}`,
       );
     }
 
-    repo.store.configMoveSection(
-      `branch.${source.slice(HEADS.length)}.`,
-      `branch.${destination.slice(HEADS.length)}.`,
-    );
-    repo.mutateRefs(
+    const sourceConfig = branchConfigPrefix(owner, source);
+    const destinationConfig = branchConfigPrefix(owner, destination);
+    repo.store.configMoveSection(sourceConfig, destinationConfig);
+    mutateRefsOwned(
+      repo.checkout,
       {
         puts: [{ name: destination, target: tip }],
         deletes: [source],
-        head: oldHead === sourceHead ? `ref: ${destination}` : undefined,
+        head: oldHead === sourceHead ? symbolicRef(owner, destination) : undefined,
         expected: { name: source, target: tip },
       },
       metadata,
+      owner.mutationOwner,
     );
   });
 }
 
-function branchRenameRef(value: unknown, label: string): string {
+function branchRenameRef(owner: RefOperationOwner, value: unknown, label: string): string {
   if (typeof value !== "string" || value === "") {
     throw new GitError("EINVAL", `${label} is required`);
   }
-  const checked = checkRefText(value, MAX_REF_NAME_BYTES - HEADS.length);
-  if (checked.problem === "too-long") {
-    throw new GitError("E2BIG", `${label} exceeds its UTF-8 byte bound`);
-  }
+  const checked = checkRefText(value);
   if (checked.problem !== null) throw new GitError("EINVAL", `${label} is invalid`);
-  const ref = `${HEADS}${value}`;
+  const ref = owner.construct(HEADS.length + value.length, () => `${HEADS}${value}`);
   if (!hasCanonicalRefSyntax(ref)) throw new GitError("EINVAL", `${label} is invalid`);
   return ref;
 }
@@ -168,29 +216,50 @@ export function branchDelete(
   repo: Repository,
   options: BranchDeleteOptions,
 ): void {
-  const full = branchRef(options.name);
+  const owner = new RefOperationOwner(repo);
+  try {
+    branchDeleteOwned(context, repo, options, owner);
+  } finally {
+    owner.dispose();
+  }
+}
+
+function branchDeleteOwned(
+  context: GitContext,
+  repo: Repository,
+  options: BranchDeleteOptions,
+  owner: RefOperationOwner,
+): void {
+  const full = branchRef(owner, options.name);
   repo.store.db.transactionSync(() => {
-    const tip = repo.store.getRef(full);
-    if (tip === null) {
+    const storedTip = repo.store.getRef(full);
+    if (storedTip === null) {
       throw new GitError("EBRANCHFAIL", `branch '${options.name}' not found`);
     }
-    if (!isOid(tip)) {
+    if (!isOid(storedTip)) {
       throw new CorruptError(`branch '${options.name}' does not point to a commit`);
     }
+    const tip = owner.retain(storedTip);
     repo.readCommit(tip);
-    const owner = context.database
+    const attachedHead = symbolicRef(owner, full);
+    const attachedCheckout = context.database
       .listCheckouts(repo.store.repoId)
-      .find((checkout) => checkout.head === `ref: ${full}`);
-    if (owner !== undefined) {
+      .find((checkout) => checkout.head === attachedHead);
+    if (attachedCheckout !== undefined) {
       throw new GitError(
         "EBRANCHFAIL",
-        `cannot delete branch '${options.name}': it is checked out at ${owner.root}`,
+        `cannot delete branch '${options.name}': it is checked out at ${attachedCheckout.root}`,
       );
     }
 
     if (options.force !== true) {
-      const upstream = resolveBranchUpstream(repo, full);
-      const comparison = upstream?.oid ?? repo.head().oid;
+      const upstream = resolveBranchUpstream(repo, full, owner.mutationOwner);
+      const upstreamOid = upstream?.oid;
+      const fallback =
+        upstreamOid === null || upstreamOid === undefined
+          ? resolveHeadOwned(repo, owner).oid
+          : null;
+      const comparison = upstreamOid ?? (fallback === null ? null : owner.retain(fallback));
       if (comparison === null) {
         throw new GitError(
           "EBRANCHFAIL",
@@ -209,9 +278,11 @@ export function branchDelete(
       }
     }
 
-    repo.mutateRefs(
+    mutateRefsOwned(
+      repo.checkout,
       { deletes: [full], expected: { name: full, target: tip } },
-      operationRefLogMetadata(context, repo, "branch: delete"),
+      operationRefLogMetadata(context, repo, "branch: delete", {}, owner.mutationOwner),
+      owner.mutationOwner,
     );
   });
 }
@@ -234,10 +305,15 @@ export function currentBranch(
   repo: Repository,
   options: CurrentBranchOptions = {},
 ): string | undefined {
-  const { ref } = repo.head();
-  if (ref === null) return undefined;
-  if (options.fullname === true) return ref;
-  return ref.startsWith(HEADS) ? ref.slice(HEADS.length) : ref;
+  const owner = new RefOperationOwner(repo);
+  try {
+    const { ref } = resolveHeadOwned(repo, owner);
+    if (ref === null) return undefined;
+    if (options.fullname === true || !ref.startsWith(HEADS)) return ref;
+    return owner.construct(ref.length - HEADS.length, () => ref.slice(HEADS.length));
+  } finally {
+    owner.dispose();
+  }
 }
 
 export interface TagOptions {
@@ -249,14 +325,36 @@ export interface TagOptions {
 
 /** Lightweight tags only: a ref row, no tag object. */
 export function tag(context: GitContext, repo: Repository, options: TagOptions): void {
-  const full = tagRef(options.name);
-  const current = repo.store.getRef(full);
-  if (options.force !== true && current !== null) {
+  const owner = new RefOperationOwner(repo);
+  try {
+    tagOwned(context, repo, options, owner);
+  } finally {
+    owner.dispose();
+  }
+}
+
+function tagOwned(
+  context: GitContext,
+  repo: Repository,
+  options: TagOptions,
+  owner: RefOperationOwner,
+): void {
+  const full = tagRef(owner, options.name);
+  const exists = refExists(repo, full);
+  if (options.force !== true && exists) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' already exists`);
   }
-  repo.mutateRefs(
+  mutateRefsOwned(
+    repo.checkout,
     { puts: [{ name: full, target: repo.revParse(options.object ?? "HEAD") }] },
-    operationRefLogMetadata(context, repo, current === null ? "tag: create" : "tag: update"),
+    operationRefLogMetadata(
+      context,
+      repo,
+      exists ? "tag: update" : "tag: create",
+      {},
+      owner.mutationOwner,
+    ),
+    owner.mutationOwner,
   );
 }
 
@@ -265,11 +363,30 @@ export interface TagDeleteOptions {
 }
 
 export function tagDelete(context: GitContext, repo: Repository, options: TagDeleteOptions): void {
-  const full = tagRef(options.name);
+  const owner = new RefOperationOwner(repo);
+  try {
+    tagDeleteOwned(context, repo, options, owner);
+  } finally {
+    owner.dispose();
+  }
+}
+
+function tagDeleteOwned(
+  context: GitContext,
+  repo: Repository,
+  options: TagDeleteOptions,
+  owner: RefOperationOwner,
+): void {
+  const full = tagRef(owner, options.name);
   if (repo.store.getRef(full) === null) {
     throw new GitError("ETAGFAIL", `tag '${options.name}' not found`);
   }
-  repo.mutateRefs({ deletes: [full] }, operationRefLogMetadata(context, repo, "tag: delete"));
+  mutateRefsOwned(
+    repo.checkout,
+    { deletes: [full] },
+    operationRefLogMetadata(context, repo, "tag: delete", {}, owner.mutationOwner),
+    owner.mutationOwner,
+  );
 }
 
 export function tagList(repo: Repository): string[] {
@@ -391,14 +508,55 @@ export function switchBranch(
   });
 }
 
-function branchRef(name: string): string {
+function branchRef(owner: RefOperationOwner, name: string): string {
   if (name === "") throw new GitError("EBRANCHFAIL", "a branch name is required");
-  return `${HEADS}${name}`;
+  return owner.construct(HEADS.length + name.length, () => `${HEADS}${name}`);
 }
 
-function tagRef(name: string): string {
+function tagRef(owner: RefOperationOwner, name: string): string {
   if (name === "") throw new GitError("ETAGFAIL", "a tag name is required");
-  return `${TAGS}${name}`;
+  return owner.construct(TAGS.length + name.length, () => `${TAGS}${name}`);
+}
+
+function refExists(repo: Repository, name: string): boolean {
+  const present = repo.store.db.scalar<unknown>(
+    "SELECT 1 FROM git_refs WHERE repo_id = ? AND name = ? LIMIT 1",
+    repo.store.repoId,
+    name,
+  );
+  if (present === undefined) return false;
+  if (present !== 1) throw new CorruptError("ref existence query returned invalid state");
+  return true;
+}
+
+function symbolicRef(owner: RefOperationOwner, ref: string): string {
+  return owner.construct(5 + ref.length, () => `ref: ${ref}`);
+}
+
+function branchConfigPrefix(owner: RefOperationOwner, ref: string): string {
+  const shortUnits = ref.length - HEADS.length;
+  const short = owner.construct(shortUnits, () => ref.slice(HEADS.length));
+  return owner.construct("branch..".length + shortUnits, () => `branch.${short}.`);
+}
+
+class RefOperationOwner {
+  readonly mutationOwner: RefMutationMemoryOwner;
+
+  constructor(repo: Repository) {
+    this.mutationOwner = createRefMutationMemoryOwner(repo.store);
+  }
+
+  construct<T extends string>(units: number, construct: () => T): T {
+    return this.mutationOwner.construct(units, construct);
+  }
+
+  retain<T extends string>(value: T): T {
+    return this.mutationOwner.owns(value) ? value : this.mutationOwner.retain(value);
+  }
+
+  dispose(): void {
+    this.mutationOwner.dispose();
+  }
 }
 
 /**
@@ -407,12 +565,20 @@ function tagRef(name: string): string {
  * branch, or a raw oid.
  */
 function moveHead(context: GitContext, repo: Repository, ref: string, commit: string): void {
-  const expanded = repo.expandRef(ref);
-  const full = expanded === "HEAD" ? repo.head().ref : expanded;
-  repo.mutateRefs(
-    { head: full?.startsWith(HEADS) ? `ref: ${full}` : commit },
-    operationRefLogMetadata(context, repo, "checkout"),
-  );
+  const owner = new RefOperationOwner(repo);
+  try {
+    const expanded = expandRefOwned(repo, ref, owner);
+    const full = expanded === "HEAD" ? resolveHeadOwned(repo, owner).ref : expanded;
+    if (full !== null) owner.retain(full);
+    mutateRefsOwned(
+      repo.checkout,
+      { head: full?.startsWith(HEADS) ? symbolicRef(owner, full) : commit },
+      operationRefLogMetadata(context, repo, "checkout", {}, owner.mutationOwner),
+      owner.mutationOwner,
+    );
+  } finally {
+    owner.dispose();
+  }
 }
 
 /**

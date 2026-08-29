@@ -1,8 +1,14 @@
-import type { CheckoutRow, CheckoutStore } from "../../sqlite/store.js";
+import {
+  type CheckoutRow,
+  type CheckoutStore,
+  createRefMutationMemoryOwner,
+  mutateRefsOwned,
+  type RefMutationMemoryOwner,
+} from "../../sqlite/store.js";
 import type { ExactRootState, GitContext } from "../context.js";
 import { CorruptError, GitError, RefNotFoundError, UnsupportedOperationError } from "../errors.js";
 import { normalizePath } from "../paths.js";
-import { requireBranchRef } from "../protocol/receive-pack.js";
+import { checkRefText, hasCanonicalRefSyntax } from "../ref-name.js";
 import { Repository } from "../repository.js";
 import { checkoutTree } from "./checkout.js";
 import { operationRefLogMetadata } from "./ref-log.js";
@@ -43,20 +49,22 @@ interface WorktreeSnapshot {
   states: readonly ExactRootState[];
 }
 
-const MAX_SHORT_BRANCH_UNITS = 1_013;
-
 function worktreeError(code: string, message: string): GitError {
   return new GitError(code, message);
 }
 
-function shortBranchRef(name: string): string {
+function shortBranchRef(owner: WorktreePlanOwner, name: string): string {
   if (typeof name !== "string" || name === "" || name.startsWith("refs/")) {
     throw worktreeError("EINVALIDREF", "invalid short branch name");
   }
-  if (name.length > MAX_SHORT_BRANCH_UNITS) {
-    throw worktreeError("E2BIG", "short branch name exceeds the ref bound");
+  if (checkRefText(name).problem !== null) {
+    throw worktreeError("EINVALIDREF", "invalid short branch name");
   }
-  return requireBranchRef(`refs/heads/${name}`);
+  const full = owner.construct("refs/heads/".length + name.length, () => `refs/heads/${name}`);
+  if (!hasCanonicalRefSyntax(full)) {
+    throw worktreeError("EINVALIDREF", "invalid short branch name");
+  }
+  return full;
 }
 
 function resolvedCommit(repo: Repository, expression: string): { oid: string; tree: string } {
@@ -67,12 +75,12 @@ function resolvedCommit(repo: Repository, expression: string): { oid: string; tr
   return { oid, tree: repo.readCommit(oid).tree };
 }
 
-function addPlan(repo: Repository, target: WorktreeAddTarget): AddPlan {
+function addPlan(repo: Repository, target: WorktreeAddTarget, owner: WorktreePlanOwner): AddPlan {
   if (typeof target !== "object" || target === null) {
     throw worktreeError("EINVAL", "worktree target is invalid");
   }
   if (target.kind === "existing-branch") {
-    const branch = shortBranchRef(target.name);
+    const branch = shortBranchRef(owner, target.name);
     if (repo.store.getRef(branch) === null) throw new RefNotFoundError(branch);
     const resolved = resolvedCommit(repo, branch);
     return {
@@ -83,7 +91,7 @@ function addPlan(repo: Repository, target: WorktreeAddTarget): AddPlan {
     };
   }
   if (target.kind === "new-branch") {
-    const branch = shortBranchRef(target.name);
+    const branch = shortBranchRef(owner, target.name);
     if (repo.store.getRef(branch) !== null) {
       throw worktreeError("EBRANCHFAIL", `branch already exists: ${target.name}`);
     }
@@ -129,6 +137,7 @@ function initializeCheckout(
   context: GitContext,
   checkout: CheckoutStore,
   plan: AddPlan,
+  owner: WorktreePlanOwner,
 ): undefined {
   requireAvailableRoot(context, checkout.root);
   const target = new Repository(checkout);
@@ -136,10 +145,17 @@ function initializeCheckout(
     const mutation = plan.createBranch
       ? {
           puts: [{ name: plan.branch, target: plan.commitOid }],
-          head: `ref: ${plan.branch}`,
+          head: owner.construct(5 + plan.branch.length, () => `ref: ${plan.branch}`),
         }
-      : { head: `ref: ${plan.branch}` };
-    if (!target.mutateRefs(mutation, operationRefLogMetadata(context, target, "checkout"))) {
+      : { head: owner.construct(5 + plan.branch.length, () => `ref: ${plan.branch}`) };
+    if (
+      !mutateRefsOwned(
+        target.checkout,
+        mutation,
+        operationRefLogMetadata(context, target, "checkout", {}, owner.mutationOwner),
+        owner.mutationOwner,
+      )
+    ) {
       throw new CorruptError("worktree HEAD publication made no change");
     }
   }
@@ -187,12 +203,36 @@ export function worktreeAdd(
   if (options.root.length > 4_096) {
     throw worktreeError("E2BIG", "worktree root exceeds 4096 UTF-16 code units");
   }
-  const root = normalizePath(options.root);
-  const plan = addPlan(repo, options.target);
-  const row = context.database.createCheckout(repo.store.repoId, root, plan.commitOid, (checkout) =>
-    initializeCheckout(context, checkout, plan),
-  );
-  return info(row, "present");
+  const owner = new WorktreePlanOwner(repo);
+  try {
+    const root = normalizePath(options.root);
+    const plan = addPlan(repo, options.target, owner);
+    const row = context.database.createCheckout(
+      repo.store.repoId,
+      root,
+      plan.commitOid,
+      (checkout) => initializeCheckout(context, checkout, plan, owner),
+    );
+    return info(row, "present");
+  } finally {
+    owner.dispose();
+  }
+}
+
+class WorktreePlanOwner {
+  readonly mutationOwner: RefMutationMemoryOwner;
+
+  constructor(repo: Repository) {
+    this.mutationOwner = createRefMutationMemoryOwner(repo.store);
+  }
+
+  construct<T extends string>(units: number, construct: () => T): T {
+    return this.mutationOwner.construct(units, construct);
+  }
+
+  dispose(): void {
+    this.mutationOwner.dispose();
+  }
 }
 
 export function worktreeList(context: GitContext, repo: Repository): readonly WorktreeInfo[] {

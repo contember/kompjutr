@@ -50,6 +50,8 @@ import {
   type RebaseStateMetadata,
   type RevertJournal,
 } from "../core/ops/operation-state.js";
+import { hasCanonicalRefSyntax } from "../core/ref-name.js";
+import { retainedStringBytes } from "../core/retained.js";
 import { Sha1 } from "../core/sha1.js";
 import { comparePaths } from "../core/streams.js";
 import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
@@ -80,8 +82,8 @@ import {
   PackStore,
 } from "./packs.js";
 import {
-  boundedRefText,
   rawSymbolicTarget,
+  refTextBytes,
   requireRawRefTarget,
   requireRefName,
 } from "./ref-validation.js";
@@ -90,11 +92,7 @@ export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_CACHED_CONTENT_ID_BYTES } from "./blob-id-cache.js";
 import {
-  MAX_REFLOG_IDENTITY_BYTES,
   MAX_REFLOG_ORDINAL,
-  MAX_REFLOG_RAW_TARGET_BYTES,
-  MAX_REFLOG_REASON_BYTES,
-  MAX_REFLOG_REF_BYTES,
   MAX_REFLOG_STATE_BYTES,
   MAX_REFLOG_STATE_ROWS,
   MAX_REFLOG_TIMEZONE_MINUTES,
@@ -192,8 +190,10 @@ export const MAX_REFLOG_ROOT_SCAN_BYTES =
   REFLOG_ROOT_PACK_ROW_CACHE_BYTES -
   REFLOG_ROOT_JS_HEADROOM_BYTES;
 export const REFLOG_ROOT_SCAN_FIXED_BYTES = 8 * 1024 * 1024;
-/** Two conservative SQL slots per row bound validation, grouping, and ordering together. */
+/** Legacy per-row envelope retained only to preserve the reviewed structural row cap. */
 export const REFLOG_ROOT_ENDPOINT_BYTES = 4_096;
+/** Numeric slots, row handles, and sort/group metadata retained per physical row. */
+export const REFLOG_ROOT_ROW_FIXED_BYTES = 512;
 export const MAX_REFLOG_ROOT_SCAN_ENTRIES = Math.floor(
   (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / (2 * REFLOG_ROOT_ENDPOINT_BYTES),
 );
@@ -217,10 +217,10 @@ const PROVISIONAL_CLONE_RENEW_WINDOW_MS = PROVISIONAL_CLONE_LEASE_MS / 2;
 const REF_ROW_RETAINED_BYTES = 256;
 const REF_MUTATION_ITEM_RETAINED_BYTES = 512;
 const REF_MUTATION_EVENT_RETAINED_BYTES = 2_048;
+const REF_MUTATION_METADATA_RETAINED_BYTES = 256;
 const REF_MUTATION_SQL_HEADROOM_BYTES = 8 * 1024 * 1024;
 export const MAX_REF_MUTATION_RETAINED_BYTES = 64 * 1024 * 1024;
-const REF_MUTATION_STATE_FIXED_RETAINED_BYTES =
-  REF_ROW_RETAINED_BYTES + 2 * MAX_REFLOG_RAW_TARGET_BYTES;
+const REF_MUTATION_STATE_FIXED_RETAINED_BYTES = REF_ROW_RETAINED_BYTES;
 export const REF_MUTATION_FIXED_RETAINED_BYTES =
   REF_MUTATION_SQL_HEADROOM_BYTES + REF_MUTATION_STATE_FIXED_RETAINED_BYTES;
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
@@ -247,6 +247,7 @@ export type BoundedSingleConfigValue =
   | { readonly kind: "missing" }
   | { readonly kind: "single"; readonly value: string }
   | { readonly kind: "multiple" };
+type ConfigValueCardinality = "missing" | "single" | "multiple";
 
 export interface StoreOptions extends PackCacheOptions {
   /** Database-wide bytes of inflated objects held hot across reads. */
@@ -298,6 +299,76 @@ export interface RefMutation {
   deletes?: Iterable<string>;
   head?: string;
   expected?: RefMutationExpected;
+}
+
+const REF_MUTATION_MEMORY_OWNER_TOKEN = Symbol("RefMutationMemoryOwner");
+
+/** Store-issued ownership for derived strings retained through a ref operation. */
+export class RefMutationMemoryOwner {
+  readonly #reservation: MemoryReservation;
+  readonly #strings: string[] = [];
+  #retained = 256;
+
+  constructor(token: typeof REF_MUTATION_MEMORY_OWNER_TOKEN, reservation: MemoryReservation) {
+    if (token !== REF_MUTATION_MEMORY_OWNER_TOKEN) {
+      throw new GitError("EINVAL", "ref mutation memory owner must be issued by the store");
+    }
+    this.#reservation = reservation;
+    this.#reservation.set("other", this.#retained);
+  }
+
+  construct<T extends string>(units: number, construct: () => T): T {
+    this.#reservation.set("other", this.#retained + 8 + retainedStringUnits(units));
+    return this.retain(construct());
+  }
+
+  retain<T extends string>(value: T): T {
+    this.#retained += 8 + retainedStringBytes(value);
+    this.#reservation.set("other", this.#retained);
+    this.#strings.push(value);
+    return value;
+  }
+
+  memoryReservation(): MemoryReservation {
+    return this.#reservation;
+  }
+
+  owns(value: string): boolean {
+    return this.#strings.includes(value);
+  }
+
+  dispose(): void {
+    this.#reservation.dispose();
+  }
+}
+
+export function createRefMutationMemoryOwner(store: SharedRepoStore): RefMutationMemoryOwner {
+  const reservation = store.reserveMemory();
+  try {
+    return new RefMutationMemoryOwner(REF_MUTATION_MEMORY_OWNER_TOKEN, reservation);
+  } catch (error) {
+    reservation.dispose();
+    throw error;
+  }
+}
+
+type OwnedRefMutation = (
+  mutation: RefMutation,
+  metadata: RefLogMetadata,
+  owner: RefMutationMemoryOwner,
+) => boolean;
+
+const OWNED_REF_MUTATIONS = new WeakMap<CheckoutStore, OwnedRefMutation>();
+
+export function mutateRefsOwned(
+  store: CheckoutStore,
+  mutation: RefMutation,
+  metadata: RefLogMetadata,
+  owner: RefMutationMemoryOwner,
+): boolean {
+  const mutate = OWNED_REF_MUTATIONS.get(store);
+  if (mutate === undefined) throw new GitError("EINVAL", "checkout store is not active");
+  return mutate(mutation, metadata, owner);
 }
 
 export interface FetchPublicationExpectedRef {
@@ -818,37 +889,153 @@ function isObjectType(value: string | null): value is ObjectType {
 
 const JSON_ENCODER = new TextEncoder();
 const CONFIG_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
-const CANONICAL_CONFIG_TEXT_DECODER = new TextDecoder("utf-8", {
+const CANONICAL_TEXT_DECODER = new TextDecoder("utf-8", {
   fatal: true,
   ignoreBOM: true,
 });
 const JSON_BATCH_ROWS = 2_048;
 const JSON_BATCH_BYTES = 1_500_000;
+const CONFIG_READ_FIXED_RETAINED_BYTES = 512;
 
-function* jsonPages<T>(items: Iterable<T>, _label: string): Generator<string> {
-  let rows: string[] = [];
-  let bytes = 2;
-  for (const item of items) {
-    const row = JSON.stringify(item);
-    const rowBytes = JSON_ENCODER.encode(row).byteLength;
-    const separator = rows.length === 0 ? 0 : 1;
+interface JsonPageMemory<T> {
+  readonly reservation: MemoryReservation;
+  readonly maxUnits: (item: T) => number;
+}
+
+function retainedStringUnits(units: number): number {
+  return 48 + 2 * units;
+}
+
+function currentTextRowRetainedBytes(textBytes: number, stringSlots = 1): number {
+  if (
+    !Number.isSafeInteger(textBytes) ||
+    textBytes < 0 ||
+    !Number.isSafeInteger(stringSlots) ||
+    stringSlots < 0
+  ) {
+    throw new CorruptError("stored text row metadata is invalid");
+  }
+  return REF_ROW_RETAINED_BYTES + textBytes + stringSlots * 48 + 2 * textBytes;
+}
+
+function requireStoredTextByteLength(
+  type: unknown,
+  bytes: unknown,
+  label: string,
+  minimum = 1,
+): number {
+  if (
+    type !== "text" ||
+    typeof bytes !== "number" ||
+    !Number.isSafeInteger(bytes) ||
+    bytes < minimum
+  ) {
+    throw new CorruptError(`${label} has invalid text metadata`);
+  }
+  return bytes;
+}
+
+function requireMaximumStoredTextBytes(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new CorruptError(`${label} metadata is invalid`);
+  }
+  return value;
+}
+
+function jsonStringMaxUnits(value: string): number {
+  let units = 2;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
     if (
-      rows.length > 0 &&
-      (rows.length >= JSON_BATCH_ROWS || bytes + separator + rowBytes > JSON_BATCH_BYTES)
+      unit === 0x22 ||
+      unit === 0x5c ||
+      unit === 0x08 ||
+      unit === 0x09 ||
+      unit === 0x0a ||
+      unit === 0x0c ||
+      unit === 0x0d
     ) {
-      yield `[${rows.join(",")}]`;
-      rows = [];
-      bytes = 2;
-    }
-    bytes += (rows.length === 0 ? 0 : 1) + rowBytes;
-    rows.push(row);
-    if (bytes >= JSON_BATCH_BYTES) {
-      yield `[${rows.join(",")}]`;
-      rows = [];
-      bytes = 2;
+      units += 2;
+    } else if (unit < 0x20) {
+      units += 6;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        units += 2;
+        index++;
+      } else {
+        units += 6;
+      }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      units += 6;
+    } else {
+      units++;
     }
   }
-  if (rows.length > 0) yield `[${rows.join(",")}]`;
+  return units;
+}
+
+function refRowJsonMaxUnits(row: RefRow): number {
+  return 19 + jsonStringMaxUnits(row.name) + jsonStringMaxUnits(row.target);
+}
+
+function* jsonPages<T>(
+  items: Iterable<T>,
+  _label: string,
+  memory?: JsonPageMemory<T>,
+): Generator<string> {
+  let rows: string[] = [];
+  let bytes = 2;
+  let retained = 256;
+  const pageMemory = memory?.reservation.scope();
+  pageMemory?.set("other", retained);
+  const emit = function* (pendingBytes = 0): Generator<string> {
+    const joinedUnits = Math.max(0, bytes - 2);
+    pageMemory?.set(
+      "other",
+      retained +
+        pendingBytes +
+        retainedStringUnits(joinedUnits) +
+        retainedStringUnits(joinedUnits + 2),
+    );
+    const joined = rows.join(",");
+    yield `[${joined}]`;
+  };
+  try {
+    for (const item of items) {
+      if (memory !== undefined) {
+        pageMemory?.set("other", retained + retainedStringUnits(memory.maxUnits(item)));
+      }
+      const row = JSON.stringify(item);
+      const rowBytes = refTextBytes(row, "JSON batch row", "input");
+      const separator = rows.length === 0 ? 0 : 1;
+      if (
+        rows.length > 0 &&
+        (rows.length >= JSON_BATCH_ROWS || bytes + separator + rowBytes > JSON_BATCH_BYTES)
+      ) {
+        const pendingBytes = retainedStringBytes(row);
+        yield* emit(pendingBytes);
+        rows = [];
+        bytes = 2;
+        retained = 256;
+        pageMemory?.set("other", retained + pendingBytes);
+      }
+      bytes += (rows.length === 0 ? 0 : 1) + rowBytes;
+      rows.push(row);
+      retained += 8 + retainedStringBytes(row);
+      pageMemory?.set("other", retained);
+      if (bytes >= JSON_BATCH_BYTES) {
+        yield* emit();
+        rows = [];
+        bytes = 2;
+        retained = 256;
+        pageMemory?.set("other", retained);
+      }
+    }
+    if (rows.length > 0) yield* emit();
+  } finally {
+    pageMemory?.dispose();
+  }
 }
 
 function requireNullableRawRefTarget(value: unknown, label: string): string | null {
@@ -905,16 +1092,32 @@ function requireRefLogIdentityText(value: unknown, label: string): string {
   if (typeof value !== "string" || value === "") {
     throw new CorruptError(`${label} is invalid`);
   }
-  boundedRefText(value, label, MAX_REFLOG_IDENTITY_BYTES, "stored");
+  refTextBytes(value, label, "stored");
+  if (value.includes("<") || value.includes(">")) {
+    throw new CorruptError(`${label} is invalid`);
+  }
   return value;
 }
 
 function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number): RefLogEntry {
   if (row.repo_id !== repoId) throw new CorruptError("reflog row belongs to another repository");
-  const refName = requireRefName(row.ref_name, "reflog ref name", "stored", true);
+  const refName = requireRefName(
+    requireCanonicalStoredText(row.ref_name_type, row.ref_name_blob, "reflog ref name"),
+    "reflog ref name",
+    "stored",
+    true,
+  );
   const ordinal = requireSafeRefLogInteger(row.ordinal, "reflog ordinal", 1, MAX_REFLOG_ORDINAL);
-  const oldEndpoint = requireStoredRefLogEndpoint(row.old_raw, row.old_oid, "old");
-  const newEndpoint = requireStoredRefLogEndpoint(row.new_raw, row.new_oid, "new");
+  const oldEndpoint = requireStoredRefLogEndpoint(
+    requireNullableCanonicalStoredText(row.old_raw_type, row.old_raw_blob, "reflog old raw target"),
+    requireNullableCanonicalStoredText(row.old_oid_type, row.old_oid_blob, "reflog old OID"),
+    "old",
+  );
+  const newEndpoint = requireStoredRefLogEndpoint(
+    requireNullableCanonicalStoredText(row.new_raw_type, row.new_raw_blob, "reflog new raw target"),
+    requireNullableCanonicalStoredText(row.new_oid_type, row.new_oid_blob, "reflog new OID"),
+    "new",
+  );
   if (
     refName !== "HEAD" &&
     oldEndpoint.raw === newEndpoint.raw &&
@@ -923,12 +1126,32 @@ function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number):
     throw new CorruptError("reflog row does not change either endpoint");
   }
   let actor: RefLogActor | null;
-  if (row.actor_name === null && row.actor_email === null) {
+  if (
+    row.actor_name_type === "null" &&
+    row.actor_name_blob === null &&
+    row.actor_email_type === "null" &&
+    row.actor_email_blob === null
+  ) {
     actor = null;
-  } else if (row.actor_name !== null && row.actor_email !== null) {
+  } else if (
+    row.actor_name_type === "text" &&
+    row.actor_name_blob !== null &&
+    row.actor_email_type === "text" &&
+    row.actor_email_blob !== null
+  ) {
     actor = {
-      name: requireRefLogIdentityText(row.actor_name, "reflog actor name"),
-      email: requireRefLogIdentityText(row.actor_email, "reflog actor email"),
+      name: requireRefLogIdentityText(
+        requireCanonicalStoredText(row.actor_name_type, row.actor_name_blob, "reflog actor name"),
+        "reflog actor name",
+      ),
+      email: requireRefLogIdentityText(
+        requireCanonicalStoredText(
+          row.actor_email_type,
+          row.actor_email_blob,
+          "reflog actor email",
+        ),
+        "reflog actor email",
+      ),
     };
   } else {
     throw new CorruptError("reflog actor is incomplete");
@@ -945,10 +1168,11 @@ function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number):
     -MAX_REFLOG_TIMEZONE_MINUTES,
     MAX_REFLOG_TIMEZONE_MINUTES,
   );
-  if (typeof row.reason !== "string" || row.reason === "") {
+  const reason = requireCanonicalStoredText(row.reason_type, row.reason_blob, "reflog reason");
+  if (reason === "") {
     throw new CorruptError("reflog reason is invalid");
   }
-  boundedRefText(row.reason, "reflog reason", MAX_REFLOG_REASON_BYTES, "stored");
+  refTextBytes(reason, "reflog reason", "stored");
   return {
     refName,
     ordinal,
@@ -959,7 +1183,7 @@ function requireStoredRefLogEntry(row: Record<string, unknown>, repoId: number):
     actor,
     timestamp,
     timezoneOffset,
-    reason: row.reason,
+    reason,
   };
 }
 
@@ -987,11 +1211,46 @@ function requireRefLogLimit(value: unknown): number {
   return requireRefLogReadInteger(value, "reflog limit", 0, 1_000);
 }
 
-function validateRefLogRootScanBudget(value: unknown): void {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new CorruptError("reflog root budget query returned an invalid row count");
+function validateRefLogRootScanBudget(
+  value:
+    | { rows: unknown; text_bytes: unknown; max_row_bytes: unknown; head_bytes: unknown }
+    | undefined,
+): void {
+  if (
+    value === undefined ||
+    typeof value.rows !== "number" ||
+    !Number.isSafeInteger(value.rows) ||
+    value.rows < 0 ||
+    typeof value.text_bytes !== "number" ||
+    !Number.isSafeInteger(value.text_bytes) ||
+    value.text_bytes < 0 ||
+    typeof value.max_row_bytes !== "number" ||
+    !Number.isSafeInteger(value.max_row_bytes) ||
+    value.max_row_bytes < 0 ||
+    value.max_row_bytes > value.text_bytes ||
+    typeof value.head_bytes !== "number" ||
+    !Number.isSafeInteger(value.head_bytes) ||
+    value.head_bytes < 1
+  ) {
+    throw new CorruptError("reflog root budget query returned invalid metadata");
   }
-  if (value > MAX_REFLOG_ROOT_SCAN_ENTRIES) {
+  const rowStateBytes = value.rows * REFLOG_ROOT_ROW_FIXED_BYTES;
+  const payloadBytes = value.text_bytes + value.head_bytes;
+  const sqlSlotBytes = rowStateBytes + payloadBytes;
+  const currentRowBytes = Math.max(value.max_row_bytes, value.head_bytes);
+  // The current BLOB coexists with a worst-case two-byte-per-input-byte JS string.
+  const currentRowRetainedBytes = 3 * currentRowBytes;
+  const scanRetainedBytes =
+    REFLOG_ROOT_SCAN_FIXED_BYTES + 2 * sqlSlotBytes + currentRowRetainedBytes;
+  if (
+    value.rows > MAX_REFLOG_ROOT_SCAN_ENTRIES ||
+    !Number.isSafeInteger(rowStateBytes) ||
+    !Number.isSafeInteger(payloadBytes) ||
+    !Number.isSafeInteger(sqlSlotBytes) ||
+    !Number.isSafeInteger(currentRowRetainedBytes) ||
+    !Number.isSafeInteger(scanRetainedBytes) ||
+    scanRetainedBytes > MAX_REFLOG_ROOT_SCAN_BYTES
+  ) {
     throw new GitError("E2BIG", "active reflog root scan exceeds its bounded SQL state");
   }
 }
@@ -1011,7 +1270,11 @@ function isCheckoutRootUniqueConstraint(error: unknown): boolean {
 
 function requireRefLogHeader(row: Record<string, unknown>, repoId: number): number {
   if (row.repo_id !== repoId) throw new CorruptError("reflog header belongs to another repository");
-  requireRawRefTarget(row.head, "stored HEAD target", "stored");
+  requireRawRefTarget(
+    requireCanonicalStoredText(row.head_type, row.head_blob, "stored HEAD target"),
+    "stored HEAD target",
+    "stored",
+  );
   const nextOrdinal = requireSafeRefLogInteger(
     row.next_ordinal,
     "reflog next ordinal",
@@ -1051,13 +1314,21 @@ function validateRefLogMetadata(metadata: RefLogMetadata): RefLogMetadata {
   if (typeof metadata.reason !== "string" || metadata.reason === "") {
     throw new GitError("EINVAL", "reflog reason is required");
   }
-  boundedRefText(metadata.reason, "reflog reason", MAX_REFLOG_REASON_BYTES, "input");
+  refTextBytes(metadata.reason, "reflog reason", "input");
   if (metadata.actor !== null) {
     if (metadata.actor.name === "" || metadata.actor.email === "") {
       throw new GitError("EINVAL", "reflog actor name and email are required together");
     }
-    boundedRefText(metadata.actor.name, "reflog actor name", MAX_REFLOG_IDENTITY_BYTES, "input");
-    boundedRefText(metadata.actor.email, "reflog actor email", MAX_REFLOG_IDENTITY_BYTES, "input");
+    refTextBytes(metadata.actor.name, "reflog actor name", "input");
+    refTextBytes(metadata.actor.email, "reflog actor email", "input");
+    if (
+      metadata.actor.name.includes("<") ||
+      metadata.actor.name.includes(">") ||
+      metadata.actor.email.includes("<") ||
+      metadata.actor.email.includes(">")
+    ) {
+      throw new GitError("EINVAL", "reflog actor identity contains an invalid character");
+    }
   }
   return metadata;
 }
@@ -1076,8 +1347,10 @@ function requireFetchTrackingPrefix(value: unknown, source: "input" | "stored"):
   ) {
     invalidFetchTrackingPrefix(source);
   }
-  boundedRefText(value, "fetch tracking prefix", MAX_REFLOG_REF_BYTES - 1, source);
-  requireRefName(`${value}x`, "fetch tracking namespace", source);
+  refTextBytes(value, "fetch tracking prefix", source);
+  if (!hasCanonicalRefSyntax(value, 0, value.length - 1)) {
+    invalidFetchTrackingPrefix(source);
+  }
   return value;
 }
 
@@ -1091,6 +1364,51 @@ function requireFetchGeneration(value: unknown, label: string, minimum: number):
     throw new CorruptError(`${label} is invalid`);
   }
   return value;
+}
+
+function requireRefReadMetadata(
+  value: { rows: unknown; name_bytes: unknown; target_bytes: unknown } | undefined,
+  label: string,
+): { rows: number; nameBytes: number; targetBytes: number } {
+  if (
+    value === undefined ||
+    typeof value.rows !== "number" ||
+    !Number.isSafeInteger(value.rows) ||
+    value.rows < 0 ||
+    typeof value.name_bytes !== "number" ||
+    !Number.isSafeInteger(value.name_bytes) ||
+    value.name_bytes < 0 ||
+    typeof value.target_bytes !== "number" ||
+    !Number.isSafeInteger(value.target_bytes) ||
+    value.target_bytes < 0
+  ) {
+    throw new CorruptError(`${label} metadata is invalid`);
+  }
+  return {
+    rows: value.rows,
+    nameBytes: value.name_bytes,
+    targetBytes: value.target_bytes,
+  };
+}
+
+function requireRefLogReadMetadata(
+  value: { rows: unknown; text_bytes: unknown; head_bytes: unknown } | undefined,
+): { rows: number; textBytes: number; headBytes: number } {
+  if (
+    value === undefined ||
+    typeof value.rows !== "number" ||
+    !Number.isSafeInteger(value.rows) ||
+    value.rows < 0 ||
+    typeof value.text_bytes !== "number" ||
+    !Number.isSafeInteger(value.text_bytes) ||
+    value.text_bytes < 0 ||
+    typeof value.head_bytes !== "number" ||
+    !Number.isSafeInteger(value.head_bytes) ||
+    value.head_bytes < 1
+  ) {
+    throw new CorruptError("reflog read metadata is invalid");
+  }
+  return { rows: value.rows, textBytes: value.text_bytes, headBytes: value.head_bytes };
 }
 
 function readCheckoutRevision(db: SqlDatabase, repoId: number): number {
@@ -1167,6 +1485,10 @@ class RefMutationBudget {
     this.#hasSqlHeadroom = true;
   }
 
+  memoryReservation(): MemoryReservation {
+    return this.#reservation;
+  }
+
   charge(bytes: number): void {
     if (
       !Number.isSafeInteger(bytes) ||
@@ -1183,49 +1505,50 @@ class RefMutationBudget {
 
 export function refMutationCreateRetainedBytes(row: RefRow): number {
   const name = requireRefName(row.name, "updated ref name", "input");
-  const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
-  const nameBytes = boundedRefText(name, "updated ref name", MAX_REFLOG_REF_BYTES, "input");
-  const targetBytes = boundedRefText(
-    target,
-    `target of ${name}`,
-    MAX_REFLOG_RAW_TARGET_BYTES,
-    "input",
-  );
+  const target = requireRawRefTarget(row.target, "updated ref target", "input");
   return (
     REF_MUTATION_ITEM_RETAINED_BYTES +
     REF_MUTATION_EVENT_RETAINED_BYTES +
-    4 * (nameBytes + targetBytes)
+    retainedStringBytes(name) +
+    retainedStringBytes(target)
   );
 }
 
 export function refMutationCheckoutRetainedBytes(checkout: { root: string; head: string }): number {
   const root = requireCheckoutRoot(checkout.root, "stored");
   const head = requireRawRefTarget(checkout.head, "stored HEAD target", "stored");
-  const retained =
-    1_024 +
-    2 *
-      (checkoutTextEncoder.encode(root).byteLength +
-        boundedRefText(head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored"));
+  const retained = 1_024 + retainedStringBytes(root) + retainedStringBytes(head);
   return Math.ceil(retained / 4) * 4;
 }
 
 function normalizeRefMutation(
   mutation: RefMutation,
   budget: RefMutationBudget,
+  owner?: RefMutationMemoryOwner,
 ): NormalizedRefMutation {
   const puts = new Map<string, string>();
   const deletes = new Set<string>();
+  const chargedStrings: string[] = [];
+  const stringBytes = (value: string): number => {
+    if (owner?.owns(value) === true || chargedStrings.includes(value)) return 0;
+    chargedStrings.push(value);
+    return retainedStringBytes(value);
+  };
   let inputs = 0;
-  const charge = (nameBytes: number, targetBytes = 0): void => {
+  const charge = (name: string, target?: string): void => {
     inputs++;
     if (inputs > MAX_REF_MUTATION_INPUTS) {
       throw new GitError("E2BIG", "ref mutation exceeds its retained input count bound");
     }
-    budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + nameBytes * 2 + targetBytes * 2);
+    budget.charge(
+      REF_MUTATION_ITEM_RETAINED_BYTES +
+        stringBytes(name) +
+        (target === undefined ? 0 : stringBytes(target)),
+    );
   };
   for (const value of mutation.deletes ?? []) {
     const name = requireRefName(value, "deleted ref name", "input");
-    charge(boundedRefText(name, "deleted ref name", MAX_REFLOG_REF_BYTES, "input"));
+    charge(name);
     deletes.add(name);
   }
   for (const row of mutation.puts ?? []) {
@@ -1233,11 +1556,8 @@ function normalizeRefMutation(
       throw new GitError("EINVAL", "ref update row is invalid");
     }
     const name = requireRefName(row.name, "updated ref name", "input");
-    const target = requireRawRefTarget(row.target, `target of ${name}`, "input");
-    charge(
-      boundedRefText(name, "updated ref name", MAX_REFLOG_REF_BYTES, "input"),
-      boundedRefText(target, `target of ${name}`, MAX_REFLOG_RAW_TARGET_BYTES, "input"),
-    );
+    const target = requireRawRefTarget(row.target, "updated ref target", "input");
+    charge(name, target);
     puts.set(name, target);
   }
   const head =
@@ -1245,26 +1565,20 @@ function normalizeRefMutation(
       ? undefined
       : requireRawRefTarget(mutation.head, "HEAD target", "input");
   if (head !== undefined) {
-    charge(4, boundedRefText(head, "HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "input"));
+    charge("HEAD", head);
   }
   let expected: RefMutationExpected | undefined;
   if (mutation.expected !== undefined) {
     const name = requireRefName(mutation.expected.name, "conditional ref name", "input");
-    const nameBytes = boundedRefText(name, "conditional ref name", MAX_REFLOG_REF_BYTES, "input");
     const target =
       mutation.expected.target === null
         ? null
-        : requireRawRefTarget(mutation.expected.target, `expected target of ${name}`, "input");
-    const targetBytes =
-      target === null
-        ? 0
-        : boundedRefText(
-            target,
-            `expected target of ${name}`,
-            MAX_REFLOG_RAW_TARGET_BYTES,
-            "input",
-          );
-    budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + 2 * (nameBytes + targetBytes));
+        : requireRawRefTarget(mutation.expected.target, "expected ref target", "input");
+    budget.charge(
+      REF_MUTATION_ITEM_RETAINED_BYTES +
+        stringBytes(name) +
+        (target === null ? 0 : stringBytes(target)),
+    );
     expected = { name, target };
     if (puts.has(name) === deletes.has(name)) {
       throw new GitError(
@@ -1279,23 +1593,26 @@ function normalizeRefMutation(
 function normalizeFetchPublication(
   state: FetchPublicationState,
   plan: FetchPublicationPlan,
+  budget: RefMutationBudget,
 ): NormalizedFetchPublication {
   const puts = new Map<string, string>();
   const deletes = new Set<string>();
   const keep = new Set<string>();
+  budget.charge(48 + 2 * (state.trackingPrefix.length + "HEAD".length));
   const remoteHeadName = `${state.trackingPrefix}HEAD`;
   let inputs = 0;
-  const charge = (name: string, label: string, target?: string): void => {
+  const charge = (name: string, label: string, target?: string, nameAlreadyOwned = false): void => {
     inputs++;
     if (inputs > MAX_FETCH_PUBLICATION_INPUTS) {
       throw new GitError("E2BIG", "fetch publication exceeds its retained input count bound");
     }
-    const nameBytes = boundedRefText(name, label, MAX_REFLOG_REF_BYTES, "input");
-    const targetBytes =
-      target === undefined
-        ? 0
-        : boundedRefText(target, `target of ${name}`, MAX_REFLOG_RAW_TARGET_BYTES, "input");
-    state.budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + 2 * (nameBytes + targetBytes));
+    refTextBytes(name, label, "input");
+    if (target !== undefined) refTextBytes(target, "fetch ref target", "input");
+    budget.charge(
+      REF_MUTATION_ITEM_RETAINED_BYTES +
+        (nameAlreadyOwned ? 0 : retainedStringBytes(name)) +
+        (target === undefined ? 0 : retainedStringBytes(target)),
+    );
   };
   const trackingName = (value: unknown, label: string): string => {
     const name = requireRefName(value, label, "input");
@@ -1329,11 +1646,11 @@ function normalizeFetchPublication(
 
   if (plan.remoteHead !== undefined) {
     if (plan.remoteHead === null) {
-      charge(remoteHeadName, "remote HEAD ref name");
+      charge(remoteHeadName, "remote HEAD ref name", undefined, true);
       deletes.add(remoteHeadName);
     } else {
       const target = requireRawRefTarget(plan.remoteHead, "remote HEAD target", "input");
-      charge(remoteHeadName, "remote HEAD ref name", target);
+      charge(remoteHeadName, "remote HEAD ref name", target, true);
       puts.set(remoteHeadName, target);
     }
   }
@@ -1387,7 +1704,7 @@ function normalizeFetchPublication(
     deletes,
     head: undefined,
     expected: undefined,
-    budget: state.budget,
+    budget,
   };
   return {
     refs,
@@ -1416,16 +1733,41 @@ function refLogEventRetainedBytes(
   oldRaw: string | null,
   newRaw: string | null,
 ): number {
-  const refBytes = boundedRefText(refName, "reflog ref name", MAX_REFLOG_REF_BYTES, "input");
-  const oldBytes =
-    oldRaw === null
+  refTextBytes(refName, "reflog ref name", "input");
+  if (oldRaw !== null) refTextBytes(oldRaw, "reflog old raw target", "input");
+  if (newRaw !== null) refTextBytes(newRaw, "reflog new raw target", "input");
+  return REF_MUTATION_EVENT_RETAINED_BYTES;
+}
+
+function refLogMetadataRetainedBytes(
+  metadata: RefLogMetadata,
+  owner?: RefMutationMemoryOwner,
+): number {
+  return (
+    REF_MUTATION_METADATA_RETAINED_BYTES +
+    (owner?.owns(metadata.reason) === true ? 0 : retainedStringBytes(metadata.reason)) +
+    (metadata.actor === null
       ? 0
-      : boundedRefText(oldRaw, "reflog old raw target", MAX_REFLOG_RAW_TARGET_BYTES, "input");
-  const newBytes =
-    newRaw === null
-      ? 0
-      : boundedRefText(newRaw, "reflog new raw target", MAX_REFLOG_RAW_TARGET_BYTES, "input");
-  return REF_MUTATION_EVENT_RETAINED_BYTES + 2 * (refBytes + oldBytes + newBytes);
+      : (owner?.owns(metadata.actor.name) === true ? 0 : retainedStringBytes(metadata.actor.name)) +
+        (owner?.owns(metadata.actor.email) === true
+          ? 0
+          : retainedStringBytes(metadata.actor.email)))
+  );
+}
+
+function refLogEventJsonMaxUnits(event: RefLogEvent | CheckoutRefLogEvent): number {
+  return (
+    512 +
+    6 *
+      (event.refName.length +
+        (event.oldRaw?.length ?? 0) +
+        (event.newRaw?.length ?? 0) +
+        (event.oldOid?.length ?? 0) +
+        (event.newOid?.length ?? 0) +
+        (event.actorName?.length ?? 0) +
+        (event.actorEmail?.length ?? 0) +
+        event.reason.length)
+  );
 }
 
 function serializeIndexMutation(
@@ -2200,8 +2542,11 @@ const CHECKOUT_LIFECYCLE_CARDINALITY_SQL = `
       LIMIT 2
    )) AS lifecycle_primary_count`;
 
-function requireStoredCheckoutLifecycle(row: Record<string, unknown>): StoredCheckoutLifecycle {
-  const checkout = requireStoredCheckoutRow(row);
+function requireStoredCheckoutLifecycle(
+  row: Record<string, unknown>,
+  admittedHeadBytes: number,
+): StoredCheckoutLifecycle {
+  const checkout = requireStoredCheckoutRow(row, admittedHeadBytes);
   const repository = requireStoredRepositoryLifecycle(row);
   if (checkout.repoId !== repository.repoId) {
     throw new CorruptError("checkout lifecycle crossed repository boundaries");
@@ -2253,11 +2598,30 @@ function requireCheckoutRoot(value: unknown, source: "input" | "stored"): string
   return canonical;
 }
 
-function requireStoredCheckoutRow(row: Record<string, unknown>): CheckoutRow {
+function requireStoredCheckoutRow(
+  row: Record<string, unknown>,
+  admittedHeadBytes: number,
+): CheckoutRow {
   const id = requireSafeId(row.checkout_id, "checkout id");
   const repoId = requireSafeId(row.repo_id, "checkout repository id");
   const root = requireCheckoutRoot(row.root, "stored");
-  const head = requireRawRefTarget(row.head, "stored HEAD target", "stored");
+  const headBytes = requireStoredTextByteLength(
+    row.head_type,
+    row.head_bytes,
+    "stored HEAD target",
+  );
+  if (headBytes > admittedHeadBytes) {
+    throw new CorruptError("stored HEAD target changed after metadata preflight");
+  }
+  const headBlob = requireStoredTextBytes(row.head_type, row.head_blob, "stored HEAD target");
+  if (headBlob.byteLength !== headBytes) {
+    throw new CorruptError("stored HEAD target changed after metadata preflight");
+  }
+  const head = requireRawRefTarget(
+    decodeCanonicalText(headBlob, "stored HEAD target"),
+    "stored HEAD target",
+    "stored",
+  );
   if (row.is_primary !== 0 && row.is_primary !== 1) {
     throw new CorruptError("checkout primary marker is invalid");
   }
@@ -2775,12 +3139,16 @@ export class SharedRepoStore {
     return this.#ops().configGet(path);
   }
 
-  configGetBounded(path: string, maxBytes: number): string | undefined {
+  configGetBounded(path: string, maxBytes?: number): string | undefined {
     return this.#ops().configGetBounded(path, maxBytes);
   }
 
-  configGetSingleBounded(path: string, maxBytes: number): BoundedSingleConfigValue {
+  configGetSingleBounded(path: string, maxBytes?: number): BoundedSingleConfigValue {
     return this.#ops().configGetSingleBounded(path, maxBytes);
+  }
+
+  configCardinality(path: string): ConfigValueCardinality {
+    return this.#ops().configCardinality(path);
   }
 
   configSet(path: string, value: string): void {
@@ -2894,6 +3262,33 @@ export class SqliteGitDatabase {
     return this.#db;
   }
 
+  #checkoutHeadBytes(query: string, ...bindings: unknown[]): number | null {
+    const metadata = this.#db.one<{ head_type: unknown; head_bytes: unknown }>(query, ...bindings);
+    if (metadata === undefined) return null;
+    return requireStoredTextByteLength(
+      metadata.head_type,
+      metadata.head_bytes,
+      "stored HEAD target",
+    );
+  }
+
+  #maximumCheckoutHeadBytes(query: string, ...bindings: unknown[]): number {
+    const metadata = this.#db.one<{ max_head_bytes: unknown }>(query, ...bindings);
+    if (metadata === undefined) throw new CorruptError("checkout HEAD metadata row is missing");
+    return requireMaximumStoredTextBytes(metadata.max_head_bytes, "stored HEAD target maximum");
+  }
+
+  #reserveCheckoutRow(headBytes: number): MemoryReservation {
+    const reservation = this.#memory.reserve();
+    try {
+      reservation.set("other", currentTextRowRetainedBytes(headBytes));
+      return reservation;
+    } catch (error) {
+      reservation.dispose();
+      throw error;
+    }
+  }
+
   #readIdentityControl(): AllocatedIdentity {
     const row = this.#db.one<Record<string, unknown>>(
       `SELECT control.singleton, control.last_repo_id, control.last_checkout_id,
@@ -2977,20 +3372,35 @@ export class SqliteGitDatabase {
   }
 
   #repositoryAtRoot(root: string): StoredCheckoutLifecycle | null {
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
-              repository.clone_generation, repository.clone_expires_ms,
-              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
-         FROM git_checkouts checkout
-         JOIN git_repositories repository ON repository.id = checkout.repo_id
-        WHERE checkout.root = ?`,
+    const headBytes = this.#checkoutHeadBytes(
+      `SELECT typeof(checkout.head) AS head_type,
+              length(CAST(checkout.head AS BLOB)) AS head_bytes
+         FROM git_checkouts checkout WHERE checkout.root = ?`,
       root,
     );
-    if (row === undefined) return null;
-    const stored = requireStoredCheckoutLifecycle(row);
-    requireCheckoutLifecycleCardinality(row, stored);
-    return stored;
+    if (headBytes === null) return null;
+    const rowMemory = this.#reserveCheckoutRow(headBytes);
+    try {
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+                typeof(checkout.head) AS head_type,
+                length(CAST(checkout.head AS BLOB)) AS head_bytes,
+                CAST(checkout.head AS BLOB) AS head_blob,
+                checkout.is_primary, repository.lifecycle,
+                repository.clone_generation, repository.clone_expires_ms,
+                ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+           FROM git_checkouts checkout
+           JOIN git_repositories repository ON repository.id = checkout.repo_id
+          WHERE checkout.root = ?`,
+        root,
+      );
+      if (row === undefined) throw new CorruptError("checkout changed after metadata preflight");
+      const stored = requireStoredCheckoutLifecycle(row, headBytes);
+      requireCheckoutLifecycleCardinality(row, stored);
+      return stored;
+    } finally {
+      rowMemory.dispose();
+    }
   }
 
   #requireReadyRepository(repoId: number): StoredRepositoryLifecycle {
@@ -3017,30 +3427,47 @@ export class SqliteGitDatabase {
     const repoId = requireSafeId(owner.checkout.repoId, "provisional repository id");
     const checkoutId = requireSafeId(owner.checkout.id, "provisional checkout id");
     const generation = requireSafeId(owner.generation, "provisional clone generation");
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
-              repository.clone_generation, repository.clone_expires_ms,
-              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
-         FROM git_repositories repository
-         JOIN git_checkouts checkout ON checkout.repo_id = repository.id
-        WHERE repository.id = ? AND checkout.id = ? AND checkout.is_primary = 1`,
+    const headBytes = this.#checkoutHeadBytes(
+      `SELECT typeof(checkout.head) AS head_type,
+              length(CAST(checkout.head AS BLOB)) AS head_bytes
+         FROM git_checkouts checkout
+        WHERE checkout.repo_id = ? AND checkout.id = ? AND checkout.is_primary = 1`,
       repoId,
       checkoutId,
     );
-    if (row === undefined) throw new GitError("ESTALE", "provisional clone owner is stale");
-    const stored = requireStoredCheckoutLifecycle(row);
-    if (
-      stored.lifecycle !== "provisional" ||
-      stored.cloneGeneration !== generation ||
-      stored.checkout.root !== owner.checkout.root ||
-      stored.checkout.repoId !== repoId ||
-      stored.checkout.id !== checkoutId
-    ) {
-      throw new GitError("ESTALE", "provisional clone owner is stale");
+    if (headBytes === null) throw new GitError("ESTALE", "provisional clone owner is stale");
+    const rowMemory = this.#reserveCheckoutRow(headBytes);
+    try {
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+                typeof(checkout.head) AS head_type,
+                length(CAST(checkout.head AS BLOB)) AS head_bytes,
+                CAST(checkout.head AS BLOB) AS head_blob,
+                checkout.is_primary, repository.lifecycle,
+                repository.clone_generation, repository.clone_expires_ms,
+                ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+           FROM git_repositories repository
+           JOIN git_checkouts checkout ON checkout.repo_id = repository.id
+          WHERE repository.id = ? AND checkout.id = ? AND checkout.is_primary = 1`,
+        repoId,
+        checkoutId,
+      );
+      if (row === undefined) throw new GitError("ESTALE", "provisional clone owner is stale");
+      const stored = requireStoredCheckoutLifecycle(row, headBytes);
+      if (
+        stored.lifecycle !== "provisional" ||
+        stored.cloneGeneration !== generation ||
+        stored.checkout.root !== owner.checkout.root ||
+        stored.checkout.repoId !== repoId ||
+        stored.checkout.id !== checkoutId
+      ) {
+        throw new GitError("ESTALE", "provisional clone owner is stale");
+      }
+      requireCheckoutLifecycleCardinality(row, stored);
+      return stored;
+    } finally {
+      rowMemory.dispose();
     }
-    requireCheckoutLifecycleCardinality(row, stored);
-    return stored;
   }
 
   #requireProvisionalOwner(owner: ProvisionalCloneOwner, nowMs: number): StoredCheckoutLifecycle {
@@ -3129,13 +3556,10 @@ export class SqliteGitDatabase {
   /** The checkout whose root is the nearest registered ancestor of `dir`. */
   findCheckout(dir: string): CheckoutRow | null {
     const path = normalizeRoot(dir);
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
-              repository.clone_generation, repository.clone_expires_ms,
-              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+    const headBytes = this.#checkoutHeadBytes(
+      `SELECT typeof(checkout.head) AS head_type,
+              length(CAST(checkout.head AS BLOB)) AS head_bytes
          FROM git_checkouts checkout
-         JOIN git_repositories repository ON repository.id = checkout.repo_id
         WHERE checkout.root = '/' OR checkout.root = ?
            OR substr(?, 1, length(checkout.root) + 1) = checkout.root || '/'
         ORDER BY length(CAST(checkout.root AS BLOB)) DESC, checkout.id DESC
@@ -3143,27 +3567,65 @@ export class SqliteGitDatabase {
       path,
       path,
     );
-    if (row === undefined) return null;
-    const stored = requireStoredCheckoutLifecycle(row);
-    requireCheckoutLifecycleCardinality(row, stored);
-    return stored.lifecycle === "provisional" ? null : this.#rememberCheckout(stored.checkout);
+    if (headBytes === null) return null;
+    const rowMemory = this.#reserveCheckoutRow(headBytes);
+    try {
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+                typeof(checkout.head) AS head_type,
+                length(CAST(checkout.head AS BLOB)) AS head_bytes,
+                CAST(checkout.head AS BLOB) AS head_blob,
+                checkout.is_primary, repository.lifecycle,
+                repository.clone_generation, repository.clone_expires_ms,
+                ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+           FROM git_checkouts checkout
+           JOIN git_repositories repository ON repository.id = checkout.repo_id
+          WHERE checkout.root = '/' OR checkout.root = ?
+             OR substr(?, 1, length(checkout.root) + 1) = checkout.root || '/'
+          ORDER BY length(CAST(checkout.root AS BLOB)) DESC, checkout.id DESC
+          LIMIT 1`,
+        path,
+        path,
+      );
+      if (row === undefined) throw new CorruptError("checkout changed after metadata preflight");
+      const stored = requireStoredCheckoutLifecycle(row, headBytes);
+      requireCheckoutLifecycleCardinality(row, stored);
+      return stored.lifecycle === "provisional" ? null : this.#rememberCheckout(stored.checkout);
+    } finally {
+      rowMemory.dispose();
+    }
   }
 
   checkoutAt(root: string): CheckoutRow | null {
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
-              repository.clone_generation, repository.clone_expires_ms,
-              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
-         FROM git_checkouts checkout
-         JOIN git_repositories repository ON repository.id = checkout.repo_id
-        WHERE checkout.root = ?`,
-      requireCheckoutRoot(root, "input"),
+    const checkedRoot = requireCheckoutRoot(root, "input");
+    const headBytes = this.#checkoutHeadBytes(
+      `SELECT typeof(head) AS head_type, length(CAST(head AS BLOB)) AS head_bytes
+         FROM git_checkouts WHERE root = ?`,
+      checkedRoot,
     );
-    if (row === undefined) return null;
-    const stored = requireStoredCheckoutLifecycle(row);
-    requireCheckoutLifecycleCardinality(row, stored);
-    return stored.lifecycle === "provisional" ? null : this.#rememberCheckout(stored.checkout);
+    if (headBytes === null) return null;
+    const rowMemory = this.#reserveCheckoutRow(headBytes);
+    try {
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+                typeof(checkout.head) AS head_type,
+                length(CAST(checkout.head AS BLOB)) AS head_bytes,
+                CAST(checkout.head AS BLOB) AS head_blob,
+                checkout.is_primary, repository.lifecycle,
+                repository.clone_generation, repository.clone_expires_ms,
+                ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+           FROM git_checkouts checkout
+           JOIN git_repositories repository ON repository.id = checkout.repo_id
+          WHERE checkout.root = ?`,
+        checkedRoot,
+      );
+      if (row === undefined) throw new CorruptError("checkout changed after metadata preflight");
+      const stored = requireStoredCheckoutLifecycle(row, headBytes);
+      requireCheckoutLifecycleCardinality(row, stored);
+      return stored.lifecycle === "provisional" ? null : this.#rememberCheckout(stored.checkout);
+    } finally {
+      rowMemory.dispose();
+    }
   }
 
   listCheckouts(repoId: number): readonly CheckoutRow[] {
@@ -3171,142 +3633,184 @@ export class SqliteGitDatabase {
       throw new GitError("EINVAL", "repository id must be a safe positive integer");
     }
     this.#requireReadyRepository(repoId);
+    const maxHeadBytes = this.#maximumCheckoutHeadBytes(
+      `SELECT coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes
+         FROM git_checkouts WHERE repo_id = ?`,
+      repoId,
+    );
+    const rowMemory = this.#reserveCheckoutRow(maxHeadBytes);
     const rows: CheckoutRow[] = [];
     let primaryCount = 0;
     let previousRoot: string | null = null;
     let retainedBytes = 0;
-    for (const raw of this.#db.iterate(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
-         FROM git_checkouts WHERE repo_id = ?
-         ORDER BY root COLLATE BINARY LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
-      repoId,
-    )) {
-      const row = requireStoredCheckoutRow(raw);
-      if (row.repoId !== repoId) {
-        throw new CorruptError("checkout listing crossed repository boundaries");
+    try {
+      for (const raw of this.#db.iterate(
+        `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                length(CAST(head AS BLOB)) AS head_bytes,
+                CAST(head AS BLOB) AS head_blob, is_primary
+           FROM git_checkouts WHERE repo_id = ?
+           ORDER BY root COLLATE BINARY LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+        repoId,
+      )) {
+        const row = requireStoredCheckoutRow(raw, maxHeadBytes);
+        if (row.repoId !== repoId) {
+          throw new CorruptError("checkout listing crossed repository boundaries");
+        }
+        if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+          throw new CorruptError("checkout roots are not in strict byte order");
+        }
+        previousRoot = row.root;
+        retainedBytes +=
+          CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
+          checkoutTextEncoder.encode(row.root).byteLength +
+          refTextBytes(row.head, "stored HEAD target", "stored");
+        if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
+          throw new GitError("E2BIG", "checkout listing exceeds its 6 MiB retained bound");
+        }
+        rows.push(this.#rememberCheckout(row));
+        if (row.isPrimary) primaryCount++;
+        if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "checkout listing exceeds its retained bound");
+        }
       }
-      if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
-        throw new CorruptError("checkout roots are not in strict byte order");
+      if (rows.length > 0 && primaryCount !== 1) {
+        throw new CorruptError("repository must have exactly one primary checkout");
       }
-      previousRoot = row.root;
-      retainedBytes +=
-        CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
-        checkoutTextEncoder.encode(row.root).byteLength +
-        boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
-      if (retainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
-        throw new GitError("E2BIG", "checkout listing exceeds its 6 MiB retained bound");
-      }
-      rows.push(this.#rememberCheckout(row));
-      if (row.isPrimary) primaryCount++;
-      if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
-        throw new GitError("E2BIG", "checkout listing exceeds its retained bound");
-      }
+      return Object.freeze(rows);
+    } finally {
+      rowMemory.dispose();
     }
-    if (rows.length > 0 && primaryCount !== 1) {
-      throw new CorruptError("repository must have exactly one primary checkout");
-    }
-    return Object.freeze(rows);
   }
 
   listRoutingCheckouts(): CheckoutRow[] {
+    const maxHeadBytes = this.#maximumCheckoutHeadBytes(
+      "SELECT coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes FROM git_checkouts",
+    );
+    const rowMemory = this.#reserveCheckoutRow(maxHeadBytes);
     const rows: CheckoutRow[] = [];
     const primaryCounts = new Map<number, number>();
     const checkoutCounts = new Map<number, number>();
     let previousRoot: string | null = null;
     let retainedBytes = 0;
     let routingCount = 0;
-    for (const raw of this.#db.iterate(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
+    try {
+      for (const raw of this.#db.iterate(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              typeof(checkout.head) AS head_type,
+              length(CAST(checkout.head AS BLOB)) AS head_bytes,
+              CAST(checkout.head AS BLOB) AS head_blob,
+              checkout.is_primary, repository.lifecycle,
               repository.clone_generation, repository.clone_expires_ms,
               ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
          FROM git_checkouts checkout
          JOIN git_repositories repository ON repository.id = checkout.repo_id
         ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_ROUTING_CHECKOUTS + 1}`,
-    )) {
-      const stored = requireStoredCheckoutLifecycle(raw);
-      requireCheckoutLifecycleCardinality(raw, stored);
-      const row = stored.checkout;
-      routingCount++;
-      if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
-        throw new CorruptError("checkout roots are not in strict byte order");
+      )) {
+        const stored = requireStoredCheckoutLifecycle(raw, maxHeadBytes);
+        requireCheckoutLifecycleCardinality(raw, stored);
+        const row = stored.checkout;
+        routingCount++;
+        if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+          throw new CorruptError("checkout roots are not in strict byte order");
+        }
+        previousRoot = row.root;
+        retainedBytes +=
+          CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
+          checkoutTextEncoder.encode(row.root).byteLength +
+          refTextBytes(row.head, "stored HEAD target", "stored");
+        if (retainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
+          throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
+        }
+        if (stored.lifecycle === "ready") rows.push(this.#rememberCheckout(row));
+        primaryCounts.set(
+          row.repoId,
+          (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0),
+        );
+        const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
+        if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
+        }
+        checkoutCounts.set(row.repoId, checkoutCount);
+        if (routingCount > MAX_ROUTING_CHECKOUTS) {
+          throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
+        }
       }
-      previousRoot = row.root;
-      retainedBytes +=
-        CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
-        checkoutTextEncoder.encode(row.root).byteLength +
-        boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
-      if (retainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
-        throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
+      for (const count of primaryCounts.values()) {
+        if (count !== 1)
+          throw new CorruptError("repository must have exactly one primary checkout");
       }
-      if (stored.lifecycle === "ready") rows.push(this.#rememberCheckout(row));
-      primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
-      const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
-      if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
-        throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
-      }
-      checkoutCounts.set(row.repoId, checkoutCount);
-      if (routingCount > MAX_ROUTING_CHECKOUTS) {
-        throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
-      }
+      return rows;
+    } finally {
+      rowMemory.dispose();
     }
-    for (const count of primaryCounts.values()) {
-      if (count !== 1) throw new CorruptError("repository must have exactly one primary checkout");
-    }
-    return rows;
   }
 
   /** All routing roots, including provisional roots that block parent traversal. */
   listRoutingRoots(): string[] {
+    const maxHeadBytes = this.#maximumCheckoutHeadBytes(
+      "SELECT coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes FROM git_checkouts",
+    );
+    const rowMemory = this.#reserveCheckoutRow(maxHeadBytes);
     const roots: string[] = [];
     const primaryCounts = new Map<number, number>();
     const checkoutCounts = new Map<number, number>();
     let previousRoot: string | null = null;
     let retainedBytes = 0;
     let rootUtf8Bytes = 0;
-    for (const raw of this.#db.iterate(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
+    try {
+      for (const raw of this.#db.iterate(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+              typeof(checkout.head) AS head_type,
+              length(CAST(checkout.head AS BLOB)) AS head_bytes,
+              CAST(checkout.head AS BLOB) AS head_blob,
+              checkout.is_primary, repository.lifecycle,
               repository.clone_generation, repository.clone_expires_ms,
               ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
          FROM git_checkouts checkout
          JOIN git_repositories repository ON repository.id = checkout.repo_id
         ORDER BY checkout.root COLLATE BINARY LIMIT ${MAX_ROUTING_CHECKOUTS + 1}`,
-    )) {
-      const stored = requireStoredCheckoutLifecycle(raw);
-      requireCheckoutLifecycleCardinality(raw, stored);
-      const row = stored.checkout;
-      if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
-        throw new CorruptError("checkout roots are not in strict byte order");
+      )) {
+        const stored = requireStoredCheckoutLifecycle(raw, maxHeadBytes);
+        requireCheckoutLifecycleCardinality(raw, stored);
+        const row = stored.checkout;
+        if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+          throw new CorruptError("checkout roots are not in strict byte order");
+        }
+        previousRoot = row.root;
+        primaryCounts.set(
+          row.repoId,
+          (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0),
+        );
+        const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
+        if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
+          throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
+        }
+        checkoutCounts.set(row.repoId, checkoutCount);
+        const rowRootBytes = checkoutTextEncoder.encode(row.root).byteLength;
+        rootUtf8Bytes += rowRootBytes;
+        if (rootUtf8Bytes > MAX_ROUTING_ROOTS_UTF8_BYTES) {
+          throw new GitError("E2BIG", "checkout routing roots exceed their 6 MiB UTF-8 bound");
+        }
+        retainedBytes +=
+          CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
+          rowRootBytes +
+          refTextBytes(row.head, "stored HEAD target", "stored");
+        if (retainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
+          throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
+        }
+        roots.push(row.root);
+        if (roots.length > MAX_ROUTING_CHECKOUTS) {
+          throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
+        }
       }
-      previousRoot = row.root;
-      primaryCounts.set(row.repoId, (primaryCounts.get(row.repoId) ?? 0) + (row.isPrimary ? 1 : 0));
-      const checkoutCount = (checkoutCounts.get(row.repoId) ?? 0) + 1;
-      if (checkoutCount > MAX_CHECKOUTS_PER_REPOSITORY) {
-        throw new GitError("E2BIG", "repository checkout routing exceeds its retained bound");
+      for (const count of primaryCounts.values()) {
+        if (count !== 1)
+          throw new CorruptError("repository must have exactly one primary checkout");
       }
-      checkoutCounts.set(row.repoId, checkoutCount);
-      const rowRootBytes = checkoutTextEncoder.encode(row.root).byteLength;
-      rootUtf8Bytes += rowRootBytes;
-      if (rootUtf8Bytes > MAX_ROUTING_ROOTS_UTF8_BYTES) {
-        throw new GitError("E2BIG", "checkout routing roots exceed their 6 MiB UTF-8 bound");
-      }
-      retainedBytes +=
-        CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
-        rowRootBytes +
-        boundedRefText(row.head, "stored HEAD target", MAX_REFLOG_RAW_TARGET_BYTES, "stored");
-      if (retainedBytes > MAX_ROUTING_CHECKOUTS_RETAINED_BYTES) {
-        throw new GitError("E2BIG", "checkout routing exceeds its 16 MiB retained bound");
-      }
-      roots.push(row.root);
-      if (roots.length > MAX_ROUTING_CHECKOUTS) {
-        throw new GitError("E2BIG", "checkout routing exceeds its retained bound");
-      }
+      return roots;
+    } finally {
+      rowMemory.dispose();
     }
-    for (const count of primaryCounts.values()) {
-      if (count !== 1) throw new CorruptError("repository must have exactly one primary checkout");
-    }
-    return roots;
   }
 
   beginProvisionalClone(
@@ -3667,40 +4171,63 @@ export class SqliteGitDatabase {
           );
         }
 
-        const rootOwner = this.#db.one<Record<string, unknown>>(
-          `SELECT id AS checkout_id, repo_id, root, head, is_primary
-           FROM git_checkouts WHERE root = ?`,
+        const rootOwnerHeadBytes = this.#checkoutHeadBytes(
+          `SELECT typeof(head) AS head_type, length(CAST(head AS BLOB)) AS head_bytes
+             FROM git_checkouts WHERE root = ?`,
           normalized,
         );
-        if (rootOwner !== undefined) {
-          const owner = requireStoredCheckoutRow(rootOwner);
-          if (owner.root !== normalized) {
-            throw new CorruptError("checkout root lookup returned another root");
-          }
-          throw new GitError(
-            "EWORKTREEEXISTS",
-            `checkout root is already registered: ${normalized}`,
-          );
-        }
-        if (attached?.startsWith("refs/heads/")) {
-          const branchOwner = this.#db.one<Record<string, unknown>>(
-            `SELECT id AS checkout_id, repo_id, root, head, is_primary
-             FROM git_checkouts WHERE repo_id = ? AND head = ?`,
-            repoId,
-            checkedHead,
-          );
-          if (branchOwner !== undefined) {
-            const owner = requireStoredCheckoutRow(branchOwner);
-            if (owner.repoId !== repoId) {
-              throw new CorruptError("attached branch lookup crossed repository boundaries");
+        if (rootOwnerHeadBytes !== null) {
+          const rowMemory = this.#reserveCheckoutRow(rootOwnerHeadBytes);
+          try {
+            const rootOwner = this.#db.one<Record<string, unknown>>(
+              `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                      length(CAST(head AS BLOB)) AS head_bytes,
+                      CAST(head AS BLOB) AS head_blob, is_primary
+                 FROM git_checkouts WHERE root = ?`,
+              normalized,
+            );
+            if (rootOwner === undefined) {
+              throw new CorruptError("checkout root owner changed after metadata preflight");
             }
-            if (owner.head !== checkedHead) {
-              throw new CorruptError("attached branch lookup returned another branch");
+            const owner = requireStoredCheckoutRow(rootOwner, rootOwnerHeadBytes);
+            if (owner.root !== normalized) {
+              throw new CorruptError("checkout root lookup returned another root");
             }
             throw new GitError(
-              "EBRANCHINUSE",
-              `branch ${attached} is already attached to checkout ${owner.root}`,
+              "EWORKTREEEXISTS",
+              `checkout root is already registered: ${normalized}`,
             );
+          } finally {
+            rowMemory.dispose();
+          }
+        }
+        if (attached?.startsWith("refs/heads/")) {
+          const checkedHeadBytes = refTextBytes(checkedHead, "initial HEAD target", "input");
+          const rowMemory = this.#reserveCheckoutRow(checkedHeadBytes);
+          try {
+            const branchOwner = this.#db.one<Record<string, unknown>>(
+              `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                      length(CAST(head AS BLOB)) AS head_bytes,
+                      CAST(head AS BLOB) AS head_blob, is_primary
+                 FROM git_checkouts WHERE repo_id = ? AND head = ?`,
+              repoId,
+              checkedHead,
+            );
+            if (branchOwner !== undefined) {
+              const owner = requireStoredCheckoutRow(branchOwner, checkedHeadBytes);
+              if (owner.repoId !== repoId) {
+                throw new CorruptError("attached branch lookup crossed repository boundaries");
+              }
+              if (owner.head !== checkedHead) {
+                throw new CorruptError("attached branch lookup returned another branch");
+              }
+              throw new GitError(
+                "EBRANCHINUSE",
+                `branch ${attached} is already attached to checkout ${owner.root}`,
+              );
+            }
+          } finally {
+            rowMemory.dispose();
           }
         }
 
@@ -3758,14 +4285,32 @@ export class SqliteGitDatabase {
             throw new GitError("EINVAL", "checkout initialization must be synchronous");
           }
         }
-        const stored = this.#db.one<Record<string, unknown>>(
-          `SELECT id AS checkout_id, repo_id, root, head, is_primary
-           FROM git_checkouts WHERE id = ? AND repo_id = ?`,
+        const storedHeadBytes = this.#checkoutHeadBytes(
+          `SELECT typeof(head) AS head_type, length(CAST(head AS BLOB)) AS head_bytes
+             FROM git_checkouts WHERE id = ? AND repo_id = ?`,
           checkoutId,
           repoId,
         );
-        if (stored === undefined) throw new CorruptError("initialized checkout row is missing");
-        const row = requireStoredCheckoutRow(stored);
+        if (storedHeadBytes === null) throw new CorruptError("initialized checkout row is missing");
+        const rowMemory = this.#reserveCheckoutRow(storedHeadBytes);
+        const row = (() => {
+          try {
+            const stored = this.#db.one<Record<string, unknown>>(
+              `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                      length(CAST(head AS BLOB)) AS head_bytes,
+                      CAST(head AS BLOB) AS head_blob, is_primary
+                 FROM git_checkouts WHERE id = ? AND repo_id = ?`,
+              checkoutId,
+              repoId,
+            );
+            if (stored === undefined) {
+              throw new CorruptError("initialized checkout changed after metadata preflight");
+            }
+            return requireStoredCheckoutRow(stored, storedHeadBytes);
+          } finally {
+            rowMemory.dispose();
+          }
+        })();
         if (
           row.id !== checkoutId ||
           row.repoId !== repoId ||
@@ -3798,13 +4343,30 @@ export class SqliteGitDatabase {
       throw new GitError("EINVAL", "checkout id must be a safe positive integer");
     }
     const removed = this.#db.transactionSync(() => {
-      const raw = this.#db.one<Record<string, unknown>>(
-        `SELECT id AS checkout_id, repo_id, root, head, is_primary
+      const headBytes = this.#checkoutHeadBytes(
+        `SELECT typeof(head) AS head_type, length(CAST(head AS BLOB)) AS head_bytes
            FROM git_checkouts WHERE id = ?`,
         checkoutId,
       );
-      if (raw === undefined) throw new GitError("EWORKTREENOTFOUND", "checkout does not exist");
-      const row = requireStoredCheckoutRow(raw);
+      if (headBytes === null) throw new GitError("EWORKTREENOTFOUND", "checkout does not exist");
+      const rowMemory = this.#reserveCheckoutRow(headBytes);
+      const row = (() => {
+        try {
+          const raw = this.#db.one<Record<string, unknown>>(
+            `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                    length(CAST(head AS BLOB)) AS head_bytes,
+                    CAST(head AS BLOB) AS head_blob, is_primary
+               FROM git_checkouts WHERE id = ?`,
+            checkoutId,
+          );
+          if (raw === undefined) {
+            throw new CorruptError("checkout changed after metadata preflight");
+          }
+          return requireStoredCheckoutRow(raw, headBytes);
+        } finally {
+          rowMemory.dispose();
+        }
+      })();
       if (row.id !== checkoutId) throw new CorruptError("checkout lookup returned another row");
       if (row.isPrimary) {
         throw new GitError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
@@ -3859,36 +4421,48 @@ export class SqliteGitDatabase {
     this.openShared(repoId);
     const idsJson = JSON.stringify(uniqueIds);
     const removed = this.#db.transactionSync(() => {
+      const maxHeadBytes = this.#maximumCheckoutHeadBytes(
+        `SELECT coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes
+           FROM git_checkouts WHERE id IN (SELECT value FROM json_each(?))`,
+        idsJson,
+      );
+      const rowMemory = this.#reserveCheckoutRow(maxHeadBytes);
       const rows: CheckoutRow[] = [];
       const selectedIds = new Set<number>();
       let previousRoot: string | null = null;
-      for (const raw of this.#db.iterate(
-        `SELECT id AS checkout_id, repo_id, root, head, is_primary
+      try {
+        for (const raw of this.#db.iterate(
+          `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                length(CAST(head AS BLOB)) AS head_bytes,
+                CAST(head AS BLOB) AS head_blob, is_primary
            FROM git_checkouts
           WHERE id IN (SELECT value FROM json_each(?))
           ORDER BY root COLLATE BINARY
           LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
-        idsJson,
-      )) {
-        const row = requireStoredCheckoutRow(raw);
-        if (!seen.has(row.id)) {
-          throw new CorruptError("checkout removal query returned an unrequested checkout");
+          idsJson,
+        )) {
+          const row = requireStoredCheckoutRow(raw, maxHeadBytes);
+          if (!seen.has(row.id)) {
+            throw new CorruptError("checkout removal query returned an unrequested checkout");
+          }
+          if (selectedIds.has(row.id)) {
+            throw new CorruptError("checkout removal query returned a duplicate checkout");
+          }
+          selectedIds.add(row.id);
+          if (row.repoId !== repoId) {
+            throw new GitError("EWORKTREENOTFOUND", "checkout belongs to another repository");
+          }
+          if (row.isPrimary) {
+            throw new GitError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
+          }
+          if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
+            throw new CorruptError("checkout removal roots are not in strict byte order");
+          }
+          previousRoot = row.root;
+          rows.push(row);
         }
-        if (selectedIds.has(row.id)) {
-          throw new CorruptError("checkout removal query returned a duplicate checkout");
-        }
-        selectedIds.add(row.id);
-        if (row.repoId !== repoId) {
-          throw new GitError("EWORKTREENOTFOUND", "checkout belongs to another repository");
-        }
-        if (row.isPrimary) {
-          throw new GitError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
-        }
-        if (previousRoot !== null && comparePaths(previousRoot, row.root) >= 0) {
-          throw new CorruptError("checkout removal roots are not in strict byte order");
-        }
-        previousRoot = row.root;
-        rows.push(row);
+      } finally {
+        rowMemory.dispose();
       }
       if (rows.length > MAX_CHECKOUTS_PER_REPOSITORY) {
         throw new CorruptError("checkout removal query exceeded its bounded result");
@@ -3970,13 +4544,30 @@ export class SqliteGitDatabase {
       this.#memory,
     );
     this.#sharedStores.set(repoId, store);
-    const primaryRaw = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+    const primaryHeadBytes = this.#checkoutHeadBytes(
+      `SELECT typeof(head) AS head_type, length(CAST(head AS BLOB)) AS head_bytes
          FROM git_checkouts WHERE repo_id = ? AND is_primary = 1`,
       repoId,
     );
-    if (primaryRaw === undefined) throw new CorruptError("repository primary checkout is missing");
-    const primary = requireStoredCheckoutRow(primaryRaw);
+    if (primaryHeadBytes === null) throw new CorruptError("repository primary checkout is missing");
+    const rowMemory = this.#reserveCheckoutRow(primaryHeadBytes);
+    const primary = (() => {
+      try {
+        const primaryRaw = this.#db.one<Record<string, unknown>>(
+          `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                  length(CAST(head AS BLOB)) AS head_bytes,
+                  CAST(head AS BLOB) AS head_blob, is_primary
+             FROM git_checkouts WHERE repo_id = ? AND is_primary = 1`,
+          repoId,
+        );
+        if (primaryRaw === undefined) {
+          throw new CorruptError("primary checkout changed after metadata preflight");
+        }
+        return requireStoredCheckoutRow(primaryRaw, primaryHeadBytes);
+      } finally {
+        rowMemory.dispose();
+      }
+    })();
     if (primary.repoId !== repoId || !primary.isPrimary) {
       throw new CorruptError("repository primary checkout lookup returned another checkout");
     }
@@ -4037,23 +4628,37 @@ export class SqliteGitDatabase {
   }
 
   #checkoutById(checkoutId: number): CheckoutRow {
-    const raw = this.#db.one<Record<string, unknown>>(
-      `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
-              checkout.head, checkout.is_primary, repository.lifecycle,
-              repository.clone_generation, repository.clone_expires_ms,
-              ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
-         FROM git_checkouts checkout
-         JOIN git_repositories repository ON repository.id = checkout.repo_id
-        WHERE checkout.id = ?`,
+    const headBytes = this.#checkoutHeadBytes(
+      `SELECT typeof(head) AS head_type, length(CAST(head AS BLOB)) AS head_bytes
+         FROM git_checkouts WHERE id = ?`,
       checkoutId,
     );
-    if (raw === undefined) throw new GitError("ENOTFOUND", "checkout does not exist");
-    const stored = requireStoredCheckoutLifecycle(raw);
-    requireCheckoutLifecycleCardinality(raw, stored);
-    if (stored.lifecycle !== "ready") {
-      throw new GitError("ENOTFOUND", "checkout is not published");
+    if (headBytes === null) throw new GitError("ENOTFOUND", "checkout does not exist");
+    const rowMemory = this.#reserveCheckoutRow(headBytes);
+    try {
+      const raw = this.#db.one<Record<string, unknown>>(
+        `SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
+                typeof(checkout.head) AS head_type,
+                length(CAST(checkout.head AS BLOB)) AS head_bytes,
+                CAST(checkout.head AS BLOB) AS head_blob,
+                checkout.is_primary, repository.lifecycle,
+                repository.clone_generation, repository.clone_expires_ms,
+                ${CHECKOUT_LIFECYCLE_CARDINALITY_SQL}
+           FROM git_checkouts checkout
+           JOIN git_repositories repository ON repository.id = checkout.repo_id
+          WHERE checkout.id = ?`,
+        checkoutId,
+      );
+      if (raw === undefined) throw new CorruptError("checkout changed after metadata preflight");
+      const stored = requireStoredCheckoutLifecycle(raw, headBytes);
+      requireCheckoutLifecycleCardinality(raw, stored);
+      if (stored.lifecycle !== "ready") {
+        throw new GitError("ENOTFOUND", "checkout is not published");
+      }
+      return stored.checkout;
+    } finally {
+      rowMemory.dispose();
     }
-    return stored.checkout;
   }
 
   #rejectStaleCheckoutRow(checkout: CheckoutRow, checkoutId: number): void {
@@ -4426,6 +5031,9 @@ export class CheckoutStore implements IndexStore {
         (oids) => this.#looseObjectMetadata(oids),
         options,
       ),
+    );
+    OWNED_REF_MUTATIONS.set(this, (mutation, metadata, owner) =>
+      this.#mutateRefsOwned(mutation, metadata, owner),
     );
     shared.installOperations(this);
   }
@@ -5740,14 +6348,91 @@ export class CheckoutStore implements IndexStore {
   getRef(name: string): string | null {
     const checkedName = requireRefName(name, "ref name", "input", true);
     if (checkedName === "HEAD") return this.head();
-    const target = this.#db.scalar<unknown>(
-      "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
+    const metadata = this.#db.one<{
+      repo_id: unknown;
+      name_type: unknown;
+      name_bytes: unknown;
+      target_type: unknown;
+      target_bytes: unknown;
+    }>(
+      `SELECT repo_id, typeof(name) AS name_type,
+              length(CAST(name AS BLOB)) AS name_bytes,
+              typeof(target) AS target_type,
+              length(CAST(target AS BLOB)) AS target_bytes
+         FROM git_refs WHERE repo_id = ? AND name = ?`,
       this.#repoId,
       checkedName,
     );
-    return target === undefined
-      ? null
-      : requireRawRefTarget(target, `stored target of ${checkedName}`, "stored");
+    if (metadata === undefined) return null;
+    if (
+      metadata.repo_id !== this.#repoId ||
+      metadata.name_type !== "text" ||
+      typeof metadata.name_bytes !== "number" ||
+      !Number.isSafeInteger(metadata.name_bytes) ||
+      metadata.name_bytes < 1 ||
+      metadata.target_type !== "text" ||
+      typeof metadata.target_bytes !== "number" ||
+      !Number.isSafeInteger(metadata.target_bytes) ||
+      metadata.target_bytes < 1
+    ) {
+      throw new CorruptError(`stored target of ${checkedName} has invalid text metadata`);
+    }
+    const reservation = this.#sharedStore.reserveMemory();
+    try {
+      reservation.set(
+        "other",
+        256 +
+          metadata.name_bytes +
+          metadata.target_bytes +
+          retainedStringUnits(metadata.name_bytes) +
+          retainedStringUnits(metadata.target_bytes),
+      );
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT repo_id, typeof(name) AS name_type,
+                length(CAST(name AS BLOB)) AS name_bytes,
+                CAST(name AS BLOB) AS name_blob,
+                typeof(target) AS target_type,
+                length(CAST(target AS BLOB)) AS target_bytes,
+                CAST(target AS BLOB) AS target_blob
+           FROM git_refs WHERE repo_id = ? AND name = ?`,
+        this.#repoId,
+        checkedName,
+      );
+      if (
+        row === undefined ||
+        row.repo_id !== this.#repoId ||
+        row.name_type !== "text" ||
+        row.name_bytes !== metadata.name_bytes ||
+        row.target_type !== "text" ||
+        row.target_bytes !== metadata.target_bytes
+      ) {
+        throw new CorruptError(`stored ref ${checkedName} changed after validation`);
+      }
+      const storedName = requireRefName(
+        decodeCanonicalStoredText(row.name_blob, "stored ref name"),
+        "stored ref name",
+        "stored",
+      );
+      if (storedName !== checkedName) {
+        throw new CorruptError(`stored ref ${checkedName} crossed a ref boundary`);
+      }
+      const checked = requireRawRefTarget(
+        decodeCanonicalStoredText(row.target_blob, `stored target of ${checkedName}`),
+        `stored target of ${checkedName}`,
+        "stored",
+      );
+      reservation.set(
+        "other",
+        256 +
+          metadata.name_bytes +
+          metadata.target_bytes +
+          retainedStringBytes(storedName) +
+          retainedStringBytes(checked),
+      );
+      return checked;
+    } finally {
+      reservation.dispose();
+    }
   }
 
   setRef(name: string, target: string): void {
@@ -5782,18 +6467,61 @@ export class CheckoutStore implements IndexStore {
   }
 
   #readTrackingRefRevision(refName: string): number | null {
-    const row = this.#db.one<{ repo_id: unknown; ref_name: unknown; revision: unknown }>(
-      `SELECT repo_id, ref_name, revision FROM git_tracking_ref_revisions
+    const metadata = this.#db.one<{
+      ref_name_type: unknown;
+      ref_name_bytes: unknown;
+    }>(
+      `SELECT typeof(ref_name) AS ref_name_type,
+              length(CAST(ref_name AS BLOB)) AS ref_name_bytes
+         FROM git_tracking_ref_revisions
         WHERE repo_id = ? AND ref_name = ?`,
       this.#repoId,
       refName,
     );
-    if (row === undefined) return null;
-    const storedName = requireRefName(row.ref_name, "stored tracking revision ref", "stored");
-    if (row.repo_id !== this.#repoId || storedName !== refName) {
-      throw new CorruptError("tracking revision crossed repository or ref boundaries");
+    if (metadata === undefined) return null;
+    if (
+      metadata.ref_name_type !== "text" ||
+      typeof metadata.ref_name_bytes !== "number" ||
+      !Number.isSafeInteger(metadata.ref_name_bytes) ||
+      metadata.ref_name_bytes < 1
+    ) {
+      throw new CorruptError("stored tracking revision ref metadata is invalid");
     }
-    return requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+    const reservation = this.#sharedStore.reserveMemory();
+    try {
+      reservation.set(
+        "other",
+        256 + metadata.ref_name_bytes + retainedStringUnits(metadata.ref_name_bytes),
+      );
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT repo_id, typeof(ref_name) AS ref_name_type,
+                length(CAST(ref_name AS BLOB)) AS ref_name_bytes,
+                CAST(ref_name AS BLOB) AS ref_name_blob, revision
+           FROM git_tracking_ref_revisions
+          WHERE repo_id = ? AND ref_name = ?`,
+        this.#repoId,
+        refName,
+      );
+      if (
+        row === undefined ||
+        row.repo_id !== this.#repoId ||
+        row.ref_name_type !== "text" ||
+        row.ref_name_bytes !== metadata.ref_name_bytes
+      ) {
+        throw new CorruptError("tracking revision changed after metadata preflight");
+      }
+      const storedName = requireRefName(
+        decodeCanonicalStoredText(row.ref_name_blob, "stored tracking revision ref"),
+        "stored tracking revision ref",
+        "stored",
+      );
+      if (storedName !== refName) {
+        throw new CorruptError("tracking revision crossed repository or ref boundaries");
+      }
+      return requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+    } finally {
+      reservation.dispose();
+    }
   }
 
   #trackingRefRevisionCount(): number {
@@ -5842,31 +6570,77 @@ export class CheckoutStore implements IndexStore {
 
   #advanceTrackingRefObservations(trackingPrefix: string, count: number): void {
     if (count === 0) return;
-    let matched = 0;
-    let previousName: string | null = null;
-    for (const row of this.#db.iterate(
-      `SELECT repo_id, ref_name, revision FROM git_tracking_ref_revisions
-        WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?
-        ORDER BY ref_name`,
+    const metadata = this.#db.one<{ rows: unknown; ref_name_bytes: unknown }>(
+      `SELECT count(*) AS rows,
+              coalesce(max(length(CAST(ref_name AS BLOB))), 0) AS ref_name_bytes
+         FROM git_tracking_ref_revisions
+        WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?`,
       this.#repoId,
       trackingPrefix,
       trackingPrefix,
-    )) {
-      const name = requireRefName(row.ref_name, "stored tracking revision ref", "stored");
-      if (
-        row.repo_id !== this.#repoId ||
-        !name.startsWith(trackingPrefix) ||
-        (previousName !== null && comparePaths(previousName, name) >= 0)
-      ) {
-        throw new CorruptError("tracking observation scan crossed or reordered repositories");
+    );
+    if (
+      metadata === undefined ||
+      typeof metadata.rows !== "number" ||
+      !Number.isSafeInteger(metadata.rows) ||
+      metadata.rows < 0 ||
+      metadata.rows > count ||
+      typeof metadata.ref_name_bytes !== "number" ||
+      !Number.isSafeInteger(metadata.ref_name_bytes) ||
+      metadata.ref_name_bytes < 0
+    ) {
+      throw new CorruptError("tracking observation metadata is invalid");
+    }
+    const reservation = this.#sharedStore.reserveMemory();
+    reservation.set(
+      "other",
+      256 + 2 * metadata.ref_name_bytes + retainedStringUnits(metadata.ref_name_bytes),
+    );
+    let matched = 0;
+    let previousNameBytes: Uint8Array | null = null;
+    try {
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, typeof(ref_name) AS ref_name_type,
+                CAST(ref_name AS BLOB) AS ref_name_blob, revision
+           FROM git_tracking_ref_revisions
+          WHERE repo_id = ? AND substr(ref_name, 1, length(?)) = ?
+          ORDER BY ref_name`,
+        this.#repoId,
+        trackingPrefix,
+        trackingPrefix,
+      )) {
+        const nameBytes = requireStoredTextBytes(
+          row.ref_name_type,
+          row.ref_name_blob,
+          "stored tracking revision ref",
+        );
+        const name = requireRefName(
+          decodeCanonicalText(nameBytes, "stored tracking revision ref"),
+          "stored tracking revision ref",
+          "stored",
+        );
+        if (
+          row.repo_id !== this.#repoId ||
+          !name.startsWith(trackingPrefix) ||
+          (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0)
+        ) {
+          throw new CorruptError("tracking observation scan crossed or reordered repositories");
+        }
+        previousNameBytes = nameBytes;
+        matched++;
+        if (matched > metadata.rows) {
+          throw new CorruptError("tracking observation count is invalid");
+        }
+        const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+        if (revision === Number.MAX_SAFE_INTEGER) {
+          throw new GitError("E2BIG", "tracking ref revision is exhausted");
+        }
       }
-      previousName = name;
-      matched++;
-      if (matched > count) throw new CorruptError("tracking observation count is invalid");
-      const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-      if (revision === Number.MAX_SAFE_INTEGER) {
-        throw new GitError("E2BIG", "tracking ref revision is exhausted");
+      if (matched !== metadata.rows) {
+        throw new CorruptError("tracking observation changed after metadata preflight");
       }
+    } finally {
+      reservation.dispose();
     }
     if (matched === 0) return;
     this.#db.run(
@@ -5881,31 +6655,84 @@ export class CheckoutStore implements IndexStore {
   #bumpTrackingRefRevisions(changedNames: ReadonlySet<string>, budget: RefMutationBudget): void {
     if (changedNames.size === 0) return;
     const affected: string[] = [];
-    for (const page of jsonPages(changedNames, "tracking ref revision lookup")) {
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, ref_name, revision FROM git_tracking_ref_revisions
-          WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))
-          ORDER BY ref_name`,
+    for (const page of jsonPages(changedNames, "tracking ref revision lookup", {
+      reservation: budget.memoryReservation(),
+      maxUnits: jsonStringMaxUnits,
+    })) {
+      const metadata = this.#db.one<{ max_ref_name_bytes: unknown }>(
+        `SELECT coalesce(max(length(CAST(ref_name AS BLOB))), 0) AS max_ref_name_bytes
+           FROM git_tracking_ref_revisions
+          WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))`,
         this.#repoId,
         page,
-      )) {
-        const name = requireRefName(row.ref_name, "stored tracking revision ref", "stored");
-        if (row.repo_id !== this.#repoId || !changedNames.has(name)) {
-          throw new CorruptError("tracking revision scan crossed repository or ref boundaries");
+      );
+      const maxRefNameBytes = requireMaximumStoredTextBytes(
+        metadata?.max_ref_name_bytes,
+        "tracking revision scan",
+      );
+      const rowMemory = budget.memoryReservation().scope();
+      rowMemory.set(
+        "other",
+        maxRefNameBytes === 0 ? 0 : currentTextRowRetainedBytes(maxRefNameBytes),
+      );
+      let observedMaxRefNameBytes = 0;
+      try {
+        for (const row of this.#db.iterate(
+          `SELECT repo_id, typeof(ref_name) AS ref_name_type,
+                  length(CAST(ref_name AS BLOB)) AS ref_name_bytes,
+                  CAST(ref_name AS BLOB) AS ref_name_blob, revision
+             FROM git_tracking_ref_revisions
+            WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))
+            ORDER BY ref_name`,
+          this.#repoId,
+          page,
+        )) {
+          if (row.repo_id !== this.#repoId) {
+            throw new CorruptError("tracking revision scan crossed repository boundaries");
+          }
+          const nameByteLength = requireStoredTextByteLength(
+            row.ref_name_type,
+            row.ref_name_bytes,
+            "stored tracking revision ref",
+          );
+          if (nameByteLength > maxRefNameBytes) {
+            throw new CorruptError("tracking revision scan changed after metadata preflight");
+          }
+          const nameBytes = requireStoredTextBytes(
+            row.ref_name_type,
+            row.ref_name_blob,
+            "stored tracking revision ref",
+          );
+          if (nameBytes.byteLength !== nameByteLength) {
+            throw new CorruptError("stored tracking revision ref changed after validation");
+          }
+          const name = requireRefName(
+            decodeCanonicalText(nameBytes, "stored tracking revision ref"),
+            "stored tracking revision ref",
+            "stored",
+          );
+          if (!changedNames.has(name)) {
+            throw new CorruptError("tracking revision scan crossed ref boundaries");
+          }
+          const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
+          if (revision === Number.MAX_SAFE_INTEGER) {
+            throw new GitError("E2BIG", "tracking ref revision is exhausted");
+          }
+          observedMaxRefNameBytes = Math.max(observedMaxRefNameBytes, nameByteLength);
+          budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(name));
+          affected.push(name);
         }
-        const revision = requireFetchGeneration(row.revision, "stored tracking ref revision", 0);
-        if (revision === Number.MAX_SAFE_INTEGER) {
-          throw new GitError("E2BIG", "tracking ref revision is exhausted");
+        if (observedMaxRefNameBytes !== maxRefNameBytes) {
+          throw new CorruptError("tracking revision scan changed after metadata preflight");
         }
-        budget.charge(
-          REF_MUTATION_ITEM_RETAINED_BYTES +
-            2 *
-              boundedRefText(name, "stored tracking revision ref", MAX_REFLOG_REF_BYTES, "stored"),
-        );
-        affected.push(name);
+      } finally {
+        rowMemory.dispose();
       }
     }
-    for (const page of jsonPages(affected, "tracking ref revision update")) {
+    for (const page of jsonPages(affected, "tracking ref revision update", {
+      reservation: budget.memoryReservation(),
+      maxUnits: jsonStringMaxUnits,
+    })) {
       this.#db.run(
         `UPDATE git_tracking_ref_revisions SET revision = revision + 1
           WHERE repo_id = ? AND ref_name IN (SELECT value FROM json_each(?))`,
@@ -5920,39 +6747,73 @@ export class CheckoutStore implements IndexStore {
     trackingPrefix: string,
     refName: string,
   ): TrackingRefPublicationToken {
-    const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
-    const name = requireRefName(refName, "tracking publication ref", "input");
-    if (!name.startsWith(prefix) || name === `${prefix}HEAD`) {
-      throw new GitError("EINVAL", "tracking publication ref is outside its branch namespace");
-    }
     const reservation = this.#sharedStore.reserveMemory();
     try {
       const budget = new RefMutationBudget(reservation, true);
+      const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
+      const name = requireRefName(refName, "tracking publication ref", "input");
       budget.charge(
-        REF_MUTATION_ITEM_RETAINED_BYTES +
-          2 *
-            (boundedRefText(prefix, "tracking publication prefix", MAX_REFLOG_REF_BYTES, "input") +
-              boundedRefText(name, "tracking publication ref", MAX_REFLOG_REF_BYTES, "input")),
+        REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(prefix) + retainedStringBytes(name),
       );
+      if (
+        !name.startsWith(prefix) ||
+        (name.length === prefix.length + 4 && name.endsWith("HEAD"))
+      ) {
+        throw new GitError("EINVAL", "tracking publication ref is outside its branch namespace");
+      }
       const snapshot = this.#db.transactionSync(() => {
         const refRevision = this.#ensureTrackingRefRevision(name);
-        const raw = this.#db.scalar<unknown>(
-          "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
+        const targetMetadata = this.#db.one<{ target_type: unknown; target_bytes: unknown }>(
+          `SELECT typeof(target) AS target_type,
+                  length(CAST(target AS BLOB)) AS target_bytes
+             FROM git_refs WHERE repo_id = ? AND name = ?`,
           this.#repoId,
           name,
         );
-        const target =
-          raw === undefined ? null : requireRawRefTarget(raw, `stored target of ${name}`, "stored");
-        if (target !== null) {
-          budget.charge(
-            2 *
-              boundedRefText(
-                target,
-                `stored target of ${name}`,
-                MAX_REFLOG_RAW_TARGET_BYTES,
-                "stored",
-              ),
+        const targetMemory = reservation.scope();
+        if (targetMetadata !== undefined) {
+          if (
+            targetMetadata.target_type !== "text" ||
+            typeof targetMetadata.target_bytes !== "number" ||
+            !Number.isSafeInteger(targetMetadata.target_bytes) ||
+            targetMetadata.target_bytes < 1
+          ) {
+            throw new CorruptError("tracking publication target metadata is invalid");
+          }
+          targetMemory.set("other", currentTextRowRetainedBytes(targetMetadata.target_bytes));
+        }
+        let target: string | null;
+        try {
+          const row = this.#db.one<Record<string, unknown>>(
+            `SELECT typeof(target) AS target_type,
+                    length(CAST(target AS BLOB)) AS target_bytes,
+                    CAST(target AS BLOB) AS target_blob
+               FROM git_refs WHERE repo_id = ? AND name = ?`,
+            this.#repoId,
+            name,
           );
+          target =
+            row === undefined
+              ? null
+              : requireRawRefTarget(
+                  requireCanonicalStoredText(
+                    row.target_type,
+                    row.target_blob,
+                    "stored tracking target",
+                  ),
+                  "stored tracking target",
+                  "stored",
+                );
+          if (
+            row !== undefined &&
+            (row.target_type !== "text" || row.target_bytes !== targetMetadata?.target_bytes)
+          ) {
+            throw new CorruptError("tracking publication target changed after metadata preflight");
+          }
+          targetMemory.clear("other");
+          if (target !== null) budget.charge(retainedStringBytes(target));
+        } finally {
+          targetMemory.dispose();
         }
         const state: TrackingRefPublicationState = {
           refName: name,
@@ -6003,39 +6864,42 @@ export class CheckoutStore implements IndexStore {
     if (state === undefined || state.disposed) {
       throw staleFetch("tracking publication token is no longer active");
     }
-    state.budget.requireSqlHeadroom();
-    const normalized = normalizeRefMutation(
-      {
-        puts: target === null ? [] : [{ name: state.refName, target }],
-        deletes: target === null ? [state.refName] : [],
-        expected: { name: state.refName, target: state.target },
-      },
-      state.budget,
-    );
-    const checkedMetadata = validateRefLogMetadata(metadata);
-    let changed: boolean;
+    const publicationReservation = state.reservation.scope();
     try {
-      changed = this.#db.transactionSync(() => {
+      const budget = new RefMutationBudget(publicationReservation);
+      const normalized = normalizeRefMutation(
+        {
+          puts: target === null ? [] : [{ name: state.refName, target }],
+          deletes: target === null ? [state.refName] : [],
+          expected: { name: state.refName, target: state.target },
+        },
+        budget,
+      );
+      const checkedMetadata = validateRefLogMetadata(metadata);
+      budget.charge(refLogMetadataRetainedBytes(checkedMetadata));
+      const changed = this.#db.transactionSync(() => {
         const refRevision = this.#readTrackingRefRevision(state.refName);
         if (refRevision !== state.refRevision) {
           throw staleFetch("the tracking ref changed after observation");
         }
         const refChanged = this.#mutateRefs(normalized, checkedMetadata);
         if (!refChanged) {
-          this.#bumpTrackingRefRevisions(new Set([state.refName]), state.budget);
-          this.#bumpFetchNamespaceRevisions(new Set([state.refName]), state.budget);
+          this.#bumpTrackingRefRevisions(new Set([state.refName]), budget);
+          this.#bumpFetchNamespaceRevisions(new Set([state.refName]), budget);
         }
         return refChanged;
       });
+      this.#issuedTrackingRefPublications.delete(token);
+      this.#trackingRefPublicationStates.delete(token);
+      return changed;
     } catch (error) {
       if (hasErrorCode(error, "ESTALEHEAD")) {
         throw staleFetch(`tracking ref ${state.refName} changed after observation`);
       }
       throw error;
+    } finally {
+      publicationReservation.dispose();
     }
-    this.#issuedTrackingRefPublications.delete(token);
-    this.#trackingRefPublicationStates.delete(token);
-    return changed;
   }
 
   /** Fence one remote-tracking namespace and retain its exact publication snapshot. */
@@ -6044,7 +6908,6 @@ export class CheckoutStore implements IndexStore {
     candidateExactRefs: Iterable<string> = [],
     owningReservation?: MemoryReservation,
   ): FetchPublicationToken {
-    const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
     if (owningReservation !== undefined) {
       if (owningReservation.disposed) {
         throw new GitError("EINVAL", "fetch publication reservation is disposed");
@@ -6063,6 +6926,8 @@ export class CheckoutStore implements IndexStore {
       }
     })();
     try {
+      const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
+      budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(prefix));
       const candidates = new Map<string, string | null>();
       let candidateInputs = 0;
       for (const value of candidateExactRefs) {
@@ -6077,10 +6942,7 @@ export class CheckoutStore implements IndexStore {
         if (candidates.has(name)) {
           throw new GitError("EINVAL", `duplicate fetch exact ref candidate ${name}`);
         }
-        budget.charge(
-          REF_MUTATION_ITEM_RETAINED_BYTES +
-            2 * boundedRefText(name, "fetch exact ref candidate", MAX_REFLOG_REF_BYTES, "input"),
-        );
+        budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(name));
         candidates.set(name, null);
       }
 
@@ -6148,20 +7010,10 @@ export class CheckoutStore implements IndexStore {
         const tracking = new Map<string, string>();
         const trackingRows: Readonly<RefRow>[] = [];
         let rows = 0;
-        let previousName: string | null = null;
-        for (const row of this.#db.iterate(
-          "SELECT repo_id, name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
-          this.#repoId,
+        for (const { name, target } of this.#iterateStoredRefs(
+          budget.memoryReservation(),
+          "fetch ref snapshot",
         )) {
-          if (row.repo_id !== this.#repoId) {
-            throw new CorruptError("fetch ref snapshot crossed repository boundaries");
-          }
-          const name = requireRefName(row.name, "stored ref name", "stored");
-          const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
-          if (previousName !== null && comparePaths(previousName, name) >= 0) {
-            throw new CorruptError("stored refs are not in strict Git byte order");
-          }
-          previousName = name;
           rows++;
           if (rows > MAX_REFLOG_STATE_ROWS) {
             throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
@@ -6172,19 +7024,8 @@ export class CheckoutStore implements IndexStore {
             }
             budget.charge(
               REF_MUTATION_ITEM_RETAINED_BYTES +
-                2 *
-                  (boundedRefText(
-                    name,
-                    "stored tracking ref name",
-                    MAX_REFLOG_REF_BYTES,
-                    "stored",
-                  ) +
-                    boundedRefText(
-                      target,
-                      `stored target of ${name}`,
-                      MAX_REFLOG_RAW_TARGET_BYTES,
-                      "stored",
-                    )),
+                retainedStringBytes(name) +
+                retainedStringBytes(target),
             );
             tracking.set(name, target);
             trackingRows.push(Object.freeze({ name, target }));
@@ -6194,15 +7035,7 @@ export class CheckoutStore implements IndexStore {
               throw new GitError("EINVAL", `fetch exact ref candidate ${name} is symbolic`);
             }
             candidates.set(name, target);
-            budget.charge(
-              2 *
-                boundedRefText(
-                  target,
-                  `stored target of ${name}`,
-                  MAX_REFLOG_RAW_TARGET_BYTES,
-                  "stored",
-                ),
-            );
+            budget.charge(retainedStringBytes(target));
           }
         }
 
@@ -6225,7 +7058,7 @@ export class CheckoutStore implements IndexStore {
           ) {
             throw new GitError("E2BIG", "fetch snapshot exceeds its retained input count bound");
           }
-          budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + 2 * row.oid.length);
+          budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(row.oid));
           shallowRows.push(row.oid);
         }
 
@@ -6253,7 +7086,10 @@ export class CheckoutStore implements IndexStore {
               prefix.startsWith(namespace.trackingPrefix),
           )
           .map((namespace) => namespace.trackingPrefix);
-        for (const page of jsonPages(overlapping, "overlapping fetch namespace")) {
+        for (const page of jsonPages(overlapping, "overlapping fetch namespace", {
+          reservation: budget.memoryReservation(),
+          maxUnits: jsonStringMaxUnits,
+        })) {
           this.#db.run(
             `UPDATE git_fetch_namespaces SET latest_generation = ?
               WHERE repo_id = ? AND tracking_prefix IN (SELECT value FROM json_each(?))`,
@@ -6360,36 +7196,43 @@ export class CheckoutStore implements IndexStore {
     if (state === undefined || state.disposed || state.reservation.disposed) {
       throw staleFetch("fetch publication token is no longer active");
     }
-    state.budget.requireSqlHeadroom();
-    const normalized = normalizeFetchPublication(state, plan);
-    const checkedMetadata = validateRefLogMetadata(metadata);
-    const shallowTouched = normalized.shallowAdd.length > 0 || normalized.shallowRemove.length > 0;
-    const refChanged = this.#db.transactionSync(() => {
-      this.#preflightFetchPublication(state, normalized.refs, shallowTouched);
-      const changed = this.#mutateRefs(normalized.refs, checkedMetadata);
-      for (const page of jsonPages(normalized.shallowRemove, "shallow deletion")) {
-        this.#db.run(
-          "DELETE FROM git_shallow WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
-          this.#repoId,
-          page,
-        );
-      }
-      for (const page of jsonPages(normalized.shallowAdd, "shallow update")) {
-        this.#db.run(
-          `INSERT OR IGNORE INTO git_shallow (repo_id, oid)
+    const publicationReservation = state.reservation.scope();
+    try {
+      const budget = new RefMutationBudget(publicationReservation);
+      const normalized = normalizeFetchPublication(state, plan, budget);
+      const checkedMetadata = validateRefLogMetadata(metadata);
+      budget.charge(refLogMetadataRetainedBytes(checkedMetadata));
+      const shallowTouched =
+        normalized.shallowAdd.length > 0 || normalized.shallowRemove.length > 0;
+      const refChanged = this.#db.transactionSync(() => {
+        this.#preflightFetchPublication(state, normalized.refs, shallowTouched);
+        const changed = this.#mutateRefs(normalized.refs, checkedMetadata);
+        for (const page of jsonPages(normalized.shallowRemove, "shallow deletion")) {
+          this.#db.run(
+            "DELETE FROM git_shallow WHERE repo_id = ? AND oid IN (SELECT value FROM json_each(?))",
+            this.#repoId,
+            page,
+          );
+        }
+        for (const page of jsonPages(normalized.shallowAdd, "shallow update")) {
+          this.#db.run(
+            `INSERT OR IGNORE INTO git_shallow (repo_id, oid)
            SELECT ?, value FROM json_each(?)`,
-          this.#repoId,
-          page,
-        );
-      }
-      if (shallowTouched) this.#advanceShallowRevision(state.shallowRevision);
-      if (shallowTouched && !changed) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
-      return changed;
-    });
-    if (shallowTouched) this.shared.invalidateShallow();
-    this.#issuedFetchPublications.delete(token);
-    this.#fetchPublicationStates.delete(token);
-    return refChanged || shallowTouched;
+            this.#repoId,
+            page,
+          );
+        }
+        if (shallowTouched) this.#advanceShallowRevision(state.shallowRevision);
+        if (shallowTouched && !changed) bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+        return changed;
+      });
+      if (shallowTouched) this.shared.invalidateShallow();
+      this.#issuedFetchPublications.delete(token);
+      this.#fetchPublicationStates.delete(token);
+      return refChanged || shallowTouched;
+    } finally {
+      publicationReservation.dispose();
+    }
   }
 
   #readFetchNamespaces(budget: RefMutationBudget): {
@@ -6402,43 +7245,75 @@ export class CheckoutStore implements IndexStore {
       latestGeneration: number;
       revision: number;
     }[] = [];
-    let previousPrefix: string | null = null;
-    for (const row of this.#db.iterate(
-      `SELECT repo_id, tracking_prefix, latest_generation, revision
-         FROM git_fetch_namespaces WHERE repo_id = ? ORDER BY tracking_prefix
-         LIMIT ${MAX_FETCH_NAMESPACES + 1}`,
+    const metadata = this.#db.one<{ rows: unknown; tracking_prefix_bytes: unknown }>(
+      `SELECT count(*) AS rows,
+              coalesce(max(length(CAST(tracking_prefix AS BLOB))), 0) AS tracking_prefix_bytes
+         FROM git_fetch_namespaces WHERE repo_id = ?`,
       this.#repoId,
-    )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError("fetch namespace scan crossed repository boundaries");
+    );
+    if (
+      metadata === undefined ||
+      typeof metadata.rows !== "number" ||
+      !Number.isSafeInteger(metadata.rows) ||
+      metadata.rows < 0 ||
+      typeof metadata.tracking_prefix_bytes !== "number" ||
+      !Number.isSafeInteger(metadata.tracking_prefix_bytes) ||
+      metadata.tracking_prefix_bytes < 0
+    ) {
+      throw new CorruptError("fetch namespace metadata is invalid");
+    }
+    if (metadata.rows > MAX_FETCH_NAMESPACES) {
+      throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
+    }
+    const rowMemory = budget.memoryReservation().scope();
+    rowMemory.set(
+      "other",
+      256 + metadata.tracking_prefix_bytes + retainedStringUnits(metadata.tracking_prefix_bytes),
+    );
+    let previousPrefix: string | null = null;
+    try {
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, typeof(tracking_prefix) AS tracking_prefix_type,
+                CAST(tracking_prefix AS BLOB) AS tracking_prefix_blob,
+                latest_generation, revision
+           FROM git_fetch_namespaces WHERE repo_id = ? ORDER BY tracking_prefix
+           LIMIT ${MAX_FETCH_NAMESPACES + 1}`,
+        this.#repoId,
+      )) {
+        if (row.repo_id !== this.#repoId) {
+          throw new CorruptError("fetch namespace scan crossed repository boundaries");
+        }
+        const storedPrefix = requireFetchTrackingPrefix(
+          requireCanonicalStoredText(
+            row.tracking_prefix_type,
+            row.tracking_prefix_blob,
+            "stored fetch tracking prefix",
+          ),
+          "stored",
+        );
+        if (previousPrefix !== null && comparePaths(previousPrefix, storedPrefix) >= 0) {
+          throw new CorruptError("fetch namespaces are not in strict Git byte order");
+        }
+        previousPrefix = storedPrefix;
+        budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(storedPrefix));
+        namespaces.push({
+          trackingPrefix: storedPrefix,
+          latestGeneration: requireFetchGeneration(
+            row.latest_generation,
+            "stored fetch namespace generation",
+            1,
+          ),
+          revision: requireFetchGeneration(row.revision, "stored fetch namespace revision", 0),
+        });
+        if (namespaces.length > metadata.rows) {
+          throw new CorruptError("fetch namespace count changed after metadata preflight");
+        }
       }
-      const storedPrefix = requireFetchTrackingPrefix(row.tracking_prefix, "stored");
-      if (previousPrefix !== null && comparePaths(previousPrefix, storedPrefix) >= 0) {
-        throw new CorruptError("fetch namespaces are not in strict Git byte order");
+      if (namespaces.length !== metadata.rows) {
+        throw new CorruptError("fetch namespaces changed after metadata preflight");
       }
-      previousPrefix = storedPrefix;
-      budget.charge(
-        REF_MUTATION_ITEM_RETAINED_BYTES +
-          2 *
-            boundedRefText(
-              storedPrefix,
-              "stored fetch tracking prefix",
-              MAX_REFLOG_REF_BYTES,
-              "stored",
-            ),
-      );
-      namespaces.push({
-        trackingPrefix: storedPrefix,
-        latestGeneration: requireFetchGeneration(
-          row.latest_generation,
-          "stored fetch namespace generation",
-          1,
-        ),
-        revision: requireFetchGeneration(row.revision, "stored fetch namespace revision", 0),
-      });
-      if (namespaces.length > MAX_FETCH_NAMESPACES) {
-        throw new GitError("E2BIG", "repository fetch namespace count exceeds 1,024");
-      }
+    } finally {
+      rowMemory.dispose();
     }
     return namespaces;
   }
@@ -6515,46 +7390,56 @@ export class CheckoutStore implements IndexStore {
       if (checkoutRevision !== state.checkoutRevision) {
         throw staleFetch("the repository checkout state changed after fetch preflight");
       }
+      const checkoutMetadata = this.#db.one<{ max_head_bytes: unknown }>(
+        `SELECT coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes
+           FROM git_checkouts WHERE repo_id = ?`,
+        this.#repoId,
+      );
+      if (checkoutMetadata === undefined) {
+        throw new CorruptError("fetch checkout HEAD metadata row is missing");
+      }
+      const maxHeadBytes = requireMaximumStoredTextBytes(
+        checkoutMetadata.max_head_bytes,
+        "fetch checkout HEAD maximum",
+      );
+      const checkoutRowMemory = state.budget.memoryReservation().scope();
+      checkoutRowMemory.set("other", currentTextRowRetainedBytes(maxHeadBytes));
       let checkoutRows = 0;
       let previousCheckoutId = 0;
-      for (const row of this.#db.iterate(
-        `SELECT id AS checkout_id, repo_id, root, head, is_primary
-           FROM git_checkouts WHERE repo_id = ? ORDER BY id
-           LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
-        this.#repoId,
-      )) {
-        const checkout = requireStoredCheckoutRow(row);
-        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
-          throw new CorruptError("fetch checkout scan crossed or reordered repositories");
+      try {
+        for (const row of this.#db.iterate(
+          `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                  length(CAST(head AS BLOB)) AS head_bytes,
+                  CAST(head AS BLOB) AS head_blob, is_primary
+             FROM git_checkouts WHERE repo_id = ? ORDER BY id
+             LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+          this.#repoId,
+        )) {
+          const checkout = requireStoredCheckoutRow(row, maxHeadBytes);
+          if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
+            throw new CorruptError("fetch checkout scan crossed or reordered repositories");
+          }
+          previousCheckoutId = checkout.id;
+          checkoutRows++;
+          if (checkoutRows > MAX_CHECKOUTS_PER_REPOSITORY) {
+            throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
+          }
+          const attached = rawSymbolicTarget(checkout.head);
+          if (attached !== null && selectedBranches.has(attached)) {
+            throw staleFetch(`branch ${attached} became attached after fetch preflight`);
+          }
         }
-        previousCheckoutId = checkout.id;
-        checkoutRows++;
-        if (checkoutRows > MAX_CHECKOUTS_PER_REPOSITORY) {
-          throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
-        }
-        const attached = rawSymbolicTarget(checkout.head);
-        if (attached !== null && selectedBranches.has(attached)) {
-          throw staleFetch(`branch ${attached} became attached after fetch preflight`);
-        }
+      } finally {
+        checkoutRowMemory.dispose();
       }
     }
     const presentExactRefs = new Set<string>();
     let rows = 0;
     let trackingRows = 0;
-    let previousName: string | null = null;
-    for (const row of this.#db.iterate(
-      "SELECT repo_id, name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
-      this.#repoId,
+    for (const { name, target } of this.#iterateStoredRefs(
+      state.budget.memoryReservation(),
+      "fetch publication preflight",
     )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError("fetch publication preflight crossed repository boundaries");
-      }
-      const name = requireRefName(row.name, "stored ref name", "stored");
-      const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
-      if (previousName !== null && comparePaths(previousName, name) >= 0) {
-        throw new CorruptError("stored refs are not in strict Git byte order");
-      }
-      previousName = name;
       rows++;
       if (rows > MAX_REFLOG_STATE_ROWS) {
         throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
@@ -6625,7 +7510,10 @@ export class CheckoutStore implements IndexStore {
       }
       affected.push(namespace.trackingPrefix);
     }
-    for (const page of jsonPages(affected, "fetch namespace revision")) {
+    for (const page of jsonPages(affected, "fetch namespace revision", {
+      reservation: budget.memoryReservation(),
+      maxUnits: jsonStringMaxUnits,
+    })) {
       this.#db.run(
         `UPDATE git_fetch_namespaces SET revision = revision + 1
           WHERE repo_id = ? AND tracking_prefix IN (SELECT value FROM json_each(?))`,
@@ -6637,11 +7525,26 @@ export class CheckoutStore implements IndexStore {
 
   /** Apply current ref state and its bounded history through one atomic seam. */
   mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
-    const reservation = this.#sharedStore.reserveMemory();
+    return this.#mutateRefsOwned(mutation, metadata);
+  }
+
+  #mutateRefsOwned(
+    mutation: RefMutation,
+    metadata: RefLogMetadata,
+    owner?: RefMutationMemoryOwner,
+  ): boolean {
+    if (owner !== undefined && !(owner instanceof RefMutationMemoryOwner)) {
+      throw new GitError("EINVAL", "ref mutation memory owner was not issued by the store");
+    }
+    const reservation =
+      owner === undefined
+        ? this.#sharedStore.reserveMemory()
+        : this.#sharedStore.scopeMemoryReservation(owner.memoryReservation());
     try {
       const budget = new RefMutationBudget(reservation);
-      const normalized = normalizeRefMutation(mutation, budget);
+      const normalized = normalizeRefMutation(mutation, budget, owner);
       const checkedMetadata = validateRefLogMetadata(metadata);
+      budget.charge(refLogMetadataRetainedBytes(checkedMetadata, owner));
       return this.#mutateRefs(normalized, checkedMetadata);
     } finally {
       reservation.dispose();
@@ -6747,23 +7650,43 @@ export class CheckoutStore implements IndexStore {
       const checkouts: CheckoutRow[] = [];
       let selected: CheckoutRow | null = null;
       let previousCheckoutId = 0;
-      for (const raw of this.#db.iterate(
-        `SELECT id AS checkout_id, repo_id, root, head, is_primary
-           FROM git_checkouts WHERE repo_id = ? ORDER BY id
-           LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+      const checkoutMetadata = this.#db.one<{ max_head_bytes: unknown }>(
+        `SELECT coalesce(max(length(CAST(head AS BLOB))), 0) AS max_head_bytes
+           FROM git_checkouts WHERE repo_id = ?`,
         this.#repoId,
-      )) {
-        const checkout = requireStoredCheckoutRow(raw);
-        if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
-          throw new CorruptError("reflog checkout scan crossed or reordered repositories");
+      );
+      if (checkoutMetadata === undefined) {
+        throw new CorruptError("ref mutation checkout HEAD metadata row is missing");
+      }
+      const maxCheckoutHeadBytes = requireMaximumStoredTextBytes(
+        checkoutMetadata.max_head_bytes,
+        "ref mutation checkout HEAD maximum",
+      );
+      const checkoutRowMemory = normalized.budget.memoryReservation().scope();
+      checkoutRowMemory.set("other", currentTextRowRetainedBytes(maxCheckoutHeadBytes));
+      try {
+        for (const raw of this.#db.iterate(
+          `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                  length(CAST(head AS BLOB)) AS head_bytes,
+                  CAST(head AS BLOB) AS head_blob, is_primary
+             FROM git_checkouts WHERE repo_id = ? ORDER BY id
+             LIMIT ${MAX_CHECKOUTS_PER_REPOSITORY + 1}`,
+          this.#repoId,
+        )) {
+          const checkout = requireStoredCheckoutRow(raw, maxCheckoutHeadBytes);
+          if (checkout.repoId !== this.#repoId || checkout.id <= previousCheckoutId) {
+            throw new CorruptError("reflog checkout scan crossed or reordered repositories");
+          }
+          previousCheckoutId = checkout.id;
+          normalized.budget.charge(refMutationCheckoutRetainedBytes(checkout));
+          checkouts.push(checkout);
+          if (checkout.id === this.#checkoutId) selected = checkout;
+          if (checkouts.length > MAX_CHECKOUTS_PER_REPOSITORY) {
+            throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
+          }
         }
-        previousCheckoutId = checkout.id;
-        normalized.budget.charge(refMutationCheckoutRetainedBytes(checkout));
-        checkouts.push(checkout);
-        if (checkout.id === this.#checkoutId) selected = checkout;
-        if (checkouts.length > MAX_CHECKOUTS_PER_REPOSITORY) {
-          throw new GitError("E2BIG", "repository checkout state exceeds its retained bound");
-        }
+      } finally {
+        checkoutRowMemory.dispose();
       }
       if (selected === null)
         throw new CorruptError("selected checkout disappeared during ref mutation");
@@ -6772,35 +7695,17 @@ export class CheckoutStore implements IndexStore {
       const before = new Map<string, string>();
       let rows = 0;
       let retainedBytes = REF_ROW_RETAINED_BYTES + oldHead.length * 2;
-      let previousName: string | null = null;
-      for (const row of this.#db.iterate(
-        "SELECT repo_id, name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
-        this.#repoId,
+      for (const { name, target } of this.#iterateStoredRefs(
+        normalized.budget.memoryReservation(),
+        "ref state query",
       )) {
-        if (row.repo_id !== this.#repoId) {
-          throw new CorruptError("ref state query crossed repository boundaries");
-        }
-        const name = requireRefName(row.name, "stored ref name", "stored");
-        const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
-        if (previousName !== null && comparePaths(previousName, name) >= 0) {
-          throw new CorruptError("stored refs are not in strict Git byte order");
-        }
-        previousName = name;
         rows++;
         retainedBytes += REF_ROW_RETAINED_BYTES + name.length * 2 + target.length * 2;
         if (rows > MAX_REFLOG_STATE_ROWS || retainedBytes > MAX_REFLOG_STATE_BYTES) {
           throw new GitError("E2BIG", "repository ref state exceeds its retained bound");
         }
         normalized.budget.charge(
-          REF_ROW_RETAINED_BYTES +
-            2 *
-              (boundedRefText(name, "stored ref name", MAX_REFLOG_REF_BYTES, "stored") +
-                boundedRefText(
-                  target,
-                  `stored target of ${name}`,
-                  MAX_REFLOG_RAW_TARGET_BYTES,
-                  "stored",
-                )),
+          REF_ROW_RETAINED_BYTES + retainedStringBytes(name) + retainedStringBytes(target),
         );
         before.set(name, target);
       }
@@ -6826,8 +7731,9 @@ export class CheckoutStore implements IndexStore {
       const newAttachedBranch = rawSymbolicTarget(newHead);
       const attachedBranchOwner = (): CheckoutRow | null => {
         if (newAttachedBranch?.startsWith("refs/heads/") !== true) return null;
-        const owner = this.#db.one<Record<string, unknown>>(
-          `SELECT id AS checkout_id, repo_id, root, head, is_primary
+        const metadata = this.#db.one<{ head_type: unknown; head_bytes: unknown }>(
+          `SELECT typeof(head) AS head_type,
+                  length(CAST(head AS BLOB)) AS head_bytes
              FROM git_checkouts
             WHERE repo_id = ? AND head = ? AND id != ?
             LIMIT 1`,
@@ -6835,12 +7741,37 @@ export class CheckoutStore implements IndexStore {
           newHead,
           this.#checkoutId,
         );
-        if (owner === undefined) return null;
-        const checkedOwner = requireStoredCheckoutRow(owner);
-        if (checkedOwner.repoId !== this.#repoId || checkedOwner.head !== newHead) {
-          throw new CorruptError("attached branch ownership crossed a repository boundary");
+        if (metadata === undefined) return null;
+        const headBytes = requireStoredTextByteLength(
+          metadata.head_type,
+          metadata.head_bytes,
+          "attached checkout HEAD",
+        );
+        const ownerMemory = normalized.budget.memoryReservation().scope();
+        ownerMemory.set("other", currentTextRowRetainedBytes(headBytes));
+        try {
+          const owner = this.#db.one<Record<string, unknown>>(
+            `SELECT id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                    length(CAST(head AS BLOB)) AS head_bytes,
+                    CAST(head AS BLOB) AS head_blob, is_primary
+               FROM git_checkouts
+              WHERE repo_id = ? AND head = ? AND id != ?
+              LIMIT 1`,
+            this.#repoId,
+            newHead,
+            this.#checkoutId,
+          );
+          if (owner === undefined) {
+            throw new CorruptError("attached checkout changed after metadata preflight");
+          }
+          const checkedOwner = requireStoredCheckoutRow(owner, headBytes);
+          if (checkedOwner.repoId !== this.#repoId || checkedOwner.head !== newHead) {
+            throw new CorruptError("attached branch ownership crossed a repository boundary");
+          }
+          return checkedOwner;
+        } finally {
+          ownerMemory.dispose();
         }
-        return checkedOwner;
       };
       if (newHead !== oldHead) {
         const owner = attachedBranchOwner();
@@ -6939,7 +7870,10 @@ export class CheckoutStore implements IndexStore {
           put.push({ name: event.refName, target: event.newRaw });
         }
       }
-      for (const page of jsonPages(deleted, "ref deletion")) {
+      for (const page of jsonPages(deleted, "ref deletion", {
+        reservation: normalized.budget.memoryReservation(),
+        maxUnits: jsonStringMaxUnits,
+      })) {
         this.#db.run(
           `DELETE FROM git_refs
             WHERE repo_id = ? AND name IN (SELECT value FROM json_each(?))`,
@@ -6947,7 +7881,10 @@ export class CheckoutStore implements IndexStore {
           page,
         );
       }
-      for (const page of jsonPages(put, "ref update")) {
+      for (const page of jsonPages(put, "ref update", {
+        reservation: normalized.budget.memoryReservation(),
+        maxUnits: refRowJsonMaxUnits,
+      })) {
         this.#db.run(
           `INSERT INTO git_refs (repo_id, name, target)
            SELECT ?, json_extract(value, '$.name'), json_extract(value, '$.target')
@@ -6959,39 +7896,51 @@ export class CheckoutStore implements IndexStore {
         );
       }
       if (newHead !== oldHead) {
+        const updatedHeadBytes = refTextBytes(newHead, "updated HEAD target", "input");
+        const updatedHeadMemory = normalized.budget.memoryReservation().scope();
+        updatedHeadMemory.set("other", currentTextRowRetainedBytes(updatedHeadBytes));
         let updated: Record<string, unknown> | undefined;
         try {
-          updated = this.#db.one<Record<string, unknown>>(
-            `UPDATE git_checkouts SET head = ?
-              WHERE id = ? AND repo_id = ? AND head = ?
-              RETURNING id AS checkout_id, repo_id, root, head, is_primary`,
-            newHead,
-            this.#checkoutId,
-            this.#repoId,
-            oldHead,
-          );
-        } catch (error) {
-          if (isAttachedBranchUniqueConstraint(error)) {
-            const owner = attachedBranchOwner();
-            if (owner !== null) {
-              throw new GitError(
-                "EBRANCHINUSE",
-                `branch ${newAttachedBranch} is already attached to checkout ${owner.root}`,
-                { cause: error },
-              );
+          try {
+            updated = this.#db.one<Record<string, unknown>>(
+              `UPDATE git_checkouts SET head = ?
+                WHERE id = ? AND repo_id = ? AND head = ?
+                RETURNING id AS checkout_id, repo_id, root, typeof(head) AS head_type,
+                          length(CAST(head AS BLOB)) AS head_bytes,
+                          CAST(head AS BLOB) AS head_blob, is_primary`,
+              newHead,
+              this.#checkoutId,
+              this.#repoId,
+              oldHead,
+            );
+          } catch (error) {
+            if (isAttachedBranchUniqueConstraint(error)) {
+              const owner = attachedBranchOwner();
+              if (owner !== null) {
+                throw new GitError(
+                  "EBRANCHINUSE",
+                  `branch ${newAttachedBranch} is already attached to checkout ${owner.root}`,
+                  { cause: error },
+                );
+              }
             }
+            throw error;
           }
-          throw error;
-        }
-        if (updated === undefined)
-          throw new CorruptError("selected checkout HEAD changed during ref mutation");
-        const checked = requireStoredCheckoutRow(updated);
-        if (checked.id !== this.#checkoutId || checked.repoId !== this.#repoId) {
-          throw new CorruptError("HEAD update crossed a checkout boundary");
+          if (updated === undefined)
+            throw new CorruptError("selected checkout HEAD changed during ref mutation");
+          const checked = requireStoredCheckoutRow(updated, updatedHeadBytes);
+          if (checked.id !== this.#checkoutId || checked.repoId !== this.#repoId) {
+            throw new CorruptError("HEAD update crossed a checkout boundary");
+          }
+        } finally {
+          updatedHeadMemory.dispose();
         }
         advanceCheckoutRevision(this.#db, this.#repoId, 1, checkoutRevision);
       }
-      for (const page of jsonPages(events, "reflog entry")) {
+      for (const page of jsonPages(events, "reflog entry", {
+        reservation: normalized.budget.memoryReservation(),
+        maxUnits: refLogEventJsonMaxUnits,
+      })) {
         this.#db.run(
           `INSERT INTO git_reflog_entries
              (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
@@ -7013,7 +7962,10 @@ export class CheckoutStore implements IndexStore {
           page,
         );
       }
-      for (const page of jsonPages(checkoutEvents, "checkout reflog entry")) {
+      for (const page of jsonPages(checkoutEvents, "checkout reflog entry", {
+        reservation: normalized.budget.memoryReservation(),
+        maxUnits: refLogEventJsonMaxUnits,
+      })) {
         this.#db.run(
           `INSERT INTO git_checkout_reflog_entries
              (checkout_id, repo_id, ordinal, old_raw, new_raw, old_oid, new_oid,
@@ -7059,7 +8011,10 @@ export class CheckoutStore implements IndexStore {
         cutoff,
       );
       const touchedRefs = events.map((event) => event.refName);
-      for (const page of jsonPages(touchedRefs, "reflog retention ref")) {
+      for (const page of jsonPages(touchedRefs, "reflog retention ref", {
+        reservation: normalized.budget.memoryReservation(),
+        maxUnits: jsonStringMaxUnits,
+      })) {
         this.#db.run(
           `DELETE FROM git_reflog_entries AS entry
             WHERE entry.repo_id = ?
@@ -7104,63 +8059,293 @@ export class CheckoutStore implements IndexStore {
     });
   }
 
-  listRefs(prefix = ""): RefRow[] {
-    if (prefix === "") {
-      return this.#db.all<RefRow>(
-        "SELECT name, target FROM git_refs WHERE repo_id = ? ORDER BY name",
-        this.#repoId,
-      );
-    }
-    return this.#db.all<RefRow>(
-      "SELECT name, target FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ? ORDER BY name",
+  *#iterateStoredRefs(reservation: MemoryReservation, label: string): Generator<RefRow> {
+    const metadata = this.#db.one<{
+      rows: unknown;
+      name_bytes: unknown;
+      target_bytes: unknown;
+    }>(
+      `SELECT count(*) AS rows,
+              coalesce(max(length(CAST(name AS BLOB))), 0) AS name_bytes,
+              coalesce(max(length(CAST(target AS BLOB))), 0) AS target_bytes
+         FROM git_refs WHERE repo_id = ?`,
       this.#repoId,
-      prefix,
-      nextPrefix(prefix),
     );
+    const measured = requireRefReadMetadata(metadata, label);
+    if (measured.rows > MAX_REFLOG_STATE_ROWS) {
+      throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
+    }
+    const rowMemory = reservation.scope();
+    rowMemory.set(
+      "other",
+      256 +
+        2 * measured.nameBytes +
+        measured.targetBytes +
+        retainedStringUnits(measured.nameBytes) +
+        retainedStringUnits(measured.targetBytes),
+    );
+    let rows = 0;
+    let previousNameBytes: Uint8Array | null = null;
+    try {
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, typeof(name) AS name_type, CAST(name AS BLOB) AS name_blob,
+                typeof(target) AS target_type, CAST(target AS BLOB) AS target_blob
+           FROM git_refs
+          WHERE repo_id = ?
+          ORDER BY name
+          LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`,
+        this.#repoId,
+      )) {
+        if (row.repo_id !== this.#repoId) {
+          throw new CorruptError(`${label} crossed repository boundaries`);
+        }
+        const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
+        const name = requireRefName(
+          decodeCanonicalText(nameBytes, "stored ref name"),
+          "stored ref name",
+          "stored",
+        );
+        const target = requireRawRefTarget(
+          requireCanonicalStoredText(row.target_type, row.target_blob, `stored target of ${name}`),
+          `stored target of ${name}`,
+          "stored",
+        );
+        if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
+          throw new CorruptError("stored refs are not in strict Git byte order");
+        }
+        rows++;
+        if (rows > MAX_REFLOG_STATE_ROWS) {
+          throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
+        }
+        previousNameBytes = nameBytes;
+        yield { name, target };
+      }
+      if (rows !== measured.rows) {
+        throw new CorruptError(`${label} changed after metadata preflight`);
+      }
+    } finally {
+      rowMemory.dispose();
+    }
+  }
+
+  listRefs(prefix = ""): RefRow[] {
+    const reservation = this.#sharedStore.reserveMemory();
+    reservation.set("other", 512);
+    try {
+      let upper: string | undefined;
+      if (prefix !== "") {
+        reservation.set("other", 512 + retainedStringUnits(prefix.length));
+        upper = nextPrefix(prefix);
+        reservation.set("other", 512 + retainedStringBytes(upper));
+      }
+      const metadata = this.#db.one<{
+        rows: unknown;
+        name_bytes: unknown;
+        target_bytes: unknown;
+        max_row_bytes: unknown;
+      }>(
+        prefix === ""
+          ? `SELECT count(*) AS rows,
+                    coalesce(sum(length(CAST(name AS BLOB))), 0) AS name_bytes,
+                    coalesce(sum(length(CAST(target AS BLOB))), 0) AS target_bytes,
+                    coalesce(max(
+                      length(CAST(name AS BLOB)) + length(CAST(target AS BLOB))
+                    ), 0) AS max_row_bytes
+               FROM git_refs WHERE repo_id = ?`
+          : `SELECT count(*) AS rows,
+                    coalesce(sum(length(CAST(name AS BLOB))), 0) AS name_bytes,
+                    coalesce(sum(length(CAST(target AS BLOB))), 0) AS target_bytes,
+                    coalesce(max(
+                      length(CAST(name AS BLOB)) + length(CAST(target AS BLOB))
+                    ), 0) AS max_row_bytes
+               FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ?`,
+        this.#repoId,
+        ...(upper === undefined ? [] : [prefix, upper]),
+      );
+      const measured = requireRefReadMetadata(metadata, "ref list");
+      if (measured.rows > MAX_REFLOG_STATE_ROWS) {
+        throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
+      }
+      const maxRowBytes = requireMaximumStoredTextBytes(metadata?.max_row_bytes, "ref list row");
+      if ((measured.rows === 0) !== (maxRowBytes === 0)) {
+        throw new CorruptError("ref list row metadata is inconsistent");
+      }
+      reservation.set(
+        "other",
+        512 +
+          measured.rows * (REF_ROW_RETAINED_BYTES + 2 * 48 + 8) +
+          2 * (measured.nameBytes + measured.targetBytes),
+      );
+      const rowMemory = reservation.scope();
+      rowMemory.set("other", maxRowBytes === 0 ? 0 : currentTextRowRetainedBytes(maxRowBytes, 2));
+      const result: RefRow[] = [];
+      const sql =
+        prefix === ""
+          ? `SELECT repo_id, typeof(name) AS name_type,
+                    length(CAST(name AS BLOB)) AS name_bytes, CAST(name AS BLOB) AS name_blob,
+                    typeof(target) AS target_type,
+                    length(CAST(target AS BLOB)) AS target_bytes,
+                    CAST(target AS BLOB) AS target_blob
+               FROM git_refs WHERE repo_id = ? ORDER BY name`
+          : `SELECT repo_id, typeof(name) AS name_type,
+                    length(CAST(name AS BLOB)) AS name_bytes, CAST(name AS BLOB) AS name_blob,
+                    typeof(target) AS target_type,
+                    length(CAST(target AS BLOB)) AS target_bytes,
+                    CAST(target AS BLOB) AS target_blob
+               FROM git_refs WHERE repo_id = ? AND name >= ? AND name < ? ORDER BY name`;
+      let actualNameBytes = 0;
+      let actualTargetBytes = 0;
+      let previousNameBytes: Uint8Array | null = null;
+      try {
+        for (const row of this.#db.iterate(
+          sql,
+          this.#repoId,
+          ...(upper === undefined ? [] : [prefix, upper]),
+        )) {
+          if (row.repo_id !== this.#repoId) {
+            throw new CorruptError("ref list crossed repository boundaries");
+          }
+          const nameByteLength = requireStoredTextByteLength(
+            row.name_type,
+            row.name_bytes,
+            "stored ref name",
+          );
+          const targetByteLength = requireStoredTextByteLength(
+            row.target_type,
+            row.target_bytes,
+            "stored ref target",
+          );
+          const currentRowBytes = nameByteLength + targetByteLength;
+          if (!Number.isSafeInteger(currentRowBytes) || currentRowBytes > maxRowBytes) {
+            throw new CorruptError("ref list row changed after metadata preflight");
+          }
+          const nameBytes = requireStoredTextBytes(row.name_type, row.name_blob, "stored ref name");
+          if (nameBytes.byteLength !== nameByteLength) {
+            throw new CorruptError("stored ref name changed after validation");
+          }
+          if (previousNameBytes !== null && compareByteArrays(previousNameBytes, nameBytes) >= 0) {
+            throw new CorruptError("stored refs are not in strict Git byte order");
+          }
+          const name = requireRefName(
+            decodeCanonicalText(nameBytes, "stored ref name"),
+            "stored ref name",
+            "stored",
+          );
+          const targetBytes = requireStoredTextBytes(
+            row.target_type,
+            row.target_blob,
+            `stored target of ${name}`,
+          );
+          if (targetBytes.byteLength !== targetByteLength) {
+            throw new CorruptError(`stored target of ${name} changed after validation`);
+          }
+          const target = requireRawRefTarget(
+            decodeCanonicalText(targetBytes, `stored target of ${name}`),
+            `stored target of ${name}`,
+            "stored",
+          );
+          actualNameBytes += nameByteLength;
+          actualTargetBytes += targetByteLength;
+          if (!Number.isSafeInteger(actualNameBytes) || !Number.isSafeInteger(actualTargetBytes)) {
+            throw new CorruptError("ref list byte totals are invalid");
+          }
+          previousNameBytes = nameBytes;
+          result.push({ name, target });
+        }
+        if (
+          result.length !== measured.rows ||
+          actualNameBytes !== measured.nameBytes ||
+          actualTargetBytes !== measured.targetBytes
+        ) {
+          throw new CorruptError("ref list changed after metadata preflight");
+        }
+      } finally {
+        rowMemory.dispose();
+      }
+      return result;
+    } finally {
+      reservation.dispose();
+    }
   }
 
   /** Stream all raw refs without materializing repository ref state. */
   *iterateRefs(): Generator<RefRow> {
-    let rows = 0;
-    let previousName: string | null = null;
-    for (const row of this.#db.iterate(
-      `SELECT repo_id, name, target
-         FROM git_refs
-        WHERE repo_id = ?
-        ORDER BY name
-        LIMIT ${MAX_REFLOG_STATE_ROWS + 1}`,
+    const metadata = this.#db.one<{
+      rows: unknown;
+      name_bytes: unknown;
+      target_bytes: unknown;
+    }>(
+      `SELECT count(*) AS rows,
+              coalesce(max(length(CAST(name AS BLOB))), 0) AS name_bytes,
+              coalesce(max(length(CAST(target AS BLOB))), 0) AS target_bytes
+         FROM git_refs WHERE repo_id = ?`,
       this.#repoId,
-    )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError("raw ref snapshot crossed repository boundaries");
-      }
-      const name = requireRefName(row.name, "stored ref name", "stored");
-      const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
-      if (previousName !== null && comparePaths(previousName, name) >= 0) {
-        throw new CorruptError("stored refs are not in strict Git byte order");
-      }
-      rows++;
-      if (rows > MAX_REFLOG_STATE_ROWS) {
-        throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
-      }
-      previousName = name;
-      yield { name, target };
+    );
+    const measured = requireRefReadMetadata(metadata, "ref iteration");
+    if (measured.rows > MAX_REFLOG_STATE_ROWS) {
+      throw new GitError("E2BIG", "repository ref state exceeds 100,000 rows");
+    }
+    const reservation = this.#sharedStore.reserveMemory();
+    reservation.set(
+      "other",
+      2 * REF_ROW_RETAINED_BYTES + 4 * 48 + 4 * (measured.nameBytes + measured.targetBytes),
+    );
+    try {
+      yield* this.#iterateStoredRefs(reservation, "ref iteration");
+    } finally {
+      reservation.dispose();
     }
   }
 
   head(): string {
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT id AS checkout_id, repo_id, root, head, is_primary
+    const metadata = this.#db.one<Record<string, unknown>>(
+      `SELECT id AS checkout_id, repo_id, typeof(head) AS head_type,
+              length(CAST(head AS BLOB)) AS head_bytes
          FROM git_checkouts WHERE id = ? AND repo_id = ?`,
       this.#checkoutId,
       this.#repoId,
     );
-    if (row === undefined) throw new CorruptError("checkout HEAD row is missing");
-    const checkout = requireStoredCheckoutRow(row);
-    if (checkout.id !== this.#checkoutId || checkout.repoId !== this.#repoId) {
+    if (metadata === undefined) throw new CorruptError("checkout HEAD row is missing");
+    if (
+      metadata.checkout_id !== this.#checkoutId ||
+      metadata.repo_id !== this.#repoId ||
+      metadata.head_type !== "text" ||
+      typeof metadata.head_bytes !== "number" ||
+      !Number.isSafeInteger(metadata.head_bytes) ||
+      metadata.head_bytes < 1
+    ) {
       throw new CorruptError("HEAD read crossed a checkout boundary");
     }
-    return checkout.head;
+    const reservation = this.#sharedStore.reserveMemory();
+    try {
+      reservation.set("other", currentTextRowRetainedBytes(metadata.head_bytes));
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT id AS checkout_id, repo_id, typeof(head) AS head_type,
+                length(CAST(head AS BLOB)) AS head_bytes,
+                CAST(head AS BLOB) AS head_blob
+           FROM git_checkouts WHERE id = ? AND repo_id = ?`,
+        this.#checkoutId,
+        this.#repoId,
+      );
+      if (
+        row === undefined ||
+        row.checkout_id !== this.#checkoutId ||
+        row.repo_id !== this.#repoId ||
+        row.head_type !== "text" ||
+        row.head_bytes !== metadata.head_bytes
+      ) {
+        throw new CorruptError("checkout HEAD changed after validation");
+      }
+      const checked = requireRawRefTarget(
+        decodeCanonicalStoredText(row.head_blob, "stored HEAD target"),
+        "stored HEAD target",
+        "stored",
+      );
+      reservation.set("other", 256 + metadata.head_bytes + retainedStringBytes(checked));
+      return checked;
+    } finally {
+      reservation.dispose();
+    }
   }
 
   setHead(value: string): void {
@@ -7181,11 +8366,97 @@ export class CheckoutStore implements IndexStore {
         ? undefined
         : requireRefLogReadInteger(options.before, "reflog cursor", 1, MAX_REFLOG_ORDINAL);
     const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-    const active: RefLogEntry[] = [];
-    let headerSeen = false;
-    let nextOrdinal = 0;
-    let previousOrdinal: number | null = null;
-    const headerSql = `SELECT 0 AS kind, repository.id AS repo_id, checkout.head,
+    const metadata = this.#db.one<{
+      rows: unknown;
+      text_bytes: unknown;
+      max_text_bytes: unknown;
+      head_bytes: unknown;
+    }>(
+      name === "HEAD"
+        ? `SELECT count(*) AS rows,
+                  coalesce(sum(
+                    length(CAST('HEAD' AS BLOB)) +
+                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
+                    length(CAST(reason AS BLOB))
+                  ), 0) AS text_bytes,
+                  coalesce(max(
+                    length(CAST('HEAD' AS BLOB)) +
+                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
+                    length(CAST(reason AS BLOB))
+                  ), 0) AS max_text_bytes,
+                  (SELECT length(CAST(head AS BLOB)) FROM git_checkouts
+                    WHERE id = ? AND repo_id = ?) AS head_bytes
+             FROM git_checkout_reflog_entries
+            WHERE repo_id = ? AND checkout_id = ?`
+        : `SELECT count(*) AS rows,
+                  coalesce(sum(
+                    length(CAST(ref_name AS BLOB)) +
+                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
+                    length(CAST(reason AS BLOB))
+                  ), 0) AS text_bytes,
+                  coalesce(max(
+                    length(CAST(ref_name AS BLOB)) +
+                    coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                    coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(new_oid AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_name AS BLOB)), 0) +
+                    coalesce(length(CAST(actor_email AS BLOB)), 0) +
+                    length(CAST(reason AS BLOB))
+                  ), 0) AS max_text_bytes,
+                  (SELECT length(CAST(head AS BLOB)) FROM git_checkouts
+                    WHERE id = ? AND repo_id = ?) AS head_bytes
+             FROM git_reflog_entries
+            WHERE repo_id = ? AND ref_name = ?`,
+      this.#checkoutId,
+      this.#repoId,
+      this.#repoId,
+      name === "HEAD" ? this.#checkoutId : name,
+    );
+    const measured = requireRefLogReadMetadata(metadata);
+    if (measured.rows > REFLOG_RETENTION_ROWS) {
+      throw new CorruptError("reflog row count exceeds its retained history bound");
+    }
+    const maxTextBytes = requireMaximumStoredTextBytes(
+      metadata?.max_text_bytes,
+      "reflog retained entry",
+    );
+    if ((measured.rows === 0) !== (maxTextBytes === 0)) {
+      throw new CorruptError("reflog retained entry metadata is inconsistent");
+    }
+    const reservation = this.#sharedStore.reserveMemory();
+    reservation.set(
+      "other",
+      512 +
+        retainedStringUnits(measured.headBytes) +
+        measured.rows * (512 + 9 * 48 + 16) +
+        2 * measured.textBytes +
+        currentTextRowRetainedBytes(measured.headBytes) +
+        (maxTextBytes === 0 ? 0 : currentTextRowRetainedBytes(maxTextBytes, 8)),
+    );
+    try {
+      const active: RefLogEntry[] = [];
+      let headerSeen = false;
+      let nextOrdinal = 0;
+      let previousOrdinal: number | null = null;
+      const headerSql = `SELECT 0 AS kind, repository.id AS repo_id,
+              typeof(checkout.head) AS head_type,
+              CAST(checkout.head AS BLOB) AS head_blob,
               state.next_ordinal,
               (SELECT max(ordinal) FROM (
                  SELECT direct.ordinal FROM git_reflog_entries direct
@@ -7194,75 +8465,112 @@ export class CheckoutStore implements IndexStore {
                  SELECT local.ordinal FROM git_checkout_reflog_entries local
                   WHERE local.repo_id = repository.id
                )) AS latest_ordinal,
-              NULL AS ref_name, NULL AS ordinal, NULL AS old_raw, NULL AS new_raw,
-              NULL AS old_oid, NULL AS new_oid, NULL AS actor_name, NULL AS actor_email,
-              NULL AS timestamp, NULL AS timezone, NULL AS reason
+              NULL AS ref_name_type, NULL AS ref_name_blob, NULL AS ordinal,
+              NULL AS old_raw_type, NULL AS old_raw_blob,
+              NULL AS new_raw_type, NULL AS new_raw_blob,
+              NULL AS old_oid_type, NULL AS old_oid_blob,
+              NULL AS new_oid_type, NULL AS new_oid_blob,
+              NULL AS actor_name_type, NULL AS actor_name_blob,
+              NULL AS actor_email_type, NULL AS actor_email_blob,
+              NULL AS timestamp, NULL AS timezone,
+              NULL AS reason_type, NULL AS reason_blob
          FROM git_repositories repository
          JOIN git_reflog_state state ON state.repo_id = repository.id
          JOIN git_checkouts checkout ON checkout.repo_id = repository.id
         WHERE repository.id = ? AND checkout.id = ?`;
-    const rows =
-      name === "HEAD"
-        ? this.#db.iterate(
-            `${headerSql}
+      const rows =
+        name === "HEAD"
+          ? this.#db.iterate(
+              `${headerSql}
              UNION ALL
-             SELECT 1 AS kind, entry.repo_id, NULL AS head, NULL AS next_ordinal,
-                    NULL AS latest_ordinal, 'HEAD' AS ref_name, entry.ordinal,
-                    entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
-                    entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone, entry.reason
+             SELECT 1 AS kind, entry.repo_id, NULL AS head_type, NULL AS head_blob,
+                    NULL AS next_ordinal,
+                    NULL AS latest_ordinal, 'text' AS ref_name_type,
+                    CAST('HEAD' AS BLOB) AS ref_name_blob, entry.ordinal,
+                    typeof(entry.old_raw) AS old_raw_type,
+                    CAST(entry.old_raw AS BLOB) AS old_raw_blob,
+                    typeof(entry.new_raw) AS new_raw_type,
+                    CAST(entry.new_raw AS BLOB) AS new_raw_blob,
+                    typeof(entry.old_oid) AS old_oid_type,
+                    CAST(entry.old_oid AS BLOB) AS old_oid_blob,
+                    typeof(entry.new_oid) AS new_oid_type,
+                    CAST(entry.new_oid AS BLOB) AS new_oid_blob,
+                    typeof(entry.actor_name) AS actor_name_type,
+                    CAST(entry.actor_name AS BLOB) AS actor_name_blob,
+                    typeof(entry.actor_email) AS actor_email_type,
+                    CAST(entry.actor_email AS BLOB) AS actor_email_blob,
+                    entry.timestamp, entry.timezone, typeof(entry.reason) AS reason_type,
+                    CAST(entry.reason AS BLOB) AS reason_blob
                FROM git_checkout_reflog_entries entry
               WHERE entry.repo_id = ? AND entry.checkout_id = ?
               ORDER BY kind, ordinal DESC
               LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
-            this.#repoId,
-            this.#checkoutId,
-            this.#repoId,
-            this.#checkoutId,
-          )
-        : this.#db.iterate(
-            `${headerSql}
+              this.#repoId,
+              this.#checkoutId,
+              this.#repoId,
+              this.#checkoutId,
+            )
+          : this.#db.iterate(
+              `${headerSql}
              UNION ALL
-             SELECT 1 AS kind, entry.repo_id, NULL AS head, NULL AS next_ordinal,
-              NULL AS latest_ordinal, entry.ref_name, entry.ordinal,
-              entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
-              entry.actor_name, entry.actor_email, entry.timestamp, entry.timezone, entry.reason
+             SELECT 1 AS kind, entry.repo_id, NULL AS head_type, NULL AS head_blob,
+              NULL AS next_ordinal,
+              NULL AS latest_ordinal, typeof(entry.ref_name) AS ref_name_type,
+              CAST(entry.ref_name AS BLOB) AS ref_name_blob, entry.ordinal,
+              typeof(entry.old_raw) AS old_raw_type,
+              CAST(entry.old_raw AS BLOB) AS old_raw_blob,
+              typeof(entry.new_raw) AS new_raw_type,
+              CAST(entry.new_raw AS BLOB) AS new_raw_blob,
+              typeof(entry.old_oid) AS old_oid_type,
+              CAST(entry.old_oid AS BLOB) AS old_oid_blob,
+              typeof(entry.new_oid) AS new_oid_type,
+              CAST(entry.new_oid AS BLOB) AS new_oid_blob,
+              typeof(entry.actor_name) AS actor_name_type,
+              CAST(entry.actor_name AS BLOB) AS actor_name_blob,
+              typeof(entry.actor_email) AS actor_email_type,
+              CAST(entry.actor_email AS BLOB) AS actor_email_blob,
+              entry.timestamp, entry.timezone, typeof(entry.reason) AS reason_type,
+              CAST(entry.reason AS BLOB) AS reason_blob
                FROM git_reflog_entries entry INDEXED BY git_reflog_entries_by_ref
               WHERE entry.repo_id = ? AND entry.ref_name = ?
               ORDER BY kind, ordinal DESC
               LIMIT ${REFLOG_RETENTION_ROWS + 1}`,
-            this.#repoId,
-            this.#checkoutId,
-            this.#repoId,
-            name,
-          );
-    for (const row of rows) {
-      if (row.kind === 0) {
-        if (headerSeen) throw new CorruptError("reflog query returned duplicate headers");
-        headerSeen = true;
-        nextOrdinal = requireRefLogHeader(row, this.#repoId);
-        continue;
+              this.#repoId,
+              this.#checkoutId,
+              this.#repoId,
+              name,
+            );
+      for (const row of rows) {
+        if (row.kind === 0) {
+          if (headerSeen) throw new CorruptError("reflog query returned duplicate headers");
+          headerSeen = true;
+          nextOrdinal = requireRefLogHeader(row, this.#repoId);
+          continue;
+        }
+        if (row.kind !== 1 || !headerSeen) {
+          throw new CorruptError("reflog query returned an invalid row sequence");
+        }
+        const entry = requireStoredRefLogEntry(row, this.#repoId);
+        if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
+        if (entry.ordinal > nextOrdinal) {
+          throw new CorruptError("reflog entry exceeds the repository allocation state");
+        }
+        if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
+          throw new CorruptError("reflog entries are not in strict descending ordinal order");
+        }
+        previousOrdinal = entry.ordinal;
+        if (entry.timestamp >= cutoff) active.push(entry);
       }
-      if (row.kind !== 1 || !headerSeen) {
-        throw new CorruptError("reflog query returned an invalid row sequence");
+      if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
+      const page: RefLogEntry[] = [];
+      for (const entry of active) {
+        if (before !== undefined && entry.ordinal >= before) continue;
+        if (page.length < limit) page.push(entry);
       }
-      const entry = requireStoredRefLogEntry(row, this.#repoId);
-      if (entry.refName !== name) throw new CorruptError("reflog query returned another ref");
-      if (entry.ordinal > nextOrdinal) {
-        throw new CorruptError("reflog entry exceeds the repository allocation state");
-      }
-      if (previousOrdinal !== null && previousOrdinal <= entry.ordinal) {
-        throw new CorruptError("reflog entries are not in strict descending ordinal order");
-      }
-      previousOrdinal = entry.ordinal;
-      if (entry.timestamp >= cutoff) active.push(entry);
+      return page;
+    } finally {
+      reservation.dispose();
     }
-    if (!headerSeen) throw new CorruptError("repository is missing its reflog state");
-    const page: RefLogEntry[] = [];
-    for (const entry of active) {
-      if (before !== undefined && entry.ordinal >= before) continue;
-      if (page.length < limit) page.push(entry);
-    }
-    return page;
   }
 
   /** Distinct active reflog roots in strict byte order. */
@@ -7272,15 +8580,69 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "reflog clock must return a safe nonnegative epoch time");
     }
     const cutoff = Math.max(0, now - REFLOG_RETENTION_SECONDS);
-    const physicalRows = this.#db.scalar<unknown>(
-      `SELECT (SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?)
-            + (SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?)`,
+    const scanMetadata = this.#db.one<{
+      rows: unknown;
+      text_bytes: unknown;
+      max_row_bytes: unknown;
+      head_bytes: unknown;
+    }>(
+      `SELECT direct.rows + local.rows AS rows,
+              direct.text_bytes + local.text_bytes AS text_bytes,
+              max(direct.max_row_bytes, local.max_row_bytes) AS max_row_bytes,
+              (SELECT length(CAST(head AS BLOB)) FROM git_checkouts
+                WHERE id = ? AND repo_id = ?) AS head_bytes
+         FROM (
+           SELECT count(*) AS rows,
+                  coalesce(sum(row_bytes), 0) AS text_bytes,
+                  coalesce(max(CASE WHEN retained_rank <= ${REFLOG_RETENTION_ROWS}
+                                    THEN row_bytes END), 0) AS max_row_bytes
+             FROM (
+               SELECT coalesce(length(CAST(ref_name AS BLOB)), 0) +
+                      coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                      coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                      coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                      coalesce(length(CAST(new_oid AS BLOB)), 0) +
+                      coalesce(length(CAST(actor_name AS BLOB)), 0) +
+                      coalesce(length(CAST(actor_email AS BLOB)), 0) +
+                      coalesce(length(CAST(reason AS BLOB)), 0) AS row_bytes,
+                      row_number() OVER (
+                        PARTITION BY ref_name ORDER BY ordinal DESC
+                      ) AS retained_rank
+                 FROM git_reflog_entries INDEXED BY git_reflog_entries_by_ref
+                WHERE repo_id = ?
+             ) direct_ranked
+         ) direct
+         CROSS JOIN (
+           SELECT count(*) AS rows,
+                  coalesce(sum(row_bytes), 0) AS text_bytes,
+                  coalesce(max(CASE WHEN retained_rank <= ${REFLOG_RETENTION_ROWS}
+                                    THEN row_bytes END), 0) AS max_row_bytes
+             FROM (
+               SELECT 4 +
+                      coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                      coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                      coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                      coalesce(length(CAST(new_oid AS BLOB)), 0) +
+                      coalesce(length(CAST(actor_name AS BLOB)), 0) +
+                      coalesce(length(CAST(actor_email AS BLOB)), 0) +
+                      coalesce(length(CAST(reason AS BLOB)), 0) AS row_bytes,
+                      row_number() OVER (
+                        PARTITION BY checkout_id ORDER BY ordinal DESC
+                      ) AS retained_rank
+                 FROM git_checkout_reflog_entries
+                WHERE repo_id = ?
+             ) local_ranked
+         ) local`,
+      this.#checkoutId,
+      this.#repoId,
       this.#repoId,
       this.#repoId,
     );
-    validateRefLogRootScanBudget(physicalRows);
+    validateRefLogRootScanBudget(scanMetadata);
     const header = this.#db.one<Record<string, unknown>>(
-      `SELECT repository.id AS repo_id, checkout.head, state.next_ordinal,
+      `SELECT repository.id AS repo_id, typeof(checkout.head) AS head_type,
+              CAST(checkout.head AS BLOB) AS head_blob,
+              state.next_ordinal,
               (SELECT max(ordinal) FROM (
                  SELECT direct.ordinal FROM git_reflog_entries direct
                   WHERE direct.repo_id = repository.id
@@ -7345,7 +8707,24 @@ export class CheckoutStore implements IndexStore {
              ) WHERE oid IS NOT NULL GROUP BY oid
            ) endpoint
        )
-       SELECT * FROM output
+       SELECT kind, repo_id, checkout_id, owner_repo_id,
+              typeof(ref_name) AS ref_name_type, CAST(ref_name AS BLOB) AS ref_name_blob, ordinal,
+              typeof(old_raw) AS old_raw_type,
+              CAST(old_raw AS BLOB) AS old_raw_blob,
+              typeof(new_raw) AS new_raw_type,
+              CAST(new_raw AS BLOB) AS new_raw_blob,
+              typeof(old_oid) AS old_oid_type,
+              CAST(old_oid AS BLOB) AS old_oid_blob,
+              typeof(new_oid) AS new_oid_type,
+              CAST(new_oid AS BLOB) AS new_oid_blob,
+              typeof(actor_name) AS actor_name_type,
+              CAST(actor_name AS BLOB) AS actor_name_blob,
+              typeof(actor_email) AS actor_email_type,
+              CAST(actor_email AS BLOB) AS actor_email_blob,
+              timestamp, timezone, typeof(reason) AS reason_type,
+              CAST(reason AS BLOB) AS reason_blob,
+              CAST(root_oid AS BLOB) AS root_oid_blob
+         FROM output
        ORDER BY kind, ref_name COLLATE BINARY, checkout_id, ordinal DESC, root_oid COLLATE BINARY`,
       this.#repoId,
       this.#repoId,
@@ -7402,14 +8781,18 @@ export class CheckoutStore implements IndexStore {
         }
         continue;
       }
-      if (row.kind !== 2 || typeof row.root_oid !== "string" || !isOid(row.root_oid)) {
+      if (row.kind !== 2) {
         throw new CorruptError("reflog root query returned an invalid object id");
       }
-      if (previousOid !== null && comparePaths(previousOid, row.root_oid) >= 0) {
+      const rootOid = decodeCanonicalStoredText(row.root_oid_blob, "reflog root object id");
+      if (!isOid(rootOid)) {
+        throw new CorruptError("reflog root query returned an invalid object id");
+      }
+      if (previousOid !== null && comparePaths(previousOid, rootOid) >= 0) {
         throw new CorruptError("reflog roots are not in strict byte order");
       }
-      previousOid = row.root_oid;
-      yield row.root_oid;
+      previousOid = rootOid;
+      yield rootOid;
     }
   }
 
@@ -7431,59 +8814,196 @@ export class CheckoutStore implements IndexStore {
     return values.length === 0 ? undefined : values[values.length - 1];
   }
 
-  /** Read one config value only after SQLite proves its type and byte bound. */
-  configGetBounded(path: string, maxBytes: number): string | undefined {
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+  /** Read one config value only after SQLite proves its text metadata. */
+  configGetBounded(path: string, maxBytes?: number): string | undefined {
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
-    const info = this.#db.one<{ value_type: unknown; value_bytes: unknown }>(
-      `SELECT typeof(value) AS value_type,
+    const reservation = this.#sharedStore.reserveMemory();
+    reservation.set("other", CONFIG_READ_FIXED_RETAINED_BYTES);
+    try {
+      const info = this.#db.one<{
+        repo_id: unknown;
+        seq_type: unknown;
+        seq: unknown;
+        value_type: unknown;
+        value_bytes: unknown;
+      }>(
+        `SELECT repo_id, typeof(seq) AS seq_type,
+              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+              typeof(value) AS value_type,
               length(CAST(value AS BLOB)) AS value_bytes
          FROM git_config
         WHERE repo_id = ? AND path = ?
         ORDER BY seq DESC
         LIMIT 1`,
-      this.#repoId,
-      path,
-    );
-    if (info === undefined) return undefined;
-    if (
-      info.value_type !== "text" ||
-      typeof info.value_bytes !== "number" ||
-      !Number.isSafeInteger(info.value_bytes) ||
-      info.value_bytes < 0
-    ) {
-      throw new CorruptError(`config ${path} has invalid text metadata`);
+        this.#repoId,
+        path,
+      );
+      if (info === undefined) return undefined;
+      if (
+        info.repo_id !== this.#repoId ||
+        info.seq_type !== "integer" ||
+        typeof info.seq !== "number" ||
+        !Number.isSafeInteger(info.seq) ||
+        info.seq < 0 ||
+        info.value_type !== "text" ||
+        typeof info.value_bytes !== "number" ||
+        !Number.isSafeInteger(info.value_bytes) ||
+        info.value_bytes < 0
+      ) {
+        throw new CorruptError(`config ${path} has invalid text metadata`);
+      }
+      if (maxBytes !== undefined && info.value_bytes > maxBytes) {
+        throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
+      }
+      reservation.set(
+        "other",
+        CONFIG_READ_FIXED_RETAINED_BYTES + info.value_bytes + 48 + 2 * info.value_bytes,
+      );
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT repo_id, typeof(seq) AS seq_type,
+                CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+                typeof(value) AS value_type,
+                length(CAST(value AS BLOB)) AS value_bytes,
+                CAST(value AS BLOB) AS value_blob
+           FROM git_config
+          WHERE repo_id = ? AND path = ? AND seq = ?
+          LIMIT 1`,
+        this.#repoId,
+        path,
+        info.seq,
+      );
+      if (
+        row === undefined ||
+        row.repo_id !== this.#repoId ||
+        row.seq_type !== "integer" ||
+        row.seq !== info.seq ||
+        row.value_type !== "text" ||
+        row.value_bytes !== info.value_bytes
+      ) {
+        throw new CorruptError(`config ${path} changed after validation`);
+      }
+      const bytes = readBlob(row.value_blob);
+      if (bytes.byteLength !== info.value_bytes) {
+        throw new CorruptError(`config ${path} changed after validation`);
+      }
+      const value = decodeCanonicalText(bytes, `config ${path}`);
+      reservation.set(
+        "other",
+        CONFIG_READ_FIXED_RETAINED_BYTES + bytes.byteLength + retainedStringBytes(value),
+      );
+      return value;
+    } finally {
+      reservation.dispose();
     }
-    if (info.value_bytes > maxBytes) {
-      throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
-    }
-    const value = this.#db.scalar<unknown>(
-      `SELECT value
-         FROM git_config
-        WHERE repo_id = ? AND path = ?
-        ORDER BY seq DESC
-        LIMIT 1`,
-      this.#repoId,
-      path,
-    );
-    if (typeof value !== "string") {
-      throw new CorruptError(`config ${path} has a non-text value`);
-    }
-    return value;
   }
 
   /** Read zero or one canonical value without materialising a multi-valued key. */
-  configGetSingleBounded(path: string, maxBytes: number): BoundedSingleConfigValue {
+  configGetSingleBounded(path: string, maxBytes?: number): BoundedSingleConfigValue {
     if (typeof path !== "string" || path === "") {
       throw new GitError("EINVAL", "bounded config path must be a non-empty string");
     }
     boundedCanonicalUtf8Bytes(path, MAX_INDEX_PATH_BYTES, "bounded config path");
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
       throw new GitError("EINVAL", "config byte limit must be a non-negative safe integer");
     }
 
-    const metadata: { seq: number; bytes: number }[] = [];
+    const reservation = this.#sharedStore.reserveMemory();
+    reservation.set("other", CONFIG_READ_FIXED_RETAINED_BYTES + 2 * 128);
+    try {
+      const metadata: { seq: number; bytes: number }[] = [];
+      for (const row of this.#db.iterate(
+        `SELECT repo_id, typeof(seq) AS seq_type,
+              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+              typeof(value) AS value_type,
+              length(CAST(value AS BLOB)) AS value_bytes
+         FROM git_config
+        WHERE repo_id = ? AND path = ?
+        ORDER BY seq
+        LIMIT 2`,
+        this.#repoId,
+        path,
+      )) {
+        if (row.repo_id !== this.#repoId) {
+          throw new CorruptError(`config ${path} crossed repository boundaries`);
+        }
+        if (
+          row.seq_type !== "integer" ||
+          typeof row.seq !== "number" ||
+          !Number.isSafeInteger(row.seq) ||
+          row.seq < 0 ||
+          row.value_type !== "text" ||
+          typeof row.value_bytes !== "number" ||
+          !Number.isSafeInteger(row.value_bytes) ||
+          row.value_bytes < 0
+        ) {
+          throw new CorruptError(`config ${path} has invalid value metadata`);
+        }
+        if (maxBytes !== undefined && row.value_bytes > maxBytes) {
+          throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
+        }
+        metadata.push({ seq: row.seq, bytes: row.value_bytes });
+      }
+      const expected = metadata[0];
+      if (expected === undefined) return { kind: "missing" };
+      if (metadata.length !== 1) return { kind: "multiple" };
+
+      reservation.set(
+        "other",
+        CONFIG_READ_FIXED_RETAINED_BYTES + 2 * 128 + expected.bytes + 48 + 2 * expected.bytes,
+      );
+
+      const row = this.#db.one<Record<string, unknown>>(
+        `SELECT repo_id, typeof(seq) AS seq_type,
+              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
+              typeof(value) AS value_type,
+              length(CAST(value AS BLOB)) AS value_bytes,
+              CAST(value AS BLOB) AS value_blob
+         FROM git_config
+        WHERE repo_id = ? AND path = ? AND seq = ?
+        LIMIT 1`,
+        this.#repoId,
+        path,
+        expected.seq,
+      );
+      if (
+        row === undefined ||
+        row.repo_id !== this.#repoId ||
+        row.seq_type !== "integer" ||
+        row.seq !== expected.seq ||
+        row.value_type !== "text" ||
+        row.value_bytes !== expected.bytes
+      ) {
+        throw new CorruptError(`config ${path} changed after validation`);
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = readBlob(row.value_blob);
+      } catch (error) {
+        throw new CorruptError(`config ${path} has an invalid value BLOB`, { cause: error });
+      }
+      if (bytes.byteLength !== expected.bytes) {
+        throw new CorruptError(`config ${path} changed after validation`);
+      }
+      const value = decodeCanonicalText(bytes, `config ${path}`);
+      reservation.set(
+        "other",
+        CONFIG_READ_FIXED_RETAINED_BYTES + 2 * 128 + bytes.byteLength + retainedStringBytes(value),
+      );
+      return { kind: "single", value };
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  /** Inspect zero, one, or multiple values without materialising their payloads. */
+  configCardinality(path: string): ConfigValueCardinality {
+    if (typeof path !== "string" || path === "") {
+      throw new GitError("EINVAL", "config path must be a non-empty string");
+    }
+    boundedCanonicalUtf8Bytes(path, MAX_INDEX_PATH_BYTES, "config path");
+    let rows = 0;
     for (const row of this.#db.iterate(
       `SELECT repo_id, typeof(seq) AS seq_type,
               CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
@@ -7496,10 +9016,8 @@ export class CheckoutStore implements IndexStore {
       this.#repoId,
       path,
     )) {
-      if (row.repo_id !== this.#repoId) {
-        throw new CorruptError(`config ${path} crossed repository boundaries`);
-      }
       if (
+        row.repo_id !== this.#repoId ||
         row.seq_type !== "integer" ||
         typeof row.seq !== "number" ||
         !Number.isSafeInteger(row.seq) ||
@@ -7511,48 +9029,9 @@ export class CheckoutStore implements IndexStore {
       ) {
         throw new CorruptError(`config ${path} has invalid value metadata`);
       }
-      if (row.value_bytes > maxBytes) {
-        throw new GitError("E2BIG", `config ${path} exceeds ${maxBytes} bytes`);
-      }
-      metadata.push({ seq: row.seq, bytes: row.value_bytes });
+      rows++;
     }
-    const expected = metadata[0];
-    if (expected === undefined) return { kind: "missing" };
-    if (metadata.length !== 1) return { kind: "multiple" };
-
-    const row = this.#db.one<Record<string, unknown>>(
-      `SELECT repo_id, typeof(seq) AS seq_type,
-              CASE WHEN typeof(seq) = 'integer' THEN seq END AS seq,
-              typeof(value) AS value_type,
-              length(CAST(value AS BLOB)) AS value_bytes,
-              CAST(value AS BLOB) AS value_blob
-         FROM git_config
-        WHERE repo_id = ? AND path = ? AND seq = ?
-        LIMIT 1`,
-      this.#repoId,
-      path,
-      expected.seq,
-    );
-    if (
-      row === undefined ||
-      row.repo_id !== this.#repoId ||
-      row.seq_type !== "integer" ||
-      row.seq !== expected.seq ||
-      row.value_type !== "text" ||
-      row.value_bytes !== expected.bytes
-    ) {
-      throw new CorruptError(`config ${path} changed after validation`);
-    }
-    let bytes: Uint8Array;
-    try {
-      bytes = readBlob(row.value_blob);
-    } catch (error) {
-      throw new CorruptError(`config ${path} has an invalid value BLOB`, { cause: error });
-    }
-    if (bytes.byteLength !== expected.bytes) {
-      throw new CorruptError(`config ${path} changed after validation`);
-    }
-    return { kind: "single", value: decodeCanonicalConfigText(bytes, `config ${path}`) };
+    return rows === 0 ? "missing" : rows === 1 ? "single" : "multiple";
   }
 
   configSet(path: string, value: string): void {
@@ -9137,10 +10616,10 @@ function decodeConfigText(bytes: Uint8Array, label: string): string {
   }
 }
 
-function decodeCanonicalConfigText(bytes: Uint8Array, label: string): string {
+function decodeCanonicalText(bytes: Uint8Array, label: string): string {
   let value: string;
   try {
-    value = CANONICAL_CONFIG_TEXT_DECODER.decode(bytes);
+    value = CANONICAL_TEXT_DECODER.decode(bytes);
   } catch (error) {
     throw new CorruptError(`${label} is not canonical UTF-8`, { cause: error });
   }
@@ -9154,4 +10633,50 @@ function decodeCanonicalConfigText(bytes: Uint8Array, label: string): string {
     }
   }
   return value;
+}
+
+function requireStoredTextBytes(type: unknown, value: unknown, label: string): Uint8Array {
+  if (type !== "text") throw new CorruptError(`${label} has an invalid stored type`);
+  try {
+    return readBlob(value);
+  } catch (error) {
+    throw new CorruptError(`${label} has an invalid text BLOB`, { cause: error });
+  }
+}
+
+function compareByteArrays(left: Uint8Array, right: Uint8Array): number {
+  const shared = Math.min(left.byteLength, right.byteLength);
+  for (let index = 0; index < shared; index++) {
+    const leftByte = left[index] ?? -1;
+    const rightByte = right[index] ?? -1;
+    if (leftByte !== rightByte) return leftByte < rightByte ? -1 : 1;
+  }
+  return left.byteLength === right.byteLength ? 0 : left.byteLength < right.byteLength ? -1 : 1;
+}
+
+function decodeCanonicalStoredText(value: unknown, label: string): string {
+  let bytes: Uint8Array;
+  try {
+    bytes = readBlob(value);
+  } catch (error) {
+    throw new CorruptError(`${label} has an invalid text BLOB`, { cause: error });
+  }
+  return decodeCanonicalText(bytes, label);
+}
+
+function requireCanonicalStoredText(type: unknown, value: unknown, label: string): string {
+  if (type !== "text") throw new CorruptError(`${label} has an invalid stored type`);
+  return decodeCanonicalStoredText(value, label);
+}
+
+function requireNullableCanonicalStoredText(
+  type: unknown,
+  value: unknown,
+  label: string,
+): string | null {
+  if (type === "null" && value === null) return null;
+  if (type !== "text" || value === null) {
+    throw new CorruptError(`${label} has an invalid stored type`);
+  }
+  return decodeCanonicalStoredText(value, label);
 }

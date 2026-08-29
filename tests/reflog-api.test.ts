@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 import { recoverRef } from "../src/core/ops/ref-log.js";
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import {
+  Database,
+  type DurableObjectStorageLike,
+  type SQLCursorLike,
+  type SQLStorageLike,
+  type SqlDatabase,
+} from "../src/sqlite/db.js";
 import {
   MAX_REFLOG_ROOT_RETAINED_BYTES,
   MAX_REFLOG_ROOT_SCAN_BYTES,
@@ -12,11 +19,13 @@ import {
   REFLOG_ROOT_JS_HEADROOM_BYTES,
   REFLOG_ROOT_OBJECT_CACHE_BYTES,
   REFLOG_ROOT_PACK_ROW_CACHE_BYTES,
+  REFLOG_ROOT_ROW_FIXED_BYTES,
   REFLOG_ROOT_SCAN_FIXED_BYTES,
   type RefLogMetadata,
   SqliteGitDatabase,
 } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
+import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 
 const NOW_SECONDS = 1_800_000_000;
@@ -26,6 +35,64 @@ const ACTOR = { name: "Recovery Actor", email: "recovery@example.com" };
 const FIRST = "1".repeat(40);
 const SECOND = "2".repeat(40);
 const THIRD = "3".repeat(40);
+
+class CodedTooBigStorage implements DurableObjectStorageLike {
+  readonly sql: SQLStorageLike;
+  #queryFragment: string | null = null;
+  writesBeforeFailure = 0;
+
+  constructor(private readonly inner: SqliteTestStorage) {
+    this.sql = {
+      exec: <Row extends object>(query: string, ...bindings: unknown[]): SQLCursorLike<Row> => {
+        if (this.#queryFragment !== null && query.includes(this.#queryFragment)) {
+          this.#queryFragment = null;
+          throw Object.assign(new Error("injected coded SQLite value failure"), {
+            code: "SQLITE_TOOBIG",
+          });
+        }
+        if (this.#queryFragment !== null && /^\s*(?:DELETE|INSERT|UPDATE)\b/.test(query)) {
+          this.writesBeforeFailure++;
+        }
+        return this.inner.sql.exec<Row>(query, ...bindings);
+      },
+    };
+  }
+
+  arm(queryFragment: string): void {
+    this.#queryFragment = queryFragment;
+    this.writesBeforeFailure = 0;
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+function durableRefMutationState(db: TestDatabase) {
+  return {
+    refs: db.all<Record<string, unknown>>(
+      "SELECT repo_id, name, target FROM git_refs ORDER BY repo_id, name",
+    ),
+    checkouts: db.all<Record<string, unknown>>(
+      "SELECT id, repo_id, head FROM git_checkouts ORDER BY id",
+    ),
+    directReflogs: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_reflog_entries ORDER BY repo_id, ordinal",
+    ),
+    checkoutReflogs: db.all<Record<string, unknown>>(
+      "SELECT * FROM git_checkout_reflog_entries ORDER BY repo_id, ordinal",
+    ),
+    reflogState: db.all<Record<string, unknown>>(
+      "SELECT repo_id, next_ordinal FROM git_reflog_state ORDER BY repo_id",
+    ),
+    revisions: db.all<Record<string, unknown>>(
+      "SELECT id, checkout_revision FROM git_repositories ORDER BY id",
+    ),
+    roots: db.all<Record<string, unknown>>(
+      "SELECT repo_id, root_epoch FROM git_maintenance_control ORDER BY repo_id",
+    ),
+  };
+}
 
 function bindGit(workspace: TestRepository, database = workspace.database): Git {
   return createGit()({
@@ -242,6 +309,10 @@ class GuardedDatabase implements SqlDatabase {
   iterateCalls = 0;
   closedIterators = 0;
   forbidAll = false;
+  rootScanRows = 0;
+  rootScanTextBytes: number | null = null;
+  rootScanMaxRowBytes = 0;
+  rootScanHeadBytes = 1;
 
   run(query: string, ...bindings: unknown[]): void {
     this.inner.run(query, ...bindings);
@@ -253,6 +324,19 @@ class GuardedDatabase implements SqlDatabase {
   }
 
   one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    if (
+      this.rootScanTextBytes !== null &&
+      query.includes("direct.rows + local.rows AS rows") &&
+      query.includes("AS max_row_bytes")
+    ) {
+      return this.inner.one<Row>(
+        "SELECT ? AS rows, ? AS text_bytes, ? AS max_row_bytes, ? AS head_bytes",
+        this.rootScanRows,
+        this.rootScanTextBytes,
+        this.rootScanMaxRowBytes,
+        this.rootScanHeadBytes,
+      );
+    }
     return this.inner.one<Row>(query, ...bindings);
   }
 
@@ -279,6 +363,108 @@ class GuardedDatabase implements SqlDatabase {
 }
 
 describe("public reflog listing", () => {
+  it("round-trips former ref, target, identity, and reason first excesses", () => {
+    const workspace = makeRepo("/");
+    const ref = `refs/tags/${"r".repeat(1_015)}`;
+    const rawTarget = `ref: refs/heads/${"t".repeat(1_009)}`;
+    const actor = { name: "n".repeat(1_025), email: "e".repeat(1_025) };
+    const longMetadata = {
+      actor,
+      reason: "reason-".padEnd(257, "r"),
+      timestamp: NOW_SECONDS,
+      timezoneOffset: 0,
+    };
+    expect(ref).toHaveLength(1_025);
+    expect(rawTarget).toHaveLength(1_025);
+    expect(longMetadata.reason).toHaveLength(257);
+
+    expect(
+      workspace.repo.store.mutateRefs({ puts: [{ name: ref, target: rawTarget }] }, longMetadata),
+    ).toBe(true);
+    expect(workspace.repo.store.getRef(ref)).toBe(rawTarget);
+    const entries = workspace.repo.store.reflog(ref);
+    expect(entries).toEqual([
+      expect.objectContaining({
+        refName: ref,
+        oldRaw: null,
+        newRaw: rawTarget,
+        actor,
+        reason: longMetadata.reason,
+      }),
+    ]);
+
+    const probe = workspace.repo.store.reserveMemory();
+    try {
+      probe.set("other", MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      probe.dispose();
+    }
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+    const reopenedCheckout = reopenedDatabase.checkoutAt("/");
+    if (reopenedCheckout === null) throw new Error("reopened checkout is missing");
+    const reopened = reopenedDatabase.openCheckout(reopenedCheckout);
+    expect(reopened.getRef(ref)).toBe(rawTarget);
+    expect(reopened.reflog(ref)).toEqual(entries);
+    const reopenedProbe = reopened.reserveMemory();
+    try {
+      reopenedProbe.set("other", MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      reopenedProbe.dispose();
+    }
+  });
+
+  it("owns one long reflog entry and its HEAD header at the exact shared boundary", () => {
+    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
+    const ref = "refs/tags/long-reason";
+    const reason = "r".repeat(1_500_001);
+    seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, ref, 1);
+    workspace.repo.store.db.run(
+      "UPDATE git_reflog_entries SET reason = ? WHERE repo_id = ? AND ref_name = ?",
+      reason,
+      workspace.repo.store.repoId,
+      ref,
+    );
+    const textBytes = ref.length + 4 * FIRST.length + reason.length;
+    const headBytes = "ref: refs/heads/main".length;
+    const operationBytes = 2_464 + 5 * (headBytes + textBytes);
+    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
+    const exactBlocker = workspace.repo.store.reserveMemory();
+    exactBlocker.set("other", externalBytes);
+    try {
+      expect(workspace.repo.store.reflog(ref)).toEqual([
+        expect.objectContaining({ refName: ref, reason }),
+      ]);
+      expect(workspace.database.openShared(workspace.repo.store.repoId).memory.highWaterBytes).toBe(
+        MAX_OPERATION_MEMORY_BYTES,
+      );
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+    const reopenedCheckout = reopenedDatabase.checkoutAt("/");
+    if (reopenedCheckout === null) throw new Error("reopened reflog checkout is missing");
+    const reopened = reopenedDatabase.openCheckout(reopenedCheckout);
+    const overBlocker = reopened.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
+    try {
+      expect(() => reopened.reflog(ref)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      overBlocker.dispose();
+    }
+    expect(reopened.reflog(ref)[0]).toEqual(expect.objectContaining({ refName: ref, reason }));
+    const probe = reopened.reserveMemory();
+    try {
+      probe.set("other", MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      probe.dispose();
+    }
+  });
+
   it("bounds pages and keeps an exclusive ordinal cursor stable across append and reopen", async () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     const ref = "refs/heads/history";
@@ -333,13 +519,13 @@ describe("public reflog listing", () => {
     );
   });
 
-  it("uses one compound traversal statement for a complete page", () => {
+  it("uses one metadata preflight and one payload read for a complete page", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 100);
     workspace.storage.resetCounters();
 
     expect(workspace.repo.reflog("HEAD", { limit: 100 })).toHaveLength(100);
-    expect(workspace.storage.statementCount).toBe(1);
+    expect(workspace.storage.statementCount).toBe(2);
   });
 });
 
@@ -673,6 +859,40 @@ describe("reflog recovery", () => {
 });
 
 describe("active reflog roots", () => {
+  it.each([
+    [
+      "ref name",
+      `UPDATE git_reflog_entries
+          SET ref_name = CAST(x'726566732f746167732ff09080' AS TEXT)
+        WHERE repo_id = ?`,
+    ],
+    [
+      "raw endpoint",
+      `UPDATE git_reflog_entries SET old_raw = CAST(x'f09080' AS TEXT) WHERE repo_id = ?`,
+    ],
+    [
+      "identity",
+      `UPDATE git_reflog_entries
+          SET actor_name = CAST(x'f09080' AS TEXT), actor_email = 'actor@example.test'
+        WHERE repo_id = ?`,
+    ],
+    ["reason", `UPDATE git_reflog_entries SET reason = CAST(x'f09080' AS TEXT) WHERE repo_id = ?`],
+    [
+      "reason type",
+      `UPDATE git_reflog_entries SET reason = CAST('reason' AS BLOB) WHERE repo_id = ?`,
+    ],
+  ])("rejects non-canonical UTF-8 in a persisted reflog %s", (_field, corruption) => {
+    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
+    seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "refs/tags/source", 1);
+    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
+    workspace.repo.store.db.run(corruption, workspace.repo.store.repoId);
+    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
+
+    expect(() => workspace.repo.activeRefLogOids().next()).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+  });
+
   it("keeps SQL state, shared caches, and JS headroom strictly below 100 MiB", () => {
     expect(
       MAX_REFLOG_ROOT_SCAN_BYTES +
@@ -694,6 +914,59 @@ describe("active reflog roots", () => {
     expect(MAX_REFLOG_ROOT_SCAN_ENTRIES).toBe(9_727);
   });
 
+  it("preflights unbounded persisted text against the retained SQL model", () => {
+    const db = new GuardedDatabase();
+    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(repository);
+    db.rootScanRows = MAX_REFLOG_ROOT_SCAN_ENTRIES;
+    const perSlotBytes = Math.floor(
+      (MAX_REFLOG_ROOT_SCAN_BYTES - REFLOG_ROOT_SCAN_FIXED_BYTES) / 2,
+    );
+    db.rootScanTextBytes =
+      perSlotBytes - MAX_REFLOG_ROOT_SCAN_ENTRIES * REFLOG_ROOT_ROW_FIXED_BYTES;
+    db.iterateCalls = 0;
+
+    expect(() => store.activeRefLogOids().next()).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(db.iterateCalls).toBe(0);
+  });
+
+  it("accepts the exact large-row memory boundary and rejects one more persisted byte", () => {
+    const db = new GuardedDatabase();
+    const database = new SqliteGitDatabase(db, { now: () => NOW_MILLISECONDS });
+    const repository = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(repository);
+    seedRefLog(db, store.repoId, "HEAD", 1);
+    db.rootScanRows = 1;
+    db.rootScanHeadBytes = "ref: refs/heads/main".length;
+    const fixedBytes =
+      REFLOG_ROOT_SCAN_FIXED_BYTES + 2 * (REFLOG_ROOT_ROW_FIXED_BYTES + db.rootScanHeadBytes);
+    const rowCopies = 2 + 1 + 2;
+    const exactRowBytes = Math.floor((MAX_REFLOG_ROOT_SCAN_BYTES - fixedBytes) / rowCopies);
+    db.rootScanTextBytes = exactRowBytes;
+    db.rootScanMaxRowBytes = exactRowBytes;
+    db.iterateCalls = 0;
+
+    expect(fixedBytes + rowCopies * exactRowBytes).toBeLessThanOrEqual(MAX_REFLOG_ROOT_SCAN_BYTES);
+    expect(fixedBytes + rowCopies * (exactRowBytes + 1)).toBeGreaterThan(
+      MAX_REFLOG_ROOT_SCAN_BYTES,
+    );
+    const accepted = store.activeRefLogOids();
+    expect(accepted.next()).toEqual({ done: false, value: FIRST });
+    accepted.return(undefined);
+    expect(db.iterateCalls).toBe(1);
+
+    db.rootScanTextBytes = exactRowBytes + 1;
+    db.rootScanMaxRowBytes = exactRowBytes + 1;
+    db.iterateCalls = 0;
+    expect(() => store.activeRefLogOids().next()).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(db.iterateCalls).toBe(0);
+  });
+
   it("deduplicates active non-null endpoints in SQL and excludes expired roots", () => {
     let now = NOW_MILLISECONDS;
     const workspace = makeRepo("/", { now: () => now });
@@ -708,27 +981,25 @@ describe("active reflog roots", () => {
     expect([...workspace.repo.activeRefLogOids()]).toEqual([]);
   });
 
-  it("excludes the 1,025th row before physical cleanup", () => {
+  it("fails closed on a persisted 1,025th row without cleaning it up", () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     seedRefLog(workspace.repo.store.db, workspace.repo.store.repoId, "HEAD", 1_025);
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = ON");
-    workspace.repo.store.db.run(
-      `UPDATE git_checkout_reflog_entries
-          SET old_raw = ?, old_oid = ?, new_raw = ?, new_oid = ?
-        WHERE repo_id = ? AND ordinal = 1`,
-      THIRD,
-      THIRD,
-      FIRST,
-      FIRST,
-      workspace.repo.store.repoId,
+    expect(() => workspace.repo.reflog("HEAD")).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
     );
-    workspace.repo.store.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(
+      workspace.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_checkout_reflog_entries WHERE repo_id = ?",
+        workspace.repo.store.repoId,
+      ),
+    ).toBe(1_025);
 
-    const listed = workspace.repo.reflog("HEAD");
-    expect(listed).toHaveLength(1_024);
-    expect(listed.at(-1)?.ordinal).toBe(2);
-    expect(workspace.repo.reflog("HEAD", { before: 2, limit: 1 })).toEqual([]);
-    expect([...workspace.repo.activeRefLogOids()]).toEqual([FIRST, SECOND]);
+    const coldDatabase = new SqliteGitDatabase(new TestDatabase(workspace.storage));
+    const coldCheckout = coldDatabase.checkoutAt("/");
+    if (coldCheckout === null) throw new Error("reopened corrupt reflog checkout is missing");
+    expect(() => coldDatabase.openCheckout(coldCheckout).reflog("HEAD")).toThrow(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
   });
 
   it("is lazy, uses one iterate query, never calls all, and closes early", () => {
@@ -957,5 +1228,46 @@ describe("mutation publication result", () => {
       ),
     ).toThrow(/injected publication failure/);
     expect(workspace.repo.store.getRef("refs/tags/fail")).toBeNull();
+  });
+
+  it("rolls ref, HEAD, and reflog state back after a coded SQLite value failure", () => {
+    const storage = new SqliteTestStorage();
+    const snapshotDb = new TestDatabase(storage);
+    const faultStorage = new CodedTooBigStorage(storage);
+    const database = new SqliteGitDatabase(new Database(faultStorage));
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const repo = new Repository(database.openCheckout(checkout));
+    const before = durableRefMutationState(snapshotDb);
+
+    faultStorage.arm("INSERT INTO git_checkout_reflog_entries");
+    expect(() =>
+      repo.mutateRefs(
+        { puts: [{ name: "refs/heads/main", target: FIRST }] },
+        metadata("coded SQLite rollback"),
+      ),
+    ).toThrowError(expect.objectContaining({ name: "GitError", code: "E2BIG" }));
+    expect(faultStorage.writesBeforeFailure).toBeGreaterThan(0);
+    expect(durableRefMutationState(snapshotDb)).toEqual(before);
+    expect(repo.checkout.head()).toBe("ref: refs/heads/main");
+    expect(repo.store.getRef("refs/heads/main")).toBeNull();
+    expect(repo.reflog("HEAD")).toEqual([]);
+    expect(repo.reflog("refs/heads/main")).toEqual([]);
+
+    const coldDatabase = new SqliteGitDatabase(new TestDatabase(storage));
+    const coldCheckout = coldDatabase.checkoutAt("/repo");
+    if (coldCheckout === null) throw new Error("reopened rollback checkout is missing");
+    const coldStore = coldDatabase.openCheckout(coldCheckout);
+    expect(durableRefMutationState(new TestDatabase(storage))).toEqual(before);
+    expect(coldStore.head()).toBe("ref: refs/heads/main");
+    expect(coldStore.getRef("refs/heads/main")).toBeNull();
+    expect(coldStore.reflog("HEAD")).toEqual([]);
+    for (const candidate of [repo.store, coldStore]) {
+      const probe = candidate.reserveMemory();
+      try {
+        probe.set("other", MAX_OPERATION_MEMORY_BYTES);
+      } finally {
+        probe.dispose();
+      }
+    }
   });
 });

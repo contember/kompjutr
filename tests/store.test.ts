@@ -26,9 +26,6 @@ import {
   MAX_CONFIG_SECTION_MOVE_ROWS,
   MAX_CONFIG_SECTION_MOVE_TEXT_BYTES,
   MAX_REF_MUTATION_RETAINED_BYTES,
-  REF_MUTATION_FIXED_RETAINED_BYTES,
-  refMutationCheckoutRetainedBytes,
-  refMutationCreateRetainedBytes,
   SqliteGitDatabase,
   type StoreOptions,
 } from "../src/sqlite/store.js";
@@ -1233,6 +1230,44 @@ describe("refs, config and index", () => {
     expect(store.getRef("HEAD")).toBe("c".repeat(40));
   });
 
+  it("owns a single long listed ref row at the exact shared boundary", () => {
+    const name = `refs/tags/${"n".repeat(1_500_001)}`;
+    const target = "1".repeat(40);
+    const rowTextBytes = utf8.encode(name).byteLength + utf8.encode(target).byteLength;
+    const operationBytes = 1_224 + 5 * rowTextBytes;
+    expect(operationBytes).toBeLessThan(MAX_REF_MUTATION_RETAINED_BYTES);
+    const prepare = (): ReturnType<typeof open> => {
+      const opened = open();
+      opened.db.run("INSERT INTO git_refs (repo_id, name, target) VALUES (1, ?, ?)", name, target);
+      return opened;
+    };
+
+    const exact = prepare();
+    const externalBytes = MAX_REF_MUTATION_RETAINED_BYTES - operationBytes;
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", externalBytes);
+    try {
+      expect(exact.store.listRefs()).toEqual([{ name, target }]);
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
+
+    const over = prepare();
+    const overBlocker = over.store.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
+    try {
+      expect(() => over.store.listRefs()).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(over.db.scalar<number>("SELECT count(*) FROM git_refs WHERE repo_id = 1")).toBe(1);
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      overBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(over.store);
+  });
+
   it("streams repository refs with symbolic targets in strict Git byte order", () => {
     const { database, store } = open();
     const direct = "1".repeat(40);
@@ -1266,6 +1301,11 @@ describe("refs, config and index", () => {
   it.each([
     ["name", "UPDATE git_refs SET name = '' WHERE repo_id = 1"],
     ["target", "UPDATE git_refs SET target = 'broken' WHERE repo_id = 1"],
+    ["name type", "UPDATE git_refs SET name = CAST('refs/heads/main' AS BLOB) WHERE repo_id = 1"],
+    [
+      "target type",
+      "UPDATE git_refs SET target = CAST(printf('%040d', 0) AS BLOB) WHERE repo_id = 1",
+    ],
   ])("rejects a corrupt stored ref %s while streaming", (_field, corruption) => {
     const { db, store } = open();
     store.setRef("refs/heads/main", "1".repeat(40));
@@ -1274,6 +1314,80 @@ describe("refs, config and index", () => {
     expect(() => [...store.shared.iterateRefs()]).toThrowError(
       expect.objectContaining({ code: "ECORRUPT" }),
     );
+  });
+
+  it.each([
+    [
+      "name",
+      "UPDATE git_refs SET name = CAST(x'726566732f68656164732ff09080' AS TEXT) WHERE repo_id = 1",
+    ],
+    ["target", "UPDATE git_refs SET target = CAST(x'f09080' AS TEXT) WHERE repo_id = 1"],
+  ])("rejects non-canonical UTF-8 in a stored ref %s", (field, corruption) => {
+    const { db, store } = open();
+    store.setRef("refs/heads/main", "1".repeat(40));
+    db.run("PRAGMA ignore_check_constraints = ON");
+    db.run(corruption);
+    db.run("PRAGMA ignore_check_constraints = OFF");
+
+    expect(() => store.listRefs()).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(() => [...store.shared.iterateRefs()]).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    if (field === "target") {
+      expect(() => store.getRef("refs/heads/main")).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+    }
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it.each([
+    ["non-canonical UTF-8", "CAST(x'f09080' AS TEXT)"],
+    ["a non-text type", "CAST(printf('%040d', 0) AS BLOB)"],
+  ])("rejects %s in persisted HEAD state", (_case, expression) => {
+    const { db, database, store } = open();
+    db.run("PRAGMA ignore_check_constraints = ON");
+    db.run(`UPDATE git_checkouts SET head = ${expression} WHERE repo_id = 1`);
+    db.run("PRAGMA ignore_check_constraints = OFF");
+
+    expect(() => store.head()).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(() => database.checkoutAt("/repo")).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    expect(() => store.reflog("HEAD")).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("rejects non-canonical UTF-8 in tracking control rows", () => {
+    const revision = open();
+    revision.store
+      .beginTrackingRefPublication("refs/remotes/origin/", "refs/remotes/origin/main")
+      .dispose();
+    revision.db.run("PRAGMA ignore_check_constraints = ON");
+    revision.db.run(
+      `UPDATE git_tracking_ref_revisions
+          SET ref_name = CAST(x'726566732f72656d6f7465732f6f726967696e2ff09080' AS TEXT)
+        WHERE repo_id = 1`,
+    );
+    revision.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() => revision.store.beginFetchPublication("refs/remotes/origin/")).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    assertMemoryCoordinatorIdle(revision.store);
+
+    const namespace = open();
+    namespace.store.beginFetchPublication("refs/remotes/origin/").dispose();
+    namespace.db.run("PRAGMA ignore_check_constraints = ON");
+    namespace.db.run(
+      `UPDATE git_fetch_namespaces
+          SET tracking_prefix = CAST(x'726566732f72656d6f7465732ff090802f' AS TEXT)
+        WHERE repo_id = 1`,
+    );
+    namespace.db.run("PRAGMA ignore_check_constraints = OFF");
+    expect(() => namespace.store.beginFetchPublication("refs/remotes/upstream/")).toThrowError(
+      expect.objectContaining({ code: "ECORRUPT" }),
+    );
+    assertMemoryCoordinatorIdle(namespace.store);
   });
 
   it("lets only the newest same-namespace fetch publish, including after its raw no-op", () => {
@@ -1581,7 +1695,8 @@ describe("refs, config and index", () => {
   it("creates a durable exact tracking revision before first fetch and detects ABA", () => {
     const { db, store } = open();
     const prefix = "refs/remotes/origin/";
-    const tracking = `${prefix}main`;
+    const tracking = `${prefix}${"m".repeat(1_025 - prefix.length)}`;
+    expect(tracking).toHaveLength(1_025);
     const original = "1".repeat(40);
     store.setRef(tracking, original);
     const stale = store.beginTrackingRefPublication(prefix, tracking);
@@ -1608,7 +1723,19 @@ describe("refs, config and index", () => {
     } finally {
       stale.dispose();
     }
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
+    const reopenedCheckout = reopenedDatabase.checkoutAt("/repo");
+    if (reopenedCheckout === null) throw new Error("reopened checkout is missing");
+    const reopened = reopenedDatabase.openCheckout(reopenedCheckout);
+    expect(reopened.getRef(tracking)).toBe(original);
+    expect(
+      reopened.db.scalar<number>(
+        "SELECT revision FROM git_tracking_ref_revisions WHERE repo_id = 1 AND ref_name = ?",
+        tracking,
+      ),
+    ).toBe(2);
     assertMemoryCoordinatorIdle(store);
+    assertMemoryCoordinatorIdle(reopened);
   });
 
   it("enforces the exact tracking revision cardinality from stored rows", () => {
@@ -2096,6 +2223,93 @@ describe("refs, config and index", () => {
     assertMemoryCoordinatorIdle(memoryBound.store);
   });
 
+  it.each(["tracking observation", "stored ref"])(
+    "owns the previous long %s row at the exact ordered-scan boundary",
+    (kind) => {
+      const prefix = "refs/remotes/origin/";
+      const long = "r".repeat(1_000_001);
+      const names =
+        kind === "tracking observation"
+          ? [`${prefix}a${long}`, `${prefix}b${long}`]
+          : [`refs/tags/a${long}`, `refs/tags/b${long}`];
+      const prepare = (): ReturnType<typeof open> => {
+        const opened = open();
+        if (kind === "tracking observation") {
+          opened.db.run(
+            `INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision)
+             VALUES (1, ?, 0), (1, ?, 0)`,
+            names[0],
+            names[1],
+          );
+        } else {
+          opened.db.run(
+            `INSERT INTO git_refs (repo_id, name, target)
+             VALUES (1, ?, ?), (1, ?, ?)`,
+            names[0],
+            "1".repeat(40),
+            names[1],
+            "2".repeat(40),
+          );
+        }
+        return opened;
+      };
+      const run = (opened: ReturnType<typeof open>): void => {
+        const token = opened.store.beginFetchPublication(prefix);
+        token.dispose();
+      };
+      const durableState = (opened: ReturnType<typeof open>): Record<string, unknown> => ({
+        repository: opened.db.all<Record<string, unknown>>(
+          "SELECT fetch_generation FROM git_repositories WHERE id = 1",
+        ),
+        tracking: opened.db.all<Record<string, unknown>>(
+          `SELECT length(CAST(ref_name AS BLOB)) AS name_bytes, revision
+             FROM git_tracking_ref_revisions WHERE repo_id = 1 ORDER BY ref_name`,
+        ),
+        refs: opened.db.all<Record<string, unknown>>(
+          `SELECT length(CAST(name AS BLOB)) AS name_bytes, target
+             FROM git_refs WHERE repo_id = 1 ORDER BY name`,
+        ),
+        namespaces: opened.db.all<Record<string, unknown>>(
+          `SELECT tracking_prefix, latest_generation, revision
+             FROM git_fetch_namespaces WHERE repo_id = 1 ORDER BY tracking_prefix`,
+        ),
+      });
+
+      const measured = prepare();
+      run(measured);
+      const operationBytes = measured.store.shared.memory.highWaterBytes;
+      expect(operationBytes).toBeGreaterThan(3 * 1024 * 1024);
+      expect(operationBytes).toBeLessThan(MAX_REF_MUTATION_RETAINED_BYTES);
+      assertMemoryCoordinatorIdle(measured.store);
+
+      const externalBytes = MAX_REF_MUTATION_RETAINED_BYTES - operationBytes;
+      const exact = prepare();
+      const exactBlocker = exact.store.reserveMemory();
+      exactBlocker.set("other", externalBytes);
+      try {
+        run(exact);
+        expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
+        expect(exactBlocker.currentBytes).toBe(externalBytes);
+      } finally {
+        exactBlocker.dispose();
+      }
+      assertMemoryCoordinatorIdle(exact.store);
+
+      const over = prepare();
+      const before = durableState(over);
+      const overBlocker = over.store.reserveMemory();
+      overBlocker.set("other", externalBytes + 1);
+      try {
+        expect(() => run(over)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(durableState(over)).toEqual(before);
+        expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+      } finally {
+        overBlocker.dispose();
+      }
+      assertMemoryCoordinatorIdle(over.store);
+    },
+  );
+
   it("publishes 9,329 tracking refs within the statement target", () => {
     const { db, store } = open();
     const refs = Array.from({ length: 9_329 }, (_, index) => ({
@@ -2557,76 +2771,69 @@ describe("refs, config and index", () => {
     }
   });
 
-  it("accepts exact-budget unique events and rejects one additional changed ref", () => {
+  it("admits the measured ref aggregate exactly and rejects one external byte more", () => {
     const target = "1".repeat(40);
     const prefix = "refs/tags/";
     const suffixBytes = 6;
     const baseNameBytes = prefix.length + suffixBytes;
-    const row = (index: number, nameBytes: number) => ({
-      name: `${prefix}${index.toString(36).padStart(suffixBytes, "0")}${"x".repeat(nameBytes - baseNameBytes)}`,
-      target,
-    });
-    const checkoutRetained = refMutationCheckoutRetainedBytes({
-      root: "/repo",
-      head: "ref: refs/heads/main",
-    });
-    const remaining =
-      MAX_REF_MUTATION_RETAINED_BYTES - REF_MUTATION_FIXED_RETAINED_BYTES - checkoutRetained;
-    const minimum = refMutationCreateRetainedBytes(row(0, baseNameBytes));
-    const maximum = refMutationCreateRetainedBytes(row(0, 1_024));
-    const count = Math.ceil(remaining / maximum);
-    const lengths = new Uint16Array(count).fill(baseNameBytes);
-    let extra = remaining - count * minimum;
-    for (let index = 0; index < lengths.length && extra > 0; index++) {
-      const added = Math.min(maximum - minimum, extra);
-      lengths[index] = (lengths[index] ?? baseNameBytes) + added / 4;
-      extra -= added;
-    }
-    expect(extra).toBe(0);
-    let retained = REF_MUTATION_FIXED_RETAINED_BYTES + checkoutRetained;
-    let index = 0;
-    for (const length of lengths) retained += refMutationCreateRetainedBytes(row(index++, length));
-    expect(retained).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
-    const puts = function* (oneOver: boolean): Generator<{ name: string; target: string }> {
-      let ordinal = 0;
-      for (const length of lengths) yield row(ordinal++, length);
-      if (oneOver) yield { name: "refs/tags/overflow", target };
+    const nameBytes = 1_025;
+    const count = 8_192;
+    const name = (index: number): string =>
+      `${prefix}${index.toString(36).padStart(suffixBytes, "0")}${"x".repeat(nameBytes - baseNameBytes)}`;
+    const puts = function* (): Generator<{ name: string; target: string }> {
+      for (let index = 0; index < count; index++) yield { name: name(index), target };
     };
+    expect(name(0)).toHaveLength(nameBytes);
 
-    const { db, store } = open({ now: () => 1_800_000_000_000 });
-    db.storage.resetCounters();
-    store.updateRefs(puts(false));
-    expect(db.storage.statementCount).toBeLessThan(1_000);
-    expect(db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
-    expect(db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
-    assertMemoryCoordinatorIdle(store);
+    const measured = open({ now: () => 1_800_000_000_000 });
+    expect(measured.store.shared.memory.highWaterBytes).toBe(0);
+    measured.db.storage.resetCounters();
+    measured.store.updateRefs(puts());
+    const measuredHighWater = measured.store.shared.memory.highWaterBytes;
+    expect(measuredHighWater).toBeGreaterThan(32 * 1024 * 1024);
+    expect(measuredHighWater).toBeLessThan(MAX_REF_MUTATION_RETAINED_BYTES);
+    expect(measured.db.storage.statementCount).toBeLessThan(1_000);
+    expect(measured.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
+    expect(measured.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
+    expect(measured.store.getRef(name(0))).toBe(target);
+    expect(measured.store.getRef(name(count - 1))).toBe(target);
+    assertMemoryCoordinatorIdle(measured.store);
+
+    const exact = open({ now: () => 1_800_000_000_000 });
+    const exactBlocker = exact.store.reserveMemory();
+    const externalBytes = MAX_REF_MUTATION_RETAINED_BYTES - measuredHighWater;
+    exactBlocker.set("other", externalBytes);
+    exact.db.storage.resetCounters();
+    try {
+      exact.store.updateRefs(puts());
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_REF_MUTATION_RETAINED_BYTES);
+      expect(exact.db.storage.statementCount).toBeLessThan(1_000);
+      expect(exact.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(count);
+      expect(exact.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(count);
+      expect(exact.store.getRef(name(0))).toBe(target);
+      expect(exact.store.getRef(name(count - 1))).toBe(target);
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
 
     const over = open({ now: () => 1_800_000_000_000 });
+    const overBlocker = over.store.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
     over.db.storage.resetCounters();
-    expect(() => over.store.updateRefs(puts(true))).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(over.db.storage.statementCount).toBeLessThan(1_000);
-    expect(over.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
-    expect(over.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
-    assertMemoryCoordinatorIdle(over.store);
-
-    const coordinated = open({ now: () => 1_800_000_000_000 });
-    const blocker = coordinated.store.reserveMemory();
-    blocker.set("other", 1);
-    coordinated.db.storage.resetCounters();
     try {
-      expect(() => coordinated.store.updateRefs(puts(false))).toThrowError(
+      expect(() => over.store.updateRefs(puts())).toThrowError(
         expect.objectContaining({ code: "E2BIG" }),
       );
-      expect(coordinated.db.storage.statementCount).toBeLessThan(1_000);
-      expect(coordinated.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
-      expect(coordinated.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
-      expect(blocker.currentBytes).toBe(1);
+      expect(over.db.storage.statementCount).toBeLessThan(1_000);
+      expect(over.db.scalar<number>("SELECT count(*) FROM git_refs")).toBe(0);
+      expect(over.db.scalar<number>("SELECT count(*) FROM git_reflog_entries")).toBe(0);
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
     } finally {
-      blocker.dispose();
+      overBlocker.dispose();
     }
-    assertMemoryCoordinatorIdle(coordinated.store);
+    assertMemoryCoordinatorIdle(over.store);
   });
 
   it("retains only the newest 1,024 entries per ref", () => {

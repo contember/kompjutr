@@ -7,8 +7,8 @@ export interface RefTextCheck {
   readonly problem: RefTextProblem | null;
 }
 
-/** Validate bounded UTF-8 text without choosing a caller-specific error type. */
-export function checkRefText(value: string, limit: number): RefTextCheck {
+/** Validate canonical UTF-8 text, with an optional caller-owned wire limit. */
+export function checkRefText(value: string, limit?: number): RefTextCheck {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const unit = value.charCodeAt(index);
@@ -27,32 +27,68 @@ export function checkRefText(value: string, limit: number): RefTextCheck {
     } else {
       bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
     }
-    if (bytes > limit) return { bytes, problem: "too-long" };
+    if (limit !== undefined && bytes > limit) return { bytes, problem: "too-long" };
   }
   return { bytes, problem: null };
 }
 
 /** Git check-ref-format syntax after text encoding and length are validated. */
-export function hasCanonicalRefSyntax(value: string): boolean {
+export function hasCanonicalRefSyntax(value: string, start = 0, end = value.length): boolean {
+  return hasCanonicalRefSyntaxWithWildcard(value, -1, start, end);
+}
+
+/** Validate one refspec pattern without constructing a substituted copy. */
+export function hasCanonicalRefPatternSyntax(value: string, wildcard: number): boolean {
+  return hasCanonicalRefSyntaxWithWildcard(value, wildcard, 0, value.length);
+}
+
+function hasCanonicalRefSyntaxWithWildcard(
+  value: string,
+  wildcard: number,
+  start: number,
+  end: number,
+): boolean {
   if (
-    value === "@" ||
-    value.startsWith("/") ||
-    value.endsWith("/") ||
-    value.endsWith(".") ||
-    value.includes("//") ||
-    value.includes("..") ||
-    value.includes("@{")
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(end) ||
+    start < 0 ||
+    start >= end ||
+    end > value.length
   ) {
     return false;
   }
-  for (const component of value.split("/")) {
-    if (component.startsWith(".") || component.endsWith(".lock")) return false;
+  if (
+    (end - start === 1 && value.charCodeAt(start) === 0x40) ||
+    value.charCodeAt(start) === 0x2f ||
+    value.charCodeAt(end - 1) === 0x2f ||
+    value.charCodeAt(end - 1) === 0x2e ||
+    value.startsWith("ref: ", start)
+  ) {
+    return false;
   }
-  for (let index = 0; index < value.length; index++) {
+  let componentStart = start;
+  for (let index = start; index < end; index++) {
     const code = value.charCodeAt(index);
-    if (code < 0x20 || code === 0x7f || " ~^:?*[\\".includes(value[index] ?? "")) {
+    if (code === 0x2f) {
+      if (
+        index === componentStart ||
+        value.charCodeAt(componentStart) === 0x2e ||
+        value.endsWith(".lock", index)
+      ) {
+        return false;
+      }
+      componentStart = index + 1;
+      continue;
+    }
+    const next = value.charCodeAt(index + 1);
+    if ((code === 0x2e && next === 0x2e) || (code === 0x40 && next === 0x7b)) return false;
+    if (
+      code < 0x20 ||
+      code === 0x7f ||
+      (" ~^:?*[\\".includes(value[index] ?? "") && index !== wildcard)
+    ) {
       return false;
     }
   }
-  return true;
+  return value.charCodeAt(componentStart) !== 0x2e && !value.endsWith(".lock", end);
 }

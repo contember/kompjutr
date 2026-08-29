@@ -3,7 +3,7 @@ import type { GitContext } from "../context.js";
 import { GitError } from "../errors.js";
 import { discover, MAX_PROTOCOL_NEGOTIATION_ENTRIES, type RemoteRef } from "../protocol/remote.js";
 import { type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
-import { checkRefText, MAX_REF_NAME_BYTES } from "../ref-name.js";
+import { checkRefText } from "../ref-name.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { type RemoteAuthOptions, remoteUrlFor, validateRemoteAuthOptions } from "./network.js";
@@ -11,7 +11,6 @@ import type { LsRemoteResult, RemoteTarget } from "./refspec.js";
 import { TransportOperationBudget } from "./transport-budget.js";
 
 export const MAX_LS_REMOTE_PATTERNS = 1_024;
-export const MAX_LS_REMOTE_PATTERN_BYTES = MAX_REF_NAME_BYTES;
 export const MAX_LS_REMOTE_REFS = MAX_PROTOCOL_NEGOTIATION_ENTRIES;
 
 export type LsRemoteOptions = RemoteAuthOptions &
@@ -150,13 +149,7 @@ function compilePatterns(
     for (let index = 0; index < patterns.length; index++) {
       const pattern = patterns[index];
       if (typeof pattern !== "string") throw invalidPattern(index, "must be a string");
-      const checked = checkRefText(pattern, MAX_LS_REMOTE_PATTERN_BYTES);
-      if (checked.problem === "too-long") {
-        throw new GitError(
-          "E2BIG",
-          `ls-remote pattern ${index + 1} exceeds ${MAX_LS_REMOTE_PATTERN_BYTES} UTF-8 bytes`,
-        );
-      }
+      const checked = checkRefText(pattern);
       if (checked.problem !== null) throw invalidPattern(index, "contains invalid text");
       retained +=
         PATTERN_FIXED_BYTES + retainedStringBytes(pattern) + checked.bytes * PATTERN_BYTE_BYTES;
@@ -248,8 +241,8 @@ function selectRefs(
     if (selected.length >= MAX_LS_REMOTE_REFS) {
       throw new GitError("E2BIG", `ls-remote result exceeds ${MAX_LS_REMOTE_REFS} refs`);
     }
-    retained +=
-      RESULT_REF_FIXED_BYTES + retainedStringBytes(ref.name) + retainedStringBytes(ref.oid);
+    // Selection retains references to advertisement-owned strings, not copies.
+    retained += RESULT_REF_FIXED_BYTES;
     budget.setMemory(RESULT_MEMORY_PART, retained);
     selected.push({ name: ref.name, oid: ref.oid });
   }

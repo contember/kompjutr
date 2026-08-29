@@ -158,7 +158,7 @@ const STATEMENTS = [
      ),
      head TEXT NOT NULL CHECK (
        typeof(head) = 'text'
-       AND length(CAST(head AS BLOB)) BETWEEN 1 AND 1024
+       AND length(CAST(head AS BLOB)) >= 1
        AND instr(head, char(0)) = 0
        AND instr(head, char(10)) = 0
        AND instr(head, char(13)) = 0
@@ -207,7 +207,7 @@ const STATEMENTS = [
      ),
      ref_name TEXT NOT NULL CHECK (
        typeof(ref_name) = 'text'
-       AND length(CAST(ref_name AS BLOB)) BETWEEN 1 AND 1024
+       AND length(CAST(ref_name AS BLOB)) >= 1
        AND substr(ref_name, 1, 13) = 'refs/remotes/'
      ),
      revision INTEGER NOT NULL CHECK (
@@ -224,7 +224,7 @@ const STATEMENTS = [
      ),
      tracking_prefix TEXT NOT NULL CHECK (
        typeof(tracking_prefix) = 'text'
-       AND length(CAST(tracking_prefix AS BLOB)) BETWEEN 1 AND 1024
+       AND length(CAST(tracking_prefix AS BLOB)) >= 1
        AND substr(tracking_prefix, 1, 13) = 'refs/remotes/'
        AND substr(tracking_prefix, -1) = '/'
      ),

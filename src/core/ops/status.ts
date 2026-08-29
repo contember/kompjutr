@@ -6,7 +6,7 @@
 // stat data cached in `git_index` no longer holds. A repeated status over an
 // untouched tree therefore reads no file content at all.
 
-import type { IndexEntry } from "../../sqlite/store.js";
+import { createRefMutationMemoryOwner, type IndexEntry } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
@@ -140,37 +140,48 @@ export function statusReport(
 
 /** Read and validate HEAD, its configured upstream, and bounded graph counts. */
 export function statusBranch(repo: Repository): StatusBranch {
-  const rawHead: unknown = repo.checkout.head();
-  if (typeof rawHead !== "string") throw new CorruptError("repository HEAD is not text");
+  const owner = createRefMutationMemoryOwner(repo.store);
+  try {
+    const rawHead: unknown = repo.checkout.head();
+    if (typeof rawHead !== "string") throw new CorruptError("repository HEAD is not text");
+    owner.retain(rawHead);
 
-  let oid: string | null;
-  let head: string | null;
-  let headRef: string | undefined;
-  if (rawHead.startsWith("ref: ")) {
-    headRef = boundedBranchRef(rawHead.slice(5).trim(), "status HEAD ref");
-    head = headRef.slice(HEADS.length);
-    oid = directRefOid(repo, headRef);
-  } else {
-    if (!isOid(rawHead)) throw new CorruptError("detached HEAD is not a full object id");
-    oid = rawHead;
-    head = null;
-  }
-  if (oid !== null && repo.typeOf(oid) !== "commit") {
-    throw new CorruptError("status HEAD does not point to a commit");
-  }
+    let oid: string | null;
+    let head: string | null;
+    let headRef: string | undefined;
+    if (rawHead.startsWith("ref: ")) {
+      const refUnits = rawHead.length - 5;
+      const sliced = owner.construct(refUnits, () => rawHead.slice(5));
+      const checkedHeadRef = boundedBranchRef(sliced, "status HEAD ref", owner);
+      headRef = checkedHeadRef;
+      head = owner.construct(checkedHeadRef.length - HEADS.length, () =>
+        checkedHeadRef.slice(HEADS.length),
+      );
+      oid = directRefOid(repo, checkedHeadRef, owner);
+    } else {
+      if (!isOid(rawHead)) throw new CorruptError("detached HEAD is not a full object id");
+      oid = rawHead;
+      head = null;
+    }
+    if (oid !== null && repo.typeOf(oid) !== "commit") {
+      throw new CorruptError("status HEAD does not point to a commit");
+    }
 
-  const base: StatusBranch = { oid, head };
-  if (headRef === undefined) return base;
-  const upstream = resolveBranchUpstream(repo, headRef);
-  if (upstream === undefined) return base;
-  if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
-  const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
-  return {
-    ...base,
-    upstream: upstream.name,
-    ahead: counts.ahead,
-    behind: counts.behind,
-  };
+    const base: StatusBranch = { oid, head };
+    if (headRef === undefined) return base;
+    const upstream = resolveBranchUpstream(repo, headRef, owner);
+    if (upstream === undefined) return base;
+    if (oid === null || upstream.oid === null) return { ...base, upstream: upstream.name };
+    const counts = countAheadBehind(repo, { currentOid: oid, incomingOid: upstream.oid });
+    return {
+      ...base,
+      upstream: upstream.name,
+      ahead: counts.ahead,
+      behind: counts.behind,
+    };
+  } finally {
+    owner.dispose();
+  }
 }
 
 /** Eager status with an optional same-database sparse fast path. */

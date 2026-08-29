@@ -9,6 +9,7 @@ import {
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
 } from "../sqlite/commits.js";
+import { requireRefName } from "../sqlite/ref-validation.js";
 import type {
   BlobReadBatch,
   CheckoutStore,
@@ -19,10 +20,12 @@ import type {
   RefLogMetadata,
   RefLogReadOptions,
   RefMutation,
+  RefMutationMemoryOwner,
   SharedRepoStore,
   WalkTreeDiffEntry,
   WalkTreeDiffObject,
 } from "../sqlite/store.js";
+import { createRefMutationMemoryOwner } from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
@@ -37,18 +40,9 @@ import {
   type TreeEntry,
   typeForMode,
 } from "./objects.js";
+import { retainedStringBytes } from "./retained.js";
 
 /** Where a short ref name is looked up, in git's own order. */
-const REF_SEARCH = [
-  (name: string) => name,
-  (name: string) => `refs/${name}`,
-  (name: string) => `refs/tags/${name}`,
-  (name: string) => `refs/heads/${name}`,
-  (name: string) => `refs/remotes/${name}`,
-  (name: string) => `refs/remotes/${name}/HEAD`,
-];
-
-const MAX_REVISION_EXPRESSION_UNITS = 1_024;
 const MAX_REVISION_TRAVERSALS = 32;
 const MAX_HEAD_REFLOG_INDEX = 1_023;
 
@@ -69,6 +63,98 @@ export interface ResolvedHead {
   ref: string | null;
   /** The commit HEAD resolves to, or null on an unborn branch. */
   oid: string | null;
+}
+
+type RefReadMemoryOwner = Pick<RefMutationMemoryOwner, "construct" | "retain">;
+
+function refSearchCandidate(name: string, index: number, owner: RefReadMemoryOwner): string {
+  if (index === 0) return name;
+  if (index === 1) return owner.construct(5 + name.length, () => `refs/${name}`);
+  if (index === 2) return owner.construct(10 + name.length, () => `refs/tags/${name}`);
+  if (index === 3) return owner.construct(11 + name.length, () => `refs/heads/${name}`);
+  if (index === 4) return owner.construct(13 + name.length, () => `refs/remotes/${name}`);
+  return owner.construct(18 + name.length, () => `refs/remotes/${name}/HEAD`);
+}
+
+function refSearchExpression(index: number): string {
+  if (index === 0) return "?";
+  if (index === 1) return "'refs/' || ?";
+  if (index === 2) return "'refs/tags/' || ?";
+  if (index === 3) return "'refs/heads/' || ?";
+  if (index === 4) return "'refs/remotes/' || ?";
+  return "'refs/remotes/' || ? || '/HEAD'";
+}
+
+/** Internal ref read that retains the exact stored target in its caller's lifetime. */
+export function readRawRefOwned(
+  repo: Repository,
+  name: string,
+  owner: RefReadMemoryOwner,
+): string | null {
+  const raw = name === "HEAD" ? repo.checkout.head() : repo.store.getRef(name);
+  return raw === null ? null : owner.retain(raw);
+}
+
+/** Internal symbolic-target allocation charged before the slice exists. */
+export function symbolicTargetOwned(raw: string, owner: RefReadMemoryOwner): string | null {
+  return raw.startsWith("ref: ") ? owner.construct(raw.length - 5, () => raw.slice(5)) : null;
+}
+
+/** Internal ref expansion whose constructed candidate stays in the caller's lifetime. */
+export function expandRefOwned(
+  repo: Repository,
+  name: string,
+  owner: RefReadMemoryOwner,
+): string | null {
+  if (name === "HEAD") return "HEAD";
+  const checkedName = requireRefName(name, "ref name", "input", true);
+  for (let index = 0; index < 6; index++) {
+    const present = repo.store.db.scalar<unknown>(
+      `SELECT 1 FROM git_refs
+        WHERE repo_id = ? AND name = ${refSearchExpression(index)} LIMIT 1`,
+      repo.store.repoId,
+      checkedName,
+    );
+    if (present === 1) return refSearchCandidate(checkedName, index, owner);
+    if (present !== undefined) {
+      throw new CorruptError("ref existence query returned invalid state");
+    }
+  }
+  return null;
+}
+
+/** Internal symbolic resolution that retains every stored hop and derived target. */
+export function resolveRefOwned(
+  repo: Repository,
+  name: string,
+  owner: RefReadMemoryOwner,
+): string | null {
+  let current = name;
+  for (let hops = 0; hops < 8; hops++) {
+    const full = expandRefOwned(repo, current, owner);
+    if (full === null) return null;
+    const value = readRawRefOwned(repo, full, owner);
+    if (value === null) return null;
+    const target = symbolicTargetOwned(value, owner);
+    if (target !== null) {
+      current = target;
+      continue;
+    }
+    return value;
+  }
+  throw new CorruptError(`symbolic ref loop at ${name}`);
+}
+
+/** Internal HEAD resolution retained through the caller's graph work. */
+export function resolveHeadOwned(repo: Repository, owner: RefReadMemoryOwner): ResolvedHead {
+  const raw = readRawRefOwned(repo, "HEAD", owner);
+  if (raw === null) throw new CorruptError("checkout HEAD is missing");
+  const ref = symbolicTargetOwned(raw, owner);
+  if (ref !== null) {
+    const value = readRawRefOwned(repo, ref, owner);
+    return { ref, oid: value };
+  }
+  return { ref: null, oid: isOid(raw) ? raw : null };
 }
 
 export interface RevisionResolution {
@@ -289,39 +375,31 @@ export class Repository {
 
   /** The full name of the ref `name` denotes, or null. */
   expandRef(name: string): string | null {
-    if (name === "HEAD") return "HEAD";
-    for (const candidate of REF_SEARCH) {
-      const full = candidate(name);
-      if (this.store.getRef(full) !== null) return full;
+    const owner = createRefMutationMemoryOwner(this.store);
+    try {
+      return expandRefOwned(this, name, owner);
+    } finally {
+      owner.dispose();
     }
-    return null;
   }
 
   /** Resolve a ref name (following symrefs) to an oid, or null. */
   resolveRef(name: string): string | null {
-    let current = name;
-    for (let hops = 0; hops < 8; hops++) {
-      const full = this.expandRef(current);
-      if (full === null) return null;
-      const value = full === "HEAD" ? this.checkout.head() : this.store.getRef(full);
-      if (value === null) return null;
-      if (value.startsWith("ref: ")) {
-        current = value.slice(5).trim();
-        continue;
-      }
-      return value;
+    const owner = createRefMutationMemoryOwner(this.store);
+    try {
+      return resolveRefOwned(this, name, owner);
+    } finally {
+      owner.dispose();
     }
-    throw new CorruptError(`symbolic ref loop at ${name}`);
   }
 
   head(): ResolvedHead {
-    const raw = this.checkout.head();
-    if (raw.startsWith("ref: ")) {
-      const ref = raw.slice(5).trim();
-      const value = this.store.getRef(ref);
-      return { ref, oid: value === null ? null : value };
+    const owner = createRefMutationMemoryOwner(this.store);
+    try {
+      return resolveHeadOwned(this, owner);
+    } finally {
+      owner.dispose();
     }
-    return { ref: null, oid: isOid(raw) ? raw : null };
   }
 
   branches(): string[] {
@@ -415,9 +493,16 @@ export class Repository {
   }
 
   #tryResolveRevisionState(expression: string): RevisionStateResolution | undefined {
-    if (expression.length > MAX_REVISION_EXPRESSION_UNITS) {
-      throw new GitError("E2BIG", "revision expression exceeds 1024 UTF-16 code units");
+    const reservation = this.store.reserveMemory();
+    try {
+      reservation.set("other", 1_024 + 8 * retainedStringBytes(expression));
+      return this.#tryResolveRevisionStateOwned(expression);
+    } finally {
+      reservation.dispose();
     }
+  }
+
+  #tryResolveRevisionStateOwned(expression: string): RevisionStateResolution | undefined {
     const trimmed = expression.trim();
     if (trimmed === "") return undefined;
 
@@ -831,8 +916,13 @@ export class Repository {
 
   /** The tree of the commit HEAD points at, or null on an unborn branch. */
   headTree(): string | null {
-    const { oid } = this.head();
-    if (oid === null) return null;
-    return this.readCommit(this.peel(oid)).tree;
+    const owner = createRefMutationMemoryOwner(this.store);
+    try {
+      const { oid } = resolveHeadOwned(this, owner);
+      if (oid === null) return null;
+      return this.readCommit(this.peel(oid)).tree;
+    } finally {
+      owner.dispose();
+    }
   }
 }

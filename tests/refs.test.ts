@@ -41,6 +41,7 @@ import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import { joinPath } from "../src/core/paths.js";
 import { Repository } from "../src/core/repository.js";
 import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -79,6 +80,35 @@ function buildFixture(): GitFixture {
 
 let fixture: GitFixture;
 let ws: TestRepository;
+
+class GraphPressureRepository extends Repository {
+  constructor(
+    repo: Repository,
+    private readonly beginGraph: () => () => void,
+  ) {
+    super(repo.checkout);
+  }
+
+  override *walkIndexed(oid: string, limits = {}) {
+    const release = this.beginGraph();
+    try {
+      yield* super.walkIndexed(oid, limits);
+    } finally {
+      release();
+    }
+  }
+}
+
+function holdGraphPressure(repo: Repository, bytes: number): () => void {
+  const pressure = repo.store.reserveMemory();
+  try {
+    pressure.set("other", bytes);
+    return () => pressure.dispose();
+  } catch (error) {
+    pressure.dispose();
+    throw error;
+  }
+}
 
 beforeEach(async () => {
   fixture = buildFixture();
@@ -188,6 +218,236 @@ describe("branch", () => {
     expect(indexPaths()).toEqual([]);
   });
 
+  it("retains only the matched long short-name candidate", () => {
+    const name = "n".repeat(1_000_001);
+    const full = `refs/remotes/${name}`;
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("long ref expansion fixture is missing main");
+    ws.repo.store.db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, ?, ?)",
+      ws.repo.store.repoId,
+      full,
+      main,
+    );
+    const operationBytes = 312 + 2 * full.length;
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
+    const exactBlocker = ws.repo.store.reserveMemory();
+    exactBlocker.set("other", externalBytes);
+    try {
+      expect(ws.repo.expandRef(name)).toBe(full);
+      expect(ws.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+
+    const overBlocker = ws.repo.store.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
+    try {
+      expect(() => ws.repo.expandRef(name)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(
+        ws.repo.store.db.scalar<string>(
+          "SELECT target FROM git_refs WHERE repo_id = ? AND name = ?",
+          ws.repo.store.repoId,
+          full,
+        ),
+      ).toBe(main);
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      overBlocker.dispose();
+    }
+    expect(ws.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it.each([
+    ["invalid character", "topic\nother", "ref name contains an invalid character"],
+    ["noncanonical UTF-16", "topic\udc00", "ref name is not canonical UTF-16"],
+  ])("validates an expand-ref %s before probing", (_case, name, message) => {
+    expect(() => ws.repo.expandRef(name)).toThrowError(
+      expect.objectContaining({ code: "EINVAL", message }),
+    );
+    expect(ws.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("owns a long raw HEAD and symbolic slice at the exact public-read boundary", () => {
+    const ref = `refs/heads/${"h".repeat(1_000_001)}`;
+    const rawHead = `ref: ${ref}`;
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("long public HEAD fixture is missing main");
+    ws.repo.store.db.run(
+      "INSERT INTO git_refs (repo_id, name, target) VALUES (?, ?, ?)",
+      ws.repo.store.repoId,
+      ref,
+      main,
+    );
+    ws.repo.store.db.run(
+      "UPDATE git_checkouts SET head = ? WHERE id = ?",
+      rawHead,
+      ws.repo.checkout.checkoutId,
+    );
+    const operationBytes = 378 + 4 * ref.length;
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
+    const blocker = ws.repo.store.reserveMemory();
+    blocker.set("other", externalBytes);
+    try {
+      expect(readRef(ws.repo, { ref: "HEAD" })).toEqual({ kind: "symbolic", target: ref });
+      expect(ws.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(blocker.currentBytes).toBe(externalBytes);
+    } finally {
+      blocker.dispose();
+    }
+
+    const over = ws.repo.store.reserveMemory();
+    over.set("other", externalBytes + 1);
+    try {
+      expect(() => readRef(ws.repo, { ref: "HEAD" })).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(ws.repo.checkout.head()).toBe(rawHead);
+      expect(over.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      over.dispose();
+    }
+    expect(ws.repo.head()).toEqual({ ref, oid: main });
+    expect(symbolicRef(ws.repo)).toBe(ref);
+    expect(currentBranch(ws.repo, { fullname: true })).toBe(ref);
+    expect(ws.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it.each([{ kind: "branch" }, { kind: "tag" }])(
+    "force-replaces a long symbolic $kind target at the exact memory boundary",
+    ({ kind }) => {
+      const prepare = (): { workspace: TestRepository; full: string; raw: string } => {
+        const workspace = makeRepo("/");
+        commit(workspace.context, workspace.repo, {
+          message: "replacement base",
+          author: { name: "Fixture", email: "fixture@example.test" },
+          committer: { name: "Fixture", email: "fixture@example.test" },
+          allowEmpty: true,
+        });
+        const full = kind === "branch" ? "refs/heads/replaced" : "refs/tags/replaced";
+        const raw = `ref: refs/heads/${"x".repeat(1_000_001)}`;
+        workspace.repo.store.db.run(
+          "INSERT INTO git_refs (repo_id, name, target) VALUES (?, ?, ?)",
+          workspace.repo.store.repoId,
+          full,
+          raw,
+        );
+        return { workspace, full, raw };
+      };
+      const run = (workspace: TestRepository): void => {
+        if (kind === "branch") {
+          branch(workspace.context, workspace.repo, {
+            name: "replaced",
+            startPoint: "HEAD",
+            force: true,
+          });
+        } else {
+          tag(workspace.context, workspace.repo, {
+            name: "replaced",
+            object: "HEAD",
+            force: true,
+          });
+        }
+      };
+
+      const measured = prepare();
+      run(measured.workspace);
+      const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
+      expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+      expect(measured.workspace.repo.store.getRef(measured.full)).not.toBe(measured.raw);
+
+      const exact = prepare();
+      const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
+      const exactBlocker = exact.workspace.repo.store.reserveMemory();
+      exactBlocker.set("other", externalBytes);
+      try {
+        run(exact.workspace);
+        expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      } finally {
+        exactBlocker.dispose();
+      }
+      expect(exact.workspace.repo.store.memory.totalBytes).toBe(0);
+
+      const over = prepare();
+      const beforeReflogs = over.workspace.repo.store.db.scalar<number>(
+        "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+        over.workspace.repo.store.repoId,
+      );
+      const overBlocker = over.workspace.repo.store.reserveMemory();
+      overBlocker.set("other", externalBytes + 1);
+      try {
+        expect(() => run(over.workspace)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(over.workspace.repo.store.getRef(over.full)).toBe(over.raw);
+        expect(
+          over.workspace.repo.store.db.scalar<number>(
+            "SELECT count(*) FROM git_reflog_entries WHERE repo_id = ?",
+            over.workspace.repo.store.repoId,
+          ),
+        ).toBe(beforeReflogs);
+        expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+      } finally {
+        overBlocker.dispose();
+      }
+      expect(over.workspace.repo.store.memory.totalBytes).toBe(0);
+    },
+  );
+
+  it("composes derived branch strings against the exact shared memory ceiling", () => {
+    const name = "x".repeat(1_014);
+    const prepare = (workspace: TestRepository): string => {
+      const tree = workspace.repo.store.write("tree", new Uint8Array());
+      const person = {
+        name: "Memory",
+        email: "memory@example.test",
+        timestamp: 1_800_000_000,
+        timezoneOffset: 0,
+      };
+      return workspace.repo.store.write(
+        "commit",
+        serializeCommit({
+          tree,
+          parent: [],
+          author: person,
+          committer: person,
+          message: "memory\n",
+        }),
+      );
+    };
+    const run = (workspace: TestRepository, startPoint: string): void => {
+      branch(workspace.context, workspace.repo, { name, startPoint });
+    };
+    const measured = makeRepo("/");
+    const measuredStart = prepare(measured);
+    run(measured, measuredStart);
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(0);
+
+    const exact = makeRepo("/");
+    const exactStart = prepare(exact);
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      run(exact, exactStart);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+
+    const over = makeRepo("/");
+    const overStart = prepare(over);
+    const overBlocker = over.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => run(over, overStart)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(over.repo.store.getRef(`refs/heads/${name}`)).toBeNull();
+    } finally {
+      overBlocker.dispose();
+    }
+  });
+
   it("deletes a branch but refuses to delete the checked-out one", () => {
     branch(ws.context, ws.repo, { name: "feature" });
     fixture.git("branch", "feature");
@@ -202,6 +462,46 @@ describe("branch", () => {
 
     expect(() => branchDelete(ws.context, ws.repo, { name: "nope" })).toThrow(/not found/);
     expect(runGit("branch", "-d", "nope").ok).toBe(false);
+  });
+
+  it("keeps upstream ownership through delete graph work at the exact shared ceiling", () => {
+    const main = ws.repo.store.getRef("refs/heads/main");
+    if (main === null) throw new Error("delete memory fixture is missing main");
+    const branchNames = ["a", "b", "c"].map((suffix) => `${"x".repeat(1_013)}${suffix}`);
+    for (const name of branchNames) {
+      ws.repo.store.setRef(`refs/heads/${name}`, main);
+      ws.repo.store.configSet(`branch.${name}.remote`, ".");
+      ws.repo.store.configSet(`branch.${name}.merge`, "refs/heads/main");
+    }
+    let beginGraph = (): (() => void) => () => {};
+    const repo = new GraphPressureRepository(ws.repo, () => beginGraph());
+
+    let operationBytes = 0;
+    beginGraph = () => {
+      operationBytes = Math.max(operationBytes, repo.store.memory.totalBytes);
+      return () => {};
+    };
+    const measuredName = branchNames[0];
+    if (measuredName === undefined) throw new Error("measured delete branch is missing");
+    branchDelete(ws.context, repo, { name: measuredName });
+    expect(operationBytes).toBeGreaterThan(0);
+    expect(repo.store.memory.totalBytes).toBe(0);
+
+    beginGraph = () => holdGraphPressure(repo, MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactName = branchNames[1];
+    if (exactName === undefined) throw new Error("exact delete branch is missing");
+    branchDelete(ws.context, repo, { name: exactName });
+    expect(repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(repo.store.memory.totalBytes).toBe(0);
+
+    beginGraph = () => holdGraphPressure(repo, MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const overName = branchNames[2];
+    if (overName === undefined) throw new Error("excess delete branch is missing");
+    expect(() => branchDelete(ws.context, repo, { name: overName })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(repo.store.getRef(`refs/heads/${overName}`)).toBe(main);
+    expect(repo.store.memory.totalBytes).toBe(0);
   });
 
   it("refuses an unmerged branch unless forced", () => {
@@ -350,14 +650,16 @@ describe("branch", () => {
     expect(ws.repo.store.getRef("refs/heads/oversized-graph")).toBe(tip);
   });
 
-  it("propagates invalid bounded config and validates the tip even with force", () => {
+  it("accepts a former first-excess upstream ref and validates the tip even with force", () => {
     branch(ws.context, ws.repo, { name: "candidate" });
     ws.repo.store.configSet("branch.candidate.remote", ".");
-    ws.repo.store.configSet("branch.candidate.merge", "x".repeat(1_025));
-    expect(() => branchDelete(ws.context, ws.repo, { name: "candidate" })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
+    const prefix = "refs/heads/";
+    ws.repo.store.configSet(
+      "branch.candidate.merge",
+      `${prefix}${"x".repeat(1_025 - prefix.length)}`,
     );
-    expect(ws.repo.store.getRef("refs/heads/candidate")).not.toBeNull();
+    branchDelete(ws.context, ws.repo, { name: "candidate" });
+    expect(ws.repo.store.getRef("refs/heads/candidate")).toBeNull();
 
     const blob = ws.repo.store.write("blob", utf8.encode("not a commit\n"));
     ws.repo.store.setRef("refs/heads/not-a-commit", blob);
@@ -490,6 +792,20 @@ describe("branch", () => {
       new_raw: "ref: refs/heads/primary",
       reason: "branch: rename",
     });
+  });
+
+  it("branch rename accepts the former first byte excess", () => {
+    const oldOid = ws.repo.store.getRef("refs/heads/main");
+    if (oldOid === null) throw new Error("main is missing");
+    const longName = "x".repeat(1_014);
+    const longRef = `refs/heads/${longName}`;
+
+    branchRename(ws.context, ws.repo, { newName: longName });
+
+    expect(ws.repo.store.getRef("refs/heads/main")).toBeNull();
+    expect(ws.repo.store.getRef(longRef)).toBe(oldOid);
+    expect(ws.repo.checkout.head()).toBe(`ref: ${longRef}`);
+    expect(currentBranch(ws.repo)).toBe(longName);
   });
 
   it("branch rename moves an inactive branch without moving the selected HEAD", () => {
@@ -1797,12 +2113,10 @@ describe("plumbing", () => {
     });
   });
 
-  it("bounds raw ref inputs and fails closed on malformed stored targets", () => {
+  it("accepts a former first-excess raw ref and fails closed on malformed stored targets", () => {
     const exactBound = `refs/${"a".repeat(1_019)}`;
     expect(readRef(ws.repo, { ref: exactBound })).toEqual({ kind: "absent" });
-    expect(() => readRef(ws.repo, { ref: `${exactBound}a` })).toThrow(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    expect(readRef(ws.repo, { ref: `${exactBound}a` })).toEqual({ kind: "absent" });
     for (const ref of ["main", "refs/", "HEAD^", "refs/heads/main\nother"]) {
       expect(() => readRef(ws.repo, { ref })).toThrow(expect.objectContaining({ code: "EINVAL" }));
     }

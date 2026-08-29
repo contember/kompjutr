@@ -15,6 +15,7 @@ import {
 } from "../src/core/ops/worktrees.js";
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git } from "../src/git/client.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { Workspace } from "../src/runtime/workspace.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
@@ -184,7 +185,7 @@ describe("worktree add", () => {
     });
   });
 
-  it("enforces branch existence, short names, and attached ownership including unborn refs", () => {
+  it("enforces branch existence, grammar, and attached ownership including unborn refs", () => {
     const workspace = makeRepo("/");
     const commit = writeCommit(workspace, "start\n");
     workspace.repo.store.setRef("refs/heads/start", commit.oid);
@@ -201,16 +202,27 @@ describe("worktree add", () => {
         target: { kind: "new-branch", name: "refs/heads/full", startPoint: commit.oid },
       }),
     ).toThrowError(expect.objectContaining({ code: "EINVALIDREF" }));
-    expect(() =>
-      worktreeAdd(workspace.context, workspace.repo, {
-        root: "/oversized-branch",
-        target: {
-          kind: "new-branch",
-          name: "x".repeat(1_014),
-          startPoint: commit.oid,
-        },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const formerFirstExcess = "x".repeat(1_014);
+    expect(`refs/heads/${formerFirstExcess}`).toHaveLength(1_025);
+    const longBranch = worktreeAdd(workspace.context, workspace.repo, {
+      root: "/long-branch",
+      target: { kind: "new-branch", name: formerFirstExcess, startPoint: commit.oid },
+    });
+    expect(longBranch).toMatchObject({
+      root: "/long-branch",
+      head: `ref: refs/heads/${formerFirstExcess}`,
+    });
+    expect(workspace.repo.store.getRef(`refs/heads/${formerFirstExcess}`)).toBe(commit.oid);
+    expect(new TextDecoder().decode(workspace.worktree.readFile("/long-branch/file.txt"))).toBe(
+      "start\n",
+    );
+    const coldDatabase = new SqliteGitDatabase(workspace.database.db);
+    const coldCheckout = coldDatabase.checkoutAt("/long-branch");
+    if (coldCheckout === null) throw new Error("long branch checkout disappeared after reopen");
+    expect(new Repository(coldDatabase.openCheckout(coldCheckout)).head()).toEqual({
+      ref: `refs/heads/${formerFirstExcess}`,
+      oid: commit.oid,
+    });
     expect(() =>
       worktreeAdd(workspace.context, workspace.repo, {
         root: "/owned-unborn",
@@ -243,6 +255,47 @@ describe("worktree add", () => {
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
     expect(workspace.worktree.stat("/owned")).toBeNull();
     expect(workspace.worktree.stat("/not-commit")).toBeNull();
+  });
+
+  it("composes the worktree plan owner against the exact shared memory ceiling", () => {
+    const name = "x".repeat(1_014);
+    const root = "/owned-memory";
+    const prepare = (workspace: TestRepository): string => writeCommit(workspace, "memory\n").oid;
+    const run = (workspace: TestRepository, startPoint: string): void => {
+      worktreeAdd(workspace.context, workspace.repo, {
+        root,
+        target: { kind: "new-branch", name, startPoint },
+      });
+    };
+
+    const measured = makeRepo("/");
+    const measuredStart = prepare(measured);
+    run(measured, measuredStart);
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(0);
+
+    const exact = makeRepo("/");
+    const exactStart = prepare(exact);
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      run(exact, exactStart);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+
+    const over = makeRepo("/");
+    const overStart = prepare(over);
+    const overBlocker = over.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => run(over, overStart)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(over.repo.store.getRef(`refs/heads/${name}`)).toBeNull();
+      expect(over.database.checkoutAt(root)).toBeNull();
+    } finally {
+      overBlocker.dispose();
+    }
   });
 
   it("accepts missing and empty roots but rejects registered, nonempty, and aliased roots", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   type CheckoutRow,
@@ -87,6 +88,65 @@ function checkoutStorageRow(db: TestDatabase, checkoutId: number): Record<string
 }
 
 describe("checkout lifecycle storage", () => {
+  it("round-trips the former symbolic HEAD first excess across a cold reopen", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const head = `ref: refs/heads/${"h".repeat(1_009)}`;
+    expect(head).toHaveLength(1_025);
+    const checkout = database.createRepository("/long-head", head);
+    expect(database.openCheckout(checkout).head()).toBe(head);
+
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
+    const reopenedCheckout = reopenedDatabase.checkoutAt("/long-head");
+    if (reopenedCheckout === null) throw new Error("long HEAD checkout disappeared after reopen");
+    expect(reopenedDatabase.openCheckout(reopenedCheckout).head()).toBe(head);
+  });
+
+  it("owns one long cold HEAD row at the exact boundary and releases a rejected read", () => {
+    const head = `ref: refs/heads/${"h".repeat(1_500_001)}`;
+    const db = new TestDatabase();
+    const setup = new SqliteGitDatabase(db);
+    const checkout = setup.createRepository("/long-head", head);
+    const currentRowBytes = 304 + 3 * utf8.encode(head).byteLength;
+    expect(currentRowBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+
+    const exactDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
+    const exactShared = exactDatabase.openShared(checkout.repoId);
+    const exactBlocker = exactShared.reserveMemory();
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - currentRowBytes;
+    exactBlocker.set("other", externalBytes);
+    try {
+      const reopened = exactDatabase.checkoutAt("/long-head");
+      expect(reopened).toEqual(expect.objectContaining({ head }));
+      expect(exactShared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exactBlocker.currentBytes).toBe(externalBytes);
+    } finally {
+      exactBlocker.dispose();
+    }
+
+    const overDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
+    const overShared = overDatabase.openShared(checkout.repoId);
+    const before = checkoutStorageRow(new TestDatabase(db.storage), checkout.id);
+    const overBlocker = overShared.reserveMemory();
+    overBlocker.set("other", externalBytes + 1);
+    try {
+      expect(() => overDatabase.checkoutAt("/long-head")).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(checkoutStorageRow(new TestDatabase(db.storage), checkout.id)).toEqual(before);
+      expect(overBlocker.currentBytes).toBe(externalBytes + 1);
+    } finally {
+      overBlocker.dispose();
+    }
+    expect(overDatabase.checkoutAt("/long-head")).toEqual(expect.objectContaining({ head }));
+    const probe = overShared.reserveMemory();
+    try {
+      probe.set("other", MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      probe.dispose();
+    }
+  });
+
   it("creates initialized checkout state atomically and installs its facade after success", () => {
     const { db, database, primary } = repository();
     let initialized: CheckoutStore | null = null;

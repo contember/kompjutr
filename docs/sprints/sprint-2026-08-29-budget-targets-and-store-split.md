@@ -542,6 +542,22 @@ shape exceptions, store import topology and proportional per-WU review.
   rows: initial write used 23,666,688 transient bytes and redirect used
   3,661,824. Typecheck and Biome passed, and the routine smoke gate passed
   153/153 in 12.19 s under a two-vCPU lease.
+- 2026-08-30 — WU6b removed the reviewed ref, config, reflog and worktree byte
+  policies without replacing them with component ceilings. Ref mutation,
+  stored-row decode, pull planning and repeated post-fetch validation now keep
+  every simultaneously live string/BLOB in the shared memory owner; ref search
+  probes absent candidates without materializing them. Four Ohm review rounds
+  found and closed canonical remote authentication, current-row decode,
+  caller-lifetime, repeated-allocation, transient-candidate, validation and
+  error-precedence gaps. The final independent verdict was CLEAN. Focused
+  exact/+1 memory, rollback, corruption and reopen witnesses passed in
+  sub-four-second slices. Biome, typecheck, diff-check and build passed, and the
+  routine smoke gate passed 156/156 in 11.66 s under a two-vCPU lease.
+- 2026-08-30 — The WU6b leader gate exposed one stale WU4 witness in
+  `tests/plumbing-write.test.ts`: it still expects the removed 65th hash range-
+  read refusal, while the source now correctly proceeds to the synthetic
+  worktree's `ENOENT`. The isolated failure predates the WU6b diff and will land
+  as a separate sprint-integration test repair before closure.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

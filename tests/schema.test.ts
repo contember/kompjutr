@@ -581,10 +581,27 @@ describe("git schema", () => {
   it("keeps current schema data unchanged when reopened", () => {
     const db = new TestDatabase();
     initializeGitSchema(db);
-    db.run("INSERT INTO git_repositories (id) VALUES (1)");
+    const head = `ref: refs/heads/${"h".repeat(1_009)}`;
+    const tracking = `refs/remotes/${"t".repeat(1_012)}`;
+    const prefixBase = "refs/remotes/";
+    const trackingPrefix = `${prefixBase}${"p".repeat(1_025 - prefixBase.length - 1)}/`;
+    expect(head).toHaveLength(1_025);
+    expect(tracking).toHaveLength(1_025);
+    expect(trackingPrefix).toHaveLength(1_025);
+    db.run("INSERT INTO git_repositories (id, fetch_generation) VALUES (1, 1)");
     db.run(
       `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
-       VALUES (17, 1, '/repo', 'ref: refs/heads/main', 1)`,
+       VALUES (17, 1, '/repo', ?, 1)`,
+      head,
+    );
+    db.run(
+      "INSERT INTO git_tracking_ref_revisions (repo_id, ref_name, revision) VALUES (1, ?, 0)",
+      tracking,
+    );
+    db.run(
+      `INSERT INTO git_fetch_namespaces
+         (repo_id, tracking_prefix, latest_generation, revision) VALUES (1, ?, 1, 0)`,
+      trackingPrefix,
     );
     db.run("INSERT INTO git_reflog_state (repo_id, next_ordinal) VALUES (1, 0)");
     const before = schemaObjects(db);
@@ -596,9 +613,13 @@ describe("git schema", () => {
       id: 17,
       repo_id: 1,
       root: "/repo",
-      head: "ref: refs/heads/main",
+      head,
       is_primary: 1,
     });
+    expect(db.scalar<string>("SELECT ref_name FROM git_tracking_ref_revisions")).toBe(tracking);
+    expect(db.scalar<string>("SELECT tracking_prefix FROM git_fetch_namespaces")).toBe(
+      trackingPrefix,
+    );
   });
 
   it("enforces immutable bounded checkout identity and validates one primary", () => {

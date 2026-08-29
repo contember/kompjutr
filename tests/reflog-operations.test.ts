@@ -75,13 +75,17 @@ describe("operation reflog metadata", () => {
     });
   });
 
-  it("records explicit absence for incomplete or oversized optional identity", () => {
+  it("accepts the former identity first excess and rejects incomplete identity", () => {
     const workspace = makeRepo("/", {
       startTime: START_MILLISECONDS,
       now: () => START_MILLISECONDS + 10_000,
     });
-    workspace.context.defaultIdentity = { name: "x".repeat(1_025), email: "valid@example.com" };
-    expect(operationRefLogMetadata(workspace.context, workspace.repo, "checkout").actor).toBeNull();
+    const longName = "x".repeat(1_025);
+    workspace.context.defaultIdentity = { name: longName, email: "valid@example.com" };
+    expect(operationRefLogMetadata(workspace.context, workspace.repo, "checkout").actor).toEqual({
+      name: longName,
+      email: "valid@example.com",
+    });
 
     workspace.context.defaultIdentity = { name: "Only name", email: "" };
     expect(operationRefLogMetadata(workspace.context, workspace.repo, "checkout").actor).toBeNull();
@@ -89,11 +93,13 @@ describe("operation reflog metadata", () => {
 
   it("falls through invalid optional config and logs a null actor when no source exists", () => {
     const fallback = repository();
-    fallback.repo.store.configSet("user.name", "x".repeat(1_025));
+    const longName = "x".repeat(1_025);
+    fallback.repo.store.configSet("user.name", longName);
     fallback.repo.store.configSet("user.email", "configured@example.com");
-    expect(operationRefLogMetadata(fallback.context, fallback.repo, "checkout").actor).toEqual(
-      ACTOR,
-    );
+    expect(operationRefLogMetadata(fallback.context, fallback.repo, "checkout").actor).toEqual({
+      name: longName,
+      email: "configured@example.com",
+    });
 
     fallback.repo.store.configSet("user.name", "invalid\nname");
     expect(operationRefLogMetadata(fallback.context, fallback.repo, "checkout").actor).toEqual(

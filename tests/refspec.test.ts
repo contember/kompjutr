@@ -5,7 +5,6 @@ import {
   compilePushRefspecs,
   MAX_REFSPEC_EXPANDED_DESTINATIONS,
   MAX_REFSPEC_MAPPINGS,
-  MAX_REFSPEC_REF_BYTES,
   type PushRefspec,
   type RefspecSourceRef,
 } from "../src/core/ops/refspec.js";
@@ -167,7 +166,7 @@ describe("structured refspecs", () => {
     coordinator.assertIdle();
   });
 
-  it("rejects malformed wildcard placement, invalid refs, and oversized refs", () => {
+  it("rejects malformed wildcard placement and invalid refs", () => {
     const cases: readonly (readonly [{ source: string; destination: string }, string])[] = [
       [{ source: "refs/source/*", destination: "refs/destination/exact" }, "EINVAL"],
       [{ source: "refs/source/**", destination: "refs/destination/*" }, "EINVAL"],
@@ -181,37 +180,25 @@ describe("structured refspecs", () => {
       reservation.dispose();
       coordinator.assertIdle();
     }
-
-    const prefix = "refs/heads/";
-    const exact = `${prefix}${"a".repeat(MAX_REFSPEC_REF_BYTES - prefix.length)}`;
-    const { coordinator, reservation, budget } = fixture();
-    const compiled = compileFetchRefspecs([{ source: exact, destination: exact }], budget);
-    compiled.dispose();
-    expectCode(
-      () => compileFetchRefspecs([{ source: `${exact}a`, destination: exact }], budget),
-      "E2BIG",
-    );
-    reservation.dispose();
-    coordinator.assertIdle();
   });
 
-  it("accepts a 1,024-byte wildcard pattern and rejects its first byte excess", () => {
-    const prefix = "refs/source/";
-    const pattern = `${prefix}${"a".repeat(MAX_REFSPEC_REF_BYTES - prefix.length - 1)}*`;
+  it("accepts exact and wildcard refs at the former first byte excess", () => {
+    const exactPrefix = "refs/heads/";
+    const exact = `${exactPrefix}${"a".repeat(1_025 - exactPrefix.length)}`;
+    const patternPrefix = "refs/source/";
+    const pattern = `${patternPrefix}${"a".repeat(1_024 - patternPrefix.length)}*`;
     const { coordinator, reservation, budget } = fixture();
     const compiled = compileFetchRefspecs(
-      [{ source: pattern, destination: "refs/destination/*" }],
+      [
+        { source: exact, destination: exact },
+        { source: pattern, destination: "refs/destination/*" },
+      ],
       budget,
     );
+    expect(compiled.expand([{ name: exact, oid: OID }])).toEqual([
+      { source: exact, destination: exact, oid: OID, force: false },
+    ]);
     compiled.dispose();
-    expectCode(
-      () =>
-        compileFetchRefspecs(
-          [{ source: `${pattern}a`, destination: "refs/destination/*" }],
-          budget,
-        ),
-      "E2BIG",
-    );
     expect(budget.retainedBytes).toBe(0);
     reservation.dispose();
     coordinator.assertIdle();
@@ -334,16 +321,26 @@ describe("structured refspecs", () => {
     expansionExcess.coordinator.assertIdle();
   });
 
-  it("rejects the first expanded destination byte excess", () => {
+  it("accepts an expanded destination at the former first byte excess", () => {
     const { coordinator, reservation, budget } = fixture();
     const compiled = compileFetchRefspecs(
       [{ source: "refs/*", destination: "refs/destination/*" }],
       budget,
     );
     const sourcePrefix = "refs/";
-    const name = `${sourcePrefix}${"a".repeat(MAX_REFSPEC_REF_BYTES - sourcePrefix.length)}`;
-    expectCode(() => compiled.expand([{ name, oid: OID }]), "E2BIG");
+    const destinationPrefix = "refs/destination/";
+    const capture = "a".repeat(1_025 - destinationPrefix.length);
+    const name = `${sourcePrefix}${capture}`;
+    expect(compiled.expand([{ name, oid: OID }])).toEqual([
+      {
+        source: name,
+        destination: `${destinationPrefix}${capture}`,
+        oid: OID,
+        force: false,
+      },
+    ]);
     compiled.dispose();
+    expect(budget.retainedBytes).toBe(0);
     reservation.dispose();
     coordinator.assertIdle();
   });
@@ -353,11 +350,8 @@ describe("structured refspecs", () => {
     expect(requireRefName("refs/heads/main", "stored ref", "stored")).toBe("refs/heads/main");
     expectCode(() => requireRefName("refs/heads/.hidden", "stored ref", "stored"), "ECORRUPT");
     expectCode(() => requireRefName("refs/heads/.hidden", "input ref", "input"), "EINVAL");
-    expectCode(
-      () =>
-        requireRefName(`refs/heads/${"a".repeat(MAX_REFSPEC_REF_BYTES)}`, "stored ref", "stored"),
-      "ECORRUPT",
-    );
+    const formerFirstExcess = `refs/heads/${"a".repeat(1_025 - "refs/heads/".length)}`;
+    expect(requireRefName(formerFirstExcess, "stored ref", "stored")).toBe(formerFirstExcess);
   });
 });
 

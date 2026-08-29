@@ -2,12 +2,22 @@
 // the repository a directory belongs to.
 
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
-import type { IndexEntry, IndexStore } from "../../sqlite/store.js";
+import {
+  createRefMutationMemoryOwner,
+  type IndexEntry,
+  type IndexStore,
+  mutateRefsOwned,
+} from "../../sqlite/store.js";
 import { isOid, utf8 } from "../bytes.js";
 import { type GitContext, type GitIdentity, openRepository } from "../context.js";
 import { CorruptError, GitError, ObjectNotFoundError } from "../errors.js";
 import { hashObject as hashRaw, type Person } from "../objects.js";
-import type { Repository } from "../repository.js";
+import {
+  type Repository,
+  readRawRefOwned,
+  resolveHeadOwned,
+  symbolicTargetOwned,
+} from "../repository.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree } from "./checkout.js";
 import {
@@ -478,10 +488,15 @@ export function readRef(repo: Repository, options: ReadRefOptions): RawRefTarget
   ) {
     throw new GitError("EINVAL", "raw ref name must be HEAD or a full refs/... name");
   }
-  const raw = ref === "HEAD" ? repo.checkout.head() : repo.store.getRef(ref);
-  if (raw === null) return { kind: "absent" };
-  if (raw.startsWith("ref: ")) return { kind: "symbolic", target: raw.slice(5) };
-  return { kind: "direct", oid: raw };
+  const owner = createRefMutationMemoryOwner(repo.store);
+  try {
+    const raw = readRawRefOwned(repo, ref, owner);
+    if (raw === null) return { kind: "absent" };
+    const target = symbolicTargetOwned(raw, owner);
+    return target === null ? { kind: "direct", oid: raw } : { kind: "symbolic", target };
+  } finally {
+    owner.dispose();
+  }
 }
 
 /**
@@ -506,7 +521,6 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
     }
     const checkedExpected =
       expected === undefined ? undefined : expected === null ? null : requireDirectOid(expected);
-    const metadata = operationRefLogMetadata(context, repo, "update-ref");
     if (deletion === true) {
       if (value !== undefined) throw new GitError("EINVAL", "delete ref update rejects value");
       repo.mutateRefs(
@@ -515,16 +529,24 @@ export function updateRef(context: GitContext, repo: Repository, options: Update
           expected:
             checkedExpected === undefined ? undefined : { name: ref, target: checkedExpected },
         },
-        metadata,
+        operationRefLogMetadata(context, repo, "update-ref"),
       );
       return;
     }
     const target = requireDirectOid(value);
-    repo.typeOf(target);
-    repo.mutateRefs(
-      { puts: [{ name: ref, target }], expected: { name: ref, target: checkedExpected ?? null } },
-      metadata,
-    );
+    const owner = createRefMutationMemoryOwner(repo.store);
+    try {
+      const metadata = operationRefLogMetadata(context, repo, "update-ref", {}, owner);
+      repo.typeOf(target);
+      mutateRefsOwned(
+        repo.checkout,
+        { puts: [{ name: ref, target }], expected: { name: ref, target: checkedExpected ?? null } },
+        metadata,
+        owner,
+      );
+    } finally {
+      owner.dispose();
+    }
     return;
   }
   if (typeof value !== "string") throw new GitError("EINVAL", "update-ref value is required");
@@ -569,5 +591,10 @@ export function repoRoot(context: GitContext, options: RepoRootOptions = {}): st
 
 /** HEAD's symbolic target, or undefined when HEAD is detached. */
 export function symbolicRef(repo: Repository): string | undefined {
-  return repo.head().ref ?? undefined;
+  const owner = createRefMutationMemoryOwner(repo.store);
+  try {
+    return resolveHeadOwned(repo, owner).ref ?? undefined;
+  } finally {
+    owner.dispose();
+  }
 }

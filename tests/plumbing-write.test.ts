@@ -15,6 +15,7 @@ import {
   MAX_COMMIT_TREE_PARENTS,
   MAX_COMMIT_TREE_REVISION_TRAVERSALS,
   readTree,
+  updateRef,
   writeTree,
 } from "../src/core/ops/plumbing.js";
 import { add } from "../src/core/ops/staging.js";
@@ -23,9 +24,11 @@ import {
   MAX_TREE_BUILD_OBJECTS,
   MAX_TREE_BUILD_TOTAL_PATH_BYTES,
 } from "../src/core/ops/tree-build.js";
+import { retainedStringBytes } from "../src/core/retained.js";
 import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
@@ -248,6 +251,74 @@ function corruptLooseObject(workspace: TestRepository, oid: string): void {
 }
 
 describe("tree and index write plumbing", () => {
+  it("keeps configured guarded-ref metadata in the exact aggregate owner", () => {
+    const name = "N".repeat(128 * 1024);
+    const email = `${"e".repeat(128 * 1024)}@example.test`;
+    const prepare = (configured: boolean): { workspace: TestRepository; target: string } => {
+      const workspace = makeRepo("/");
+      if (configured) {
+        workspace.repo.store.configSet("user.name", name);
+        workspace.repo.store.configSet("user.email", email);
+      }
+      return {
+        workspace,
+        target: workspace.repo.store.write("blob", utf8.encode("guarded target\n")),
+      };
+    };
+    const run = (workspace: TestRepository, target: string): void => {
+      updateRef(workspace.context, workspace.repo, {
+        ref: "refs/heads/guarded-memory",
+        value: target,
+        expected: null,
+      });
+    };
+
+    const plain = prepare(false);
+    run(plain.workspace, plain.target);
+    const plainBytes = plain.workspace.repo.store.memory.highWaterBytes;
+    expect(plain.workspace.repo.store.memory.activeCount).toBe(0);
+    expect(plain.workspace.repo.store.memory.totalBytes).toBe(0);
+
+    const measured = prepare(true);
+    run(measured.workspace, measured.target);
+    const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
+    // Reflog JSON precharge retains two bytes for each six-unit escaped maximum.
+    expect(operationBytes - plainBytes).toBe(
+      16 +
+        retainedStringBytes(name) +
+        retainedStringBytes(email) +
+        12 * (name.length + email.length),
+    );
+    expect(measured.workspace.repo.store.memory.activeCount).toBe(0);
+    expect(measured.workspace.repo.store.memory.totalBytes).toBe(0);
+
+    const exact = prepare(true);
+    const exactBlocker = exact.workspace.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      run(exact.workspace, exact.target);
+      expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    expect(exact.workspace.repo.store.memory.activeCount).toBe(0);
+    expect(exact.workspace.repo.store.memory.totalBytes).toBe(0);
+
+    const over = prepare(true);
+    const overBlocker = over.workspace.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => run(over.workspace, over.target)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(over.workspace.repo.store.getRef("refs/heads/guarded-memory")).toBeNull();
+    } finally {
+      overBlocker.dispose();
+    }
+    expect(over.workspace.repo.store.memory.activeCount).toBe(0);
+    expect(over.workspace.repo.store.memory.totalBytes).toBe(0);
+  });
+
   it("matches Git write-tree for checkout, scratch, empty, mixed-mode, and non-BMP indexes", async () => {
     const fixture = newFixture();
     fixture

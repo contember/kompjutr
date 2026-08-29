@@ -1,13 +1,12 @@
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
-import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
+import { checkRefText, hasCanonicalRefPatternSyntax, hasCanonicalRefSyntax } from "../ref-name.js";
 import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 import type { TransportOperationBudget } from "./transport-budget.js";
 
 export const MAX_REFSPEC_MAPPINGS = 1_024;
 export const MAX_REFSPEC_EXPANDED_DESTINATIONS = 1_024;
-export const MAX_REFSPEC_REF_BYTES = MAX_REF_NAME_BYTES;
 
 export type RemoteTarget =
   | { readonly remote?: string; readonly url?: never }
@@ -135,16 +134,13 @@ function invalidRef(label: string): GitError {
   return new GitError("EINVALIDREF", `${label} is not a canonical full ref`);
 }
 
-function boundedRefText(value: string, label: string): void {
-  const checked = checkRefText(value, MAX_REFSPEC_REF_BYTES);
-  if (checked.problem === "too-long") {
-    throw new GitError("E2BIG", `${label} exceeds ${MAX_REFSPEC_REF_BYTES} UTF-8 bytes`);
-  }
+function canonicalRefText(value: string, label: string): void {
+  const checked = checkRefText(value);
   if (checked.problem !== null) throw invalidRef(label);
 }
 
 function requireFullRef(value: string, label: string): void {
-  boundedRefText(value, label);
+  canonicalRefText(value, label);
   if (!value.startsWith("refs/") || !hasCanonicalRefSyntax(value)) throw invalidRef(label);
 }
 
@@ -155,10 +151,9 @@ function starIndex(value: string): number {
 }
 
 function requirePattern(value: string, star: number, label: string): void {
-  boundedRefText(value, label);
+  canonicalRefText(value, label);
   if (star < 0) throw malformed(`${label} must contain exactly one wildcard`);
-  const substituted = `${value.slice(0, star)}x${value.slice(star + 1)}`;
-  if (!substituted.startsWith("refs/") || !hasCanonicalRefSyntax(substituted)) {
+  if (!value.startsWith("refs/") || !hasCanonicalRefPatternSyntax(value, star)) {
     throw invalidRef(label);
   }
 }
@@ -288,20 +283,22 @@ function actualSourceRefs(
     if (typeof ref.name !== "string" || typeof ref.oid !== "string" || !isOid(ref.oid)) {
       throw new CorruptError("refspec source set contains a malformed row");
     }
-    const checked = checkRefText(ref.name, MAX_REFSPEC_REF_BYTES);
+    const checked = checkRefText(ref.name);
     if (checked.problem !== null) throw new CorruptError(`invalid refspec source ${ref.name}`);
+    expansion.addSource();
     let metadata = ref.name === "HEAD";
     if (ref.name.endsWith("^{}")) {
+      expansion.prechargeTransient(ref.name.length - 3);
       const base = ref.name.slice(0, -3);
       if (!base.startsWith("refs/tags/") || !hasCanonicalRefSyntax(base)) {
         throw new CorruptError(`invalid peeled refspec source ${ref.name}`);
       }
+      expansion.clearTransient();
       metadata = true;
     } else if (!metadata && (!ref.name.startsWith("refs/") || !hasCanonicalRefSyntax(ref.name))) {
       throw new CorruptError(`invalid refspec source ${ref.name}`);
     }
     if (seen.has(ref.name)) throw new CorruptError(`duplicate refspec source ${ref.name}`);
-    expansion.addSource(ref.name);
     seen.add(ref.name);
     if (metadata) continue;
     actual.set(ref.name, ref.oid);
@@ -309,38 +306,46 @@ function actualSourceRefs(
   return actual;
 }
 
-function wildcardCapture(source: string, pattern: string, star: number): string | null {
-  const prefix = pattern.slice(0, star);
-  const suffix = pattern.slice(star + 1);
-  if (!source.startsWith(prefix) || !source.endsWith(suffix)) return null;
-  if (source.length < prefix.length + suffix.length) return null;
-  return source.slice(prefix.length, source.length - suffix.length);
+interface WildcardCapture {
+  readonly start: number;
+  readonly end: number;
 }
 
-function substitute(pattern: string, star: number, capture: string): string {
-  return `${pattern.slice(0, star)}${capture}${pattern.slice(star + 1)}`;
+function wildcardCapture(source: string, pattern: string, star: number): WildcardCapture | null {
+  const suffixUnits = pattern.length - star - 1;
+  if (source.length < star + suffixUnits) return null;
+  for (let index = 0; index < star; index++) {
+    if (source.charCodeAt(index) !== pattern.charCodeAt(index)) return null;
+  }
+  for (let index = 0; index < suffixUnits; index++) {
+    if (
+      source.charCodeAt(source.length - suffixUnits + index) !==
+      pattern.charCodeAt(star + 1 + index)
+    ) {
+      return null;
+    }
+  }
+  return { start: star, end: source.length - suffixUnits };
+}
+
+function substitute(
+  pattern: string,
+  star: number,
+  source: string,
+  capture: WildcardCapture,
+): string {
+  return `${pattern.slice(0, star)}${source.slice(capture.start, capture.end)}${pattern.slice(star + 1)}`;
 }
 
 function requireExpandedDestination(value: string): void {
-  const checked = checkRefText(value, MAX_REFSPEC_REF_BYTES);
-  if (checked.problem === "too-long") {
-    throw new GitError(
-      "E2BIG",
-      `expanded refspec destination exceeds ${MAX_REFSPEC_REF_BYTES} UTF-8 bytes`,
-    );
-  }
+  const checked = checkRefText(value);
   if (checked.problem !== null || !value.startsWith("refs/") || !hasCanonicalRefSyntax(value)) {
     throw invalidRef("expanded refspec destination");
   }
 }
 
-function expandedBytes(source: string | null, destination: string, oid: string | null): number {
-  return (
-    EXPANDED_MAPPING_FIXED_BYTES +
-    retainedStringBytes(destination) +
-    (source === null ? 0 : retainedStringBytes(source)) +
-    (oid === null ? 0 : retainedStringBytes(oid))
-  );
+function expandedBytes(destination: string, ownsDestination: boolean): number {
+  return EXPANDED_MAPPING_FIXED_BYTES + (ownsDestination ? retainedStringBytes(destination) : 0);
 }
 
 class ExpansionBudget {
@@ -351,22 +356,56 @@ class ExpansionBudget {
     budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
   }
 
-  addSource(name: string): void {
-    this.#retained += SOURCE_INDEX_FIXED_BYTES + retainedStringBytes(name);
+  addSource(): void {
+    this.#retained += SOURCE_INDEX_FIXED_BYTES;
     this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
   }
 
-  add(source: string | null, destination: string, oid: string | null): void {
+  prechargeTransient(units: number): void {
+    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained + retainedStringUnits(units));
+  }
+
+  clearTransient(): void {
+    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
+  }
+
+  add(
+    _source: string | null,
+    destination: string,
+    _oid: string | null,
+    ownsDestination = false,
+  ): void {
     if (this.#destinations >= MAX_REFSPEC_EXPANDED_DESTINATIONS) {
       throw new GitError(
         "E2BIG",
         `expanded refspec set exceeds ${MAX_REFSPEC_EXPANDED_DESTINATIONS} destinations`,
       );
     }
-    this.#retained += expandedBytes(source, destination, oid);
+    this.#retained += expandedBytes(destination, ownsDestination);
     this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained);
     this.#destinations++;
   }
+
+  prechargeDerived(pattern: string, star: number, capture: WildcardCapture): void {
+    if (this.#destinations >= MAX_REFSPEC_EXPANDED_DESTINATIONS) {
+      throw new GitError(
+        "E2BIG",
+        `expanded refspec set exceeds ${MAX_REFSPEC_EXPANDED_DESTINATIONS} destinations`,
+      );
+    }
+    const captureUnits = capture.end - capture.start;
+    const destinationUnits = pattern.length - 1 + captureUnits;
+    const finalBytes = EXPANDED_MAPPING_FIXED_BYTES + retainedStringUnits(destinationUnits);
+    const transientBytes =
+      retainedStringUnits(star) +
+      retainedStringUnits(captureUnits) +
+      retainedStringUnits(pattern.length - star - 1);
+    this.budget.setMemory(EXPANDED_MEMORY_PART, this.#retained + finalBytes + transientBytes);
+  }
+}
+
+function retainedStringUnits(units: number): number {
+  return 48 + units * 2;
 }
 
 function destinationGuard(seen: Set<string>, destination: string): void {
@@ -402,8 +441,8 @@ class FetchCompiler implements CompiledFetchRefspecs {
           if (oid === undefined) {
             throw new GitError("EREFNOTFOUND", `remote ref not found: ${source}`);
           }
-          destinationGuard(seen, mapping.destination);
           expansion.add(source, mapping.destination, oid);
+          destinationGuard(seen, mapping.destination);
           result.push({
             source,
             destination: mapping.destination,
@@ -415,10 +454,16 @@ class FetchCompiler implements CompiledFetchRefspecs {
         for (const [name, oid] of sources) {
           const capture = wildcardCapture(name, source, mapping.sourceStar);
           if (capture === null) continue;
-          const destination = substitute(mapping.destination, mapping.destinationStar, capture);
+          expansion.prechargeDerived(mapping.destination, mapping.destinationStar, capture);
+          const destination = substitute(
+            mapping.destination,
+            mapping.destinationStar,
+            name,
+            capture,
+          );
           requireExpandedDestination(destination);
+          expansion.add(name, destination, oid, true);
           destinationGuard(seen, destination);
-          expansion.add(name, destination, oid);
           result.push({ source: name, destination, oid, force: mapping.force });
         }
       }
@@ -459,8 +504,8 @@ class PushCompiler implements CompiledPushRefspecs {
       for (const mapping of this.mappings) {
         const source = mapping.source;
         if (source === null) {
-          destinationGuard(seen, mapping.destination);
           expansion.add(null, mapping.destination, null);
+          destinationGuard(seen, mapping.destination);
           result.push({
             source: null,
             destination: mapping.destination,
@@ -470,8 +515,8 @@ class PushCompiler implements CompiledPushRefspecs {
           continue;
         }
         if (mapping.oidSource) {
-          destinationGuard(seen, mapping.destination);
           expansion.add(source, mapping.destination, source);
+          destinationGuard(seen, mapping.destination);
           result.push({
             source,
             destination: mapping.destination,
@@ -485,8 +530,8 @@ class PushCompiler implements CompiledPushRefspecs {
           if (oid === undefined) {
             throw new GitError("EREFNOTFOUND", `local ref not found: ${source}`);
           }
-          destinationGuard(seen, mapping.destination);
           expansion.add(source, mapping.destination, oid);
+          destinationGuard(seen, mapping.destination);
           result.push({
             source,
             destination: mapping.destination,
@@ -498,10 +543,16 @@ class PushCompiler implements CompiledPushRefspecs {
         for (const [name, oid] of sources) {
           const capture = wildcardCapture(name, source, mapping.sourceStar);
           if (capture === null) continue;
-          const destination = substitute(mapping.destination, mapping.destinationStar, capture);
+          expansion.prechargeDerived(mapping.destination, mapping.destinationStar, capture);
+          const destination = substitute(
+            mapping.destination,
+            mapping.destinationStar,
+            name,
+            capture,
+          );
           requireExpandedDestination(destination);
+          expansion.add(name, destination, oid, true);
           destinationGuard(seen, destination);
-          expansion.add(name, destination, oid);
           result.push({ source: name, destination, oid, force: mapping.force });
         }
       }
