@@ -28,6 +28,10 @@ export interface ShellOptions {
   readonly limits?: Limits;
 }
 
+export interface ShellRunOptions {
+  readonly stdin?: Uint8Array | string;
+}
+
 export interface RunResult {
   readonly stdout: string;
   readonly stderr: string;
@@ -43,9 +47,9 @@ export interface RunResult {
 
 export interface Shell {
   /** Run one command line. Text in, text out. */
-  run(source: string): RunResult;
+  run(source: string, options?: ShellRunOptions): RunResult;
   /** Run one command line, keeping stdout as bytes. */
-  exec(source: string): ExecResult;
+  exec(source: string, options?: ShellRunOptions): ExecResult;
   cwd(): string;
 }
 
@@ -59,7 +63,7 @@ export function createShell(options: ShellOptions): Shell {
     for (const [name, command] of options.commands) commands.set(name, command);
   }
 
-  const exec = (source: string): ExecResult => {
+  const exec = (source: string, runOptions?: ShellRunOptions): ExecResult => {
     const before = session.cwd();
     let plan: ReturnType<typeof planScript>;
     try {
@@ -87,6 +91,7 @@ export function createShell(options: ShellOptions): Shell {
       cwd: before,
       commands,
       limits: options.limits ?? DEFAULT_LIMITS,
+      stdin: runOptions?.stdin,
     });
     if (outcome.cwd !== before) session.setCwd(outcome.cwd);
     return outcome;
@@ -94,8 +99,8 @@ export function createShell(options: ShellOptions): Shell {
 
   return {
     exec,
-    run: (source: string): RunResult => {
-      const outcome = exec(source);
+    run: (source: string, runOptions?: ShellRunOptions): RunResult => {
+      const outcome = exec(source, runOptions);
       return {
         stdout: decode(outcome.stdout),
         stderr: decode(outcome.stderr),

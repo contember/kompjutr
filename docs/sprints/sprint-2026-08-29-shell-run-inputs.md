@@ -225,3 +225,8 @@ the proportional review gates.
 - 2026-08-29 — Peirce approved the corrected proposal. The combined
   pre-allocation reservation, parse precedence and direct close-path witnesses
   resolve both blockers; WU1 may start.
+- 2026-08-29 — WU1 added bounded caller stdin with one run-owned cursor and
+  non-owning pipeline borrows. The focused witness passed 34 tests and
+  typecheck passed. Tesla's T3 review found one missing exact-close witness;
+  the expanded probe now covers every frozen exit path, and re-review approved
+  the corrected WU1 with no remaining findings.

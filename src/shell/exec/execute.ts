@@ -24,6 +24,7 @@ import { compileGlob, sqlGlobFor } from "./glob.js";
 
 const ARGUMENT_COUNT_MAX = 10_000;
 const ARGUMENT_BYTES_MAX = 1_000_000;
+const STDIN_BYTES_MAX = 1024 * 1024;
 const PATH_PAGE_MAX = 1_000;
 // Filesystem.writeFileStream enforces this atomically before publishing a redirect.
 const ATOMIC_REDIRECT_BYTES_MAX = 96 * 1024 * 1024;
@@ -34,6 +35,7 @@ export interface ExecOptions {
   readonly cwd: string;
   readonly commands: ReadonlyMap<string, Command>;
   readonly limits?: Limits;
+  readonly stdin?: Uint8Array | string;
 }
 
 export interface ExecResult {
@@ -57,45 +59,52 @@ export function execute(plan: Plan, options: ExecOptions): ExecResult {
   let cwd = normalize(options.cwd);
   let exitCode = 0;
   let previousConnector: "&&" | "||" | ";" | null = null;
+  let runInput: RunInputOwner | null = null;
 
   try {
-    for (const step of plan.steps) {
-      const selected =
-        previousConnector === null ||
-        previousConnector === ";" ||
-        (previousConnector === "&&" ? exitCode === 0 : exitCode !== 0);
-      if (selected) {
-        exitCode = runPipeline(step.pipeline, {
-          fs,
-          cwd,
-          commands: options.commands,
-          out,
-          errors,
-          chdir: (path: string) => {
-            cwd = path;
-          },
-        });
+    try {
+      runInput = prepareRunInput(options.stdin, fs);
+      for (const step of plan.steps) {
+        const selected =
+          previousConnector === null ||
+          previousConnector === ";" ||
+          (previousConnector === "&&" ? exitCode === 0 : exitCode !== 0);
+        if (selected) {
+          exitCode = runPipeline(step.pipeline, {
+            fs,
+            cwd,
+            commands: options.commands,
+            out,
+            errors,
+            stdin: runInput,
+            chdir: (path: string) => {
+              cwd = path;
+            },
+          });
+        }
+        previousConnector = step.connector;
       }
-      previousConnector = step.connector;
+    } catch (error) {
+      if (error instanceof ShellLimitError || error instanceof ShellSyntaxError) {
+        errors.writeBytes(line(`kompjutr: ${error.message}`));
+        exitCode = 2;
+      } else {
+        throw error;
+      }
     }
-  } catch (error) {
-    if (error instanceof ShellLimitError || error instanceof ShellSyntaxError) {
-      errors.writeBytes(line(`kompjutr: ${error.message}`));
-      exitCode = 2;
-    } else {
-      throw error;
-    }
-  }
 
-  return {
-    stdout: out.bytes(),
-    stderr: errors.bytes(),
-    exitCode,
-    cwd,
-    truncated: out.truncated || errors.truncated,
-    operations: fs.operations,
-    peakRetainedBytes: fs.retained.peak,
-  };
+    return {
+      stdout: out.bytes(),
+      stderr: errors.bytes(),
+      exitCode,
+      cwd,
+      truncated: out.truncated || errors.truncated,
+      operations: fs.operations,
+      peakRetainedBytes: fs.retained.peak,
+    };
+  } finally {
+    runInput?.close();
+  }
 }
 
 interface PipelineEnvironment {
@@ -104,11 +113,12 @@ interface PipelineEnvironment {
   readonly commands: ReadonlyMap<string, Command>;
   readonly out: Sink;
   readonly errors: Sink;
+  readonly stdin: RunInputOwner | null;
   chdir(path: string): void;
 }
 
 function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): number {
-  let stream: ByteStream | null = null;
+  let stream: ByteStream | null = env.stdin?.borrow() ?? null;
   const statuses: Array<() => number> = [];
   let settled = false;
 
@@ -218,6 +228,95 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
   } finally {
     if (!settled) stream?.return();
   }
+}
+
+/** Own caller stdin and its retained-memory reservation for one complete run. */
+export class RunInputOwner {
+  #closed = false;
+
+  constructor(
+    private readonly source: ByteStream,
+    private readonly release: () => void,
+  ) {}
+
+  /** A pipeline may close its borrow without closing the run-owned cursor. */
+  borrow(): ByteStream {
+    const source = this.source;
+    return (function* (): ByteStream {
+      for (;;) {
+        const next = source.next();
+        if (next.done) return;
+        yield next.value;
+      }
+    })();
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    try {
+      this.source.return();
+    } finally {
+      this.release();
+    }
+  }
+}
+
+function prepareRunInput(
+  stdin: Uint8Array | string | undefined,
+  fs: BoundedFs,
+): RunInputOwner | null {
+  if (stdin === undefined) return null;
+  const bytes = stdinBytes(stdin);
+  const release = fs.retained.retain(bytes, "caller stdin");
+  try {
+    const snapshot = typeof stdin === "string" ? ENCODER.encode(stdin) : stdin.slice();
+    return new RunInputOwner(singleChunk(snapshot), release);
+  } catch (error) {
+    release();
+    throw error;
+  }
+}
+
+function stdinBytes(stdin: Uint8Array | string): number {
+  if (typeof stdin !== "string") {
+    if (!(stdin instanceof Uint8Array)) {
+      throw new ShellLimitError("arguments", "caller stdin must be a string or Uint8Array");
+    }
+    if (stdin.byteLength > STDIN_BYTES_MAX) {
+      throw new ShellLimitError("arguments", `caller stdin exceeds ${STDIN_BYTES_MAX} bytes`);
+    }
+    return stdin.byteLength;
+  }
+
+  const bytes = boundedUtf8Bytes(stdin, STDIN_BYTES_MAX);
+  if (bytes === null) {
+    throw new ShellLimitError("arguments", `caller stdin exceeds ${STDIN_BYTES_MAX} bytes`);
+  }
+  return bytes;
+}
+
+/** Match TextEncoder's replacement of unpaired surrogates without allocating. */
+function boundedUtf8Bytes(value: string, maximum: number): number | null {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else bytes += 3;
+    } else bytes += 3;
+    if (bytes > maximum) return null;
+  }
+  return bytes;
+}
+
+function* singleChunk(bytes: Uint8Array): ByteStream {
+  if (bytes.length > 0) yield bytes;
 }
 
 class UpstreamError extends Error {
