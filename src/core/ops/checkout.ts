@@ -69,7 +69,6 @@ const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_PRUNE_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_PRUNE_PATHS = 50_000;
 const CHECKOUT_REMOVE_BINDING_BYTES = 1_000_000;
-const CHECKOUT_REMOVE_BATCHES = 16;
 const CHECKOUT_PATH_FIXED_BYTES = 96;
 const CHECKOUT_UNMERGED_PATHS = 10_000;
 const CHECKOUT_UNMERGED_BYTES = 4 * 1024 * 1024;
@@ -744,9 +743,6 @@ function planWorktreeRemovalBatches(
   let bytes = 2;
   const flush = (): void => {
     if (batch.length === 0) return;
-    if (batches.length >= CHECKOUT_REMOVE_BATCHES) {
-      throw new GitError("E2BIG", `${label} exceeds ${CHECKOUT_REMOVE_BATCHES} removal batches`);
-    }
     batches.push(batch);
     batch = [];
     bytes = 2;

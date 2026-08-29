@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
 import { worktreeAdd } from "../src/core/ops/worktrees.js";
 import {
   fetchHttpClient,
@@ -7,7 +6,6 @@ import {
   type GitHttpRequest,
 } from "../src/core/protocol/transport.js";
 import { createGit, type FetchRefspec, type Git } from "../src/index.js";
-import { FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
 import { reopenTestRepository } from "./helpers/repository-invariants.js";
@@ -82,7 +80,7 @@ function withoutIncludeTag(request: GitHttpRequest): GitHttpRequest {
 }
 
 describe("mapped fetch refspecs", () => {
-  it("keeps both legacy upload exchanges in one SQL and memory operation", async () => {
+  it("keeps both legacy upload exchanges in one retained-memory operation", async () => {
     const workspace = makeRepo("/", { startTime: TEST_TIME, now: () => TEST_TIME });
     let posts = 0;
     const http: GitHttpClient = (request) => {
@@ -395,7 +393,7 @@ describe("mapped fetch refspecs", () => {
     expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
-  it("admits exactly 1,024 mappings under the aggregate SQL and memory limits", async () => {
+  it("admits exactly 1,024 mappings under the aggregate structural and memory limits", async () => {
     const { workspace, git } = configured();
     const refspecs = Array.from({ length: 1_024 }, (_, index) => ({
       source: "refs/checkpoints/base",
@@ -430,75 +428,40 @@ describe("mapped fetch refspecs", () => {
     expect(workspace.repo.store.memory.activeCount).toBe(0);
   });
 
-  it("consumes exact publication SQL from the pre-POST reservation", () => {
+  it("publishes the former first-excess ref set atomically and survives cold reopen", () => {
     const { workspace } = configured();
     const oid = workspace.repo.store.write("blob", new TextEncoder().encode("budget\n"));
     const rows = Array.from({ length: 1_024 }, (_, index) => ({
-      name: `refs/budget/${index.toString().padStart(4, "0")}`,
+      name: `refs/checkpoints/budget-first-excess/${index.toString().padStart(4, "0")}`,
       target: oid,
     }));
-    for (const row of rows) workspace.repo.store.setRef(row.name, row.target);
     const metadata = {
-      actor: null,
+      actor: { name: "Fetch Bot", email: "fetch@example.test" },
       reason: "fetch",
-      timestamp: 0,
+      timestamp: TEST_TIME / 1_000,
       timezoneOffset: 0,
     };
-
-    const admittedReservation = workspace.repo.store.reserveMemory();
-    const admittedBudget = new TransportOperationBudget(admittedReservation);
-    admittedBudget.reserveSql("fetch-finalization", 128);
-    workspace.storage.resetCounters();
-    const admitted = workspace.repo.store.beginFetchPublication(
-      "refs/remotes/budget/",
-      rows.map((row) => row.name),
-      admittedReservation,
-      admittedBudget,
-      "fetch-finalization",
-    );
-    try {
-      expect(admittedBudget.sqlStatements).toBe(FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS);
-      expect(workspace.storage.statementCount).toBeLessThanOrEqual(
-        FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS,
-      );
-      workspace.repo.store.publishFetchRefs(admitted, { exactPuts: rows }, metadata);
-      expect(admittedBudget.sqlStatements).toBe(FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS + 48);
-      expect(admittedBudget.reservedSqlStatements).toBe(80);
-    } finally {
-      admitted.dispose();
-      admittedBudget.clearAllMemory();
-      admittedReservation.dispose();
-    }
-
-    const rejectedReservation = workspace.repo.store.reserveMemory();
-    const rejectedBudget = new TransportOperationBudget(rejectedReservation);
-    rejectedBudget.reserveSql("fetch-finalization", 47);
-    const rejectedRows = rows.map((row, index) => ({
-      name: `refs/budget-first-excess/${index.toString().padStart(4, "0")}`,
-      target: row.target,
-    }));
-    const rejectedFirst = rejectedRows[0];
-    if (rejectedFirst === undefined) throw new Error("missing first rejected publication row");
-    const rejected = workspace.repo.store.beginFetchPublication(
+    const first = rows[0];
+    if (first === undefined) throw new Error("missing first publication row");
+    const reservation = workspace.repo.store.reserveMemory();
+    const publication = workspace.repo.store.beginFetchPublication(
       "refs/remotes/budget-first-excess/",
-      rejectedRows.map((row) => row.name),
-      rejectedReservation,
-      rejectedBudget,
-      "fetch-finalization",
+      rows.map((row) => row.name),
+      reservation,
     );
     try {
-      expect(() =>
-        workspace.repo.store.publishFetchRefs(rejected, { exactPuts: rejectedRows }, metadata),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(rejectedBudget.sqlStatements).toBe(FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS);
-      expect(rejectedBudget.reservedSqlStatements).toBe(47);
-      expect(workspace.repo.store.listRefs("refs/budget-first-excess/")).toEqual([]);
-      expect(workspace.repo.store.reflog(rejectedFirst.name)).toEqual([]);
+      expect(
+        workspace.repo.store.publishFetchRefs(publication, { exactPuts: rows }, metadata),
+      ).toBe(true);
     } finally {
-      rejected.dispose();
-      rejectedBudget.clearAllMemory();
-      rejectedReservation.dispose();
+      publication.dispose();
+      reservation.dispose();
     }
+    expect(workspace.repo.store.listRefs("refs/checkpoints/budget-first-excess/")).toEqual(rows);
+    expect(workspace.repo.store.reflog(first.name)).toHaveLength(1);
+    const cold = reopenTestRepository(workspace);
+    expect(cold.repo.store.listRefs("refs/checkpoints/budget-first-excess/")).toEqual(rows);
+    expect(cold.repo.store.reflog(first.name)).toHaveLength(1);
     expect(workspace.repo.store.memory.totalBytes).toBe(0);
     expect(workspace.repo.store.memory.activeCount).toBe(0);
   });

@@ -12,7 +12,6 @@ import type { Person } from "../objects.js";
 import type { Repository } from "../repository.js";
 
 const MAX_IDENTITY_BYTES = 1_024;
-export const MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS = 4;
 
 export type RefLogReason =
   | "commit (initial)"

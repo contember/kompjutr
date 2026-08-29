@@ -51,8 +51,6 @@ const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
 const DIFF_PATH_BYTES = 2_200;
 const DIFF_SUMMARY_ENTRY_FIXED_BYTES = 128;
 const DIFF_SUMMARY_MAX_ROWS = 50_000;
-/** One hundred full worktree pages plus one terminal or first-excess query. */
-export const DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS = 100_000;
 const MIB = 1024 * 1024;
 export const DIFF_MAX_OUTPUT_BYTES = 16 * MIB;
 // 64 MiB renderer + 16 MiB hydration + 12 MiB caches + 4 MiB headroom = 96 MiB.
@@ -1052,8 +1050,8 @@ function* indexWorktreePatchChanges(
       worktree,
       repo.root,
       options.paths === undefined || options.paths.length === 0
-        ? { filesOnly: true, maxScanRows: DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS }
-        : { paths: options.paths, maxScanRows: DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS },
+        ? { filesOnly: true }
+        : { paths: options.paths },
     ),
     { left: (group) => group.path, right: (entry) => entry.path },
   )) {

@@ -40,7 +40,6 @@ const SPARSE_STATUS_RETAINED_BYTES = 8 * 1024 * 1024;
 const SPARSE_STATUS_PATH_FIXED_BYTES = 96;
 const SPARSE_INDEX_DIRTY = 1;
 const SPARSE_WORKTREE_DIRTY = 2;
-const FULL_STATUS_TRACKER_ROWS = 32_000;
 const FULL_STATUS_TRACKER_BYTES = 16 * 1024 * 1024;
 const FULL_STATUS_TRACKER_FIXED_BYTES = 256;
 const FULL_STATUS_TRACKER_ROW_BYTES = 256;
@@ -114,7 +113,6 @@ export class FullStatusTrackerSeed {
     }
     const retained = FULL_STATUS_TRACKER_ROW_BYTES + path.length * 2;
     if (
-      this.#entries.size === FULL_STATUS_TRACKER_ROWS ||
       retained >= FULL_STATUS_TRACKER_BYTES - this.#retainedBytes ||
       !trackerPathRepresentable(path)
     ) {

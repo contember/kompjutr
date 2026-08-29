@@ -12,7 +12,6 @@ import { type TargetEntry, treeStream } from "./tree-stream.js";
 const INITIAL_WINDOW_ROWS = 1_000;
 const INITIAL_BLOB_BYTES = MAX_BLOB_BATCH_BYTES;
 const INITIAL_SMALL_FILE_BYTES = 1024 * 1024;
-const INITIAL_TRACKER_ROWS = 32_000;
 const INITIAL_TRACKER_BYTES = 4 * 1024 * 1024;
 const INITIAL_TRACKER_FIXED_BYTES = 64 * 1024;
 const INITIAL_TRACKER_ROW_BYTES = 128;
@@ -116,10 +115,7 @@ function writeInitialCheckout(
     if (entry.mode === "160000") {
       if (trackerSeed !== null) {
         const retainedBytes = INITIAL_TRACKER_ROW_BYTES + entry.path.length * 2;
-        if (
-          trackerSeed.length === INITIAL_TRACKER_ROWS ||
-          trackerSeedBytes > INITIAL_TRACKER_BYTES - retainedBytes
-        ) {
+        if (trackerSeedBytes > INITIAL_TRACKER_BYTES - retainedBytes) {
           trackerSeed = null;
         } else {
           trackerSeed.push({ path: entry.path, flags: INITIAL_INDEX_DIRTY });

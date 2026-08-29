@@ -5,8 +5,7 @@ import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
-import { commitMaterializationSqlStatements, commitPublicationSqlStatements } from "./commit.js";
-import { type IntegrationPlan, MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ } from "./integration.js";
+import type { IntegrationPlan } from "./integration.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
 import { projectMergePlan } from "./merge-projection.js";
 import type { MergeTouchedPath } from "./merge-state.js";
@@ -27,9 +26,6 @@ export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
 export const MAX_INTEGRATION_INDEX_PATH_BYTES = MAX_TREE_BUILD_TOTAL_PATH_BYTES;
 export const MAX_INTEGRATION_TREE_OBJECTS = MAX_TREE_BUILD_OBJECTS;
 export const MAX_INTEGRATION_SERIALIZED_TREE_BYTES = MAX_TREE_BUILD_SERIALIZED_BYTES;
-export const INTEGRATION_INDEX_SQL_STATEMENTS = 48;
-export const INTEGRATION_GUARD_SQL_STATEMENTS = 300;
-export const INTEGRATION_COLLISION_SQL_STATEMENTS = 160;
 const MAX_REPOSITORY_ROWS = 50_000;
 const MAX_GUARD_HASH_BYTES = 32 * 1024 * 1024;
 export const INTEGRATION_EXECUTION_HEADROOM_BYTES = TREE_BUILD_EXECUTION_MEMORY_BYTES;
@@ -45,10 +41,6 @@ function dirtyPathLimits(): DirtyPathLimits {
     hashCandidates: 0,
     maxHashBytes: MAX_GUARD_HASH_BYTES,
     hashBytes: 0,
-    maxHashRangeReads: 64,
-    hashRangeReads: 0,
-    maxHashBatches: 10,
-    hashBatches: 0,
   };
 }
 
@@ -66,21 +58,6 @@ function indexEntry(path: string, mode: string, oid: string): IndexEntry {
     rev: null,
   };
 }
-
-export function integrationSqlStatements(plan: IntegrationPlan, treeStatements: number): number {
-  return treeStatements + plan.blobReadCalls * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
-}
-
-export const integrationCommitMaterializationSqlStatements = commitMaterializationSqlStatements;
-export const integrationCommitSqlStatements = commitPublicationSqlStatements;
-
-export const MAX_INTEGRATION_COMMIT_SQL_STATEMENTS = integrationCommitSqlStatements({
-  leafEntries: MAX_INTEGRATION_INDEX_ENTRIES,
-  totalPathBytes: MAX_INTEGRATION_INDEX_PATH_BYTES,
-  treeObjects: MAX_INTEGRATION_TREE_OBJECTS,
-  serializedTreeBytes: MAX_INTEGRATION_SERIALIZED_TREE_BYTES,
-  maxSingleTreeBytes: MAX_INTEGRATION_SERIALIZED_TREE_BYTES,
-});
 
 export function requireBoundedIntegrationTree(
   entries: Iterable<IndexEntry>,
@@ -225,12 +202,8 @@ export function requireSafeIntegrationWorktree(
     maxHashBytes: MAX_GUARD_HASH_BYTES,
     rows: 0,
     hashBytes: 0,
-    maxHashRangeReads: 30,
-    hashRangeReads: 0,
     maxHashCandidates: 1_000,
     hashCandidates: 0,
-    maxHashBatches: 1,
-    hashBatches: 0,
   };
   const blockers =
     baselineTree === undefined

@@ -220,9 +220,6 @@ const REF_MUTATION_STATE_FIXED_RETAINED_BYTES =
 export const REF_MUTATION_FIXED_RETAINED_BYTES =
   REF_MUTATION_SQL_HEADROOM_BYTES + REF_MUTATION_STATE_FIXED_RETAINED_BYTES;
 /** Conservative SQL ceiling for one direct-ref or raw-HEAD publication. */
-export const MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS = 12;
-export const MAX_FETCH_PUBLICATION_SQL_STATEMENTS = 1_000;
-export const FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS = 32;
 
 interface ConfigSectionCandidateMetadata {
   readonly path: string;
@@ -376,11 +373,6 @@ export interface FetchPublicationPlan {
   shallowRemove?: Iterable<string>;
 }
 
-export interface FetchPublicationSqlBudget {
-  chargeSql(statements?: number): void;
-  chargeReservedSql(part: string, statements?: number): void;
-}
-
 export interface RefLogEntry {
   refName: string;
   ordinal: number;
@@ -437,8 +429,6 @@ interface FetchPublicationState {
   readonly checkoutRevision: number;
   readonly budget: RefMutationBudget;
   readonly reservation: MemoryReservation;
-  readonly operationBudget: FetchPublicationSqlBudget | undefined;
-  readonly publicationSqlReservation: string | undefined;
   disposed: boolean;
 }
 
@@ -455,12 +445,6 @@ interface NormalizedFetchPublication {
   readonly refs: NormalizedRefMutation;
   readonly shallowAdd: readonly string[];
   readonly shallowRemove: readonly string[];
-}
-
-interface FetchPublicationChange {
-  readonly name: string;
-  readonly oldRaw: string | null;
-  readonly newRaw: string | null;
 }
 
 export interface IndexEntry {
@@ -1404,88 +1388,6 @@ function normalizeFetchPublication(
     shallowAdd: [...shallowAdd],
     shallowRemove: [...shallowRemove],
   };
-}
-
-function fetchPublicationExpectedTarget(state: FetchPublicationState, name: string): string | null {
-  const tracking = state.trackingRefs.get(name);
-  if (tracking !== undefined) return tracking;
-  return state.exactRefs.get(name) ?? null;
-}
-
-function* fetchPublicationChanges(
-  state: FetchPublicationState,
-  publication: NormalizedRefMutation,
-): Generator<FetchPublicationChange> {
-  for (const name of publication.deletes) {
-    const oldRaw = fetchPublicationExpectedTarget(state, name);
-    if (oldRaw !== null) yield { name, oldRaw, newRaw: null };
-  }
-  for (const [name, newRaw] of publication.puts) {
-    const oldRaw = fetchPublicationExpectedTarget(state, name);
-    if (oldRaw !== newRaw) yield { name, oldRaw, newRaw };
-  }
-}
-
-function jsonPageCount<T>(items: Iterable<T>, label: string): number {
-  let pages = 0;
-  for (const _page of jsonPages(items, label)) pages++;
-  return pages;
-}
-
-function publicationEndpointOid(raw: string | null): string | null {
-  if (raw === null) return null;
-  return isOid(raw) ? raw : "0".repeat(40);
-}
-
-function admitFetchPublicationSql(
-  state: FetchPublicationState,
-  publication: NormalizedFetchPublication,
-  metadata: RefLogMetadata,
-): number {
-  const changes = () => fetchPublicationChanges(state, publication.refs);
-  const deletes = function* (): Generator<string> {
-    for (const change of changes()) {
-      if (change.newRaw === null) yield change.name;
-    }
-  };
-  const puts = function* (): Generator<RefRow> {
-    for (const change of changes()) {
-      if (change.newRaw !== null) yield { name: change.name, target: change.newRaw };
-    }
-  };
-  const events = function* (): Generator<Omit<RefLogEvent, "ordinal"> & { ordinal: number }> {
-    for (const change of changes()) {
-      yield {
-        refName: change.name,
-        ordinal: MAX_REFLOG_ORDINAL,
-        oldRaw: change.oldRaw,
-        newRaw: change.newRaw,
-        oldOid: publicationEndpointOid(change.oldRaw),
-        newOid: publicationEndpointOid(change.newRaw),
-        actorName: metadata.actor?.name ?? null,
-        actorEmail: metadata.actor?.email ?? null,
-        timestamp: metadata.timestamp,
-        timezoneOffset: metadata.timezoneOffset,
-        reason: metadata.reason,
-      };
-    }
-  };
-  const names = function* (): Generator<string> {
-    for (const change of changes()) yield change.name;
-  };
-
-  let statements = 48;
-  statements += jsonPageCount(deletes(), "fetch SQL deletion admission");
-  statements += jsonPageCount(puts(), "fetch SQL update admission");
-  statements += jsonPageCount(events(), "fetch SQL reflog admission");
-  const namePages = jsonPageCount(names(), "fetch SQL ref-name admission");
-  statements += 3 * namePages;
-  statements += jsonPageCount(publication.shallowAdd, "fetch SQL shallow-add admission");
-  statements += jsonPageCount(publication.shallowRemove, "fetch SQL shallow-remove admission");
-  if (statements > MAX_FETCH_PUBLICATION_SQL_STATEMENTS) {
-    throw new GitError("E2BIG", `fetch publication requires up to ${statements} SQL statements`);
-  }
-  return statements;
 }
 
 function resolveRawRef(raw: string | null, lookup: (name: string) => string | null): string | null {
@@ -2826,16 +2728,8 @@ export class SharedRepoStore {
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
     reservation?: MemoryReservation,
-    operationBudget?: FetchPublicationSqlBudget,
-    publicationSqlReservation?: string,
   ): FetchPublicationToken {
-    return this.#ops().beginFetchPublication(
-      trackingPrefix,
-      candidateExactRefs,
-      reservation,
-      operationBudget,
-      publicationSqlReservation,
-    );
+    return this.#ops().beginFetchPublication(trackingPrefix, candidateExactRefs, reservation);
   }
 
   publishFetchRefs(
@@ -6140,16 +6034,8 @@ export class CheckoutStore implements IndexStore {
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
     owningReservation?: MemoryReservation,
-    operationBudget?: FetchPublicationSqlBudget,
-    publicationSqlReservation?: string,
   ): FetchPublicationToken {
     const prefix = requireFetchTrackingPrefix(trackingPrefix, "input");
-    if (
-      publicationSqlReservation !== undefined &&
-      (publicationSqlReservation === "" || operationBudget === undefined)
-    ) {
-      throw new GitError("EINVAL", "fetch publication SQL reservation is invalid");
-    }
     if (owningReservation !== undefined) {
       if (owningReservation.disposed) {
         throw new GitError("EINVAL", "fetch publication reservation is disposed");
@@ -6188,8 +6074,6 @@ export class CheckoutStore implements IndexStore {
         );
         candidates.set(name, null);
       }
-
-      operationBudget?.chargeSql(FETCH_PUBLICATION_SNAPSHOT_SQL_STATEMENTS);
 
       const snapshot = this.#db.transactionSync(() => {
         const repository = this.#db.one<{
@@ -6415,8 +6299,6 @@ export class CheckoutStore implements IndexStore {
           checkoutRevision,
           budget,
           reservation,
-          operationBudget,
-          publicationSqlReservation,
           disposed: false,
         };
         return {
@@ -6472,17 +6354,6 @@ export class CheckoutStore implements IndexStore {
     state.budget.requireSqlHeadroom();
     const normalized = normalizeFetchPublication(state, plan);
     const checkedMetadata = validateRefLogMetadata(metadata);
-    const publicationStatements = admitFetchPublicationSql(state, normalized, checkedMetadata);
-    if (state.operationBudget !== undefined) {
-      if (state.publicationSqlReservation === undefined) {
-        state.operationBudget.chargeSql(publicationStatements);
-      } else {
-        state.operationBudget.chargeReservedSql(
-          state.publicationSqlReservation,
-          publicationStatements,
-        );
-      }
-    }
     const shallowTouched = normalized.shallowAdd.length > 0 || normalized.shallowRemove.length > 0;
     const refChanged = this.#db.transactionSync(() => {
       this.#preflightFetchPublication(state, normalized.refs, shallowTouched);

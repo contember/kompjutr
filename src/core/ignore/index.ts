@@ -30,8 +30,6 @@ export const IGNORE_LIMITS = {
   querySegments: 128,
   matcherWork: 4_096,
   discoveryPage: 128,
-  discoveryStatements: 8,
-  readStatements: 8,
 };
 
 export type IgnoreLimitResource =
@@ -46,9 +44,7 @@ export type IgnoreLimitResource =
   | "wildcardSegments"
   | "queryBytes"
   | "querySegments"
-  | "matcherWork"
-  | "discoveryStatements"
-  | "readStatements";
+  | "matcherWork";
 
 /** A fail-closed resource limit from loading ignore rules. */
 export class IgnoreLimitError extends Error {
@@ -83,8 +79,6 @@ class IgnoreBudget {
   compiledBytes = 0;
   totalNfaStates = 0;
   wildcardSegments = 0;
-  discoveryStatements = 0;
-  readStatements = 0;
 
   addRaw(bytes: number, path?: string): void {
     const observed = this.rawBytes + bytes;
@@ -148,26 +142,6 @@ class IgnoreBudget {
       );
     }
     this.wildcardSegments = wildcardSegments;
-  }
-
-  beforeDiscovery(): void {
-    const observed = this.discoveryStatements + 1;
-    if (observed > IGNORE_LIMITS.discoveryStatements) {
-      throw new IgnoreLimitError(
-        "discoveryStatements",
-        IGNORE_LIMITS.discoveryStatements,
-        observed,
-      );
-    }
-    this.discoveryStatements = observed;
-  }
-
-  beforeRead(): void {
-    const observed = this.readStatements + 1;
-    if (observed > IGNORE_LIMITS.readStatements) {
-      throw new IgnoreLimitError("readStatements", IGNORE_LIMITS.readStatements, observed);
-    }
-    this.readStatements = observed;
   }
 }
 
@@ -590,7 +564,6 @@ function compileHandlePage(
 ): void {
   let remaining = [...handles];
   while (remaining.length > 0) {
-    budget.beforeRead();
     const batch = worktree.readFileHandles(remaining);
     const completed = remaining.length - batch.remaining.length;
     if (completed <= 0) throw new IgnoreLoadError("readFileHandles made no progress");
@@ -647,7 +620,6 @@ function loadRules(
   let after: RealPath | undefined;
 
   for (;;) {
-    budget.beforeDiscovery();
     const page = worktree.discoverFiles(canonicalRoot, "*/.gitignore", {
       after,
       limit: IGNORE_LIMITS.discoveryPage,

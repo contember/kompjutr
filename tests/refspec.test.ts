@@ -11,7 +11,6 @@ import {
 } from "../src/core/ops/refspec.js";
 import {
   MAX_TRANSPORT_MEMORY_BYTES,
-  MAX_TRANSPORT_SQL_STATEMENTS,
   TransportOperationBudget,
 } from "../src/core/ops/transport-budget.js";
 import { MemoryCoordinator } from "../src/sqlite/memory.js";
@@ -376,23 +375,6 @@ describe("transport operation budget", () => {
     expectCode(() => budget.setMemory("protocol", MAX_TRANSPORT_MEMORY_BYTES), "E2BIG");
     expect(budget.retainedBytes).toBe(0);
     reservation.clear("other");
-    reservation.dispose();
-    coordinator.assertIdle();
-  });
-
-  it("admits exactly 1,000 shared SQL statements", () => {
-    const { coordinator, reservation, budget } = fixture();
-    budget.reserveSql("finalization", 200);
-    expect(budget.reservedSqlStatements).toBe(200);
-    expect(budget.remainingSqlStatements).toBe(800);
-    budget.admitSql(800);
-    expect(budget.sqlStatements).toBe(0);
-    budget.chargeSql(800);
-    expectCode(() => budget.chargeSql(), "E2BIG");
-    budget.chargeReservedSql("finalization", 200);
-    expect(budget.sqlStatements).toBe(MAX_TRANSPORT_SQL_STATEMENTS);
-    expectCode(() => budget.chargeSql(), "E2BIG");
-    expectCode(() => budget.admitSql(1), "E2BIG");
     reservation.dispose();
     coordinator.assertIdle();
   });

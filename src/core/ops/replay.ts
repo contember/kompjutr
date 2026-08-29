@@ -32,10 +32,7 @@ import { writeTree } from "./plumbing.js";
 export const MAX_REPLAY_REVISION_CODE_UNITS = 1_024;
 export const MAX_REPLAY_REVISION_HOPS = 32;
 export const MAX_REPLAY_TAG_HOPS = 16;
-// Covers bounded revision/tag peeling and authoritative commit-object reads.
-export const MAX_REPLAY_METADATA_SQL_STATEMENTS = 256;
 export const MAX_REPLAY_PREFLIGHT_BYTES = 32 * 1024 * 1024;
-export const MAX_REPLAY_PREFLIGHT_READ_CALLS = MAX_REPLAY_PREFLIGHT_BYTES / MAX_BLOB_BATCH_BYTES;
 export const REPLAY_PREFLIGHT_HEADROOM_BYTES = 16 * 1024 * 1024;
 export const MAX_REPLAY_PLAN_METADATA_BYTES = 8 * 1024 * 1024;
 const MAX_REPLAY_PREFLIGHT_INPUT_OIDS = MAX_OPERATION_STEPS * 2 + 1;
@@ -81,8 +78,6 @@ export interface ReplayPlan {
   integration: IntegrationPlan;
   /** Replay metadata retained beside the integration plan. */
   retainedBytes: number;
-  /** Conservative metadata work, excluding the integration plan's own reads. */
-  sqlStatements: number;
 }
 
 export interface ReplaySnapshotOptions {
@@ -185,8 +180,6 @@ function readCommit(repo: Repository, oid: string): Commit {
 
 export interface ReplayCommitPreflight {
   bytes: number;
-  readCalls: number;
-  sqlStatements: number;
 }
 
 /** Validate every source commit before a sequencer creates durable state. */
@@ -221,11 +214,9 @@ function preflightReplayCommitObjectsInternal(
     );
   }
   let bytes = 0;
-  let metadataCalls = 0;
   for (let offset = 0; offset < unique.length; offset += MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE) {
     const page = unique.slice(offset, offset + MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE);
     const info = repo.store.objectInfo(page);
-    metadataCalls++;
     for (let ordinal = 0; ordinal < info.length; ordinal++) {
       const object = info[ordinal];
       const oid = page[ordinal];
@@ -245,16 +236,9 @@ function preflightReplayCommitObjectsInternal(
       bytes += object.size;
     }
   }
-  let readCalls = 0;
   for (let offset = 0; offset < unique.length; offset += MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE) {
     let remaining = unique.slice(offset, offset + MAX_REPLAY_PREFLIGHT_OIDS_PER_PAGE);
     while (remaining.length > 0) {
-      if (readCalls >= MAX_REPLAY_PREFLIGHT_READ_CALLS) {
-        throw new GitError(
-          "E2BIG",
-          `replay source commits require more than ${MAX_REPLAY_PREFLIGHT_READ_CALLS} reads`,
-        );
-      }
       const batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
       if (batch.objects.size === 0 || batch.remaining.length >= remaining.length) {
         throw new CorruptError("replay commit preflight made no progress");
@@ -270,10 +254,9 @@ function preflightReplayCommitObjectsInternal(
         parseReplayCommit(object.data);
       }
       remaining = batch.remaining;
-      readCalls++;
     }
   }
-  return { bytes, readCalls, sqlStatements: metadataCalls + readCalls * 8 };
+  return { bytes };
 }
 
 function peelCommit(repo: Repository, start: string, operation: string): string {
@@ -749,7 +732,6 @@ function planReplayInternal(
     labels,
     integration,
     retainedBytes,
-    sqlStatements: MAX_REPLAY_METADATA_SQL_STATEMENTS,
   };
 }
 

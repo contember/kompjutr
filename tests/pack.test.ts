@@ -30,53 +30,10 @@ import {
   MAX_PACK_DELETE_BATCH,
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_CHUNK,
-  type PackIngestSqlBudget,
 } from "../src/sqlite/packs.js";
 import { CheckoutStore, SharedRepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
-
-class TestPackIngestSqlBudget implements PackIngestSqlBudget {
-  charged = 0;
-  readonly #reservations = new Map<string, number>();
-
-  constructor(readonly limit = Number.MAX_SAFE_INTEGER) {}
-
-  get reserved(): number {
-    let statements = 0;
-    for (const reserved of this.#reservations.values()) statements += reserved;
-    return statements;
-  }
-
-  chargeSql(statements = 1): void {
-    if (statements > this.limit - this.charged - this.reserved) {
-      throw new GitError("E2BIG", "test pack SQL budget exceeded");
-    }
-    this.charged += statements;
-  }
-
-  reserveSql(part: string, statements: number): void {
-    const previous = this.#reservations.get(part) ?? 0;
-    if (statements > this.limit - this.charged - (this.reserved - previous)) {
-      throw new GitError("E2BIG", "test pack SQL budget exceeded");
-    }
-    if (statements === 0) this.#reservations.delete(part);
-    else this.#reservations.set(part, statements);
-  }
-
-  chargeReservedSql(part: string, statements = 1): void {
-    const reserved = this.#reservations.get(part) ?? 0;
-    if (statements > reserved) throw new GitError("E2BIG", "test pack SQL budget exceeded");
-    const remaining = reserved - statements;
-    if (remaining === 0) this.#reservations.delete(part);
-    else this.#reservations.set(part, remaining);
-    this.charged += statements;
-  }
-
-  releaseSql(part: string): void {
-    this.#reservations.delete(part);
-  }
-}
 
 class ReorderedRangeDatabase implements SqlDatabase {
   constructor(readonly inner: TestDatabase) {}
@@ -349,7 +306,7 @@ async function sharedOversizedDeltaFixture(
   const baseOid = hashObject("blob", base);
   const basePack = await store.packs.ingest(slices(singleBlobPack(base), 64 * 1024));
   const targetSize = 2 * 1024 * 1024 + 64 * 1024;
-  const count = 22;
+  const count = 33;
   const chunks: Uint8Array[] = [];
   const writer = new PackWriter((chunk) => chunks.push(chunk));
   writer.header(count);
@@ -594,114 +551,6 @@ describe("delta", () => {
 });
 
 describe("synthetic pack ingest", () => {
-  it("charges every pack ingest SQL statement before execution", async () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const data = utf8.encode("pack SQL accounting\n");
-
-    db.storage.resetCounters();
-    const success = new TestPackIngestSqlBudget();
-    await store.packs.ingest(slices(singleBlobPack(data), 7), { sqlBudget: success });
-    expect(success.charged).toBe(db.storage.statementCount);
-
-    const corrupt = singleBlobPack(utf8.encode("pack SQL cleanup accounting\n"));
-    corrupt[corrupt.length - 1] = (corrupt.at(-1) ?? 0) ^ 0xff;
-    db.storage.resetCounters();
-    const failure = new TestPackIngestSqlBudget();
-    await expect(store.packs.ingest(slices(corrupt, 7), { sqlBudget: failure })).rejects.toThrow(
-      /checksum/,
-    );
-    expect(failure.charged).toBe(db.storage.statementCount);
-    const beforeReclaim = failure.charged;
-    db.storage.resetCounters();
-    await store.packs.ingest(slices(singleBlobPack(utf8.encode("after pending reclaim\n")), 7), {
-      sqlBudget: failure,
-    });
-    expect(failure.charged - beforeReclaim).toBe(db.storage.statementCount);
-    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta WHERE state = 'pending'")).toBe(0);
-
-    const twoExchangeDb = new TestDatabase();
-    const twoExchangeDatabase = new SqliteGitDatabase(twoExchangeDb);
-    const twoExchange = twoExchangeDatabase.openCheckout(
-      twoExchangeDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const shared = new TestPackIngestSqlBudget();
-    twoExchangeDb.storage.resetCounters();
-    await twoExchange.packs.ingest(slices(singleBlobPack(data), 7), { sqlBudget: shared });
-    await twoExchange.packs.ingest(
-      slices(singleBlobPack(utf8.encode("legacy fallback exchange\n")), 7),
-      { sqlBudget: shared },
-    );
-    expect(shared.charged).toBe(twoExchangeDb.storage.statementCount);
-
-    const admittedDb = new TestDatabase();
-    const admittedDatabase = new SqliteGitDatabase(admittedDb);
-    const admitted = admittedDatabase.openCheckout(
-      admittedDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    admittedDb.storage.resetCounters();
-    const exact = new TestPackIngestSqlBudget(success.charged);
-    await admitted.packs.ingest(slices(singleBlobPack(data), 7), { sqlBudget: exact });
-    expect(exact.charged).toBe(success.charged);
-    expect(admittedDb.storage.statementCount).toBe(exact.charged);
-    expect(exact.reserved).toBe(0);
-
-    const rejectedDb = new TestDatabase();
-    const rejectedDatabase = new SqliteGitDatabase(rejectedDb);
-    const rejected = rejectedDatabase.openCheckout(
-      rejectedDatabase.createRepository("/repo", "ref: refs/heads/main"),
-    );
-    const rejectedReservation = rejected.reserveMemory();
-    rejectedDb.storage.resetCounters();
-    const firstExcess = new TestPackIngestSqlBudget(success.charged - 1);
-    await expect(
-      rejected.packs.ingest(slices(singleBlobPack(data), 7), {
-        reservation: rejectedReservation,
-        sqlBudget: firstExcess,
-      }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
-    expect(firstExcess.charged).toBe(success.charged - 1);
-    expect(rejectedDb.storage.statementCount).toBe(firstExcess.charged);
-    expect(firstExcess.reserved).toBe(0);
-    expect(rejectedReservation.currentBytes).toBe(0);
-    expect(
-      rejectedDb.one<{ active_pack_id: number | null; expires_ms: number | null }>(
-        "SELECT active_pack_id, expires_ms FROM git_pack_ingest_control WHERE repo_id = ?",
-        rejected.repoId,
-      ),
-    ).toEqual({ active_pack_id: null, expires_ms: null });
-    expect(
-      rejectedDb.scalar<number>(
-        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'pending'",
-        rejected.repoId,
-      ),
-    ).toBe(1);
-
-    rejectedDb.storage.resetCounters();
-    const afterExcess = new TestPackIngestSqlBudget();
-    await rejected.packs.ingest(
-      slices(singleBlobPack(utf8.encode("after exhausted cleanup\n")), 7),
-      { reservation: rejectedReservation, sqlBudget: afterExcess },
-    );
-    expect(afterExcess.charged).toBe(rejectedDb.storage.statementCount);
-    expect(afterExcess.reserved).toBe(0);
-    expect(rejectedReservation.currentBytes).toBe(0);
-    expect(
-      rejectedDb.scalar<number>(
-        "SELECT count(*) FROM git_pack_meta WHERE repo_id = ? AND state = 'pending'",
-        rejected.repoId,
-      ),
-    ).toBe(0);
-    rejectedReservation.dispose();
-    const rejectedProbe = rejected.reserveMemory();
-    try {
-      rejectedProbe.set("other", MAX_OPERATION_MEMORY_BYTES);
-    } finally {
-      rejectedProbe.dispose();
-    }
-  });
-
   it("composes ingest memory under one repository-owned operation reservation", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
@@ -2039,43 +1888,86 @@ describe("pack fallback preservation", () => {
     expect(compressedDb.storage.statementCount).toBeLessThan(10);
   });
 
-  it("shares the cold dependency-read budget across packed-source pages", async () => {
+  it("authenticates beyond the former 180 uncached dependency-read limit", async () => {
     const store = open();
     const fixture = await sharedOversizedDeltaFixture(store);
     const db = store.db;
     if (!(db instanceof TestDatabase)) throw new Error("expected test database");
+    const baseSource = db.one<{ data_off: number; data_len: number }>(
+      "SELECT data_off, data_len FROM git_pack_entries WHERE repo_id = ? AND pack_id = ? AND oid = ?",
+      store.sharedRepoId,
+      fixture.basePackId,
+      fixture.baseOid,
+    );
+    if (baseSource === undefined) throw new Error("shared delta base source disappeared");
+    let formerReadsPerPage = 0;
+    for (let consumed = 0; consumed < baseSource.data_len; consumed += PACK_CHUNK) {
+      const window = Math.min(PACK_CHUNK, baseSource.data_len - consumed);
+      const first = Math.floor((baseSource.data_off + consumed) / PACK_CHUNK);
+      const last = Math.floor((baseSource.data_off + consumed + window - 1) / PACK_CHUNK);
+      formerReadsPerPage += last - first + 1;
+    }
+    expect(formerReadsPerPage).toBe(9);
+    const firstExcessPages = Math.floor(180 / formerReadsPerPage) + 1;
+    const authenticated = fixture.targets.slice(0, firstExcessPages);
+    const priorReads = formerReadsPerPage * (firstExcessPages - 1);
+    const admittedReads = formerReadsPerPage * firstExcessPages;
+    expect(firstExcessPages).toBe(21);
+    expect(authenticated).toHaveLength(21);
+    expect(priorReads).toBe(180);
+    expect(priorReads + 1).toBe(181);
+    expect(admittedReads).toBe(189);
     db.storage.resetCounters();
 
-    expect(() =>
-      store.packs.authenticateCompleteSources(
-        fixture.targets.map((target) => ({ ...target, packId: fixture.deltaPackId })),
-      ),
-    ).toThrow(/uncached row-read limit/);
-    expect(db.storage.statementCount).toBeLessThan(1_000);
+    store.packs.authenticateCompleteSources(
+      authenticated.map((target) => ({ ...target, packId: fixture.deltaPackId })),
+    );
+    expect(fixture.targets).toHaveLength(33);
+    expect(db.storage.statementCount).toBeGreaterThan(0);
     expect(store.packs.completePackedEntry(fixture.baseOid)?.packId).toBe(fixture.basePackId);
     for (const target of fixture.targets) {
       expect(store.packs.completePackedEntry(target.oid)?.packId).toBe(fixture.deltaPackId);
     }
+    expect(store.packs.completePackMatches(fixture.deltaPackId, fixture.targets)).toBe(true);
   });
 
-  it("rolls fallback promotion back when pages repeat one oversized dependency", async () => {
+  it("promotes fallbacks on the former 33rd audit page", async () => {
     const store = open();
     const fixture = await sharedOversizedDeltaFixture(store);
     const fallback = await store.packs.ingest(slices(fixture.deltaBytes, 64 * 1024));
     const db = store.db;
     if (!(db instanceof TestDatabase)) throw new Error("expected test database");
+    const reopened = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
+    const checkout = reopened.findCheckout("/repo");
+    if (checkout === null) throw new Error("shared fallback repository disappeared");
+    const cold = reopened.openCheckout(checkout);
     db.storage.resetCounters();
 
-    expect(() => store.packs.deleteCompletePacks([fixture.deltaPackId])).toThrow(
-      /uncached row-read limit/,
+    expect(cold.packs.deleteCompletePacks([fixture.deltaPackId])).toBe(1);
+    expect(fixture.targets).toHaveLength(33);
+    expect(fixture.targets.every((target) => target.size > MAX_PACK_BLOB_BATCH_BYTES / 2)).toBe(
+      true,
     );
-    expect(db.storage.statementCount).toBeLessThan(1_000);
-    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(3);
-    expect(store.packs.completePackedEntry(fixture.baseOid)?.packId).toBe(fixture.basePackId);
-    for (const target of fixture.targets) {
-      expect(store.packs.completePackedEntry(target.oid)?.packId).toBe(fixture.deltaPackId);
+    expect(db.storage.statementCount).toBeGreaterThan(0);
+    expect(db.scalar<number>("SELECT count(*) FROM git_pack_meta")).toBe(2);
+    expect(cold.packs.completePackedEntry(fixture.baseOid)?.packId).toBe(fixture.basePackId);
+    for (let start = 0; start < fixture.targets.length; start += 22) {
+      cold.packs.authenticateCompleteSources(
+        fixture.targets
+          .slice(start, start + 22)
+          .map((target) => ({ ...target, packId: fallback.packId })),
+      );
     }
-    expect(store.packs.completePackMatches(fallback.packId, fixture.targets)).toBe(true);
+    for (const target of fixture.targets) {
+      expect(cold.packs.completePackedEntry(target.oid)?.packId).toBe(fallback.packId);
+    }
+    expect(cold.packs.completePackMatches(fallback.packId, fixture.targets)).toBe(true);
+    for (const index of [0, fixture.targets.length - 1]) {
+      const target = fixture.targets[index]!;
+      expect(cold.packs.readAuthenticatedObject(target.oid, target.type)?.data).toEqual(
+        fixture.base.subarray(index * 4096, index * 4096 + target.size),
+      );
+    }
   });
 
   it("rejects an oversized streamed delta before reading padded ranges", async () => {
@@ -2111,7 +2003,7 @@ describe("pack fallback preservation", () => {
     expect(db.storage.statementCount).toBeLessThan(15);
   });
 
-  it("audits one thousand thin fallback deltas below the statement ceiling", async () => {
+  it("audits one thousand thin fallback deltas before enforcing dependency safety", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -2144,10 +2036,9 @@ describe("pack fallback preservation", () => {
     expect(() => cold.packs.deleteCompletePacks([primary.packId])).toThrow(
       /required by a surviving delta chain/,
     );
-    expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("fails closed below the statement ceiling when fallback pack fanout is too large", async () => {
+  it("fails closed when fallback pack fanout exceeds its structural limit", async () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db, { objectCacheBytes: 0 });
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
@@ -2170,7 +2061,6 @@ describe("pack fallback preservation", () => {
     expect(() => cold.packs.deleteCompletePacks([primary.packId])).toThrow(
       /fallback pack audit exceeds its pack limit/,
     );
-    expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
   it("repairs only promoted tree and commit projections across a cold reopen", async () => {

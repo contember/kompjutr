@@ -8,7 +8,6 @@ import {
   diff as coreDiff,
   DIFF_COMBINED_MAX_LINES,
   DIFF_COMBINED_MAX_MEMORY_BYTES,
-  DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS,
   DIFF_MAX_OUTPUT_BYTES,
   diffHeaderPath,
 } from "../src/core/ops/diff.js";
@@ -672,12 +671,12 @@ describe("plain git diff semantics and cumulative bounds", () => {
     );
   });
 
-  it("bounds index-worktree source rows at the exact limit and first excess", async () => {
+  it("continues index-worktree diff after the former 100,000-row scan ceiling", async () => {
     const fixture = new GitFixture().init();
     fixtures.push(fixture);
     fixture.write("z-tracked.txt", "tracked\n").commit("base");
     const workspace = await importAt(fixture);
-    const untracked = DIFF_INDEX_WORKTREE_MAX_SCAN_ROWS - 1;
+    const untracked = 99_999;
     workspace.storage.db.exec(`
       WITH RECURSIVE sequence(i) AS (
         VALUES (0) UNION ALL SELECT i + 1 FROM sequence WHERE i + 1 < ${untracked}
@@ -691,10 +690,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
       SELECT printf('/repo/u-%06d.txt', i), '/repo', 2000000 + i FROM sequence;
     `);
 
-    workspace.storage.resetCounters();
     expect(nativeRun(workspace, ["diff"])).toEqual({ stdout: "", stderr: "", exitCode: 0 });
-    const exactStatements = workspace.storage.statementCount;
-    expect(exactStatements).toBe(108);
 
     workspace.storage.db.exec(`
       INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
@@ -702,11 +698,7 @@ describe("plain git diff semantics and cumulative bounds", () => {
       INSERT INTO fs_paths (path, parent, inode)
       VALUES ('/repo/u-999999.txt', '/repo', 2100000);
     `);
-    workspace.storage.resetCounters();
-    expect(() => nativeRun(workspace, ["diff"])).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(workspace.storage.statementCount).toBe(107);
+    expect(nativeRun(workspace, ["diff"])).toEqual({ stdout: "", stderr: "", exitCode: 0 });
   });
 });
 

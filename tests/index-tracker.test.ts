@@ -223,13 +223,35 @@ describe("index tracker", () => {
     expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
   });
 
-  it("bounds total dirty rows and pages with rollback and fail-closed reads", () => {
+  it("streams and reseals past the former dirty-row and page ceilings", () => {
     const db = setup();
     addRepository(db, 1, "/repo");
     function* entries(count: number): Generator<{ path: string; flags: number }> {
       for (let index = 0; index < count; index++) {
-        yield { path: `p/${index.toString().padStart(5, "0")}`, flags: INDEX_DIRTY };
+        yield { path: `p/${index.toString().padStart(5, "0")}`, flags: (index % 3) + 1 };
       }
+    }
+    function inspect(
+      source: TestDatabase,
+      count: number,
+      pageRows?: number,
+    ): {
+      count: number;
+      first: { path: string; flags: number } | undefined;
+      middle: { path: string; flags: number } | undefined;
+      last: { path: string; flags: number } | undefined;
+    } {
+      let seen = 0;
+      let first: { path: string; flags: number } | undefined;
+      let middle: { path: string; flags: number } | undefined;
+      let last: { path: string; flags: number } | undefined;
+      for (const entry of iterateIndexTrackerDirty(source, 1, pageRows)) {
+        if (seen === 0) first = entry;
+        if (seen === Math.floor(count / 2)) middle = entry;
+        last = entry;
+        seen++;
+      }
+      return { count: seen, first, middle, last };
     }
 
     expect(resealIndexTracker(db, 1, TREE, entries(32_000))).toBe(true);
@@ -237,17 +259,61 @@ describe("index tracker", () => {
     for (const _entry of iterateIndexTrackerDirty(db, 1)) count++;
     expect(count).toBe(32_000);
 
-    expect(() => resealIndexTracker(db, 1, OTHER_TREE, entries(32_001))).toThrowError(
-      /too many dirty rows/,
-    );
-    expect(readIndexTrackerState(db, 1)).toEqual({ available: true, baselineTreeOid: TREE });
+    expect(resealIndexTracker(db, 1, OTHER_TREE, entries(32_001))).toBe(true);
+    expect(readIndexTrackerState(db, 1)).toEqual({
+      available: true,
+      baselineTreeOid: OTHER_TREE,
+    });
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_index_dirty WHERE checkout_id = 1")).toBe(
-      32_000,
+      32_001,
     );
+    expect(inspect(db, 32_001)).toEqual({
+      count: 32_001,
+      first: { path: "p/00000", flags: 1 },
+      middle: { path: "p/16000", flags: 2 },
+      last: { path: "p/32000", flags: 3 },
+    });
+    const largeEpoch = db.scalar<number>(
+      "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
+      sharedId(1),
+    );
+    if (largeEpoch === undefined) throw new Error("missing large tracker root epoch");
 
-    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, 'z', 1)");
-    expect(() => [...iterateIndexTrackerDirty(db, 1)]).toThrowError(/too many dirty rows/);
-    expect(() => [...iterateIndexTrackerDirty(db, 1, 1)]).toThrowError(/page limit/);
+    const cold = new TestDatabase(db.storage);
+    expect(readIndexTrackerState(cold, 1)).toEqual({
+      available: true,
+      baselineTreeOid: OTHER_TREE,
+    });
+    expect(inspect(cold, 32_001)).toEqual({
+      count: 32_001,
+      first: { path: "p/00000", flags: 1 },
+      middle: { path: "p/16000", flags: 2 },
+      last: { path: "p/32000", flags: 3 },
+    });
+    expect(
+      cold.scalar<number>(
+        "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
+        sharedId(1),
+      ),
+    ).toBe(largeEpoch);
+
+    expect(resealIndexTracker(cold, 1, TREE, entries(513))).toBe(true);
+    expect(inspect(cold, 513, 1)).toEqual({
+      count: 513,
+      first: { path: "p/00000", flags: 1 },
+      middle: { path: "p/00256", flags: 2 },
+      last: { path: "p/00512", flags: 3 },
+    });
+    expect(readIndexTrackerState(cold, 1)).toEqual({
+      available: true,
+      baselineTreeOid: TREE,
+    });
+    expect(
+      cold.scalar<number>(
+        "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
+        sharedId(1),
+      ),
+    ).toBe(largeEpoch + 1);
   });
 
   it("journals semantic and stat-only index mutations with distinct bits", () => {

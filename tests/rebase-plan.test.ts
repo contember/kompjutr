@@ -95,15 +95,12 @@ describe("bounded rebase planner", () => {
   it("matches Git's oldest-first selection for a divergent linear branch without mutation", () => {
     const { fixture, base, current, upstream, sources } = divergentFixture();
     try {
-      const { db, store, repo } = harness();
+      const { store, repo } = harness();
       importCommits(store, fixture, [current, upstream]);
       store.setRef("refs/heads/main", current);
       store.setRef("refs/heads/upstream", upstream);
       const before = snapshot(store);
-      db.storage.resetCounters();
-
       const plan = planRebase(repo, { upstream: "upstream~0", currentOid: current });
-      const statements = db.storage.statementCount;
 
       expect(fixture.git("merge-base", current, upstream)).toBe(base);
       expect(plan).toMatchObject({
@@ -127,8 +124,6 @@ describe("bounded rebase planner", () => {
         })),
       );
       expect(plan.retainedBytes).toBeGreaterThan(0);
-      expect(statements).toBeLessThanOrEqual(plan.sqlStatements);
-      expect(plan.sqlStatements).toBeLessThan(1_000);
       expect(snapshot(store)).toEqual(before);
     } finally {
       fixture.dispose();

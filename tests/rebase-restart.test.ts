@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { fromHex } from "../src/core/bytes.js";
 import type { GitContext } from "../src/core/context.js";
 import { serializeCommit, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
@@ -16,20 +17,19 @@ import {
   rebaseContinue,
   rebaseSkip,
 } from "../src/core/ops/rebase.js";
-import {
-  calculateRebaseBaselineSqlStatements,
-  calculateRebaseJournalSqlStatements,
-  calculateRebaseTransitionSqlStatements,
-} from "../src/core/ops/rebase-lifecycle.js";
+import { preflightReplayCommitObjects } from "../src/core/ops/replay.js";
 import { add } from "../src/core/ops/staging.js";
 import { status } from "../src/core/ops/status.js";
 import { worktreeAdd } from "../src/core/ops/worktrees.js";
 import { Repository } from "../src/core/repository.js";
+import type { Worktree } from "../src/core/worktree.js";
+import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 const fixtures: GitFixture[] = [];
 
@@ -85,6 +85,29 @@ function reopenBThenA(
   if (aRow === null) throw new Error("reopened checkout A is missing");
   const a = new Repository(database.openCheckout(aRow));
   return { context: { ...workspace.context, database }, a, b };
+}
+
+class LateMetadataWorktree extends CountingWorktree {
+  scanCalls = 0;
+
+  constructor(
+    inner: Worktree,
+    private readonly cleanContentId: Uint8Array,
+  ) {
+    super(inner);
+  }
+
+  override scan(root: string, options: ScanOptions): ScanEntry[] {
+    const page = super.scan(root, options);
+    this.scanCalls++;
+    return page.map((entry) =>
+      entry.path === "/guard.bin"
+        ? this.scanCalls <= 2
+          ? { ...entry, contentId: this.cleanContentId }
+          : { ...entry, mtime: entry.mtime + 1, rev: entry.rev + 1, contentId: null }
+        : entry,
+    );
+  }
 }
 
 function history(
@@ -207,18 +230,42 @@ async function suspendedMultiCheckout(): Promise<{
 }
 
 describe("rebase restart recovery", () => {
-  it("accepts transition statement 999 and saturates statement 1000", () => {
-    expect(calculateRebaseTransitionSqlStatements(800, 100, 99)).toBe(999);
-    expect(calculateRebaseTransitionSqlStatements(800, 100, 100)).toBe(1_000);
-    expect(
-      calculateRebaseJournalSqlStatements(4_096, 1_000, 4 * 1024 * 1024, "replace"),
-    ).toBeLessThan(1_000);
-    expect(calculateRebaseJournalSqlStatements(4_097, 0, 0, "create")).toBe(1_000);
-    expect(calculateRebaseBaselineSqlStatements(4_096, 32 * 1024 * 1024)).toBeLessThan(1_000);
-    expect(calculateRebaseBaselineSqlStatements(4_097, 0)).toBe(1_000);
+  it("authenticates replay commits after more than eight progressing object reads", () => {
+    const workspace = makeRepo("/");
+    const tree = workspace.repo.store.write("tree", serializeTree([]));
+    const sourceOids: string[] = [];
+    const message = "x".repeat(900 * 1024);
+    for (let ordinal = 0; ordinal < 33; ordinal++) {
+      sourceOids.push(
+        workspace.repo.store.write(
+          "commit",
+          serializeCommit({
+            tree,
+            parent: [],
+            author: PERSON,
+            committer: PERSON,
+            message: `${ordinal}\n${message}\n`,
+          }),
+        ),
+      );
+    }
+    const before = workspace.repo.store.objectCount();
+    const readObjects = workspace.repo.readObjects.bind(workspace.repo);
+    let readCalls = 0;
+    workspace.repo.readObjects = (oids, options) => {
+      readCalls++;
+      return readObjects(oids, options);
+    };
+
+    const result = preflightReplayCommitObjects(workspace.repo, sourceOids);
+
+    expect(readCalls).toBeGreaterThan(8);
+    expect(result.bytes).toBeGreaterThan(28 * 1024 * 1024);
+    expect(workspace.repo.store.objectCount()).toBe(before);
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
-  it("keeps an actual maximum-entry replay transition below 1000 SQL statements", async () => {
+  it("completes an actual maximum-entry replay transition", async () => {
     const source = fixture();
     source.write("base.txt", "base\n");
     const base = source.commit("base");
@@ -231,24 +278,150 @@ describe("rebase restart recovery", () => {
     }
     source.commit("maximum integration entries");
     const workspace = await imported(source);
-    const originalTransaction = workspace.storage.transactionSync.bind(workspace.storage);
-    const transitionStatements: number[] = [];
-    workspace.storage.transactionSync = function transactionSync<T>(closure: () => T): T {
-      const before = workspace.storage.statementCount;
-      return originalTransaction(() => {
-        try {
-          return closure();
-        } finally {
-          transitionStatements.push(workspace.storage.statementCount - before);
-        }
-      });
-    };
+    const result = rebase(workspace.context, workspace.repo, workspace.worktree, { upstream });
+    expect(result).toMatchObject({ outcome: "completed", replayed: 1 });
+    if (result.outcome !== "completed") throw new Error("maximum-entry rebase did not complete");
+    expect(workspace.repo.head().oid).toBe(result.oid);
+  });
+
+  it("recovers the former first-excess rebase across two valid large baselines", async () => {
+    const source = fixture();
+    source.write("conflict.txt", "base\n");
+    const base = source.commit("base");
+    const baselineSizes = [4 * 1024 * 1024, 4 * 1024 * 1024, 1];
+
+    source.git("checkout", "-q", "-b", "upstream", base);
+    for (const [ordinal, size] of baselineSizes.entries()) {
+      source.write(`upstream-${ordinal}.bin`, new Uint8Array(size).fill(0x75 + ordinal));
+    }
+    source.write("conflict.txt", "upstream\n");
+    const upstream = source.commit("upstream");
+    const upstreamBlobs = baselineSizes.map((_, ordinal) => ({
+      path: `upstream-${ordinal}.bin`,
+      oid: source.git("rev-parse", `upstream:upstream-${ordinal}.bin`),
+    }));
+
+    source.git("checkout", "-q", "-b", "current", base);
+    for (const [ordinal, size] of baselineSizes.entries()) {
+      source.write(`current-${ordinal}.bin`, new Uint8Array(size).fill(0x63 + ordinal));
+    }
+    source.write("conflict.txt", "current\n");
+    source.commit("current");
+    const currentBlobs = baselineSizes.map((_, ordinal) => ({
+      path: `current-${ordinal}.bin`,
+      oid: source.git("rev-parse", `current:current-${ordinal}.bin`),
+    }));
+    const workspace = await imported(source);
 
     expect(
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
-    ).toMatchObject({ outcome: "completed", replayed: 1 });
-    expect(transitionStatements.length).toBeGreaterThanOrEqual(3);
-    expect(Math.max(...transitionStatements)).toBeLessThan(1_000);
+    ).toMatchObject({ outcome: "conflicted", replayed: 0 });
+    const cold = reopen(workspace);
+    expect(cold.repo.checkout.requireOperationState("rebase").state.phase).toBe("conflicted");
+    for (const expected of [...upstreamBlobs, ...currentBlobs]) {
+      expect(cold.repo.checkout.indexGet(expected.path)?.oid).toBe(expected.oid);
+    }
+
+    writeWorkFile(workspace, "/conflict.txt", "resolved\n");
+    add(cold.repo, workspace.worktree, { paths: ["conflict.txt"] });
+    const result = rebaseContinue(cold.context, cold.repo, workspace.worktree);
+
+    expect(result).toMatchObject({ outcome: "completed", replayed: 1 });
+    if (result.outcome !== "completed") throw new Error("large-baseline rebase did not complete");
+    const durable = reopen(workspace);
+    expect(durable.repo.head().oid).toBe(result.oid);
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
+    for (const expected of [...upstreamBlobs, ...currentBlobs]) {
+      expect(durable.repo.checkout.indexGet(expected.path)?.oid).toBe(expected.oid);
+    }
+    expect(workspace.worktree.readFile("/conflict.txt")).toEqual(
+      new TextEncoder().encode("resolved\n"),
+    );
+  });
+
+  it("aborts the former first-excess rebase recovery after a cold reopen", async () => {
+    const source = fixture();
+    source.write("conflict.txt", "base\n");
+    const stableSizes = [
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      4 * 1024 * 1024,
+      1,
+    ];
+    for (const [ordinal, size] of stableSizes.entries()) {
+      source.write(`stable-${ordinal}.bin`, new Uint8Array(size).fill(0x31 + ordinal));
+    }
+    const base = source.commit("base");
+
+    source.git("checkout", "-q", "-b", "upstream", base);
+    source.write("conflict.txt", "upstream\n");
+    const upstream = source.commit("upstream");
+
+    source.git("checkout", "-q", "-b", "current", base);
+    source.write("conflict.txt", "current\n");
+    const current = source.commit("current");
+    const stable = stableSizes.map((size, ordinal) => ({
+      path: `stable-${ordinal}.bin`,
+      size,
+      oid: source.git("rev-parse", `current:stable-${ordinal}.bin`),
+    }));
+    const conflictOid = source.git("rev-parse", "current:conflict.txt");
+    const workspace = await imported(source);
+
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
+    ).toMatchObject({ outcome: "conflicted", replayed: 0 });
+    const cold = reopen(workspace);
+    const journal = cold.repo.checkout.requireOperationState("rebase");
+    expect(journal.steps).toHaveLength(1);
+    expect(journal.touched).toHaveLength(1);
+    expect(journal.retainedBytes).toBeGreaterThan(0);
+    expect(journal.retainedBytes).toBeLessThan(1024 * 1024);
+
+    rebaseAbort(cold.repo, workspace.worktree);
+
+    const durable = reopen(workspace);
+    expect(durable.repo.head()).toEqual({ ref: "refs/heads/current", oid: current });
+    expect(durable.repo.checkout.readOperationState()).toBeNull();
+    expect(durable.repo.checkout.indexGet("conflict.txt")?.oid).toBe(conflictOid);
+    expect(workspace.worktree.readFile("/conflict.txt")).toEqual(
+      new TextEncoder().encode("current\n"),
+    );
+    for (const expected of stable) {
+      expect(durable.repo.checkout.indexGet(expected.path)?.oid).toBe(expected.oid);
+      expect(workspace.worktree.stat(`/${expected.path}`)).toMatchObject({
+        size: expected.size,
+        contentId: fromHex(expected.oid),
+      });
+    }
+  });
+
+  it("fast-forwards after the rebase guard's former 65th range read", async () => {
+    const source = fixture();
+    const bytes = 4 * 1024 * 1024 + 1;
+    const baseBytes = new Uint8Array(bytes).fill(0x62);
+    const targetBytes = new Uint8Array(bytes).fill(0x74);
+    source.write("guard.bin", baseBytes);
+    const base = source.commit("base");
+    source.write("guard.bin", targetBytes);
+    const upstream = source.commit("upstream");
+    source.git("checkout", "-q", "-b", "behind", base);
+    const workspace = await imported(source);
+    const guard = workspace.repo.checkout.indexGet("guard.bin");
+    if (guard === null) throw new Error("guard index entry is missing");
+    const worktree = new LateMetadataWorktree(workspace.worktree, fromHex(guard.oid));
+
+    const result = rebase(workspace.context, workspace.repo, worktree, { upstream });
+
+    expect(result).toMatchObject({ outcome: "completed", replayed: 0, fastForward: true });
+    expect(worktree.rangeReads).toBe(65);
+    expect(workspace.repo.head().oid).toBe(upstream);
+    expect(workspace.worktree.readFile("/guard.bin")).toEqual(targetBytes);
+    expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });
 
   it("preflights the exact maximum replay queue before creating its journal", () => {
@@ -288,18 +461,6 @@ describe("rebase restart recovery", () => {
       );
     }
     workspace.repo.store.setRef("refs/heads/main", current);
-    const originalTransaction = workspace.storage.transactionSync.bind(workspace.storage);
-    const transitionStatements: number[] = [];
-    workspace.storage.transactionSync = function transactionSync<T>(closure: () => T): T {
-      const before = workspace.storage.statementCount;
-      return originalTransaction(() => {
-        try {
-          return closure();
-        } finally {
-          transitionStatements.push(workspace.storage.statementCount - before);
-        }
-      });
-    };
     const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
       workspace.repo.checkout,
     );
@@ -315,7 +476,6 @@ describe("rebase restart recovery", () => {
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("maximum replay journal seam");
     expect(reachedJournal).toBe(true);
-    expect(Math.max(...transitionStatements)).toBeLessThan(1_000);
     expect(workspace.repo.head().oid).toBe(current);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
   });

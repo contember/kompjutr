@@ -7,14 +7,8 @@ import type { Repository, ResolvedHead } from "../repository.js";
 import { joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { type CommitIdentities, commitIndex } from "./commit.js";
-import { MAX_INTEGRATION_TREE_STATEMENTS } from "./integration.js";
 import {
-  INTEGRATION_COLLISION_SQL_STATEMENTS,
-  INTEGRATION_GUARD_SQL_STATEMENTS,
-  INTEGRATION_INDEX_SQL_STATEMENTS,
-  integrationCommitSqlStatements,
   integrationIndexMatchesTree,
-  integrationSqlStatements,
   projectedTouchedShape,
   projectIntegrationWithCollisions,
   prospectiveIntegrationIndexEntries,
@@ -37,8 +31,6 @@ import { planReplay, type ReplayIncomingLabelStyle, type ReplayPlan } from "./re
 import { treeStream } from "./tree-stream.js";
 
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
-const REPLAY_FIXED_SQL_STATEMENTS = 30;
-const OPERATION_STATE_TRANSITION_SQL_STATEMENTS = 11;
 
 export interface ReplayStartOptions {
   source: string;
@@ -154,45 +146,6 @@ function conflicts(entries: ReplayPlan["integration"]["entries"]): boolean {
   return entries.some((entry) => entry.kind === "conflict");
 }
 
-function replayPlanningSqlStatements(plan: ReplayPlan): number {
-  return (
-    plan.sqlStatements +
-    integrationSqlStatements(plan.integration, MAX_INTEGRATION_TREE_STATEMENTS) +
-    REPLAY_FIXED_SQL_STATEMENTS
-  );
-}
-
-function replayStartSqlStatements(plan: ReplayPlan): number {
-  return (
-    replayPlanningSqlStatements(plan) +
-    INTEGRATION_INDEX_SQL_STATEMENTS +
-    INTEGRATION_GUARD_SQL_STATEMENTS
-  );
-}
-
-/** Compose replay recovery work; 999 is valid and 1,000 fails closed. */
-export function calculateReplayRecoverySqlStatements(
-  ownershipSqlStatements: number,
-  transitionSqlStatements: number,
-): number {
-  if (
-    !Number.isSafeInteger(ownershipSqlStatements) ||
-    ownershipSqlStatements < 0 ||
-    !Number.isSafeInteger(transitionSqlStatements) ||
-    transitionSqlStatements < 0 ||
-    transitionSqlStatements > 999 - ownershipSqlStatements
-  ) {
-    return 1_000;
-  }
-  return ownershipSqlStatements + transitionSqlStatements;
-}
-
-function requireSql(total: number): void {
-  if (!Number.isSafeInteger(total) || total >= 1_000) {
-    throw new GitError("E2BIG", `replay SQL model requires ${total} statements`);
-  }
-}
-
 function planForState(
   repo: Repository,
   state: ReplayStateMetadata,
@@ -259,7 +212,6 @@ function requireOwnership(
   incomingLabelStyle: ReplayIncomingLabelStyle,
 ): {
   plan: ReplayPlan;
-  sqlStatements: number;
   reservation: ReturnType<Repository["store"]["reserveMemory"]>;
 } {
   requireOriginalSnapshots(repo, journal);
@@ -295,9 +247,7 @@ function requireOwnership(
         throw new GitError("ECORRUPT", "replay journal path ownership differs from its plan");
       }
     }
-    const sqlStatements = replayPlanningSqlStatements(plan) + INTEGRATION_COLLISION_SQL_STATEMENTS;
-    requireSql(sqlStatements);
-    return { plan, sqlStatements, reservation };
+    return { plan, reservation };
   } catch (error) {
     reservation.dispose();
     throw error;
@@ -325,11 +275,9 @@ export function startReplay(
       incomingLabelStyle: policy.incomingLabelStyle,
     });
     const message = input.message ?? policy.defaultMessage(plan);
-    const prior = replayStartSqlStatements(plan);
     const reservation = reserveIntegrationPlan(repo, plan.integration, plan.retainedBytes);
     try {
       if (plan.integration.entries.length === 0) {
-        requireSql(prior);
         const reason = emptyReason(plan);
         if (policy.suspendEmpty) {
           repo.checkout.writeOperationState(
@@ -350,10 +298,6 @@ export function startReplay(
         new Set(),
         policy.kind,
       );
-      let sql = prior;
-      if (projected.some((entry) => entry.purpose !== "primary")) {
-        sql += INTEGRATION_COLLISION_SQL_STATEMENTS;
-      }
       requireSafeIntegrationWorktree(
         repo,
         worktree,
@@ -361,12 +305,8 @@ export function startReplay(
         plan.integration.entries.map((entry) => entry.path),
         policy.kind,
       );
-      const treeStats = requireBoundedIntegrationTree(
-        prospectiveIntegrationIndexEntries(repo, projected),
-      );
+      requireBoundedIntegrationTree(prospectiveIntegrationIndexEntries(repo, projected));
       const conflicted = conflicts(plan.integration.entries);
-      if (!conflicted) sql += integrationCommitSqlStatements(treeStats);
-      requireSql(sql);
       const current = repo.head();
       if (current.ref !== head.ref || current.oid !== head.oid) {
         throw new GitError("ESTALEHEAD", `HEAD changed while ${policy.kind} was being prepared`);
@@ -375,7 +315,6 @@ export function startReplay(
         ? replayState(policy, plan, head, "conflicted", null, message, input)
         : null;
       applyProjectedOperation(repo, worktree, projected, {
-        priorSqlStatements: sql,
         suspendedState: state,
       });
       if (conflicted) return { outcome: "conflicted" };
@@ -411,7 +350,6 @@ export function continueReplay(
     const plan = verified.plan;
     try {
       if (journal.state.phase === "empty") {
-        requireSql(verified.sqlStatements);
         const reason = journal.state.emptyReason;
         if (reason === null) throw new GitError("ECORRUPT", "empty replay lost its reason");
         return { outcome: "empty", reason };
@@ -422,14 +360,8 @@ export function continueReplay(
           `cannot continue ${policy.kind}: the index has unmerged paths`,
         );
       }
-      const treeStats = requireBoundedIntegrationIndex(repo);
+      requireBoundedIntegrationIndex(repo);
       if (integrationIndexMatchesTree(repo, plan.currentTreeOid)) {
-        requireSql(
-          calculateReplayRecoverySqlStatements(
-            verified.sqlStatements,
-            INTEGRATION_INDEX_SQL_STATEMENTS * 2 + OPERATION_STATE_TRANSITION_SQL_STATEMENTS,
-          ),
-        );
         const reason: ReplayEmptyReason = "result";
         if (policy.suspendEmpty) {
           repo.checkout.replaceOperationState(journal.integrityOid, {
@@ -448,14 +380,6 @@ export function continueReplay(
         committer: input.committer ?? journal.state.committer ?? undefined,
         env: input.env,
       });
-      requireSql(
-        calculateReplayRecoverySqlStatements(
-          verified.sqlStatements,
-          INTEGRATION_INDEX_SQL_STATEMENTS * 2 +
-            integrationCommitSqlStatements(treeStats) +
-            OPERATION_STATE_TRANSITION_SQL_STATEMENTS,
-        ),
-      );
       const result = commitIndex(
         repo,
         {
@@ -484,17 +408,7 @@ export function cancelReplay(repo: Repository, worktree: Worktree, kind: ReplayK
     const verified = requireOwnership(repo, worktree, journal, incomingLabelStyle);
     try {
       if (journal.touched.length > 0) {
-        restoreProjectedOperation(repo, worktree, journal, {
-          priorSqlStatements: verified.sqlStatements,
-          clearState: true,
-        });
-      } else {
-        requireSql(
-          calculateReplayRecoverySqlStatements(
-            verified.sqlStatements,
-            OPERATION_STATE_TRANSITION_SQL_STATEMENTS,
-          ),
-        );
+        restoreProjectedOperation(repo, worktree, journal);
       }
       repo.checkout.clearOperationState();
     } finally {

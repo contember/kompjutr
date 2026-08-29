@@ -12,6 +12,7 @@ import type {
   SelectedPathResult,
   SparseIndexAncestorResult,
 } from "../src/core/sparse-workspace.js";
+import type { ScanEntry } from "../src/fs/types.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   createSqliteSelectedPathSource,
@@ -1136,6 +1137,75 @@ describe("rm", () => {
     expect(indexLines(workspace.repo)).toEqual(gitIndexLines(fixture));
     expect(lsFiles(workspace.repo)).toEqual(["b.txt"]);
     expect(workspace.worktree.stat("/a.txt")).toBeNull();
+  });
+
+  it("hashes through the former 65th range read for add and rm", () => {
+    const workspace = makeRepo("/");
+    const bytes = new Uint8Array(64 * 64 * 1024 + 1);
+    bytes[0] = 1;
+    bytes[bytes.length - 1] = 2;
+    workspace.worktree.writeFile("/large.bin", bytes);
+    const worktree = new CountingWorktree(workspace.worktree);
+
+    add(workspace.repo, worktree, { paths: ["large.bin"] });
+
+    const expectedOid = hashObject("blob", bytes);
+    expect(worktree.rangeReads).toBe(130);
+    expect(workspace.repo.checkout.indexGet("large.bin")?.oid).toBe(expectedOid);
+
+    const entry = workspace.repo.checkout.indexGet("large.bin");
+    if (entry === null) throw new Error("large-file index entry is missing");
+    workspace.repo.checkout.indexPut({ ...entry, mtime: null, ino: null, rev: null });
+    worktree.rangeReads = 0;
+
+    rm(workspace.repo, worktree, { paths: ["large.bin"], cached: true });
+
+    expect(worktree.rangeReads).toBe(65);
+    expect(workspace.repo.checkout.indexGet("large.bin")).toBeNull();
+    expect(workspace.worktree.stat("/large.bin")?.size).toBe(bytes.length);
+  });
+
+  it("continues worktree safety hashing through the former 17th batch", () => {
+    const workspace = makeRepo("/");
+    const bytes = utf8.encode("x\n");
+    const oid = workspace.repo.store.write("blob", bytes);
+    const paths = Array.from(
+      { length: 16_001 },
+      (_, index) => `/f${index.toString().padStart(5, "0")}.txt`,
+    );
+    workspace.worktree.writeFiles(paths.map((path) => ({ path, bytes })));
+
+    const scanned: ScanEntry[] = [];
+    for (;;) {
+      const after = scanned.at(-1)?.path;
+      const page = workspace.worktree.scan("/", {
+        filesOnly: true,
+        limit: 1_000,
+        ...(after === undefined ? {} : { after }),
+      });
+      scanned.push(...page);
+      if (page.length < 1_000) break;
+    }
+    expect(scanned).toHaveLength(paths.length);
+    workspace.repo.checkout.indexReplace(
+      scanned.map((stat, index) => ({
+        path: stat.path.slice(1),
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: stat.size,
+        mtime: index % 1_000 === 0 ? null : stat.mtime,
+        ino: stat.ino,
+        rev: stat.rev,
+      })),
+    );
+    const worktree = new CountingWorktree(workspace.worktree);
+
+    rm(workspace.repo, worktree, { paths: ["."], cached: true, recursive: true });
+
+    expect(worktree.bulkReadPaths).toHaveLength(17);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(workspace.worktree.scan("/", { filesOnly: true, limit: 1 })).toHaveLength(1);
   });
 
   it("keeps cached removals in the working tree", () => {

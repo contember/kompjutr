@@ -37,8 +37,6 @@ const PUSH_GRAPH_MEMORY_PART = "push-plan-graph";
 const PUSH_PACK_PREFLIGHT_MEMORY_PART = "push-pack-preflight";
 const PUSH_PACK_FIRST_MEMORY_PART = "push-pack-first-read";
 const PUSH_PACK_REPLAY_MEMORY_PART = "push-pack-replay-read";
-const PUSH_PACK_FIRST_SQL_PART = "push-pack-first";
-const PUSH_PACK_REPLAY_SQL_PART = "push-pack-replay";
 const CONTAINER_BASE_BYTES = 64;
 const ARRAY_SLOT_BYTES = 16;
 const SET_ENTRY_BYTES = 96;
@@ -51,15 +49,11 @@ const PACK_BATCH_ENTRY_BYTES = 192;
 const PACK_STREAM_HEADROOM_BYTES = 256 * 1024;
 const NO_REMOTE_OIDS: readonly string[] = Object.freeze([]);
 
-/** Worst-case tracking and reflog SQL reserved by the composed push operation. */
-export const PUSH_FINALIZATION_SQL_ALLOWANCE = 128;
-
 export interface PushObject {
   oid: string;
   type: ObjectType;
   size: number;
   source: "loose" | "pack";
-  chunkRows: number;
 }
 
 export interface PushPlan {
@@ -99,7 +93,6 @@ interface AuthenticatedTagTarget {
 interface PushPlanBudgetState {
   readonly budget: TransportOperationBudget | undefined;
   readonly objects: PushObject[];
-  readonly passStatements: number;
   readonly packMemoryBytes: number;
   readonly retainedPeakBytes: number;
   openings: number;
@@ -254,12 +247,6 @@ function normalizedOptions(options: PushPlanOptions): NormalizedPushPlanOptions 
   };
 }
 
-// Includes two authoritative commit reads and configured tracking reconciliation.
-const PUSH_FIXED_STATEMENTS = 64;
-const SMALL_BATCH_STATEMENTS = 8;
-const LARGE_PACKED_STATEMENTS = 192;
-const MAX_PUSH_STATEMENTS = 1_000;
-
 function addObject(
   objects: Map<string, ObjectType>,
   oid: string,
@@ -319,7 +306,6 @@ function hydrateObjects(
   repo: Repository,
   objects: Map<string, ObjectType>,
   tracker: PushRetainedTracker,
-  operationBudget?: TransportOperationBudget,
 ): PushObject[] {
   tracker.set("hydrated-plan", CONTAINER_BASE_BYTES);
   const planned: PushObject[] = [];
@@ -331,7 +317,6 @@ function hydrateObjects(
       "hydration-info",
       2 * CONTAINER_BASE_BYTES + page.length * (PUSH_PLAN_OBJECT_BYTES + ARRAY_SLOT_BYTES),
     );
-    operationBudget?.chargeSql();
     const oids: string[] = [];
     for (const entry of page) {
       if (entry === undefined) throw new CorruptError("push hydration page lost an entry");
@@ -386,11 +371,6 @@ function validateAuthenticatedObject(
   return null;
 }
 
-function authenticationStatements(object: PushObject): number {
-  if (object.source === "loose") return object.chunkRows + 2;
-  return LARGE_PACKED_STATEMENTS;
-}
-
 function authenticateObjects(
   repo: Repository,
   oids: readonly string[],
@@ -402,7 +382,6 @@ function authenticateObjects(
   tracker.set("root-auth-input", 2 * CONTAINER_BASE_BYTES + oids.length * 2 * SET_ENTRY_BYTES);
   let remaining = oids.filter((oid) => !state.types.has(oid));
   while (remaining.length > 0) {
-    operationBudget?.chargeSql();
     const info = repo.store.objectInfo(remaining);
     let selectedBytes = 0;
     let selected = 0;
@@ -420,7 +399,6 @@ function authenticateObjects(
         throw new CorruptError("push authentication lost its oversized object");
       }
       operationBudget?.setMemory(authMemoryPart, objectInfo.size + 256);
-      operationBudget?.chargeSql(authenticationStatements(objectInfo));
       try {
         const object = repo.store.readAuthenticatedObject(oid, objectInfo.type);
         if (object === null) throw new CorruptError(`local push object ${oid} disappeared`);
@@ -439,7 +417,6 @@ function authenticateObjects(
       continue;
     }
     operationBudget?.setMemory(authMemoryPart, selectedBytes + selected * 256);
-    operationBudget?.chargeSql(8);
     try {
       const batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
       if (batch.objects.size !== selected || batch.remaining.length >= remaining.length) {
@@ -610,35 +587,6 @@ function resolveRoots(
   }
 }
 
-function packPassStatements(objects: readonly PushObject[]): number {
-  let statements = 0;
-  let batchBytes = 0;
-  let batchObjects = 0;
-  const flush = (): void => {
-    if (batchObjects === 0) return;
-    statements += SMALL_BATCH_STATEMENTS;
-    batchBytes = 0;
-    batchObjects = 0;
-  };
-  for (const object of objects) {
-    if (object.size > MAX_BLOB_BATCH_BYTES) {
-      flush();
-      statements += object.source === "loose" ? object.chunkRows + 2 : LARGE_PACKED_STATEMENTS;
-      continue;
-    }
-    if (
-      batchObjects > 0 &&
-      (batchObjects >= OBJECT_PAGE || batchBytes + object.size > MAX_BLOB_BATCH_BYTES)
-    ) {
-      flush();
-    }
-    batchObjects++;
-    batchBytes += object.size;
-  }
-  flush();
-  return statements;
-}
-
 function packGenerationMemoryBytes(objects: readonly PushObject[]): number {
   if (objects.length === 0) return PACK_STREAM_HEADROOM_BYTES;
   let peak =
@@ -652,22 +600,6 @@ function packGenerationMemoryBytes(objects: readonly PushObject[]): number {
     if (bytes > peak) peak = bytes;
   }
   return peak;
-}
-
-function requireStatementBudget(objects: readonly PushObject[], newCommits: number): void {
-  const metadataPages = Math.ceil(objects.length / OBJECT_PAGE);
-  const statements =
-    PUSH_FIXED_STATEMENTS +
-    newCommits +
-    metadataPages +
-    2 * packPassStatements(objects) +
-    PUSH_FINALIZATION_SQL_ALLOWANCE;
-  if (statements > MAX_PUSH_STATEMENTS) {
-    throw new GitError(
-      "E2BIG",
-      `push requires up to ${statements} SQL statements, exceeding the ${MAX_PUSH_STATEMENTS} statement limit`,
-    );
-  }
 }
 
 function validatePlanningUpdates(
@@ -747,13 +679,11 @@ function collectCommitGraphs(
   repo: Repository,
   roots: Iterable<string>,
   tracker: PushRetainedTracker,
-  operationBudget: TransportOperationBudget | undefined,
 ): Map<string, PlannedCommit> {
   tracker.set("commit-map", CONTAINER_BASE_BYTES);
   const commits = new Map<string, PlannedCommit>();
   let retainedBytes = CONTAINER_BASE_BYTES;
   for (const root of roots) {
-    operationBudget?.chargeSql(3);
     for (const { oid, commit } of repo.walkIndexed(root, { maxBytes: MAX_PUSH_PLAN_BYTES })) {
       const prior = commits.get(oid);
       if (prior !== undefined) {
@@ -937,14 +867,11 @@ function planUpdateSet(
     const nonDeletes: PushPlanningUpdate[] = [];
     for (const update of ordered) if (update.oid !== null) nonDeletes.push(update);
     if (nonDeletes.length === 0) {
-      operationBudget?.admitSql(PUSH_FINALIZATION_SQL_ALLOWANCE);
       ordered.length = 0;
       nonDeletes.length = 0;
       tracker.clearAll();
       return null;
     }
-
-    operationBudget?.chargeSql(PUSH_FIXED_STATEMENTS);
     tracker.set("verified-refs", CONTAINER_BASE_BYTES + nonDeletes.length * (MAP_ENTRY_BYTES + 80));
     const verifiedRefs = new Map<string, string>();
     for (const update of nonDeletes) {
@@ -992,7 +919,7 @@ function planUpdateSet(
     // Repository graph-walk state is additive to the separate 16 MiB retained-plan limit.
     operationBudget?.setMemory(PUSH_GRAPH_MEMORY_PART, MAX_PUSH_PLAN_BYTES);
     const shallow = repo.shallow();
-    const commits = collectCommitGraphs(repo, commitRootOids, tracker, operationBudget);
+    const commits = collectCommitGraphs(repo, commitRootOids, tracker);
     commitRootOids.clear();
     tracker.clear("commit-roots");
     const boundaries = requireNamespaceRules(
@@ -1039,7 +966,6 @@ function planUpdateSet(
       if (firstParent !== undefined && parent === undefined) {
         throw new CorruptError(`push commit ${commit.oid} has a missing parent ${firstParent}`);
       }
-      operationBudget?.chargeSql();
       for (const object of repo.walkTreeDiffObjects(parent?.tree ?? null, commit.tree)) {
         addObject(objects, object.oid, object.type, tracker, options);
       }
@@ -1064,7 +990,6 @@ function planUpdateSet(
       if (root === undefined) throw new CorruptError(`push source ${oid} was not resolved`);
       for (const tagOid of root.tags) addObject(objects, tagOid, "tag", tracker, options);
       if (root.finalType === "tree") {
-        operationBudget?.chargeSql();
         for (const object of repo.walkTreeDiffObjects(null, root.finalOid)) {
           addObject(objects, object.oid, object.type, tracker, options);
         }
@@ -1079,15 +1004,8 @@ function planUpdateSet(
     tracker.clear("sorted-active-roots");
     tracker.clear("roots");
 
-    const hydrated = hydrateObjects(repo, objects, tracker, operationBudget);
+    const hydrated = hydrateObjects(repo, objects, tracker);
     validatePushPlanBounds(hydrated.length, newCommitCount, tracker.total, options);
-    if (operationBudget === undefined) requireStatementBudget(hydrated, newCommitCount);
-    const passStatements = packPassStatements(hydrated);
-    if (operationBudget !== undefined) {
-      operationBudget.reserveSql(PUSH_PACK_FIRST_SQL_PART, passStatements);
-      operationBudget.reserveSql(PUSH_PACK_REPLAY_SQL_PART, passStatements);
-      operationBudget.admitSql(PUSH_FINALIZATION_SQL_ALLOWANCE);
-    }
     ordered.length = 0;
     nonDeletes.length = 0;
     tracker.clear("ordered");
@@ -1101,7 +1019,6 @@ function planUpdateSet(
     stateByPlan.set(plan, {
       budget: operationBudget,
       objects: hydrated,
-      passStatements,
       packMemoryBytes,
       retainedPeakBytes: tracker.peak,
       openings: 0,
@@ -1111,10 +1028,6 @@ function planUpdateSet(
     });
     return plan;
   } catch (error) {
-    if (operationBudget !== undefined) {
-      operationBudget.releaseSql(PUSH_PACK_FIRST_SQL_PART);
-      operationBudget.releaseSql(PUSH_PACK_REPLAY_SQL_PART);
-    }
     operationBudget?.clearMemory(PUSH_AUTH_MEMORY_PART);
     operationBudget?.clearMemory(PUSH_GRAPH_MEMORY_PART);
     operationBudget?.clearMemory(PUSH_PACK_PREFLIGHT_MEMORY_PART);
@@ -1169,15 +1082,8 @@ export async function* openPushPack(repo: Repository, plan: PushPlan): AsyncGene
   }
   let memoryPart: string | null = null;
   if (state.budget !== undefined) {
-    const sqlPart = state.openings === 0 ? PUSH_PACK_FIRST_SQL_PART : PUSH_PACK_REPLAY_SQL_PART;
     memoryPart = state.openings === 0 ? PUSH_PACK_FIRST_MEMORY_PART : PUSH_PACK_REPLAY_MEMORY_PART;
     state.budget.setMemory(memoryPart, state.packMemoryBytes);
-    try {
-      state.budget.chargeReservedSql(sqlPart, state.passStatements);
-    } catch (error) {
-      state.budget.clearMemory(memoryPart);
-      throw error;
-    }
   }
   state.openings++;
   state.activeStreams++;
@@ -1195,13 +1101,11 @@ export async function* openPushPack(repo: Repository, plan: PushPlan): AsyncGene
   }
 }
 
-/** Release retained planning state and unused SQL admission after push completion. */
+/** Release retained planning state after push completion. */
 export function disposePushPlan(plan: PushPlan): void {
   const state = stateByPlan.get(plan);
   if (state === undefined || state.disposed) return;
   state.disposeRequested = true;
-  state.budget?.releaseSql(PUSH_PACK_FIRST_SQL_PART);
-  state.budget?.releaseSql(PUSH_PACK_REPLAY_SQL_PART);
   if (state.activeStreams === 0) finalizePushPlanDisposal(state);
 }
 

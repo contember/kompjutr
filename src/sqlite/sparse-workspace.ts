@@ -40,7 +40,6 @@ const MAX_EXACT_INDEX_ANCESTOR_ROWS = MAX_EXACT_INDEX_ANCESTORS * 6;
 const MAX_SELECTED_ROWS = 32_768;
 const MAX_SELECTED_EXACT_ANCESTORS = 32_768;
 const MAX_SNAPSHOT_DIRECTORIES = 1_000;
-const MAX_SNAPSHOT_DIRTY_ROWS = 32_000;
 const MAX_SOURCE_ENTRIES = 8_192;
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_WORKTREE_RETAINED_BYTES = 4 * 1024 * 1024;
@@ -56,6 +55,8 @@ const SELECTED_EXACT_ARRAY_RETAINED_BYTES = 64;
 const SELECTED_EXACT_ARRAY_SLOT_BYTES = 8;
 const SNAPSHOT_ARRAY_RETAINED_BYTES = 64;
 const SNAPSHOT_ARRAY_SLOT_BYTES = 8;
+const SNAPSHOT_MIN_DIRTY_ROW_RETAINED_BYTES =
+  ROW_RETAINED_BYTES + SNAPSHOT_ARRAY_SLOT_BYTES + 4 + 1;
 const SNAPSHOT_MAP_RETAINED_BYTES = 128;
 const SNAPSHOT_MAP_ENTRY_BYTES = 96;
 const SNAPSHOT_REQUEST_RETAINED_BYTES = 512;
@@ -2504,7 +2505,7 @@ function validateSnapshotRequest(input: unknown): ValidatedSnapshotRequest | nul
   };
 }
 
-const SNAPSHOT_DIRTY_SQL = `WITH state AS MATERIALIZED (
+const SNAPSHOT_DIRTY_SQL = `WITH state AS (
   SELECT checkout.id AS checkout_id, checkout.repo_id, checkout.root,
          typeof(checkout.repo_id) AS repo_type, typeof(checkout.root) AS root_type,
          length(CAST(checkout.root AS BLOB)) AS root_bytes,
@@ -2517,15 +2518,15 @@ const SNAPSHOT_DIRTY_SQL = `WITH state AS MATERIALIZED (
    WHERE checkout.id = ?
 ), dirty AS MATERIALIZED (
   SELECT path, flags FROM git_index_dirty WHERE checkout_id = ?
-   ORDER BY path COLLATE BINARY LIMIT ${MAX_SNAPSHOT_DIRTY_ROWS + 1}
-), totals AS (SELECT count(*) AS dirty_count FROM dirty)
-SELECT 0 AS kind, state.*, totals.dirty_count,
+   ORDER BY path COLLATE BINARY LIMIT ?
+)
+SELECT 0 AS kind, state.*,
        NULL AS path, 'null' AS path_type, NULL AS path_bytes,
        NULL AS flags, 'null' AS flags_type
-  FROM totals LEFT JOIN state ON 1 = 1
+  FROM (SELECT 1) LEFT JOIN state ON 1 = 1
 UNION ALL
 SELECT 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-       NULL, dirty.path, typeof(dirty.path), length(CAST(dirty.path AS BLOB)),
+       dirty.path, typeof(dirty.path), length(CAST(dirty.path AS BLOB)),
        dirty.flags, typeof(dirty.flags)
   FROM dirty
 ORDER BY kind, path COLLATE BINARY`;
@@ -2539,6 +2540,8 @@ function readSnapshotDirty(
     return { available: false, dirty: [] };
   }
   const dirty: SparseWorkspaceDirty[] = [];
+  const remaining = budget.limit - budget.used;
+  const capacityRows = Math.floor(remaining / SNAPSHOT_MIN_DIRTY_ROW_RETAINED_BYTES);
   let metadata = false;
   let available = true;
   let previous: string | null = null;
@@ -2546,6 +2549,7 @@ function readSnapshotDirty(
     SNAPSHOT_DIRTY_SQL,
     validated.request.checkoutId,
     validated.request.checkoutId,
+    capacityRows + 1,
   )) {
     if (row.kind === 0) {
       if (metadata) throw new CorruptError("commit tree snapshot duplicated tracker state");
@@ -2584,11 +2588,6 @@ function readSnapshotDirty(
         throw new CorruptError("commit tree snapshot tracker baseline is malformed");
       }
       if (row.baseline_tree_oid !== validated.request.baselineTreeOid) available = false;
-      const count = numberField(row.dirty_count);
-      if (count === null || count < 0) {
-        throw new CorruptError("commit tree snapshot dirty count is invalid");
-      }
-      if (count > MAX_SNAPSHOT_DIRTY_ROWS) available = false;
       continue;
     }
     if (row.kind !== 1 || !metadata) {
@@ -2610,11 +2609,11 @@ function readSnapshotDirty(
     ) {
       throw new CorruptError("commit tree snapshot dirty row is malformed");
     }
+    if (dirty.length === capacityRows) return { available: false, dirty: [] };
     previous = row.path;
     const bytes = ROW_RETAINED_BYTES + SNAPSHOT_ARRAY_SLOT_BYTES + row.path.length * 4 + pathBytes;
     if (!reserveSnapshot(budget, bytes)) {
-      available = false;
-      continue;
+      return { available: false, dirty: [] };
     }
     dirty.push({ path: row.path, flags });
   }

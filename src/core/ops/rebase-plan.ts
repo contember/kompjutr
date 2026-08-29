@@ -6,7 +6,6 @@ import type { Repository } from "../repository.js";
 import {
   MAX_MERGE_BASE_COMMITS,
   MAX_MERGE_BASE_RETAINED_BYTES,
-  MERGE_BASE_SQL_STATEMENTS,
   type MergeBaseLimits,
   type MergeBaseSelection,
   selectMergeBases,
@@ -17,16 +16,7 @@ import {
   type OperationStepMetadata,
   validateOperationStepMetadata,
 } from "./operation-state.js";
-import { MAX_REPLAY_METADATA_SQL_STATEMENTS, resolveBoundedCommitRevision } from "./replay.js";
-
-const REBASE_RANGE_SQL_STATEMENTS = 1;
-
-export const MAX_REBASE_PLAN_SQL_STATEMENTS =
-  MAX_REPLAY_METADATA_SQL_STATEMENTS + MERGE_BASE_SQL_STATEMENTS + REBASE_RANGE_SQL_STATEMENTS;
-
-if (MAX_REBASE_PLAN_SQL_STATEMENTS >= 1_000) {
-  throw new Error("rebase planning SQL budget must stay below 1000 statements");
-}
+import { resolveBoundedCommitRevision } from "./replay.js";
 
 export type RebasePlanRelation = "up-to-date" | "fast-forward" | "replay";
 
@@ -52,8 +42,6 @@ export interface RebasePlan {
   retainedBytes: number;
   graphCommits: number;
   graphRetainedBytes: number;
-  /** Conservative upper bound including revision resolution and both graph walks. */
-  sqlStatements: number;
 }
 
 interface ResolvedLimits {
@@ -116,7 +104,6 @@ function zeroStepPlan(
     retainedBytes: 0,
     graphCommits: selection.commits,
     graphRetainedBytes: selection.retainedBytes,
-    sqlStatements: MAX_REBASE_PLAN_SQL_STATEMENTS,
   };
 }
 
@@ -214,6 +201,5 @@ export function planRebase(repo: Repository, input: RebasePlanInput): RebasePlan
     retainedBytes: sequence.retainedBytes,
     graphCommits: selection.commits,
     graphRetainedBytes: selection.retainedBytes,
-    sqlStatements: MAX_REBASE_PLAN_SQL_STATEMENTS,
   };
 }

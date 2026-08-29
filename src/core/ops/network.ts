@@ -38,11 +38,7 @@ import { retainedStringBytes } from "../retained.js";
 import { joinSorted } from "../streams.js";
 import { checkoutTree, matchesPaths, type TargetEntry } from "./checkout.js";
 import { isInitialCheckoutFallback, tryInitialCheckout } from "./initial-checkout.js";
-import {
-  MAX_MERGE_BASE_RETAINED_BYTES,
-  MERGE_BASE_SQL_STATEMENTS,
-  selectMergeBases,
-} from "./merge-base.js";
+import { MAX_MERGE_BASE_RETAINED_BYTES, selectMergeBases } from "./merge-base.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import {
   compileFetchRefspecs,
@@ -74,7 +70,6 @@ const FETCH_CHECKOUT_RETAINED_BYTES = 6 * 1024 * 1024;
 const FETCH_ROOT_TYPES_FIXED_BYTES = 192;
 const FETCH_ROOT_TYPE_ENTRY_BYTES = 96;
 const FETCH_TARGET_ENTRY_BYTES = 96;
-const FETCH_PUBLICATION_SQL_STATEMENTS = 128;
 const tagHeaderDecoder = new TextDecoder("utf-8", { fatal: true });
 
 function authenticatedObjectRetainedBytes(bytes: number): number {
@@ -329,7 +324,6 @@ function readTagObjects(
       FETCH_TAG_AUTH_MEMORY_PART,
       authenticatedObjectRetainedBytes(retainedBytes + readBudget),
     );
-    operationBudget.chargeSql(8);
     const batch = repo.readObjects(page, {
       budgetBytes: readBudget,
     });
@@ -357,15 +351,10 @@ interface TagPeelState {
   seen: Set<string>;
 }
 
-function objectTypes(
-  repo: Repository,
-  oids: readonly string[],
-  budget: TransportOperationBudget,
-): Map<string, ObjectType> {
+function objectTypes(repo: Repository, oids: readonly string[]): Map<string, ObjectType> {
   const types = new Map<string, ObjectType>();
   const unique = [...new Set(oids)];
   for (let offset = 0; offset < unique.length; offset += TAG_OBJECT_PAGE) {
-    budget.chargeSql(2);
     for (const info of repo.store.objectInfo(unique.slice(offset, offset + TAG_OBJECT_PAGE))) {
       types.set(info.oid, info.type);
     }
@@ -416,7 +405,6 @@ function authenticateTags(
   const required = [...unique.values()];
   const requiredOids: string[] = [];
   for (const tag of required) requiredOids.push(tag.ref.oid, tag.peeledOid);
-  operationBudget.chargeSql();
   const held = repo.store.hasAll(new Set(requiredOids));
   for (const tag of required) {
     if (!held.has(tag.ref.oid) || !held.has(tag.peeledOid)) {
@@ -427,7 +415,6 @@ function authenticateTags(
   const rootTypes = objectTypes(
     repo,
     required.map((tag) => tag.ref.oid),
-    operationBudget,
   );
   const pendingRoots: TagPeelState[] = [];
   for (const tag of required) {
@@ -449,7 +436,6 @@ function authenticateTags(
   try {
     for (let hop = 0; hop < TAG_PEEL_HOPS && pending.length > 0; hop++) {
       const frontier = new Set(pending.map((state) => state.current));
-      operationBudget.chargeSql();
       const heldFrontier = repo.store.hasAll(frontier);
       for (const state of pending) {
         if (!heldFrontier.has(state.current)) {
@@ -538,7 +524,6 @@ async function ingestPack(
   repo: Repository,
   pack: AsyncIterable<Uint8Array>,
   reservation: MemoryReservation,
-  operationBudget: TransportOperationBudget,
   say: ((text: string) => void) | undefined,
   checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
 ): Promise<void> {
@@ -551,7 +536,6 @@ async function ingestPack(
         };
   await repo.store.packs.ingest(pack, {
     reservation,
-    sqlBudget: operationBudget,
     ...(say === undefined ? {} : { onProgress: say }),
     now: context.now,
     ...(yieldNow === undefined ? {} : { yieldNow }),
@@ -573,7 +557,6 @@ async function transferPack(
   },
   auth: Parameters<typeof uploadPack>[1],
   reservation: MemoryReservation,
-  operationBudget: TransportOperationBudget,
   say: ((text: string) => void) | undefined,
   checkpoint: ((stage: FetchCheckpointStage) => Promise<void> | undefined) | undefined,
 ): Promise<{ shallow: string[]; unshallow: string[] }> {
@@ -607,15 +590,7 @@ async function transferPack(
   }
   const beforeIngest = checkpoint?.("before-ingest");
   if (beforeIngest !== undefined) await beforeIngest;
-  await ingestPack(
-    context,
-    repo,
-    fetchPackStream(result.pack),
-    reservation,
-    operationBudget,
-    say,
-    checkpoint,
-  );
+  await ingestPack(context, repo, fetchPackStream(result.pack), reservation, say, checkpoint);
   const afterIngest = checkpoint?.("after-ingest");
   if (afterIngest !== undefined) await afterIngest;
   if (result.shallow.length > 0 || result.unshallow.length > 0) {
@@ -695,7 +670,6 @@ function fetchCredentialsBytes(credentials: GitAuth | undefined): number {
 function fetchRemoteUrl(
   repo: Repository,
   options: FetchOperationOptions,
-  budget: TransportOperationBudget,
 ): { readonly remote: string; readonly url: string } {
   if (options.url !== undefined) {
     if (typeof options.url !== "string") throw new GitError("EINVAL", "fetch url must be a string");
@@ -708,7 +682,6 @@ function fetchRemoteUrl(
     throw new GitError("EINVAL", "fetch remote must be a non-empty string");
   }
   const remote = options.remote ?? "origin";
-  budget.chargeSql();
   const url = remoteUrlFor(repo, remote);
   if (url === undefined) throw new GitError("ENOREMOTE", `no such remote: ${remote}`);
   return { remote, url };
@@ -822,7 +795,6 @@ function requireMappedBranchesAvailable(
   );
   if (selected.size === 0) return;
   budget.setMemory(FETCH_CHECKOUTS_MEMORY_PART, FETCH_CHECKOUT_RETAINED_BYTES);
-  budget.chargeSql(3);
   const checkouts = context.database.listCheckouts(repo.store.repoId);
   let retained = 192;
   for (const checkout of checkouts) {
@@ -877,7 +849,6 @@ function preflightMappedUpdates(
 ): void {
   const existing = mappedExistingTargets(token, budget);
   try {
-    let ancestryChecks = 0;
     for (const ref of refs) {
       const previous = existing.get(ref.destination);
       if (previous === undefined) {
@@ -891,16 +862,7 @@ function preflightMappedUpdates(
       ) {
         throw new GitError("ETAGFAIL", `fetch would clobber existing tag ${ref.destination}`);
       }
-      if (
-        ref.destination.startsWith("refs/heads/") &&
-        previous !== null &&
-        previous !== ref.oid &&
-        !ref.force
-      ) {
-        ancestryChecks++;
-      }
     }
-    budget.reserveSql("fetch-merge-bases", ancestryChecks * MERGE_BASE_SQL_STATEMENTS);
   } finally {
     budget.clearMemory(FETCH_TARGETS_MEMORY_PART);
   }
@@ -939,7 +901,6 @@ function authenticateMappedRoots(
           FETCH_ROOT_AUTH_MEMORY_PART,
           authenticatedObjectRetainedBytes(MAX_BLOB_BATCH_BYTES),
         );
-        budget.chargeSql(8);
         let batch: ReturnType<Repository["readObjects"]>;
         try {
           batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
@@ -950,7 +911,6 @@ function authenticateMappedRoots(
             });
           }
           if (!hasErrorCode(error, "EFBIG")) throw error;
-          budget.chargeSql(8);
           const first = remaining[0];
           if (first === undefined) throw new CorruptError("fetch authentication lost its root");
           const info = repo.store.objectInfo([first])[0];
@@ -1031,13 +991,11 @@ function requireMappedUpdateRules(
         } finally {
           budget.clearMemory(FETCH_MERGE_BASE_MEMORY_PART);
         }
-        budget.chargeReservedSql("fetch-merge-bases", MERGE_BASE_SQL_STATEMENTS);
         if (selection.kind !== "fast-forward") {
           throw new GitError("ENONFASTFORWARD", `fetch would not fast-forward ${ref.destination}`);
         }
       }
     }
-    budget.releaseSql("fetch-merge-bases");
   } finally {
     budget.clearMemory(FETCH_TARGETS_MEMORY_PART);
   }
@@ -1056,7 +1014,7 @@ export async function fetchInto(
   let compiler: ReturnType<typeof compileFetchRefspecs> | undefined;
   try {
     if (isMappedFetchOptions(options)) compiler = compileFetchRefspecs(options.refspecs, budget);
-    const { remote, url } = fetchRemoteUrl(repo, options, budget);
+    const { remote, url } = fetchRemoteUrl(repo, options);
     const auth = fetchAuth(context, options, url, budget);
     const beforeDiscovery = behavior.checkpoint?.("before-discovery");
     if (beforeDiscovery !== undefined) await beforeDiscovery;
@@ -1124,13 +1082,10 @@ async function fetchMappedInto(
   }
 
   requireMappedBranchesAvailable(context, repo, refs, budget);
-  budget.reserveSql("fetch-finalization", FETCH_PUBLICATION_SQL_STATEMENTS);
   const publication = repo.store.beginFetchPublication(
     `refs/remotes/${remote}/`,
     refs.map((ref) => ref.destination),
     reservation,
-    budget,
-    "fetch-finalization",
   );
   try {
     preflightMappedUpdates(refs, publication, budget);
@@ -1154,7 +1109,6 @@ async function fetchMappedInto(
       },
       auth,
       reservation,
-      budget,
       say,
       behavior.checkpoint,
     );
@@ -1179,7 +1133,6 @@ async function fetchMappedInto(
       },
       operationRefLogMetadata(context, repo, refLogReason),
     );
-    budget.releaseSql("fetch-finalization");
     publication.dispose();
     const afterRefs = behavior.checkpoint?.("after-ref-publication");
     if (afterRefs !== undefined) await afterRefs;
@@ -1195,8 +1148,6 @@ async function fetchMappedInto(
     };
   } finally {
     publication.dispose();
-    budget.releaseSql("fetch-merge-bases");
-    budget.releaseSql("fetch-finalization");
   }
 }
 
@@ -1233,13 +1184,10 @@ async function fetchLegacyInto(
   const requiredTags = tags.filter((tag) => allTags || selectedTagNames.has(tag.ref.name));
   const candidateTags = allTags || autoTags ? tags : requiredTags;
   const trackingPrefix = `refs/remotes/${remote}/`;
-  budget.reserveSql("fetch-finalization", FETCH_PUBLICATION_SQL_STATEMENTS);
   const publication = repo.store.beginFetchPublication(
     trackingPrefix,
     candidateTags.map((tag) => tag.ref.name),
     reservation,
-    budget,
-    "fetch-finalization",
   );
 
   try {
@@ -1285,7 +1233,6 @@ async function fetchLegacyInto(
         },
         auth,
         reservation,
-        budget,
         say,
         behavior.checkpoint,
       ),
@@ -1311,7 +1258,6 @@ async function fetchLegacyInto(
           },
           auth,
           reservation,
-          budget,
           say,
           behavior.checkpoint,
         ),
@@ -1369,7 +1315,6 @@ async function fetchLegacyInto(
       },
       operationRefLogMetadata(context, repo, refLogReason),
     );
-    budget.releaseSql("fetch-finalization");
     publication.dispose();
     const afterRefs = behavior.checkpoint?.("after-ref-publication");
     if (afterRefs !== undefined) await afterRefs;
@@ -1382,7 +1327,6 @@ async function fetchLegacyInto(
     };
   } finally {
     publication.dispose();
-    budget.releaseSql("fetch-finalization");
   }
 }
 

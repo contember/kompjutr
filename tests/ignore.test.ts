@@ -473,7 +473,7 @@ describe("gitignore", () => {
     }
   });
 
-  it("bounds discovery and content statements at the file-count ceiling", () => {
+  it("pages discovery and content reads through the file-count ceiling", () => {
     const workspace = makeRepo("/");
     writeIgnoreFiles(workspace, IGNORE_LIMITS.files);
     const measured = new MeasuringIgnoreWorktree(workspace.worktree, workspace.storage);
@@ -481,10 +481,11 @@ describe("gitignore", () => {
 
     loadIgnoreMatcher(measured, "/");
 
-    expect(measured.discoveryCalls).toBe(IGNORE_LIMITS.discoveryStatements);
-    expect(measured.discoveryStatements).toBe(IGNORE_LIMITS.discoveryStatements);
-    expect(measured.contentCalls).toBe(IGNORE_LIMITS.readStatements);
-    expect(measured.contentStatements).toBe(IGNORE_LIMITS.readStatements);
+    const contentPages = IGNORE_LIMITS.files / IGNORE_LIMITS.discoveryPage;
+    expect(measured.discoveryCalls).toBe(contentPages);
+    expect(measured.discoveryStatements).toBe(contentPages);
+    expect(measured.contentCalls).toBe(contentPages);
+    expect(measured.contentStatements).toBe(contentPages);
     expect(workspace.storage.statementCount).toBe(17);
   });
 
@@ -497,8 +498,9 @@ describe("gitignore", () => {
     const error = expectLimit(() => loadIgnoreMatcher(measured, "/"), "files");
 
     expect(error.observed).toBe(IGNORE_LIMITS.files + 1);
-    expect(measured.discoveryCalls).toBe(IGNORE_LIMITS.discoveryStatements);
-    expect(measured.contentCalls).toBe(IGNORE_LIMITS.readStatements - 1);
+    const contentPages = IGNORE_LIMITS.files / IGNORE_LIMITS.discoveryPage;
+    expect(measured.discoveryCalls).toBe(contentPages);
+    expect(measured.contentCalls).toBe(contentPages - 1);
   });
 
   it("does not follow a symlink named .gitignore", () => {
@@ -536,15 +538,15 @@ describe("gitignore", () => {
     expect(matcher.ignores("b/file.b", false)).toBe(true);
   });
 
-  it("caps handle-read retries before a ninth statement", () => {
+  it("continues handle-read retries after the former eighth statement", () => {
     const workspace = makeRepo("/");
-    writeIgnoreFiles(workspace, IGNORE_LIMITS.readStatements + 1);
+    writeIgnoreFiles(workspace, 9);
     const split = new SplitReadWorktree(workspace.worktree, workspace.storage);
 
-    const error = expectLimit(() => loadIgnoreMatcher(split, "/"), "readStatements");
+    const matcher = loadIgnoreMatcher(split, "/");
 
-    expect(error.observed).toBe(IGNORE_LIMITS.readStatements + 1);
-    expect(split.contentCalls).toBe(IGNORE_LIMITS.readStatements);
+    expect(split.contentCalls).toBe(9);
+    expect(matcher.ignores("d0008/x", false)).toBe(true);
   });
 
   it("caps one file, aggregate bytes, physical lines and compiled patterns", () => {

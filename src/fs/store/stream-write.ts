@@ -10,7 +10,6 @@ import { allocateInodes, bumpRev } from "./meta.js";
 
 const DEFAULT_FILE_MODE = 0o644;
 const MAX_STREAM_BYTES = 96 * 1024 * 1024;
-const MAX_CONTENT_STATEMENTS = 900;
 
 interface TargetRow {
   inode: unknown;
@@ -130,7 +129,6 @@ export function writeFileStream(
 
     let offset = append ? (existing?.size ?? 0) : 0;
     let streamed = 0;
-    let statements = 0;
     for (const chunk of chunks) {
       if (!(chunk instanceof Uint8Array)) {
         throw fsError("EINVAL", "redirect stream yielded a non-byte chunk", path);
@@ -143,9 +141,6 @@ export function writeFileStream(
       }
       let at = 0;
       while (at < chunk.length) {
-        if (statements >= MAX_CONTENT_STATEMENTS) {
-          throw fsError("EFBIG", "redirect exceeds its SQL statement limit", path);
-        }
         const idx = Math.floor(offset / CHUNK_SIZE);
         const within = offset % CHUNK_SIZE;
         const length = Math.min(CHUNK_SIZE - within, chunk.length - at);
@@ -166,7 +161,6 @@ export function writeFileStream(
             within,
           );
         }
-        statements++;
         streamed += length;
         offset += length;
         at += length;

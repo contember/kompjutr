@@ -11,8 +11,6 @@ import {
 } from "../src/core/objects.js";
 import {
   type IntegrationEntry,
-  MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS,
-  MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS,
   planIntegration,
   planVirtualAncestorIntegration,
 } from "../src/core/ops/integration.js";
@@ -179,12 +177,6 @@ function assertCoordinatorIdle(store: CheckoutStore): void {
 }
 
 describe("virtual-ancestor integration planning", () => {
-  it("keeps its explicit SQL proof below the operation ceiling", () => {
-    expect(MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS).toBe(10);
-    expect(MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS).toBe(138);
-    expect(MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS).toBeLessThan(1_000);
-  });
-
   it("materializes normal add/add worktree bytes and matches Git's virtual marker blob", () => {
     const states = {
       base: {},

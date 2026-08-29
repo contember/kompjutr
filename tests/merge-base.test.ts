@@ -1,10 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  AHEAD_BEHIND_SQL_STATEMENTS,
   countAheadBehind,
   MAX_MERGE_BASES,
-  MERGE_BASE_SQL_STATEMENTS,
   mergeBase,
   selectMergeBases,
 } from "../src/core/ops/merge-base.js";
@@ -89,18 +87,15 @@ describe("bounded merge-base selection", () => {
       const second = fixture.commit("second");
       fixture.write("file", "three\n");
       const third = fixture.commit("third");
-      const { db, store, repo } = harness();
+      const { store, repo } = harness();
       importReachable(store, fixture, [third]);
-      db.storage.resetCounters();
 
       expect(fixture.git("merge-base", "--is-ancestor", second, third)).toBe("");
       expect(selectMergeBases(repo, { currentOid: second, incomingOid: third })).toMatchObject({
         kind: "fast-forward",
         bases: [second],
         commits: 3,
-        sqlStatements: MERGE_BASE_SQL_STATEMENTS,
       });
-      expect(db.storage.statementCount).toBe(MERGE_BASE_SQL_STATEMENTS);
 
       expect(fixture.git("merge-base", "--is-ancestor", second, third)).toBe("");
       expect(
@@ -159,16 +154,13 @@ describe("bounded merge-base selection", () => {
   it("counts bounded ahead and behind histories with one graph traversal per side", () => {
     const { fixture, current, incoming } = divergentFixture();
     try {
-      const { db, store, repo } = harness();
+      const { store, repo } = harness();
       importReachable(store, fixture, [current, incoming]);
-      db.storage.resetCounters();
 
       expect(countAheadBehind(repo, { currentOid: current, incomingOid: incoming })).toMatchObject({
         ...gitAheadBehind(fixture, current, incoming),
         commits: 3,
-        sqlStatements: AHEAD_BEHIND_SQL_STATEMENTS,
       });
-      expect(db.storage.statementCount).toBe(AHEAD_BEHIND_SQL_STATEMENTS);
       expect(() =>
         countAheadBehind(new Repository(store), {
           currentOid: current,
@@ -289,7 +281,7 @@ describe("bounded merge-base selection", () => {
   it("accepts exact union graph bounds and rejects the preceding boundary", () => {
     const { fixture, current, incoming } = divergentFixture();
     try {
-      const { db, store, repo } = harness();
+      const { store, repo } = harness();
       importReachable(store, fixture, [current, incoming]);
       const measured = selectMergeBases(repo, { currentOid: current, incomingOid: incoming });
       const before = store.objectCount();
@@ -316,16 +308,6 @@ describe("bounded merge-base selection", () => {
         }),
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
       expect(store.objectCount()).toBe(before);
-
-      db.storage.resetCounters();
-      expect(() =>
-        selectMergeBases(new Repository(store), {
-          currentOid: current,
-          incomingOid: incoming,
-          limits: { maxSqlStatements: MERGE_BASE_SQL_STATEMENTS - 1 },
-        }),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(db.storage.statementCount).toBe(0);
     } finally {
       fixture.dispose();
     }

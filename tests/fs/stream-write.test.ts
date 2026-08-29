@@ -27,6 +27,15 @@ describe("Filesystem.writeFileStream", () => {
     expect(bytes.slice(-4)).toEqual(new Uint8Array([2, 2, 3, 4]));
   });
 
+  it("commits the former 901st content statement exactly", () => {
+    const { fs } = open();
+    const chunks = Array.from({ length: 901 }, (_, index) => new Uint8Array([index % 251]));
+
+    fs.writeFileStream("/file", chunks);
+
+    expect(fs.readFile("/file")).toEqual(Uint8Array.from(chunks, (chunk) => chunk[0] ?? 0));
+  });
+
   it("overwrites through a hardlink and clears content identity", () => {
     const { fs } = open();
     fs.writeFiles([

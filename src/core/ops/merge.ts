@@ -1,31 +1,19 @@
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
-import {
-  type IndexEntry,
-  MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS,
-  type ObjectBatch,
-} from "../../sqlite/store.js";
+import type { IndexEntry, ObjectBatch } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
-import { hashObject, type ObjectType, serializeCommit } from "../objects.js";
+import { hashObject, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import { joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { type CommitIdentities, commitIndex, resolveIdentity } from "./commit.js";
 import {
   type IntegrationPlan,
-  MAX_INTEGRATION_TREE_STATEMENTS,
-  MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS,
   planIntegration,
   planVirtualAncestorIntegration,
 } from "./integration.js";
 import {
-  INTEGRATION_COLLISION_SQL_STATEMENTS,
-  INTEGRATION_GUARD_SQL_STATEMENTS,
-  INTEGRATION_INDEX_SQL_STATEMENTS,
-  integrationCommitSqlStatements,
-  integrationSqlStatements,
-  MAX_INTEGRATION_COMMIT_SQL_STATEMENTS,
   projectedTouchedShape,
   projectIntegrationWithCollisions,
   prospectiveIntegrationIndexEntries,
@@ -47,20 +35,13 @@ import {
   type MergeTouchedPath,
   validateMergeStateMetadata,
 } from "./merge-state.js";
-import {
-  MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS,
-  operationRefLogMetadata,
-  type RefLogReason,
-} from "./ref-log.js";
-import { buildTreeInBatch, type TreeBuildPreflightStats } from "./tree-build.js";
+import { operationRefLogMetadata, type RefLogReason } from "./ref-log.js";
+import { buildTreeInBatch } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
 
 const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
 const MAX_VIRTUAL_COMMITS = 1;
-const MERGE_FIXED_SQL_STATEMENTS = 30;
-const VIRTUAL_OBJECT_PAYLOAD_BYTES = 1024 * 1024;
-const VIRTUAL_OBJECT_OVERHEAD_BYTES = 64 * 1024;
 const VIRTUAL_IDENTITY = {
   name: "git merge-recursive",
   email: "merge-recursive@localhost",
@@ -150,9 +131,8 @@ function commitTree(repo: Repository, oid: string): string {
   return repo.readCommit(oid).tree;
 }
 
-interface VirtualBudget {
+interface VirtualState {
   commits: number;
-  sqlStatements: number;
 }
 
 function indexEntry(path: string, mode: string, oid: string): IndexEntry {
@@ -222,40 +202,13 @@ function materializeVirtualCommit(
   });
 }
 
-function virtualMaterializationStatements(
+function requireBoundedVirtualTree(
   repo: Repository,
   currentOid: string,
-  incomingOid: string,
   plan: IntegrationPlan,
-): number {
+): void {
   const currentTree = commitTree(repo, currentOid);
   requireBoundedIntegrationTree(virtualTreeEntries(repo, batchForIdentity(), currentTree, plan));
-  let statements = 1;
-  const batch: ObjectBatch = {
-    write(type: ObjectType, data: Uint8Array): string {
-      const payloads = Math.max(
-        1,
-        Math.ceil((data.length + VIRTUAL_OBJECT_OVERHEAD_BYTES) / VIRTUAL_OBJECT_PAYLOAD_BYTES),
-      );
-      statements += 2 + payloads;
-      if (type === "tree") statements += 2;
-      if (type === "commit") statements++;
-      return hashObject(type, data);
-    },
-    flush() {},
-  };
-  const tree = buildTreeInBatch(batch, virtualTreeEntries(repo, batch, currentTree, plan));
-  batch.write(
-    "commit",
-    serializeCommit({
-      tree,
-      parent: [currentOid, incomingOid],
-      author: VIRTUAL_IDENTITY,
-      committer: VIRTUAL_IDENTITY,
-      message: "virtual merge base\n",
-    }),
-  );
-  return statements;
 }
 
 function batchForIdentity(): ObjectBatch {
@@ -269,11 +222,10 @@ function synthesizeVirtualPair(
   repo: Repository,
   currentOid: string,
   incomingOid: string,
-  budget: VirtualBudget,
+  state: VirtualState,
   depth: number,
 ): string {
   const selection = selectMergeBases(repo, { currentOid, incomingOid });
-  budget.sqlStatements += selection.sqlStatements;
   if (selection.kind === "already-merged") return currentOid;
   if (selection.kind === "fast-forward") return incomingOid;
   if (selection.kind === "shallow") {
@@ -282,14 +234,14 @@ function synthesizeVirtualPair(
   if (selection.kind === "unrelated") {
     throw new GitError("EUNRELATED", "cannot synthesize unrelated merge bases");
   }
-  budget.commits++;
-  if (budget.commits > MAX_VIRTUAL_COMMITS) {
+  state.commits++;
+  if (state.commits > MAX_VIRTUAL_COMMITS) {
     throw new GitError(
       "E2BIG",
       `recursive merge-base synthesis exceeds ${MAX_VIRTUAL_COMMITS} temporary commits`,
     );
   }
-  const baseCommit = synthesizeVirtualBases(repo, selection.bases, budget, depth + 1);
+  const baseCommit = synthesizeVirtualBases(repo, selection.bases, state, depth + 1);
   const plan = planVirtualAncestorIntegration(repo, {
     baseTreeOid: commitTree(repo, baseCommit),
     currentTreeOid: commitTree(repo, currentOid),
@@ -297,16 +249,9 @@ function synthesizeVirtualPair(
     labels: { current: "Temporary merge branch 1", incoming: "Temporary merge branch 2" },
     depth,
   });
-  budget.sqlStatements += integrationSqlStatements(plan, MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS);
   const reservation = reserveIntegrationPlan(repo, plan);
   try {
-    budget.sqlStatements += virtualMaterializationStatements(repo, currentOid, incomingOid, plan);
-    if (budget.sqlStatements >= 1_000) {
-      throw new GitError(
-        "E2BIG",
-        `recursive merge-base SQL model requires ${budget.sqlStatements} statements`,
-      );
-    }
+    requireBoundedVirtualTree(repo, currentOid, plan);
     return materializeVirtualCommit(repo, currentOid, incomingOid, plan);
   } finally {
     reservation.dispose();
@@ -316,7 +261,7 @@ function synthesizeVirtualPair(
 function synthesizeVirtualBases(
   repo: Repository,
   bases: readonly string[],
-  budget: VirtualBudget,
+  state: VirtualState,
   depth: number,
 ): string {
   const first = bases[0];
@@ -325,17 +270,13 @@ function synthesizeVirtualBases(
   for (let index = 1; index < bases.length; index++) {
     const incoming = bases[index];
     if (incoming === undefined) throw new GitError("ECORRUPT", "merge base list has a hole");
-    current = synthesizeVirtualPair(repo, current, incoming, budget, depth);
+    current = synthesizeVirtualPair(repo, current, incoming, state, depth);
   }
   return current;
 }
 
-function selectedBaseTree(
-  repo: Repository,
-  bases: readonly string[],
-  budget: VirtualBudget,
-): string {
-  return commitTree(repo, synthesizeVirtualBases(repo, bases, budget, 1));
+function selectedBaseTree(repo: Repository, bases: readonly string[], state: VirtualState): string {
+  return commitTree(repo, synthesizeVirtualBases(repo, bases, state, 1));
 }
 
 function snapshotMode(entry: MergeTouchedPath): string | null {
@@ -385,7 +326,6 @@ function requireJournalOwnership(
   repo: Repository,
   worktree: Worktree,
   journal: MergeJournal,
-  tailSqlStatements: number,
 ): void {
   const state = journal.state;
   requireOriginalSnapshots(repo, journal);
@@ -401,12 +341,8 @@ function requireJournalOwnership(
   }
   const currentTree = commitTree(repo, state.currentParentOid);
   const incomingTree = commitTree(repo, state.incomingParentOid);
-  const budget: VirtualBudget = {
-    commits: 0,
-    sqlStatements:
-      selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + INTEGRATION_COLLISION_SQL_STATEMENTS,
-  };
-  const baseTree = selectedBaseTree(repo, selection.bases, budget);
+  const virtualState: VirtualState = { commits: 0 };
+  const baseTree = selectedBaseTree(repo, selection.bases, virtualState);
   const plan = planIntegration(repo, {
     baseTreeOid: baseTree,
     currentTreeOid: currentTree,
@@ -419,10 +355,6 @@ function requireJournalOwnership(
       },
     },
   });
-  budget.sqlStatements += integrationSqlStatements(plan, MAX_INTEGRATION_TREE_STATEMENTS);
-  if (budget.sqlStatements + tailSqlStatements >= 1_000) {
-    throw new GitError("E2BIG", "merge recovery SQL model exceeds 999 statements");
-  }
   const reservation = reserveIntegrationPlan(repo, plan);
   try {
     const omitted = new Set(journal.touched.map((entry) => entry.path));
@@ -569,28 +501,20 @@ function mergeInTransaction(
       : requireMergeRevision(behavior.incomingLabel, "incoming label");
   const currentLabel = "HEAD";
   const isFastForward = selection.kind === "fast-forward" && options.fastForward !== false;
-  const budget: VirtualBudget = {
-    commits: 0,
-    sqlStatements:
-      selection.sqlStatements + MERGE_FIXED_SQL_STATEMENTS + INTEGRATION_GUARD_SQL_STATEMENTS,
-  };
-  if (isFastForward) {
-    budget.sqlStatements +=
-      MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS + MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS;
-  }
+  const virtualState: VirtualState = { commits: 0 };
   if (!isFastForward) {
     requireBoundedIntegrationIndex(repo);
     requireCleanIntegrationIndex(repo, currentTree, "merge");
-    budget.sqlStatements += INTEGRATION_INDEX_SQL_STATEMENTS;
   }
-  const baseTree = isFastForward ? currentTree : selectedBaseTree(repo, selection.bases, budget);
+  const baseTree = isFastForward
+    ? currentTree
+    : selectedBaseTree(repo, selection.bases, virtualState);
   const plan = planIntegration(repo, {
     baseTreeOid: baseTree,
     currentTreeOid: currentTree,
     incomingTreeOid: nextTree,
     text: { labels: { current: currentLabel, base: "base", incoming: nextLabel } },
   });
-  budget.sqlStatements += integrationSqlStatements(plan, MAX_INTEGRATION_TREE_STATEMENTS);
   const reservation = reserveIntegrationPlan(repo, plan);
   try {
     const projected = projectIntegrationWithCollisions(
@@ -602,9 +526,6 @@ function mergeInTransaction(
       currentLabel,
       nextLabel,
     );
-    if (projected.some((entry) => entry.purpose !== "primary")) {
-      budget.sqlStatements += INTEGRATION_COLLISION_SQL_STATEMENTS;
-    }
     requireSafeIntegrationWorktree(
       repo,
       worktree,
@@ -616,14 +537,8 @@ function mergeInTransaction(
     if (conflicts.length > 0 && behavior.persistConflicts === false) {
       throw compatibilityConflict(conflicts);
     }
-    let projectedTree: TreeBuildPreflightStats | null = null;
     if (!isFastForward) {
-      projectedTree = requireBoundedIntegrationTree(
-        prospectiveIntegrationIndexEntries(repo, projected),
-      );
-      if (conflicts.length === 0 && options.commit !== false) {
-        budget.sqlStatements += integrationCommitSqlStatements(projectedTree);
-      }
+      requireBoundedIntegrationTree(prospectiveIntegrationIndexEntries(repo, projected));
     }
 
     const current = repo.head();
@@ -639,9 +554,7 @@ function mergeInTransaction(
       behavior.origin ?? "merge",
     );
     mergeMetadata.message = messageWithConflicts(mergeMetadata.message, conflicts);
-    const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata, {
-      priorSqlStatements: budget.sqlStatements,
-    });
+    const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata);
     if (isFastForward) {
       repo.mutateRefs(
         {
@@ -707,12 +620,7 @@ export function mergeContinue(
   return repo.store.db.transactionSync(() => {
     const journal = repo.checkout.requireMergeState();
     const head = requireOriginalHead(repo, journal.state);
-    requireJournalOwnership(
-      repo,
-      context.worktree,
-      journal,
-      MAX_INTEGRATION_COMMIT_SQL_STATEMENTS + INTEGRATION_INDEX_SQL_STATEMENTS,
-    );
+    requireJournalOwnership(repo, context.worktree, journal);
     if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue: the index has unmerged paths");
     }
@@ -750,7 +658,7 @@ export function mergeAbort(repo: Repository, worktree: Worktree): void {
   repo.store.db.transactionSync(() => {
     const journal = repo.checkout.requireMergeState();
     requireOriginalHead(repo, journal.state);
-    requireJournalOwnership(repo, worktree, journal, 350);
+    requireJournalOwnership(repo, worktree, journal);
     const reservation = reserveIntegrationExecution(repo);
     try {
       abortProjectedMerge(repo, worktree, journal);

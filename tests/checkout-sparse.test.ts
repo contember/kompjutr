@@ -1036,7 +1036,7 @@ describe("sparse checkout", () => {
     expect(workspace.repo.head().oid).toBe(target);
   });
 
-  it("falls back before mutating 296 distinct directories that exceed the prune SQL budget", () => {
+  it("keeps the selected plan past the former prune SQL budget", () => {
     const workspace = makeRepo("/");
     configureFixtureIdentity(workspace);
     // The old two-SQL charge admitted this 1,531-statement prune.
@@ -1055,12 +1055,16 @@ describe("sparse checkout", () => {
     sealIndexTracker(workspace);
     const worktree = new NoScanWorktree(workspace.worktree);
 
-    expect(() =>
-      checkout(sparseTrackerContext(workspace), workspace.repo, worktree, { ref: target }),
-    ).toThrow(/must not scan/);
+    checkout(sparseTrackerContext(workspace), workspace.repo, worktree, { ref: target });
+
     expect(worktree.writes).toEqual([]);
-    expect(worktree.removals).toEqual([]);
-    expect(workspace.repo.head().oid).toBe(base);
+    expect(worktree.removals).toEqual([
+      ...paths.map((path) => `/${path}`),
+      ...paths.map((path) => `/${path.slice(0, path.indexOf("/"))}`),
+    ]);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(paths.every((path) => workspace.worktree.stat(`/${path}`) === null)).toBe(true);
+    expect(workspace.repo.head().oid).toBe(target);
   });
 
   it("does not fall back or reseal when sparse apply fails", () => {

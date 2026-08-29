@@ -9,10 +9,6 @@ import type { Repository } from "../repository.js";
 export const MAX_MERGE_BASE_COMMITS = MAX_LOG_COMMITS;
 export const MAX_MERGE_BASE_RETAINED_BYTES = MAX_LOG_STATE_BYTES;
 export const MAX_MERGE_BASES = 64;
-/** Two commit-type checks, two indexed root checks, two graph cursors, and one shallow read. */
-export const MERGE_BASE_SQL_STATEMENTS = 7;
-/** Ahead/behind uses the same validated roots and indexed graph cursors as merge-base. */
-export const AHEAD_BEHIND_SQL_STATEMENTS = 7;
 
 const CURRENT = 1;
 const INCOMING = 2;
@@ -34,14 +30,12 @@ export interface MergeBaseSelection {
   /** Unique commits retained across both reachable graphs. */
   commits: number;
   retainedBytes: number;
-  sqlStatements: number;
 }
 
 export interface MergeBaseLimits {
   maxCommits?: number;
   maxRetainedBytes?: number;
   maxBases?: number;
-  maxSqlStatements?: number;
 }
 
 export interface MergeBaseInput {
@@ -55,7 +49,6 @@ export interface AheadBehindResult {
   behind: number;
   commits: number;
   retainedBytes: number;
-  sqlStatements: number;
 }
 
 export interface DivergenceOptions {
@@ -93,7 +86,6 @@ interface ResolvedLimits {
   maxCommits: number;
   maxRetainedBytes: number;
   maxBases: number;
-  maxSqlStatements: number;
 }
 
 interface GraphNode {
@@ -123,11 +115,6 @@ function resolveLimits(limits: MergeBaseLimits | undefined): ResolvedLimits {
       "retained byte",
     ),
     maxBases: boundedLimit(limits?.maxBases, MAX_MERGE_BASES, "base"),
-    maxSqlStatements: boundedLimit(
-      limits?.maxSqlStatements,
-      MERGE_BASE_SQL_STATEMENTS,
-      "SQL statement",
-    ),
   };
 }
 
@@ -249,22 +236,14 @@ function result(
     bases,
     commits: state.nodes.size,
     retainedBytes: state.retainedBytes,
-    sqlStatements: MERGE_BASE_SQL_STATEMENTS,
   };
 }
 
-function reachableGraph(
-  repo: Repository,
-  input: MergeBaseInput,
-  requiredSqlStatements: number,
-): GraphState {
+function reachableGraph(repo: Repository, input: MergeBaseInput): GraphState {
   if (!isOid(input.currentOid) || !isOid(input.incomingOid)) {
     throw new GitError("EINVAL", "merge-base inputs must be full object ids");
   }
   const limits = resolveLimits(input.limits);
-  if (limits.maxSqlStatements < requiredSqlStatements) {
-    throw new GitError("E2BIG", `merge-base requires ${requiredSqlStatements} SQL statements`);
-  }
   const currentType = repo.typeOf(input.currentOid);
   if (currentType !== "commit") {
     throw new CorruptError(`${input.currentOid} is a ${currentType}, not a commit`);
@@ -281,7 +260,7 @@ function reachableGraph(
 
 /** Count commits reachable from only one side of two bounded indexed histories. */
 export function countAheadBehind(repo: Repository, input: MergeBaseInput): AheadBehindResult {
-  const state = reachableGraph(repo, input, AHEAD_BEHIND_SQL_STATEMENTS);
+  const state = reachableGraph(repo, input);
   let ahead = 0;
   let behind = 0;
   for (const node of state.nodes.values()) {
@@ -293,7 +272,6 @@ export function countAheadBehind(repo: Repository, input: MergeBaseInput): Ahead
     behind,
     commits: state.nodes.size,
     retainedBytes: state.retainedBytes,
-    sqlStatements: AHEAD_BEHIND_SQL_STATEMENTS,
   };
 }
 
@@ -301,11 +279,7 @@ export function countAheadBehind(repo: Repository, input: MergeBaseInput): Ahead
 export function divergence(repo: Repository, options: DivergenceOptions): DivergenceResult {
   const currentOid = repo.peel(repo.revParse(options.current));
   const upstreamOid = repo.peel(repo.revParse(options.upstream));
-  const state = reachableGraph(
-    repo,
-    { currentOid, incomingOid: upstreamOid },
-    AHEAD_BEHIND_SQL_STATEMENTS,
-  );
+  const state = reachableGraph(repo, { currentOid, incomingOid: upstreamOid });
 
   let ahead = 0;
   let behind = 0;
@@ -340,7 +314,7 @@ export function mergeBase(repo: Repository, options: MergeBaseOptions): MergeBas
 /** Select ancestry mode and all best common ancestors without mutating repository state. */
 export function selectMergeBases(repo: Repository, input: MergeBaseInput): MergeBaseSelection {
   const limits = resolveLimits(input.limits);
-  const state = reachableGraph(repo, input, MERGE_BASE_SQL_STATEMENTS);
+  const state = reachableGraph(repo, input);
 
   if (state.nodes.get(input.incomingOid)?.sides === BOTH) {
     return result("already-merged", [input.incomingOid], state);

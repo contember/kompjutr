@@ -37,25 +37,7 @@ import {
 } from "./operation-state.js";
 
 const APPLY_SCAN_PAGE = 1_000;
-export const MAX_MERGE_APPLY_SCAN_PAGES = 50;
-export const MAX_MERGE_APPLY_SCAN_ROWS = APPLY_SCAN_PAGE * MAX_MERGE_APPLY_SCAN_PAGES;
-export const MAX_MERGE_APPLY_SNAPSHOT_READ_CALLS = 4;
-export const MAX_MERGE_APPLY_BLOB_READ_CALLS = 8;
 export const MAX_MERGE_APPLY_CONTENT_BYTES = 32 * 1024 * 1024;
-const MAX_SNAPSHOT_STATEMENTS_PER_READ = 4;
-const MAX_OBJECT_STATEMENTS_PER_READ = 8;
-// Covers 64 MiB of object writes, 80 MiB of worktree writes, and bounded index/journal batches.
-const MAX_MERGE_APPLY_MUTATION_STATEMENTS = 650;
-export const MAX_MERGE_APPLY_SQL_STATEMENTS =
-  MAX_MERGE_APPLY_SCAN_PAGES +
-  (MAX_MERGE_APPLY_SCAN_PAGES + 1) +
-  MAX_MERGE_APPLY_SNAPSHOT_READ_CALLS * MAX_SNAPSHOT_STATEMENTS_PER_READ +
-  MAX_MERGE_APPLY_BLOB_READ_CALLS * MAX_OBJECT_STATEMENTS_PER_READ +
-  MAX_MERGE_APPLY_MUTATION_STATEMENTS;
-export const MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS = 999 - MAX_MERGE_APPLY_SQL_STATEMENTS;
-if (MAX_MERGE_APPLY_SQL_STATEMENTS >= 1_000) {
-  throw new Error("merge apply SQL model exceeds the operation statement limit");
-}
 
 export type MergeApplyMetadata = Omit<MergeStateMetadata, "phase">;
 export type MergeApplyOutcome = "clean" | "conflicted" | "ready";
@@ -63,16 +45,9 @@ export type MergeApplyOutcome = "clean" | "conflicted" | "ready";
 export interface MergeApplyResult {
   outcome: MergeApplyOutcome;
   journal: MergeJournal | null;
-  sqlStatements: number;
-}
-
-export interface MergeApplyOptions {
-  /** Statements already reserved by merge-base selection and integration planning. */
-  priorSqlStatements?: number;
 }
 
 export interface OperationApplyOptions {
-  priorSqlStatements?: number;
   suspendedState: OperationStateMetadata | null;
 }
 
@@ -84,45 +59,6 @@ interface ActiveRebaseApply {
 
 export interface OperationApplyResult {
   touched: readonly MergeTouchedPath[] | null;
-  sqlStatements: number;
-}
-
-export interface OperationRestoreOptions {
-  /** Statements already reserved by journal verification and ownership reconstruction. */
-  priorSqlStatements?: number;
-  /** Include the caller's operation-state clear in the pre-write estimate. */
-  clearState?: boolean;
-}
-
-export interface OperationRestoreSqlInput {
-  worktreeScanPages: number;
-  blobReadCalls: number;
-  worktreeWriteCalls: number;
-  worktreeWriteBytes: number;
-  indexMutations: number;
-  hasRemovals: boolean;
-  clearState: boolean;
-}
-
-export interface MergeApplySqlInput {
-  worktreeScanPages: number;
-  indexScanRows: number;
-  snapshotReadCalls: number;
-  blobReadCalls: number;
-  snapshotObjectSizes: readonly number[];
-  contentObjectSizes: readonly number[];
-  worktreeWriteCalls: number;
-  worktreeWriteBytes: number;
-  indexMutations: number;
-  journalRetainedBytes: number;
-  hasJournal: boolean;
-  hasRemovals: boolean;
-  objectInfoCalls: number;
-}
-
-export interface MergeApplySqlEstimate {
-  applySqlStatements: number;
-  totalSqlStatements: number;
 }
 
 interface TouchedSpec {
@@ -137,151 +73,12 @@ interface SnapshotDraft {
   stat: WorktreeStat | null;
 }
 
-interface ReadCallBudget {
-  snapshot: number;
-  blobs: number;
-}
-
 interface WorktreeSnapshotScan {
   entries: Map<string, WorktreeStat>;
-  pages: number;
 }
 
 interface IndexSnapshots {
   entries: Map<string, MergeIndexSnapshot>;
-  rows: number;
-}
-
-interface SourceBlobBudget {
-  calls: number;
-  bytes: number;
-}
-
-function useReadCall(budget: ReadCallBudget, kind: "snapshot" | "blobs"): void {
-  const limit =
-    kind === "snapshot" ? MAX_MERGE_APPLY_SNAPSHOT_READ_CALLS : MAX_MERGE_APPLY_BLOB_READ_CALLS;
-  if (budget[kind] >= limit) {
-    throw new GitError("E2BIG", `merge ${kind} reads exceed ${limit} bounded calls`);
-  }
-  budget[kind]++;
-}
-
-function requireCount(value: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new GitError("EINVAL", `merge ${label} must be a non-negative safe integer`);
-  }
-  return value;
-}
-
-function addStatements(total: number, additional: number): number {
-  if (!Number.isSafeInteger(additional) || additional < 0 || additional > 999 - total) {
-    return 1_000;
-  }
-  return total + additional;
-}
-
-function payloadPages(bytes: number): number {
-  requireCount(bytes, "payload bytes");
-  return bytes === 0 ? 0 : Math.ceil(bytes / (1024 * 1024));
-}
-
-function objectWriteStatements(sizes: readonly number[]): number {
-  let statements = 0;
-  for (const size of sizes) {
-    requireCount(size, "object size");
-    // One metadata insert, one stale-chunk delete, then bounded payload pages.
-    statements = addStatements(statements, 2 + Math.max(1, payloadPages(size + 64 * 1024)));
-  }
-  return statements;
-}
-
-/** Compose the apply estimate with work already reserved by the caller. */
-export function calculateMergeApplySqlStatements(
-  priorSqlStatements: number,
-  input: MergeApplySqlInput,
-): MergeApplySqlEstimate {
-  requireCount(priorSqlStatements, "prior SQL statements");
-  const counts = [
-    input.worktreeScanPages,
-    input.indexScanRows,
-    input.snapshotReadCalls,
-    input.blobReadCalls,
-    input.worktreeWriteCalls,
-    input.worktreeWriteBytes,
-    input.indexMutations,
-    input.journalRetainedBytes,
-    input.objectInfoCalls,
-  ];
-  for (const count of counts) requireCount(count, "SQL estimate input");
-
-  let apply = 6; // state guard, roots, and bounded fixed probes
-  apply = addStatements(apply, input.worktreeScanPages);
-  apply = addStatements(
-    apply,
-    input.indexScanRows === 0
-      ? input.hasJournal
-        ? 1
-        : 0
-      : Math.ceil(input.indexScanRows / 1_000) + 1,
-  );
-  apply = addStatements(apply, input.snapshotReadCalls * MAX_SNAPSHOT_STATEMENTS_PER_READ);
-  apply = addStatements(apply, input.blobReadCalls * MAX_OBJECT_STATEMENTS_PER_READ);
-  apply = addStatements(apply, input.objectInfoCalls);
-  apply = addStatements(apply, objectWriteStatements(input.snapshotObjectSizes));
-  apply = addStatements(apply, objectWriteStatements(input.contentObjectSizes));
-  if (input.worktreeWriteCalls > 0) {
-    apply = addStatements(
-      apply,
-      input.worktreeWriteCalls * 10 + payloadPages(input.worktreeWriteBytes),
-    );
-  }
-  if (input.hasRemovals) apply = addStatements(apply, 6);
-  if (input.indexMutations > 0) {
-    apply = addStatements(apply, Math.ceil(input.indexMutations / 512) * 2);
-  }
-  if (input.hasJournal) {
-    apply = addStatements(apply, 9 + payloadPages(input.journalRetainedBytes));
-  }
-  return {
-    applySqlStatements: apply,
-    totalSqlStatements: addStatements(priorSqlStatements, apply),
-  };
-}
-
-/** Compose a replay restore estimate before its first mutation. */
-export function calculateOperationRestoreSqlStatements(
-  priorSqlStatements: number,
-  input: OperationRestoreSqlInput,
-): MergeApplySqlEstimate {
-  requireCount(priorSqlStatements, "prior SQL statements");
-  for (const count of [
-    input.worktreeScanPages,
-    input.blobReadCalls,
-    input.worktreeWriteCalls,
-    input.worktreeWriteBytes,
-    input.indexMutations,
-  ]) {
-    requireCount(count, "restore SQL estimate input");
-  }
-  let restore = 6; // authenticated journal, roots, and bounded fixed probes
-  restore = addStatements(restore, input.worktreeScanPages);
-  restore = addStatements(restore, input.blobReadCalls * MAX_OBJECT_STATEMENTS_PER_READ);
-  restore = addStatements(restore, 1); // one bounded object-info probe for snapshot blobs
-  if (input.hasRemovals) restore = addStatements(restore, 6);
-  if (input.worktreeWriteCalls > 0) {
-    restore = addStatements(
-      restore,
-      input.worktreeWriteCalls * 10 + payloadPages(input.worktreeWriteBytes),
-    );
-  }
-  if (input.indexMutations > 0) {
-    restore = addStatements(restore, Math.ceil(input.indexMutations / 512) * 2);
-  }
-  if (input.clearState) restore = addStatements(restore, 9);
-  return {
-    applySqlStatements: restore,
-    totalSqlStatements: addStatements(priorSqlStatements, restore),
-  };
 }
 
 function validMode(mode: string): boolean {
@@ -485,16 +282,11 @@ function worktreeSnapshotScan(
   const exactOwned = new Set(ownedPaths);
   const found = new Map<string, WorktreeStat>();
   const last = specs[specs.length - 1];
-  if (last === undefined) return { entries: found, pages: 0 };
+  if (last === undefined) return { entries: found };
   const lastAbsolute = joinPath(root, last.path);
   let after: string | undefined;
-  let pages = 0;
   while (true) {
-    if (pages >= MAX_MERGE_APPLY_SCAN_PAGES) {
-      throw new GitError("E2BIG", `merge apply scan exceeds ${MAX_MERGE_APPLY_SCAN_ROWS} rows`);
-    }
     const page = worktree.scan(root, { after, limit: APPLY_SCAN_PAGE });
-    pages++;
     if (page.length === 0) break;
     for (const entry of page) {
       const relative = relativeTo(root, entry.path);
@@ -516,6 +308,9 @@ function worktreeSnapshotScan(
     }
     const tail = page[page.length - 1];
     if (tail === undefined || page.length < APPLY_SCAN_PAGE) break;
+    if (after !== undefined && comparePaths(tail.path, after) <= 0) {
+      throw new CorruptError("merge worktree scan cursor made no progress");
+    }
     if (
       comparePaths(tail.path, lastAbsolute) > 0 &&
       destructiveOwner(tail.path, absoluteDestructive) === null
@@ -524,20 +319,15 @@ function worktreeSnapshotScan(
     }
     after = tail.path;
   }
-  return { entries: found, pages };
+  return { entries: found };
 }
 
 function indexSnapshots(repo: Repository, specs: readonly TouchedSpec[]): IndexSnapshots {
   const wanted = new Set(specs.map((spec) => spec.path));
   const found = new Map<string, MergeIndexSnapshot>();
   const last = specs[specs.length - 1];
-  if (last === undefined) return { entries: found, rows: 0 };
-  let rows = 0;
+  if (last === undefined) return { entries: found };
   for (const entry of repo.checkout.indexScan()) {
-    rows++;
-    if (rows > MAX_MERGE_APPLY_SCAN_ROWS) {
-      throw new GitError("E2BIG", `merge index scan exceeds ${MAX_MERGE_APPLY_SCAN_ROWS} rows`);
-    }
     if (comparePaths(entry.path, last.path) > 0) break;
     if (!wanted.has(entry.path)) continue;
     if (entry.stage !== 0) {
@@ -553,7 +343,7 @@ function indexSnapshots(repo: Repository, specs: readonly TouchedSpec[]): IndexS
       rev: entry.rev ?? null,
     });
   }
-  return { entries: found, rows };
+  return { entries: found };
 }
 
 function snapshotWorktreeObjects(
@@ -561,11 +351,10 @@ function snapshotWorktreeObjects(
   worktree: Worktree,
   root: string,
   drafts: readonly SnapshotDraft[],
-  calls: ReadCallBudget,
 ): Map<string, string> {
   const oids = new Map<string, string>();
   const files: string[] = [];
-  const snapshotLimit = MAX_MERGE_APPLY_SNAPSHOT_READ_CALLS * MAX_BLOB_BATCH_BYTES;
+  const snapshotLimit = 4 * MAX_BLOB_BATCH_BYTES;
   let snapshotBytes = 0;
   for (const draft of drafts) {
     const stat = draft.stat;
@@ -602,7 +391,6 @@ function snapshotWorktreeObjects(
     }
     let remaining = files;
     while (remaining.length > 0) {
-      useReadCall(calls, "snapshot");
       const read = worktree.readFiles(remaining, { budget: MAX_BLOB_BATCH_BYTES });
       for (const [absolute, bytes] of read.files) {
         const relative = relativeTo(root, absolute);
@@ -647,50 +435,7 @@ function touchedFromDrafts(
   }));
 }
 
-function snapshotSizes(drafts: readonly SnapshotDraft[]): number[] {
-  const sizes: number[] = [];
-  for (const draft of drafts) {
-    const stat = draft.stat;
-    if (stat?.type === "file") sizes.push(stat.size);
-    else if (stat?.type === "symlink" && stat.target !== null) {
-      sizes.push(
-        boundedUtf8Length(
-          stat.target,
-          MAX_BLOB_BATCH_BYTES,
-          `merge snapshot symlink ${draft.spec.path}`,
-        ),
-      );
-    }
-  }
-  return sizes;
-}
-
-function snapshotFileSizes(drafts: readonly SnapshotDraft[]): number[] {
-  return drafts.flatMap((draft) => (draft.stat?.type === "file" ? [draft.stat.size] : []));
-}
-
-function boundedReadCalls(sizes: readonly number[], limit: number, label: string): number {
-  let calls = 0;
-  let bytes = 0;
-  for (const size of sizes) {
-    if (size > MAX_BLOB_BATCH_BYTES) {
-      throw new GitError("E2BIG", `merge ${label} object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
-    }
-    if (bytes > 0 && bytes + size > MAX_BLOB_BATCH_BYTES) {
-      calls++;
-      bytes = 0;
-    }
-    bytes += size;
-  }
-  if (bytes > 0 || sizes.length > 0) calls++;
-  if (calls > limit) throw new GitError("E2BIG", `merge ${label} reads exceed ${limit} calls`);
-  return calls;
-}
-
-function sourceBlobBudget(
-  repo: Repository,
-  entries: readonly ProjectedMergeEntry[],
-): SourceBlobBudget {
+function validateSourceBlobs(repo: Repository, entries: readonly ProjectedMergeEntry[]): void {
   const seen = new Set<string>();
   const oids: string[] = [];
   for (const entry of entries) {
@@ -699,43 +444,23 @@ function sourceBlobBudget(
     seen.add(identity.oid);
     oids.push(identity.oid);
   }
-  if (oids.length === 0) return { calls: 0, bytes: 0 };
-  const sizes: number[] = [];
+  if (oids.length === 0) return;
   const sizeByOid = new Map<string, number>();
   for (const object of repo.store.objectInfo(oids)) {
     if (object.type !== "blob") {
       throw new CorruptError(`merge output object ${object.oid} is not a blob`);
     }
-    sizes.push(object.size);
+    if (object.size > MAX_BLOB_BATCH_BYTES) {
+      throw new GitError("E2BIG", `merge blob object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
+    }
     sizeByOid.set(object.oid, object.size);
   }
-  let bytes = 0;
   for (const entry of entries) {
     const identity = entry.content === null ? entry.worktree : null;
     if (identity === null) continue;
     const size = sizeByOid.get(identity.oid);
     if (size === undefined) throw new CorruptError(`merge output lost object ${identity.oid}`);
-    bytes += size;
-    if (!Number.isSafeInteger(bytes)) throw new GitError("E2BIG", "merge output size overflow");
   }
-  return {
-    calls: boundedReadCalls(sizes, MAX_MERGE_APPLY_BLOB_READ_CALLS, "blob"),
-    bytes,
-  };
-}
-
-function indexMutationCount(
-  entries: readonly ProjectedMergeEntry[],
-  specs: readonly TouchedSpec[],
-): number {
-  let mutations = specs.length;
-  for (const entry of entries) {
-    if (entry.stageZero !== null) mutations++;
-    if (entry.stages?.base !== null && entry.stages?.base !== undefined) mutations++;
-    if (entry.stages?.current !== null && entry.stages?.current !== undefined) mutations++;
-    if (entry.stages?.incoming !== null && entry.stages?.incoming !== undefined) mutations++;
-  }
-  return mutations;
 }
 
 function outcomeOf(
@@ -776,7 +501,6 @@ function materialiseWrites(
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   contentOids: ReadonlyMap<string, string>,
-  calls: ReadCallBudget,
 ): void {
   const inline: WriteEntry[] = [];
   const pending: ProjectedMergeEntry[] = [];
@@ -799,7 +523,6 @@ function materialiseWrites(
 
   let remaining = pending;
   while (remaining.length > 0) {
-    useReadCall(calls, "blobs");
     const read = repo.readBlobs(
       remaining.map((entry) => entry.worktree?.oid ?? ""),
       { budgetBytes: MAX_BLOB_BATCH_BYTES },
@@ -969,13 +692,10 @@ function applyProjectedOperationInternal(
   const owned = specs.map((spec) => spec.path);
   const destructive = applyDestructiveRoots(entries);
   const worktreeRows = worktreeSnapshotScan(repo, worktree, specs, destructive, owned);
-  const calls: ReadCallBudget = { snapshot: 0, blobs: 0 };
   let drafts: SnapshotDraft[] = [];
   let previewTouched: MergeTouchedPath[] = [];
-  let indexRows = 0;
   if (suspendedState !== null) {
     const index = indexSnapshots(repo, specs);
-    indexRows = index.rows;
     drafts = specs.map((spec) => ({
       spec,
       index: index.entries.get(spec.path) ?? null,
@@ -984,51 +704,16 @@ function applyProjectedOperationInternal(
     previewTouched = touchedFromDrafts(drafts, null);
   }
 
-  const source = sourceBlobBudget(repo, entries);
-  const snapshotObjectSizes = snapshotSizes(drafts);
-  const snapshotReadCalls = boundedReadCalls(
-    snapshotFileSizes(drafts),
-    MAX_MERGE_APPLY_SNAPSHOT_READ_CALLS,
-    "snapshot",
-  );
-  const contentObjectSizes = entries.flatMap((entry) =>
-    entry.content === null ? [] : [entry.content.length],
-  );
-  const contentBytes = contentObjectSizes.reduce((total, size) => total + size, 0);
+  validateSourceBlobs(repo, entries);
   const removals = structuralRemovals(entries, worktreeRows.entries);
-  const journalRetainedBytes =
-    suspendedState === null
-      ? 0
-      : operationJournalRetainedBytes(suspendedState, previewTouched, suspendedSteps);
-  const estimate = calculateMergeApplySqlStatements(options.priorSqlStatements ?? 0, {
-    worktreeScanPages: worktreeRows.pages,
-    indexScanRows: indexRows,
-    snapshotReadCalls,
-    blobReadCalls: source.calls,
-    snapshotObjectSizes,
-    contentObjectSizes,
-    worktreeWriteCalls: source.calls + (contentObjectSizes.length > 0 ? 1 : 0),
-    worktreeWriteBytes: source.bytes + contentBytes,
-    indexMutations: indexMutationCount(entries, specs),
-    journalRetainedBytes,
-    hasJournal: suspendedState !== null,
-    hasRemovals: removals.length > 0,
-    objectInfoCalls: (source.calls > 0 ? 1 : 0) + (suspendedState === null ? 0 : 1),
-  });
-  if (
-    estimate.applySqlStatements > MAX_MERGE_APPLY_SQL_STATEMENTS ||
-    estimate.totalSqlStatements >= 1_000
-  ) {
-    throw new GitError(
-      "E2BIG",
-      `merge SQL model requires ${estimate.totalSqlStatements} statements`,
-    );
+  if (suspendedState !== null) {
+    operationJournalRetainedBytes(suspendedState, previewTouched, suspendedSteps);
   }
 
   let touched: readonly MergeTouchedPath[] | null = null;
   if (suspendedState !== null) {
     const root = worktree.realpath(repo.root);
-    const snapshotOids = snapshotWorktreeObjects(repo, worktree, root, drafts, calls);
+    const snapshotOids = snapshotWorktreeObjects(repo, worktree, root, drafts);
     touched = touchedFromDrafts(drafts, snapshotOids);
     operationJournalRetainedBytes(suspendedState, touched, suspendedSteps);
   }
@@ -1042,7 +727,7 @@ function applyProjectedOperationInternal(
       },
     );
   }
-  materialiseWrites(repo, worktree, entries, contentOids, calls);
+  materialiseWrites(repo, worktree, entries, contentOids);
   applyIndex(repo.checkout, entries, specs);
   if (touched !== null) {
     if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
@@ -1057,7 +742,7 @@ function applyProjectedOperationInternal(
       );
     }
   }
-  return { touched, sqlStatements: estimate.applySqlStatements };
+  return { touched };
 }
 
 /** Apply a normal operation inside its caller-owned transaction. */
@@ -1071,7 +756,6 @@ export function applyProjectedOperation(
 }
 
 export interface ProjectedRebaseTransitionOptions<T> extends ActiveRebaseApply {
-  priorSqlStatements?: number;
   onClean: (applied: OperationApplyResult) => T;
 }
 
@@ -1091,7 +775,7 @@ export function applyProjectedRebaseTransition<T>(
       repo,
       worktree,
       entries,
-      { priorSqlStatements: options.priorSqlStatements, suspendedState: null },
+      { suspendedState: null },
       options,
     );
     if (options.conflictState !== null) {
@@ -1112,7 +796,6 @@ export function applyProjectedMerge(
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   metadata: MergeApplyMetadata,
-  options: MergeApplyOptions = {},
 ): MergeApplyResult {
   const outcome = outcomeOf(entries, metadata.mode);
   if (outcome === "clean") {
@@ -1120,7 +803,6 @@ export function applyProjectedMerge(
   }
   const state = outcome === "clean" ? null : metadataForOutcome(metadata, outcome);
   const applied = applyProjectedOperation(repo, worktree, entries, {
-    priorSqlStatements: options.priorSqlStatements,
     suspendedState: state === null ? null : mergeOperationState(state),
   });
   const journal =
@@ -1131,7 +813,7 @@ export function applyProjectedMerge(
           touched: applied.touched,
           retainedBytes: mergeJournalRetainedBytes(state, applied.touched),
         };
-  return { outcome, journal, sqlStatements: applied.sqlStatements };
+  return { outcome, journal };
 }
 
 function validateJournal(journal: MergeJournal): void {
@@ -1212,7 +894,6 @@ function restoreWorktree(
   worktree: Worktree,
   touched: readonly MergeTouchedPath[],
   current: ReadonlyMap<string, WorktreeStat>,
-  calls: ReadCallBudget,
 ): void {
   const removals = new Set<string>();
   const directories: WriteEntry[] = [];
@@ -1242,7 +923,6 @@ function restoreWorktree(
 
   let remaining = pending;
   while (remaining.length > 0) {
-    useReadCall(calls, "blobs");
     const read = repo.readBlobs(
       remaining.flatMap((entry) =>
         entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
@@ -1281,62 +961,30 @@ function restoreWorktree(
   }
 }
 
-function restoreSqlInput(
-  repo: Repository,
-  touched: readonly MergeTouchedPath[],
-  current: ReadonlyMap<string, WorktreeStat>,
-  worktreeScanPages: number,
-  clearState: boolean,
-): OperationRestoreSqlInput {
+function validateRestoreBlobs(repo: Repository, touched: readonly MergeTouchedPath[]): void {
   const oids: string[] = [];
   const seen = new Set<string>();
-  let directories = 0;
-  let hasRemovals = false;
   for (const entry of touched) {
     const snapshot = entry.worktree;
-    if (snapshot.kind === "absent") {
-      hasRemovals = true;
-      continue;
-    }
-    if (snapshot.kind === "directory") {
-      directories++;
-      if (current.get(entry.path)?.type !== "dir") hasRemovals = true;
-      continue;
-    }
-    if (current.get(entry.path)?.type === "dir") hasRemovals = true;
+    if (snapshot.kind !== "file" && snapshot.kind !== "symlink") continue;
     if (!seen.has(snapshot.oid)) {
       seen.add(snapshot.oid);
       oids.push(snapshot.oid);
     }
   }
-  const sizes: number[] = [];
-  const sizeByOid = new Map<string, number>();
+  const found = new Set<string>();
   for (const object of repo.store.objectInfo(oids)) {
     if (object.type !== "blob") {
       throw new CorruptError(`merge abort object ${object.oid} is not a blob`);
     }
-    sizes.push(object.size);
-    sizeByOid.set(object.oid, object.size);
+    if (object.size > MAX_BLOB_BATCH_BYTES) {
+      throw new GitError("E2BIG", `merge blob object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
+    }
+    found.add(object.oid);
   }
-  let bytes = 0;
-  for (const entry of touched) {
-    const snapshot = entry.worktree;
-    if (snapshot.kind !== "file" && snapshot.kind !== "symlink") continue;
-    const size = sizeByOid.get(snapshot.oid);
-    if (size === undefined) throw new CorruptError(`merge abort lost object ${snapshot.oid}`);
-    bytes += size;
-    if (!Number.isSafeInteger(bytes)) throw new GitError("E2BIG", "merge abort size overflow");
+  for (const oid of oids) {
+    if (!found.has(oid)) throw new CorruptError(`merge abort lost object ${oid}`);
   }
-  const blobReadCalls = boundedReadCalls(sizes, MAX_MERGE_APPLY_BLOB_READ_CALLS, "blob");
-  return {
-    worktreeScanPages,
-    blobReadCalls,
-    worktreeWriteCalls: blobReadCalls + (directories > 0 ? 1 : 0),
-    worktreeWriteBytes: bytes,
-    indexMutations: touched.length * 2,
-    hasRemovals,
-    clearState,
-  };
 }
 
 /** Restore only journal-owned paths; the caller supplies the atomic transaction. */
@@ -1346,7 +994,6 @@ export function abortProjectedMerge(
   journal: MergeJournal,
 ): void {
   validateJournal(journal);
-  const calls: ReadCallBudget = { snapshot: 0, blobs: 0 };
   validateJournalObjects(repo, journal);
   const specs = journal.touched.map((entry) => ({
     path: entry.path,
@@ -1363,7 +1010,7 @@ export function abortProjectedMerge(
     abortDestructiveRoots(journal.touched),
     owned,
   );
-  restoreWorktree(repo, worktree, journal.touched, current.entries, calls);
+  restoreWorktree(repo, worktree, journal.touched, current.entries);
   restoreIndex(repo, journal.touched);
   repo.checkout.clearMergeState();
 }
@@ -1373,7 +1020,6 @@ export function restoreProjectedOperation(
   repo: Repository,
   worktree: Worktree,
   journal: OperationJournal,
-  options: OperationRestoreOptions = {},
 ): void {
   const retainedBytes = operationJournalRetainedBytes(
     journal.state,
@@ -1396,7 +1042,6 @@ export function restoreProjectedOperation(
     }
     previous = entry.path;
   }
-  const calls: ReadCallBudget = { snapshot: 0, blobs: 0 };
   const specs = journal.touched.map((entry) => ({
     path: entry.path,
     logicalPath: entry.logicalPath,
@@ -1412,22 +1057,7 @@ export function restoreProjectedOperation(
     abortDestructiveRoots(journal.touched),
     owned,
   );
-  const estimate = calculateOperationRestoreSqlStatements(
-    options.priorSqlStatements ?? 0,
-    restoreSqlInput(
-      repo,
-      journal.touched,
-      current.entries,
-      current.pages,
-      options.clearState ?? false,
-    ),
-  );
-  if (estimate.totalSqlStatements >= 1_000) {
-    throw new GitError(
-      "E2BIG",
-      `merge restore SQL model requires ${estimate.totalSqlStatements} statements`,
-    );
-  }
-  restoreWorktree(repo, worktree, journal.touched, current.entries, calls);
+  validateRestoreBlobs(repo, journal.touched);
+  restoreWorktree(repo, worktree, journal.touched, current.entries);
   restoreIndex(repo, journal.touched);
 }

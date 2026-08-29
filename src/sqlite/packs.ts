@@ -48,7 +48,6 @@ export const MAX_PACK_DELETE_BATCH = 48;
 export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
 const MAX_PACK_FALLBACK_AUDIT_BYTES = 48 * 1024 * 1024;
 const MAX_PACK_FALLBACK_AUDIT_PACKS = 128;
-const MAX_PACK_FALLBACK_AUDIT_PAGES = 32;
 const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
 const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
 const PACK_FALLBACK_AUDIT_METADATA_BYTES = 2 * 1024 * 1024;
@@ -94,9 +93,6 @@ const PACK_RANGE_BATCH_BYTES = 1024 * 1024;
 const PACK_RANGE_REQUEST_MEMORY_BYTES = 832;
 const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
 const MAX_PACK_AUTH_COMPRESSED_BYTES = MAX_PACK_DELTA_WORKING_BYTES + PACK_INFLATE_HEADROOM_BYTES;
-// Two maintenance auth passes can spend 360 reads, leaving 639 statements for fixed work.
-const MAX_PACK_AUTH_UNCACHED_ROW_READS = 180;
-const MAX_PACK_GENERIC_UNCACHED_ROW_READS = 900;
 const PACK_SHARED_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const PACK_INFLATE_OUTPUT_CHUNK_BYTES = 16 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
@@ -188,40 +184,6 @@ function packRangeFragmentMask(request: PackRangeRequest): number {
   return 2 ** fragments - 1;
 }
 
-function uncachedPackRowReads(offset: number, length: number): number {
-  let reads = 0;
-  for (let consumed = 0; consumed < length; consumed += PACK_READ_BYTES) {
-    const window = Math.min(PACK_READ_BYTES, length - consumed);
-    const first = Math.floor((offset + consumed) / PACK_CHUNK);
-    const last = Math.floor((offset + consumed + window - 1) / PACK_CHUNK);
-    reads += last - first + 1;
-  }
-  return reads;
-}
-
-interface UncachedReadBudget {
-  uncachedReads: number;
-  readonly uncachedReadLimit: number;
-}
-
-function reserveUncachedPackRowReads(
-  budget: UncachedReadBudget,
-  entries: Iterable<{ dataOff: number; dataLen: number }>,
-  message: string,
-): void {
-  let additional = 0;
-  for (const entry of entries) {
-    if (entry.dataLen <= MAX_PACK_BLOB_BATCH_BYTES) continue;
-    additional += uncachedPackRowReads(entry.dataOff, entry.dataLen);
-    if (!Number.isSafeInteger(additional)) throw new GitError("E2BIG", message);
-  }
-  const next = budget.uncachedReads + additional;
-  if (!Number.isSafeInteger(next) || next > budget.uncachedReadLimit) {
-    throw new GitError("E2BIG", message);
-  }
-  budget.uncachedReads = next;
-}
-
 class FlatByteSource implements ByteSource {
   constructor(readonly bytes: Uint8Array) {}
 
@@ -301,11 +263,10 @@ interface FallbackPackAudit {
   count: number;
 }
 
-interface FallbackAuditBudget extends UncachedReadBudget {
+interface FallbackAuditBudget {
   readonly packIds: Set<number>;
   bytes: number;
   entries: number;
-  pages: number;
 }
 
 function fallbackAuditBudget(): FallbackAuditBudget {
@@ -313,9 +274,6 @@ function fallbackAuditBudget(): FallbackAuditBudget {
     packIds: new Set(),
     bytes: 0,
     entries: 0,
-    pages: 0,
-    uncachedReads: 0,
-    uncachedReadLimit: MAX_PACK_AUTH_UNCACHED_ROW_READS,
   };
 }
 
@@ -454,8 +412,6 @@ export interface PackIngestOptions {
   maxBytes?: number;
   /** Caller-owned operation budget; ingest uses and disposes one additive child scope. */
   reservation?: MemoryReservation;
-  /** Caller-owned SQL budget shared with the surrounding transport operation. */
-  sqlBudget?: PackIngestSqlBudget;
   onProgress?: (message: string) => void;
   /** Awaited periodically so the runtime can flush its write buffer. */
   yieldNow?: () => Promise<void>;
@@ -464,52 +420,6 @@ export interface PackIngestOptions {
   lifecycle?: PackIngestLifecycle;
   /** Ordinary ingest reclaims abandoned packs; owned maintenance retries skip that broad scan. */
   reclaimPending?: boolean;
-}
-
-/** Layer-safe SQL accounting seam for one pack ingest. */
-export interface PackIngestSqlBudget {
-  chargeSql(statements?: number): void;
-  reserveSql(part: string, statements: number): void;
-  chargeReservedSql(part: string, statements?: number): void;
-  releaseSql(part: string): void;
-}
-
-const PACK_INGEST_CLEANUP_SQL_PART = "pack-ingest-cleanup";
-
-class PackIngestDatabase implements SqlDatabase {
-  constructor(
-    private readonly db: SqlDatabase,
-    private readonly budget: PackIngestSqlBudget,
-  ) {}
-
-  run(query: string, ...bindings: unknown[]): void {
-    this.budget.chargeSql();
-    this.db.run(query, ...bindings);
-  }
-
-  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    this.budget.chargeSql();
-    return this.db.all<Row>(query, ...bindings);
-  }
-
-  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    this.budget.chargeSql();
-    return this.db.one<Row>(query, ...bindings);
-  }
-
-  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    this.budget.chargeSql();
-    return this.db.scalar<T>(query, ...bindings);
-  }
-
-  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    this.budget.chargeSql();
-    return this.db.iterate(query, ...bindings);
-  }
-
-  transactionSync<T>(closure: () => T): T {
-    return this.db.transactionSync(closure);
-  }
 }
 
 export interface PackIngestResult {
@@ -854,9 +764,6 @@ export class PackStore {
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
   readonly #maxDeltaDepth: number;
-  #ingestSqlBudget: PackIngestSqlBudget | undefined;
-  #ingestCleanupDb: SqlDatabase | undefined;
-
   constructor(
     db: SqlDatabase,
     repoId: number,
@@ -1212,10 +1119,6 @@ export class PackStore {
       }
     }
 
-    const uncachedBudget: UncachedReadBudget = {
-      uncachedReads: 0,
-      uncachedReadLimit: MAX_PACK_AUTH_UNCACHED_ROW_READS,
-    };
     let page: AuthenticatedPackSource[] = [];
     let pageBytes = 0;
     const authenticatePage = (): void => {
@@ -1225,7 +1128,6 @@ export class PackStore {
         this.#authenticateFullPackSourceStreaming(
           only,
           "canonical packed source bytes disagree with their object id",
-          uncachedBudget,
         );
         page = [];
         pageBytes = 0;
@@ -1238,7 +1140,6 @@ export class PackStore {
         false,
         new Map(),
         true,
-        uncachedBudget,
       );
       if (read.size !== page.length) {
         throw new CorruptError("canonical packed source authentication is incomplete");
@@ -1274,22 +1175,13 @@ export class PackStore {
     authenticatePage();
   }
 
-  #authenticateFullPackSourceStreaming(
-    source: AuthenticatedPackSource,
-    message: string,
-    uncachedBudget: UncachedReadBudget,
-  ): void {
+  #authenticateFullPackSourceStreaming(source: AuthenticatedPackSource, message: string): void {
     if (source.baseOid !== null || source.entrySize !== source.size || source.dataLen < 1) {
       throw new CorruptError(message);
     }
     if (source.dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
       throw new GitError("E2BIG", "packed source compressed bytes exceed the streaming limit");
     }
-    reserveUncachedPackRowReads(
-      uncachedBudget,
-      [source],
-      "packed source authentication exceeds its uncached row-read limit",
-    );
     const sha = new Sha1().update(objectHeader(source.type, source.size));
     let produced = 0;
     const stream = new InflateStream((chunk) => {
@@ -1328,10 +1220,6 @@ export class PackStore {
     allowMissing: boolean,
     seeds: ReadonlyMap<string, RawObject> = new Map(),
     bypassCache = false,
-    uncachedBudget: UncachedReadBudget = {
-      uncachedReads: 0,
-      uncachedReadLimit: MAX_PACK_GENERIC_UNCACHED_ROW_READS,
-    },
   ): Map<string, RawObject> {
     const wanted = [...new Set(oids)];
     if (wanted.length === 0) return new Map();
@@ -1492,12 +1380,6 @@ export class PackStore {
     if (oversizedEntries > 0 && (wanted.length !== 1 || oversizedEntries !== 1)) {
       throw new GitError("E2BIG", "packed blob compressed graph exceeds the 4 MiB batch limit");
     }
-    reserveUncachedPackRowReads(
-      uncachedBudget,
-      needed.values(),
-      "packed object read exceeds its uncached row-read limit",
-    );
-
     let compressedBytes = 0;
     const streamedCompressed = new Set<string>();
     const compressed = new Map<string, CompressedEntry>();
@@ -1616,7 +1498,6 @@ export class PackStore {
               compressed.get(current.oid)?.bytes,
               streamedCompressed.has(current.oid),
               bypassCache,
-              uncachedBudget,
             ),
           };
           if (!bypassCache) this.#cacheObject(current.packId, current.oid, object);
@@ -1651,7 +1532,6 @@ export class PackStore {
           compressed.get(entry.oid)?.bytes,
           streamedCompressed.has(entry.oid),
           bypassCache,
-          uncachedBudget,
         );
         checkDeltaWorkingSet(object.data, delta);
         object = { type: object.type, data: applyDelta(object.data, delta) };
@@ -1673,7 +1553,6 @@ export class PackStore {
     compressed: Uint8Array | undefined,
     streamed: boolean,
     bypassCache: boolean,
-    uncachedBudget: UncachedReadBudget,
   ): Uint8Array {
     if (compressed === undefined) {
       if (!streamed) throw new CorruptError(`packed blob entry ${entry.oid} was not loaded`);
@@ -1684,8 +1563,6 @@ export class PackStore {
         entry.entrySize,
         `pack entry at ${entry.offset}`,
         bypassCache,
-        uncachedBudget,
-        true,
       );
     }
     return this.#inflateBytes(compressed, entry.entrySize, `pack entry at ${entry.offset}`);
@@ -1755,11 +1632,6 @@ export class PackStore {
     expectedSize: number,
     label: string,
     bypassCache = false,
-    uncachedBudget: UncachedReadBudget = {
-      uncachedReads: 0,
-      uncachedReadLimit: MAX_PACK_GENERIC_UNCACHED_ROW_READS,
-    },
-    uncachedReadsReserved = false,
   ): Uint8Array {
     if (
       !Number.isSafeInteger(dataLen) ||
@@ -1772,13 +1644,6 @@ export class PackStore {
     }
     if (dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
       throw new GitError("E2BIG", `${label} compressed bytes exceed the streaming limit`);
-    }
-    if (!uncachedReadsReserved) {
-      reserveUncachedPackRowReads(
-        uncachedBudget,
-        [{ dataOff, dataLen }],
-        `${label} exceeds its uncached row-read limit`,
-      );
     }
     const stream = new InflateInto(expectedSize);
     let consumed = 0;
@@ -2787,11 +2652,7 @@ export class PackStore {
     }
   }
 
-  #auditPromotedFallbacks(
-    deletingPackId: number,
-    rows: readonly AuthenticatedPackSource[],
-    budget: FallbackAuditBudget,
-  ): void {
+  #auditPromotedFallbacks(deletingPackId: number, rows: readonly AuthenticatedPackSource[]): void {
     if (rows.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
       throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
     }
@@ -2800,16 +2661,11 @@ export class PackStore {
     let pageBytes = 0;
     const auditPage = (): void => {
       if (page.length === 0) return;
-      if (budget.pages >= MAX_PACK_FALLBACK_AUDIT_PAGES) {
-        throw new GitError("E2BIG", "promoted fallback audit exceeds its SQL page budget");
-      }
-      budget.pages++;
       const only = page.length === 1 ? page[0] : undefined;
       if (only !== undefined && only.dataLen > MAX_PACK_BLOB_BATCH_BYTES && only.baseOid === null) {
         this.#authenticateFullPackSourceStreaming(
           only,
           `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
-          budget,
         );
         page = [];
         pageBytes = 0;
@@ -2822,7 +2678,6 @@ export class PackStore {
         false,
         new Map(),
         true,
-        budget,
       );
       if (objects.size !== page.length) {
         throw new CorruptError(`pack ${deletingPackId}: promoted fallback audit is incomplete`);
@@ -3206,7 +3061,7 @@ export class PackStore {
         throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
       }
     }
-    this.#auditPromotedFallbacks(packId, promoted, auditBudget);
+    this.#auditPromotedFallbacks(packId, promoted);
     this.#authenticateLooseDeltaBases(packId, deletingPackIds, auditBudget);
     this.#db.run(
       `DELETE FROM git_commits
@@ -3288,14 +3143,6 @@ export class PackStore {
     source: AsyncIterable<Uint8Array>,
     options: PackIngestOptions = {},
   ): Promise<PackIngestResult> {
-    if (options.sqlBudget !== undefined && this.#ingestSqlBudget === undefined) {
-      options.sqlBudget.reserveSql(PACK_INGEST_CLEANUP_SQL_PART, 1);
-      try {
-        return await this.#sqlBudgeted(options.sqlBudget).#ingest(source, options);
-      } finally {
-        options.sqlBudget.releaseSql(PACK_INGEST_CLEANUP_SQL_PART);
-      }
-    }
     return this.#ingest(source, options);
   }
 
@@ -3382,7 +3229,7 @@ export class PackStore {
         if (options.lifecycle !== undefined) {
           requireLifecycleResult(options.lifecycle.published(result), "published");
         }
-        if (publishingLease !== null) this.#releaseReservedIngestLease(publishingLease, true);
+        if (publishingLease !== null) this.#releaseIngestLease(publishingLease, true);
       });
       if (publishingLease !== null) lease = null;
       memoryReservation.clear("other");
@@ -3391,7 +3238,7 @@ export class PackStore {
     } finally {
       if (activePackId !== undefined) this.#sharedState.activePending.delete(activePackId);
       try {
-        if (lease !== null) this.#releaseReservedIngestLease(lease, false);
+        if (lease !== null) this.#releaseIngestLease(lease, false);
       } finally {
         if (memory !== undefined) {
           const { reservation, pool } = memory;
@@ -3416,31 +3263,6 @@ export class PackStore {
         }
       }
     }
-  }
-
-  #sqlBudgeted(sqlBudget: PackIngestSqlBudget): PackStore {
-    const store = new PackStore(
-      new PackIngestDatabase(this.#db, sqlBudget),
-      this.#repoId,
-      this.#objects,
-      this.#chunks,
-      this.#memory,
-      this.#scopeMemory,
-      this.#cacheNamespace,
-      this.#external,
-      this.#externalBatch,
-      this.#externalMetadata,
-      {
-        now: this.#now,
-        maxBufferedEntry: this.#maxBufferedEntry,
-        cacheEntryLimit: this.#cacheEntryLimit,
-        maxDeltaDepth: this.#maxDeltaDepth,
-      },
-    );
-    store.#sharedState = this.#sharedState;
-    store.#ingestSqlBudget = sqlBudget;
-    store.#ingestCleanupDb = this.#db;
-    return store;
   }
 
   #reservePending(
@@ -3540,13 +3362,6 @@ export class PackStore {
       throw new CorruptError("pack ingest lease renewal returned an invalid owner");
     }
     lease.expiresMs = control.expiresMs;
-  }
-
-  #releaseReservedIngestLease(lease: PackIngestLease, required: boolean): void {
-    const budget = this.#ingestSqlBudget;
-    const db = this.#ingestCleanupDb ?? this.#db;
-    budget?.chargeReservedSql(PACK_INGEST_CLEANUP_SQL_PART);
-    this.#releaseIngestLease(lease, required, db);
   }
 
   #releaseIngestLease(lease: PackIngestLease, required: boolean, db: SqlDatabase = this.#db): void {
@@ -4178,7 +3993,6 @@ export class PackStore {
         const baseOids = [...baseOidSet];
         const packedMetadata = this.#packedBaseMetadata(baseOids, packId);
         const externalOids = baseOids.filter((oid) => !packedMetadata.has(oid));
-        if (externalOids.length > 0) this.#ingestSqlBudget?.chargeSql();
         const externalMetadata = this.#externalMetadata(externalOids);
         this.#checkBaseAdmission(packedMetadata, externalMetadata);
         let admittedBaseBytes = 0;
@@ -4200,7 +4014,6 @@ export class PackStore {
             throw new CorruptError("materialized pack base disagrees with its admitted metadata");
           }
         }
-        if (externalMetadata.size > 0) this.#ingestSqlBudget?.chargeSql(3);
         for (const [oid, object] of this.#externalBatch([...externalMetadata.keys()])) {
           const metadata = externalMetadata.get(oid);
           if (

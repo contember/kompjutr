@@ -4,14 +4,7 @@ import { concat } from "../src/core/bytes.js";
 import { DEFAULT_TEXT_MERGE_LIMITS } from "../src/core/diff/xmerge.js";
 import { hasErrorCode } from "../src/core/errors.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
-import {
-  type IntegrationEntry,
-  MAX_INTEGRATION_BLOB_READ_CALLS,
-  MAX_INTEGRATION_SQL_STATEMENTS,
-  MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ,
-  MAX_INTEGRATION_TREE_STATEMENTS,
-  planIntegration,
-} from "../src/core/ops/integration.js";
+import { type IntegrationEntry, planIntegration } from "../src/core/ops/integration.js";
 import { reserveIntegrationPlan } from "../src/core/ops/integration-worktree.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
@@ -77,15 +70,6 @@ function assertCoordinatorIdle(store: CheckoutStore): void {
 }
 
 describe("bounded three-way integration plan", () => {
-  it("keeps the modeled SQL ceiling below the operation limit", () => {
-    expect(MAX_INTEGRATION_SQL_STATEMENTS).toBe(
-      MAX_INTEGRATION_TREE_STATEMENTS +
-        MAX_INTEGRATION_BLOB_READ_CALLS * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ,
-    );
-    expect(MAX_INTEGRATION_SQL_STATEMENTS).toBe(134);
-    expect(MAX_INTEGRATION_SQL_STATEMENTS).toBeLessThan(1_000);
-  });
-
   it("rejects concurrent operation state before opening a tree cursor", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
@@ -209,7 +193,6 @@ describe("bounded three-way integration plan", () => {
       refs: coldStore.listRefs(),
       index: coldStore.indexEntries(),
     };
-    db.storage.resetCounters();
     const plan = planIntegration(new Repository(coldStore), {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
@@ -217,9 +200,7 @@ describe("bounded three-way integration plan", () => {
       text: { labels: { current: "HEAD", incoming: "topic" } },
     });
 
-    expect(plan.blobReadCalls).toBe(1);
     expect(plan.memoryHighWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(db.storage.statementCount).toBeLessThan(1_000);
 
     const clean = find(plan.entries, "clean.txt");
     expect(clean).toMatchObject({
@@ -287,8 +268,6 @@ describe("bounded three-way integration plan", () => {
       refs: store.listRefs(),
       index: store.indexEntries(),
     };
-    db.storage.resetCounters();
-
     const plan = planIntegration(repo, {
       baseTreeOid: base.tree,
       currentTreeOid: current.tree,
@@ -302,9 +281,7 @@ describe("bounded three-way integration plan", () => {
       "conflict.txt",
       "delete.txt",
     ]);
-    expect(plan.blobReadCalls).toBe(1);
     expect(plan.memoryHighWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(db.storage.statementCount).toBe(9);
 
     const clean = find(plan.entries, "a.txt");
     expect(clean).toMatchObject({
@@ -362,27 +339,70 @@ describe("bounded three-way integration plan", () => {
     assertCoordinatorIdle(store);
   });
 
-  it("fails at the blob-read boundary without leaking its reservation or mutating state", () => {
+  it("finishes after more than sixteen progressing blob reads without mutating state", () => {
     const database = new SqliteGitDatabase(new TestDatabase());
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const base = writeTree(store, { file: { content: "base\n" } });
-    const current = writeTree(store, { file: { content: "current\n" } });
-    const incoming = writeTree(store, { file: { content: "incoming\n" } });
+    const baseFiles: Record<string, FileValue> = {};
+    const currentFiles: Record<string, FileValue> = {};
+    const incomingFiles: Record<string, FileValue> = {};
+    for (let ordinal = 0; ordinal < 17; ordinal++) {
+      const path = `file-${ordinal.toString().padStart(2, "0")}`;
+      baseFiles[path] = { content: `base-${ordinal}\n` };
+      currentFiles[path] = { content: `current-${ordinal}\n` };
+      incomingFiles[path] = { content: `incoming-${ordinal}\n` };
+    }
+    const base = writeTree(store, baseFiles);
+    const current = writeTree(store, currentFiles);
+    const incoming = writeTree(store, incomingFiles);
     const repo = new Repository(store);
+    const readBlobs = repo.readBlobs.bind(repo);
+    let readCalls = 0;
+    repo.readBlobs = (oids, options) => {
+      const first = oids[0];
+      if (first === undefined) throw new Error("test blob batch is empty");
+      readCalls++;
+      const batch = readBlobs([first], options);
+      return {
+        blobs: batch.blobs,
+        remaining: [...batch.remaining, ...oids.slice(1)],
+        bytes: batch.bytes,
+      };
+    };
     const before = {
       objects: store.objectCount(),
       refs: store.listRefs(),
       index: store.indexEntries(),
     };
 
-    expect(() =>
-      planIntegration(repo, {
-        baseTreeOid: base.tree,
-        currentTreeOid: current.tree,
-        incomingTreeOid: incoming.tree,
-        limits: { maxBlobReadCalls: 0 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const plan = planIntegration(repo, {
+      baseTreeOid: base.tree,
+      currentTreeOid: current.tree,
+      incomingTreeOid: incoming.tree,
+    });
+    expect(readCalls).toBeGreaterThan(16);
+    expect(plan.entries).toHaveLength(17);
+    for (let ordinal = 0; ordinal < 17; ordinal++) {
+      const path = `file-${ordinal.toString().padStart(2, "0")}`;
+      const entry = plan.entries[ordinal];
+      if (entry === undefined || entry.kind !== "conflict" || entry.content === null) {
+        throw new Error(`missing exact conflict plan entry for ${path}`);
+      }
+      expect(entry).toMatchObject({
+        kind: "conflict",
+        path,
+        conflict: "content",
+        conflicts: 1,
+        resultMode: MODE_FILE,
+        stages: {
+          base: base.files.get(path),
+          current: current.files.get(path),
+          incoming: incoming.files.get(path),
+        },
+      });
+      expect(new TextDecoder().decode(entry.content)).toBe(
+        `<<<<<<<\ncurrent-${ordinal}\n=======\nincoming-${ordinal}\n>>>>>>>\n`,
+      );
+    }
     expect({
       objects: store.objectCount(),
       refs: store.listRefs(),

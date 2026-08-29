@@ -38,14 +38,6 @@ const SPARSE_CHECKOUT_GUARD_ROW_BYTES = 512;
 const SPARSE_CHECKOUT_CHANGE_ROW_BYTES = 128;
 const CHECKOUT_PATH_FIXED_BYTES = 96;
 const SPARSE_CHECKOUT_FIXED_BYTES = 384;
-const SPARSE_CHECKOUT_SQL_LIMIT = 1_000;
-// Conservatively reserves all non-prune tree, guard, write, HEAD and reseal SQL.
-const SPARSE_CHECKOUT_FIXED_SQL = 400;
-// Guarded ancestors are real: stat costs two SQL, and resolve + LIMIT 1 scan costs two.
-const SPARSE_CHECKOUT_STAT_SQL = 2;
-// Keep one extra statement over the measured two-SQL directory probe.
-const SPARSE_CHECKOUT_DIRECTORY_PROBE_SQL = 3;
-const SPARSE_CHECKOUT_GROUP_REMOVE_SQL = 7;
 
 class SparseCheckoutRetainedBudget {
   #retainedBytes = 0;
@@ -693,10 +685,6 @@ function prepareSparseCheckout(
     else group.push(directory);
   }
   const depths = [...byDepth.keys()].sort((left, right) => right - left);
-  const pruneStatements =
-    pruneDirectories.size * (SPARSE_CHECKOUT_STAT_SQL + SPARSE_CHECKOUT_DIRECTORY_PROBE_SQL) +
-    depths.length * SPARSE_CHECKOUT_GROUP_REMOVE_SQL;
-  if (pruneStatements > SPARSE_CHECKOUT_SQL_LIMIT - SPARSE_CHECKOUT_FIXED_SQL) return null;
   const pruneGroups: string[][] = [];
   for (const depth of depths) {
     const group = byDepth.get(depth);

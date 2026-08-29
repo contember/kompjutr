@@ -1,7 +1,7 @@
 // Restart-safe execution of one authenticated linear rebase sequence.
 
 import { MAX_OPERATION_MEMORY_BYTES } from "../../sqlite/memory.js";
-import { type IndexEntry, MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
+import type { IndexEntry } from "../../sqlite/store.js";
 import { utf8 } from "../bytes.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
@@ -14,7 +14,6 @@ import { resolveIdentity, writeUnpublishedCommit } from "./commit.js";
 import { MAX_INTEGRATION_STRUCTURE_BYTES } from "./integration.js";
 import {
   INTEGRATION_EXECUTION_HEADROOM_BYTES,
-  integrationCommitMaterializationSqlStatements,
   integrationIndexMatchesTree,
   projectedTouchedShape,
   projectIntegrationWithCollisions,
@@ -28,20 +27,15 @@ import {
 } from "./integration-worktree.js";
 import type { RebaseResult } from "./kinds.js";
 import { applyProjectedRebaseTransition } from "./merge-apply.js";
-import { MERGE_BASE_SQL_STATEMENTS, selectMergeBases } from "./merge-base.js";
-import { MAX_MERGE_STATE_BYTES, MAX_MERGE_TOUCHED_PATHS } from "./merge-state.js";
+import { selectMergeBases } from "./merge-base.js";
+import { MAX_MERGE_STATE_BYTES } from "./merge-state.js";
 import type {
   OperationStepMetadata,
   RebaseJournal,
   RebaseStateMetadata,
 } from "./operation-state.js";
-import { MAX_OPERATION_STEPS } from "./operation-state.js";
 import { planRebase } from "./rebase-plan.js";
-import {
-  MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS,
-  operationRefLogMetadata,
-  persistedRefLogMetadata,
-} from "./ref-log.js";
+import { operationRefLogMetadata, persistedRefLogMetadata } from "./ref-log.js";
 import {
   type CheckoutBlockerLimits,
   checkoutBlockersAgainst,
@@ -60,7 +54,6 @@ const REBASE_BASELINE_MAX_ENTRIES = 4_096;
 const REBASE_BASELINE_MAX_BYTES = 32 * 1024 * 1024;
 const REBASE_INTEGRATION_PLAN_BYTES = 20 * 1024 * 1024;
 const REBASE_INTEGRATION_OVERHEAD_BYTES = 2 * 1024 * 1024;
-const REBASE_FINAL_PUBLICATION_SQL_STATEMENTS = 32 + MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS;
 const REBASE_EXCLUDE_ROOTS = 64;
 const REBASE_EXCLUDE_BYTES = 1024 * 1024;
 if (
@@ -130,88 +123,6 @@ function requirePathsOutsideExclusions(
         throw new GitError("ECHECKOUTFAIL", `rebase would change foreign checkout path ${path}`);
       }
     }
-  }
-}
-
-function checkedStatements(total: number, additional: number): number {
-  if (
-    !Number.isSafeInteger(total) ||
-    total < 0 ||
-    !Number.isSafeInteger(additional) ||
-    additional < 0 ||
-    additional > 999 - total
-  ) {
-    return 1_000;
-  }
-  return total + additional;
-}
-
-/** Compose one durable rebase transition; 999 passes and 1,000 fails closed. */
-export function calculateRebaseTransitionSqlStatements(
-  priorSqlStatements: number,
-  journalSqlStatements: number,
-  executionSqlStatements: number,
-): number {
-  return checkedStatements(
-    checkedStatements(priorSqlStatements, journalSqlStatements),
-    executionSqlStatements,
-  );
-}
-
-/** Conservative whole-journal read/create/replace work for the persisted bounded shape. */
-export function calculateRebaseJournalSqlStatements(
-  stepCount: number,
-  touchedCount: number,
-  retainedBytes: number,
-  mode: "read" | "create" | "replace",
-): number {
-  if (
-    !Number.isSafeInteger(stepCount) ||
-    stepCount < 0 ||
-    stepCount > MAX_OPERATION_STEPS ||
-    !Number.isSafeInteger(touchedCount) ||
-    touchedCount < 0 ||
-    touchedCount > MAX_MERGE_TOUCHED_PATHS ||
-    !Number.isSafeInteger(retainedBytes) ||
-    retainedBytes < 0 ||
-    retainedBytes > MAX_MERGE_STATE_BYTES
-  ) {
-    return 1_000;
-  }
-  const childPages =
-    Math.ceil(stepCount / MAX_OPERATION_STEPS) +
-    Math.ceil(touchedCount / MAX_MERGE_TOUCHED_PATHS) +
-    Math.ceil(retainedBytes / (1024 * 1024));
-  const base = mode === "read" ? 48 : mode === "create" ? 72 : 104;
-  return base + childPages * 12;
-}
-
-export function calculateRebaseBaselineSqlStatements(
-  entryCount: number,
-  blobBytes: number,
-): number {
-  if (
-    !Number.isSafeInteger(entryCount) ||
-    entryCount < 0 ||
-    entryCount > REBASE_BASELINE_MAX_ENTRIES ||
-    !Number.isSafeInteger(blobBytes) ||
-    blobBytes < 0 ||
-    blobBytes > REBASE_BASELINE_MAX_BYTES
-  ) {
-    return 1_000;
-  }
-  return 192 + Math.ceil(entryCount / 1_000) * 12 + Math.ceil(blobBytes / (1024 * 1024)) * 10;
-}
-
-const REBASE_JOURNAL_CREATE_SQL_STATEMENTS = calculateRebaseJournalSqlStatements(
-  MAX_OPERATION_STEPS,
-  MAX_MERGE_TOUCHED_PATHS,
-  MAX_MERGE_STATE_BYTES,
-  "create",
-);
-function requireSql(total: number): void {
-  if (!Number.isSafeInteger(total) || total >= 1_000) {
-    throw new GitError("E2BIG", `rebase SQL model requires ${total} statements`);
   }
 }
 
@@ -320,9 +231,6 @@ function materializeTree(
 
 interface BaselineTransition {
   treeOid: string;
-  entryCount: number;
-  blobBytes: number;
-  sqlStatements: number;
 }
 
 function checkoutGuardLimits(): CheckoutBlockerLimits {
@@ -331,12 +239,8 @@ function checkoutGuardLimits(): CheckoutBlockerLimits {
     maxHashBytes: REBASE_BASELINE_MAX_BYTES,
     rows: 0,
     hashBytes: 0,
-    maxHashRangeReads: 64,
-    hashRangeReads: 0,
     maxHashCandidates: REBASE_BASELINE_MAX_ENTRIES,
     hashCandidates: 0,
-    maxHashBatches: 5,
-    hashBatches: 0,
   };
 }
 
@@ -416,9 +320,7 @@ function preflightBaselineTransition(repo: Repository, treeOid: string): Baselin
     }
     blobBytes += size;
   }
-  const sqlStatements = calculateRebaseBaselineSqlStatements(oids.length, blobBytes);
-  requireSql(sqlStatements);
-  return { treeOid, entryCount: oids.length, blobBytes, sqlStatements };
+  return { treeOid };
 }
 
 function initialState(
@@ -539,51 +441,6 @@ function stepIdentities(
   );
 }
 
-function replayPlanSqlStatements(plan: ReplayPlan): number {
-  return plan.sqlStatements + 6 + plan.integration.blobReadCalls * 8;
-}
-
-function rebaseJournalTransitionSqlStatements(journal: RebaseJournal): number {
-  const read = calculateRebaseJournalSqlStatements(
-    journal.steps.length,
-    journal.touched.length,
-    journal.retainedBytes,
-    "read",
-  );
-  const replace = calculateRebaseJournalSqlStatements(
-    journal.steps.length,
-    journal.touched.length,
-    journal.retainedBytes,
-    "replace",
-  );
-  return read * 2 + replace;
-}
-
-function rebaseTransitionPriorSqlStatements(
-  journal: RebaseJournal,
-  planningSqlStatements: number,
-): number {
-  return (
-    MERGE_BASE_SQL_STATEMENTS +
-    rebaseJournalTransitionSqlStatements(journal) +
-    planningSqlStatements
-  );
-}
-
-function requireTransitionBudget(
-  journal: RebaseJournal,
-  executionSqlStatements: number,
-  planningSqlStatements = 0,
-): void {
-  requireSql(
-    calculateRebaseTransitionSqlStatements(
-      rebaseTransitionPriorSqlStatements(journal, planningSqlStatements),
-      0,
-      executionSqlStatements,
-    ),
-  );
-}
-
 function applyOneStep(
   context: GitContext,
   repo: Repository,
@@ -608,13 +465,8 @@ function applyOneStep(
         const plan = retainedPlan.plan;
         const planReservation = reserveIntegrationPlan(repo, plan.integration);
         try {
-          const treeStats = requireRebaseIndex(repo);
+          requireRebaseIndex(repo);
           if (sourceIsEmpty(plan)) {
-            requireTransitionBudget(
-              journal,
-              integrationCommitMaterializationSqlStatements(treeStats),
-              replayPlanSqlStatements(plan),
-            );
             const identities = stepIdentities(context, repo, plan, options);
             const result = writeUnpublishedCommit(repo, {
               message: plan.sourceCommit.message,
@@ -625,7 +477,6 @@ function applyOneStep(
             return "advanced";
           }
           if (plan.integration.entries.length === 0) {
-            requireTransitionBudget(journal, 32, replayPlanSqlStatements(plan));
             advance(repo, journal, "skipped", null);
             return "advanced";
           }
@@ -651,21 +502,9 @@ function applyOneStep(
             "rebase",
             currentTree,
           );
-          const projectedTreeStats = requireRebaseTree(
-            prospectiveIntegrationIndexEntries(repo, projected),
-          );
+          requireRebaseTree(prospectiveIntegrationIndexEntries(repo, projected));
           const conflicted = plan.integration.entries.some((entry) => entry.kind === "conflict");
-          const commitSqlStatements =
-            integrationCommitMaterializationSqlStatements(projectedTreeStats);
-          requireTransitionBudget(
-            journal,
-            conflicted ? 256 : 192 + commitSqlStatements,
-            replayPlanSqlStatements(plan),
-          );
           const transition = applyProjectedRebaseTransition<"advanced">(repo, worktree, projected, {
-            priorSqlStatements:
-              rebaseTransitionPriorSqlStatements(journal, replayPlanSqlStatements(plan)) +
-              (conflicted ? 0 : commitSqlStatements),
             expectedIntegrityOid: journal.integrityOid,
             conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
             steps: journal.steps,
@@ -701,7 +540,7 @@ function requireConflictOwnership(
   repo: Repository,
   worktree: Worktree,
   journal: RebaseJournal,
-): number {
+): void {
   requireConflictSnapshots(repo, journal);
   const journalReservation = repo.store.reserveMemory();
   journalReservation.set("other", journal.retainedBytes);
@@ -740,7 +579,6 @@ function requireConflictOwnership(
             throw new CorruptError("rebase conflict ownership differs from its replay plan");
           }
         }
-        return replayPlanSqlStatements(plan);
       } finally {
         reservation.dispose();
       }
@@ -806,7 +644,6 @@ function publishCompleted(
     if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
       throw new CorruptError("completed rebase baseline changed before publication");
     }
-    requireTransitionBudget(journal, REBASE_FINAL_PUBLICATION_SQL_STATEMENTS);
     repo.mutateRefs(
       {
         expected: {
@@ -889,7 +726,6 @@ export function startRebase(
     requireCleanIntegrationWorktree(repo, worktree, "rebase");
     const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
     if (plan.relation === "up-to-date") {
-      requireSql(plan.sqlStatements);
       return { relation: plan.relation, oid: head.oid };
     }
     const planReservation = repo.store.reserveMemory();
@@ -900,23 +736,10 @@ export function startRebase(
         replayOids.push(step.sourceOid);
         if (step.selectedParentOid !== null) replayOids.push(step.selectedParentOid);
       }
-      const replayPreflight =
-        plan.relation === "replay" ? preflightReplayCommitObjects(repo, replayOids) : null;
+      if (plan.relation === "replay") preflightReplayCommitObjects(repo, replayOids);
       const upstreamTree = repo.readCommit(plan.upstreamOid).tree;
       const baseline = preflightBaselineTransition(repo, upstreamTree);
-      const abortBaseline =
-        plan.relation === "replay" ? preflightBaselineTransition(repo, originalTree) : null;
-      requireSql(
-        calculateRebaseTransitionSqlStatements(
-          plan.sqlStatements,
-          plan.relation === "replay" ? REBASE_JOURNAL_CREATE_SQL_STATEMENTS : 0,
-          baseline.sqlStatements +
-            (abortBaseline?.sqlStatements ?? 0) +
-            (replayPreflight?.sqlStatements ?? 0) +
-            MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS +
-            (plan.relation === "fast-forward" ? MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS : 0),
-        ),
-      );
+      if (plan.relation === "replay") preflightBaselineTransition(repo, originalTree);
       materializeTree(repo, worktree, originalTree, baseline);
       const observed = repo.head();
       if (observed.ref !== head.ref || observed.oid !== head.oid) {
@@ -1027,7 +850,7 @@ function continueRebaseInternal(
     if (repo.checkout.hasConflicts()) {
       throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
     }
-    const treeStats = requireRebaseIndex(repo);
+    requireRebaseIndex(repo);
     requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
     const journalReservation = repo.store.reserveMemory();
     journalReservation.set("other", current.retainedBytes);
@@ -1040,14 +863,6 @@ function continueRebaseInternal(
           const currentTree = repo.readCommit(current.state.currentParentOid).tree;
           const resultEmpty = integrationIndexMatchesTree(repo, currentTree);
           const baseline = resultEmpty ? preflightBaselineTransition(repo, currentTree) : null;
-          requireTransitionBudget(
-            current,
-            192 +
-              (resultEmpty
-                ? (baseline?.sqlStatements ?? 0)
-                : integrationCommitMaterializationSqlStatements(treeStats)),
-            replayPlanSqlStatements(plan),
-          );
           if (resultEmpty) {
             if (baseline === null) throw new CorruptError("result-empty rebase lost its baseline");
             hardMaterializeTree(repo, worktree, currentTree, baseline, exclusions);
@@ -1109,7 +924,6 @@ export function skipRebase(
       throw new GitError("EOPMISMATCH", "rebase conflict changed before skip");
     }
     requireOriginalHead(repo, current.state);
-    requireTransitionBudget(current, 192 + prepared.baseline.sqlStatements);
     hardMaterializeTree(
       repo,
       worktree,
@@ -1165,7 +979,6 @@ function abortRebaseInternal(
       throw new GitError("EOPMISMATCH", "rebase operation changed before abort");
     }
     requireOriginalHead(repo, current.state);
-    requireTransitionBudget(current, 192 + prepared.baseline.sqlStatements);
     hardMaterializeTree(repo, worktree, prepared.baselineTree, prepared.baseline, exclusions);
     repo.checkout.clearOperationState();
   });

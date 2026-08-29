@@ -104,6 +104,46 @@ class ExplainSnapshotDatabase implements SqlDatabase {
   }
 }
 
+class RecordingSnapshotDirtyDatabase implements SqlDatabase {
+  readonly limits: number[] = [];
+  rows = 0;
+
+  constructor(private readonly delegate: SqlDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.delegate.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.delegate.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.delegate.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.delegate.scalar<T>(query, ...bindings);
+  }
+
+  *iterate(query: string, ...bindings: unknown[]): Generator<Record<string, unknown>> {
+    const recordsDirty = query.includes("FROM git_index_dirty") && query.includes("LIMIT ?");
+    if (recordsDirty) {
+      const limit = bindings[2];
+      if (typeof limit !== "number") throw new Error("snapshot dirty limit was not numeric");
+      this.limits.push(limit);
+    }
+    for (const row of this.delegate.iterate(query, ...bindings)) {
+      if (recordsDirty && row.kind === 1) this.rows++;
+      yield row;
+    }
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.delegate.transactionSync(closure);
+  }
+}
+
 class ExplainIndexAncestorDatabase implements SqlDatabase {
   readonly details: string[] = [];
   query = "";
@@ -1137,6 +1177,55 @@ describe("SQLite sparse workspace source", () => {
         baselineTreeOid: baseline,
       }),
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
+  });
+
+  it("stops the dirty snapshot at the exact retained-capacity sentinel", () => {
+    const workspace = makeRepo("/");
+    const checkoutId = workspace.repo.checkout.checkoutId;
+    expect(resealIndexTracker(workspace.database.db, checkoutId, null, [])).toBe(true);
+    workspace.database.db.run(
+      "INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (?, 'a', 1), (?, 'b', 2)",
+      checkoutId,
+      checkoutId,
+    );
+    workspace.database.db.run(
+      `WITH RECURSIVE sequence(i) AS (
+         VALUES (0) UNION ALL SELECT i + 1 FROM sequence WHERE i + 1 < 9998
+       )
+       INSERT INTO git_index_dirty (checkout_id, path, flags)
+       SELECT ?, printf('p%05d', i), i % 3 + 1 FROM sequence`,
+      checkoutId,
+    );
+    const requestBytes = 512 + 4;
+    const dirtyArrayBytes = 64;
+    const minimumDirtyRowBytes = 1_024 + 8 + 4 + 1;
+    const exactOneRowBytes = requestBytes + dirtyArrayBytes + minimumDirtyRowBytes;
+
+    const exactDb = new RecordingSnapshotDirtyDatabase(workspace.database.db);
+    expect(
+      createSqliteCommitTreeSnapshotSource(exactDb).snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId,
+        root: "/",
+        baselineTreeOid: null,
+        maxRetainedBytes: exactOneRowBytes,
+      }),
+    ).toEqual({ available: false });
+    expect(exactDb.limits).toEqual([2]);
+    expect(exactDb.rows).toBe(2);
+
+    const firstExcessDb = new RecordingSnapshotDirtyDatabase(workspace.database.db);
+    expect(
+      createSqliteCommitTreeSnapshotSource(firstExcessDb).snapshot({
+        repoId: workspace.repo.store.repoId,
+        checkoutId,
+        root: "/",
+        baselineTreeOid: null,
+        maxRetainedBytes: exactOneRowBytes - 1,
+      }),
+    ).toEqual({ available: false });
+    expect(firstExcessDb.limits).toEqual([1]);
+    expect(firstExcessDb.rows).toBe(1);
   });
 
   it("reads authenticated snapshot entries by active source key", () => {

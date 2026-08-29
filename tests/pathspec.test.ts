@@ -2,30 +2,14 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { checkoutTree } from "../src/core/ops/checkout.js";
-import {
-  compileReadPathspec,
-  LS_FILES_INDEX_PAGE,
-  lsFilesResultRetainedBytes,
-  MAX_LS_FILES_COMBINED_PATTERNS,
-  MAX_LS_FILES_PATTERNS,
-  MAX_LS_FILES_SCAN_PREFIXES,
-  MAX_LS_FILES_SCAN_ROWS,
-  MAX_LS_FILES_SQL_STATEMENTS,
-} from "../src/core/ops/pathspec.js";
+import { compileReadPathspec, lsFilesResultRetainedBytes } from "../src/core/ops/pathspec.js";
 import { lsFilesAtRef } from "../src/core/ops/reads.js";
 import {
   lsFiles,
   lsFilesWithWorktree,
-  MAX_LS_FILES_CACHED_SQL_STATEMENTS,
-  MAX_LS_FILES_COMBINED_FIXED_STATEMENTS,
-  MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS,
-  MAX_LS_FILES_COMBINED_INDEX_STATEMENTS,
-  MAX_LS_FILES_COMBINED_SQL_STATEMENTS,
-  MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS,
   MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES,
   MAX_LS_FILES_EXCLUDE_ROOTS,
 } from "../src/core/ops/staging.js";
-import { WORKTREE_SCAN_PAGE } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type {
@@ -233,23 +217,17 @@ describe("ls-files pathspec", () => {
     expect(lsFiles(workspace.repo, { paths: ["a?x"] })).toEqual(["a-x", "a/x", "acx"]);
   });
 
-  it("uses literal prefix scans without charging unrelated index rows", () => {
+  it("uses literal prefix scans without reading unrelated index rows", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", new Uint8Array([1]));
     workspace.repo.checkout.indexPut(indexEntry("dir/a", oid));
     workspace.repo.checkout.indexPut(indexEntry("dir/sub/b", oid));
     workspace.repo.checkout.indexPut(indexEntry("other/a", oid));
 
-    expect(lsFiles(workspace.repo, { paths: ["dir"], limits: { maxScanRows: 2 } })).toEqual([
-      "dir/a",
-      "dir/sub/b",
-    ]);
-    expect(() =>
-      lsFiles(workspace.repo, { paths: ["dir"], limits: { maxScanRows: 1 } }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(lsFiles(workspace.repo, { paths: ["dir"] })).toEqual(["dir/a", "dir/sub/b"]);
   });
 
-  it("coalesces redundant literal scans before charging the row budget", () => {
+  it("coalesces redundant literal scans", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", new Uint8Array([1]));
     workspace.repo.checkout.indexPut(indexEntry("dir/a", oid));
@@ -258,29 +236,20 @@ describe("ls-files pathspec", () => {
     expect(
       lsFiles(workspace.repo, {
         paths: ["dir", "./dir", "dir//sub", "dir/sub/../sub"],
-        limits: { maxScanRows: 2 },
       }),
     ).toEqual(["dir/a", "dir/sub/b"]);
   });
 
   it("uses one bounded derived-tree traversal for literal ref selectors", async () => {
     const { workspace } = await parityRepo();
-    const totalRows = lsFilesAtRef(workspace.repo, "HEAD").length;
     workspace.storage.resetCounters();
 
     expect(
       lsFilesAtRef(workspace.repo, "HEAD", {
         paths: ["dir", "dir/sub/b.ts", "./dir//sub/../a.ts"],
-        limits: { maxScanRows: totalRows },
       }),
     ).toEqual(["dir/a.ts", "dir/sub/b.ts", "dir/sub/c.js"]);
     expect(workspace.storage.statementCount).toBeLessThanOrEqual(10);
-    expect(() =>
-      lsFilesAtRef(workspace.repo, "HEAD", {
-        paths: ["dir"],
-        limits: { maxScanRows: totalRows - 1 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 
   it("rejects unsupported leading root and magic forms", () => {
@@ -306,7 +275,7 @@ describe("ls-files pathspec", () => {
       { paths: ["bad\ud800path"] },
       { paths: ["bad\udc00path"] },
       { limits: [] },
-      { limits: { maxScanRows: "one" } },
+      { limits: { maxMatcherWork: "one" } },
     ]) {
       expect(() => Reflect.apply(compileReadPathspec, undefined, [input])).toThrowError(
         expect.objectContaining({ code: "EINVAL" }),
@@ -320,10 +289,6 @@ describe("ls-files pathspec", () => {
   });
 
   it("fails closed immediately above every injected structural limit", () => {
-    expect(() => compileReadPathspec({ paths: ["?"], limits: { maxPatterns: 1 } })).not.toThrow();
-    expect(() => compileReadPathspec({ paths: ["?"], limits: { maxPatterns: 0 } })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
     expect(() =>
       compileReadPathspec({ paths: ["?"], limits: { maxPatternBytes: 1, maxInputBytes: 1 } }),
     ).not.toThrow();
@@ -339,25 +304,13 @@ describe("ls-files pathspec", () => {
     expect(() =>
       compileReadPathspec({ paths: ["?"], limits: { maxWildcardTokens: 0 } }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
-    const worstCaseIndexStatements =
-      Math.ceil(MAX_LS_FILES_SCAN_ROWS / LS_FILES_INDEX_PAGE) + MAX_LS_FILES_SCAN_PREFIXES;
-    expect(MAX_LS_FILES_SCAN_PREFIXES).toBe(512);
-    expect(MAX_LS_FILES_SCAN_PREFIXES).toBe(MAX_LS_FILES_PATTERNS * 2);
-    expect(worstCaseIndexStatements).toBe(903);
-    expect(worstCaseIndexStatements).toBeLessThan(MAX_LS_FILES_SQL_STATEMENTS);
   });
 
-  it("fails rather than truncating scan, matcher, or retained results", () => {
+  it("fails rather than truncating matcher or retained results", () => {
     const workspace = makeRepo("/");
     const oid = workspace.repo.store.write("blob", new Uint8Array([1]));
     workspace.repo.checkout.indexPut(indexEntry("a", oid));
     workspace.repo.checkout.indexPut(indexEntry("b", oid));
-
-    expect(lsFiles(workspace.repo, { limits: { maxScanRows: 2 } })).toEqual(["a", "b"]);
-    expect(() => lsFiles(workspace.repo, { limits: { maxScanRows: 1 } })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
 
     expect(lsFiles(workspace.repo, { paths: ["?"], limits: { maxMatcherWork: 2 } })).toEqual([
       "a",
@@ -494,20 +447,6 @@ describe("ls-files selection", () => {
       lsFilesWithWorktree(workspace.repo, workspace.worktree, { cached: true, others: true }),
     ).toEqual(["conflict.txt"]);
     expect(lsFilesWithWorktree(workspace.repo, workspace.worktree, { others: true })).toEqual([]);
-    expect(
-      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
-        cached: true,
-        others: true,
-        limits: { maxScanRows: 3 },
-      }),
-    ).toEqual(["conflict.txt"]);
-    expect(() =>
-      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
-        cached: true,
-        others: true,
-        limits: { maxScanRows: 2 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 
   it("prunes a nested checkout while recording Git's directory-row divergence", () => {
@@ -648,7 +587,7 @@ describe("ls-files selection", () => {
     ).toEqual([]);
   });
 
-  it("validates selection combinations and enforces the combined pattern cap", () => {
+  it("validates selection combinations and crosses former pattern and prefix caps", () => {
     const workspace = makeRepo("/");
     expect(() => Reflect.apply(lsFiles, undefined, [workspace.repo, null])).toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
@@ -668,44 +607,108 @@ describe("ls-files selection", () => {
       ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
     }
 
-    const exact = Array.from({ length: MAX_LS_FILES_COMBINED_PATTERNS }, (_, index) => `p${index}`);
+    const cached = [
+      ...Array.from(
+        { length: 256 },
+        (_, index) => `cached-${index.toString().padStart(3, "0")}\\x`,
+      ),
+      "cached-last",
+    ];
+    expect(cached).toHaveLength(257);
+    expect(compileReadPathspec({ paths: cached }).scanPrefixes).toHaveLength(513);
+    expect(lsFiles(workspace.repo, { paths: cached })).toEqual([]);
+
+    const exact = [
+      ...Array.from({ length: 64 }, (_, index) => `p${index.toString().padStart(2, "0")}\\x`),
+      "first-excess",
+    ];
+    expect(compileReadPathspec({ paths: exact }).scanPrefixes).toHaveLength(129);
     expect(
       lsFilesWithWorktree(workspace.repo, workspace.worktree, { others: true, paths: exact }),
     ).toEqual([]);
-    expect(() =>
-      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
-        others: true,
-        paths: [...exact, "first-excess"],
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 
-  it("succeeds at the merged row limit and fails first-excess without truncation", () => {
-    const workspace = makeRepo("/");
-    const oid = workspace.repo.store.write("blob", new Uint8Array([1]));
-    workspace.repo.checkout.indexPut(indexEntry("a", oid));
-    workspace.repo.checkout.indexPut(indexEntry("b", oid));
-    writeWorkFile(workspace, "/a", "tracked\n");
-    writeWorkFile(workspace, "/c", "fresh\n");
+  it("collects the selected row after 100,000 direct iterable rows", () => {
+    let traversed = 0;
+    function* rows(): Generator<string> {
+      for (let index = 0; index < 100_000; index++) {
+        traversed++;
+        yield `a${index.toString().padStart(6, "0")}.txt`;
+      }
+      traversed++;
+      yield "z-selected";
+    }
+    const pathspec = compileReadPathspec({ paths: ["*selected"] });
 
+    expect(pathspec.scanPrefixes).toBeNull();
+    expect(pathspec.collect(rows())).toEqual(["z-selected"]);
+    expect(traversed).toBe(100_001);
+  });
+
+  it("streams the 100,001st cached index row through leading-wildcard public paths", () => {
+    const workspace = makeRepo("/");
+    const oid = workspace.repo.store.write("blob", new Uint8Array(0));
+    workspace.storage.db.exec(`
+      WITH RECURSIVE sequence(i) AS (
+        VALUES (0) UNION ALL SELECT i + 1 FROM sequence WHERE i + 1 < 100001
+      )
+      INSERT INTO git_index
+        (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
+      SELECT ${workspace.repo.checkout.checkoutId},
+             CASE WHEN i = 100000 THEN 'z-selected' ELSE printf('a%06d.txt', i) END,
+             0, 33188,
+             '${oid}', NULL, NULL, NULL, NULL
+        FROM sequence
+    `);
+
+    expect(lsFiles(workspace.repo, { paths: ["*selected"] })).toEqual(["z-selected"]);
     expect(
       lsFilesWithWorktree(workspace.repo, workspace.worktree, {
         cached: true,
         others: true,
-        limits: { maxScanRows: 3 },
+        paths: ["*selected"],
       }),
-    ).toEqual(["a", "b", "c"]);
-    expect(() =>
-      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
-        cached: true,
-        others: true,
-        limits: { maxScanRows: 2 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    ).toEqual(["z-selected"]);
+    expect(
+      workspace.repo.checkout.db.scalar<number>(
+        "SELECT count(*) FROM git_index WHERE checkout_id = ?",
+        workspace.repo.checkout.checkoutId,
+      ),
+    ).toBe(100_001);
   });
 
-  it("uses the 101st worktree scan as the exact terminal or first-excess probe", () => {
-    const exact = syntheticWorktreeSelection(MAX_LS_FILES_SCAN_ROWS);
+  it("selects after merging 50,001 index and 50,001 worktree rows", () => {
+    const indexed = 50_001;
+    const walked = 50_001;
+    const synthetic = syntheticWorktreeSelection(walked, { prefix: "b", selectedLast: true });
+    const oid = synthetic.workspace.repo.store.write("blob", new Uint8Array(0));
+    synthetic.workspace.storage.db.exec(`
+      WITH RECURSIVE sequence(i) AS (
+        VALUES (0) UNION ALL SELECT i + 1 FROM sequence WHERE i + 1 < ${indexed}
+      )
+      INSERT INTO git_index
+        (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
+      SELECT ${synthetic.workspace.repo.checkout.checkoutId}, printf('a%06d.txt', i), 0, 33188,
+             '${oid}', NULL, NULL, NULL, NULL
+        FROM sequence
+    `);
+
+    expect(
+      lsFilesWithWorktree(synthetic.workspace.repo, synthetic.workspace.worktree, {
+        cached: true,
+        others: true,
+        paths: ["*selected"],
+      }),
+    ).toEqual(["z-selected"]);
+    expect(indexed).toBeLessThanOrEqual(100_000);
+    expect(walked).toBeLessThanOrEqual(100_000);
+    expect(indexed + walked).toBe(100_002);
+    expect(synthetic.scanCalls()).toBe(51);
+  });
+
+  it("continues after the former 100,000-row worktree scan ceiling", () => {
+    const formerLimit = 100_000;
+    const exact = syntheticWorktreeSelection(formerLimit);
     const result = lsFilesWithWorktree(exact.workspace.repo, exact.workspace.worktree, {
       others: true,
       paths: ["never"],
@@ -713,81 +716,26 @@ describe("ls-files selection", () => {
     expect(result).toEqual([]);
     expect(exact.scanCalls()).toBe(101);
 
-    const excess = syntheticWorktreeSelection(MAX_LS_FILES_SCAN_ROWS + 1);
-    expect(() =>
+    const excess = syntheticWorktreeSelection(formerLimit + 1);
+    expect(
       lsFilesWithWorktree(excess.workspace.repo, excess.workspace.worktree, {
         others: true,
         paths: ["never"],
       }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(excess.scanCalls()).toBe(101);
-  });
-
-  it("measures the combined SQL ceiling and separates its conservative reserve", () => {
-    const workspace = combinedCostWorkspace();
-    const measured = new StatementCountingWorktree(workspace.worktree, workspace.storage);
-    const patterns = Array.from(
-      { length: MAX_LS_FILES_COMBINED_PATTERNS },
-      (_, index) => `p${index.toString().padStart(2, "0")}\\x`,
-    );
-    expect(
-      compileReadPathspec({ paths: patterns }, MAX_LS_FILES_COMBINED_PATTERNS).scanPrefixes,
-    ).toHaveLength(128);
-    workspace.storage.resetCounters();
-
-    expect(
-      lsFilesWithWorktree(workspace.repo, measured, {
-        others: true,
-        excludeStandard: true,
-        paths: patterns,
-      }),
     ).toEqual([]);
-
-    const measuredWorktreePages = measured.scanCalls;
-    const measuredIgnoreStatements = measured.discoveryStatements + measured.handleReadStatements;
-    const measuredHelperStatements =
-      measured.realpathStatements + (measured.scanStatements - measured.scanCalls);
-    const measuredIndexStatements =
-      workspace.storage.statementCount -
-      measured.scanStatements -
-      measured.discoveryStatements -
-      measured.handleReadStatements -
-      measured.realpathStatements;
-
-    expect(measuredIndexStatements).toBe(518);
-    expect(measuredWorktreePages).toBe(MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS);
-    expect(measured.discoveryCalls).toBe(8);
-    expect(measured.handleReadCalls).toBe(8);
-    expect(measuredIgnoreStatements).toBe(MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS);
-    expect(measuredHelperStatements).toBe(3);
-    expect(workspace.storage.statementCount).toBe(638);
-
-    const conservativeReserve =
-      MAX_LS_FILES_COMBINED_INDEX_STATEMENTS -
-      measuredIndexStatements +
-      (MAX_LS_FILES_COMBINED_FIXED_STATEMENTS - measuredHelperStatements);
-    expect(conservativeReserve).toBe(62);
-    expect(workspace.storage.statementCount + conservativeReserve).toBe(
-      MAX_LS_FILES_COMBINED_SQL_STATEMENTS,
-    );
-  });
-
-  it("pins the cached and conservative combined SQL allocation", () => {
-    expect(MAX_LS_FILES_CACHED_SQL_STATEMENTS).toBe(903);
-    expect(MAX_LS_FILES_COMBINED_INDEX_STATEMENTS).toBe(519);
-    expect(MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS).toBe(101);
-    expect(MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS).toBe(16);
-    expect(MAX_LS_FILES_COMBINED_FIXED_STATEMENTS).toBe(64);
-    expect(MAX_LS_FILES_COMBINED_SQL_STATEMENTS).toBe(700);
-    expect(WORKTREE_SCAN_PAGE).toBe(1_000);
+    expect(excess.scanCalls()).toBe(101);
   });
 });
 
-function syntheticWorktreeSelection(total: number): {
+function syntheticWorktreeSelection(
+  total: number,
+  fixtureOptions: { prefix?: string; selectedLast?: boolean } = {},
+): {
   workspace: TestRepository;
   scanCalls(): number;
 } {
   const workspace = makeRepo("/");
+  const prefix = fixtureOptions.prefix ?? "p";
   let calls = 0;
   const scan = (_root: string, options: ScanOptions): ScanEntry[] => {
     calls++;
@@ -797,7 +745,10 @@ function syntheticWorktreeSelection(total: number): {
     const page: ScanEntry[] = [];
     for (let index = start; index < end; index++) {
       page.push({
-        path: `/p${index.toString().padStart(6, "0")}`,
+        path:
+          fixtureOptions.selectedLast === true && index === total - 1
+            ? "/z-selected"
+            : `/${prefix}${index.toString().padStart(6, "0")}`,
         type: "file",
         mode: 0o100644,
         size: 0,
@@ -813,51 +764,4 @@ function syntheticWorktreeSelection(total: number): {
   };
   Object.defineProperty(workspace.worktree, "scan", { value: scan });
   return { workspace, scanCalls: () => calls };
-}
-
-function combinedCostWorkspace(): TestRepository {
-  const workspace = makeRepo("/");
-  const rows = MAX_LS_FILES_SCAN_ROWS;
-  const inodeBase = 10_000_000;
-  const oid = workspace.repo.store.write("blob", new Uint8Array(0));
-  workspace.repo.checkout.db.run(
-    `WITH RECURSIVE seq(i) AS (
-       VALUES (0) UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ?
-     )
-     INSERT INTO fs_nodes (inode, type, mode, mtime, size, rev, nlink)
-     SELECT ? + i, 'file', 420, 0, 0, 1, 1 FROM seq`,
-    rows,
-    inodeBase,
-  );
-  workspace.repo.checkout.db.run(
-    `WITH RECURSIVE seq(i) AS (
-       VALUES (0) UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ?
-     )
-     INSERT INTO fs_paths (path, parent, inode)
-     SELECT CASE
-              WHEN i < 1024 THEN printf('/p00\\x/d%06d/.gitignore', i)
-              ELSE printf('/p00\\x/file%06d', i)
-            END,
-            '/', ? + i
-       FROM seq`,
-    rows,
-    inodeBase,
-  );
-  workspace.repo.checkout.db.run(
-    `WITH RECURSIVE seq(i) AS (
-       VALUES (0) UNION ALL SELECT i + 1 FROM seq WHERE i + 1 < ?
-     )
-     INSERT INTO git_index (checkout_id, path, stage, mode, oid, size, mtime, ino, rev)
-     SELECT ?,
-            CASE
-              WHEN i < 1024 THEN printf('p00\\x/d%06d/.gitignore', i)
-              ELSE printf('p00\\x/file%06d', i)
-            END,
-            0, 33188, ?, NULL, NULL, NULL, NULL
-       FROM seq`,
-    rows,
-    workspace.repo.checkout.checkoutId,
-    oid,
-  );
-  return workspace;
 }

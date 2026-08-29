@@ -642,10 +642,6 @@ describe("mutating git CLI handlers", () => {
       hashCandidates: 0,
       maxHashBytes: 1024,
       hashBytes: 0,
-      maxHashRangeReads: 1,
-      hashRangeReads: 0,
-      maxHashBatches: 1,
-      hashBatches: 0,
     };
 
     expect([...dirtyPathStream(workspace.repo, workspace.worktree, undefined, limits)]).toEqual([]);

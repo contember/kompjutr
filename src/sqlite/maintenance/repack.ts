@@ -355,10 +355,6 @@ function validateLooseCandidate(row: Record<string, unknown>, repoId: number): L
   return { oid, type, size, packId, baseOid };
 }
 
-function estimatedStatements(objectCount: number, maxStoredBytes: number): number {
-  return 128 + Math.ceil(objectCount / 128) * 16 + Math.ceil(maxStoredBytes / 1048576) * 4;
-}
-
 function requireRepackedCapacity(run: RepackRun, objectCount: number): void {
   if (
     !Number.isSafeInteger(objectCount) ||
@@ -421,15 +417,6 @@ function selectCandidates(
       }
       const nextBytes = inflatedBytes + candidate.size;
       if (objects.length > 0 && nextBytes > selectedLimits.maxInflatedBytes) break;
-      if (estimatedStatements(objects.length + 1, selectedLimits.maxStoredBytes) >= 900) {
-        if (objects.length === 0) {
-          throw new GitError(
-            "E2BIG",
-            "maintenance repack cannot fit one object below 900 statements",
-          );
-        }
-        break;
-      }
       inflatedBytes = nextBytes;
     }
     objects.push(candidate);

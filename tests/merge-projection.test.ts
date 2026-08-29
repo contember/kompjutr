@@ -25,7 +25,6 @@ function conflictPlan(
       },
     ],
     sourceRows: 1,
-    blobReadCalls: 0,
     retainedBytes: 0,
     memoryHighWaterBytes: 0,
   };
@@ -49,7 +48,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      blobReadCalls: 1,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -263,7 +261,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -312,7 +309,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -350,7 +346,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -390,7 +385,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -417,7 +411,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -452,7 +445,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 2,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };
@@ -477,7 +469,6 @@ describe("merge projection", () => {
         },
       ],
       sourceRows: 1,
-      blobReadCalls: 0,
       retainedBytes: 0,
       memoryHighWaterBytes: 0,
     };

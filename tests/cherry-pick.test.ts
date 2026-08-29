@@ -10,7 +10,6 @@ import {
   cherryPickSkip,
 } from "../src/core/ops/cherry-pick.js";
 import { restoreProjectedOperation } from "../src/core/ops/merge-apply.js";
-import { calculateReplayRecoverySqlStatements } from "../src/core/ops/replay-lifecycle.js";
 import { add, rm } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -116,11 +115,6 @@ function durableSnapshot(workspace: TestRepository): {
 }
 
 describe("cherry-pick lifecycle", () => {
-  it("accepts recovery statement 999 and saturates statement 1000", () => {
-    expect(calculateReplayRecoverySqlStatements(900, 99)).toBe(999);
-    expect(calculateReplayRecoverySqlStatements(900, 100)).toBe(1_000);
-  });
-
   it("rolls back every conflicted replay write class", async () => {
     const faultClasses: readonly ("snapshot" | "content" | "worktree" | "index" | "journal")[] = [
       "snapshot",
@@ -507,17 +501,16 @@ describe("cherry-pick lifecycle", () => {
     writeWorkFile(workspace, "/sentinel.txt", "local sentinel\n");
     writeWorkFile(workspace, "/untracked.txt", "untracked\n");
 
-    const beforeRejectedRestore = durableSnapshot(workspace);
     const journal = workspace.repo.checkout.requireOperationState("cherry-pick");
-    expect(() =>
-      workspace.repo.store.db.transactionSync(() =>
-        restoreProjectedOperation(workspace.repo, workspace.worktree, journal, {
-          priorSqlStatements: 999,
-          clearState: true,
-        }),
-      ),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(durableSnapshot(workspace)).toEqual(beforeRejectedRestore);
+    workspace.repo.store.db.transactionSync(() =>
+      restoreProjectedOperation(workspace.repo, workspace.worktree, journal),
+    );
+    expect(textAt(workspace, "conflict.txt")).toBe("current\n");
+    expect(textAt(workspace, "sentinel.txt")).toBe("local sentinel\n");
+    expect(textAt(workspace, "untracked.txt")).toBe("untracked\n");
+    expect(reopen(workspace).repo.checkout.requireOperationState("cherry-pick").integrityOid).toBe(
+      journal.integrityOid,
+    );
 
     cherryPickAbort(workspace.repo, workspace.worktree);
 

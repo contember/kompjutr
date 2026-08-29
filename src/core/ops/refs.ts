@@ -24,7 +24,6 @@ import {
   indexMatchesStat,
   type WorktreePath,
   walkWorktreeEntriesStream,
-  worktreeHashRangeReads,
 } from "./worktree-io.js";
 
 const HEADS = "refs/heads/";
@@ -434,12 +433,8 @@ export interface CheckoutBlockerLimits {
   maxHashBytes: number;
   rows: number;
   hashBytes: number;
-  maxHashRangeReads: number;
-  hashRangeReads: number;
   maxHashCandidates: number;
   hashCandidates: number;
-  maxHashBatches: number;
-  hashBatches: number;
 }
 
 /**
@@ -761,29 +756,14 @@ function flushGuardCandidates(
   }
   if (limits !== undefined) {
     if (needsHash.length > 0) {
-      if (limits.hashBatches >= limits.maxHashBatches) {
-        throw new GitError(
-          "E2BIG",
-          `checkout guard hashing exceeds ${limits.maxHashBatches} batches`,
-        );
-      }
       if (needsHash.length > limits.maxHashCandidates - limits.hashCandidates) {
         throw new GitError(
           "E2BIG",
           `checkout guard hashing exceeds ${limits.maxHashCandidates} paths`,
         );
       }
-      limits.hashBatches++;
       limits.hashCandidates += needsHash.length;
     }
-    const rangeReads = worktreeHashRangeReads(needsHash.map((candidate) => candidate.worktree));
-    if (rangeReads > limits.maxHashRangeReads - limits.hashRangeReads) {
-      throw new GitError(
-        "E2BIG",
-        `checkout guard hashing exceeds ${limits.maxHashRangeReads} range reads`,
-      );
-    }
-    limits.hashRangeReads += rangeReads;
     for (const candidate of needsHash) {
       const size = candidate.worktree.stat.size;
       if (size > limits.maxHashBytes - limits.hashBytes) {

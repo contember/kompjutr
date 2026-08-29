@@ -494,6 +494,28 @@ shape exceptions, store import topology and proportional per-WU review.
   review-to-clean after the expanded semantic and byte audits. Independent typecheck,
   Biome, benchmark, and diff checks passed. The routine smoke gate passed 148/
   148 in 16.99 s under a two-vCPU no-SMT lease.
+- 2026-08-29 — WU2 removed the core integration/history statement currency,
+  read-call admissions, scan-row/page ceilings, and hash batch/range-read
+  admissions. Initial T3 review caught a missing worktree cursor-progress guard,
+  a dead range-read calculator, and weak first-excess oracles; all were fixed.
+  Reachable boundaries now prove exact merge, rebase, replay-preflight, and 65th
+  range-read outcomes. The former 11th dirty batch, sixth rebase batch, and
+  replay statement refusal are shadowed by lower real cardinality/byte maxima;
+  their arithmetic is recorded in the reviewed tests and no artificial seam was
+  added. Ohm approved the final review-to-clean.
+- 2026-08-29 — WU3 removed all 56 transport SQL charge/reserve/release sites,
+  push projection, fetch-publication admission, and pack-ingest SQL wrappers.
+  The 64 MiB retained-memory coordinator, fetch/push CAS and revisions, atomic
+  publication, retry uncertainty, and pack leases remain. Ohm independently
+  approved the 1,024-ref publication/reopen witness and final T3 review.
+- 2026-08-29 — WU4 removed the remaining schema, redirect, checkout,
+  pathspec/staging/diff, tracker/sparse, maintenance, ignore, and pack query
+  gates or fallbacks. Review replaced false >100,000-row witnesses, added exact
+  tracker reopen/epoch and pack 181st-read boundaries, and bounded sparse dirty
+  loading by `floor(remaining retained bytes / 1,037) + 1` sentinel rows. This
+  derives only from the real 8 MiB owner, not query cost. Dalton approved the
+  final review-to-clean. The combined routine smoke gate passed 150/150 in
+  12.30 s under a two-vCPU lease.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

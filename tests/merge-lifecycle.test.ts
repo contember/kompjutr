@@ -7,10 +7,7 @@ import type { GitContext } from "../src/core/context.js";
 import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { merge, mergeAbort, mergeContinue } from "../src/core/ops/merge.js";
-import {
-  MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS,
-  operationRefLogMetadata,
-} from "../src/core/ops/ref-log.js";
+import { operationRefLogMetadata } from "../src/core/ops/ref-log.js";
 import { add } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
 import { createGit, type Git } from "../src/git/client.js";
@@ -19,6 +16,7 @@ import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 const IDENTITY = { name: "Fixture", email: "fixture@example.com" };
 const fixtures: GitFixture[] = [];
@@ -144,9 +142,12 @@ function distinctTypeDivergence(
   return { fixture, base, current, incoming };
 }
 
-function crissCrossDivergence(): CrissCrossHistory {
+function crissCrossDivergence(stableDirectories = 0): CrissCrossHistory {
   const fixture = newFixture();
   fixture.write("conflict.txt", "base\n");
+  for (let ordinal = 0; ordinal < stableDirectories; ordinal++) {
+    fixture.write(`d${ordinal.toString().padStart(3, "0")}/file.txt`, `${ordinal}\n`);
+  }
   const base = fixture.commit("base");
 
   fixture.git("checkout", "-q", "-b", "side-a");
@@ -400,7 +401,7 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
-  it("rejects large dirty-file hashing before the merge SQL limit", async () => {
+  it("hashes a dirty file past the former range-read cap and reports the real blocker", async () => {
     const fixture = newFixture();
     fixture.write("guard.txt", "base\n");
     const base = fixture.commit("base");
@@ -409,15 +410,14 @@ describe("merge lifecycle", () => {
     fixture.commit("topic");
     fixture.git("checkout", "-q", "main");
     const workspace = await clonedFrom(fixture);
-    const dirty = "x".repeat(2 * 1024 * 1024);
+    const dirty = "x".repeat(4 * 1024 * 1024 + 1);
     writeWorkFile(workspace, "/guard.txt", dirty);
-    workspace.storage.resetCounters();
-
+    const worktree = new CountingWorktree(workspace.worktree);
     expect(() =>
-      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "topic" }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      merge(workspace.context, workspace.repo, worktree, { theirs: "topic" }),
+    ).toThrowError(expect.objectContaining({ code: "ECHECKOUTFAIL" }));
 
-    expect(workspace.storage.statementCount).toBeLessThan(1_000);
+    expect(worktree.rangeReads).toBe(65);
     expect(workspace.repo.head().oid).toBe(base);
     expect(textAt(workspace, "guard.txt")).toBe(dirty);
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
@@ -426,7 +426,6 @@ describe("merge lifecycle", () => {
   it("creates the same clean divergent merge commit with current then incoming parents", async () => {
     const history = cleanDivergence();
     const workspace = await clonedFrom(history.fixture);
-    workspace.storage.resetCounters();
 
     const result = merge(workspace.context, workspace.repo, workspace.worktree, {
       theirs: "topic",
@@ -456,7 +455,6 @@ describe("merge lifecycle", () => {
     });
     if (named === undefined || head === undefined) throw new Error("merge reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
-    expect(workspace.storage.statementCount).toBeLessThan(1_000);
   });
 
   it("rolls back a clean merge when publication fails after the ref mutation", async () => {
@@ -478,7 +476,7 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.checkout.reflog("HEAD")).toEqual([]);
   });
 
-  it("bounds configured reflog identity reads and skips them for an explicit actor", () => {
+  it("reads a configured reflog identity and skips config for an explicit actor", () => {
     const workspace = makeRepo("/");
     workspace.repo.store.configSet("user.name", "Configured");
     workspace.repo.store.configSet("user.email", "configured@example.com");
@@ -490,8 +488,6 @@ describe("merge lifecycle", () => {
       name: "Configured",
       email: "configured@example.com",
     });
-    expect(workspace.storage.statementCount).toBe(MAX_CONFIGURED_REFLOG_IDENTITY_SQL_STATEMENTS);
-
     workspace.storage.resetCounters();
     expect(
       operationRefLogMetadata(workspace.context, workspace.repo, "merge: fast-forward", {
@@ -1026,7 +1022,7 @@ describe("merge lifecycle", () => {
   });
 
   it("matches Git when multiple best bases require a synthetic virtual ancestor", async () => {
-    const history = crissCrossDivergence();
+    const history = crissCrossDivergence(116);
     expect(
       new Set(history.fixture.git("merge-base", "--all", "side-a", "side-b").split("\n")),
     ).toEqual(new Set(history.bestBases));
@@ -1036,7 +1032,6 @@ describe("merge lifecycle", () => {
     const expectedIndex = gitIndexLines(history.fixture);
     const expectedWorktree = readFileSync(join(history.fixture.dir, "conflict.txt"), "utf8");
     const expectedBase = history.fixture.git("show", ":1:conflict.txt");
-    workspace.storage.resetCounters();
 
     expect(
       merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "side-b" }),
@@ -1059,6 +1054,28 @@ describe("merge lifecycle", () => {
     expect(workspace.repo.store.objectInfo([stageOne.oid])).toEqual([
       expect.objectContaining({ oid: stageOne.oid, source: "loose", type: "blob" }),
     ]);
-    expect(workspace.storage.statementCount).toBeLessThan(1_000);
+  });
+
+  it("aborts recursive merge recovery past the former first-excess model", async () => {
+    const history = crissCrossDivergence(81);
+    const workspace = await clonedFrom(history.fixture);
+
+    expect(() => history.fixture.git("merge", "side-b")).toThrow();
+    history.fixture.git("merge", "--abort");
+    const expectedIndex = gitIndexLines(history.fixture);
+    const expectedConflict = readFileSync(join(history.fixture.dir, "conflict.txt"), "utf8");
+
+    expect(
+      merge(workspace.context, workspace.repo, workspace.worktree, { theirs: "side-b" }),
+    ).toEqual({ conflicted: true, pendingCommit: true });
+    const cold = reopen(workspace);
+
+    mergeAbort(cold.repo, workspace.worktree);
+
+    expect(cold.repo.head()).toEqual({ ref: "refs/heads/side-a", oid: history.current });
+    expect(cold.repo.checkout.readMergeState()).toBeNull();
+    expect(indexLines(cold.repo)).toEqual(expectedIndex);
+    expect(textAt(workspace, "conflict.txt")).toBe(expectedConflict);
+    expect(workspace.worktree.scan("/", { filesOnly: true, limit: 200 })).toHaveLength(82);
   });
 });

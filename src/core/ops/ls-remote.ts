@@ -256,11 +256,7 @@ function selectRefs(
   return selected;
 }
 
-function resolveRemoteUrl(
-  repo: Repository,
-  options: LsRemoteOptions,
-  budget: TransportOperationBudget,
-): string {
+function resolveRemoteUrl(repo: Repository, options: LsRemoteOptions): string {
   if (options.remote !== undefined && options.url !== undefined) {
     throw new GitError("EINVAL", "ls-remote accepts either remote or url, not both");
   }
@@ -276,7 +272,6 @@ function resolveRemoteUrl(
     throw new GitError("EINVAL", "ls-remote remote must be a non-empty string");
   }
   const remote = options.remote ?? "origin";
-  budget.chargeSql();
   const url = remoteUrlFor(repo, remote);
   if (url === undefined) throw new GitError("ENOREMOTE", `no such remote: ${remote}`);
   return url;
@@ -383,7 +378,7 @@ export async function lsRemote(
   const budget = new TransportOperationBudget(reservation);
   try {
     const patterns = compilePatterns(options.patterns, budget);
-    const url = resolveRemoteUrl(repo, options, budget);
+    const url = resolveRemoteUrl(repo, options);
     const advertisement = await discoverRefs(context, url, options, budget);
     return {
       refs: selectRefs(advertisement.refs, patterns, budget),

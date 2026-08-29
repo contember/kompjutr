@@ -235,17 +235,6 @@ export interface WorktreePath {
   stat: WorktreeStat;
 }
 
-/** Number of bounded filesystem range reads used to hash large regular files. */
-export function worktreeHashRangeReads(paths: readonly WorktreePath[]): number {
-  let reads = 0;
-  for (const path of paths) {
-    if (path.stat.type !== "file" || path.stat.size <= STREAM_ABOVE) continue;
-    reads += Math.ceil(path.stat.size / READ_CHUNK);
-    if (!Number.isSafeInteger(reads)) return Number.MAX_SAFE_INTEGER;
-  }
-  return reads;
-}
-
 /**
  * Every file and symlink under the working tree, as sorted repo-relative
  * paths. Directories are not returned — git tracks files.
@@ -623,10 +612,6 @@ export interface DirtyPathLimits {
   hashCandidates: number;
   maxHashBytes: number;
   hashBytes: number;
-  maxHashRangeReads: number;
-  hashRangeReads: number;
-  maxHashBatches: number;
-  hashBatches: number;
 }
 
 export function dirtyPaths(
@@ -689,22 +674,10 @@ export function* dirtyPathStream(
     }
 
     if (limits !== undefined && needsHash.length > 0) {
-      if (limits.hashBatches >= limits.maxHashBatches) {
-        throw new GitError("E2BIG", `dirty-path hashing exceeds ${limits.maxHashBatches} batches`);
-      }
       if (needsHash.length > limits.maxHashCandidates - limits.hashCandidates) {
         throw new GitError("E2BIG", `dirty-path hashing exceeds ${limits.maxHashCandidates} paths`);
       }
-      limits.hashBatches++;
       limits.hashCandidates += needsHash.length;
-      const rangeReads = worktreeHashRangeReads(needsHash);
-      if (rangeReads > limits.maxHashRangeReads - limits.hashRangeReads) {
-        throw new GitError(
-          "E2BIG",
-          `dirty-path hashing exceeds ${limits.maxHashRangeReads} range reads`,
-        );
-      }
-      limits.hashRangeReads += rangeReads;
       for (const candidate of needsHash) {
         if (candidate.stat.size > limits.maxHashBytes - limits.hashBytes) {
           throw new GitError("E2BIG", `dirty-path hashing exceeds ${limits.maxHashBytes} bytes`);

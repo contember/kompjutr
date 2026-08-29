@@ -5,14 +5,12 @@ import { hashObject } from "../src/core/objects.js";
 import {
   abortProjectedMerge,
   applyProjectedMerge,
-  calculateOperationRestoreSqlStatements,
-  MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS,
-  MAX_MERGE_APPLY_SQL_STATEMENTS,
   type MergeApplyMetadata,
 } from "../src/core/ops/merge-apply.js";
 import type { ProjectedMergeEntry } from "../src/core/ops/merge-projection.js";
 import type { MergeJournal, MergeTouchedPath } from "../src/core/ops/merge-state.js";
 import type { Repository } from "../src/core/repository.js";
+import type { ScanEntry } from "../src/fs/types.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
 
 function commit(repo: Repository, digit: string): string {
@@ -71,32 +69,6 @@ function textAt(workspace: TestRepository, path: string): string | null {
 }
 
 describe("projected merge apply", () => {
-  it("accepts recovery statement 999 and rejects statement 1000 exactly", () => {
-    const emptyTail = {
-      worktreeScanPages: 0,
-      blobReadCalls: 0,
-      worktreeWriteCalls: 0,
-      worktreeWriteBytes: 0,
-      indexMutations: 0,
-      hasRemovals: false,
-      clearState: false,
-    };
-    const tail = calculateOperationRestoreSqlStatements(0, emptyTail).applySqlStatements;
-    expect(calculateOperationRestoreSqlStatements(999 - tail, emptyTail).totalSqlStatements).toBe(
-      999,
-    );
-    expect(calculateOperationRestoreSqlStatements(1_000 - tail, emptyTail).totalSqlStatements).toBe(
-      1_000,
-    );
-  });
-
-  it("reserves a bounded apply share of the whole-operation SQL limit", () => {
-    expect(MAX_MERGE_APPLY_SQL_STATEMENTS).toBe(831);
-    expect(MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS).toBe(168);
-    expect(MAX_MERGE_APPLY_PRIOR_SQL_STATEMENTS + MAX_MERGE_APPLY_SQL_STATEMENTS).toBe(999);
-    expect(MAX_MERGE_APPLY_SQL_STATEMENTS).toBeLessThan(1_000);
-  });
-
   it("does not retain rollback blobs for a clean commit-mode outcome", () => {
     const workspace = makeRepo();
     const oldBytes = utf8.encode("unretained original\n");
@@ -119,12 +91,12 @@ describe("projected merge apply", () => {
       applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
     );
 
-    expect(result).toEqual({ outcome: "clean", journal: null, sqlStatements: 29 });
+    expect(result).toEqual({ outcome: "clean", journal: null });
     expect(workspace.repo.has(oldOid)).toBe(false);
     expect(textAt(workspace, "clean.txt")).toBe("next\n");
   });
 
-  it("composes a small apply with prior virtual-base work", () => {
+  it("applies a small projected merge", () => {
     const workspace = makeRepo();
     workspace.worktree.writeFiles([{ path: "/small.txt", bytes: utf8.encode("old\n") }]);
     const next = blob(workspace.repo, "next\n");
@@ -141,16 +113,14 @@ describe("projected merge apply", () => {
     ];
 
     const result = workspace.repo.store.db.transactionSync(() =>
-      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo), {
-        priorSqlStatements: 279,
-      }),
+      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
     );
 
-    expect(279 + result.sqlStatements).toBeLessThan(1_000);
+    expect(result).toEqual({ outcome: "clean", journal: null });
     expect(textAt(workspace, "small.txt")).toBe("next\n");
   });
 
-  it("rejects an exhausted prior budget before writing the worktree or index", () => {
+  it("applies the operation that the former exhausted prior budget rejected", () => {
     const workspace = makeRepo();
     workspace.worktree.writeFiles([{ path: "/guarded.txt", bytes: utf8.encode("old\n") }]);
     const next = blob(workspace.repo, "next\n");
@@ -166,15 +136,204 @@ describe("projected merge apply", () => {
       },
     ];
 
+    const result = workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
+    );
+    expect(result).toEqual({ outcome: "clean", journal: null });
+    expect(textAt(workspace, "guarded.txt")).toBe("next\n");
+    expect(workspace.repo.checkout.indexGet("guarded.txt")).toMatchObject({
+      stage: 0,
+      oid: next.oid,
+    });
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
+  });
+
+  it("continues a worktree snapshot scan past fifty full pages", () => {
+    const workspace = makeRepo();
+    const next = blob(workspace.repo, "next\n");
+    const entries: readonly ProjectedMergeEntry[] = [
+      {
+        path: "z.txt",
+        logicalPath: "z.txt",
+        purpose: "primary",
+        stageZero: next,
+        stages: null,
+        worktree: next,
+        content: null,
+      },
+    ];
+    let scanCalls = 0;
+    workspace.worktree.scan = (_root, options): ScanEntry[] => {
+      scanCalls++;
+      if (scanCalls > 50) return [];
+      const first = (scanCalls - 1) * options.limit;
+      return Array.from({ length: options.limit }, (_, offset) => ({
+        path: `/a-${(first + offset).toString().padStart(5, "0")}`,
+        type: "file",
+        mode: 0o100644,
+        size: 0,
+        mtime: 0,
+        ino: first + offset + 1,
+        nlink: 1,
+        rev: 1,
+        target: null,
+        contentId: null,
+      }));
+    };
+
+    const result = workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
+    );
+
+    expect(scanCalls).toBe(51);
+    expect(result).toEqual({ outcome: "clean", journal: null });
+    expect(textAt(workspace, "z.txt")).toBe("next\n");
+  });
+
+  it("rejects a worktree snapshot cursor that does not advance", () => {
+    const workspace = makeRepo();
+    const next = blob(workspace.repo, "next\n");
+    const entries: readonly ProjectedMergeEntry[] = [
+      {
+        path: "z.txt",
+        logicalPath: "z.txt",
+        purpose: "primary",
+        stageZero: next,
+        stages: null,
+        worktree: next,
+        content: null,
+      },
+    ];
+    const page = Array.from(
+      { length: 1_000 },
+      (_, ordinal): ScanEntry => ({
+        path: `/a-${ordinal.toString().padStart(4, "0")}`,
+        type: "file",
+        mode: 0o100644,
+        size: 0,
+        mtime: 0,
+        ino: ordinal + 1,
+        nlink: 1,
+        rev: 1,
+        target: null,
+        contentId: null,
+      }),
+    );
+    workspace.worktree.scan = () => page;
+
     expect(() =>
       workspace.repo.store.db.transactionSync(() =>
-        applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo), {
-          priorSqlStatements: 999,
-        }),
+        applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
       ),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(textAt(workspace, "guarded.txt")).toBe("old\n");
-    expect(workspace.repo.checkout.indexGet("guarded.txt")).toBeNull();
+    ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
+    expect(workspace.repo.checkout.readMergeState()).toBeNull();
+    expect(textAt(workspace, "z.txt")).toBeNull();
+  });
+
+  it("continues an index snapshot scan past fifty thousand rows", () => {
+    const workspace = makeRepo();
+    const next = blob(workspace.repo, "next\n");
+    const entries: readonly ProjectedMergeEntry[] = [
+      {
+        path: "z.txt",
+        logicalPath: "z.txt",
+        purpose: "primary",
+        stageZero: next,
+        stages: null,
+        worktree: next,
+        content: null,
+      },
+    ];
+    workspace.repo.checkout.indexScan = function* () {
+      for (let ordinal = 0; ordinal <= 50_000; ordinal++) {
+        yield {
+          path: `a-${ordinal.toString().padStart(5, "0")}`,
+          stage: 0,
+          mode: 0o100644,
+          oid: "1".repeat(40),
+          size: null,
+          mtime: null,
+          ino: null,
+          rev: null,
+        };
+      }
+    };
+
+    const result = workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(
+        workspace.repo,
+        workspace.worktree,
+        entries,
+        metadata(workspace.repo, "no-commit"),
+      ),
+    );
+
+    expect(result.outcome).toBe("ready");
+    expect(result.journal?.touched).toHaveLength(1);
+    expect(workspace.repo.checkout.indexGet("z.txt")).toMatchObject({ oid: next.oid });
+  });
+
+  it("snapshots and restores files past the former read-call caps", () => {
+    const workspace = makeRepo();
+    const entries: ProjectedMergeEntry[] = [];
+    for (let ordinal = 0; ordinal < 9; ordinal++) {
+      const path = `file-${ordinal}`;
+      seedFile(workspace, path, `old-${ordinal}\n`);
+      const next = blob(workspace.repo, `next-${ordinal}\n`);
+      entries.push({
+        path,
+        logicalPath: path,
+        purpose: "primary",
+        stageZero: next,
+        stages: null,
+        worktree: next,
+        content: null,
+      });
+    }
+    const readFiles = workspace.worktree.readFiles.bind(workspace.worktree);
+    let snapshotReads = 0;
+    workspace.worktree.readFiles = (paths, options) => {
+      const first = paths[0];
+      if (first === undefined) throw new Error("test snapshot batch is empty");
+      snapshotReads++;
+      const batch = readFiles([first], options);
+      return { files: batch.files, remaining: [...batch.remaining, ...paths.slice(1)] };
+    };
+    const readBlobs = workspace.repo.readBlobs.bind(workspace.repo);
+    let blobReads = 0;
+    workspace.repo.readBlobs = (oids, options) => {
+      const first = oids[0];
+      if (first === undefined) throw new Error("test blob batch is empty");
+      blobReads++;
+      const batch = readBlobs([first], options);
+      return {
+        blobs: batch.blobs,
+        remaining: [...batch.remaining, ...oids.slice(1)],
+        bytes: batch.bytes,
+      };
+    };
+
+    const result = workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(
+        workspace.repo,
+        workspace.worktree,
+        entries,
+        metadata(workspace.repo, "no-commit"),
+      ),
+    );
+    const journal = result.journal;
+    if (journal === null) throw new Error("ready merge omitted its journal");
+    expect(snapshotReads).toBe(9);
+    expect(blobReads).toBe(9);
+    const restoreStart = blobReads;
+    workspace.repo.store.db.transactionSync(() =>
+      abortProjectedMerge(workspace.repo, workspace.worktree, journal),
+    );
+
+    expect(blobReads - restoreStart).toBe(9);
+    for (let ordinal = 0; ordinal < 9; ordinal++) {
+      expect(textAt(workspace, `file-${ordinal}`)).toBe(`old-${ordinal}\n`);
+    }
     expect(workspace.repo.checkout.readMergeState()).toBeNull();
   });
 

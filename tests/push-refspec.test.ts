@@ -13,7 +13,6 @@ import {
   MAX_PUSH_COMMITS,
   MAX_PUSH_PLAN_BYTES,
   openPushPack,
-  PUSH_FINALIZATION_SQL_ALLOWANCE,
   type PushPlan,
   planPushUpdates,
   pushPlanHasObject,
@@ -106,14 +105,9 @@ describe("post-push branch target authentication", () => {
     );
     const { budget, reservation } = operation(workspace.repo);
     budget.setMemory("caller", 256);
-    const statementStart = workspace.storage.statementCount;
-    const chargeStart = budget.sqlStatements;
 
     authenticatePushBranchTargets(workspace.repo, [commit], budget);
 
-    expect(budget.sqlStatements - chargeStart).toBeGreaterThanOrEqual(
-      workspace.storage.statementCount - statementStart,
-    );
     expect(budget.memory("push-branch-target-auth")).toBe(0);
     expect(budget.memory("push-branch-target-auth-read")).toBe(0);
     expect(budget.memory("caller")).toBe(256);
@@ -186,7 +180,6 @@ describe("post-push branch target authentication", () => {
 
     const single = operation(workspace.repo);
     authenticatePushBranchTargets(workspace.repo, [commit], single.budget);
-    const singleStatements = single.budget.sqlStatements;
     single.reservation.dispose();
 
     const exact = operation(workspace.repo);
@@ -195,7 +188,6 @@ describe("post-push branch target authentication", () => {
       Array.from({ length: MAX_PUSH_BRANCH_TARGETS }, () => commit),
       exact.budget,
     );
-    expect(exact.budget.sqlStatements).toBe(singleStatements);
     expect(exact.budget.retainedBytes).toBe(0);
     exact.reservation.dispose();
 
@@ -207,7 +199,6 @@ describe("post-push branch target authentication", () => {
         excess.budget,
       ),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(excess.budget.sqlStatements).toBe(0);
     expect(excess.budget.retainedBytes).toBe(0);
     excess.reservation.dispose();
 
@@ -216,7 +207,6 @@ describe("post-push branch target authentication", () => {
     expect(() => authenticatePushBranchTargets(workspace.repo, [commit], bounded.budget)).toThrow(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(bounded.budget.sqlStatements).toBe(0);
     expect(bounded.budget.memory("push-branch-target-auth")).toBe(0);
     expect(bounded.budget.memory("push-branch-target-auth-read")).toBe(0);
     expect(bounded.budget.memory("caller")).toBe(MAX_OPERATION_MEMORY_BYTES);
@@ -451,12 +441,8 @@ describe("multi-ref push planning", () => {
       force: false,
     }));
     const exact = operation(workspace.repo);
-    exact.budget.chargeSql(1_000 - PUSH_FINALIZATION_SQL_ALLOWANCE);
     expect(planPushUpdates(workspace.repo, deletions, exact.budget)).toBeNull();
-    expect(exact.budget.reservedSqlStatements).toBe(0);
-    exact.budget.reserveSql("publication", PUSH_FINALIZATION_SQL_ALLOWANCE);
-    expect(exact.budget.reservedSqlStatements).toBe(PUSH_FINALIZATION_SQL_ALLOWANCE);
-    exact.budget.releaseSql("publication");
+    expect(exact.budget.retainedBytes).toBe(0);
     exact.reservation.dispose();
 
     const excess = operation(workspace.repo);
@@ -480,7 +466,6 @@ describe("multi-ref push planning", () => {
     const observedStatements = workspace.storage.statementCount - statementStart;
     expect(pushPlanObjectCount(plan)).toBe(1);
     expect(observedStatements).toBeLessThan(100);
-    expect(exact.budget.sqlStatements).toBeGreaterThanOrEqual(observedStatements);
     disposePushPlan(plan);
     exact.reservation.dispose();
     workspace.repo.store.memory.assertIdle();
@@ -714,35 +699,20 @@ describe("multi-ref push planning", () => {
 });
 
 describe("caller-owned push budget", () => {
-  it("charges retained planning state and both replayable SQL passes to one root", async () => {
+  it("charges retained planning state and both replayable pack reads to one root", async () => {
     const workspace = makeRepo();
     const blob = workspace.repo.store.write("blob", new TextEncoder().encode("one\n"));
     const reservation = workspace.repo.store.reserveMemory();
     const budget = new TransportOperationBudget(reservation);
-    const planningStatements = workspace.storage.statementCount;
-    const planningCharge = budget.sqlStatements;
     const plan = requirePlan(
       planPushUpdates(workspace.repo, [update(blob, "refs/checkpoints/blob", blob)], budget),
     );
-    expect(budget.sqlStatements - planningCharge).toBeGreaterThanOrEqual(
-      workspace.storage.statementCount - planningStatements,
-    );
     expect(budget.memory("push-plan")).toBeGreaterThan(0);
-    const reservedBefore = budget.reservedSqlStatements;
-    const firstStatements = workspace.storage.statementCount;
-    const firstCharge = budget.sqlStatements;
     const first = await collect(openPushPack(workspace.repo, plan));
-    expect(budget.sqlStatements - firstCharge).toBeGreaterThanOrEqual(
-      workspace.storage.statementCount - firstStatements,
-    );
-    const secondStatements = workspace.storage.statementCount;
-    const secondCharge = budget.sqlStatements;
+    expect(budget.memory("push-pack-first-read")).toBe(0);
     const second = await collect(openPushPack(workspace.repo, plan));
-    expect(budget.sqlStatements - secondCharge).toBeGreaterThanOrEqual(
-      workspace.storage.statementCount - secondStatements,
-    );
+    expect(budget.memory("push-pack-replay-read")).toBe(0);
     expect(second).toEqual(first);
-    expect(budget.reservedSqlStatements).toBeLessThan(reservedBefore);
     await expect(collect(openPushPack(workspace.repo, plan))).rejects.toMatchObject({
       code: "EPUSHLOCAL",
     });
@@ -750,63 +720,6 @@ describe("caller-owned push budget", () => {
     expect(budget.memory("push-plan")).toBe(0);
     reservation.dispose();
     workspace.repo.store.memory.assertIdle();
-  });
-
-  it("admits exactly 1,000 shared statements and rejects the first excess", async () => {
-    const calibration = makeRepo();
-    const calibrationBlob = calibration.repo.store.write("blob", new TextEncoder().encode("one\n"));
-    const calibrationOperation = operation(calibration.repo);
-    const calibrationPlan = requirePlan(
-      planPushUpdates(
-        calibration.repo,
-        [update(calibrationBlob, "refs/checkpoints/blob", calibrationBlob)],
-        calibrationOperation.budget,
-      ),
-    );
-    await collect(openPushPack(calibration.repo, calibrationPlan));
-    await collect(openPushPack(calibration.repo, calibrationPlan));
-    const requiredStatements =
-      calibrationOperation.budget.sqlStatements + PUSH_FINALIZATION_SQL_ALLOWANCE;
-    disposePushPlan(calibrationPlan);
-    calibrationOperation.reservation.dispose();
-
-    const exact = makeRepo();
-    const exactBlob = exact.repo.store.write("blob", new TextEncoder().encode("one\n"));
-    const exactOperation = operation(exact.repo);
-    exactOperation.budget.chargeSql(1_000 - requiredStatements);
-    const exactStart = exact.storage.statementCount;
-    const exactCharge = exactOperation.budget.sqlStatements;
-    const exactPlan = requirePlan(
-      planPushUpdates(
-        exact.repo,
-        [update(exactBlob, "refs/checkpoints/blob", exactBlob)],
-        exactOperation.budget,
-      ),
-    );
-    await collect(openPushPack(exact.repo, exactPlan));
-    await collect(openPushPack(exact.repo, exactPlan));
-    exactOperation.budget.chargeSql(PUSH_FINALIZATION_SQL_ALLOWANCE);
-    expect(exactOperation.budget.sqlStatements).toBe(1_000);
-    expect(exactOperation.budget.sqlStatements - exactCharge).toBeGreaterThanOrEqual(
-      exact.storage.statementCount - exactStart,
-    );
-    disposePushPlan(exactPlan);
-    exactOperation.reservation.dispose();
-
-    const excess = makeRepo();
-    const excessBlob = excess.repo.store.write("blob", new TextEncoder().encode("one\n"));
-    const excessOperation = operation(excess.repo);
-    excessOperation.budget.chargeSql(1_001 - requiredStatements);
-    expect(() =>
-      planPushUpdates(
-        excess.repo,
-        [update(excessBlob, "refs/checkpoints/blob", excessBlob)],
-        excessOperation.budget,
-      ),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(excessOperation.budget.reservedSqlStatements).toBe(0);
-    expect(excessOperation.budget.memory("push-plan")).toBe(0);
-    excessOperation.reservation.dispose();
   });
 
   it("keeps pack memory additive and defers disposal until an active stream closes", async () => {

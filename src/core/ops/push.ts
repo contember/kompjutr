@@ -28,7 +28,6 @@ import {
   authenticatePushBranchTargets,
   disposePushPlan,
   openPushPack,
-  PUSH_FINALIZATION_SQL_ALLOWANCE,
   type PushPlan,
   planPushUpdates,
 } from "./push-plan.js";
@@ -88,7 +87,6 @@ const PUSH_COMMANDS_MEMORY_PART = "push-commands";
 const PUSH_RESULT_PREFLIGHT_MEMORY_PART = "push-result-preflight";
 const PUSH_RESULT_MEMORY_PART = "push-result";
 const PUSH_TRACKING_MEMORY_PART = "push-tracking";
-const PUSH_FINALIZATION_SQL_PART = "push-finalization";
 const PROTOCOL_DISCOVERY_MEMORY_PART = "protocol-discovery";
 const PUSH_OPTIONS_FIXED_BYTES = 256;
 const PUSH_HEADER_FIXED_BYTES = 64;
@@ -185,13 +183,8 @@ function fullBranchRef(ref: string): string {
   return requireBranchRef(ref.startsWith("refs/") ? ref : `refs/heads/${ref}`);
 }
 
-function localBranch(
-  repo: Repository,
-  requested: string | undefined,
-  budget: TransportOperationBudget,
-): string {
+function localBranch(repo: Repository, requested: string | undefined): string {
   if (requested !== undefined) return fullBranchRef(requested);
-  budget.chargeSql(4);
   const head = repo.head();
   if (head.ref === null) {
     throw new GitError("EDETACHED", "push from detached HEAD requires an explicit branch ref");
@@ -204,11 +197,9 @@ function targetBranch(
   localRef: string,
   remote: string,
   requested: string | undefined,
-  budget: TransportOperationBudget,
 ): string {
   if (requested !== undefined) return fullBranchRef(requested);
   const branch = localRef.slice("refs/heads/".length);
-  budget.chargeSql(2);
   const upstreamRemote = repo.store.configGet(`branch.${branch}.remote`);
   const merge = repo.store.configGet(`branch.${branch}.merge`);
   if ((upstreamRemote === undefined || upstreamRemote === remote) && merge !== undefined) {
@@ -221,13 +212,12 @@ function legacyRefspecs(
   repo: Repository,
   options: PushOptions & LegacyPushSelection,
   remote: string,
-  budget: TransportOperationBudget,
 ): readonly [PushRefspec] {
   const localRef =
     options.delete === true && options.ref === undefined && options.remoteRef !== undefined
       ? fullBranchRef(options.remoteRef)
-      : localBranch(repo, options.ref, budget);
-  const destination = targetBranch(repo, localRef, remote, options.remoteRef, budget);
+      : localBranch(repo, options.ref);
+  const destination = targetBranch(repo, localRef, remote, options.remoteRef);
   return options.delete === true
     ? [{ source: null, destination }]
     : [{ source: localRef, destination, force: options.force === true }];
@@ -250,7 +240,6 @@ function resolveRawLocalRef(name: string, refs: ReadonlyMap<string, string>): st
 function localRefSnapshot(repo: Repository, budget: TransportOperationBudget): RefspecSourceRef[] {
   let rawBytes = LOCAL_REFS_FIXED_BYTES + LOCAL_REF_RESOLUTION_HEADROOM_BYTES;
   budget.setMemory(PUSH_LOCAL_REFS_MEMORY_PART, rawBytes);
-  budget.chargeSql();
   const raw = new Map<string, string>();
   for (const row of repo.store.iterateRefs()) {
     rawBytes +=
@@ -283,11 +272,9 @@ function needsLocalRefs(refspecs: readonly PushRefspec[]): boolean {
 function pushTarget(
   repo: Repository,
   options: PushOptions,
-  budget: TransportOperationBudget,
 ): { readonly remote: string; readonly url: string; readonly configured: boolean } {
   const remote = options.remote ?? "origin";
   if (options.url !== undefined) return { remote, url: options.url, configured: false };
-  budget.chargeSql(2);
   const pushUrl = repo.store.configGet(`remote.${remote}.pushurl`);
   const url = pushUrl ?? remoteUrlFor(repo, remote);
   if (url === undefined) throw new GitError("ENOREMOTE", `no such remote: ${remote}`);
@@ -544,9 +531,7 @@ export async function push(
     budget.setMemory(PUSH_OPTIONS_MEMORY_PART, staticOptionBytes);
     const remote = options.remote ?? "origin";
     const refspecs =
-      options.refspecs === undefined
-        ? legacyRefspecs(repo, options, remote, budget)
-        : options.refspecs;
+      options.refspecs === undefined ? legacyRefspecs(repo, options, remote) : options.refspecs;
     compiler = compilePushRefspecs(refspecs, budget);
     const localRefs = needsLocalRefs(refspecs) ? localRefSnapshot(repo, budget) : [];
     const mappings = compiler.expand(localRefs);
@@ -554,7 +539,7 @@ export async function push(
     budget.clearMemory(PUSH_LOCAL_REFS_MEMORY_PART);
     if (mappings.length === 0) return emptyPushResult();
 
-    const target = pushTarget(repo, options, budget);
+    const target = pushTarget(repo, options);
     const auth = createRemoteAuth(
       context,
       options,
@@ -580,7 +565,6 @@ export async function push(
     compiler = null;
 
     const commands = commandSet(joined.updates, budget);
-    budget.reserveSql(PUSH_FINALIZATION_SQL_PART, PUSH_FINALIZATION_SQL_ALLOWANCE);
     if (
       target.configured &&
       joined.updates.some((update) => update.destination.startsWith("refs/heads/"))
@@ -589,8 +573,6 @@ export async function push(
         `refs/remotes/${target.remote}/`,
         [],
         reservation,
-        budget,
-        PUSH_FINALIZATION_SQL_PART,
       );
     }
     budget.setMemory(PUSH_RESULT_PREFLIGHT_MEMORY_PART, PUSH_RESULT_PREFLIGHT_BYTES);
@@ -647,7 +629,6 @@ export async function push(
     publication?.dispose();
     if (plan !== null) disposePushPlan(plan);
     compiler?.dispose();
-    budget.releaseSql(PUSH_FINALIZATION_SQL_PART);
     budget.clearAllMemory();
     reservation.dispose();
   }

@@ -944,7 +944,7 @@ describe("sparse eager status", () => {
     });
   });
 
-  it("returns normal status and skips reseal above the dirty-row cap", () => {
+  it("returns normal status and reseals after the former dirty-row cap", () => {
     const workspace = makeRepo("/");
     workspace.repo.checkout.indexReplace(
       Array.from({ length: 32_001 }, (_, index) =>
@@ -956,7 +956,13 @@ describe("sparse eager status", () => {
     expect(
       eagerStatus(workspace.repo, workspace.worktree, { untrackedFiles: "all" }, recorded.context),
     ).toHaveLength(32_001);
-    expect(recorded.reseals).toEqual([]);
+    expect(recorded.reseals).toHaveLength(1);
+    expect(recorded.reseals[0]?.entries).toHaveLength(32_001);
+    expect(recorded.reseals[0]?.entries[0]).toEqual({ path: "f00000.txt", flags: 3 });
+    expect(recorded.reseals[0]?.entries.at(-1)).toEqual({
+      path: "f32000.txt",
+      flags: 3,
+    });
   });
 
   it("returns normal status and skips reseal above the retained-memory cap", () => {

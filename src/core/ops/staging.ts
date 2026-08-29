@@ -38,15 +38,7 @@ import {
   indexFromTree,
   matchesPaths,
 } from "./checkout.js";
-import {
-  compileReadPathspec,
-  LS_FILES_INDEX_PAGE,
-  type LsFilesOptions,
-  MAX_LS_FILES_COMBINED_PATTERNS,
-  MAX_LS_FILES_COMBINED_SCAN_PREFIXES,
-  MAX_LS_FILES_SCAN_PREFIXES,
-  MAX_LS_FILES_SCAN_ROWS,
-} from "./pathspec.js";
+import { compileReadPathspec, LS_FILES_INDEX_PAGE, type LsFilesOptions } from "./pathspec.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 import {
@@ -54,17 +46,14 @@ import {
   hashWorktreePaths,
   indexEntryFor,
   indexMatchesStat,
-  WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktreeEntriesStream,
-  worktreeHashRangeReads,
 } from "./worktree-io.js";
 
 const ADD_WINDOW_ROWS = 1000;
 const ADD_RETAINED_BYTES = 16 * 1024 * 1024;
 const ADD_MAX_ROWS_PER_STREAM = 50_000;
 const ADD_MAX_HASH_BYTES = 64 * 1024 * 1024;
-const ADD_MAX_HASH_RANGE_READS = 64;
 const ADD_SELECTED_RETAINED_BYTES = 8 * 1024 * 1024;
 const ADD_SELECTED_PATHS = 1_000;
 const ADD_SELECTED_ROWS = 32_768;
@@ -88,32 +77,10 @@ const TYPED_ARRAY_BYTE_LENGTH_GETTER: unknown = Object.getOwnPropertyDescriptor(
   "byteLength",
 )?.get;
 
-export const MAX_LS_FILES_CACHED_SQL_STATEMENTS =
-  Math.ceil(MAX_LS_FILES_SCAN_ROWS / LS_FILES_INDEX_PAGE) + MAX_LS_FILES_SCAN_PREFIXES;
-/** Row pages plus a terminal probe per compiled prefix; deliberately one over the measured mix. */
-export const MAX_LS_FILES_COMBINED_INDEX_STATEMENTS =
-  Math.ceil(MAX_LS_FILES_SCAN_ROWS / LS_FILES_INDEX_PAGE) + MAX_LS_FILES_COMBINED_SCAN_PREFIXES;
-export const MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS =
-  Math.ceil(MAX_LS_FILES_SCAN_ROWS / WORKTREE_SCAN_PAGE) + 1;
-export const MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS = 16;
-/** Conservative allowance for root resolution and caller/backend helper statements. */
-export const MAX_LS_FILES_COMBINED_FIXED_STATEMENTS = 64;
-export const MAX_LS_FILES_COMBINED_SQL_STATEMENTS =
-  MAX_LS_FILES_COMBINED_INDEX_STATEMENTS +
-  MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS +
-  MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS +
-  MAX_LS_FILES_COMBINED_FIXED_STATEMENTS;
 export const MAX_LS_FILES_EXCLUDE_ROOTS = MAX_ROUTING_CHECKOUTS;
 export const MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES = MAX_ROUTING_ROOTS_UTF8_BYTES;
 const MAX_LS_FILES_EXCLUDE_ROOT_INPUTS = MAX_ROUTING_CHECKOUTS + 1;
 const LS_FILES_EXCLUDE_ROOT_ENCODER = new TextEncoder();
-
-if (MAX_LS_FILES_CACHED_SQL_STATEMENTS !== 903) {
-  throw new Error("cached ls-files SQL bound changed");
-}
-if (MAX_LS_FILES_COMBINED_SQL_STATEMENTS !== 700) {
-  throw new Error("combined ls-files SQL bound changed");
-}
 
 type AvailableSelectedPaths = Extract<SelectedPathResult, { available: true }>;
 
@@ -132,7 +99,6 @@ interface AddOperationLimits {
   worktreeRows: number;
   headRows: number;
   hashBytes: number;
-  hashRangeReads: number;
 }
 
 interface StageCandidate {
@@ -218,7 +184,6 @@ function runAdd(
     worktreeRows: 0,
     headRows: 0,
     hashBytes: 0,
-    hashRangeReads: 0,
   };
   const force = options.force === true;
   const trackedOnly = all && options.trackedOnly === true;
@@ -1164,11 +1129,6 @@ function stageCandidates(
       unresolved.push(row.worktree);
     } else mapped.set(row.path, oid);
   }
-  const rangeReads = worktreeHashRangeReads(unresolved);
-  if (rangeReads > ADD_MAX_HASH_RANGE_READS - limits.hashRangeReads) {
-    throw new GitError("E2BIG", `add hashing exceeds ${ADD_MAX_HASH_RANGE_READS} range reads`);
-  }
-  limits.hashRangeReads += rangeReads;
   const hashes = hashWorktreePaths(repo, worktree, unresolved);
   repo.store.upsertBlobIds(
     [...hashes.values()].flatMap((hashed) => {
@@ -1264,8 +1224,6 @@ const RM_MAX_PATHSPECS = 10_000;
 const RM_MAX_PATH_BYTES = 2_200;
 const RM_MAX_HASH_CANDIDATES = 10_000;
 const RM_MAX_HASH_BYTES = 32 * 1024 * 1024;
-const RM_MAX_HASH_RANGE_READS = 64;
-const RM_MAX_HASH_BATCHES = 16;
 const RM_CANDIDATE_FIXED_BYTES = 320;
 const RM_DIRECTORY_FIXED_BYTES = 96;
 const RM_SPEC_FIXED_BYTES = 192;
@@ -1419,8 +1377,6 @@ function* rmIndexPaths(
 function identifyRmWorktree(repo: Repository, worktree: Worktree, candidates: RmCandidate[]): void {
   let hashCandidates = 0;
   let hashBytes = 0;
-  let hashRangeReads = 0;
-  let hashBatches = 0;
 
   for (let offset = 0; offset < candidates.length; offset += RM_WINDOW_ROWS) {
     const batch = candidates.slice(offset, offset + RM_WINDOW_ROWS);
@@ -1448,16 +1404,9 @@ function identifyRmWorktree(repo: Repository, worktree: Worktree, candidates: Rm
     const authoritative = pending.flatMap((candidate) =>
       candidate.worktree === undefined ? [] : [candidate.worktree],
     );
-    hashBatches++;
     hashCandidates += authoritative.length;
-    hashRangeReads += worktreeHashRangeReads(authoritative);
     for (const candidate of authoritative) hashBytes += candidate.stat.size;
-    if (
-      hashBatches > RM_MAX_HASH_BATCHES ||
-      hashCandidates > RM_MAX_HASH_CANDIDATES ||
-      hashBytes > RM_MAX_HASH_BYTES ||
-      hashRangeReads > RM_MAX_HASH_RANGE_READS
-    ) {
+    if (hashCandidates > RM_MAX_HASH_CANDIDATES || hashBytes > RM_MAX_HASH_BYTES) {
       throw new GitError("E2BIG", "rm working-tree safety proof exceeds its structural limit");
     }
     const hashes = hashExactWorktreePaths(repo, worktree, authoritative, { write: false });
@@ -1786,31 +1735,16 @@ export function lsFilesWithWorktree(
       : pathspec.collect([]);
   }
   const excludeRoots = lsFilesExcludeRoots(repo.root, Reflect.get(options, "excludeRoots"));
-  const pathspec = compileReadPathspec(
-    lsFilesPathspecOptions(options),
-    MAX_LS_FILES_COMBINED_PATTERNS,
-  );
-  if (
-    pathspec.scanPrefixes !== null &&
-    pathspec.scanPrefixes.length > MAX_LS_FILES_COMBINED_SCAN_PREFIXES
-  ) {
-    throw new GitError(
-      "E2BIG",
-      `ls-files compiled scan prefixes exceeds ${MAX_LS_FILES_COMBINED_SCAN_PREFIXES}`,
-    );
-  }
+  const pathspec = compileReadPathspec(lsFilesPathspecOptions(options));
   const ignores = selection.excludeStandard
     ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
     : undefined;
-  const index = uniqueBoundedIndexPaths(repo, pathspec.scanPrefixes, pathspec.maxScanRows);
+  const index = uniqueIndexPaths(repo, pathspec.scanPrefixes);
   const walked = walkWorktreeEntriesStream(worktree, repo.root, {
     excludeRoots,
     ignores,
-    maxScanRows: pathspec.maxScanRows,
   });
-  return pathspec.collect(
-    selectedLsFilesPaths(index, walked, selection.cached, pathspec.maxScanRows),
-  );
+  return pathspec.collect(selectedLsFilesPaths(index, walked, selection.cached));
 }
 
 function lsFilesPathspecOptions(options: LsFilesWorktreeOptions): LsFilesOptions {
@@ -1889,18 +1823,12 @@ function lsFilesExcludeRoots(root: string, paths: unknown): string[] {
   return coalesced;
 }
 
-function* uniqueBoundedIndexPaths(
+function* uniqueIndexPaths(
   repo: Repository,
   prefixes: readonly string[] | null,
-  maxRows: number,
 ): Generator<string> {
-  let rows = 0;
   let previous: string | undefined;
   for (const path of indexPaths(repo, prefixes)) {
-    rows++;
-    if (rows > maxRows) {
-      throw new GitError("E2BIG", `ls-files index scan exceeds ${maxRows} rows`);
-    }
     if (path === previous) continue;
     previous = path;
     yield path;
@@ -1911,17 +1839,11 @@ function* selectedLsFilesPaths(
   index: Iterable<string>,
   worktree: Iterable<WorktreePath>,
   cached: boolean,
-  maxRows: number,
 ): Generator<string> {
-  let rows = 0;
   for (const row of joinSorted(index, worktree, {
     left: (path) => path,
     right: (entry) => entry.path,
   })) {
-    rows++;
-    if (rows > maxRows) {
-      throw new GitError("E2BIG", `ls-files merged scan exceeds ${maxRows} rows`);
-    }
     if (row.left !== undefined) {
       if (cached) yield row.path;
     } else if (row.right !== undefined) {

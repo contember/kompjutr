@@ -2,25 +2,19 @@
 // and the ref HEAD points at moves to it.
 
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
-import { MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, hasErrorCode, MissingIdentityError } from "../errors.js";
 import { type Commit, hashObject, type Person, serializeCommit } from "../objects.js";
 import type { Repository, ResolvedHead } from "../repository.js";
 import type { CommitResult } from "./kinds.js";
-import { MAX_MERGE_IDENTITY_BYTES, MAX_MERGE_MESSAGE_BYTES } from "./merge-state.js";
 import { committerRefLogMetadata, type RefLogReason } from "./ref-log.js";
 import {
   buildTreeInBatch,
   planSparseTreeBuild,
   type SparseTreeBuildPlan,
-  type TreeBuildPreflightStats,
   writeSparseTreePlanInBatch,
 } from "./tree-build.js";
 
-const OBJECT_BATCH_BYTES = 1024 * 1024;
-const OBJECT_BATCH_COUNT = 4_096;
-const TREE_INDEX_ROWS = 2_048;
 const EMPTY_TREE_OID = hashObject("tree", new Uint8Array());
 
 /** Native commit options; Computer-compatible fields plus explicit empty-commit policy. */
@@ -61,33 +55,6 @@ export interface UnpublishedCommitResult {
 
 type CommitMessage = { mode: "clean"; value: string } | { mode: "exact"; value: string };
 type PublishedCommitContext = Pick<GitContext, "commitTrees" | "indexTracker">;
-
-/** Conservatively account for one bounded index-tree and commit materialization. */
-export function commitMaterializationSqlStatements(stats: TreeBuildPreflightStats): number {
-  const objects = stats.treeObjects + 1;
-  const payloadBytes =
-    stats.serializedTreeBytes +
-    stats.treeObjects * 1_024 +
-    MAX_MERGE_MESSAGE_BYTES +
-    4 * MAX_MERGE_IDENTITY_BYTES +
-    1_024;
-  const payloadPages = Math.max(1, Math.ceil(payloadBytes / OBJECT_BATCH_BYTES));
-  const flushes = Math.ceil(objects / OBJECT_BATCH_COUNT) + payloadPages;
-  const indexedRows = stats.leafEntries + stats.treeObjects - 1;
-  return (
-    20 +
-    flushes * 6 +
-    payloadPages * 2 +
-    Math.ceil(indexedRows / TREE_INDEX_ROWS) * 2 +
-    Math.ceil(stats.treeObjects / TREE_INDEX_ROWS) * 2 +
-    Math.ceil(stats.leafEntries / 2_048)
-  );
-}
-
-/** Materialization plus the atomic single-ref/causal-HEAD publication seam. */
-export function commitPublicationSqlStatements(stats: TreeBuildPreflightStats): number {
-  return commitMaterializationSqlStatements(stats) + MAX_SINGLE_REF_MUTATION_SQL_STATEMENTS;
-}
 
 export function commit(
   context: GitContext,

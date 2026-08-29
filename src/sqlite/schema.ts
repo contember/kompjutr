@@ -1,7 +1,7 @@
 // The whole Git store and its checkouts live in these tables. Shared rows use
 // `repo_id`; worktree-private rows use `checkout_id`.
 
-import { CorruptError, GitError } from "../core/errors.js";
+import { CorruptError } from "../core/errors.js";
 import {
   BLOB_ID_GENERATION_EXHAUSTED,
   MAX_BLOB_ID_CACHE_ROWS,
@@ -1025,50 +1025,6 @@ if (maxSchemaObjectRetainedBytes >= MAX_SCHEMA_OBJECT_RETAINED_BYTES) {
   throw new Error("git schema definitions exceed their retained-memory bound");
 }
 
-const MAX_SCHEMA_INITIALIZATION_STATEMENTS = 999;
-
-class SchemaDatabase implements SqlDatabase {
-  #statements = 0;
-
-  constructor(private readonly inner: SqlDatabase) {}
-
-  #count(): void {
-    this.#statements++;
-    if (this.#statements > MAX_SCHEMA_INITIALIZATION_STATEMENTS) {
-      throw new GitError("E2BIG", "git schema initialization exceeds the 1,000-statement limit");
-    }
-  }
-
-  run(query: string, ...bindings: unknown[]): void {
-    this.#count();
-    this.inner.run(query, ...bindings);
-  }
-
-  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
-    this.#count();
-    return this.inner.all<Row>(query, ...bindings);
-  }
-
-  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
-    this.#count();
-    return this.inner.one<Row>(query, ...bindings);
-  }
-
-  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
-    this.#count();
-    return this.inner.scalar<T>(query, ...bindings);
-  }
-
-  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    this.#count();
-    return this.inner.iterate(query, ...bindings);
-  }
-
-  transactionSync<T>(closure: () => T): T {
-    return this.inner.transactionSync(closure);
-  }
-}
-
 function readSchemaObjects(db: SqlDatabase): Map<string, ExpectedSchemaObject> {
   const objects = new Map<string, ExpectedSchemaObject>();
   let retainedBytes = 0;
@@ -1196,29 +1152,28 @@ function requireCurrentVersion(db: SqlDatabase): void {
 
 export function initializeGitSchema(db: SqlDatabase): void {
   db.transactionSync(() => {
-    const bounded = new SchemaDatabase(db);
-    const before = readSchemaObjects(bounded);
+    const before = readSchemaObjects(db);
     if (before.size !== 0) {
       if (!before.has("git_meta")) {
         throw new CorruptError("git schema metadata is missing from an existing database");
       }
       requireCurrentSchemaObject(before, "git_meta");
-      requireCurrentVersion(bounded);
+      requireCurrentVersion(db);
       requireCurrentSchema(before);
       return;
     }
 
-    for (const statement of STATEMENTS) bounded.run(statement);
-    bounded.run(
+    for (const statement of STATEMENTS) db.run(statement);
+    db.run(
       `INSERT OR IGNORE INTO git_identity_control
          (singleton, last_repo_id, last_checkout_id, last_clone_generation)
        VALUES (1, 0, 0, 0)`,
     );
-    bounded.run(
+    db.run(
       "INSERT INTO git_meta (key, value) VALUES ('schema_version', ?)",
       String(SCHEMA_VERSION),
     );
-    requireCurrentSchema(readSchemaObjects(bounded));
-    requireCurrentVersion(bounded);
+    requireCurrentSchema(readSchemaObjects(db));
+    requireCurrentVersion(db);
   });
 }

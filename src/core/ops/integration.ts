@@ -27,22 +27,6 @@ export const MAX_INTEGRATION_SOURCE_ROWS = 200_000;
 export const MAX_INTEGRATION_PLAN_ENTRIES = 1_000;
 export const MAX_INTEGRATION_STRUCTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_INTEGRATION_PLAN_BYTES = 32 * 1024 * 1024;
-export const MAX_INTEGRATION_BLOB_READ_CALLS = 16;
-export const MAX_INTEGRATION_TREE_STATEMENTS = 6;
-export const MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ = 8;
-export const MAX_INTEGRATION_SQL_STATEMENTS =
-  MAX_INTEGRATION_TREE_STATEMENTS +
-  MAX_INTEGRATION_BLOB_READ_CALLS * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
-if (MAX_INTEGRATION_SQL_STATEMENTS >= 1_000) {
-  throw new Error("integration SQL model exceeds the operation statement limit");
-}
-export const MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS = 10;
-export const MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS =
-  MAX_VIRTUAL_ANCESTOR_TREE_STATEMENTS +
-  MAX_INTEGRATION_BLOB_READ_CALLS * MAX_INTEGRATION_STATEMENTS_PER_BLOB_READ;
-if (MAX_VIRTUAL_ANCESTOR_SQL_STATEMENTS >= 1_000) {
-  throw new Error("virtual-ancestor integration SQL model exceeds the operation statement limit");
-}
 
 const FIXED_CALLER_BYTES = 16 * 1024;
 const STRUCTURAL_ENTRY_BYTES = 768;
@@ -81,7 +65,6 @@ export interface IntegrationPlan {
   /** A Git-path-ordered delta relative to the current tree. */
   entries: readonly IntegrationEntry[];
   sourceRows: number;
-  blobReadCalls: number;
   /** Conservative bytes the caller must reserve while retaining this plan. */
   retainedBytes: number;
   memoryHighWaterBytes: number;
@@ -92,7 +75,6 @@ export interface IntegrationLimits {
   maxEntries?: number;
   maxStructureBytes?: number;
   maxPlanBytes?: number;
-  maxBlobReadCalls?: number;
 }
 
 export interface IntegrationInput {
@@ -388,7 +370,6 @@ interface ResolvedIntegrationLimits {
   maxEntries: number;
   maxStructureBytes: number;
   maxPlanBytes: number;
-  maxBlobReadCalls: number;
 }
 
 function boundedLimit(value: number | undefined, ceiling: number, label: string): number {
@@ -409,11 +390,6 @@ function resolveLimits(limits: IntegrationLimits | undefined): ResolvedIntegrati
       "structure byte",
     ),
     maxPlanBytes: boundedLimit(limits?.maxPlanBytes, MAX_INTEGRATION_PLAN_BYTES, "plan byte"),
-    maxBlobReadCalls: boundedLimit(
-      limits?.maxBlobReadCalls,
-      MAX_INTEGRATION_BLOB_READ_CALLS,
-      "blob read call",
-    ),
   };
 }
 
@@ -910,7 +886,6 @@ function planIntegrationInternal(
     let resolvedBytes = 0;
     let remaining = requestedOids;
     let nextCandidate = 0;
-    let blobReadCalls = 0;
     reservation.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
     while (nextCandidate < candidates.length) {
       const candidate = candidates[nextCandidate]!;
@@ -918,12 +893,6 @@ function planIntegrationInternal(
       if (!ready) {
         if (remaining.length === 0) {
           throw new CorruptError("integration blob batches ended before all candidates resolved");
-        }
-        if (blobReadCalls >= limits.maxBlobReadCalls) {
-          throw new GitError(
-            "E2BIG",
-            `integration exceeds ${limits.maxBlobReadCalls} blob read calls`,
-          );
         }
         const beforeRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
         requireCallerHeadroom(checkedAdd(externalBytes, beforeRead, "caller state"));
@@ -936,7 +905,6 @@ function planIntegrationInternal(
         const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, available);
         reservation.set("other", exclusiveBytes);
         const batch = repo.readBlobs(remaining, { budgetBytes });
-        blobReadCalls++;
         validateBlobBatch(remaining, batch.blobs, batch.remaining, batch.bytes);
         for (const [oid, data] of batch.blobs) loaded.set(oid, data);
         remaining = batch.remaining;
@@ -1008,7 +976,6 @@ function planIntegrationInternal(
     return {
       entries,
       sourceRows: structure.sourceRows,
-      blobReadCalls,
       retainedBytes: finalPeak,
       memoryHighWaterBytes: reservation.highWaterBytes,
     };

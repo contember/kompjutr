@@ -24,9 +24,6 @@ const DEFAULT_PAGE_ROWS = 1_000;
 const MAX_PAGE_ROWS = 1_000;
 const MAX_PAGE_BYTES = 1024 * 1024;
 const MAX_PATH_BYTES = 2_200;
-// Thirty-two full pages leave ample room under the 1,000-statement operation gate.
-const MAX_DIRTY_ROWS = 32_000;
-const MAX_ITERATE_PAGES = 512;
 
 function invalidPathSql(path: string): string {
   return `typeof(${path}) <> 'text'
@@ -458,13 +455,7 @@ function* dirtyRows(
   pageRows: number,
 ): Generator<IndexTrackerDirty> {
   let after: string | null = null;
-  let totalRows = 0;
-  let pages = 0;
   for (;;) {
-    if (pages === MAX_ITERATE_PAGES) {
-      throw new CorruptError("index tracker dirty rows exceed the page limit");
-    }
-    pages++;
     let rows = 0;
     let hasMore = false;
     for (const row of db.iterate(
@@ -504,12 +495,8 @@ function* dirtyRows(
         hasMore = true;
         break;
       }
-      if (totalRows === MAX_DIRTY_ROWS) {
-        throw new CorruptError("index tracker has too many dirty rows");
-      }
       after = entry.path;
       rows++;
-      totalRows++;
       yield entry;
     }
     if (!hasMore) return;
@@ -650,11 +637,7 @@ export function resealIndexTracker(
     db.run("DELETE FROM git_index_dirty WHERE checkout_id = ?", checkoutId);
     let page: IndexTrackerDirty[] = [];
     let pageBytes = 2;
-    let totalRows = 0;
     for (const entry of entries) {
-      if (totalRows === MAX_DIRTY_ROWS) {
-        throw new CorruptError("index tracker has too many dirty rows");
-      }
       validateDirty(entry);
       const bytes = encodedEntryBytes(entry);
       if (bytes + 2 > MAX_PAGE_BYTES) throw new CorruptError("index tracker entry is too large");
@@ -668,7 +651,6 @@ export function resealIndexTracker(
       }
       page.push({ path: entry.path, flags: entry.flags });
       pageBytes += bytes + (page.length === 1 ? 0 : 1);
-      totalRows++;
     }
     if (page.length !== 0) insertPage(db, checkoutId, page);
     db.run(
