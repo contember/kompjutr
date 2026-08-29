@@ -31,7 +31,10 @@ import {
 /** The DO SQLite ceiling on a GLOB/LIKE pattern. */
 export const GLOB_PATTERN_MAX_BYTES = 50;
 export const DISCOVERY_PAGE_MAX = 1_000;
-export const DISCOVERY_EXCLUDE_ROOTS_MAX = 64;
+export const DISCOVERY_EXCLUDE_ROOTS_MAX = 1_024;
+export const DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX = 8_192;
+/** 1,024 roots at six JSON bytes per 4,096-code-unit path, rounded up. */
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES = 25 * 1024 * 1024;
 const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
 
 const PERMISSION_BITS = 0o7777;
@@ -135,6 +138,31 @@ const DISCOVER_FILES_PREFIX = `WITH candidates AS MATERIALIZED (
           AND fs_paths.path GLOB ?
           AND fs_nodes.type = 'file'`;
 
+const DISCOVER_FILES_EXCLUDED_PREFIX = `WITH excluded(path) AS MATERIALIZED (
+       SELECT value FROM json_each(?)
+     ),
+candidates AS MATERIALIZED (
+       SELECT fs_paths.path AS path,
+              fs_paths.inode AS inode,
+              fs_nodes.size AS size,
+              fs_nodes.rev AS rev
+         FROM fs_paths
+         JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode
+        WHERE fs_paths.path > ? AND fs_paths.path < ?
+          AND fs_paths.path GLOB ?
+          AND fs_nodes.type = 'file'
+          AND NOT EXISTS (
+                SELECT 1 FROM excluded
+                 WHERE fs_paths.path >= CASE
+                         WHEN excluded.path = '/' THEN '/'
+                         ELSE excluded.path || '/'
+                       END
+                   AND fs_paths.path < CASE
+                         WHEN excluded.path = '/' THEN '0'
+                         ELSE excluded.path || '0'
+                       END
+              )`;
+
 const DISCOVER_FILES_SUFFIX = `
         ORDER BY fs_paths.path
         LIMIT ?
@@ -166,20 +194,15 @@ SELECT candidates.path AS path,
  GROUP BY candidates.path, candidates.inode, candidates.size, candidates.rev
  ORDER BY candidates.path`;
 
-function discoverFilesSql(excludeRoots: number): string {
-  let excluded = "";
-  for (let index = 0; index < excludeRoots; index++) {
-    excluded += "\n          AND NOT (fs_paths.path >= ? AND fs_paths.path < ?)";
-  }
-  return `${DISCOVER_FILES_PREFIX}${excluded}${DISCOVER_FILES_SUFFIX}`;
-}
+const DISCOVER_FILES_SQL = `${DISCOVER_FILES_PREFIX}${DISCOVER_FILES_SUFFIX}`;
+const DISCOVER_FILES_EXCLUDED_SQL = `${DISCOVER_FILES_EXCLUDED_PREFIX}${DISCOVER_FILES_SUFFIX}`;
 
 export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): string[] {
   if (input === undefined) return [];
   if (!Array.isArray(input)) throw new Error("discoverFiles: excludeRoots must be an array");
-  if (input.length > DISCOVERY_EXCLUDE_ROOTS_MAX) {
+  if (input.length > DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX) {
     throw new Error(
-      `discoverFiles: at most ${DISCOVERY_EXCLUDE_ROOTS_MAX} excluded roots may be supplied`,
+      `discoverFiles: at most ${DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX} excluded root inputs may be supplied`,
     );
   }
   const prefix = root === "/" ? "/" : `${root}/`;
@@ -205,7 +228,22 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
     if (parent !== undefined && (path === parent || path.startsWith(`${parent}/`))) continue;
     coalesced.push(path);
   }
+  if (coalesced.length > DISCOVERY_EXCLUDE_ROOTS_MAX) {
+    throw new Error(
+      `discoverFiles: at most ${DISCOVERY_EXCLUDE_ROOTS_MAX} effective excluded roots may be supplied`,
+    );
+  }
   return coalesced;
+}
+
+function discoveryExcludeRootsJson(excludeRoots: readonly string[]): string {
+  const json = JSON.stringify(excludeRoots);
+  if (ENCODER.encode(json).byteLength > DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES) {
+    throw new Error(
+      `discoverFiles: excluded roots exceed ${DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES} JSON bytes`,
+    );
+  }
+  return json;
 }
 
 interface ScanRow {
@@ -438,20 +476,13 @@ export function discoverFiles(
   const after =
     options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
   const excludeRoots = validateDiscoveryExcludeRoots(root, options.excludeRoots);
-  const excludeBindings: string[] = [];
-  for (const excluded of excludeRoots) {
-    excludeBindings.push(excluded === "/" ? "/" : `${excluded}/`, subtreeSuccessor(excluded));
-  }
+  const bindings: unknown[] = [];
+  if (excludeRoots.length > 0) bindings.push(discoveryExcludeRootsJson(excludeRoots));
+  bindings.push(after, upper, pattern, limit + 1, CHUNK_SIZE, CHUNK_SIZE);
   const found = db
     .all<FileHandleRow>(
-      discoverFilesSql(excludeRoots.length),
-      after,
-      upper,
-      pattern,
-      ...excludeBindings,
-      limit + 1,
-      CHUNK_SIZE,
-      CHUNK_SIZE,
+      excludeRoots.length === 0 ? DISCOVER_FILES_SQL : DISCOVER_FILES_EXCLUDED_SQL,
+      ...bindings,
     )
     .map(validateFileHandle);
   const handles = found.slice(0, limit);

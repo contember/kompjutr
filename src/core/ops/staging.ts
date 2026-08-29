@@ -5,6 +5,7 @@
 // tracked-file count is the single `SELECT` over `git_index` — everything
 // after that is bounded by what actually changed.
 
+import { MAX_CHECKOUT_ROOT_BYTES, MAX_CHECKOUTS_PER_REPOSITORY } from "../../sqlite/schema.js";
 import {
   contentIdKey,
   type IndexEntry,
@@ -98,7 +99,11 @@ export const MAX_LS_FILES_COMBINED_SQL_STATEMENTS =
   MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS +
   MAX_LS_FILES_COMBINED_IGNORE_STATEMENTS +
   MAX_LS_FILES_COMBINED_FIXED_STATEMENTS;
-const MAX_LS_FILES_EXCLUDE_ROOTS = 64;
+export const MAX_LS_FILES_EXCLUDE_ROOTS = MAX_CHECKOUTS_PER_REPOSITORY;
+export const MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES =
+  MAX_LS_FILES_EXCLUDE_ROOTS * MAX_CHECKOUT_ROOT_BYTES;
+const MAX_LS_FILES_EXCLUDE_ROOT_INPUTS = 8_192;
+const LS_FILES_EXCLUDE_ROOT_ENCODER = new TextEncoder();
 
 if (MAX_LS_FILES_CACHED_SQL_STATEMENTS !== 903) {
   throw new Error("cached ls-files SQL bound changed");
@@ -1836,8 +1841,11 @@ function optionalLsFilesBoolean(
 function lsFilesExcludeRoots(root: string, paths: unknown): string[] {
   if (paths === undefined) return [];
   if (!Array.isArray(paths)) throw new GitError("EINVAL", "ls-files excludeRoots must be an array");
-  if (paths.length > MAX_LS_FILES_EXCLUDE_ROOTS) {
-    throw new GitError("E2BIG", `ls-files exclude roots exceeds ${MAX_LS_FILES_EXCLUDE_ROOTS}`);
+  if (paths.length > MAX_LS_FILES_EXCLUDE_ROOT_INPUTS) {
+    throw new GitError(
+      "E2BIG",
+      `ls-files exclude root inputs exceed ${MAX_LS_FILES_EXCLUDE_ROOT_INPUTS}`,
+    );
   }
   const roots: string[] = [];
   for (let index = 0; index < paths.length; index++) {
@@ -1849,6 +1857,7 @@ function lsFilesExcludeRoots(root: string, paths: unknown): string[] {
     if (
       !path.startsWith("/") ||
       normalizePath(path) !== path ||
+      LS_FILES_EXCLUDE_ROOT_ENCODER.encode(path).byteLength > MAX_CHECKOUT_ROOT_BYTES ||
       relative === null ||
       relative === ""
     ) {
@@ -1856,7 +1865,25 @@ function lsFilesExcludeRoots(root: string, paths: unknown): string[] {
     }
     roots.push(path);
   }
-  return roots;
+  roots.sort(comparePaths);
+  const coalesced: string[] = [];
+  let retainedBytes = 0;
+  for (const path of roots) {
+    const parent = coalesced[coalesced.length - 1];
+    if (parent !== undefined && (path === parent || path.startsWith(`${parent}/`))) continue;
+    coalesced.push(path);
+    retainedBytes += LS_FILES_EXCLUDE_ROOT_ENCODER.encode(path).byteLength;
+  }
+  if (coalesced.length > MAX_LS_FILES_EXCLUDE_ROOTS) {
+    throw new GitError("E2BIG", `ls-files exclude roots exceeds ${MAX_LS_FILES_EXCLUDE_ROOTS}`);
+  }
+  if (retainedBytes > MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES) {
+    throw new GitError(
+      "E2BIG",
+      `ls-files exclude roots exceed ${MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES} UTF-8 bytes`,
+    );
+  }
+  return coalesced;
 }
 
 function* uniqueBoundedIndexPaths(

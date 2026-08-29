@@ -22,6 +22,8 @@ import {
   MAX_LS_FILES_COMBINED_INDEX_STATEMENTS,
   MAX_LS_FILES_COMBINED_SQL_STATEMENTS,
   MAX_LS_FILES_COMBINED_WORKTREE_STATEMENTS,
+  MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES,
+  MAX_LS_FILES_EXCLUDE_ROOTS,
 } from "../src/core/ops/staging.js";
 import { WORKTREE_SCAN_PAGE } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -123,6 +125,8 @@ class StatementCountingWorktree extends CountingWorktree {
   scanStatements = 0;
   discoveryCalls = 0;
   discoveryStatements = 0;
+  discoverySourceRows = 0;
+  maxDiscoveryExcludeRoots = 0;
   handleReadCalls = 0;
   handleReadStatements = 0;
 
@@ -158,6 +162,11 @@ class StatementCountingWorktree extends CountingWorktree {
     const page = super.discoverFiles(root, pattern, options);
     this.discoveryCalls++;
     this.discoveryStatements += this.storage.statementCount - before;
+    this.discoverySourceRows += page.handles.length;
+    this.maxDiscoveryExcludeRoots = Math.max(
+      this.maxDiscoveryExcludeRoots,
+      options?.excludeRoots?.length ?? 0,
+    );
     return page;
   }
 
@@ -551,6 +560,56 @@ describe("ls-files selection", () => {
         excludeRoots: ["/nested"],
       }),
     ).toEqual(["kept.txt", "z/.gitignore", "z/visible.txt"]);
+  });
+
+  it("coalesces 65 redundant nested roots before applying the effective limit", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/kept.txt", "kept\n");
+    writeWorkFile(workspace, "/nested/.gitignore", "*.txt\n");
+    writeWorkFile(workspace, "/nested/hidden.txt", "hidden\n");
+    const measured = new StatementCountingWorktree(workspace.worktree, workspace.storage);
+
+    expect(
+      lsFilesWithWorktree(workspace.repo, measured, {
+        others: true,
+        excludeStandard: true,
+        excludeRoots: Array.from({ length: 65 }, () => "/nested"),
+      }),
+    ).toEqual(["kept.txt"]);
+    expect(measured.maxDiscoveryExcludeRoots).toBe(1);
+    expect(measured.discoverySourceRows).toBe(0);
+  });
+
+  it("prunes 65 sibling roots with one bounded ignore-discovery statement", () => {
+    const workspace = makeRepo("/");
+    const roots = Array.from(
+      { length: 65 },
+      (_, index) => `/nested-${index.toString().padStart(2, "0")}`,
+    );
+    for (const root of roots) {
+      writeWorkFile(workspace, `${root}/.gitignore`, "*.txt\n");
+      writeWorkFile(workspace, `${root}/hidden.txt`, "hidden\n");
+    }
+    writeWorkFile(workspace, "/kept.txt", "kept\n");
+    writeWorkFile(workspace, "/z/.gitignore", "*.log\n");
+    writeWorkFile(workspace, "/z/hidden.log", "hidden\n");
+    writeWorkFile(workspace, "/z/visible.txt", "visible\n");
+    const measured = new StatementCountingWorktree(workspace.worktree, workspace.storage);
+    workspace.storage.resetCounters();
+
+    expect(
+      lsFilesWithWorktree(workspace.repo, measured, {
+        others: true,
+        excludeStandard: true,
+        excludeRoots: roots,
+      }),
+    ).toEqual(["kept.txt", "z/.gitignore", "z/visible.txt"]);
+    expect(measured.maxDiscoveryExcludeRoots).toBe(65);
+    expect(measured.discoveryCalls).toBe(1);
+    expect(measured.discoveryStatements).toBe(1);
+    expect(measured.discoverySourceRows).toBe(1);
+    expect(MAX_LS_FILES_EXCLUDE_ROOTS).toBe(1_024);
+    expect(MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES).toBe(4 * 1024 * 1024);
   });
 
   it("validates selection combinations and enforces the combined pattern cap", () => {

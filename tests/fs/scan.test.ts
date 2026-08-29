@@ -13,7 +13,14 @@ import { comparePaths, subtreeSuccessor } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
 import { realpath } from "../../src/fs/store/resolve.js";
-import { discoverFiles, glob, globPage, listEntries, scan } from "../../src/fs/store/scan.js";
+import {
+  DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
+  discoverFiles,
+  glob,
+  globPage,
+  listEntries,
+  scan,
+} from "../../src/fs/store/scan.js";
 import { writeFiles } from "../../src/fs/store/write.js";
 import {
   type EntryType,
@@ -720,6 +727,40 @@ describe("discoverFiles", () => {
       expect(discoverFiles(db, root, "*/.gitignore").handles).toHaveLength(count);
       expect(db.storage.statementCount).toBe(1);
     }
+  });
+
+  it("passes 65 coalesced exclusion ranges through one bounded JSON binding", () => {
+    const db = open();
+    const roots = Array.from(
+      { length: 65 },
+      (_, index) => `/repo/nested-${index.toString().padStart(2, "0")}`,
+    );
+    writeFiles(db, [
+      ...roots.map((root) => ({
+        path: `${root}/.gitignore`,
+        bytes: new Uint8Array(0),
+      })),
+      { path: "/repo/z/.gitignore", bytes: new Uint8Array(0) },
+    ]);
+    const root = realpath(db, "/repo");
+    const recorder = new RecordingDatabase(db);
+
+    const page = discoverFiles(recorder, root, "*/.gitignore", { excludeRoots: roots });
+
+    expect(page.handles.map((handle) => handle.path)).toEqual(["/repo/z/.gitignore"]);
+    expect(recorder.queries).toHaveLength(1);
+    const issued = recorder.queries[0];
+    if (issued === undefined) throw new Error("discovery statement was not recorded");
+    expect(issued.query).toContain("json_each(?)");
+    expect(issued.bindings).toHaveLength(7);
+    const ranges = issued.bindings[0];
+    if (typeof ranges !== "string") throw new Error("exclusion ranges were not JSON text");
+    expect(db.scalar<number>("SELECT count(*) FROM json_each(?)", ranges)).toBe(65);
+    expect(new TextEncoder().encode(ranges).byteLength).toBeLessThanOrEqual(
+      DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
+    );
+    expect(recorder.maxResultRows).toBe(1);
+    expect(recorder.maxResultBytes).toBe(0);
   });
 
   it("materializes the bounded candidate page before touching chunks", () => {
