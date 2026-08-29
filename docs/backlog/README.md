@@ -102,7 +102,7 @@ issues; it stays filed and unscheduled until a caller appears.
 | **Phase 1 — a consumer can run** | | | | |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 1 | Budget targets and store split | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
+| 1 | [Budget targets and store split](../sprints/sprint-2026-08-29-budget-targets-and-store-split.md) **(active)** | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
 | **Phase 2 — production scale** | | | | |
 | 2 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
 | 3 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |

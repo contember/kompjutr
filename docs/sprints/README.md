@@ -20,4 +20,6 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-None.
+- [Budget targets and table-family store split](sprint-2026-08-29-budget-targets-and-store-split.md)
+  — remove projected SQL failure modes, review every byte limit from evidence,
+  and split the SQLite store behind its unchanged facade.

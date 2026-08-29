@@ -15,17 +15,20 @@ decisions → reference → archive.
 
 ## Active sprints
 
-None.
+- [`sprints/sprint-2026-08-29-budget-targets-and-store-split.md`](sprints/sprint-2026-08-29-budget-targets-and-store-split.md)
+  — measured statement targets, evidence-backed byte limits, and an internal
+  table-family split behind the unchanged SQLite store facade.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Active: rerun the real consumer adapter now that per-run stdin/env is served,
-  then re-plan from that integration result —
-  [`backlog/README.md`](backlog/README.md#consumer-demand).
-- The next local cleanup is the measured SQL targets, memory-limit inventory,
-  and store split in [backlog 60](backlog/60-budget-targets-and-store-split.md).
+- Active: remove projected SQL failure modes, review byte limits from evidence,
+  and split the SQLite store by table family —
+  [`sprint plan`](sprints/sprint-2026-08-29-budget-targets-and-store-split.md).
+- The external consumer adapter remains an integration gate outside this public
+  repository; its provider lacks the bulk worktree scan needed for an efficient
+  implementation without crossing private storage boundaries.
 
 ## Key reference
 
