@@ -16,10 +16,14 @@ import { realpath } from "../../src/fs/store/resolve.js";
 import {
   DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS,
   DISCOVERY_EXCLUDE_ROOTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES,
+  DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS,
   DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES,
   discoverFiles,
+  discoveryExcludeRootsJsonSegments,
   glob,
   globPage,
   listEntries,
@@ -757,15 +761,46 @@ describe("discoverFiles", () => {
     const issued = recorder.queries[0];
     if (issued === undefined) throw new Error("discovery statement was not recorded");
     expect(issued.query).toContain("json_each(?)");
-    expect(issued.bindings).toHaveLength(7);
-    const ranges = issued.bindings[0];
-    if (typeof ranges !== "string") throw new Error("exclusion ranges were not JSON text");
-    expect(db.scalar<number>("SELECT count(*) FROM json_each(?)", ranges)).toBe(65);
-    expect(new TextEncoder().encode(ranges).byteLength).toBeLessThanOrEqual(
-      DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
+    expect(issued.query.match(/json_each\(\?\)/g)).toHaveLength(
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS,
     );
+    expect(issued.bindings).toHaveLength(DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS);
+    let sourceRows = 0;
+    for (let index = 0; index < DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS; index++) {
+      const ranges = issued.bindings[index];
+      if (typeof ranges !== "string") throw new Error("exclusion ranges were not JSON text");
+      expect(new TextEncoder().encode(ranges).byteLength).toBeLessThanOrEqual(
+        DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+      );
+      sourceRows += db.scalar<number>("SELECT count(*) FROM json_each(?)", ranges) ?? 0;
+      if (index > 0) expect(ranges).toBe("[]");
+    }
+    expect(sourceRows).toBe(65);
     expect(recorder.maxResultRows).toBe(1);
     expect(recorder.maxResultBytes).toBe(0);
+  });
+
+  it("rolls the first JSON value over without exceeding one SQL binding", () => {
+    const path = `/repo/${"x".repeat(4_090)}`;
+    const item = JSON.stringify(path);
+    const itemBytes = new TextEncoder().encode(item).byteLength;
+    const exactItems = Math.floor(
+      (DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES - 1) / (itemBytes + 1),
+    );
+    const segments = discoveryExcludeRootsJsonSegments(
+      Array.from({ length: exactItems + 1 }, () => path),
+    );
+
+    expect(segments).toHaveLength(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS);
+    expect(new TextEncoder().encode(segments[0] ?? "").byteLength).toBeLessThanOrEqual(
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+    );
+    expect(new TextEncoder().encode(segments[1] ?? "").byteLength).toBeLessThanOrEqual(
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+    );
+    expect(segments[0]).not.toBe("[]");
+    expect(segments[1]).not.toBe("[]");
+    expect(segments.slice(2).every((segment) => segment === "[]")).toBe(true);
   });
 
   it("derives exact exclusion cardinality and memory bounds from global routing", () => {
@@ -791,8 +826,17 @@ describe("discoverFiles", () => {
     expect(DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX).toBe(8_193);
     expect(DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES).toBe(6 * 1024 * 1024);
     expect(DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES).toBe(
-      DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2,
+      DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 +
+        DISCOVERY_EXCLUDE_ROOTS_MAX * 3 +
+        2 +
+        DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS -
+        1,
     );
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES).toBe(1_500_000);
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS).toBe(26);
+    expect(DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS).toBe(32);
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES).toBeLessThan(2_000_000);
+    expect(DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS).toBeLessThan(100);
     expect(DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES).toBeLessThan(100 * 1024 * 1024);
 
     const exactBytes = Array.from({ length: 1_536 }, (_, index) => {

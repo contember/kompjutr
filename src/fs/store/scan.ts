@@ -35,21 +35,36 @@ export const DISCOVERY_PAGE_MAX = 1_000;
 export const DISCOVERY_EXCLUDE_ROOTS_MAX = MAX_ROUTING_CHECKOUTS;
 export const DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX = MAX_ROUTING_CHECKOUTS + 1;
 export const DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES = MAX_ROUTING_ROOTS_UTF8_BYTES;
+const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
+const DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES = DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX * 6 + 2;
 /** Every input byte can expand to a six-byte JSON escape, plus quotes and separators. */
-export const DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES =
+const DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES =
   DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2;
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES = 1_500_000;
+/** A completed segment can leave less than one maximum-sized item of slack. */
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS = Math.ceil(
+  DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES /
+    (DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES - DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES - 1),
+);
+/** Splitting replaces each inter-item comma with two array brackets. */
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES =
+  DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES + DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS - 1;
+export const DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS = DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS + 6;
 const DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES = 64;
 const DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES = 8;
 const DISCOVERY_EXCLUDE_STRING_FIXED_BYTES = 48;
 export const DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES =
   2 * DISCOVERY_EXCLUDE_ROOTS_UTF8_MAX_BYTES +
-  DISCOVERY_EXCLUDE_ROOTS_MAX * DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
-  DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
+  3 * DISCOVERY_EXCLUDE_ROOTS_MAX * DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS * DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
   2 * DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES +
   2 *
     (DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES +
-      DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX * DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES);
-const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
+      DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX * DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES) +
+  DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES +
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS * DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES +
+  DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
+  2 * DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES;
 
 const PERMISSION_BITS = 0o7777;
 
@@ -63,6 +78,12 @@ const ENCODER = new TextEncoder();
 
 if (DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES >= 100 * 1024 * 1024) {
   throw new Error("discovery excluded-root retained bound exceeds 100 MiB");
+}
+if (
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES >= 2_000_000 ||
+  DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS >= 100
+) {
+  throw new Error("discovery excluded-root SQL bindings exceed the platform limit");
 }
 
 function boundedUtf8Bytes(value: string, limit: number): number {
@@ -176,8 +197,13 @@ const DISCOVER_FILES_PREFIX = `WITH candidates AS MATERIALIZED (
           AND fs_paths.path GLOB ?
           AND fs_nodes.type = 'file'`;
 
+const DISCOVER_FILES_EXCLUDED_SOURCES = Array.from(
+  { length: DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS },
+  (_, index) => `${index === 0 ? "" : "       UNION ALL "}SELECT value FROM json_each(?)`,
+).join("\n");
+
 const DISCOVER_FILES_EXCLUDED_PREFIX = `WITH excluded(path) AS MATERIALIZED (
-       SELECT value FROM json_each(?)
+${DISCOVER_FILES_EXCLUDED_SOURCES}
      ),
 candidates AS MATERIALIZED (
        SELECT fs_paths.path AS path,
@@ -288,17 +314,40 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
   return coalesced;
 }
 
-function discoveryExcludeRootsJson(excludeRoots: readonly string[]): string {
-  const json = JSON.stringify(excludeRoots);
-  if (
-    boundedUtf8Bytes(json, DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES) >
-    DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES
-  ) {
-    throw new Error(
-      `discoverFiles: excluded roots exceed ${DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES} JSON bytes`,
-    );
+export function discoveryExcludeRootsJsonSegments(
+  excludeRoots: readonly string[],
+): readonly string[] {
+  const segments: string[] = [];
+  let segment = "[";
+  let segmentBytes = 1;
+  for (const path of excludeRoots) {
+    const item = JSON.stringify(path);
+    if (item === undefined) throw new Error("discoverFiles: excluded root is not JSON text");
+    const itemBytes = boundedUtf8Bytes(item, DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES);
+    if (itemBytes + 2 > DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES) {
+      throw new Error("discoverFiles: one excluded root exceeds the JSON segment bound");
+    }
+    const delimiter = segmentBytes === 1 ? "" : ",";
+    if (
+      segmentBytes + delimiter.length + itemBytes + 1 >
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES
+    ) {
+      segments.push(`${segment}]`);
+      if (segments.length >= DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS) {
+        throw new Error(
+          `discoverFiles: excluded roots exceed ${DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS} JSON segments`,
+        );
+      }
+      segment = `[${item}`;
+      segmentBytes = 1 + itemBytes;
+      continue;
+    }
+    segment += `${delimiter}${item}`;
+    segmentBytes += delimiter.length + itemBytes;
   }
-  return json;
+  segments.push(`${segment}]`);
+  while (segments.length < DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS) segments.push("[]");
+  return segments;
 }
 
 interface ScanRow {
@@ -532,7 +581,7 @@ export function discoverFiles(
     options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
   const excludeRoots = validateDiscoveryExcludeRoots(root, options.excludeRoots);
   const bindings: unknown[] = [];
-  if (excludeRoots.length > 0) bindings.push(discoveryExcludeRootsJson(excludeRoots));
+  if (excludeRoots.length > 0) bindings.push(...discoveryExcludeRootsJsonSegments(excludeRoots));
   bindings.push(after, upper, pattern, limit + 1, CHUNK_SIZE, CHUNK_SIZE);
   const found = db
     .all<FileHandleRow>(
