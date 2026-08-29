@@ -56,20 +56,25 @@ Caller stdin is one run-owned byte cursor. Each selected pipeline borrows the
 remaining cursor for its first stage; pipeline cleanup closes only that borrow.
 Bytes already consumed stay consumed, while an earlier command that does not
 read stdin leaves it for a later selected pipeline. The run closes the owned
-cursor exactly once on success, short-circuit, parse/execution failure, or
-early downstream termination. An explicit `< file` replaces stdin for that
-stage but does not consume or close the run-owned cursor, so a later selected
-pipeline may still read it. Pipeline stages after the first receive only the
-previous stage's output as before.
+cursor exactly once on success, short-circuit, execution failure, or early
+downstream termination. Parsing and planning deliberately happen first: a
+syntax error keeps today's result and precedence, creates no cursor, performs no
+input measurement or reservation, and invokes no command. An explicit `< file`
+replaces stdin for that stage but does not consume or close the run-owned cursor,
+so a later selected pipeline may still read it. Pipeline stages after the first
+receive only the previous stage's output as before.
 
 Caller stdin is limited to 1 MiB. String size is proven in UTF-8 before the
-encoded buffer is allocated. The encoded or supplied bytes are charged to the
-existing retained-memory budget for the lifetime of the run. The environment
-accepts at most 256 own enumerable entries and 1 MiB of cumulative UTF-8 key
-and value bytes. It is validated and copied to one frozen readonly snapshot
-before the first command. Exceeding a count, byte, or retained-memory bound
-returns the ordinary shell limit result before a command or filesystem call;
-it never truncates semantic input.
+encoded buffer is allocated. The environment accepts at most 256 own enumerable
+entries and 1 MiB of cumulative UTF-8 key and value bytes. After syntax is valid,
+both inputs are measured without encoded copies, their combined byte count is
+reserved once from the existing retained-memory budget, and only then are the
+stdin buffer and frozen own-property env snapshot allocated. The reservation
+lives until the outermost execution `finally`, is reflected in
+`peakRetainedBytes`, and is released on every result or exception. Exceeding a
+count, intrinsic byte, or combined retained-memory bound returns the ordinary
+shell limit result before input allocation, command, or filesystem work; it
+never truncates semantic input.
 
 Built-ins do not expand or otherwise read env. Injected commands receive the
 snapshot through `CommandContext.env`; it is `undefined` when the caller did not
@@ -86,17 +91,25 @@ inherit env and still receive no implicit stdin.
 - **Verify first.** Show that `shell.run("cat", { stdin: "value" })` is rejected
   by TypeScript today, while `cat < input` already produces the desired bytes.
 - **Scope.** Add the shared public run-options type and optional parameter;
-  validate/encode at most 1 MiB before execution; charge the resulting bytes to
-  retained memory; implement the single run-owned cursor plus non-owning
-  per-pipeline borrows; define redirect and AND/OR/list ownership exactly as
-  frozen above. Do not add commands or parser syntax.
+  after successful parsing, measure at most 1 MiB without allocating an encoded
+  copy; reserve the shared input lifetime before encoding; implement the single
+  run-owned cursor plus non-owning per-pipeline borrows; define redirect and
+  AND/OR/list ownership exactly as frozen above. Do not add commands or parser
+  syntax.
 - **Acceptance / witness.** String and binary stdin match `< file` byte for byte
   through `cat` and one pipeline; a command that does not read leaves input for
   a later selected pipeline; a consuming command leaves no replay; `< file`
-  overrides only its stage; skipped branches do not consume; exact 1 MiB input
-  succeeds and the first byte above it fails before any filesystem operation;
-  small configured retained memory also fails without a leak. Runs without
-  options retain their current result and operation count. Run
+  overrides only its stage; skipped branches do not consume. A close-count probe
+  covers ordinary success, command-not-found followed by `||`, injected-command
+  throw, early downstream return, explicit redirect, and repeated borrow close;
+  the existing Git command's explicit `stdin.return()` also leaves owner bytes
+  available to a later selected pipeline. Borrow closure is idempotent and never
+  closes the run owner; owner/reservation cleanup is exactly once on every
+  execution exit. A syntax error proves that parsing wins and no owner or input
+  reservation exists. Exact 1 MiB input succeeds and the first byte above it
+  fails before allocation or filesystem work; stdin-only and combined-input
+  retained first-excess cases report the expected `peakRetainedBytes` and do not
+  leak. Runs without options retain their current result and operation count. Run
   `npx vitest run tests/shell/run-inputs.test.ts tests/shell/bounds.test.ts`.
 - **Touch points.** `src/shell/index.ts`, `src/shell/exec/execute.ts`,
   `tests/shell/run-inputs.test.ts`, `tests/shell/bounds.test.ts`.
@@ -108,16 +121,18 @@ inherit env and still receive no implicit stdin.
 - **Verify first.** Use one injected probe command and the Git runner spy to
   confirm neither can observe env at HEAD.
 - **Scope.** Validate at most 256 entries and 1 MiB of cumulative UTF-8 key/value
-  bytes without allocating encoded copies; freeze one own-property snapshot;
+  bytes without allocating encoded copies; combine those bytes with stdin in
+  the one pre-allocation retained reservation; freeze one own-property snapshot;
   add optional readonly env to `CommandContext`; inherit it through pipelines
   and nested invocation; forward it from `createGitCommand()` only when supplied.
   Built-ins and the parser remain env-blind.
 - **Acceptance / witness.** An injected command reads the exact snapshot; a
   mutation of the caller object during command execution cannot change it;
   nested invocation inherits it; absence remains `undefined`; exact entry and
-  byte boundaries pass and first excesses fail before command/filesystem work;
-  the Git runner receives the four identity values through the same object and
-  successfully commits with them. Run
+  byte boundaries pass and first excesses fail before snapshot allocation or
+  command/filesystem work. Env-only and combined stdin+env retained boundaries
+  prove `peakRetainedBytes` and cleanup; the Git runner receives the four
+  identity values through the same object and successfully commits with them. Run
   `npx vitest run tests/shell/run-inputs.test.ts tests/shell/git.test.ts`.
 - **Touch points.** `src/shell/exec/context.ts`, `src/shell/exec/execute.ts`,
   `src/git/shell.ts`, `tests/shell/run-inputs.test.ts`,
@@ -185,9 +200,17 @@ An independent reviewer checks the proposal against HEAD, including input
 ownership, bounds, witness strength, out-of-scope consumer contract clauses and
 the proportional review gates.
 
-- **Reviewer:** pending
-- **Verdict:** pending
-- **Material findings:** pending
+- **Reviewer:** Peirce (`review_shell_inputs_plan_fast`)
+- **Verdict:** blocked pending re-review
+- **Material findings:** The initial plan encoded stdin before its retained
+  reservation and did not charge env snapshot bytes, so caller input could
+  allocate outside a smaller configured memory ceiling. It also promised exact
+  closure without witnesses for syntax error, command failure, early return,
+  redirect and Git's explicit close. The corrected contract now parses before
+  any input owner exists, measures stdin and env without encoded copies,
+  reserves their combined lifetime before allocation, releases in the outermost
+  execution `finally`, and adds direct boundary/close-path witnesses. Independent
+  re-review is required before WU1 starts.
 
 ## Run log
 
@@ -195,4 +218,7 @@ the proportional review gates.
   checks against current kompjutr and reported 13 explicit skips. The complete
   shell port is absent because per-run stdin/env cannot cross the package seam;
   backlog 63 is therefore scheduled before the integration gate.
-
+- 2026-08-29 — Peirce blocked the initial plan on incomplete combined
+  retained-memory preflight and unobserved close paths. Both findings are
+  corrected in the frozen contract and witnesses; implementation remains
+  stopped pending re-review.
