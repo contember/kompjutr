@@ -43,8 +43,9 @@ not effort: a wrong answer outranks a missing one.
   config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
   concrete workload behind it. Textual `apply` is not filed because local
   snapshot replay serves the current workload.
-- **Not a parity gap.** [60](60-consolidate-limits-and-split-store.md) is
-  cleanup: no new behaviour, no new surface.
+- **Not a parity gap.** [60](60-budget-targets-and-store-split.md) is cleanup
+  plus one deliberate relaxation: no new surface, but calls that were refused
+  on a projected SQL statement count start succeeding.
   [62](62-sparse-status-rename-classification.md) is performance: a
   tracker-backed `status` still pays a whole-repository join for rename
   detection.
@@ -103,7 +104,7 @@ issues; it stays filed and unscheduled until a caller appears.
 | 1 | Agent shell git and builder file selection | [active sprint](../sprints/sprint-2026-08-28-agent-git-and-file-selection.md) | long | Package-side implementation is complete; closure and the external integration gate remain. |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 2 | Limits and store consolidation | [60](60-consolidate-limits-and-split-store.md) | long | Before Phase 2 adds a promisor state to every read path: derive per-operation limits from the two global budgets, split `store.ts` by table family, change no behaviour. |
+| 2 | Budget targets and store split | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
 | **Phase 2 — production scale** | | | | |
 | 3 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
 | 4 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
@@ -143,6 +144,6 @@ units over the same files, and a long sprint does not make that safe.
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
-- [60 — Consolidate operation limits and split the store](60-consolidate-limits-and-split-store.md)
+- [60 — Make the SQL budget a measured target and split the store](60-budget-targets-and-store-split.md)
 - [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
 - [63 — Accept caller-supplied stdin and env for a shell run](63-shell-run-stdin-and-env.md)

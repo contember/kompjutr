@@ -71,9 +71,15 @@ and `shell` never imports `git`.
 4. **Every SQL row is untrusted.** Validate numeric, text, BLOB, size, revision,
    and ordinal fields before use. Derived tree and commit rows validate against
    an authoritative loose object or a complete packed source.
-5. **Bound before allocating.** YOU MUST fail closed with a stable error when an
-   operation exceeds a structural limit — never truncate silently, never continue
-   unbounded. The budget is ≤1,000 SQL statements and <100 MiB per operation.
+5. **Bound the cost; do not manufacture the failure.** Write operations whose
+   cost stays bounded — no unbounded traversal, no per-row statement in a loop.
+   ≤1,000 SQL statements and <100 MiB per operation is a *target*, measured in
+   `bench/`. It is not a runtime barrier: a refusal that fires below the
+   platform's own limit only turns a call that would have worked into an error.
+   Fail closed on a structural limit that protects against a real failure, and
+   never truncate silently — but never refuse on a projected statement count.
+   Removing the existing ones is
+   [backlog 60](docs/backlog/60-budget-targets-and-store-split.md).
 
 ## Module context
 
