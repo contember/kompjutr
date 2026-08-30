@@ -208,4 +208,79 @@ describe("MemoryCoordinator", () => {
     firstCoordinator.assertIdle();
     secondCoordinator.assertIdle();
   });
+
+  it("transfers ownership across sibling and ancestor scopes without new admission", () => {
+    const coordinator = new MemoryCoordinator();
+    const root = coordinator.reserve();
+    const sourceParent = root.scope();
+    const source = sourceParent.scope();
+    const target = root.scope();
+    source.set("flat", MAX_OPERATION_MEMORY_BYTES);
+
+    source.transfer("flat", target, "other");
+    expect(coordinator.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(coordinator.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(root.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(sourceParent.currentBytes).toBe(0);
+    expect(source.currentBytes).toBe(0);
+    expect(target.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+
+    target.transfer("other", root, "metadata");
+    expect(root.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(target.currentBytes).toBe(0);
+    source.dispose();
+    sourceParent.dispose();
+    target.dispose();
+    root.dispose();
+    coordinator.assertIdle();
+  });
+
+  it("rejects cross-root transfer without mutating either reservation", () => {
+    const coordinator = new MemoryCoordinator();
+    const first = coordinator.reserve();
+    const second = coordinator.reserve();
+    first.set("flat", 10);
+    second.set("other", 20);
+
+    expect(() => first.transfer("flat", second, "other")).toThrow(/ownership tree/);
+    expect(first.currentBytes).toBe(10);
+    expect(second.currentBytes).toBe(20);
+    expect(coordinator.totalBytes).toBe(30);
+    first.dispose();
+    second.dispose();
+    coordinator.assertIdle();
+  });
+
+  it("publishes final-map components at the exact boundary without duplicate admission", () => {
+    const loosePayloadBytes = 3 * 1024 * 1024;
+    const packedPayloadBytes = 5 * 1024 * 1024;
+    const finalMapBytes = 512 + 2 * 256 + loosePayloadBytes;
+    const packedMapBytes = 512 + 256 + packedPayloadBytes;
+    const liveBytes = finalMapBytes + packedMapBytes;
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const root = coordinator.reserve();
+      const finalOutput = root.scope();
+      const packedOutput = root.scope();
+      root.set("other", MAX_OPERATION_MEMORY_BYTES - liveBytes + excess);
+      finalOutput.set("other", finalMapBytes);
+      if (excess === 0) {
+        packedOutput.set("flat", packedMapBytes);
+        expect(coordinator.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+        packedOutput.transfer("flat", finalOutput, "other");
+        expect(coordinator.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+        expect(packedOutput.currentBytes).toBe(0);
+        finalOutput.set("other", 512 + 2 * 256 + loosePayloadBytes + packedPayloadBytes);
+        expect(coordinator.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES - 512 - 256);
+      } else {
+        expect(() => packedOutput.set("flat", packedMapBytes)).toThrowError(
+          expect.objectContaining({ code: "E2BIG" }),
+        );
+      }
+      packedOutput.dispose();
+      finalOutput.dispose();
+      root.dispose();
+      coordinator.assertIdle();
+    }
+  });
 });

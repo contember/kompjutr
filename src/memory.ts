@@ -200,6 +200,57 @@ export class MemoryReservation {
     this.set(category, 0);
   }
 
+  /** Relabel one category within the same ownership tree without changing admission. */
+  transfer(
+    category: MemoryCategory,
+    target: MemoryReservation,
+    targetCategory: MemoryCategory = category,
+  ): void {
+    if (this.#resize === null || target.#resize === null) {
+      throw new Error("memory reservation is disposed");
+    }
+    if (this.#root() !== target.#root()) {
+      throw new Error("memory reservations do not share an ownership tree");
+    }
+    const bytes = this.#read(category);
+    if (bytes === 0 || (this === target && category === targetCategory)) return;
+    const targetBytes = target.#read(targetCategory);
+    if (bytes > Number.MAX_SAFE_INTEGER - targetBytes) throw memoryLimit();
+
+    this.#write(category, 0);
+    target.#write(targetCategory, targetBytes + bytes);
+    if (this === target) return;
+
+    const sourceAncestors = new Set<MemoryReservation>();
+    let current: MemoryReservation | null = this;
+    while (current !== null) {
+      sourceAncestors.add(current);
+      current = current.#parent;
+    }
+    let common: MemoryReservation | null = target;
+    while (common !== null && !sourceAncestors.has(common)) common = common.#parent;
+    if (common === null) throw new Error("memory reservation ownership tree is corrupt");
+
+    let sourceCurrent: MemoryReservation = this;
+    while (sourceCurrent !== common) {
+      sourceCurrent.#currentBytes -= bytes;
+      const parent = sourceCurrent.#parent;
+      if (parent === null) throw new Error("memory reservation ownership tree is corrupt");
+      sourceCurrent = parent;
+    }
+    let targetCurrent: MemoryReservation = target;
+    while (targetCurrent !== common) {
+      targetCurrent.#currentBytes += bytes;
+      targetCurrent.#highWaterBytes = Math.max(
+        targetCurrent.#highWaterBytes,
+        targetCurrent.#currentBytes,
+      );
+      const parent = targetCurrent.#parent;
+      if (parent === null) throw new Error("memory reservation ownership tree is corrupt");
+      targetCurrent = parent;
+    }
+  }
+
   assertEmpty(): void {
     if (this.#currentBytes !== 0) throw new Error("memory reservation still owns bytes");
   }
