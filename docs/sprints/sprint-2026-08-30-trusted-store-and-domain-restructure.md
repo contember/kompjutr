@@ -49,6 +49,10 @@ planning as `e6b9287` + `59d8438`.
 - ✔ Inline `unknown` option decoding and local path helpers are scattered
   through ops (`lsFilesExcludeRoots`, `staging.ts:2159`, and path-ish helpers
   in ~14 ops files).
+- ✔ Line-count baseline (2026-08-31, after `59d8438`): `src/` 96,781 total,
+  git side (`core` + `sqlite` + `git`) 80,621, `tests/` 102,939. The headline
+  sprint metric is the net deletion against these numbers with functionality
+  witnessed by the closure gate.
 
 ## Policy contract
 
@@ -235,7 +239,8 @@ planning as `e6b9287` + `59d8438`.
 - **Scope.** Rewrite `docs/reference/architecture.md`, root and module
   `CLAUDE.md` files, `docs/INDEX.md`; stamp OUTCOME and archive this sprint.
 - **Acceptance / witness.** Closure gate below green; docs lint clean;
-  INDEX/README indexes current.
+  INDEX/README indexes current; OUTCOME records the final `src/` and `tests/`
+  line counts against the baseline above and lists the removed public types.
 - **Touch points.** `docs/`, root `CLAUDE.md`, `src/**/CLAUDE.md`.
 
 ## Review strategy
