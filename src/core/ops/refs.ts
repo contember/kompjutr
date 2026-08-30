@@ -8,6 +8,7 @@ import {
   createRefMutationMemoryOwner,
   type IndexEntry,
   indexScanOwned,
+  listCheckoutsOwned,
   mutateRefsOwned,
   type RefMutationMemoryOwner,
 } from "../../sqlite/store.js";
@@ -176,14 +177,21 @@ function branchRenameOwned(
     }
 
     const sourceHead = symbolicRef(owner, source);
-    const checkoutOwner = context.database
-      .listCheckouts(repo.store.repoId)
-      .find((checkout) => checkout.head === sourceHead);
-    if (checkoutOwner !== undefined && checkoutOwner.id !== repo.checkout.checkoutId) {
-      throw new GitError(
-        "EBRANCHFAIL",
-        `cannot rename branch '${source.slice(HEADS.length)}': it is checked out at ${checkoutOwner.root}`,
-      );
+    const checkoutMemory = owner.scopeMemory();
+    try {
+      const checkoutOwner = listCheckoutsOwned(
+        context.database,
+        repo.store.repoId,
+        checkoutMemory,
+      ).find((checkout) => checkout.head === sourceHead);
+      if (checkoutOwner !== undefined && checkoutOwner.id !== repo.checkout.checkoutId) {
+        throw new GitError(
+          "EBRANCHFAIL",
+          `cannot rename branch '${source.slice(HEADS.length)}': it is checked out at ${checkoutOwner.root}`,
+        );
+      }
+    } finally {
+      checkoutMemory.dispose();
     }
 
     const sourceConfig = branchConfigPrefix(owner, source);
@@ -244,15 +252,22 @@ function branchDeleteOwned(
     }
     const tip = owner.retain(storedTip);
     repo.readCommit(tip);
-    const attachedHead = symbolicRef(owner, full);
-    const attachedCheckout = context.database
-      .listCheckouts(repo.store.repoId)
-      .find((checkout) => checkout.head === attachedHead);
-    if (attachedCheckout !== undefined) {
-      throw new GitError(
-        "EBRANCHFAIL",
-        `cannot delete branch '${options.name}': it is checked out at ${attachedCheckout.root}`,
-      );
+    const checkoutMemory = owner.scopeMemory();
+    try {
+      const attachedHead = symbolicRef(owner, full);
+      const attachedCheckout = listCheckoutsOwned(
+        context.database,
+        repo.store.repoId,
+        checkoutMemory,
+      ).find((checkout) => checkout.head === attachedHead);
+      if (attachedCheckout !== undefined) {
+        throw new GitError(
+          "EBRANCHFAIL",
+          `cannot delete branch '${options.name}': it is checked out at ${attachedCheckout.root}`,
+        );
+      }
+    } finally {
+      checkoutMemory.dispose();
     }
 
     if (options.force !== true) {
@@ -562,6 +577,10 @@ class RefOperationOwner {
 
   retain<T extends string>(value: T): T {
     return this.mutationOwner.owns(value) ? value : this.mutationOwner.retain(value);
+  }
+
+  scopeMemory(): MemoryReservation {
+    return this.mutationOwner.memoryReservation().scope();
   }
 
   dispose(): void {

@@ -10,6 +10,7 @@ import type { MemoryReservation } from "../../memory.js";
 import {
   type CheckoutStore,
   type FetchPublicationToken,
+  listCheckoutsOwned,
   MAX_BLOB_BATCH_BYTES,
 } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
@@ -56,15 +57,12 @@ const HAVE_BUDGET = 256;
 const TAG_OBJECT_PAGE = 4_096;
 const TAG_PEEL_HOPS = 16;
 const FETCH_OPTIONS_MEMORY_PART = "fetch-options";
-const FETCH_CHECKOUTS_MEMORY_PART = "fetch-checkouts";
 const FETCH_ROOT_AUTH_MEMORY_PART = "fetch-root-auth";
 const FETCH_ROOT_TYPES_MEMORY_PART = "fetch-root-types";
 const FETCH_TAG_AUTH_MEMORY_PART = "fetch-tag-auth";
 const FETCH_TARGETS_MEMORY_PART = "fetch-targets";
 const FETCH_OPTIONS_FIXED_BYTES = 192;
 const FETCH_HEADER_FIXED_BYTES = 64;
-const FETCH_CHECKOUT_FIXED_BYTES = 128;
-const FETCH_CHECKOUT_RETAINED_BYTES = 6 * 1024 * 1024;
 const FETCH_ROOT_TYPES_FIXED_BYTES = 192;
 const FETCH_ROOT_TYPE_ENTRY_BYTES = 96;
 const FETCH_TARGET_ENTRY_BYTES = 96;
@@ -827,22 +825,23 @@ function requireMappedBranchesAvailable(
     refs.filter((ref) => ref.destination.startsWith("refs/heads/")).map((ref) => ref.destination),
   );
   if (selected.size === 0) return;
-  budget.setMemory(FETCH_CHECKOUTS_MEMORY_PART, FETCH_CHECKOUT_RETAINED_BYTES);
-  const checkouts = context.database.listCheckouts(repo.store.repoId);
-  let retained = 192;
-  for (const checkout of checkouts) {
-    retained +=
-      FETCH_CHECKOUT_FIXED_BYTES +
-      retainedStringBytes(checkout.root) +
-      retainedStringBytes(checkout.head);
-    if (checkout.head.startsWith("ref: ") && selected.has(checkout.head.slice(5).trim())) {
-      throw new GitError(
-        "EBRANCHFAIL",
-        `cannot fetch into checked out branch ${checkout.head.slice(5).trim()}`,
-      );
+  const checkoutMemory = budget.scopeMemory();
+  try {
+    for (const checkout of listCheckoutsOwned(
+      context.database,
+      repo.store.repoId,
+      checkoutMemory,
+    )) {
+      if (checkout.head.startsWith("ref: ") && selected.has(checkout.head.slice(5).trim())) {
+        throw new GitError(
+          "EBRANCHFAIL",
+          `cannot fetch into checked out branch ${checkout.head.slice(5).trim()}`,
+        );
+      }
     }
+  } finally {
+    checkoutMemory.dispose();
   }
-  budget.setMemory(FETCH_CHECKOUTS_MEMORY_PART, retained);
 }
 
 function mappedTagTargets(
