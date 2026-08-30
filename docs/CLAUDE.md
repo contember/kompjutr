@@ -9,7 +9,7 @@ follow these rules.)
 
 When documents disagree, higher wins:
 
-1. `docs/invariants/` or hard rules in the root `CLAUDE.md` — binding.
+1. Hard rules in the root `CLAUDE.md` and the module `CLAUDE.md` files — binding.
 2. The active sprint plan in `sprints/` — the contract for current work.
 3. `decisions/` (ADR) — why the system is the way it is.
 4. `reference/` — how the system currently works.

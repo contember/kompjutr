@@ -30,7 +30,8 @@ Benchmarks have their own rules. Read `bench/CLAUDE.md` before running one.
 src/core/      Git engine: ops, object store, packs, protocol, diff, ignore
 src/fs/        The filesystem over Durable Object SQLite
 src/shell/     kompjutr/shell — bash-shaped commands compiled to queries
-src/sqlite/    Database adapter, schema, migrations
+src/sqlite/    The Git store: adapter, schema, objects, packs, caches, maintenance
+src/memory.ts  MemoryCoordinator: the shared per-operation byte owner
 src/runtime/   Workspace: composes db + filesystem + git
 src/git/       Git client facade over core/ops
 src/compat/    Migration adapter; the only entry allowed to import @cloudflare/computer
@@ -88,6 +89,7 @@ Read the file for a directory before changing code in it:
 - `src/core/CLAUDE.md` — op structure, merge-join cost model, packs, trust rules
 - `src/fs/CLAUDE.md` — POSIX semantics, handles and revalidation, the bulk API
 - `src/shell/CLAUDE.md` — a command is a query; parse → plan → execute
+- `src/sqlite/CLAUDE.md` — row ownership, pack storage, maintenance, trust rules
 - `tests/CLAUDE.md` — parity against real binaries, conformance against `node:fs`
 - `bench/CLAUDE.md` — measurement rules; a number measured wrong is worse than none
 
