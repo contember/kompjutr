@@ -30,4 +30,4 @@ Do not lower structural limits or introduce a projected-work refusal.
 `src/sqlite/packs.ts`, `src/sqlite/maintenance/reachability.ts`,
 `tests/pack.test.ts`, `tests/maintenance-reachability.test.ts`.
 
-<!-- Origin: ../sprints/sprint-2026-08-29-budget-targets-and-store-split.md WU6g -->
+<!-- Origin: ../archive/sprint-2026-08-29-budget-targets-and-store-split.md WU6g -->

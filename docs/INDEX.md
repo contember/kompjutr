@@ -16,23 +16,27 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-29-budget-targets-and-store-split.md`](sprints/sprint-2026-08-29-budget-targets-and-store-split.md)
-  — measured statement targets, evidence-backed byte limits, and an internal
-  table-family split behind the unchanged SQLite store facade.
+- [`sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md)
+  — trusted stored rows (ADR-0018), no memory ledger (ADR-0017), domain layout
+  with bottom-up layers (ADR-0019), shared guard/path kits, and the finished
+  store split; tests are the only gate.
 
 ## Specs
 
+- [`specs/trusted-domain-architecture.md`](specs/trusted-domain-architecture.md)
+  — the authoritative target architecture for the active restructure sprint.
 - [`specs/budget-targets-evidence-ledger.md`](specs/budget-targets-evidence-ledger.md)
   — accepted statement-barrier and byte-limit evidence incorporated by the
-  active budget-targets sprint.
+  archived budget-targets sprint.
 
 ## What's hot
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Active: remove projected SQL failure modes, review byte limits from evidence,
-  and split the SQLite store by table family —
-  [`sprint plan`](sprints/sprint-2026-08-29-budget-targets-and-store-split.md).
+- Active: adopt the trusted-store contract, delete the distrust and ledger
+  machinery, restructure `src/` into `fs`/`shell`/`git` domains, finish the
+  store split —
+  [`sprint plan`](sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md).
 - The external consumer adapter remains an integration gate outside this public
   repository; its provider lacks the bulk worktree scan needed for an efficient
   implementation without crossing private storage boundaries.
@@ -66,9 +70,15 @@ decisions → reference → archive.
 - [`decisions/0015-route-git-argv-through-one-synchronous-runner.md`](decisions/0015-route-git-argv-through-one-synchronous-runner.md)
 - [`decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md`](decisions/0016-preflight-mutating-cli-output-inside-the-transaction.md)
 - [`decisions/0017-measure-query-cost-and-bound-real-failures.md`](decisions/0017-measure-query-cost-and-bound-real-failures.md)
+- [`decisions/0018-trust-stored-rows-validate-at-the-boundary.md`](decisions/0018-trust-stored-rows-validate-at-the-boundary.md)
+- [`decisions/0019-organize-source-by-domain-with-bottom-up-layers.md`](decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
 
 ## Historical records
 
+- [`archive/sprint-2026-08-29-budget-targets-and-store-split.md`](archive/sprint-2026-08-29-budget-targets-and-store-split.md)
+  — measured statement targets, the byte-limit evidence ledger, operation-owned
+  memory ceilings, and the store-split start superseded by the restructure
+  sprint.
 - [`archive/sprint-2026-08-29-shell-run-inputs.md`](archive/sprint-2026-08-29-shell-run-inputs.md)
   — bounded caller stdin, frozen injected-command env and Git identity
   forwarding through one run-owned input lifetime.

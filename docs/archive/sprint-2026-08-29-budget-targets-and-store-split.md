@@ -1,3 +1,23 @@
+> **OUTCOME — closed 2026-08-30 (WU1–WU6g shipped; WU7–WU10 superseded).**
+> The budget half shipped: statement barriers, module-load ceilings, and
+> transport SQL accounting are gone, the evidence ledger classified all 147
+> byte declarations (38 keep / 11 remove / 67 replace / 31 dedupe), fixed
+> store/cache ceilings became operation-owned reservations, and leased cgroup
+> memory evidence landed in `bench/` (WU6g: highest capped transient
+> 74,506,240 bytes under a 512 MiB cgroup; smoke 167/167). Commit map: WU-level
+> shas are recorded per entry in the run log below; the range ends at
+> `4e4f1e0`; the WU7 facade split landed separately as `e6b9287` + `59d8438`
+> without closure gates. The successor sprint
+> (`sprint-2026-08-30-trusted-store-and-domain-restructure.md`) verifies that
+> baseline and supersedes WU8–WU10, the closure gates, and the final benchmark
+> comparison.
+> Backlog closed: 60 deleted (statement half shipped, split half moved to the
+> successor); 63 filed and kept; 64 filed by WU6g, then deleted on 2026-08-30 —
+> its hardening direction is rejected by ADR-0018. Deferred: everything the
+> successor sprint now owns, under the rewritten ADR-0017/0018/0019 policy
+> (trusted rows, no memory ledger, domain layout) that this sprint's frozen
+> policy contract predates.
+
 # Sprint — Budget targets and table-family store split (2026-08-29)
 
 **Goal.** Make SQL statement count a measured performance target instead of a

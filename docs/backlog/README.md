@@ -43,14 +43,10 @@ not effort: a wrong answer outranks a missing one.
   config scopes, `clean -x`, SSH transport. Reopen a case for one only with a
   concrete workload behind it. Textual `apply` is not filed because local
   snapshot replay serves the current workload.
-- **Not a parity gap.** [60](60-budget-targets-and-store-split.md) is cleanup
-  plus one deliberate relaxation: no new surface, but calls that were refused
-  on a projected SQL statement count start succeeding.
-  [62](62-sparse-status-rename-classification.md) is performance: a
-  tracker-backed `status` still pays a whole-repository join for rename
-  detection. [63](63-bound-packed-dependency-graph-traversal.md) and
-  [64](64-harden-owned-reads-and-blob-id-sql-rows.md) retain non-regression
-  scaling and internal hardening found while closing WU6g.
+- **Not a parity gap.** [62](62-sparse-status-rename-classification.md) is
+  performance: a tracker-backed `status` still pays a whole-repository join for
+  rename detection. [63](63-bound-packed-dependency-graph-traversal.md)
+  retains non-regression scaling found while closing the budget sprint.
 
 ## Consumer demand
 
@@ -104,7 +100,7 @@ issues; it stays filed and unscheduled until a caller appears.
 | **Phase 1 — a consumer can run** | | | | |
 | — | **Integration gate** | — | — | Not a sprint. Wire one consumer adapter (the adapter lives in the consumer) and run its real workflow end to end. Re-plan Phase 2 and 3 from the result. |
 | **Cleanup** | | | | |
-| 1 | [Budget targets and store split](../sprints/sprint-2026-08-29-budget-targets-and-store-split.md) **(active)** | [60](60-budget-targets-and-store-split.md) | long | Before Phase 2 adds a promisor state to every read path: drop the SQL statement budget from the runtime and measure it in `bench/` instead, inventory the memory limits, split `store.ts` by table family. |
+| 1 | [Trusted store and domain restructure](../sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md) **(active)** | — | long | Before Phase 2 adds a promisor state to every read path: adopt the trusted-store contract (ADR-0018), remove the memory ledger (ADR-0017), restructure into domains (ADR-0019), finish the store split. Successor of the archived budget sprint. |
 | **Phase 2 — production scale** | | | | |
 | 2 | Partial clone | [41](41-partial-clone.md) | long | Blobless clone is what both consumers run today. Needs an ADR and a promisor object state that every read path honours. |
 | 3 | Deepening and network safety | [38](38-clone-depth-and-deepening.md) (deepen/unshallow), [13](13-force-with-lease.md), [15](15-abortable-network-operations.md) | long | Hardening after the transport contracts settle: cross a shallow boundary later, protect remote refs, cancel without leaving local state behind. |
@@ -144,7 +140,5 @@ units over the same files, and a long sprint does not make that safe.
 - [41 — Add partial clone with lazy blob backfill](41-partial-clone.md)
 - [58 — Materialize gitlink distinct-type conflicts](58-materialize-gitlink-conflicts.md)
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
-- [60 — Make the SQL budget a measured target and split the store](60-budget-targets-and-store-split.md)
 - [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
 - [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
-- [64 — Harden owned reads and blob-id SQL rows](64-harden-owned-reads-and-blob-id-sql-rows.md)

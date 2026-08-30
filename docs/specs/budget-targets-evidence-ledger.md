@@ -1,7 +1,7 @@
 # Budget targets evidence ledger
 
 This is the accepted and frozen implementation evidence ledger incorporated by
-the [active budget-targets sprint](../sprints/sprint-2026-08-29-budget-targets-and-store-split.md).
+the [archived budget-targets sprint](../archive/sprint-2026-08-29-budget-targets-and-store-split.md).
 It is grounded at `6dac935` and reviewed as recorded in that sprint. Changes
 require an explicit superseding correction, not casual drift.
 
