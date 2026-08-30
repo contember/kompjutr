@@ -18,7 +18,7 @@ import {
   readIndexTrackerState,
   resealIndexTracker,
 } from "../src/sqlite/index-tracker.js";
-import { MAX_BLOB_BATCH_BYTES, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -364,14 +364,14 @@ describe("initial standalone checkout", () => {
     }
   });
 
-  it("rolls back a late capacity refusal before ordinary checkout fallback", async () => {
+  it("keeps a late blob above the batching target on the initial checkout path", async () => {
     const fixture = new GitFixture().init("main");
     for (let index = 0; index < 1_100; index++) {
       fixture.write(`file-${String(index).padStart(4, "0")}.txt`, "same\n");
     }
-    const large = randomBytes(MAX_BLOB_BATCH_BYTES + 1);
+    const large = randomBytes(PACK_BLOB_BATCH_TARGET_BYTES + 1);
     fixture.write("zz-large.bin", large);
-    fixture.commit("late capacity refusal");
+    fixture.commit("late blob above batching target");
     const runtime = makeInitialRepository();
 
     try {
@@ -384,7 +384,8 @@ describe("initial standalone checkout", () => {
       expect(tableCount(runtime, "git_index")).toBe(1_101);
       expect(runtime.repo.checkout.indexEntries()).toHaveLength(1_101);
       expect(readIndexTrackerState(runtime.db, runtime.repo.checkout.checkoutId)).toEqual({
-        available: false,
+        available: true,
+        baselineTreeOid: fixture.git("rev-parse", "HEAD^{tree}"),
       });
     } finally {
       fixture.dispose();

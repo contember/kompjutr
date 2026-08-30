@@ -1,7 +1,7 @@
 // Bounded outbound closure and replayable full-object pack generation.
 
 import { MAX_OPERATION_MEMORY_BYTES } from "../../memory.js";
-import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import {
@@ -379,37 +379,15 @@ function authenticateObjects(
     while (selected < info.length) {
       const object = info[selected];
       if (object === undefined) throw new CorruptError("push authentication lost object metadata");
-      if (selectedBytes + object.size > MAX_BLOB_BATCH_BYTES) break;
+      if (selected > 0 && object.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
+        break;
+      }
       selectedBytes += object.size;
       selected++;
     }
-    if (selected === 0) {
-      const objectInfo = info[0];
-      const oid = remaining[0];
-      if (objectInfo === undefined || oid === undefined || objectInfo.oid !== oid) {
-        throw new CorruptError("push authentication lost its oversized object");
-      }
-      operationBudget?.setMemory(authMemoryPart, objectInfo.size + 256);
-      try {
-        const object = repo.store.readAuthenticatedObject(oid, objectInfo.type);
-        if (object === null) throw new CorruptError(`local push object ${oid} disappeared`);
-        const tag = validateAuthenticatedObject(oid, object);
-        tracker.set(
-          "root-auth-state",
-          (state.types.size + 1) * ROOT_ENTRY_BYTES +
-            (state.tags.size + (tag === null ? 0 : 1)) * TAG_ENTRY_BYTES,
-        );
-        state.types.set(oid, object.type);
-        if (tag !== null) state.tags.set(oid, tag);
-      } finally {
-        operationBudget?.clearMemory(authMemoryPart);
-      }
-      remaining = remaining.slice(1);
-      continue;
-    }
     operationBudget?.setMemory(authMemoryPart, selectedBytes + selected * 256);
     try {
-      const batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
+      const batch = repo.readObjects(remaining, { budgetBytes: Math.max(1, selectedBytes) });
       if (batch.objects.size !== selected || batch.remaining.length >= remaining.length) {
         throw new CorruptError("push authentication made no progress");
       }
@@ -576,16 +554,35 @@ function resolveRoots(
 
 function packGenerationMemoryBytes(objects: readonly PushObject[]): number {
   if (objects.length === 0) return PACK_STREAM_HEADROOM_BYTES;
-  let peak =
-    MAX_BLOB_BATCH_BYTES + OBJECT_PAGE * PACK_BATCH_ENTRY_BYTES + PACK_STREAM_HEADROOM_BYTES;
-  for (const object of objects) {
-    if (object.source !== "pack" || object.size <= MAX_BLOB_BATCH_BYTES) continue;
-    const bytes = object.size + PACK_BATCH_ENTRY_BYTES + PACK_STREAM_HEADROOM_BYTES;
+  let peak = PACK_STREAM_HEADROOM_BYTES;
+  let batchBytes = 0;
+  let batchObjects = 0;
+  const flush = (): void => {
+    const bytes = batchBytes + batchObjects * PACK_BATCH_ENTRY_BYTES + PACK_STREAM_HEADROOM_BYTES;
     if (!Number.isSafeInteger(bytes)) {
       throw new GitError("E2BIG", "push pack retained memory is not representable");
     }
     if (bytes > peak) peak = bytes;
+    batchBytes = 0;
+    batchObjects = 0;
+  };
+  for (const object of objects) {
+    if (object.size > PACK_BLOB_BATCH_TARGET_BYTES) {
+      flush();
+      if (object.source === "pack") {
+        batchBytes = object.size;
+        batchObjects = 1;
+        flush();
+      }
+      continue;
+    }
+    if (batchObjects === OBJECT_PAGE || object.size > PACK_BLOB_BATCH_TARGET_BYTES - batchBytes) {
+      flush();
+    }
+    batchBytes += object.size;
+    batchObjects++;
   }
+  flush();
   return peak;
 }
 
@@ -1169,7 +1166,7 @@ async function* generatePushPack(
       readBatch: (objects) =>
         repo.readObjects(
           objects.map((object) => object.oid),
-          { budgetBytes: MAX_BLOB_BATCH_BYTES },
+          { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES },
         ).objects,
       readChunks: (object) => repo.store.readChunks(object.oid),
     },
@@ -1177,7 +1174,7 @@ async function* generatePushPack(
       maxObjects: MAX_PUSH_OBJECTS,
       maxInflatedBytes: Number.MAX_SAFE_INTEGER,
       maxStoredBytes: Number.MAX_SAFE_INTEGER,
-      readBatchBytes: MAX_BLOB_BATCH_BYTES,
+      readBatchBytes: PACK_BLOB_BATCH_TARGET_BYTES,
       allowOversizedObject: true,
     },
   );

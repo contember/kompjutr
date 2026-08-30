@@ -1,15 +1,16 @@
 import { isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
-import type { ObjectType } from "../core/objects.js";
-import { type ChunkedBytes, PACK_CHUNK_BYTES } from "../core/pack/chunks.js";
+import { hashObject, type ObjectType, parseCommit } from "../core/objects.js";
+import { type ChunkedBytes, type ChunkPool, PACK_CHUNK_BYTES } from "../core/pack/chunks.js";
 import type { MemoryReservation } from "../memory.js";
 import {
+  COMMIT_CACHE_FLUSH_BYTES,
   type CommitCacheEntry,
   type CommitCacheSource,
+  commitCacheFlushTransientBytes,
+  commitPreparationTransientBytes,
   insertCommitCaches,
-  MAX_COMMIT_CACHE_BYTES,
-  MAX_INDEXED_COMMIT_BYTES,
-  prepareCommitCache,
+  prepareCommitCacheOwned,
 } from "./commits.js";
 import type { SqlDatabase } from "./db.js";
 import {
@@ -28,17 +29,7 @@ const PACK_TREE_CHUNK_ARRAY_BYTES = 64;
 const PACK_TREE_DIRECT_FIXED_BYTES =
   PACK_TREE_SOURCE_BYTES + PACK_TREE_CHUNK_ARRAY_BYTES + PACK_TREE_CHUNK_BYTES;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
-const PACK_COMMIT_PARSE_BYTES = 1024;
 export const PACK_COMMIT_PAYLOAD_BYTES = 256;
-const PACK_COMMIT_PHYSICAL_LINE_BYTES = 32;
-const PACK_COMMIT_LOGICAL_HEADER_BYTES = 64;
-const PACK_COMMIT_CONTINUATION_BYTES = 32;
-const PACK_COMMIT_PAGE_ROWS = 2048;
-const PACK_COMMIT_PAGE_JSON_BYTES = 1024 * 1024;
-// Three UTF-16 page copies, one encoded binding, and bounded row-array wrappers.
-const PACK_COMMIT_PAGE_TRANSIENT_BYTES =
-  7 * PACK_COMMIT_PAGE_JSON_BYTES + PACK_COMMIT_PAGE_ROWS * PACK_COMMIT_LOGICAL_HEADER_BYTES;
-const PACK_COMMIT_ACTIVE_HEADROOM_BYTES = 8 * 1024 * 1024;
 const PACK_INDEX_BATCH_BYTES = 1024 * 1024;
 const PACK_INDEX_BATCH_ROWS = 2048;
 export const PACK_PENDING_PAGE_ROWS = 4096;
@@ -48,186 +39,35 @@ export const PACK_OFFSET_WINDOW_BYTES = 2 * 1024 * 1024;
 export const PACK_INGEST_METADATA_BYTES =
   PACK_INDEX_MEMORY_BYTES + PACK_OFFSET_WINDOW_BYTES + PACK_PENDING_PAGE_MEMORY_BYTES;
 
-function commitHeaderKind(data: Uint8Array, start: number, end: number): number {
-  const length = end - start;
-  if (
-    length === 4 &&
-    data[start] === 0x74 &&
-    data[start + 1] === 0x72 &&
-    data[start + 2] === 0x65 &&
-    data[start + 3] === 0x65
-  ) {
-    return 1;
+function largeCommitParserBytes(data: Uint8Array): number {
+  let physicalLines = 1;
+  for (const byte of data) if (byte === 0x0a) physicalLines++;
+  const retained = 1_024 + 6 * data.length + 128 * physicalLines;
+  if (!Number.isSafeInteger(retained)) {
+    throw new GitError("E2BIG", "packed commit parser memory accounting overflow");
   }
-  if (
-    length === 6 &&
-    data[start] === 0x70 &&
-    data[start + 1] === 0x61 &&
-    data[start + 2] === 0x72 &&
-    data[start + 3] === 0x65 &&
-    data[start + 4] === 0x6e &&
-    data[start + 5] === 0x74
-  ) {
-    return 2;
-  }
-  if (
-    length === 6 &&
-    data[start] === 0x61 &&
-    data[start + 1] === 0x75 &&
-    data[start + 2] === 0x74 &&
-    data[start + 3] === 0x68 &&
-    data[start + 4] === 0x6f &&
-    data[start + 5] === 0x72
-  ) {
-    return 3;
-  }
-  if (
-    length === 9 &&
-    data[start] === 0x63 &&
-    data[start + 1] === 0x6f &&
-    data[start + 2] === 0x6d &&
-    data[start + 3] === 0x6d &&
-    data[start + 4] === 0x69 &&
-    data[start + 5] === 0x74 &&
-    data[start + 6] === 0x74 &&
-    data[start + 7] === 0x65 &&
-    data[start + 8] === 0x72
-  ) {
-    return 4;
-  }
-  if (
-    length === 6 &&
-    data[start] === 0x67 &&
-    data[start + 1] === 0x70 &&
-    data[start + 2] === 0x67 &&
-    data[start + 3] === 0x73 &&
-    data[start + 4] === 0x69 &&
-    data[start + 5] === 0x67
-  ) {
-    return 5;
-  }
-  return 0;
+  return retained;
 }
 
-function jsonEscapedChars(data: Uint8Array, start: number, end: number): number {
-  let chars = 0;
-  for (let index = start; index < end; index++) {
-    const byte = data[index]!;
-    if (byte === 0x22 || byte === 0x5c) {
-      chars += 2;
-    } else if (byte < 0x20) {
-      chars +=
-        byte === 0x08 || byte === 0x09 || byte === 0x0a || byte === 0x0c || byte === 0x0d ? 2 : 6;
-    } else {
-      chars++;
+function validateLargeCommit(source: CommitCacheSource, reservation: MemoryReservation): void {
+  if (!Number.isSafeInteger(source.repoId) || source.repoId < 1 || !isOid(source.oid)) {
+    throw new CorruptError("commit cache source identity is invalid");
+  }
+  reservation.set("commit", largeCommitParserBytes(source.data));
+  if (hashObject("commit", source.data) !== source.oid) {
+    throw new CorruptError(`commit cache source ${source.oid} does not match its bytes`);
+  }
+  const commit = parseCommit(source.data);
+  for (const value of [
+    commit.author.timestamp,
+    commit.author.timezoneOffset,
+    commit.committer.timestamp,
+    commit.committer.timezoneOffset,
+  ]) {
+    if (!Number.isSafeInteger(value)) {
+      throw new GitError("E2BIG", "commit has an unrepresentable identity number");
     }
   }
-  return chars;
-}
-
-function jsonEncodedBytes(data: Uint8Array, start: number, end: number): number {
-  let bytes = 0;
-  for (let index = start; index < end; index++) {
-    const byte = data[index]!;
-    if (byte === 0x22 || byte === 0x5c) {
-      bytes += 2;
-    } else if (byte < 0x20) {
-      bytes +=
-        byte === 0x08 || byte === 0x09 || byte === 0x0a || byte === 0x0c || byte === 0x0d ? 2 : 6;
-    } else {
-      bytes += byte < 0x80 ? 1 : 3;
-    }
-  }
-  return bytes;
-}
-
-/** Preflight the parser's decoded text, header tables and retained commit without decoding. */
-function commitMemoryEstimate(
-  data: Uint8Array,
-  oid: string,
-): { prepareBytes: number; serializationBytes: number } {
-  if (data.length > MAX_INDEXED_COMMIT_BYTES) {
-    throw new GitError(
-      "E2BIG",
-      `packed commit ${oid} exceeds the ${MAX_INDEXED_COMMIT_BYTES}-byte index limit`,
-    );
-  }
-
-  let headEnd = data.length;
-  for (let index = 0; index + 1 < data.length; index++) {
-    if (data[index] === 0x0a && data[index + 1] === 0x0a) {
-      headEnd = index;
-      break;
-    }
-  }
-
-  let physicalLines = 0;
-  let logicalHeaders = 0;
-  let continuations = 0;
-  let parentCount = 0;
-  let outputBytes = headEnd === data.length ? 0 : data.length - headEnd - 2;
-  let serializedChars =
-    headEnd === data.length ? 0 : jsonEscapedChars(data, headEnd + 2, data.length);
-  let serializedBytes =
-    headEnd === data.length ? 0 : jsonEncodedBytes(data, headEnd + 2, data.length);
-  let currentKind = 0;
-  let hasHeader = false;
-  let lineStart = 0;
-  for (;;) {
-    let lineEnd = lineStart;
-    while (lineEnd < headEnd && data[lineEnd] !== 0x0a) lineEnd++;
-    physicalLines++;
-
-    if (data[lineStart] === 0x20 && hasHeader) {
-      continuations++;
-      if (currentKind !== 0) outputBytes += lineEnd - lineStart;
-      if (currentKind >= 3) {
-        serializedChars += 2 + jsonEscapedChars(data, lineStart + 1, lineEnd);
-        serializedBytes += 2 + jsonEncodedBytes(data, lineStart + 1, lineEnd);
-      }
-    } else {
-      let space = lineStart;
-      while (space < lineEnd && data[space] !== 0x20) space++;
-      if (space > lineStart && space < lineEnd) {
-        logicalHeaders++;
-        hasHeader = true;
-        currentKind = commitHeaderKind(data, lineStart, space);
-        if (currentKind !== 0) outputBytes += lineEnd - space - 1;
-        if (currentKind === 2) parentCount++;
-        if (currentKind >= 3) {
-          serializedChars += jsonEscapedChars(data, space + 1, lineEnd);
-          serializedBytes += jsonEncodedBytes(data, space + 1, lineEnd);
-        }
-      }
-    }
-
-    if (lineEnd === headEnd) break;
-    lineStart = lineEnd + 1;
-  }
-
-  const parsePeakBytes =
-    PACK_COMMIT_PARSE_BYTES +
-    2 * data.length +
-    physicalLines * PACK_COMMIT_PHYSICAL_LINE_BYTES +
-    logicalHeaders * PACK_COMMIT_LOGICAL_HEADER_BYTES +
-    continuations * PACK_COMMIT_CONTINUATION_BYTES +
-    2 * outputBytes +
-    parentCount * PACK_COMMIT_LOGICAL_HEADER_BYTES;
-  const cacheBytes =
-    PACK_COMMIT_PARSE_BYTES + 2 * outputBytes + parentCount * PACK_COMMIT_LOGICAL_HEADER_BYTES;
-  const parentJsonChars = parentCount === 0 ? 2 : 43 * parentCount + 1;
-  const escapedParentJsonChars = parentJsonChars + 2 * parentCount + 2;
-  const outerJsonChars = PACK_COMMIT_PARSE_BYTES + escapedParentJsonChars + serializedChars;
-  const outerJsonBytes = PACK_COMMIT_PARSE_BYTES + escapedParentJsonChars + serializedBytes;
-  const serializationPeakBytes = Math.max(
-    cacheBytes + 2 * parentJsonChars + 2 * outerJsonChars,
-    cacheBytes + 2 * outerJsonChars + outerJsonBytes,
-  );
-  const prepareBytes = Math.max(parsePeakBytes, serializationPeakBytes);
-  if (!Number.isSafeInteger(prepareBytes)) {
-    throw new GitError("E2BIG", `packed commit ${oid} parser state is too large`);
-  }
-  return { prepareBytes, serializationBytes: serializationPeakBytes };
 }
 
 export type PackObjectInput = [
@@ -568,7 +408,10 @@ export class PackTreeIndex {
 export class PackCommitIndex {
   readonly #entries: CommitCacheEntry[] = [];
   #bytes = 0;
-  #serializationTransientBytes = 0;
+  #expected = 0;
+  #eligible = 0;
+  #skipped = 0;
+  #written = 0;
 
   constructor(
     private readonly db: SqlDatabase,
@@ -576,6 +419,7 @@ export class PackCommitIndex {
     private readonly packId: number,
     private readonly objects: PackObjectBatch,
     private readonly reservation: MemoryReservation,
+    private readonly pool: ChunkPool,
   ) {}
 
   get retainedBytes(): number {
@@ -583,42 +427,58 @@ export class PackCommitIndex {
   }
 
   add(source: CommitCacheSource): void {
-    const estimate = commitMemoryEstimate(source.data, source.oid);
-    if (
-      this.#entries.length > 0 &&
-      (this.#entries.length >= PACK_COMMIT_BATCH_SOURCES ||
-        this.#bytes + estimate.prepareBytes > MAX_COMMIT_CACHE_BYTES ||
-        this.#bytes + estimate.serializationBytes + PACK_COMMIT_PAGE_TRANSIENT_BYTES >
-          PACK_COMMIT_ACTIVE_HEADROOM_BYTES)
-    ) {
+    this.reservation.set("pool", this.pool.allocatedBytes);
+    let completed = false;
+    try {
+      this.#add(source);
+      completed = true;
+    } finally {
+      if (completed) this.reservation.set("pool", this.pool.allocatedBytes);
+    }
+  }
+
+  #add(source: CommitCacheSource): void {
+    if (source.data.length > COMMIT_CACHE_FLUSH_BYTES) {
+      const parserBytes = largeCommitParserBytes(source.data);
+      if (this.#entries.length > 0 && parserBytes > this.reservation.remainingBytes) {
+        this.#stage();
+      }
+      const parser = this.reservation.scope();
+      try {
+        validateLargeCommit(source, parser);
+      } finally {
+        parser.dispose();
+      }
+      this.#expected++;
+      this.#skipped++;
+      return;
+    }
+    const prepareBytes = commitPreparationTransientBytes(source.data.length);
+    if (this.#entries.length > 0 && prepareBytes > this.reservation.remainingBytes) {
       this.#stage();
     }
-    this.reservation.set("commit", this.#bytes + estimate.prepareBytes);
+    const preparation = this.reservation.scope();
     let entry: CommitCacheEntry;
     try {
-      entry = prepareCommitCache(source);
-    } catch (error) {
-      this.reservation.set("commit", this.#bytes);
-      throw error;
+      entry = prepareCommitCacheOwned(source, preparation);
+    } finally {
+      preparation.dispose();
     }
-    if (entry.cacheBytes > MAX_COMMIT_CACHE_BYTES) {
-      this.reservation.set("commit", this.#bytes);
-      throw new GitError("E2BIG", `packed commit ${source.oid} exceeds the cache batch limit`);
+    this.#expected++;
+    if (entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES) {
+      this.#skipped++;
+      return;
     }
     if (
       this.#entries.length > 0 &&
       (this.#entries.length >= PACK_COMMIT_BATCH_SOURCES ||
-        this.#bytes + entry.cacheBytes > MAX_COMMIT_CACHE_BYTES)
+        this.#bytes + entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES)
     ) {
       this.#stage();
     }
     this.reservation.set("commit", this.#bytes + entry.cacheBytes);
     this.#entries.push(entry);
     this.#bytes += entry.cacheBytes;
-    this.#serializationTransientBytes = Math.max(
-      this.#serializationTransientBytes,
-      estimate.serializationBytes - entry.cacheBytes,
-    );
   }
 
   /** Flush the final batch after the caller marks the pack complete. */
@@ -626,6 +486,11 @@ export class PackCommitIndex {
     this.objects.flush();
     this.#insert();
     this.#clear();
+    if (this.#written !== this.#eligible || this.#eligible + this.#skipped !== this.#expected) {
+      throw new CorruptError(
+        `packed commit cache wrote ${this.#written} of ${this.#eligible} eligible rows and skipped ${this.#skipped} of ${this.#expected}`,
+      );
+    }
   }
 
   checkpoint(): void {
@@ -655,17 +520,20 @@ export class PackCommitIndex {
 
   #insert(): void {
     if (this.#entries.length === 0) return;
-    this.reservation.set(
-      "commit",
-      this.#bytes + this.#serializationTransientBytes + PACK_COMMIT_PAGE_TRANSIENT_BYTES,
-    );
+    this.reservation.set("commit", this.#bytes + commitCacheFlushTransientBytes(this.#entries));
     try {
       const result = insertCommitCaches(this.db, this.#entries);
-      if (result.eligible !== this.#entries.length || result.written !== this.#entries.length) {
+      if (
+        result.written !== result.eligible ||
+        result.eligible + result.skipped !== this.#entries.length
+      ) {
         throw new CorruptError(
-          `packed commit cache wrote ${result.written} of ${this.#entries.length} required rows`,
+          `packed commit cache wrote ${result.written} of ${result.eligible} eligible rows and skipped ${result.skipped} of ${this.#entries.length}`,
         );
       }
+      this.#eligible += result.eligible;
+      this.#skipped += result.skipped;
+      this.#written += result.written;
     } finally {
       this.reservation.set("commit", this.#bytes);
     }
@@ -674,7 +542,6 @@ export class PackCommitIndex {
   #clear(): void {
     this.#entries.length = 0;
     this.#bytes = 0;
-    this.#serializationTransientBytes = 0;
     this.reservation.clear("commit");
   }
 }

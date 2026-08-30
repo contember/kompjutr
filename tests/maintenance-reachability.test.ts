@@ -12,7 +12,8 @@ import {
 } from "../src/core/objects.js";
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
-import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { deflate } from "../src/core/zlib.js";
+import type { MemoryCoordinator } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { advanceMaintenanceReachability } from "../src/sqlite/maintenance/reachability.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -84,6 +85,146 @@ class GuardedTreeEdgeDatabase implements SqlDatabase {
         yield { ...row, raw_type: "blob", raw_length: 101 * 1024 * 1024 };
       }
     }
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+type ReachabilityFailure = "sql" | "source" | "parser" | "publication";
+
+class FailingReachabilityDatabase implements SqlDatabase {
+  failure: ReachabilityFailure | null = null;
+  activeHeaderIterators = 0;
+  closedHeaderIterators = 0;
+
+  constructor(readonly inner: TestDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    if (this.failure === "publication" && query.includes("INSERT INTO git_maintenance_objects")) {
+      this.failure = null;
+      throw new Error("injected reachability publication failure");
+    }
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    if (!query.includes("maintenance-loose-headers")) {
+      return this.inner.iterate(query, ...bindings);
+    }
+    if (this.failure === "sql") {
+      this.failure = null;
+      throw new Error("injected reachability SQL failure");
+    }
+    const source = this.inner.iterate(query, ...bindings);
+    const owner = this;
+    return {
+      [Symbol.iterator](): IterableIterator<Record<string, unknown>> {
+        const iterator = source[Symbol.iterator]();
+        let finished = false;
+        let rows = 0;
+        owner.activeHeaderIterators++;
+        const close = (): void => {
+          if (finished) return;
+          finished = true;
+          owner.activeHeaderIterators--;
+          owner.closedHeaderIterators++;
+        };
+        const wrapped: IterableIterator<Record<string, unknown>> = {
+          [Symbol.iterator]: () => wrapped,
+          next(): IteratorResult<Record<string, unknown>> {
+            const next = iterator.next();
+            if (next.done) {
+              close();
+              return next;
+            }
+            rows++;
+            if (rows === 2 && owner.failure === "source") {
+              owner.failure = null;
+              iterator.return?.();
+              close();
+              throw new Error("injected reachability source failure");
+            }
+            if (rows === 2 && owner.failure === "parser") {
+              owner.failure = null;
+              const value = next.value.data;
+              const data =
+                value instanceof Uint8Array
+                  ? value
+                  : value instanceof ArrayBuffer
+                    ? new Uint8Array(value)
+                    : null;
+              if (data === null) throw new Error("parser fixture did not receive a BLOB");
+              const malformed = data.slice();
+              const corruptAt = Math.floor(malformed.length / 2);
+              const byte = malformed[corruptAt];
+              if (byte === undefined) throw new Error("parser fixture received an empty BLOB");
+              malformed[corruptAt] = byte ^ 0xff;
+              return { done: false, value: { ...next.value, data: malformed } };
+            }
+            return next;
+          },
+          return(): IteratorResult<Record<string, unknown>> {
+            iterator.return?.();
+            close();
+            return { done: true, value: undefined };
+          },
+        };
+        return wrapped;
+      },
+    };
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+class ObservedReachabilityDatabase implements SqlDatabase {
+  memory: MemoryCoordinator | null = null;
+  packedDataQueries = 0;
+  publicationReservedBytes = 0;
+
+  constructor(readonly inner: TestDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    if (query.includes("git_pack_data")) this.packedDataQueries++;
+    if (query.includes("maintenance-edge-targets")) {
+      this.publicationReservedBytes = Math.max(
+        this.publicationReservedBytes,
+        this.memory?.totalBytes ?? 0,
+      );
+    }
+    return this.inner.iterate(query, ...bindings);
   }
 
   transactionSync<T>(closure: () => T): T {
@@ -207,6 +348,85 @@ function fullBlobPack(values: readonly Uint8Array[]): Uint8Array {
   for (const value of values) writer.object("blob", value);
   writer.finish();
   return concat(chunks);
+}
+
+function fullObjectPack(type: ObjectType, value: Uint8Array): Uint8Array {
+  const chunks: Uint8Array[] = [];
+  const writer = new PackWriter((chunk) => chunks.push(chunk));
+  writer.header(1);
+  writer.object(type, value);
+  writer.finish();
+  return concat(chunks);
+}
+
+const FORMER_HEADER_OBJECT_BYTES = 48 * 1024 * 1024;
+const LARGE_HEADER_OBJECT_BYTES = FORMER_HEADER_OBJECT_BYTES + 64 * 1024;
+
+function deterministicIncompressibleBytes(size: number, prefix: Uint8Array): Uint8Array {
+  if (prefix.length > size) throw new Error("deterministic fixture prefix exceeds its size");
+  const data = new Uint8Array(size);
+  const words = new Uint32Array(data.buffer, 0, Math.floor(size / 4));
+  let state = 0x9e3779b9;
+  for (let index = 0; index < words.length; index++) {
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    words[index] = state;
+  }
+  data.set(prefix);
+  return data;
+}
+
+function installLargeLooseHeader(
+  db: TestDatabase,
+  repoId: number,
+  type: "commit" | "tag",
+  prefix: string,
+  size = LARGE_HEADER_OBJECT_BYTES,
+): string {
+  const start = utf8.encode(`${prefix}\n\n`);
+  const data = deterministicIncompressibleBytes(size, start);
+  const oid = hashObject(type, data);
+  const compressed = deflate(data);
+  db.run(
+    "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
+    repoId,
+    oid,
+    type,
+    size,
+  );
+  let seq = 0;
+  for (let offset = 0; offset < compressed.length; offset += 1024 * 1024) {
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+      repoId,
+      oid,
+      seq++,
+      compressed.subarray(offset, offset + 1024 * 1024),
+    );
+  }
+  return oid;
+}
+
+async function packedHeaderFixture(size = 2 * 1024 * 1024) {
+  const inner = new TestDatabase();
+  const observed = new ObservedReachabilityDatabase(inner);
+  const database = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
+  const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+  const store = database.openCheckout(checkout);
+  const target = store.write("blob", utf8.encode("packed tag target\n"));
+  const prefix = utf8.encode(`object ${target}\ntype blob\ntag ownership\n\n`);
+  const bytes = deterministicIncompressibleBytes(size, prefix);
+  const oid = hashObject("tag", bytes);
+  await store.packs.ingest(slices(fullObjectPack("tag", bytes), 64 * 1024));
+  seedMark(inner, checkout.repoId, [{ oid }]);
+
+  const reopened = new SqliteGitDatabase(observed, { objectCacheBytes: 0, chunkBytes: 0 });
+  const shared = reopened.openCheckout(checkout.id).shared;
+  observed.memory = shared.memory;
+  observed.packedDataQueries = 0;
+  observed.publicationReservedBytes = 0;
+  return { db: inner, observed, checkout, shared, oid, bytes };
 }
 
 describe("maintenance reachability", () => {
@@ -370,7 +590,7 @@ describe("maintenance reachability", () => {
     }
   });
 
-  it("accepts the former tree-name excess and pre-admits its payload exactly", () => {
+  it("accepts the former tree-name excess and pre-admits its payload before reading it", () => {
     const fixture = () => {
       const { db, checkout, store } = open();
       const target = store.write("blob", utf8.encode("owned\n"));
@@ -383,40 +603,16 @@ describe("maintenance reachability", () => {
       return { db, shared: reopened.openCheckout(checkout.id).shared, tree };
     };
 
-    const measured = fixture();
-    measured.db.storage.histogram = new Map();
-    expect(advanceMaintenanceReachability(measured.shared)).toMatchObject({
-      processedOid: measured.tree,
+    const current = fixture();
+    current.db.storage.histogram = new Map();
+    expect(advanceMaintenanceReachability(current.shared)).toMatchObject({
+      processedOid: current.tree,
       discoveredObjects: 1,
     });
-    const operationBytes = measured.shared.memory.highWaterBytes;
-    measured.shared.memory.assertIdle();
+    current.shared.memory.assertIdle();
     expect(
-      [...measured.db.storage.histogram.keys()].some((query) => query.includes("WITH expected AS")),
+      [...current.db.storage.histogram.keys()].some((query) => query.includes("WITH expected AS")),
     ).toBe(true);
-
-    for (const excess of [0, 1]) {
-      const current = fixture();
-      const blocker = current.shared.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
-      current.db.storage.histogram = new Map();
-      try {
-        const advance = () => advanceMaintenanceReachability(current.shared);
-        if (excess === 0) {
-          expect(advance()).toMatchObject({ processedOid: current.tree, discoveredObjects: 1 });
-        } else {
-          expect(advance).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-          expect(
-            [...current.db.storage.histogram.keys()].some((query) =>
-              query.includes("WITH expected AS"),
-            ),
-          ).toBe(false);
-        }
-      } finally {
-        blocker.dispose();
-      }
-      current.shared.memory.assertIdle();
-    }
   });
 
   it("streams large unknown and continuation tag headers without retaining the message", () => {
@@ -440,6 +636,328 @@ describe("maintenance reachability", () => {
     });
     expect(db.storage.statementCount).toBeLessThan(1_000);
     expect(marks(db, checkout.repoId).map((row) => row.oid)).toContain(target);
+  });
+
+  describe("WU6g reachability ownership", () => {
+    it("streams valid loose commit and tag headers beyond 48 MiB with bounded live memory", () => {
+      const { db, checkout, store } = open();
+      const tree = store.write("tree", serializeTree([]));
+      const target = store.write("blob", utf8.encode("large tag target\n"));
+      const identity = "Reachability Fixture <fixture@example.com> 1700000000 +0000";
+      const commitOid = installLargeLooseHeader(
+        db,
+        checkout.repoId,
+        "commit",
+        `tree ${tree}\nauthor ${identity}\ncommitter ${identity}\nx `,
+      );
+      const tagOid = installLargeLooseHeader(
+        db,
+        checkout.repoId,
+        "tag",
+        `object ${target}\ntype blob\ntag large\ntagger ${identity}\nx `,
+      );
+      const chunkCounts = db.all<{ chunks: number }>(
+        `SELECT count(*) AS chunks FROM git_object_chunks
+          WHERE repo_id = ? AND oid IN (?, ?) GROUP BY oid`,
+        checkout.repoId,
+        commitOid,
+        tagOid,
+      );
+      expect(chunkCounts).toHaveLength(2);
+      expect(chunkCounts.every((row) => row.chunks > 1)).toBe(true);
+      seedMark(db, checkout.repoId, [{ oid: commitOid }, { oid: tagOid }]);
+      const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 0, chunkBytes: 0 });
+      const cold = reopened.openCheckout(checkout.id);
+
+      for (let call = 0; call < 8; call++) {
+        advanceMaintenanceReachability(cold.shared);
+        const expanded = db.scalar<number>(
+          `SELECT count(*) FROM git_maintenance_objects
+            WHERE repo_id = ? AND oid IN (?, ?) AND expanded = 1`,
+          checkout.repoId,
+          commitOid,
+          tagOid,
+        );
+        if (expanded === 2) break;
+      }
+
+      const reached = new Set(marks(db, checkout.repoId).map((row) => row.oid));
+      expect(reached.has(tree)).toBe(true);
+      expect(reached.has(target)).toBe(true);
+      expect(
+        db.scalar<number>(
+          `SELECT count(*) FROM git_maintenance_objects
+            WHERE repo_id = ? AND oid IN (?, ?) AND expanded = 1`,
+          checkout.repoId,
+          commitOid,
+          tagOid,
+        ),
+      ).toBe(2);
+      expect(cold.shared.memory.highWaterBytes).toBeLessThan(2 * 1024 * 1024);
+      cold.shared.memory.assertIdle();
+
+      const last = db.one<{ seq: number; data: unknown }>(
+        `SELECT seq, data FROM git_object_chunks
+          WHERE repo_id = ? AND oid = ? ORDER BY seq DESC LIMIT 1`,
+        checkout.repoId,
+        commitOid,
+      );
+      if (last === undefined) throw new Error("large commit has no final storage chunk");
+      const finalChunk =
+        last.data instanceof Uint8Array
+          ? last.data
+          : last.data instanceof ArrayBuffer
+            ? new Uint8Array(last.data)
+            : null;
+      if (finalChunk === null || finalChunk.length === 0) {
+        throw new Error("large commit final storage chunk is empty");
+      }
+      db.run("DELETE FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId);
+      db.run(
+        `UPDATE git_object_chunks SET data = substr(data, 1, length(data) - 1)
+          WHERE repo_id = ? AND oid = ? AND seq = ?`,
+        checkout.repoId,
+        commitOid,
+        last.seq,
+      );
+      seedMark(db, checkout.repoId, [{ oid: commitOid }]);
+
+      expect(() => advanceMaintenanceReachability(cold.shared)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(
+        db.scalar<number>(
+          "SELECT expanded FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+          checkout.repoId,
+          commitOid,
+        ),
+      ).toBe(0);
+      cold.shared.memory.assertIdle();
+
+      db.run(
+        "UPDATE git_object_chunks SET data = ? WHERE repo_id = ? AND oid = ? AND seq = ?",
+        finalChunk,
+        checkout.repoId,
+        commitOid,
+        last.seq,
+      );
+      expect(advanceMaintenanceReachability(cold.shared)).toMatchObject({
+        processedOid: commitOid,
+        discoveredLogicalObjects: 1,
+      });
+      cold.shared.memory.assertIdle();
+
+      db.run("DELETE FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId);
+      const malformedOid = installLargeLooseHeader(
+        db,
+        checkout.repoId,
+        "commit",
+        `tree ${"z".repeat(40)}\nauthor ${identity}\ncommitter ${identity}\nx `,
+        3 * 1024 * 1024,
+      );
+      seedMark(db, checkout.repoId, [{ oid: malformedOid }]);
+      expect(() => advanceMaintenanceReachability(cold.shared)).toThrowError(
+        expect.objectContaining({
+          code: "ECORRUPT",
+          message: expect.stringContaining("malformed tree oid"),
+        }),
+      );
+      expect(
+        db.scalar<number>(
+          "SELECT expanded FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+          checkout.repoId,
+          malformedOid,
+        ),
+      ).toBe(0);
+      cold.shared.memory.assertIdle();
+    });
+
+    it("retains real packed output through publication", async () => {
+      const current = await packedHeaderFixture();
+
+      expect(advanceMaintenanceReachability(current.shared)).toMatchObject({
+        processedOid: current.oid,
+        discoveredLogicalObjects: 1,
+      });
+      expect(current.observed.publicationReservedBytes).toBeGreaterThanOrEqual(
+        current.bytes.length + 512 + 256,
+      );
+      current.shared.memory.assertIdle();
+    });
+
+    it("releases ownership and restarts after SQL, source, parser, and publication failures", () => {
+      const failures: readonly ReachabilityFailure[] = ["sql", "source", "parser", "publication"];
+      for (const failure of failures) {
+        const inner = new TestDatabase();
+        const failing = new FailingReachabilityDatabase(inner);
+        const database = new SqliteGitDatabase(failing, { objectCacheBytes: 0, chunkBytes: 0 });
+        const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+        const store = database.openCheckout(checkout);
+        const tree = store.write("tree", serializeTree([]));
+        const root =
+          failure === "source" || failure === "parser"
+            ? installLargeLooseHeader(
+                inner,
+                checkout.repoId,
+                "commit",
+                `tree ${tree}`,
+                3 * 1024 * 1024,
+              )
+            : store.write("commit", commit(tree));
+        seedMark(inner, checkout.repoId, [{ oid: root }]);
+        failing.failure = failure;
+
+        expect(() => advanceMaintenanceReachability(store.shared)).toThrow();
+        expect(failing.activeHeaderIterators).toBe(0);
+        expect(
+          inner.one<{ expanded: number; reachable_objects: number; queued_objects: number }>(
+            `SELECT object.expanded, run.reachable_objects, run.queued_objects
+               FROM git_maintenance_objects object
+               JOIN git_maintenance_runs run
+                 ON run.repo_id = object.repo_id AND run.run_id = object.run_id
+              WHERE object.repo_id = ? AND object.oid = ?`,
+            checkout.repoId,
+            root,
+          ),
+        ).toEqual({ expanded: 0, reachable_objects: 0, queued_objects: 1 });
+        store.shared.memory.assertIdle();
+
+        expect(advanceMaintenanceReachability(store.shared)).toMatchObject({
+          processedOid: root,
+          discoveredLogicalObjects: 1,
+        });
+        expect(failing.activeHeaderIterators).toBe(0);
+        expect(failing.closedHeaderIterators).toBeGreaterThan(0);
+        store.shared.memory.assertIdle();
+      }
+    });
+
+    it("rejects constraint-bypassed object sizes and chunk ordinals as corruption", async () => {
+      const corruptValues: readonly unknown[] = [1.5, "invalid", new Uint8Array([1])];
+      for (const value of corruptValues) {
+        const size = open();
+        const tree = size.store.write("tree", serializeTree([]));
+        const root = size.store.write("commit", commit(tree));
+        seedMark(size.db, size.checkout.repoId, [{ oid: root }]);
+        size.db.run("PRAGMA ignore_check_constraints = ON");
+        try {
+          size.db.run(
+            "UPDATE git_objects SET size = ? WHERE repo_id = ? AND oid = ?",
+            value,
+            size.checkout.repoId,
+            root,
+          );
+        } finally {
+          size.db.run("PRAGMA ignore_check_constraints = OFF");
+        }
+
+        expect(() => advanceMaintenanceReachability(size.store.shared)).toThrowError(
+          expect.objectContaining({ code: "ECORRUPT" }),
+        );
+        size.store.shared.memory.assertIdle();
+
+        const ordinal = open();
+        const ordinalTree = ordinal.store.write("tree", serializeTree([]));
+        const ordinalRoot = ordinal.store.write("commit", commit(ordinalTree));
+        seedMark(ordinal.db, ordinal.checkout.repoId, [{ oid: ordinalRoot }]);
+        ordinal.db.run(
+          "UPDATE git_object_chunks SET seq = ? WHERE repo_id = ? AND oid = ? AND seq = 0",
+          value,
+          ordinal.checkout.repoId,
+          ordinalRoot,
+        );
+        ordinal.db.storage.histogram = new Map();
+
+        expect(() => advanceMaintenanceReachability(ordinal.store.shared)).toThrowError(
+          expect.objectContaining({ code: "ECORRUPT" }),
+        );
+        expect([...ordinal.db.storage.histogram.keys()].join("\n")).not.toContain(
+          "maintenance-loose-headers",
+        );
+        ordinal.store.shared.memory.assertIdle();
+      }
+
+      const edge = open();
+      const edgeTree = edge.store.write("tree", serializeTree([]));
+      const edgeRoot = edge.store.write("commit", commit(edgeTree));
+      seedMark(edge.db, edge.checkout.repoId, [{ oid: edgeRoot }]);
+      edge.db.run("PRAGMA ignore_check_constraints = ON");
+      try {
+        edge.db.run(
+          "UPDATE git_objects SET size = 1.5 WHERE repo_id = ? AND oid = ?",
+          edge.checkout.repoId,
+          edgeTree,
+        );
+      } finally {
+        edge.db.run("PRAGMA ignore_check_constraints = OFF");
+      }
+      expect(() => advanceMaintenanceReachability(edge.store.shared)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      edge.store.shared.memory.assertIdle();
+
+      for (const value of corruptValues) {
+        const packed = await packedHeaderFixture(64 * 1024);
+        packed.db.run("PRAGMA ignore_check_constraints = ON");
+        try {
+          packed.db.run(
+            "UPDATE git_pack_objects SET size = ? WHERE repo_id = ? AND oid = ?",
+            value,
+            packed.checkout.repoId,
+            packed.oid,
+          );
+        } finally {
+          packed.db.run("PRAGMA ignore_check_constraints = OFF");
+        }
+
+        expect(() => advanceMaintenanceReachability(packed.shared)).toThrowError(
+          expect.objectContaining({ code: "ECORRUPT" }),
+        );
+        expect(packed.observed.packedDataQueries).toBe(0);
+        packed.shared.memory.assertIdle();
+      }
+    });
+
+    it("fails a corrupt loose commit shadow instead of reading its valid packed copy", async () => {
+      const { db, checkout, store } = open();
+      const tree = store.write("tree", serializeTree([]));
+      const packedBytes = commit(tree);
+      const oid = hashObject("commit", packedBytes);
+      await store.packs.ingest(slices(fullObjectPack("commit", packedBytes), 17));
+      const corrupt = utf8.encode(`tree ${"z".repeat(40)}\n\n`);
+      db.run(
+        "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'commit', ?, 'raw')",
+        checkout.repoId,
+        oid,
+        corrupt.length,
+      );
+      db.run(
+        "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+        checkout.repoId,
+        oid,
+        corrupt,
+      );
+      seedMark(db, checkout.repoId, [{ oid }]);
+      db.storage.histogram = new Map();
+
+      expect(() => advanceMaintenanceReachability(store.shared)).toThrowError(
+        expect.objectContaining({
+          code: "ECORRUPT",
+          message: expect.stringContaining("malformed tree oid"),
+        }),
+      );
+      const queries = [...db.storage.histogram.keys()].join("\n");
+      expect(queries).toContain("maintenance-loose-headers");
+      expect(queries).not.toContain("git_pack_data");
+      expect(
+        db.scalar<number>(
+          "SELECT expanded FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
+          checkout.repoId,
+          oid,
+        ),
+      ).toBe(0);
+      store.shared.memory.assertIdle();
+    });
   });
 
   it("promotes an expanded physical mark to logical exactly once and requeues it", () => {

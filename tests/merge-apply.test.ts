@@ -13,6 +13,7 @@ import type { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/store.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
 
 function commit(repo: Repository, digit: string): string {
@@ -161,6 +162,32 @@ describe("projected merge apply", () => {
     expect(textAt(workspace, "small.txt")).toBe("next\n");
   });
 
+  it("reads one valid merge blob above the batching target as a singleton", () => {
+    const workspace = makeRepo();
+    seedFile(workspace, "large.bin", "old\n");
+    const content = new Uint8Array(PACK_BLOB_BATCH_TARGET_BYTES + 1).fill(0x61);
+    const next = { mode: "100644", oid: workspace.repo.store.write("blob", content) };
+    const entries: readonly ProjectedMergeEntry[] = [
+      {
+        path: "large.bin",
+        logicalPath: "large.bin",
+        purpose: "primary",
+        stageZero: next,
+        stages: null,
+        worktree: next,
+        content: null,
+      },
+    ];
+
+    const result = workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
+    );
+
+    expect(result).toEqual({ outcome: "clean", journal: null });
+    expect(workspace.worktree.readFile("/large.bin")).toEqual(content);
+    workspace.repo.store.memory.assertIdle();
+  });
+
   it("applies content one byte past the former standalone ceiling", () => {
     const workspace = makeRepo();
     const entries: ProjectedMergeEntry[] = [];
@@ -248,7 +275,7 @@ describe("projected merge apply", () => {
         ),
       );
       expect(result.outcome).toBe("ready");
-      expect(exactOwner.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
       expect(exactPayloadReads).toBeGreaterThan(0);
       expect(exactSnapshotReads).toBeGreaterThan(0);
       expect(exactIndexApplies).toBeGreaterThan(0);
@@ -305,8 +332,19 @@ describe("projected merge apply", () => {
 
   it("admits restore payloads before reading and rolls back exact aggregate excess", () => {
     const measured = readyAbortFixture();
+    const calibration = measured.workspace.repo.store.reserveMemory();
+    calibration.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
     const measuredOwner = measured.workspace.repo.store.reserveMemory();
     measuredOwner.set("other", measured.journal.retainedBytes);
+    const measuredReadBlobs = measured.workspace.repo.readBlobs.bind(measured.workspace.repo);
+    let readAdmissionBytes = 0;
+    measured.workspace.repo.readBlobs = (oids, options) => {
+      readAdmissionBytes = Math.max(
+        readAdmissionBytes,
+        measuredOwner.highWaterBytes - measured.journal.retainedBytes,
+      );
+      return measuredReadBlobs(oids, options);
+    };
     measured.workspace.repo.store.db.transactionSync(() =>
       abortProjectedMerge(
         measured.workspace.repo,
@@ -315,9 +353,14 @@ describe("projected merge apply", () => {
         measuredOwner,
       ),
     );
-    const transientBytes = measuredOwner.highWaterBytes - measuredOwner.currentBytes;
+    const transientBytes =
+      measured.workspace.repo.store.memory.highWaterBytes -
+      calibration.currentBytes -
+      measuredOwner.currentBytes;
     expect(transientBytes).toBeGreaterThan(0);
+    expect(readAdmissionBytes).toBeGreaterThan(0);
     measuredOwner.dispose();
+    calibration.dispose();
     measured.workspace.repo.store.memory.assertIdle();
 
     const exact = readyAbortFixture();
@@ -355,7 +398,7 @@ describe("projected merge apply", () => {
       expect(exactPayloadReads).toBeGreaterThan(0);
       expect(exactRestoreWrites).toBeGreaterThan(0);
       expect(exactIndexRestores).toBeGreaterThan(0);
-      expect(exactOwner.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
     } finally {
       exactOwner.dispose();
     }
@@ -363,7 +406,7 @@ describe("projected merge apply", () => {
 
     const excess = readyAbortFixture();
     const excessOwner = excess.workspace.repo.store.reserveMemory();
-    excessOwner.set("other", MAX_OPERATION_MEMORY_BYTES - transientBytes + 1);
+    excessOwner.set("other", MAX_OPERATION_MEMORY_BYTES - readAdmissionBytes + 1);
     const excessReadBlobs = excess.workspace.repo.readBlobs.bind(excess.workspace.repo);
     const excessWriteFiles = excess.workspace.worktree.writeFiles.bind(excess.workspace.worktree);
     const excessIndexApply = excess.workspace.repo.checkout.indexApply.bind(
@@ -399,10 +442,10 @@ describe("projected merge apply", () => {
       expect(excessRestoreWrites).toBe(0);
       expect(excessIndexRestores).toBe(0);
       expect(textAt(excess.workspace, "owned.txt")).toBe("next\n");
-      expect(excess.workspace.repo.checkout.readMergeState()).not.toBeNull();
     } finally {
       excessOwner.dispose();
     }
+    expect(excess.workspace.repo.checkout.readMergeState()).not.toBeNull();
     excess.workspace.repo.store.memory.assertIdle();
   });
 

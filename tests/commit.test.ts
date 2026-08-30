@@ -312,6 +312,21 @@ describe("history", () => {
 });
 
 describe("explicit-parent commit seam", () => {
+  it("serializes a commit above the former 1 MiB validity threshold", () => {
+    const workspace = makeRepo("/");
+    workspace.context.defaultIdentity = FIXTURE_IDENTITY;
+    const message = "m".repeat(1024 * 1024 + 1);
+
+    const result = writeUnpublishedCommit(workspace.repo, {
+      message,
+      parent: [],
+      identities: resolveIdentity(workspace.context, workspace.repo, {}),
+    });
+
+    expect(workspace.repo.readCommit(result.oid).message).toBe(message);
+    workspace.repo.store.memory.assertIdle();
+  });
+
   it("writes an authoritative commit without changing any ref", () => {
     const repo = mirror();
     repo.write("a.txt", "one\n");
@@ -684,7 +699,7 @@ describe("identity", () => {
     ).toThrow(/identity unknown/);
   });
 
-  it("pre-admits a long configured identity before its payload at the exact boundary", () => {
+  it("pre-admits a long configured identity before its payload and cleans up", () => {
     const configuredName = `Configured ${"x".repeat(220 * 1024)}`;
     const configuredEmail = "configured@example.com";
     const prepare = (): TestRepository => {
@@ -703,7 +718,7 @@ describe("identity", () => {
     let configPeakBytes: number | undefined;
     const measuredContext = trackerOnlyContext(measured);
     measuredContext.now = () => {
-      configPeakBytes = measured.repo.store.memory.highWaterBytes;
+      configPeakBytes = measured.repo.store.memory.totalBytes;
       throw stopAfterIdentity;
     };
     expect(() => commit(measuredContext, measured.repo, { message: "configured" })).toThrow(
@@ -713,11 +728,11 @@ describe("identity", () => {
     measured.repo.store.memory.assertIdle();
     if (configPeakBytes === undefined) throw new Error("configured identity was not resolved");
 
-    for (const excess of [0, 1]) {
+    for (const blocked of [false, true]) {
       const workspace = prepare();
       const before = publicationState(workspace);
       const blocker = workspace.repo.store.reserveMemory();
-      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - configPeakBytes + excess);
+      if (blocked) blocker.set("other", MAX_OPERATION_MEMORY_BYTES - configPeakBytes);
       const histogram = new Map<string, number>();
       workspace.storage.histogram = histogram;
       workspace.storage.resetCounters();
@@ -738,14 +753,14 @@ describe("identity", () => {
       let result: ReturnType<typeof commit> | undefined;
       try {
         const publish = () => commit(context, workspace.repo, { message: "configured" });
-        if (excess === 0) result = publish();
-        else expect(publish).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        if (blocked) expect(publish).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        else result = publish();
       } finally {
         blocker.dispose();
       }
       workspace.repo.store.memory.assertIdle();
 
-      if (excess === 0) {
+      if (!blocked) {
         expect(releasedAtIdentity).toBe(true);
         expect(result?.oid).toBe(workspace.repo.head().oid);
         expect(workspace.repo.readCommit(result?.oid ?? "").author.name).toBe(configuredName);

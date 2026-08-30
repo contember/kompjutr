@@ -517,32 +517,46 @@ describe("concurrent pack ownership", () => {
     ).toEqual([{ pack_id: winner.packId, state: "complete" }]);
   });
 
-  it("rejects reentrant deletion that would overlap the ingest memory owner", async () => {
+  it("allows reentrant deletion when the actual memory owners fit", async () => {
     const opened = createStore();
     const retained = utf8.encode("retained during reentrant deletion\n");
+    const published = utf8.encode("reentrant publication\n");
     const first = await opened.store.packs.ingest(slices(fullObjectPack([retained]), 64));
+    let deleted = 0;
     opened.storage.resetCounters();
-    await expect(
-      opened.store.packs.ingest(
-        slices(fullObjectPack([utf8.encode("reentrant publication\n")]), 64),
-        {
-          lifecycle: {
-            reserved() {},
-            published() {
-              opened.store.packs.deleteCompletePacks([first.packId]);
-            },
-          },
+    const second = await opened.store.packs.ingest(slices(fullObjectPack([published]), 64), {
+      lifecycle: {
+        reserved() {},
+        published() {
+          deleted = opened.store.packs.deleteCompletePacks([first.packId]);
         },
-      ),
-    ).rejects.toMatchObject({ code: "E2BIG" });
+      },
+    });
+    expect(deleted).toBe(1);
+    expect(second.packId).toBe(first.packId + 1);
     expect(opened.storage.statementCount).toBeLessThan(1_000);
     expect(opened.store.packs.lastIngestMemoryHighWater).toBeLessThanOrEqual(
       MAX_OPERATION_MEMORY_BYTES,
     );
-    expect(opened.store.read(hashObject("blob", retained))?.data).toEqual(retained);
+    expect(opened.store.read(hashObject("blob", retained))).toBeNull();
+    expect(opened.store.read(hashObject("blob", published))?.data).toEqual(published);
+    opened.store.shared.memory.assertIdle();
+
     const cold = reopenStore(opened.storage);
-    expect(cold.store.packs.reclaimPending()).toBe(1);
     expect(cold.store.packs.reclaimPending()).toBe(0);
+    expect(cold.store.packs.reclaimPending()).toBe(0);
+    expect(cold.store.read(hashObject("blob", retained))).toBeNull();
+    expect(cold.store.read(hashObject("blob", published))?.data).toEqual(published);
+    expect(cold.store.packs.completePackMatches(second.packId, [blobMembership(published)])).toBe(
+      true,
+    );
+    expect(
+      cold.db.all<{ pack_id: number; state: string }>(
+        "SELECT pack_id, state FROM git_pack_meta WHERE repo_id = ? ORDER BY pack_id",
+        cold.store.sharedRepoId,
+      ),
+    ).toEqual([{ pack_id: second.packId, state: "complete" }]);
+    cold.store.shared.memory.assertIdle();
   });
 
   it("reports ESTALE when a reentrant progress callback expires and reclaims its lease", async () => {

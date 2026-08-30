@@ -14,7 +14,7 @@ import {
   iterateIndexTrackerDirty,
   readIndexTrackerState,
 } from "../src/sqlite/index-tracker.js";
-import { MAX_BLOB_BATCH_BYTES, WALK_TREE_SQL } from "../src/sqlite/store.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, WALK_TREE_SQL } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
@@ -217,14 +217,14 @@ describe("clone initial-state fast path", () => {
     }
   });
 
-  it("rolls back a late oversized batch and completes through ordinary checkout", async () => {
+  it("keeps a late blob above the batching target on the initial clone path", async () => {
     const fixture = new GitFixture().init();
     for (let index = 0; index < 1_100; index++) {
       fixture.write(`file-${String(index).padStart(4, "0")}.txt`, "same\n");
     }
-    const large = randomBytes(MAX_BLOB_BATCH_BYTES + 1);
+    const large = randomBytes(PACK_BLOB_BATCH_TARGET_BYTES + 1);
     fixture.write("zz-large.bin", large);
-    fixture.commit("late oversized blob");
+    fixture.commit("late blob above batching target");
     const server = await startGitServer(fixture.dir);
     const storage = new RecordingStorage();
     const workspace = makeRuntime(storage);
@@ -237,7 +237,11 @@ describe("clone initial-state fast path", () => {
       expect(await workspace.fs.readFile("/repo/file-0000.txt", "utf8")).toBe("same\n");
       expect(await workspace.fs.readFile("/repo/zz-large.bin")).toEqual(large);
       expect(count(workspace, "git_index")).toBe(1_101);
-      expect(storage.walkStatements).toBe(4);
+      expect(storage.walkStatements).toBe(1);
+      expect(readIndexTrackerState(workspace.db, repoId(workspace))).toEqual({
+        available: true,
+        baselineTreeOid: fixture.git("rev-parse", "HEAD^{tree}"),
+      });
       expect(await git.status({ dir: "/repo" })).toEqual([]);
     } finally {
       await server.close();

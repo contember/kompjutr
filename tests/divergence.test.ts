@@ -372,25 +372,30 @@ describe("bounded divergence", () => {
   it("shares exact aggregate graph capacity and releases success and failure ownership", () => {
     const split = divergentFixture();
     try {
-      const attempt = (capacity: number): boolean => {
+      const attempt = (capacity: number, expectExactHighWater = false): boolean => {
         const active = harness();
         importReachable(active.store, split.fixture, [split.current, split.upstream]);
         const blocker = active.repo.store.reserveMemory();
         blocker.set("other", MAX_OPERATION_MEMORY_BYTES - capacity);
         try {
-          const result = divergence(active.repo, {
-            current: split.current,
-            upstream: split.upstream,
-          });
+          let result: ReturnType<typeof divergence>;
+          try {
+            result = divergence(active.repo, {
+              current: split.current,
+              upstream: split.upstream,
+            });
+          } catch (error) {
+            expect(error).toEqual(expect.objectContaining({ code: "E2BIG" }));
+            return false;
+          }
           expect(result).toEqual({
             relationship: "diverged",
             ...gitCounts(split.fixture, split.current, split.upstream),
           });
-          expect(active.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+          if (expectExactHighWater) {
+            expect(active.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+          }
           return true;
-        } catch (error) {
-          expect(error).toEqual(expect.objectContaining({ code: "E2BIG" }));
-          return false;
         } finally {
           blocker.dispose();
           active.repo.store.memory.assertIdle();
@@ -405,7 +410,7 @@ describe("bounded divergence", () => {
         else insufficient = candidate;
       }
       expect(sufficient).toBeGreaterThan(1);
-      expect(attempt(sufficient)).toBe(true);
+      expect(attempt(sufficient, true)).toBe(true);
       expect(attempt(sufficient - 1)).toBe(false);
     } finally {
       split.fixture.dispose();

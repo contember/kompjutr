@@ -13,10 +13,12 @@ import {
   MAX_REPLAY_REVISION_HOPS,
   planFixedReplayStep,
   planReplay,
+  preflightReplayCommitObjects,
 } from "../src/core/ops/replay.js";
 import { Repository } from "../src/core/repository.js";
 import { retainedStringBytes } from "../src/core/retained.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { commitPreparationTransientBytes } from "../src/sqlite/commits.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
@@ -639,6 +641,21 @@ describe("one-commit replay planner", () => {
     store.shared.memory.assertIdle();
   });
 
+  it("parses and preflights a commit above the former 1 MiB validity threshold", () => {
+    const { store, repo } = harness();
+    const unchanged = tree(store, "same\n");
+    const parent = commit(store, unchanged.tree, [], "parent");
+    const source = commit(store, unchanged.tree, [parent], "x".repeat(1024 * 1024 + 1));
+
+    const preflight = preflightReplayCommitObjects(repo, [source]);
+    const plan = planReplay(repo, { kind: "cherry-pick", source, currentOid: parent });
+
+    expect(preflight.bytes).toBeGreaterThan(1024 * 1024);
+    expect(plan.sourceCommit.message.length).toBeGreaterThan(1024 * 1024);
+    plan.integration.release();
+    store.shared.memory.assertIdle();
+  });
+
   it("admits the exact first commit payload and rejects one excess byte before reading it", () => {
     const { store, repo } = harness();
     const unchanged = tree(store, "same\n");
@@ -646,12 +663,13 @@ describe("one-commit replay planner", () => {
     const source = commit(store, unchanged.tree, [parent], "source");
     const metadata = store.typeAndSize(parent);
     if (metadata === null) throw new Error("current commit metadata is missing");
-    const exactCallerBytes = MAX_OPERATION_MEMORY_BYTES - 1_024 - (4_096 + metadata.size * 6);
-    const originalRead = repo.read.bind(repo);
+    const exactCallerBytes =
+      MAX_OPERATION_MEMORY_BYTES - 1_024 - commitPreparationTransientBytes(metadata.size);
+    const originalRead = store.readAuthenticatedObject.bind(store);
     let reads = 0;
-    repo.read = (oid) => {
+    store.readAuthenticatedObject = (oid, expectedType) => {
       reads++;
-      return originalRead(oid);
+      return originalRead(oid, expectedType);
     };
 
     expectCode(

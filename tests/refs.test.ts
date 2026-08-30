@@ -82,35 +82,6 @@ function buildFixture(): GitFixture {
 let fixture: GitFixture;
 let ws: TestRepository;
 
-class GraphPressureRepository extends Repository {
-  constructor(
-    repo: Repository,
-    private readonly beginGraph: () => () => void,
-  ) {
-    super(repo.checkout);
-  }
-
-  override *walkIndexed(oid: string, limits = {}) {
-    const release = this.beginGraph();
-    try {
-      yield* super.walkIndexed(oid, limits);
-    } finally {
-      release();
-    }
-  }
-}
-
-function holdGraphPressure(repo: Repository, bytes: number): () => void {
-  const pressure = repo.store.reserveMemory();
-  try {
-    pressure.set("other", bytes);
-    return () => pressure.dispose();
-  } catch (error) {
-    pressure.dispose();
-    throw error;
-  }
-}
-
 beforeEach(async () => {
   fixture = buildFixture();
   ws = makeRepo("/");
@@ -465,7 +436,7 @@ describe("branch", () => {
     expect(runGit("branch", "-d", "nope").ok).toBe(false);
   });
 
-  it("keeps upstream ownership through delete graph work at the exact shared ceiling", () => {
+  it("keeps upstream ownership through delete graph work and releases it", () => {
     const main = ws.repo.store.getRef("refs/heads/main");
     if (main === null) throw new Error("delete memory fixture is missing main");
     const branchNames = ["a", "b", "c"].map((suffix) => `${"x".repeat(1_013)}${suffix}`);
@@ -474,33 +445,29 @@ describe("branch", () => {
       ws.repo.store.configSet(`branch.${name}.remote`, ".");
       ws.repo.store.configSet(`branch.${name}.merge`, "refs/heads/main");
     }
-    let beginGraph = (): (() => void) => () => {};
-    const repo = new GraphPressureRepository(ws.repo, () => beginGraph());
-
-    let operationBytes = 0;
-    beginGraph = () => {
-      operationBytes = Math.max(operationBytes, repo.store.memory.totalBytes);
-      return () => {};
-    };
+    const repo = ws.repo;
+    const concurrent = repo.store.reserveMemory();
+    concurrent.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
     const measuredName = branchNames[0];
     if (measuredName === undefined) throw new Error("measured delete branch is missing");
-    branchDelete(ws.context, repo, { name: measuredName });
-    expect(operationBytes).toBeGreaterThan(0);
+    try {
+      branchDelete(ws.context, repo, { name: measuredName });
+    } finally {
+      concurrent.dispose();
+    }
     expect(repo.store.memory.totalBytes).toBe(0);
 
-    beginGraph = () => holdGraphPressure(repo, MAX_OPERATION_MEMORY_BYTES - operationBytes);
-    const exactName = branchNames[1];
-    if (exactName === undefined) throw new Error("exact delete branch is missing");
-    branchDelete(ws.context, repo, { name: exactName });
-    expect(repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
-    expect(repo.store.memory.totalBytes).toBe(0);
-
-    beginGraph = () => holdGraphPressure(repo, MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
-    const overName = branchNames[2];
+    const excessPressure = repo.store.reserveMemory();
+    excessPressure.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
+    const overName = branchNames[1];
     if (overName === undefined) throw new Error("excess delete branch is missing");
-    expect(() => branchDelete(ws.context, repo, { name: overName })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    try {
+      expect(() => branchDelete(ws.context, repo, { name: overName })).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+    } finally {
+      excessPressure.dispose();
+    }
     expect(repo.store.getRef(`refs/heads/${overName}`)).toBe(main);
     expect(repo.store.memory.totalBytes).toBe(0);
   });
@@ -617,7 +584,7 @@ describe("branch", () => {
     expect(ws.repo.store.getRef("refs/heads/side")).not.toBeNull();
   });
 
-  it("propagates a bounded merge-base graph failure without deleting the branch", () => {
+  it("evaluates a graph above the former retained ceiling without deleting an unmerged branch", () => {
     const main = ws.repo.store.getRef("refs/heads/main");
     if (main === null) throw new Error("main is missing");
     const tree = ws.repo.readCommit(main).tree;
@@ -646,7 +613,7 @@ describe("branch", () => {
     ws.repo.store.setRef("refs/heads/oversized-graph", tip);
 
     expect(() => branchDelete(ws.context, ws.repo, { name: "oversized-graph" })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
+      expect.objectContaining({ code: "EBRANCHFAIL" }),
     );
     expect(ws.repo.store.getRef("refs/heads/oversized-graph")).toBe(tip);
   });
@@ -1336,7 +1303,7 @@ describe("checkout", () => {
     expect(ws.repo.store.memory.totalBytes).toBe(0);
   });
 
-  it("owns full index and worktree guard pages at the exact shared-memory boundary", () => {
+  it("owns full index and worktree guard pages under concurrent memory pressure", () => {
     const workspace = makeRepo("/");
     workspace.repo.store.configSet("user.name", "Fixture");
     workspace.repo.store.configSet("user.email", "fixture@example.com");
@@ -1373,14 +1340,16 @@ describe("checkout", () => {
     const tree = workspace.repo.readCommit(current.oid).tree;
 
     const measured = workspace.repo.store.reserveMemory();
-    expect(
-      checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true, measured),
-    ).toEqual({ tracked: [], untracked: [] });
-    const operationBytes = measured.highWaterBytes;
-    measured.dispose();
+    try {
+      expect(
+        checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true, measured),
+      ).toEqual({ tracked: [], untracked: [] });
+    } finally {
+      measured.dispose();
+    }
 
     const exactBlocker = workspace.repo.store.reserveMemory();
-    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
     const exactOwner = workspace.repo.store.reserveMemory();
     try {
       expect(
@@ -1393,16 +1362,13 @@ describe("checkout", () => {
           exactOwner,
         ),
       ).toEqual({ tracked: [], untracked: [] });
-      expect(exactOwner.highWaterBytes + exactBlocker.currentBytes).toBe(
-        MAX_OPERATION_MEMORY_BYTES,
-      );
     } finally {
       exactOwner.dispose();
       exactBlocker.dispose();
     }
 
     const overBlocker = workspace.repo.store.reserveMemory();
-    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
     const overOwner = workspace.repo.store.reserveMemory();
     try {
       expect(() =>

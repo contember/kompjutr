@@ -1,7 +1,7 @@
 // Bounded create-only materialisation shared by clone and an eligible first
 // standalone checkout. Publication stays with the caller.
 
-import { type InitialStateSession, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { type InitialStateSession, PACK_BLOB_BATCH_TARGET_BYTES } from "../../sqlite/store.js";
 import { fromHex } from "../bytes.js";
 import type { GitContext, IndexTrackerSeedEntry, InitialWorktreeSession } from "../context.js";
 import { CorruptError } from "../errors.js";
@@ -10,7 +10,7 @@ import { fileModeFor } from "../worktree.js";
 import { type TargetEntry, treeStream } from "./tree-stream.js";
 
 const INITIAL_WINDOW_ROWS = 1_000;
-const INITIAL_BLOB_BYTES = MAX_BLOB_BATCH_BYTES;
+const INITIAL_BLOB_BYTES = PACK_BLOB_BATCH_TARGET_BYTES;
 const INITIAL_SMALL_FILE_BYTES = 1024 * 1024;
 const INITIAL_TRACKER_BYTES = 4 * 1024 * 1024;
 const INITIAL_TRACKER_FIXED_BYTES = 64 * 1024;

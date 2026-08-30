@@ -6,6 +6,7 @@ import {
   type GitHttpRequest,
 } from "../src/core/protocol/transport.js";
 import { createGit, type FetchRefspec, type Git } from "../src/index.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, startGitServer } from "./helpers/http-backend.js";
 import { reopenTestRepository } from "./helpers/repository-invariants.js";
@@ -16,6 +17,7 @@ let server: GitServer;
 let baseOid: string;
 let tipOid: string;
 let blobOid: string;
+let oversizedBlobOid: string;
 const TEST_TIME = 1_700_000_000_000;
 
 beforeAll(async () => {
@@ -25,7 +27,12 @@ beforeAll(async () => {
   fixture.write("tip.txt", "tip\n");
   tipOid = fixture.commit("tip");
   blobOid = fixture.git("hash-object", "-w", "base.txt");
+  oversizedBlobOid = fixture.writeObject(
+    "blob",
+    new Uint8Array(PACK_BLOB_BATCH_TARGET_BYTES + 1).fill(0x61),
+  );
   fixture.git("update-ref", "refs/blobs/base", blobOid);
+  fixture.git("update-ref", "refs/blobs/oversized", oversizedBlobOid);
   fixture.git("update-ref", "refs/checkpoints/base", baseOid);
   fixture.git("update-ref", "refs/heads/team/\ue000", baseOid);
   fixture.git("update-ref", "refs/heads/team/\u{10000}", tipOid);
@@ -196,6 +203,25 @@ describe("mapped fetch refspecs", () => {
     expect(workspace.repo.store.getRef("refs/tags/release")).toBe(tagOid);
     expect(workspace.repo.store.has(tipOid)).toBe(true);
     expect(requestsSince(before).filter((request) => request.method === "POST")).toHaveLength(1);
+  });
+
+  it("authenticates a mapped root above the object batching target as a singleton", async () => {
+    const { workspace, git } = configured();
+
+    await expect(
+      git.fetch({
+        refspecs: [{ source: "refs/blobs/oversized", destination: "refs/snapshots/oversized" }],
+      }),
+    ).resolves.toMatchObject({
+      mode: "mapped",
+      updates: [{ destination: "refs/snapshots/oversized", oid: oversizedBlobOid }],
+    });
+
+    expect(workspace.repo.store.getRef("refs/snapshots/oversized")).toBe(oversizedBlobOid);
+    expect(workspace.repo.read(oversizedBlobOid).data).toHaveLength(
+      PACK_BLOB_BATCH_TARGET_BYTES + 1,
+    );
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("rejects a corrupt loose peeled-target shadow during tag-chain authentication", async () => {

@@ -5,11 +5,12 @@ import { describe, expect, it } from "vitest";
 import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
+import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { retainedStringBytes } from "../src/core/retained.js";
 import { deflate } from "../src/core/zlib.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
-import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
+import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/sqlite/blob-id-cache.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
 import {
   MAX_BLOB_ID_CACHE_ROWS,
@@ -26,10 +27,9 @@ import {
   configGetOwned,
   contentIdKey,
   createRefMutationMemoryOwner,
-  MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
   MAX_CONFIG_SECTION_MOVE_ROWS,
-  MAX_CONFIG_SECTION_MOVE_TEXT_BYTES,
   MAX_REF_MUTATION_RETAINED_BYTES,
+  PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
   type StoreOptions,
   writeBatchOwned,
@@ -646,31 +646,126 @@ describe("blob id batches", () => {
     expect(db.storage.rowCount).toBe(3);
   });
 
-  it("bounds all expected and returned identity state before SQL", () => {
-    const { db, store } = open();
+  it("preserves absolute mismatch ordinals around oversized uncached ids", () => {
+    const { store } = open();
+    const oversized = new Uint8Array(BLOB_ID_CACHE_ELIGIBILITY_BYTES + 1).fill(9);
+    const cacheable = new Uint8Array([1, 2, 3]);
+    const storedOid = "1".repeat(40);
+    const expectedOid = "2".repeat(40);
+    store.upsertBlobIds([{ contentId: cacheable, oid: storedOid }]);
+
+    expect(
+      store.blobIdMismatches([
+        { contentId: oversized, oid: "3".repeat(40) },
+        { contentId: cacheable, oid: expectedOid },
+      ]),
+    ).toEqual(
+      new Map([
+        [0, null],
+        [1, storedOid],
+      ]),
+    );
+    expect(
+      store.blobIdMismatches([
+        { contentId: cacheable, oid: expectedOid },
+        { contentId: oversized, oid: "3".repeat(40) },
+      ]),
+    ).toEqual(
+      new Map([
+        [1, null],
+        [0, storedOid],
+      ]),
+    );
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("snapshots yielded cacheable ids and does not retain oversized mismatch inputs", () => {
+    const { store } = open();
+    const first = new Uint8Array([1, 2, 3]);
+    const second = new Uint8Array([4, 5, 6]);
+    const firstKey = contentIdKey(first);
+    const secondKey = contentIdKey(second);
+    const firstOid = "1".repeat(40);
+    const secondOid = "2".repeat(40);
+    const replacementOid = "3".repeat(40);
+    store.upsertBlobIds(
+      (function* () {
+        yield { contentId: first, oid: firstOid };
+        first.fill(9);
+        yield { contentId: second, oid: secondOid };
+        second.fill(8);
+        yield { contentId: new Uint8Array([1, 2, 3]), oid: replacementOid };
+      })(),
+    );
+
+    const lookup = new Uint8Array([1, 2, 3]);
+    expect(
+      store.lookupBlobIds(
+        (function* () {
+          yield lookup;
+          lookup.fill(7);
+        })(),
+      ),
+    ).toEqual(new Map([[firstKey, replacementOid]]));
+
+    const expected = new Uint8Array([4, 5, 6]);
+    expect(
+      store.blobIdMismatches(
+        (function* () {
+          yield { contentId: expected, oid: secondOid };
+          expected.fill(6);
+        })(),
+      ),
+    ).toEqual(new Map());
+    expect(store.lookupBlobIds([new Uint8Array([4, 5, 6])])).toEqual(
+      new Map([[secondKey, secondOid]]),
+    );
+
+    const oversized = new Uint8Array(8 * 1024 * 1024).fill(5);
+    expect(store.blobIdMismatches([{ contentId: oversized, oid: firstOid }])).toEqual(
+      new Map([[0, null]]),
+    );
+    expect(store.shared.memory.highWaterBytes).toBeLessThan(oversized.length);
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("charges expected and returned identity maps exactly and releases every path", () => {
     const oid = "1".repeat(40);
-    const full = new Uint8Array(MAX_CACHED_CONTENT_ID_BYTES);
-    const emptyCost = blobIdMismatchRetainedBytes({ contentId: new Uint8Array(0), oid });
-    const fullCost = blobIdMismatchRetainedBytes({ contentId: full, oid });
-    const prefixLength = Math.floor(MAX_BLOB_ID_MISMATCH_RETAINED_BYTES / fullCost);
-    const prefix = Array.from({ length: prefixLength }, () => ({ contentId: full, oid }));
-    const lastLength = MAX_BLOB_ID_MISMATCH_RETAINED_BYTES - prefix.length * fullCost - emptyCost;
-    expect(lastLength).toBeGreaterThan(0);
-    expect(lastLength).toBeLessThanOrEqual(MAX_CACHED_CONTENT_ID_BYTES);
-    const exact = [...prefix, { contentId: new Uint8Array(lastLength), oid }];
-    expect(exact.reduce((bytes, mapping) => bytes + blobIdMismatchRetainedBytes(mapping), 0)).toBe(
-      MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
-    );
+    const mappings = Array.from({ length: 2_048 }, (_, index) => ({
+      contentId: new Uint8Array([index & 0xff, index >>> 8]),
+      oid,
+    }));
 
-    db.storage.resetCounters();
-    expect(store.blobIdMismatches(exact).size).toBe(exact.length);
-    expect(db.storage.statementCount).toBeLessThan(1_000);
-
-    db.storage.resetCounters();
-    expect(() => store.blobIdMismatches([...exact, { contentId: new Uint8Array(0), oid }])).toThrow(
-      /comparison state exceeds/,
+    const measured = open();
+    expect(measured.store.blobIdMismatches(mappings).size).toBe(mappings.length);
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(
+      mappings.reduce((bytes, mapping) => bytes + blobIdMismatchRetainedBytes(mapping), 0),
     );
-    expect(db.storage.statementCount).toBe(0);
+    assertMemoryCoordinatorIdle(measured.store);
+
+    const exact = open();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(exact.store.blobIdMismatches(mappings).size).toBe(mappings.length);
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
+
+    const excess = open();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => excess.store.blobIdMismatches(mappings)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+    } finally {
+      excessBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(excess.store);
   });
 
   it("rejects invalid expected identities and fails closed on corrupt mappings", () => {
@@ -679,7 +774,7 @@ describe("blob id batches", () => {
     expect(() => store.blobIdMismatches([{ contentId, oid: "not-an-oid" }])).toThrow(
       /invalid blob oid/,
     );
-    const longId = new Uint8Array(MAX_CACHED_CONTENT_ID_BYTES + 1).fill(7);
+    const longId = new Uint8Array(BLOB_ID_CACHE_ELIGIBILITY_BYTES + 1).fill(7);
     store.upsertBlobIds([{ contentId: longId, oid: "1".repeat(40) }]);
     expect(store.db.scalar<number>("SELECT count(*) FROM git_blob_ids")).toBe(0);
     expect(store.lookupBlobIds([longId])).toEqual(new Map());
@@ -795,16 +890,20 @@ describe("blob id batches", () => {
 });
 
 describe("loose objects", () => {
-  it("rejects an oversized tree name while the parser field is growing", () => {
+  it("accepts a tree name above the removed parser cache threshold", () => {
     const { store } = open();
+    const name = "a".repeat(2_201);
     const data = concat([
       utf8.encode("100644 "),
-      new Uint8Array(2_201).fill(0x61),
+      utf8.encode(name),
       new Uint8Array([0]),
       new Uint8Array(20),
     ]);
-    expect(() => store.write("tree", data)).toThrow(/entry name is too long/);
-    expect(store.objectCount()).toBe(0);
+    const oid = store.write("tree", data);
+    expect(store.objectCount()).toBe(1);
+    expect([...store.walkTree(oid)]).toEqual([
+      { path: name, mode: MODE_FILE, oid: "0".repeat(40) },
+    ]);
   });
 
   it("round-trips through chunked storage", () => {
@@ -849,6 +948,47 @@ describe("loose objects", () => {
     expect(store.read(oid)?.data.length).toBe(data.length);
   });
 
+  it("keeps large scalar, batch, and streamed commits authoritative when cache-ineligible", () => {
+    const person = {
+      name: "Large Commit",
+      email: "large@example.test",
+      timestamp: 1_700_000_000,
+      timezoneOffset: 0,
+    };
+    const data = serializeCommit({
+      tree: "1".repeat(40),
+      parent: [],
+      author: person,
+      committer: person,
+      message: `${"m".repeat(2_100_000)}\n`,
+    });
+    const expectedOid = hashObject("commit", data);
+
+    const scalar = open();
+    expect(scalar.store.write("commit", data)).toBe(expectedOid);
+    expect(scalar.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
+    expect(scalar.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    assertMemoryCoordinatorIdle(scalar.store);
+
+    const batch = open();
+    expect(batch.store.writeObjects((writer) => writer.write("commit", data))).toBe(expectedOid);
+    expect(batch.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
+    expect(batch.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    assertMemoryCoordinatorIdle(batch.store);
+
+    const streamed = open();
+    expect(
+      streamed.store.writeStream("commit", data.length, function* () {
+        for (let offset = 0; offset < data.length; offset += 64 * 1024) {
+          yield data.subarray(offset, offset + 64 * 1024);
+        }
+      }),
+    ).toBe(expectedOid);
+    expect(streamed.store.readAuthenticatedObject(expectedOid, "commit")?.data).toEqual(data);
+    expect(streamed.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    assertMemoryCoordinatorIdle(streamed.store);
+  });
+
   it("resolves unambiguous prefixes only", () => {
     const { store } = open();
     const oid = store.write("blob", new TextEncoder().encode("a"));
@@ -878,7 +1018,7 @@ describe("loose objects", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("returns remaining at object boundaries and rejects no-progress reads", () => {
+  it("returns remaining at object boundaries and admits an oversized first singleton", () => {
     const { store } = open();
     const first = store.write("blob", new Uint8Array(10));
     const second = store.write("blob", new Uint8Array(20));
@@ -887,7 +1027,232 @@ describe("loose objects", () => {
       remaining: [second],
       bytes: 10,
     });
-    expect(() => store.readBlobs([second], { budgetBytes: 10 })).toThrow(/EFBIG|exceeds/);
+    expect(store.readBlobs([second], { budgetBytes: 10 })).toEqual({
+      blobs: new Map([[second, new Uint8Array(20)]]),
+      remaining: [],
+      bytes: 20,
+    });
+  });
+
+  it("reads a valid first object above the pack batching target as one singleton", () => {
+    const { store } = open();
+    const data = new Uint8Array(randomBytes(PACK_BLOB_BATCH_TARGET_BYTES + 1));
+    const oid = store.write("blob", data);
+
+    expect(store.readBlobs([oid], { budgetBytes: 1 })).toEqual({
+      blobs: new Map([[oid, data]]),
+      remaining: [],
+      bytes: data.length,
+    });
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("reads two packed 2.2 MiB objects under an 8 MiB caller target", async () => {
+    const { store } = open();
+    const first = new Uint8Array(randomBytes(2_200_000));
+    const second = new Uint8Array(randomBytes(2_200_000));
+    const firstOid = hashObject("blob", first);
+    const secondOid = hashObject("blob", second);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(2);
+    writer.object("blob", first);
+    writer.object("blob", second);
+    writer.finish();
+    await store.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    const objects = store.readObjects([firstOid, secondOid], { budgetBytes: 8 * 1024 * 1024 });
+    expect([...objects.objects.keys()]).toEqual([firstOid, secondOid]);
+    expect(objects.objects.get(firstOid)).toEqual({ type: "blob", data: first });
+    expect(objects.objects.get(secondOid)).toEqual({ type: "blob", data: second });
+    expect(objects.remaining).toEqual([]);
+    expect(objects.bytes).toBe(first.length + second.length);
+    assertMemoryCoordinatorIdle(store);
+
+    const blobs = store.readBlobs([secondOid, firstOid, secondOid], {
+      budgetBytes: 8 * 1024 * 1024,
+    });
+    expect([...blobs.blobs.keys()]).toEqual([secondOid, firstOid]);
+    expect(blobs.blobs.get(secondOid)).toEqual(second);
+    expect(blobs.blobs.get(firstOid)).toEqual(first);
+    expect(blobs.remaining).toEqual([]);
+    expect(blobs.bytes).toBe(first.length + second.length);
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("owns mixed loose and packed output once through final map assembly", async () => {
+    const db = new TestDatabase();
+    const setupDatabase = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
+    const setup = setupDatabase.openCheckout(
+      setupDatabase.createRepository("/repo", "ref: refs/heads/main"),
+    );
+    const loose = new Uint8Array(randomBytes(300_000));
+    const packed = new Uint8Array(randomBytes(300_001));
+    const looseOid = setup.write("blob", loose);
+    const packedOid = hashObject("blob", packed);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("blob", packed);
+    writer.finish();
+    await setup.packs.ingest(slices(concat(chunks), 64 * 1024));
+
+    const reopen = (): ReturnType<typeof open>["store"] => {
+      const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
+      const checkout = database.findCheckout("/repo");
+      if (checkout === null) throw new Error("mixed object checkout disappeared");
+      return database.openCheckout(checkout);
+    };
+    const read = (store: ReturnType<typeof open>["store"]): void => {
+      expect(store.readObjects([looseOid, packedOid], { budgetBytes: 1024 * 1024 })).toEqual({
+        objects: new Map([
+          [looseOid, { type: "blob", data: loose }],
+          [packedOid, { type: "blob", data: packed }],
+        ]),
+        remaining: [],
+        bytes: loose.length + packed.length,
+      });
+    };
+
+    const current = reopen();
+    read(current);
+    assertMemoryCoordinatorIdle(current);
+  });
+
+  it("owns a large loose delta base once during a packed read", async () => {
+    const db = new TestDatabase();
+    const options: StoreOptions = { chunkBytes: 0, objectCacheBytes: 0 };
+    const setupDatabase = new SqliteGitDatabase(db, options);
+    const setup = setupDatabase.openCheckout(
+      setupDatabase.createRepository("/repo", "ref: refs/heads/main"),
+    );
+    const base = new Uint8Array(4_500_000).fill(0x61);
+    const baseOid = setup.write("blob", base);
+    const target = new Uint8Array([0x62]);
+    const targetOid = hashObject("blob", target);
+    const packChunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => packChunks.push(chunk));
+    writer.header(1);
+    writer.refDelta(
+      baseOid,
+      concat([encodeDeltaHeader(base.length, target.length), new Uint8Array([1]), target]),
+    );
+    writer.finish();
+    await setup.packs.ingest(slices(concat(packChunks), 64 * 1024));
+
+    const reopen = (): ReturnType<typeof open>["store"] => {
+      const database = new SqliteGitDatabase(db, options);
+      const checkout = database.findCheckout("/repo");
+      if (checkout === null) throw new Error("packed read checkout disappeared");
+      return database.openCheckout(checkout);
+    };
+    const run = (store: ReturnType<typeof open>["store"]): void => {
+      expect(store.readBlobs([targetOid], { budgetBytes: 8 * 1024 * 1024 })).toEqual({
+        blobs: new Map([[targetOid, target]]),
+        remaining: [],
+        bytes: target.length,
+      });
+    };
+
+    const current = reopen();
+    run(current);
+    assertMemoryCoordinatorIdle(current);
+  });
+
+  it("validates complete metadata beyond the selected prefix", () => {
+    const { db, store } = open();
+    const present = insertRawBlob(db, 1, new Uint8Array(10));
+    const missing = "f".repeat(40);
+    expect(() => store.readObjects([present, missing], { budgetBytes: 10 })).toThrowError(
+      expect.objectContaining({ code: "ENOTFOUND" }),
+    );
+    assertMemoryCoordinatorIdle(store);
+  });
+
+  it("pre-admits complete object metadata before its query", () => {
+    const wanted = Array.from({ length: 256 }, (_, index) => index.toString(16).padStart(40, "0"));
+    const run = (opened: ReturnType<typeof open>): void => {
+      expect(() => opened.store.readObjects(wanted)).toThrowError(
+        expect.objectContaining({ code: "ENOTFOUND" }),
+      );
+    };
+
+    const measured = open();
+    measured.db.storage.resetCounters();
+    run(measured);
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    expect(measured.db.storage.statementCount).toBe(1);
+    assertMemoryCoordinatorIdle(measured.store);
+
+    const exact = open();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      exact.db.storage.resetCounters();
+      run(exact);
+      expect(exact.db.storage.statementCount).toBe(1);
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
+
+    const excess = open();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      excess.db.storage.resetCounters();
+      expect(() => excess.store.readObjects(wanted)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(excess.db.storage.statementCount).toBe(0);
+    } finally {
+      excessBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(excess.store);
+  });
+
+  it("pre-admits loose rows and payloads before opening the payload cursor", () => {
+    const data = new Uint8Array(randomBytes(900_000));
+    const prepare = (): ReturnType<typeof open> => {
+      const opened = open();
+      insertRawBlob(opened.db, 1, data);
+      return opened;
+    };
+    const run = (opened: ReturnType<typeof open>) =>
+      opened.store.readBlobs([hashObject("blob", data)], { budgetBytes: 2 * 1024 * 1024 });
+
+    const measured = prepare();
+    measured.db.storage.resetCounters();
+    expect(run(measured).blobs.values().next().value).toEqual(data);
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    expect(measured.db.storage.statementCount).toBe(3);
+    assertMemoryCoordinatorIdle(measured.store);
+
+    const exact = prepare();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      exact.db.storage.resetCounters();
+      expect(run(exact).blobs.values().next().value).toEqual(data);
+      expect(exact.db.storage.statementCount).toBe(3);
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
+
+    const excess = prepare();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      excess.db.storage.resetCounters();
+      expect(() => run(excess)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(excess.db.storage.statementCount).toBe(2);
+    } finally {
+      excessBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(excess.store);
   });
 });
 
@@ -3329,24 +3694,89 @@ describe("refs, config and index", () => {
     expect(over.store.configPaths("branch.new.")).toEqual([]);
   });
 
-  it("accepts the exact config section text bound and rejects one more byte", () => {
-    const path = "branch.old.remote";
-    const pathBytes = new TextEncoder().encode(path).byteLength;
-    const exact = open();
-    exact.store.configSet(path, "x".repeat(MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes));
-    exact.store.configMoveSection("branch.old.", "branch.new.");
-    expect(exact.store.configGet("branch.new.remote")?.length).toBe(
-      MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes,
-    );
+  it("pre-admits the bounded config path row before opening its cursor", () => {
+    const prepare = (): ReturnType<typeof open> => {
+      const opened = open();
+      opened.store.configSet("branch.new.remote", "origin");
+      return opened;
+    };
+    const run = (opened: ReturnType<typeof open>): void => {
+      opened.store.configMoveSection("branch.old.", "branch.new.");
+    };
 
-    const over = open();
-    over.store.configSet(path, "x".repeat(MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes + 1));
-    expect(() => over.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(over.store.configGet(path)?.length).toBe(
-      MAX_CONFIG_SECTION_MOVE_TEXT_BYTES - pathBytes + 1,
-    );
+    const measured = prepare();
+    measured.db.storage.resetCounters();
+    expect(() => run(measured)).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    expect(measured.db.storage.statementCount).toBe(1);
+    assertMemoryCoordinatorIdle(measured.store);
+
+    const exact = prepare();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      exact.db.storage.resetCounters();
+      expect(() => run(exact)).toThrowError(expect.objectContaining({ code: "EEXIST" }));
+      expect(exact.db.storage.statementCount).toBe(1);
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
+
+    const excess = prepare();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      excess.db.storage.resetCounters();
+      expect(() => run(excess)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(excess.db.storage.statementCount).toBe(0);
+    } finally {
+      excessBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(excess.store);
+  });
+
+  it("streams config values above the former text cap with exact owner cleanup", () => {
+    const path = "branch.old.remote";
+    const value = "x".repeat(1_100_000);
+    const prepare = (): ReturnType<typeof open> => {
+      const opened = open();
+      opened.store.configSet(path, value);
+      return opened;
+    };
+
+    const measured = prepare();
+    measured.store.configMoveSection("branch.old.", "branch.new.");
+    expect(measured.store.configGet("branch.new.remote")).toBe(value);
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    assertMemoryCoordinatorIdle(measured.store);
+
+    const exact = prepare();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      exact.store.configMoveSection("branch.old.", "branch.new.");
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exact.store.configGet("branch.new.remote")).toBe(value);
+    } finally {
+      exactBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(exact.store);
+
+    const excess = prepare();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => excess.store.configMoveSection("branch.old.", "branch.new.")).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(excess.store.configGet(path)).toBe(value);
+      expect(excess.store.configGet("branch.new.remote")).toBeUndefined();
+    } finally {
+      excessBlocker.dispose();
+    }
+    assertMemoryCoordinatorIdle(excess.store);
   });
 
   it("rejects corrupt config section rows before mutation", () => {

@@ -2,13 +2,11 @@
 // and the ref HEAD points at moves to it.
 
 import type { MemoryReservation } from "../../memory.js";
-import { commitPreparationTransientBytes, MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
 import { snapshotCommitTreeOwned } from "../../sqlite/sparse-workspace.js";
 import {
   configGetOwned,
   createRefMutationMemoryOwner,
   indexScanOwned,
-  mutateRefsOwned,
   type RefMutationMemoryOwner,
   writeObjectsOwned,
 } from "../../sqlite/store.js";
@@ -192,12 +190,22 @@ export function writeUnpublishedCommitFromTree(
   repo: Repository,
   tree: string,
   options: UnpublishedCommitOptions,
+  owningReservation?: MemoryReservation,
 ): string {
-  const data = serializedCommit(options, { mode: "exact", value: options.message }, tree);
-  if (data.length > MAX_INDEXED_COMMIT_BYTES) {
-    throw new GitError("E2BIG", `commit exceeds ${MAX_INDEXED_COMMIT_BYTES} bytes`);
+  const reservation = owningReservation ?? repo.store.reserveMemory();
+  try {
+    return writeObjectsOwned(repo.store, reservation, (batch) =>
+      writeSerializedCommit(
+        batch.write,
+        options,
+        { mode: "exact", value: options.message },
+        tree,
+        reservation,
+      ),
+    );
+  } finally {
+    if (owningReservation === undefined) reservation.dispose();
   }
-  return repo.store.writeObjects((batch) => batch.write("commit", data));
 }
 
 /** Materialize the stage-zero index through one shared object encoder. */
@@ -341,14 +349,9 @@ function publishCommitResult(
 ): CommitResult {
   // A symbolic HEAD on an unborn branch creates the branch here.
   if (expectedHead.ref === null) {
-    mutateRefsOwned(repo.checkout, { head: result.oid }, metadata, owner);
+    repo.mutateRefs({ head: result.oid }, metadata, owner);
   } else {
-    mutateRefsOwned(
-      repo.checkout,
-      { puts: [{ name: expectedHead.ref, target: result.oid }] },
-      metadata,
-      owner,
-    );
+    repo.mutateRefs({ puts: [{ name: expectedHead.ref, target: result.oid }] }, metadata, owner);
   }
   // A false result leaves the prior baseline mismatched, so sparse readers safely use full scans.
   context?.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, result.tree);
@@ -460,18 +463,7 @@ function commitSerializationBytes(
 }
 
 function readCommitOwned(repo: Repository, oid: string, reservation: MemoryReservation): Commit {
-  const metadata = repo.store.typeAndSize(oid);
-  if (metadata === null) return repo.readAuthenticatedCommit(oid);
-  const source = reservation.scope();
-  let retained = false;
-  try {
-    source.set("commit", commitPreparationTransientBytes(metadata.size));
-    const commit = repo.readAuthenticatedCommit(oid);
-    retained = true;
-    return commit;
-  } finally {
-    if (!retained) source.dispose();
-  }
+  return repo.readAuthenticatedCommitOwned(oid, reservation);
 }
 
 function checkedCommitProduct(left: number, right: number): number {
@@ -531,7 +523,7 @@ export function resolveIdentity(
   return completeIdentity(context, amended, sources, config);
 }
 
-function resolveIdentityOwned(
+export function resolveIdentityOwned(
   context: GitContext,
   repo: Repository,
   options: Pick<CommitOptions, "author" | "committer" | "env">,
@@ -546,7 +538,7 @@ function resolveIdentityOwned(
           configGetOwned(repo.store, "user.name", owner),
           configGetOwned(repo.store, "user.email", owner),
         );
-  return completeIdentity(context, amended, sources, config);
+  return ownIdentities(owner, completeIdentity(context, amended, sources, config));
 }
 
 interface IdentitySources {

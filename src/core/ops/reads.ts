@@ -2,6 +2,7 @@
 // `rev-parse`, `ls-tree`, `ls-files` and `cat-file`.
 
 import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
+import { readAuthenticatedObjectOwned } from "../../sqlite/store.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
 import {
   type Commit,
@@ -13,7 +14,7 @@ import {
   type TreeEntry,
   typeForMode,
 } from "../objects.js";
-import type { Repository } from "../repository.js";
+import { type Repository, walkIndexedOwned, walkOwned } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { compileReadPathspec, type LsFilesOptions } from "./pathspec.js";
 
@@ -69,26 +70,31 @@ export function log(
   repo: Repository,
   options: { ref?: string; depth?: number } = {},
 ): CommitView[] {
-  const start =
-    repo.head().oid !== null || options.ref !== undefined ? (options.ref ?? "HEAD") : null;
-  if (start === null) return [];
-  const oid = repo.revParse(start);
-  const bounded = options.depth !== undefined && options.depth <= 256;
-  if (bounded) {
-    const collected: { oid: string; commit: Commit }[] = [];
-    for (const entry of repo.walk(oid)) {
-      collected.push(entry);
-      if (options.depth !== undefined && collected.length >= options.depth) break;
+  const reservation = repo.store.reserveMemory();
+  try {
+    const start =
+      repo.head().oid !== null || options.ref !== undefined ? (options.ref ?? "HEAD") : null;
+    if (start === null) return [];
+    const oid = repo.revParse(start);
+    const bounded = options.depth !== undefined && options.depth <= 256;
+    if (bounded) {
+      const collected: { oid: string; commit: Commit }[] = [];
+      for (const entry of walkOwned(repo, oid, reservation)) {
+        collected.push(entry);
+        if (options.depth !== undefined && collected.length >= options.depth) break;
+      }
+      repo.validateCommitWalk(collected);
+      return collected.map(({ oid: commitOid, commit }) => parsedCommitView(commitOid, commit));
     }
-    repo.validateCommitWalk(collected);
-    return collected.map(({ oid: commitOid, commit }) => parsedCommitView(commitOid, commit));
+    const out: CommitView[] = [];
+    for (const { oid: commitOid, commit } of walkIndexedOwned(repo, oid, reservation)) {
+      out.push(parsedCommitView(commitOid, commit));
+      if (options.depth !== undefined && out.length >= options.depth) break;
+    }
+    return out;
+  } finally {
+    reservation.dispose();
   }
-  const out: CommitView[] = [];
-  for (const { oid: commitOid, commit } of repo.walkIndexed(oid)) {
-    out.push(parsedCommitView(commitOid, commit));
-    if (options.depth !== undefined && out.length >= options.depth) break;
-  }
-  return out;
 }
 
 /**
@@ -101,25 +107,30 @@ export function linearLogRange(
   right: string,
   depth?: number,
 ): CommitView[] {
-  const leftOid = repo.peel(repo.revParse(left));
-  const rightOid = repo.peel(repo.revParse(right));
-  if (leftOid === rightOid) return [];
+  const reservation = repo.store.reserveMemory();
+  try {
+    const leftOid = repo.peel(repo.revParse(left));
+    const rightOid = repo.peel(repo.revParse(right));
+    if (leftOid === rightOid) return [];
 
-  const boundary = repo.shallow();
-  const out: CommitView[] = [];
-  let expected = rightOid;
-  for (const entry of repo.walkIndexed(rightOid)) {
-    if (entry.oid !== expected) throw unsupportedLinearRange();
-    if (entry.oid === leftOid) return out;
-    if (boundary.has(entry.oid) || entry.commit.parent.length !== 1) {
-      throw unsupportedLinearRange();
+    const boundary = repo.shallow();
+    const out: CommitView[] = [];
+    let expected = rightOid;
+    for (const entry of walkIndexedOwned(repo, rightOid, reservation)) {
+      if (entry.oid !== expected) throw unsupportedLinearRange();
+      if (entry.oid === leftOid) return out;
+      if (boundary.has(entry.oid) || entry.commit.parent.length !== 1) {
+        throw unsupportedLinearRange();
+      }
+      if (depth === undefined || out.length < depth) {
+        out.push(parsedCommitView(entry.oid, entry.commit));
+      }
+      expected = entry.commit.parent[0]!;
     }
-    if (depth === undefined || out.length < depth) {
-      out.push(parsedCommitView(entry.oid, entry.commit));
-    }
-    expected = entry.commit.parent[0]!;
+    throw unsupportedLinearRange();
+  } finally {
+    reservation.dispose();
   }
-  throw unsupportedLinearRange();
 }
 
 function unsupportedLinearRange(): GitError {
@@ -253,7 +264,7 @@ function readDirectTreeEntries(
   const source = reservation.scope();
   try {
     source.set("other", directTreeRetainedBytes(metadata.size, prefix.length));
-    const object = repo.store.readAuthenticatedObject(treeOid, "tree");
+    const object = readAuthenticatedObjectOwned(repo.store, treeOid, "tree", source);
     if (object === null) throw new ObjectNotFoundError(treeOid);
     if (object.data.length !== metadata.size) {
       throw new CorruptError("tree source size changed during ls-tree");

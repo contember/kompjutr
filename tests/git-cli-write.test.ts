@@ -17,7 +17,7 @@ import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGitCliRunner } from "../src/git/cli/index.js";
 import { createGitCliWriteHandlers } from "../src/git/cli/write.js";
 import { iterateSqlCursor, type SqlDatabase } from "../src/sqlite/db.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { type GitCommandResult, GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -385,6 +385,31 @@ describe("mutating git CLI handlers", () => {
     });
     expect(actualCommit).toEqual(cliResult(expectedCommit));
     expect(workspace.repo.head().oid).toBe(source.git("rev-parse", "HEAD"));
+  });
+
+  it("summarizes a root blob above the repository batching target", () => {
+    const workspace = nativeRepository();
+    const content = new Uint8Array(PACK_BLOB_BATCH_TARGET_BYTES + 1).fill(0x61);
+    content[0] = 0;
+    workspace.worktree.writeFiles([{ path: "/repo/large.bin", bytes: content }]);
+    const git = runner(workspace.context);
+
+    expect(git.runCli({ argv: ["add", "large.bin"], cwd: "/repo", env: IDENTITY_ENV })).toEqual({
+      stdout: "",
+      stderr: "",
+      exitCode: 0,
+    });
+    const result = git.runCli({
+      argv: ["commit", "-m", "large root"],
+      cwd: "/repo",
+      env: IDENTITY_ENV,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("1 file changed, 0 insertions(+), 0 deletions(-)");
+    expect(result.stdout).toContain("create mode 100644 large.bin");
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("maps missing and outside path operands without changing the index", () => {

@@ -865,9 +865,10 @@ describe("caller-owned push budget", () => {
     const replay = openPushPack(concurrent.repo, concurrentPlan);
     expect((await first.next()).done).toBe(false);
     expect((await replay.next()).done).toBe(false);
-    expect(concurrentOperation.budget.memory("push-pack-first-read")).toBe(packBytes);
-    expect(concurrentOperation.budget.memory("push-pack-replay-read")).toBe(packBytes);
-    expect(concurrentOperation.reservation.currentBytes).toBe(planBytes + 2 * packBytes);
+    const concurrentPackBytes = concurrentOperation.budget.memory("push-pack-first-read");
+    expect(concurrentPackBytes).toBeGreaterThan(0);
+    expect(concurrentOperation.budget.memory("push-pack-replay-read")).toBe(concurrentPackBytes);
+    expect(concurrentOperation.reservation.currentBytes).toBe(planBytes + 2 * concurrentPackBytes);
     disposePushPlan(concurrentPlan);
     expect(() => pushPlanObjectCount(concurrentPlan)).toThrow(
       expect.objectContaining({ code: "EINVAL" }),
@@ -879,7 +880,7 @@ describe("caller-owned push budget", () => {
     );
     await first.return(undefined);
     expect(concurrentOperation.budget.memory("push-pack-first-read")).toBe(0);
-    expect(concurrentOperation.budget.memory("push-pack-replay-read")).toBe(packBytes);
+    expect(concurrentOperation.budget.memory("push-pack-replay-read")).toBe(concurrentPackBytes);
     expect(concurrentOperation.budget.memory("push-plan")).toBe(planBytes);
     await expect(collect(replay)).rejects.toMatchObject({
       code: "EPUSHLOCAL",

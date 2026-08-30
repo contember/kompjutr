@@ -1,7 +1,7 @@
 // Pure content resolution for a bounded three-tree integration plan.
 
 import type { MemoryReservation } from "../../memory.js";
-import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../../sqlite/store.js";
 import {
   DEFAULT_TEXT_MERGE_LIMITS,
   estimateTextMergeMemory,
@@ -31,6 +31,9 @@ const FIXED_CALLER_BYTES = 16 * 1024;
 const INTEGRATION_ENTRY_BYTES = 512;
 const ID_VECTOR_ENTRY_BYTES = 192;
 const BLOB_MAP_ENTRY_BYTES = 128;
+const BLOB_READ_FIXED_BYTES = 640;
+const BLOB_READ_ENTRY_BYTES = 640;
+const BLOB_READ_PAGE = 4_096;
 const EMPTY_BLOB = new Uint8Array();
 const BASE_CONFLICT_MARKER_SIZE = 7;
 
@@ -960,18 +963,53 @@ function planIntegrationInternal(
         if (remaining.length === 0) {
           throw new CorruptError("integration blob batches ended before all candidates resolved");
         }
+        const page = remaining.slice(0, BLOB_READ_PAGE);
+        const info = repo.store.objectInfo(page);
+        let selected = 0;
+        let selectedBytes = 0;
+        while (selected < info.length) {
+          const object = info[selected];
+          const oid = page[selected];
+          if (object === undefined || oid === undefined || object.oid !== oid) {
+            throw new CorruptError("integration blob metadata is incomplete");
+          }
+          if (object.type !== "blob") {
+            throw new CorruptError(`integration object ${oid} is not a blob`);
+          }
+          if (selected > 0 && object.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
+            break;
+          }
+          selectedBytes = checkedAdd(selectedBytes, object.size, "blob read payload");
+          selected++;
+        }
+        const selectedOids = page.slice(0, selected);
         const beforeRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        const mapHeadroom = Math.min(remaining.length, 4096) * BLOB_MAP_ENTRY_BYTES;
-        const available = reservation.remainingBytes - mapHeadroom;
-        const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, Math.max(1, available));
-        stateMemory.set(
-          "other",
-          checkedAdd(beforeRead, budgetBytes + mapHeadroom, "blob read admission"),
+        const mapHeadroom = selected * BLOB_MAP_ENTRY_BYTES;
+        const retainedAfterRead = checkedAdd(
+          beforeRead,
+          checkedAdd(selectedBytes, mapHeadroom, "blob read retention"),
+          "blob read retention",
         );
-        const batch = repo.readBlobs(remaining, { budgetBytes });
-        validateBlobBatch(remaining, batch.blobs, batch.remaining, batch.bytes);
+        const retainedDuringRead = checkedAdd(beforeRead, mapHeadroom, "blob read metadata");
+        const readWorkingBytes = checkedAdd(
+          selectedBytes,
+          checkedAdd(
+            BLOB_READ_FIXED_BYTES,
+            selected * BLOB_READ_ENTRY_BYTES,
+            "blob read working set",
+          ),
+          "blob read working set",
+        );
+        const admittedBytes = Math.max(
+          retainedAfterRead,
+          checkedAdd(retainedDuringRead, readWorkingBytes, "blob read admission"),
+        );
+        stateMemory.set("other", admittedBytes);
+        stateMemory.set("other", retainedDuringRead);
+        const batch = repo.readBlobs(selectedOids, { budgetBytes: Math.max(1, selectedBytes) });
+        validateBlobBatch(selectedOids, batch.blobs, batch.remaining, batch.bytes);
         for (const [oid, data] of batch.blobs) loaded.set(oid, data);
-        remaining = batch.remaining;
+        remaining = [...batch.remaining, ...remaining.slice(selected)];
         const afterRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
         stateMemory.set("other", afterRead);
         continue;

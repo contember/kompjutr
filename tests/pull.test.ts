@@ -470,10 +470,37 @@ describe("pull", () => {
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
 
-        await expect(exact.git.pull({ dir: "/work" })).resolves.toEqual({
-          oid: incoming,
-          fastForward: true,
-        });
+        let observedIntegrationEntry = false;
+        const typeAndSize = exact.repo.store.typeAndSize;
+        exact.repo.store.typeAndSize = (oid) => {
+          const result = typeAndSize.call(exact.repo.store, oid);
+          // The incoming object's first type lookup is merge's post-fetch peel.
+          if (oid === incoming && !observedIntegrationEntry) {
+            const memory = exact.repo.store.memory;
+            expect(memory.activeCount).toBe(1);
+            expect(memory.totalBytes).toBeGreaterThan(0);
+            observedIntegrationEntry = true;
+            const release = holdPullPressure(
+              exact.repo,
+              MAX_OPERATION_MEMORY_BYTES - memory.totalBytes,
+            );
+            try {
+              expect(memory.totalBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+            } finally {
+              release();
+            }
+          }
+          return result;
+        };
+        try {
+          await expect(exact.git.pull({ dir: "/work" })).resolves.toEqual({
+            oid: incoming,
+            fastForward: true,
+          });
+        } finally {
+          exact.repo.store.typeAndSize = typeAndSize;
+        }
+        expect(observedIntegrationEntry).toBe(true);
         expect(exact.repo.head().oid).toBe(incoming);
         expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
         expect(exact.repo.store.memory.activeCount).toBe(0);

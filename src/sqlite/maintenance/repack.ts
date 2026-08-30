@@ -7,7 +7,7 @@ import {
   streamFullObjectPack,
 } from "../../core/pack/full-object-stream.js";
 import type { SqlDatabase } from "../db.js";
-import { MAX_PACK_BLOB_BATCH_BYTES, type PackIngestResult } from "../packs.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, type PackIngestResult } from "../packs.js";
 import type { SharedRepoStore } from "../store.js";
 
 const MAX_REPACK_OBJECTS = 2_048;
@@ -126,7 +126,7 @@ function limits(options: MaintenanceRepackOptions): RepackLimits {
     ),
     readBatchBytes: optionLimit(
       options.readBatchBytes,
-      MAX_PACK_BLOB_BATCH_BYTES,
+      PACK_BLOB_BATCH_TARGET_BYTES,
       "repack read-batch limit",
     ),
   };

@@ -14,7 +14,6 @@ import {
 } from "../src/core/ops/operation-state.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
-  MAX_LOG_STATE_BYTES,
   readOperationStateOwned,
   SqliteGitDatabase,
   writeOperationJournalOwned,
@@ -673,7 +672,7 @@ describe("durable operation journal", () => {
     excess.store.shared.memory.assertIdle();
   });
 
-  it("pages exact-limit object validation and enforces 32 MiB across body pages", () => {
+  it("pages exact-limit validation while cumulative commit bodies exceed 32 MiB", () => {
     const { db, store } = open();
     const steps: OperationStepMetadata[] = [];
     let parentOid = ORIGINAL;
@@ -684,7 +683,7 @@ describe("durable operation journal", () => {
           parent: [parentOid],
           author: PERSON,
           committer: PERSON,
-          message: `step ${ordinal}\n`,
+          message: `${"x".repeat(8_192)} step ${ordinal}\n`,
         });
         const sourceOid = batch.write("commit", data);
         steps.push({
@@ -699,44 +698,30 @@ describe("durable operation journal", () => {
     });
     const state = rebase({ originalHeadOid: parentOid });
     const objectInfoCalls: number[] = [];
-    const objectReadCalls: number[] = [];
     const objectInfo = store.objectInfo.bind(store);
-    const readObjects = store.readObjects.bind(store);
     store.objectInfo = (oids) => {
       objectInfoCalls.push(oids.length);
       return objectInfo(oids);
     };
-    store.readObjects = (oids, options) => {
-      objectReadCalls.push(oids.length);
-      return readObjects(oids, options);
-    };
 
     store.writeOperationJournal(state, steps, []);
 
+    expect(
+      db.scalar<number>("SELECT sum(size) FROM git_objects WHERE repo_id = 1 AND type = 'commit'"),
+    ).toBeGreaterThan(32 * 1024 * 1024);
     expect(objectInfoCalls.length).toBeGreaterThanOrEqual(2);
     expect(Math.max(...objectInfoCalls)).toBe(4_096);
     expect(objectInfoCalls.every((count) => count <= 4_096)).toBe(true);
-    expect(objectReadCalls.every((count) => count <= 4_096)).toBe(true);
     expect(store.requireOperationState("rebase").steps).toHaveLength(MAX_OPERATION_STEPS);
-    store.clearOperationState();
+    expect(store.shared.memory.highWaterBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+    store.shared.memory.assertIdle();
 
-    store.readObjects = (oids, options = {}) => {
-      const selected = oids.slice(0, 455);
-      const batch = readObjects(selected, options);
-      return {
-        objects: batch.objects,
-        remaining: [...batch.remaining, ...oids.slice(selected.length)],
-        bytes: options.budgetBytes ?? batch.bytes,
-      };
-    };
-    expect(() => store.writeOperationJournal(state, steps, [])).toThrowError(
-      expect.objectContaining({
-        code: "E2BIG",
-        message: `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
-      }),
-    );
-    expect(MAX_LOG_STATE_BYTES).toBe(33_554_432);
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    const coldDatabase = new SqliteGitDatabase(db);
+    const coldRow = coldDatabase.checkoutAt("/repo");
+    if (coldRow === null) throw new Error("cold checkout disappeared");
+    const cold = coldDatabase.openCheckout(coldRow);
+    expect(cold.requireOperationState("rebase").steps).toHaveLength(MAX_OPERATION_STEPS);
+    cold.shared.memory.assertIdle();
   });
 
   it("clears state and corrupt orphan rows generically", () => {

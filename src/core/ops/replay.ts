@@ -1,8 +1,12 @@
 // Pure one-commit replay planning shared by cherry-pick and revert.
 
 import type { MemoryReservation } from "../../memory.js";
-import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
-import { type IndexEntry, type IndexStore, MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
+import { commitPreparationTransientBytes } from "../../sqlite/commits.js";
+import {
+  type IndexEntry,
+  type IndexStore,
+  PACK_BLOB_BATCH_TARGET_BYTES,
+} from "../../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "../bytes.js";
 import type { TextMergeOptions } from "../diff/xmerge.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "../errors.js";
@@ -41,7 +45,6 @@ const REPLAY_PREFLIGHT_OID_BYTES = 256;
 const REPLAY_PREFLIGHT_INFO_BYTES = 384;
 const REPLAY_PREFLIGHT_BATCH_BYTES = 512;
 const REPLAY_PREFLIGHT_BATCH_ENTRY_BYTES = 384;
-const REPLAY_COMMIT_PARSE_FIXED_BYTES = 4_096;
 
 export type ReplayKind = "cherry-pick" | "revert";
 export type ReplayIncomingLabelStyle = "tree" | "source-subject" | "parent-of-source-subject";
@@ -174,13 +177,11 @@ function readCommit(
   if (metadata.type !== "commit") {
     throw new CorruptError(`${oid} is a ${metadata.type}, not a commit`);
   }
-  if (metadata.size > MAX_INDEXED_COMMIT_BYTES) {
-    throw new CorruptError(`commit ${oid} exceeds the indexed commit size limit`);
-  }
-  const transient = reservation?.scope() ?? null;
-  transient?.set("other", REPLAY_COMMIT_PARSE_FIXED_BYTES + metadata.size * 6);
+  const transient = reservation?.scope() ?? repo.store.reserveMemory();
+  transient.set("commit", commitPreparationTransientBytes(metadata.size));
   try {
-    const object = repo.read(oid);
+    const object = repo.store.readAuthenticatedObject(oid, "commit");
+    if (object === null) throw new ObjectNotFoundError(oid);
     if (object.type !== "commit") {
       throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
     }
@@ -191,7 +192,7 @@ function readCommit(
     retain?.(commit);
     return commit;
   } finally {
-    transient?.dispose();
+    transient.dispose();
   }
 }
 
@@ -259,9 +260,6 @@ function preflightReplayCommitObjectsInternal(
           throw new CorruptError("replay commit preflight metadata is incomplete");
         }
         if (object.type !== "commit") throw new CorruptError(`${oid} is not a commit`);
-        if (object.size > MAX_INDEXED_COMMIT_BYTES) {
-          throw new CorruptError(`commit ${oid} exceeds the indexed commit size limit`);
-        }
         bytes = checkedRetainedAdd(bytes, object.size);
         sizes.set(oid, object.size);
       }
@@ -279,7 +277,7 @@ function preflightReplayCommitObjectsInternal(
       if (oid === undefined) throw new CorruptError("replay commit preflight lost an object id");
       const size = sizes.get(oid);
       if (size === undefined) throw new CorruptError(`replay commit preflight lost ${oid}`);
-      if (end > offset && size > MAX_BLOB_BATCH_BYTES - batchBytes) break;
+      if (end > offset && size > PACK_BLOB_BATCH_TARGET_BYTES - batchBytes) break;
       batchBytes += size;
       largest = Math.max(largest, size);
       end++;
@@ -290,7 +288,7 @@ function preflightReplayCommitObjectsInternal(
       REPLAY_PREFLIGHT_BATCH_BYTES +
         (end - offset) * REPLAY_PREFLIGHT_BATCH_ENTRY_BYTES +
         batchBytes +
-        largest * 6,
+        commitPreparationTransientBytes(largest),
     );
     try {
       const batchOids = unique.slice(offset, end);
@@ -299,11 +297,7 @@ function preflightReplayCommitObjectsInternal(
         throw new CorruptError("replay commit preflight made no progress");
       }
       for (const [oid, object] of batch.objects) {
-        if (
-          object.type !== "commit" ||
-          object.data.length > MAX_INDEXED_COMMIT_BYTES ||
-          hashObject("commit", object.data) !== oid
-        ) {
+        if (object.type !== "commit" || hashObject("commit", object.data) !== oid) {
           throw new CorruptError(`commit ${oid} failed authoritative replay preflight`);
         }
         parseReplayCommit(object.data);
@@ -316,7 +310,7 @@ function preflightReplayCommitObjectsInternal(
   return { bytes };
 }
 
-function peelCommit(repo: Repository, start: string, operation: string): string {
+function peelCommit(repo: Repository, start: string, _operation: string): string {
   let oid = start;
   const seen = new Set<string>();
   for (let hops = 0; ; hops++) {
@@ -325,21 +319,24 @@ function peelCommit(repo: Repository, start: string, operation: string): string 
     const metadata = repo.store.objectInfo([oid])[0];
     if (metadata === undefined) throw new ObjectNotFoundError(oid);
     if (metadata.type === "commit" || metadata.type !== "tag") return oid;
-    if (metadata.size > MAX_INDEXED_COMMIT_BYTES) {
-      throw new CorruptError(`tag ${oid} exceeds the ${operation} metadata size limit`);
+    const transient = repo.store.reserveMemory();
+    try {
+      transient.set("other", commitPreparationTransientBytes(metadata.size));
+      const object = repo.store.readAuthenticatedObject(oid, "tag");
+      if (
+        object === null ||
+        object.data.length !== metadata.size ||
+        hashObject("tag", object.data) !== oid
+      ) {
+        throw new CorruptError(`tag ${oid} does not match its authoritative object metadata`);
+      }
+      if (hops >= MAX_REPLAY_TAG_HOPS) {
+        throw new GitError("E2BIG", `tag chain exceeds ${MAX_REPLAY_TAG_HOPS} hops`);
+      }
+      oid = parseTag(object.data).object;
+    } finally {
+      transient.dispose();
     }
-    const object = repo.read(oid);
-    if (
-      object.type !== "tag" ||
-      object.data.length !== metadata.size ||
-      hashObject("tag", object.data) !== oid
-    ) {
-      throw new CorruptError(`tag ${oid} does not match its authoritative object metadata`);
-    }
-    if (hops >= MAX_REPLAY_TAG_HOPS) {
-      throw new GitError("E2BIG", `tag chain exceeds ${MAX_REPLAY_TAG_HOPS} hops`);
-    }
-    oid = parseTag(object.data).object;
   }
 }
 

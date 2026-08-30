@@ -14,7 +14,7 @@ import { formatCommitRefusalStatus, statusFormatOptions } from "../../core/ops/s
 import { joinPath, normalizePath, relativeTo } from "../../core/paths.js";
 import type { Repository, ResolvedHead } from "../../core/repository.js";
 import type { MemoryReservation } from "../../memory.js";
-import { MAX_BLOB_BATCH_BYTES, type WalkTreeDiffEntry } from "../../sqlite/store.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../../sqlite/store.js";
 import {
   boundedGitCliResult,
   type GitCliOutputContext,
@@ -563,6 +563,8 @@ function summarizeRoot(
   quoteNonAscii: boolean,
   maximum: number,
 ): CommitSummary {
+  const operationMemory = repo.store.reserveMemory();
+  const blobMemory = operationMemory.scope();
   const retained = new SummaryRetainedBudget(maximum);
   const details: string[] = [];
   let files = 0;
@@ -570,45 +572,55 @@ function summarizeRoot(
   let pending: RootSummaryRow[] = [];
   const flush = (): void => {
     if (pending.length === 0) return;
-    const rows = pending;
+    let rows = pending;
     pending = [];
-    const blobs = new Map<string, Uint8Array>();
-    let remaining = rows.map((row) => row.oid);
-    let retainedBytes = 0;
-    while (remaining.length > 0 && retainedBytes < SUMMARY_REPOSITORY_BYTES) {
-      const batch = repo.readBlobs(remaining, {
-        budgetBytes: Math.min(MAX_BLOB_BATCH_BYTES, SUMMARY_REPOSITORY_BYTES - retainedBytes),
-      });
-      for (const [oid, bytes] of batch.blobs) blobs.set(oid, bytes);
-      if (batch.remaining.length === remaining.length) break;
-      retainedBytes += batch.bytes;
-      remaining = batch.remaining;
-    }
-    if (remaining.length > 0) {
-      throw new GitError("EFBIG", "commit summary blob window exceeds its byte limit");
-    }
-    for (const row of rows) {
-      const bytes = blobs.get(row.oid);
-      if (bytes === undefined) throw new Error(`commit summary blob ${row.oid} is missing`);
-      if (!isBinary(bytes)) insertions += diffText("", utf8Decoder.decode(bytes)).insertions;
-      pushSummaryDetail(
-        details,
-        `create mode ${row.mode} ${summaryPath(row.path, quoteNonAscii)}`,
-        retained,
-      );
+    try {
+      while (rows.length > 0) {
+        const batch = repo.readBlobs(
+          rows.map((row) => row.oid),
+          { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES },
+        );
+        if (batch.blobs.size === 0) {
+          throw new Error("commit summary blob batch made no progress");
+        }
+        blobMemory.set("other", 256 + batch.blobs.size * 128 + batch.bytes);
+        let processed = 0;
+        while (processed < rows.length) {
+          const row = rows[processed];
+          if (row === undefined) throw new Error("commit summary blob row is missing");
+          const bytes = batch.blobs.get(row.oid);
+          if (bytes === undefined) break;
+          if (!isBinary(bytes)) insertions += diffText("", utf8Decoder.decode(bytes)).insertions;
+          pushSummaryDetail(
+            details,
+            `create mode ${row.mode} ${summaryPath(row.path, quoteNonAscii)}`,
+            retained,
+          );
+          processed++;
+        }
+        if (processed === 0) throw new Error("commit summary blob batch made no progress");
+        rows = rows.slice(processed);
+        blobMemory.clear("other");
+      }
+    } finally {
+      blobMemory.clear("other");
     }
   };
-  for (const row of repo.walkTreeDiff(null, tree)) {
-    if (row.afterMode === null || row.afterOid === null) {
-      throw new Error("root commit summary yielded a deletion");
+  try {
+    for (const row of repo.walkTreeDiff(null, tree)) {
+      if (row.afterMode === null || row.afterOid === null) {
+        throw new Error("root commit summary yielded a deletion");
+      }
+      files++;
+      retained.addPath(row.path);
+      pending.push({ path: row.path, mode: row.afterMode, oid: row.afterOid });
+      if (pending.length >= SUMMARY_WINDOW_ROWS) flush();
     }
-    files++;
-    retained.addPath(row.path);
-    pending.push({ path: row.path, mode: row.afterMode, oid: row.afterOid });
-    if (pending.length >= SUMMARY_WINDOW_ROWS) flush();
+    flush();
+    return { files, insertions, deletions: 0, details };
+  } finally {
+    operationMemory.dispose();
   }
-  flush();
-  return { files, insertions, deletions: 0, details };
 }
 
 function modeDetail(row: WalkTreeDiffEntry, quoteNonAscii: boolean): string | undefined {

@@ -10,8 +10,6 @@ import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import {
   commitTree,
-  MAX_COMMIT_TREE_INPUT_BYTES,
-  MAX_COMMIT_TREE_MESSAGE_BYTES,
   MAX_COMMIT_TREE_PARENTS,
   MAX_COMMIT_TREE_REVISION_TRAVERSALS,
   readTree,
@@ -32,12 +30,13 @@ import {
   resealIndexTracker,
   WORKTREE_DIRTY,
 } from "../src/sqlite/index-tracker.js";
-import { MAX_PACK_BLOB_BATCH_BYTES } from "../src/sqlite/packs.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/packs.js";
 import type { IndexEntry, IndexStore } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 
+const FORMER_COMMIT_TREE_MESSAGE_BYTES = 1024 * 1024;
 const fixtures: GitFixture[] = [];
 
 function newFixture(): GitFixture {
@@ -563,8 +562,15 @@ describe("tree and index write plumbing", () => {
     };
 
     const measured = prepare();
-    writeTree(measured.repo);
-    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    const calibration = measured.repo.store.reserveMemory();
+    calibration.set("other", MAX_OPERATION_MEMORY_BYTES / 2);
+    try {
+      writeTree(measured.repo);
+    } finally {
+      calibration.dispose();
+    }
+    const operationBytes =
+      measured.repo.store.memory.highWaterBytes - MAX_OPERATION_MEMORY_BYTES / 2;
     expect(measured.repo.store.memory.activeCount).toBe(0);
     expect(measured.repo.store.memory.totalBytes).toBe(0);
 
@@ -783,7 +789,7 @@ describe("tree and index write plumbing", () => {
         oid: blob,
       })),
     );
-    expect(treeBytes.length).toBeGreaterThan(MAX_PACK_BLOB_BATCH_BYTES);
+    expect(treeBytes.length).toBeGreaterThan(PACK_BLOB_BATCH_TARGET_BYTES);
     const tree = fixture.writeObject("tree", treeBytes);
     fixture.git("update-ref", "refs/tags/large-tree", tree);
     const expected = fixture.gitInput("large tree\n", "commit-tree", tree);
@@ -805,7 +811,7 @@ describe("tree and index write plumbing", () => {
     expect(worktreeState(workspace)).toEqual([]);
   });
 
-  it("fails closed at commit-tree count, text, identity, and aggregate input limits", () => {
+  it("fails closed at commit-tree count, traversal, and format limits", () => {
     const workspace = makeRepo("/");
     workspace.context.defaultIdentity = { name: "Fixture", email: "fixture@example.com" };
     const tree = workspace.repo.store.write("tree", new Uint8Array(0));
@@ -833,40 +839,88 @@ describe("tree and index write plumbing", () => {
     expect(() =>
       commitTree(workspace.context, workspace.repo, {
         tree,
-        message: "x".repeat(MAX_COMMIT_TREE_MESSAGE_BYTES + 1),
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(() =>
-      commitTree(workspace.context, workspace.repo, {
-        tree,
-        message: "x".repeat(MAX_COMMIT_TREE_INPUT_BYTES - tree.length + 1),
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(() =>
-      commitTree(workspace.context, workspace.repo, {
-        tree,
-        message: "large identity",
-        author: { name: "x".repeat(1_025), email: "author@example.com" },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(() =>
-      commitTree(workspace.context, workspace.repo, {
-        tree,
         message: "header injection",
         author: { name: "bad\nname", email: "author@example.com" },
       }),
     ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
 
-    workspace.context.defaultIdentity = undefined;
-    workspace.repo.store.configSet("user.name", "x".repeat(1_025));
-    workspace.repo.store.configSet("user.email", "configured@example.com");
-    expect(() =>
-      commitTree(workspace.context, workspace.repo, { tree, message: "large config" }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
     expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
     expect(controlState(workspace)).toEqual(beforeControl);
     expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("serializes former commit-tree message and identity first excesses under the owner", () => {
+    const workspace = makeRepo("/");
+    workspace.context.defaultIdentity = { name: "Fixture", email: "fixture@example.com" };
+    const tree = workspace.repo.store.write("tree", new Uint8Array(0));
+    const message = "x".repeat(FORMER_COMMIT_TREE_MESSAGE_BYTES + 1);
+
+    const messageOid = commitTree(workspace.context, workspace.repo, { tree, message });
+    const identityOid = commitTree(workspace.context, workspace.repo, {
+      tree,
+      message: "large identity\n",
+      author: { name: "x".repeat(1_025), email: "author@example.com" },
+    });
+
+    expect(workspace.repo.readCommit(messageOid).message).toBe(message);
+    expect(workspace.repo.readCommit(identityOid).author.name).toHaveLength(1_025);
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("retains a large configured commit-tree identity through exact serialization", () => {
+    const configuredName = `Configured ${"x".repeat(220 * 1024)}`;
+    const prepare = (): { workspace: TestRepository; tree: string } => {
+      const workspace = makeRepo("/");
+      const tree = workspace.repo.store.write("tree", new Uint8Array(0));
+      workspace.database.db.run(
+        "INSERT INTO git_config (repo_id, path, seq, value) VALUES (?, ?, 0, ?)",
+        workspace.repo.store.repoId,
+        "user.name",
+        configuredName,
+      );
+      workspace.database.db.run(
+        "INSERT INTO git_config (repo_id, path, seq, value) VALUES (?, ?, 0, ?)",
+        workspace.repo.store.repoId,
+        "user.email",
+        "configured@example.com",
+      );
+      return { workspace, tree };
+    };
+
+    const measured = prepare();
+    const measuredOid = commitTree(measured.workspace.context, measured.workspace.repo, {
+      tree: measured.tree,
+      message: "configured identity\n",
+    });
+    const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
+    expect(measured.workspace.repo.readCommit(measuredOid).author.name).toBe(configuredName);
+    measured.workspace.repo.store.memory.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const { workspace, tree } = prepare();
+      const beforeObjects = workspace.repo.store.objectCount();
+      const blocker = workspace.repo.store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      let oid: string | undefined;
+      try {
+        const write = () =>
+          commitTree(workspace.context, workspace.repo, {
+            tree,
+            message: "configured identity\n",
+          });
+        if (excess === 0) oid = write();
+        else expect(write).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      } finally {
+        blocker.dispose();
+      }
+      workspace.repo.store.memory.assertIdle();
+      if (excess === 0) {
+        expect(workspace.repo.readCommit(oid ?? "").author.name).toBe(configuredName);
+        expect(workspace.repo.store.objectCount()).toBe(beforeObjects + 1);
+      } else {
+        expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+      }
+    }
   });
 
   it("resolves the maximal packed parent list below the SQL gate", async () => {
@@ -931,7 +985,8 @@ describe("tree and index write plumbing", () => {
         try {
           commitTree(workspace.context, workspace.repo, {
             tree,
-            message: "x".repeat(MAX_COMMIT_TREE_MESSAGE_BYTES + 1),
+            message: "too many parents",
+            parent: Array.from({ length: MAX_COMMIT_TREE_PARENTS + 1 }, () => "missing"),
           });
         } catch (error) {
           if (!(error instanceof GitError)) throw error;
@@ -1246,50 +1301,6 @@ describe("tree and index write plumbing", () => {
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(directoryError).toContain("50000 rows");
     expect(workspace.storage.statementCount - beforeDirectoryStatements).toBeLessThan(1_000);
-
-    const scalarSpecs = Array.from(
-      { length: 129 },
-      (_, index) => `missing-${index.toString().padStart(3, "0")}`,
-    );
-    let scalarError = "";
-    const beforeScalarStatements = workspace.storage.statementCount;
-    expect(() =>
-      workspace.repo.store.withScratchIndex("scalar-path-limit", (scratch) => {
-        try {
-          add(
-            workspace.repo,
-            workspace.worktree,
-            { paths: scalarSpecs, force: true },
-            undefined,
-            scratch,
-          );
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          scalarError = error.message;
-        }
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(scalarError).toContain("128 paths");
-    expect(workspace.storage.statementCount - beforeScalarStatements).toBeLessThan(1_000);
-
-    let byteError = "";
-    expect(() =>
-      workspace.repo.store.withScratchIndex("byte-limit", (scratch) => {
-        try {
-          add(
-            workspace.repo,
-            syntheticWorktree(workspace.worktree, 1, null, 64 * 1024 * 1024 + 1),
-            { paths: [], all: true, force: true },
-            undefined,
-            scratch,
-          );
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          byteError = error.message;
-        }
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(byteError).toContain(`${64 * 1024 * 1024} bytes`);
 
     const rangeSize = 64 * 64 * 1024 + 1;
     const rangeOid = workspace.repo.store.write("blob", new Uint8Array(rangeSize));

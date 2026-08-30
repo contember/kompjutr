@@ -21,7 +21,11 @@ import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
-import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import {
+  type CheckoutStore,
+  PACK_BLOB_BATCH_TARGET_BYTES,
+  SqliteGitDatabase,
+} from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { makeRepo } from "./helpers/workspace.js";
@@ -711,6 +715,28 @@ describe("bounded three-way integration plan", () => {
       refs: store.listRefs(),
       index: store.indexEntries(),
     }).toEqual(before);
+    plan.release();
+    assertCoordinatorIdle(store);
+  });
+
+  it("plans one valid binary blob above the batching target as a singleton", () => {
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const large = new Uint8Array(PACK_BLOB_BATCH_TARGET_BYTES + 1).fill(0x61);
+    large[0] = 0;
+    const base = writeTree(store, { "large.bin": { content: "base\n" } });
+    const current = writeTree(store, { "large.bin": { content: large } });
+    const incoming = writeTree(store, { "large.bin": { content: "incoming\n" } });
+
+    const plan = planIntegration(new Repository(store), {
+      baseTreeOid: base.tree,
+      currentTreeOid: current.tree,
+      incomingTreeOid: incoming.tree,
+    });
+
+    const entry = find(plan.entries, "large.bin");
+    expect(entry).toMatchObject({ kind: "conflict", conflict: "binary" });
+    expect(entry.content).toEqual(large);
     plan.release();
     assertCoordinatorIdle(store);
   });

@@ -1,24 +1,29 @@
 import { describe, expect, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
-import { GitError } from "../src/core/errors.js";
+import { hasErrorCode } from "../src/core/errors.js";
 import { type Commit, hashObject, parseCommit, serializeCommit } from "../src/core/objects.js";
-import { Repository, walkIndexedOwned } from "../src/core/repository.js";
+import { Repository, walkIndexedOwned, walkOwned } from "../src/core/repository.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
+  COMMIT_CACHE_FLUSH_BYTES,
   commitCacheBytes,
+  commitCacheMaterializationBytes,
+  commitCacheSqlPayloadBytes,
   commitGraphBytes,
+  commitPreparationTransientBytes,
   indexCommitSource,
-  MAX_COMMIT_CACHE_BYTES,
-  MAX_INDEXED_COMMIT_BYTES,
   MAX_LOG_COMMITS,
-  MAX_LOG_STATE_BYTES,
   prepareCommitCache,
   WALK_COMMIT_GRAPH_SQL,
 } from "../src/sqlite/commits.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { readShallowOwned, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
+
+const FORMER_LOG_STATE_BYTES = 32 * 1024 * 1024;
+const FORMER_INDEXED_COMMIT_BYTES = 1024 * 1024;
+const MEMORY_EXCESS_COMMIT_MESSAGE_BYTES = 4 * 1024 * 1024;
 
 class MeasuredDatabase implements SqlDatabase {
   widestStringBytes = 0;
@@ -132,6 +137,26 @@ function commitChain(store: ReturnType<typeof open>, count: number): string[] {
   });
 }
 
+function insertAuthoritativeCommit(db: SqlDatabase, data: Uint8Array): string {
+  const oid = hashObject("commit", data);
+  db.run(
+    "INSERT INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, 'commit', ?, 'raw')",
+    1,
+    oid,
+    data.length,
+  );
+  for (let offset = 0, sequence = 0; offset < data.length; offset += 1024 * 1024, sequence++) {
+    db.run(
+      "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+      1,
+      oid,
+      sequence,
+      data.subarray(offset, offset + 1024 * 1024),
+    );
+  }
+  return oid;
+}
+
 describe("parsed commit cache", () => {
   it("normalizes both signed zero timezone spellings before caching", () => {
     const store = open();
@@ -187,10 +212,62 @@ describe("parsed commit cache", () => {
     const oid = hashObject("commit", data);
     const entry = prepareCommitCache({ repoId: 1, oid, data });
 
-    expect(data.length).toBeLessThan(MAX_INDEXED_COMMIT_BYTES);
+    expect(data.length).toBeLessThan(FORMER_INDEXED_COMMIT_BYTES);
     expect(entry.cacheBytes).toBeGreaterThan(1_200_000);
     expect(entry.cacheBytes).toBeLessThan(1_300_000);
-    expect(entry.cacheBytes).toBeLessThanOrEqual(MAX_COMMIT_CACHE_BYTES);
+    expect(entry.cacheBytes).toBeLessThanOrEqual(COMMIT_CACHE_FLUSH_BYTES);
+  });
+
+  it("reads and traverses an authoritative commit above the former cache threshold uncached", () => {
+    const db = new TestDatabase();
+    const store = open(db);
+    const commit = fixture(`${"m".repeat(2_100_000)}\n`);
+    commit.parent = [];
+    const data = serializeCommit(commit);
+    const oid = insertAuthoritativeCommit(db, data);
+    store.shared.markLoose();
+    const repo = new Repository(store);
+
+    expect(data.length).toBeGreaterThan(FORMER_INDEXED_COMMIT_BYTES);
+    expect(store.cachedCommit(oid)).toBeNull();
+    expect(repo.readCommit(oid).message).toBe(commit.message);
+    expect(store.cachedCommit(oid)).toBeNull();
+    expect([...repo.walkIndexed(oid)].map((entry) => entry.oid)).toEqual([oid]);
+    expect(store.cachedCommit(oid)).toBeNull();
+    store.shared.memory.assertIdle();
+  });
+
+  it("admits authoritative bytes before allocation and retains the parsed commit for its caller", () => {
+    const db = new TestDatabase();
+    const store = open(db);
+    const expected = fixture(`${"owned".repeat(10_000)}\n`);
+    expected.parent = [];
+    const data = serializeCommit(expected);
+    const oid = insertAuthoritativeCommit(db, data);
+    store.shared.markLoose();
+    const repo = new Repository(store);
+    const owner = store.reserveMemory();
+    const originalRead = repo.store.readAuthenticatedObject.bind(repo.store);
+    let admittedBeforeRead: number | undefined;
+    repo.store.readAuthenticatedObject = (candidate, type) => {
+      admittedBeforeRead = owner.currentBytes;
+      return originalRead(candidate, type);
+    };
+
+    let commit: Commit;
+    try {
+      commit = repo.readAuthenticatedCommitOwned(oid, owner);
+    } finally {
+      repo.store.readAuthenticatedObject = originalRead;
+    }
+    expect(admittedBeforeRead).toBe(commitPreparationTransientBytes(data.length));
+    expect(owner.currentBytes).toBe(commitCacheBytes(commit));
+    expect(commit.message).toBe(expected.message);
+    owner.dispose();
+    store.shared.memory.assertIdle();
+
+    expect(repo.readAuthenticatedCommit(oid).message).toBe(expected.message);
+    store.shared.memory.assertIdle();
   });
 
   it("charges the documented fixed graph slots before payload and parents", () => {
@@ -349,10 +426,11 @@ describe("parsed commit cache", () => {
     expect(store.cachedCommit(oid)?.commit.message).toBe("source\n");
   });
 
-  it("rejects every inadmissible loose commit atomically", () => {
+  it("rejects malformed, unsafe-numeric, and real-memory-excess commits atomically", () => {
     const malformed = utf8.encode("not a commit");
-    const oversized = serializeCommit(fixture(`${"x".repeat(MAX_INDEXED_COMMIT_BYTES)}\n`));
-    const expanding = serializeCommit(fixture(`${"\0".repeat(220_000)}\n`));
+    const oversized = serializeCommit(
+      fixture(`${"x".repeat(MEMORY_EXCESS_COMMIT_MESSAGE_BYTES)}\n`),
+    );
     const numeric = serializeCommit({
       ...fixture(),
       author: { ...fixture().author, timestamp: Number.MAX_SAFE_INTEGER + 1 },
@@ -360,7 +438,6 @@ describe("parsed commit cache", () => {
     const cases = [
       { data: malformed, code: "ECORRUPT" },
       { data: oversized, code: "E2BIG" },
-      { data: expanding, code: "E2BIG" },
       { data: numeric, code: "E2BIG" },
     ];
 
@@ -382,9 +459,7 @@ describe("parsed commit cache", () => {
         } catch (caught) {
           error = caught;
         }
-        expect(error).toBeInstanceOf(GitError);
-        if (!(error instanceof GitError)) throw new Error("expected GitError");
-        expect(error.code).toBe(code);
+        expect(hasErrorCode(error, code)).toBe(true);
         expect(store.objectCount()).toBe(0);
         expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_object_chunks")).toBe(0);
         expect(store.db.scalar<number>("SELECT COUNT(*) FROM git_commits")).toBe(0);
@@ -513,28 +588,51 @@ describe("parsed commit cache", () => {
     const store = open();
     const oid = commitChain(store, 1)[0]!;
     const commit = store.cachedCommit(oid)!.commit;
-    const bytes = commitGraphBytes(commit);
+    const bytes = commitCacheMaterializationBytes(commit);
 
     expect([...store.commitGraph(oid, { maxBytes: bytes })]).toHaveLength(1);
     expect(() => [...store.commitGraph(oid, { maxBytes: bytes - 1 })]).toThrow(
-      /32 MiB retained-state limit/,
+      /retained-memory capacity/,
     );
+  });
+
+  it("pre-admits point-cache SQL payload coexistence at the exact shared boundary", () => {
+    const measured = open();
+    const oid = commitChain(measured, 1)[0]!;
+    const measuredOwner = measured.reserveMemory();
+    expect([...walkOwned(new Repository(measured), oid, measuredOwner)]).toHaveLength(1);
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
+    measured.shared.memory.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const store = open();
+      const candidate = commitChain(store, 1)[0]!;
+      const blocker = store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = store.reserveMemory();
+      try {
+        const read = () => [...walkOwned(new Repository(store), candidate, owner)];
+        if (excess === 0) expect(read()).toHaveLength(1);
+        else expect(read).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      store.shared.memory.assertIdle();
+    }
   });
 
   it("retains an owned graph at the exact shared-memory boundary and releases it", () => {
     const measure = open();
     const oid = commitChain(measure, 1)[0]!;
-    const commit = measure.cachedCommit(oid)!.commit;
-    const rowBytes =
-      utf8.encode(commit.tree).byteLength +
-      utf8.encode(JSON.stringify(commit.parent)).byteLength +
-      utf8.encode(commit.author.name).byteLength +
-      utf8.encode(commit.author.email).byteLength +
-      utf8.encode(commit.committer.name).byteLength +
-      utf8.encode(commit.committer.email).byteLength +
-      utf8.encode(commit.message).byteLength +
-      (commit.gpgsig === undefined ? 0 : utf8.encode(commit.gpgsig).byteLength);
-    const operationBytes = 256 + commitCacheBytes(commit) + rowBytes;
+    const measuredOwner = measure.reserveMemory();
+    expect([...walkIndexedOwned(new Repository(measure), oid, measuredOwner)]).toHaveLength(1);
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
 
     const exactBlocker = measure.reserveMemory();
     exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
@@ -616,23 +714,23 @@ describe("parsed commit cache", () => {
     const oid = commitChain(store, 1)[0]!;
     store.db.run(
       "UPDATE git_commits SET message = zeroblob(?) WHERE repo_id = ? AND oid = ?",
-      20 * 1024 * 1024,
+      40 * 1024 * 1024,
       1,
       oid,
     );
     db.widestResultBlob = 0;
 
-    expect(() => [...store.commitGraph(oid)]).toThrow(/32 MiB retained-state limit/);
+    expect(() => [...store.commitGraph(oid)]).toThrow(/retained-memory capacity/);
     expect(db.widestResultBlob).toBe(0);
   });
 
-  it("accepts the largest practical graph below 32 MiB and rejects its next row", () => {
+  it("owns a graph above 32 MiB and rejects its exact aggregate first excess", () => {
     const store = open();
     let parent: string | undefined;
-    let accepted: string | undefined;
-    let rejected: string | undefined;
+    let root: string | undefined;
     let bytes = 0;
-    for (let index = 0; rejected === undefined; index++) {
+    let payloadBytes = 0;
+    for (let index = 0; bytes <= FORMER_LOG_STATE_BYTES; index++) {
       const commit = fixture(`${"m".repeat(500_000)}${index}\n`);
       commit.parent = parent === undefined ? [] : [parent];
       commit.committer.timestamp = index;
@@ -640,15 +738,20 @@ describe("parsed commit cache", () => {
       const cached = store.cachedCommit(oid);
       if (cached === null) throw new Error("large graph cache row is missing");
       bytes += commitGraphBytes(cached.commit);
-      if (bytes <= MAX_LOG_STATE_BYTES) accepted = oid;
-      else rejected = oid;
+      payloadBytes = Math.max(payloadBytes, commitCacheSqlPayloadBytes(cached.commit));
+      root = oid;
       parent = oid;
     }
-    if (accepted === undefined) throw new Error("large graph has no accepted root");
-    if (rejected === undefined) throw new Error("large graph has no rejected root");
+    if (root === undefined) throw new Error("large graph has no root");
+    const repo = new Repository(store);
 
-    expect([...store.commitGraph(accepted)]).not.toHaveLength(0);
-    expect(() => [...store.commitGraph(rejected)]).toThrow(/32 MiB retained-state limit/);
+    expect(bytes).toBeGreaterThan(FORMER_LOG_STATE_BYTES);
+    const operationBytes = bytes + payloadBytes;
+    expect([...repo.walkIndexed(root, { maxBytes: operationBytes })]).not.toHaveLength(0);
+    expect(() => [...repo.walkIndexed(root, { maxBytes: operationBytes - 1 })]).toThrow(
+      /retained-memory capacity/,
+    );
+    store.shared.memory.assertIdle();
   }, 30_000);
 
   it("stops at shallow commits before requiring their parents", () => {
@@ -661,13 +764,30 @@ describe("parsed commit cache", () => {
     expect([...store.commitGraph(root!)]).toHaveLength(1);
   });
 
-  it("fails an incomplete cache before returning a graph row", () => {
+  it("reports an unavailable cache before returning a graph row", () => {
     const store = open();
     const [parent, root] = commitChain(store, 2);
     store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, parent);
     const walk = store.commitGraph(root!)[Symbol.iterator]();
 
-    expect(() => walk.next()).toThrow(/reindex or reclone/);
+    expect(() => walk.next()).toThrow(/cache is unavailable/);
+  });
+
+  it("fails closed on a corrupt cached parent reached from an uncached root", () => {
+    const store = open();
+    const [parent, root] = commitChain(store, 2);
+    store.db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, root);
+    store.db.run("PRAGMA ignore_check_constraints = ON");
+    store.db.run(
+      "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
+      1,
+      parent,
+    );
+    store.db.run("PRAGMA ignore_check_constraints = OFF");
+    const repo = new Repository(store);
+
+    expect(() => [...repo.walkIndexed(root!)]).toThrow(/cache row is corrupt/);
+    store.shared.memory.assertIdle();
   });
 
   it("fails a corrupt tail row before returning the valid root", () => {
@@ -683,6 +803,47 @@ describe("parsed commit cache", () => {
     const walk = store.commitGraph(root!)[Symbol.iterator]();
 
     expect(() => walk.next()).toThrow(/cache is corrupt/);
+  });
+
+  it("never falls back from a corrupt cache row and releases direct and caller owners", () => {
+    const store = open();
+    const oid = commitChain(store, 1)[0]!;
+    store.db.run("PRAGMA ignore_check_constraints = ON");
+    store.db.run(
+      "UPDATE git_commits SET parents = 'not-json' WHERE repo_id = ? AND oid = ?",
+      1,
+      oid,
+    );
+    store.db.run("PRAGMA ignore_check_constraints = OFF");
+    const repo = new Repository(store);
+
+    expect(() => [...repo.walkIndexed(oid)]).toThrow(/cache is corrupt/);
+    store.shared.memory.assertIdle();
+
+    const owner = store.reserveMemory();
+    const iterator = walkIndexedOwned(repo, oid, owner)[Symbol.iterator]();
+    expect(() => iterator.next()).toThrow(/cache is corrupt/);
+    expect(owner.currentBytes).toBe(0);
+    owner.dispose();
+    store.shared.memory.assertIdle();
+  });
+
+  it("releases direct and caller-owned graph iterators on early return", () => {
+    const store = open();
+    const oid = commitChain(store, 2)[1]!;
+    const repo = new Repository(store);
+    const direct = repo.walkIndexed(oid);
+    expect(direct.next().done).toBe(false);
+    direct.return(undefined);
+    store.shared.memory.assertIdle();
+
+    const owner = store.reserveMemory();
+    const owned = walkIndexedOwned(repo, oid, owner)[Symbol.iterator]();
+    expect(owned.next().done).toBe(false);
+    owned.return?.();
+    expect(owner.currentBytes).toBe(0);
+    owner.dispose();
+    store.shared.memory.assertIdle();
   });
 
   it("leaves graph cycles to fail-closed Repository validation", () => {

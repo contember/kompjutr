@@ -53,7 +53,7 @@ import { hasCanonicalRefSyntax } from "../core/ref-name.js";
 import { retainedStringBytes } from "../core/retained.js";
 import { Sha1 } from "../core/sha1.js";
 import { comparePaths } from "../core/streams.js";
-import { deflate, InflateInto, InflateSizeError, InflateStream, inflate } from "../core/zlib.js";
+import { deflate, InflateInto, InflateSizeError, InflateStream } from "../core/zlib.js";
 import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import {
   type CommitCacheEntry,
@@ -63,8 +63,8 @@ import {
   commitPreparationTransientBytes,
   indexCommitSource,
   insertCommitCaches,
-  MAX_INDEXED_COMMIT_BYTES,
   prepareCommitCache,
+  prepareCommitCacheOwned,
   readCommitCache,
   readCommitGraph,
 } from "./commits.js";
@@ -76,10 +76,11 @@ import {
   validatedOperationJournalRoots,
 } from "./maintenance/roots.js";
 import {
-  MAX_PACK_BLOB_BATCH_BYTES,
   MAX_PACK_DELTA_WORKING_BYTES,
   MAX_PACK_ROW_CACHE_BYTES,
+  PACK_BLOB_BATCH_TARGET_BYTES,
   type PackCacheOptions,
+  type PackReadOwnership,
   PackStore,
 } from "./packs.js";
 import {
@@ -89,9 +90,9 @@ import {
   requireRefName,
 } from "./ref-validation.js";
 
-export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
+export { PACK_BLOB_BATCH_TARGET_BYTES, PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 
-import { BLOB_ID_GENERATION_EXHAUSTED, MAX_CACHED_CONTENT_ID_BYTES } from "./blob-id-cache.js";
+import { BLOB_ID_CACHE_ELIGIBILITY_BYTES, BLOB_ID_GENERATION_EXHAUSTED } from "./blob-id-cache.js";
 import {
   MAX_REFLOG_ORDINAL,
   MAX_REFLOG_STATE_ROWS,
@@ -149,10 +150,7 @@ const OID_PROBE_PAGE = 4096;
 const CONTENT_ID_PAYLOAD = 1024 * 1024;
 const CONTENT_ID_PAGE = 4096;
 
-/** A blob batch shares the pack reader's conservative memory budget. */
-export const MAX_BLOB_BATCH_BYTES = MAX_PACK_BLOB_BATCH_BYTES;
 const MAX_BLOB_BATCH_OIDS = 4096;
-export const MAX_LOG_STATE_BYTES = 32 * 1024 * 1024;
 
 /** Index rows per round trip. This is the memory bound of a scan. */
 const DEFAULT_INDEX_PAGE = 1000;
@@ -206,7 +204,6 @@ const CHECKOUT_RESULT_ROW_BYTES = 128;
 const CHECKOUT_ROUTING_MAP_BYTES = 128;
 const CHECKOUT_ROUTING_MAP_ENTRY_BYTES = 72;
 export const MAX_CONFIG_SECTION_MOVE_ROWS = 1_024;
-export const MAX_CONFIG_SECTION_MOVE_TEXT_BYTES = 1024 * 1024;
 export const CONFIG_SECTION_MOVE_UPDATE_SQL = `UPDATE git_config
        SET path = ? || substr(path, length(?) + 1)
      WHERE repo_id = ? AND path >= ? AND path < ?
@@ -238,12 +235,6 @@ interface ConfigSectionCandidateMetadata {
 
 interface ConfigSectionMoveMetadata extends ConfigSectionCandidateMetadata {
   readonly valueBytes: number;
-}
-
-interface ConfigSectionMoveRow {
-  readonly path: string;
-  readonly seq: number;
-  readonly value: string;
 }
 
 export type BoundedSingleConfigValue =
@@ -353,6 +344,24 @@ export function createRefMutationMemoryOwner(store: SharedRepoStore): RefMutatio
     reservation.dispose();
     throw error;
   }
+}
+
+function validateRefMutationMemoryOwner(
+  store: SharedRepoStore,
+  owner: RefMutationMemoryOwner,
+  operation: string,
+): MemoryReservation {
+  if (!(owner instanceof RefMutationMemoryOwner)) {
+    throw new GitError("EINVAL", `${operation} memory owner was not issued by the store`);
+  }
+  const reservation = owner.memoryReservation();
+  if (reservation.disposed) {
+    throw new GitError("EINVAL", `${operation} memory owner is disposed`);
+  }
+  if (!store.ownsMemoryReservation(reservation)) {
+    throw new GitError("EINVAL", `${operation} memory owner belongs to another repository`);
+  }
+  return reservation;
 }
 
 type OwnedRefMutation = (
@@ -600,6 +609,7 @@ interface FetchPublicationState {
   readonly checkoutRevision: number;
   readonly budget: RefMutationBudget;
   readonly reservation: MemoryReservation;
+  readonly owner: RefMutationMemoryOwner | undefined;
   disposed: boolean;
 }
 
@@ -773,6 +783,15 @@ export interface ObjectReadInfo {
   chunkRows: number;
 }
 
+interface ObjectReadMetadata {
+  ordinal: number;
+  oid: string;
+  source: "loose" | "pack";
+  type: ObjectType;
+  size: number;
+  stored: "raw" | "zlib" | null;
+}
+
 interface ExpectedOperationObject {
   oid: string;
   type: "blob" | "commit";
@@ -805,7 +824,17 @@ type OwnedObjectBatchFactory = (
   options: ObjectBatchOptions,
 ) => OwnedObjectBatch;
 
+type OwnedAuthenticatedObjectReader = (
+  oid: string,
+  expectedType: ObjectType,
+  reservation: MemoryReservation,
+) => RawObject | null;
+
 const OWNED_OBJECT_BATCHES = new WeakMap<SharedRepoStore, OwnedObjectBatchFactory>();
+const OWNED_AUTHENTICATED_OBJECT_READERS = new WeakMap<
+  SharedRepoStore,
+  OwnedAuthenticatedObjectReader
+>();
 
 function ownedObjectBatchFactory(store: SharedRepoStore): OwnedObjectBatchFactory {
   const factory = OWNED_OBJECT_BATCHES.get(store);
@@ -842,6 +871,20 @@ export function writeObjectsOwned<T>(
   } finally {
     batch.dispose();
   }
+}
+
+/** Internal authenticated read covered by a caller's pre-admitted live-set owner. */
+export function readAuthenticatedObjectOwned(
+  store: SharedRepoStore,
+  oid: string,
+  expectedType: ObjectType,
+  reservation: MemoryReservation,
+): RawObject | null {
+  const read = OWNED_AUTHENTICATED_OBJECT_READERS.get(store);
+  if (read === undefined) {
+    throw new GitError("EINVAL", "repository authenticated object reader is unavailable");
+  }
+  return read(oid, expectedType, reservation);
 }
 
 /** Internal shallow-boundary snapshot retained under an existing graph owner. */
@@ -953,62 +996,89 @@ interface ExpectedContentIdPage {
   rows: { i: number; a: number; n: number; o: string }[];
 }
 
+interface ExpectedBlobIdMapping extends BlobIdMapping {
+  ordinal: number;
+}
+
 interface BlobIdWriteRow {
   a: number;
   n: number;
   o: string;
 }
 
-export const MAX_BLOB_ID_MISMATCH_RETAINED_BYTES = 16 * 1024 * 1024;
-export const MAX_BLOB_ID_INPUT_RETAINED_BYTES = 16 * 1024 * 1024;
 const BLOB_ID_MISMATCH_ROW_BYTES = 384;
 
 export function blobIdMismatchRetainedBytes(mapping: BlobIdMapping): number {
   return BLOB_ID_MISMATCH_ROW_BYTES + mapping.contentId.length + mapping.oid.length * 2;
 }
 
-function contentIdPages(contentIds: Iterable<Uint8Array>): ContentIdPage[] {
+function blobIdRetainedTotal(current: number, addition: number, label: string): number {
+  const next = current + addition;
+  if (!Number.isSafeInteger(next)) {
+    throw new GitError("E2BIG", `${label} retained-memory accounting overflow`);
+  }
+  return next;
+}
+
+function* contentIdPages(
+  contentIds: Iterable<Uint8Array>,
+  reservation: MemoryReservation,
+): Generator<ContentIdPage> {
   const unique = new Map<string, Uint8Array>();
   let retainedBytes = 0;
-  for (const contentId of contentIds) {
-    if (contentId.length > MAX_CACHED_CONTENT_ID_BYTES) continue;
-    const key = contentIdKey(contentId);
-    if (!unique.has(key)) {
-      const bytes = BLOB_ID_MISMATCH_ROW_BYTES + contentId.length + key.length * 2;
-      if (bytes > MAX_BLOB_ID_INPUT_RETAINED_BYTES - retainedBytes) {
-        throw new GitError(
-          "E2BIG",
-          `blob id lookup state exceeds ${MAX_BLOB_ID_INPUT_RETAINED_BYTES} bytes`,
-        );
+  const inputMemory = reservation.scope();
+  const pageMemory = reservation.scope();
+  try {
+    for (const contentId of contentIds) {
+      if (contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
+      const keyBytes = contentId.length * 4;
+      const nextBytes = blobIdRetainedTotal(
+        retainedBytes,
+        BLOB_ID_MISMATCH_ROW_BYTES + contentId.length + keyBytes,
+        "blob id lookup",
+      );
+      inputMemory.set("other", nextBytes);
+      const snapshot = contentId.slice();
+      const key = contentIdKey(snapshot);
+      if (!unique.has(key)) {
+        retainedBytes = nextBytes;
+        unique.set(key, snapshot);
+      } else {
+        unique.set(key, snapshot);
+        inputMemory.set("other", retainedBytes);
       }
-      retainedBytes += bytes;
     }
-    unique.set(key, contentId);
-  }
-  const pages: ContentIdPage[] = [];
-  let parts: Uint8Array[] = [];
-  let rows: { a: number; n: number }[] = [];
-  let length = 0;
-  const flush = (): void => {
-    if (rows.length === 0) return;
-    pages.push({ payload: concat(parts), rows });
-    parts = [];
-    rows = [];
-    length = 0;
-  };
-  for (const contentId of unique.values()) {
-    if (
-      rows.length > 0 &&
-      (rows.length >= CONTENT_ID_PAGE || length + contentId.length > CONTENT_ID_PAYLOAD)
-    ) {
-      flush();
+    let parts: Uint8Array[] = [];
+    let rows: { a: number; n: number }[] = [];
+    let length = 0;
+    let pageBytes = 256;
+    for (const contentId of unique.values()) {
+      if (
+        rows.length > 0 &&
+        (rows.length >= CONTENT_ID_PAGE || length + contentId.length > CONTENT_ID_PAYLOAD)
+      ) {
+        pageMemory.set("other", blobIdRetainedTotal(pageBytes, length, "blob id lookup page"));
+        yield { payload: concat(parts), rows };
+        parts = [];
+        rows = [];
+        length = 0;
+        pageBytes = 256;
+        pageMemory.set("other", pageBytes);
+      }
+      pageBytes = blobIdRetainedTotal(pageBytes, 96, "blob id lookup page");
+      pageMemory.set("other", pageBytes);
+      rows.push({ a: length + 1, n: contentId.length });
+      parts.push(contentId);
+      length += contentId.length;
     }
-    rows.push({ a: length + 1, n: contentId.length });
-    parts.push(contentId);
-    length += contentId.length;
+    if (rows.length > 0) {
+      pageMemory.set("other", blobIdRetainedTotal(pageBytes, length, "blob id lookup page"));
+      yield { payload: concat(parts), rows };
+    }
+  } finally {
+    pageMemory.dispose();
+    inputMemory.dispose();
   }
-  flush();
-  return pages;
 }
 
 function writeBlobIdPage(
@@ -1056,34 +1126,63 @@ function writeBlobIdPage(
 
 /** Expected mappings in pages whose BLOB and JSON inputs stay bounded. */
 function* expectedContentIdPages(
-  mappings: readonly BlobIdMapping[],
+  mappings: readonly ExpectedBlobIdMapping[],
+  reservation: MemoryReservation,
 ): Generator<ExpectedContentIdPage> {
   let parts: Uint8Array[] = [];
   let rows: { i: number; a: number; n: number; o: string }[] = [];
   let length = 0;
+  let retainedBytes = 256;
+  const pageMemory = reservation.scope();
 
-  for (let ordinal = 0; ordinal < mappings.length; ordinal++) {
-    const mapping = mappings[ordinal];
-    if (mapping === undefined) continue;
-    if (mapping.contentId.length > MAX_CACHED_CONTENT_ID_BYTES) continue;
-    if (
-      rows.length > 0 &&
-      (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
-    ) {
-      yield { payload: concat(parts), rows };
-      parts = [];
-      rows = [];
-      length = 0;
+  try {
+    pageMemory.set("other", retainedBytes);
+    for (const mapping of mappings) {
+      if (mapping === undefined) continue;
+      if (
+        rows.length > 0 &&
+        (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+      ) {
+        pageMemory.set(
+          "other",
+          blobIdRetainedTotal(retainedBytes, length, "blob id comparison page"),
+        );
+        yield { payload: concat(parts), rows };
+        parts = [];
+        rows = [];
+        length = 0;
+        retainedBytes = 256;
+        pageMemory.set("other", retainedBytes);
+      }
+      retainedBytes = blobIdRetainedTotal(
+        retainedBytes,
+        160 + mapping.oid.length * 2,
+        "blob id comparison page",
+      );
+      pageMemory.set("other", retainedBytes);
+      rows.push({
+        i: mapping.ordinal,
+        a: length + 1,
+        n: mapping.contentId.length,
+        o: mapping.oid,
+      });
+      parts.push(mapping.contentId);
+      length += mapping.contentId.length;
     }
-    rows.push({ i: ordinal, a: length + 1, n: mapping.contentId.length, o: mapping.oid });
-    parts.push(mapping.contentId);
-    length += mapping.contentId.length;
+    if (rows.length > 0) {
+      pageMemory.set(
+        "other",
+        blobIdRetainedTotal(retainedBytes, length, "blob id comparison page"),
+      );
+      yield { payload: concat(parts), rows };
+    }
+  } finally {
+    pageMemory.dispose();
   }
-  if (rows.length > 0) yield { payload: concat(parts), rows };
 }
 
 function requireCommitCacheWrites(result: CommitCacheWriteResult, expected: number): void {
-  if (result.written !== expected || result.eligible !== expected || result.skipped !== 0) {
+  if (result.written !== result.eligible || result.eligible + result.skipped !== expected) {
     throw new CorruptError(`commit cache wrote ${result.written} of ${expected} required rows`);
   }
 }
@@ -1238,7 +1337,6 @@ function isObjectType(value: string | null): value is ObjectType {
 }
 
 const JSON_ENCODER = new TextEncoder();
-const CONFIG_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
 const CANONICAL_TEXT_DECODER = new TextDecoder("utf-8", {
   fatal: true,
   ignoreBOM: true,
@@ -1449,7 +1547,6 @@ function* jsonPages<T>(
   let bytes = 2;
   let retained = 256;
   const pageMemory = memory?.reservation.scope();
-  pageMemory?.set("other", retained);
   const emit = function* (pendingBytes = 0): Generator<string> {
     const joinedUnits = Math.max(0, bytes - 2);
     pageMemory?.set(
@@ -1463,6 +1560,7 @@ function* jsonPages<T>(
     yield `[${joined}]`;
   };
   try {
+    pageMemory?.set("other", retained);
     for (const item of items) {
       if (memory !== undefined) {
         pageMemory?.set("other", retained + retainedStringUnits(memory.maxUnits(item)));
@@ -2055,10 +2153,17 @@ function normalizeFetchPublication(
   state: FetchPublicationState,
   plan: FetchPublicationPlan,
   budget: RefMutationBudget,
+  owner?: RefMutationMemoryOwner,
 ): NormalizedFetchPublication {
   const puts = new Map<string, string>();
   const deletes = new Set<string>();
   const keep = new Set<string>();
+  const chargedStrings: string[] = [];
+  const stringBytes = (value: string): number => {
+    if (owner?.owns(value) === true || chargedStrings.includes(value)) return 0;
+    chargedStrings.push(value);
+    return retainedStringBytes(value);
+  };
   budget.charge(48 + 2 * (state.trackingPrefix.length + "HEAD".length));
   const remoteHeadName = `${state.trackingPrefix}HEAD`;
   let inputs = 0;
@@ -2071,8 +2176,8 @@ function normalizeFetchPublication(
     if (target !== undefined) refTextBytes(target, "fetch ref target", "input");
     budget.charge(
       REF_MUTATION_ITEM_RETAINED_BYTES +
-        (nameAlreadyOwned ? 0 : retainedStringBytes(name)) +
-        (target === undefined ? 0 : retainedStringBytes(target)),
+        (nameAlreadyOwned ? 0 : stringBytes(name)) +
+        (target === undefined ? 0 : stringBytes(target)),
     );
   };
   const trackingName = (value: unknown, label: string): string => {
@@ -2859,7 +2964,7 @@ class InitialBlobIdBuffer {
   }
 
   willCache(mapping: BlobIdMapping): boolean {
-    return mapping.contentId.length <= MAX_CACHED_CONTENT_ID_BYTES;
+    return mapping.contentId.length <= BLOB_ID_CACHE_ELIGIBILITY_BYTES;
   }
 
   needsFlush(mapping: BlobIdMapping): boolean {
@@ -3918,20 +4023,29 @@ export class SharedRepoStore {
     return this.#ops().publishTrackingRef(token, target, metadata);
   }
 
+  /** Internal owner seam: candidate aliases must be values returned by this exact owner. */
   beginFetchPublication(
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
     reservation?: MemoryReservation,
+    owner?: RefMutationMemoryOwner,
   ): FetchPublicationToken {
-    return this.#ops().beginFetchPublication(trackingPrefix, candidateExactRefs, reservation);
+    return this.#ops().beginFetchPublication(
+      trackingPrefix,
+      candidateExactRefs,
+      reservation,
+      owner,
+    );
   }
 
+  /** Internal owner seam: owned strings must be values returned by this exact owner. */
   publishFetchRefs(
     token: FetchPublicationToken,
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
+    owner?: RefMutationMemoryOwner,
   ): boolean {
-    return this.#ops().publishFetchRefs(token, plan, metadata);
+    return this.#ops().publishFetchRefs(token, plan, metadata, owner);
   }
 
   listRefs(prefix = ""): RefRow[] {
@@ -6188,8 +6302,8 @@ export class CheckoutStore implements IndexStore {
         this.#memoryCoordinator,
         (reservation) => shared.scopeMemoryReservation(reservation),
         shared.cacheNamespace,
-        (oid) => this.#readLoose(oid),
-        (oids) => this.#readLooseObjects(oids),
+        (oids: readonly string[], ownership: PackReadOwnership) =>
+          this.#readLooseObjects(oids, ownership),
         (oids) => this.#looseObjectMetadata(oids),
         options,
       ),
@@ -6199,6 +6313,9 @@ export class CheckoutStore implements IndexStore {
     );
     OWNED_OBJECT_BATCHES.set(shared, (reservation, batchOptions) =>
       this.#writeBatchOwned(reservation, batchOptions),
+    );
+    OWNED_AUTHENTICATED_OBJECT_READERS.set(shared, (oid, expectedType, reservation) =>
+      this.#readAuthenticatedObjectOwned(oid, expectedType, reservation),
     );
     if (!OWNED_CONFIG_GETTERS.has(shared)) {
       OWNED_CONFIG_GETTERS.set(shared, (path, owner) => this.#configGetOwned(path, owner));
@@ -6302,29 +6419,46 @@ export class CheckoutStore implements IndexStore {
 
   /** Look up opaque filesystem content ids without interpreting their bytes. */
   lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
+    const reservation = this.reserveMemory();
+    const resultMemory = reservation.scope();
     const found = new Map<string, string>();
-    for (const page of contentIdPages(contentIds)) {
-      for (const row of this.#db.all<{ content_key: string; oid: string }>(
-        `WITH ids(content_id) AS MATERIALIZED (
-           SELECT CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
-                       ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
-                   END
-             FROM json_each(?)
-         )
-         SELECT lower(hex(ids.content_id)) AS content_key, b.oid
-           FROM ids
-           JOIN git_blob_ids b ON b.repo_id = ? AND b.content_id = ids.content_id`,
-        blob(page.payload),
-        JSON.stringify(page.rows),
-        this.#repoId,
-      )) {
-        if (typeof row.content_key !== "string" || !isOid(row.oid)) {
-          throw new CorruptError("blob id lookup returned an invalid mapping");
+    let resultBytes = 128;
+    try {
+      resultMemory.set("other", resultBytes);
+      for (const page of contentIdPages(contentIds, reservation)) {
+        for (const row of this.#db.iterate(
+          `WITH ids(content_id) AS MATERIALIZED (
+             SELECT CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
+                         ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
+                     END
+               FROM json_each(?)
+           )
+           SELECT lower(hex(ids.content_id)) AS content_key, b.oid
+             FROM ids
+             JOIN git_blob_ids b ON b.repo_id = ? AND b.content_id = ids.content_id`,
+          blob(page.payload),
+          JSON.stringify(page.rows),
+          this.#repoId,
+        )) {
+          const contentKey = row.content_key;
+          const oid = row.oid;
+          if (typeof contentKey !== "string" || typeof oid !== "string" || !isOid(oid)) {
+            throw new CorruptError("blob id lookup returned an invalid mapping");
+          }
+          resultBytes = blobIdRetainedTotal(
+            resultBytes,
+            BLOB_ID_MISMATCH_ROW_BYTES + contentKey.length * 2 + oid.length * 2,
+            "blob id lookup result",
+          );
+          resultMemory.set("other", resultBytes);
+          found.set(contentKey, oid);
         }
-        found.set(row.content_key, row.oid);
       }
+      return found;
+    } finally {
+      resultMemory.dispose();
+      reservation.dispose();
     }
-    return found;
   }
 
   /**
@@ -6335,106 +6469,149 @@ export class CheckoutStore implements IndexStore {
    * the content instead of trusting it.
    */
   blobIdMismatches(expected: Iterable<BlobIdMapping>): Map<number, string | null> {
-    const retained: BlobIdMapping[] = [];
+    const reservation = this.reserveMemory();
+    const stateMemory = reservation.scope();
+    const retained: ExpectedBlobIdMapping[] = [];
     const mismatches = new Map<number, string | null>();
-    let retainedBytes = 0;
-    for (const mapping of expected) {
-      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-      const cacheable = mapping.contentId.length <= MAX_CACHED_CONTENT_ID_BYTES;
-      const bytes = cacheable ? blobIdMismatchRetainedBytes(mapping) : BLOB_ID_MISMATCH_ROW_BYTES;
-      if (bytes > MAX_BLOB_ID_MISMATCH_RETAINED_BYTES - retainedBytes) {
-        throw new GitError(
-          "E2BIG",
-          `blob id comparison state exceeds ${MAX_BLOB_ID_MISMATCH_RETAINED_BYTES} bytes`,
+    let retainedBytes = 256;
+    let capturedCount = 0;
+    try {
+      stateMemory.set("other", retainedBytes);
+      for (const mapping of expected) {
+        if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+        const cacheable = mapping.contentId.length <= BLOB_ID_CACHE_ELIGIBILITY_BYTES;
+        retainedBytes = blobIdRetainedTotal(
+          retainedBytes,
+          cacheable ? blobIdMismatchRetainedBytes(mapping) : BLOB_ID_MISMATCH_ROW_BYTES,
+          "blob id comparison",
         );
+        stateMemory.set("other", retainedBytes);
+        if (cacheable) {
+          retained.push({
+            ordinal: capturedCount,
+            contentId: mapping.contentId.slice(),
+            oid: mapping.oid,
+          });
+        } else {
+          mismatches.set(capturedCount, null);
+        }
+        capturedCount++;
       }
-      retainedBytes += bytes;
-      retained.push(mapping);
-      if (!cacheable) mismatches.set(retained.length - 1, null);
-    }
 
-    for (const page of expectedContentIdPages(retained)) {
-      for (const row of this.#db.all<{ ordinal: number; oid: string | null }>(
-        `WITH expected(ordinal, content_id, expected_oid) AS MATERIALIZED (
-           SELECT json_extract(value, '$.i'),
-                  CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
-                       ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
-                   END,
-                  json_extract(value, '$.o')
-             FROM json_each(?)
-         )
-         SELECT expected.ordinal, b.oid
-           FROM expected
-           LEFT JOIN git_blob_ids b
-             ON b.repo_id = ? AND b.content_id = expected.content_id
-          WHERE b.oid IS NULL OR b.oid <> expected.expected_oid`,
-        blob(page.payload),
-        JSON.stringify(page.rows),
-        this.#repoId,
-      )) {
-        if (
-          !Number.isSafeInteger(row.ordinal) ||
-          row.ordinal < 0 ||
-          row.ordinal >= retained.length ||
-          (row.oid !== null && !isOid(row.oid))
-        ) {
-          throw new CorruptError("blob id comparison returned an invalid mapping");
+      for (const page of expectedContentIdPages(retained, reservation)) {
+        for (const row of this.#db.iterate(
+          `WITH expected(ordinal, content_id, expected_oid) AS MATERIALIZED (
+             SELECT json_extract(value, '$.i'),
+                    CASE WHEN json_extract(value, '$.n') = 0 THEN zeroblob(0)
+                         ELSE substr(?, json_extract(value, '$.a'), json_extract(value, '$.n'))
+                     END,
+                    json_extract(value, '$.o')
+               FROM json_each(?)
+           )
+           SELECT expected.ordinal, b.oid
+             FROM expected
+             LEFT JOIN git_blob_ids b
+               ON b.repo_id = ? AND b.content_id = expected.content_id
+            WHERE b.oid IS NULL OR b.oid <> expected.expected_oid`,
+          blob(page.payload),
+          JSON.stringify(page.rows),
+          this.#repoId,
+        )) {
+          const returnedOrdinal = row.ordinal;
+          const oid = row.oid;
+          if (
+            typeof returnedOrdinal !== "number" ||
+            !Number.isSafeInteger(returnedOrdinal) ||
+            returnedOrdinal < 0 ||
+            returnedOrdinal >= capturedCount ||
+            !page.rows.some((candidate) => candidate.i === returnedOrdinal) ||
+            (oid !== null && (typeof oid !== "string" || !isOid(oid)))
+          ) {
+            throw new CorruptError("blob id comparison returned an invalid mapping");
+          }
+          if (mismatches.has(returnedOrdinal)) {
+            throw new CorruptError("blob id comparison returned a duplicate ordinal");
+          }
+          mismatches.set(returnedOrdinal, oid);
         }
-        if (mismatches.has(row.ordinal)) {
-          throw new CorruptError("blob id comparison returned a duplicate ordinal");
-        }
-        mismatches.set(row.ordinal, row.oid);
       }
+      return mismatches;
+    } finally {
+      stateMemory.dispose();
+      reservation.dispose();
     }
-    return mismatches;
   }
 
   /** Upsert opaque content-id mappings in bounded BLOB payloads. */
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
+    const reservation = this.reserveMemory();
+    const inputMemory = reservation.scope();
+    const pageMemory = reservation.scope();
     const unique = new Map<string, BlobIdMapping>();
-    let retainedBytes = 0;
-    for (const mapping of mappings) {
-      if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
-      if (mapping.contentId.length > MAX_CACHED_CONTENT_ID_BYTES) continue;
-      const key = contentIdKey(mapping.contentId);
-      const previous = unique.get(key);
-      if (previous === undefined) {
-        const bytes = blobIdMismatchRetainedBytes(mapping) + key.length * 2;
-        if (bytes > MAX_BLOB_ID_INPUT_RETAINED_BYTES - retainedBytes) {
-          throw new GitError(
-            "E2BIG",
-            `blob id update state exceeds ${MAX_BLOB_ID_INPUT_RETAINED_BYTES} bytes`,
+    let retainedBytes = 256;
+    try {
+      inputMemory.set("other", retainedBytes);
+      for (const mapping of mappings) {
+        if (!isOid(mapping.oid)) throw new CorruptError(`invalid blob oid ${mapping.oid}`);
+        if (mapping.contentId.length > BLOB_ID_CACHE_ELIGIBILITY_BYTES) continue;
+        const addition = blobIdMismatchRetainedBytes(mapping) + mapping.contentId.length * 4;
+        const nextBytes = blobIdRetainedTotal(retainedBytes, addition, "blob id update");
+        inputMemory.set("other", nextBytes);
+        const snapshot: BlobIdMapping = {
+          contentId: mapping.contentId.slice(),
+          oid: mapping.oid,
+        };
+        const key = contentIdKey(snapshot.contentId);
+        if (!unique.has(key)) {
+          retainedBytes = nextBytes;
+          unique.set(key, snapshot);
+        } else {
+          unique.set(key, snapshot);
+          inputMemory.set("other", retainedBytes);
+        }
+      }
+      if (unique.size === 0) return;
+      this.#db.transactionSync(() => {
+        let parts: Uint8Array[] = [];
+        let rows: { a: number; n: number; o: string }[] = [];
+        let length = 0;
+        let pageBytes = 256;
+        const flush = (): void => {
+          if (rows.length === 0) return;
+          pageMemory.set("other", blobIdRetainedTotal(pageBytes, length, "blob id update page"));
+          writeBlobIdPage(this.#db, this.#repoId, concat(parts), rows, true, true);
+          parts = [];
+          rows = [];
+          length = 0;
+          pageBytes = 256;
+          pageMemory.set("other", pageBytes);
+        };
+        pageMemory.set("other", pageBytes);
+        for (const mapping of unique.values()) {
+          if (
+            rows.length > 0 &&
+            (rows.length >= CONTENT_ID_PAGE ||
+              length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
+          ) {
+            flush();
+          }
+          pageBytes = blobIdRetainedTotal(
+            pageBytes,
+            160 + mapping.oid.length * 2,
+            "blob id update page",
           );
+          pageMemory.set("other", pageBytes);
+          rows.push({ a: length + 1, n: mapping.contentId.length, o: mapping.oid });
+          parts.push(mapping.contentId);
+          length += mapping.contentId.length;
         }
-        retainedBytes += bytes;
-      }
-      unique.set(key, mapping);
+        flush();
+      });
+    } finally {
+      pageMemory.dispose();
+      inputMemory.dispose();
+      reservation.dispose();
     }
-    if (unique.size === 0) return;
-    this.#db.transactionSync(() => {
-      let parts: Uint8Array[] = [];
-      let rows: { a: number; n: number; o: string }[] = [];
-      let length = 0;
-      const flush = (): void => {
-        if (rows.length === 0) return;
-        writeBlobIdPage(this.#db, this.#repoId, concat(parts), rows, true, true);
-        parts = [];
-        rows = [];
-        length = 0;
-      };
-      for (const mapping of unique.values()) {
-        if (
-          rows.length > 0 &&
-          (rows.length >= CONTENT_ID_PAGE || length + mapping.contentId.length > CONTENT_ID_PAYLOAD)
-        ) {
-          flush();
-        }
-        rows.push({ a: length + 1, n: mapping.contentId.length, o: mapping.oid });
-        parts.push(mapping.contentId);
-        length += mapping.contentId.length;
-      }
-      flush();
-    });
   }
 
   has(oid: string): boolean {
@@ -6501,22 +6678,92 @@ export class CheckoutStore implements IndexStore {
 
   /** Cold-read and hash one authoritative loose or complete-pack object. */
   readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
+    return this.#readAuthenticatedObject(oid, expectedType);
+  }
+
+  #readAuthenticatedObjectOwned(
+    oid: string,
+    expectedType: ObjectType,
+    reservation: MemoryReservation,
+  ): RawObject | null {
+    if (reservation.disposed) {
+      throw new GitError("EINVAL", "authenticated object read reservation is disposed");
+    }
+    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
+      throw new GitError(
+        "EINVAL",
+        "authenticated object read reservation belongs to another repository",
+      );
+    }
+    if (reservation.currentBytes === 0) {
+      throw new GitError("EINVAL", "authenticated object read reservation is not pre-admitted");
+    }
+    return this.#readAuthenticatedObject(oid, expectedType, reservation);
+  }
+
+  #readAuthenticatedObject(
+    oid: string,
+    expectedType: ObjectType,
+    owningReservation?: MemoryReservation,
+  ): RawObject | null {
     if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
     const loose = this.#looseRow(oid);
-    if (loose === null) return this.#packs.readAuthenticatedObject(oid, expectedType);
-    const cacheKey = this.#objectCacheKey(oid);
+    const operation = owningReservation?.scope();
+    const output = owningReservation?.scope();
     try {
-      const object = this.#readLooseObjectRows([{ oid, ...loose }]).get(oid);
-      if (object === undefined) throw new CorruptError(`loose ${expectedType} ${oid} disappeared`);
-      if (object.type !== expectedType) {
-        throw new CorruptError(`${oid} is a ${object.type}, not a ${expectedType}`);
+      if (loose === null) {
+        if (operation === undefined || output === undefined || owningReservation === undefined) {
+          return this.#packs.readAuthenticatedObject(oid, expectedType);
+        }
+        const admittedBytes = owningReservation.currentBytes;
+        owningReservation.clear("other");
+        if (owningReservation.currentBytes !== 0) {
+          owningReservation.set("other", admittedBytes - owningReservation.currentBytes);
+          throw new GitError(
+            "EINVAL",
+            "authenticated object read reservation must use a dedicated scope",
+          );
+        }
+        let aggregateRestored = false;
+        try {
+          const object = this.#packs.readAuthenticatedObject(oid, expectedType, {
+            operation,
+            output,
+          });
+          output.transfer("flat", owningReservation, "other");
+          owningReservation.set("other", admittedBytes);
+          aggregateRestored = true;
+          return object;
+        } finally {
+          if (!aggregateRestored) {
+            output.dispose();
+            operation.dispose();
+            owningReservation.set("other", admittedBytes);
+          }
+        }
       }
-      if (hashObject(object.type, object.data) !== oid) {
-        throw new CorruptError(`loose ${expectedType} ${oid} does not match its bytes`);
+      const cacheKey = this.#objectCacheKey(oid);
+      try {
+        const object = this.#readLooseObjectRows(
+          [{ oid, ...loose }],
+          operation === undefined || output === undefined ? undefined : { operation, output },
+          owningReservation !== undefined,
+        ).get(oid);
+        if (object === undefined)
+          throw new CorruptError(`loose ${expectedType} ${oid} disappeared`);
+        if (object.type !== expectedType) {
+          throw new CorruptError(`${oid} is a ${object.type}, not a ${expectedType}`);
+        }
+        if (hashObject(object.type, object.data) !== oid) {
+          throw new CorruptError(`loose ${expectedType} ${oid} does not match its bytes`);
+        }
+        return object;
+      } finally {
+        this.#objects.delete(cacheKey);
       }
-      return object;
     } finally {
-      this.#objects.delete(cacheKey);
+      output?.dispose();
+      operation?.dispose();
     }
   }
 
@@ -6637,65 +6884,106 @@ export class CheckoutStore implements IndexStore {
 
   /** Read a deduplicated prefix of mixed objects under an explicit byte budget. */
   readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
-    const budget = options.budgetBytes ?? MAX_BLOB_BATCH_BYTES;
-    if (!Number.isSafeInteger(budget) || budget <= 0 || budget > MAX_BLOB_BATCH_BYTES) {
-      throw new RangeError(
-        `object read budget must be an integer from 1 to ${MAX_BLOB_BATCH_BYTES}`,
-      );
+    const reservation = this.reserveMemory();
+    try {
+      return this.#readObjectsOwned(oids, options, reservation);
+    } finally {
+      reservation.dispose();
     }
-    const wanted = [...new Set(oids)];
-    if (wanted.length > MAX_BLOB_BATCH_OIDS) {
+  }
+
+  #readObjectsOwned(
+    oids: readonly string[],
+    options: { budgetBytes?: number },
+    reservation: MemoryReservation,
+  ): ObjectReadBatch {
+    const budget = options.budgetBytes ?? PACK_BLOB_BATCH_TARGET_BYTES;
+    if (!Number.isSafeInteger(budget) || budget <= 0) {
+      throw new RangeError("object read budget must be a positive safe integer");
+    }
+    const inputLength = oids.length;
+    if (!Number.isSafeInteger(inputLength) || inputLength > MAX_BLOB_BATCH_OIDS) {
       throw new GitError("E2BIG", `object batch exceeds ${MAX_BLOB_BATCH_OIDS} inputs`);
     }
-    for (const oid of wanted) {
+    const inputMemory = reservation.scope();
+    let inputBytes = 512 + inputLength * 8;
+    inputMemory.set("other", inputBytes);
+    const captured: string[] = [];
+    for (let index = 0; index < inputLength; index++) {
+      const oid = oids[index];
+      if (typeof oid !== "string") throw new CorruptError("invalid object id input");
+      inputBytes = blobIdRetainedTotal(
+        inputBytes,
+        retainedStringBytes(oid) + 8,
+        "object read input",
+      );
+      inputMemory.set("other", inputBytes);
+      captured.push(oid);
       if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
+    }
+    const seen = new Set<string>();
+    const wanted: string[] = [];
+    for (const oid of captured) {
+      if (seen.has(oid)) continue;
+      inputBytes = blobIdRetainedTotal(inputBytes, 160, "object read input");
+      inputMemory.set("other", inputBytes);
+      seen.add(oid);
+      wanted.push(oid);
     }
     if (wanted.length === 0) return { objects: new Map(), remaining: [], bytes: 0 };
 
-    const metadata = this.#db.all<{
-      ordinal: number;
-      oid: string;
-      source: string | null;
-      type: string | null;
-      size: number | null;
-      stored: string | null;
-    }>(
+    const jsonMemory = reservation.scope();
+    const jsonUnits = 2 + Math.max(0, wanted.length - 1) + wanted.length * 42;
+    jsonMemory.set("other", 128 + retainedStringUnits(jsonUnits));
+    const encodedWanted = JSON.stringify(wanted);
+
+    const metadataMemory = reservation.scope();
+    metadataMemory.set("other", 512 + wanted.length * 768);
+    const rawMetadata = this.#db.all<Record<string, unknown>>(
       `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
        SELECT w.ordinal, w.oid,
-              CASE WHEN loose.oid IS NOT NULL THEN 'loose'
-                   WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
-              CASE WHEN loose.oid IS NOT NULL THEN loose.type
-                   WHEN pack.pack_id IS NOT NULL THEN packed.type END AS type,
-              CASE WHEN loose.oid IS NOT NULL THEN loose.size
-                   WHEN pack.pack_id IS NOT NULL THEN packed.size END AS size,
-              loose.stored
-         FROM wanted w
-         LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
-         LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
+               CASE WHEN loose.oid IS NOT NULL THEN 'loose'
+                    WHEN pack.pack_id IS NOT NULL THEN 'pack' ELSE NULL END AS source,
+               CASE WHEN loose.oid IS NOT NULL
+                          AND typeof(loose.type) = 'text'
+                          AND length(CAST(loose.type AS BLOB)) <= 6 THEN loose.type
+                    WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
+                          AND typeof(packed.type) = 'text'
+                          AND length(CAST(packed.type AS BLOB)) <= 6 THEN packed.type END AS type,
+               CASE WHEN loose.oid IS NOT NULL AND typeof(loose.size) = 'integer' THEN loose.size
+                    WHEN loose.oid IS NULL AND pack.pack_id IS NOT NULL
+                          AND typeof(packed.size) = 'integer' THEN packed.size END AS size,
+               CASE WHEN loose.oid IS NOT NULL
+                          AND typeof(loose.stored) = 'text'
+                          AND length(CAST(loose.stored AS BLOB)) <= 4 THEN loose.stored END AS stored
+          FROM wanted w
+          LEFT JOIN git_objects loose ON loose.repo_id = ? AND loose.oid = w.oid
+          LEFT JOIN git_pack_objects packed ON packed.repo_id = ? AND packed.oid = w.oid
          LEFT JOIN git_pack_meta pack
            ON pack.repo_id = packed.repo_id AND pack.pack_id = packed.pack_id
-          AND pack.state = 'complete'
-        ORDER BY w.ordinal`,
-      JSON.stringify(wanted),
+           AND pack.state = 'complete'
+         ORDER BY w.ordinal`,
+      encodedWanted,
       this.#repoId,
       this.#repoId,
     );
-    if (metadata.length !== wanted.length) {
+    if (rawMetadata.length !== wanted.length) {
       throw new CorruptError("object metadata lookup returned the wrong row count");
     }
 
-    const selected: typeof metadata = [];
-    let bytes = 0;
-    for (let index = 0; index < metadata.length; index++) {
-      const row = metadata[index]!;
-      if (
-        row.ordinal !== index ||
-        row.oid !== wanted[index] ||
-        (row.source !== "loose" && row.source !== "pack")
-      ) {
-        if (row.source === null) throw new ObjectNotFoundError(wanted[index]!);
+    const metadata: ObjectReadMetadata[] = [];
+    for (let index = 0; index < rawMetadata.length; index++) {
+      const row = rawMetadata[index];
+      if (row === undefined) throw new CorruptError("object metadata lookup returned a sparse row");
+      const oid = row.oid;
+      const source = row.source;
+      if (row.ordinal !== index || typeof oid !== "string" || oid !== wanted[index]) {
+        throw new CorruptError("object metadata lookup returned an invalid identity");
+      }
+      if (source !== "loose" && source !== "pack") {
+        if (source === null) throw new ObjectNotFoundError(oid);
         throw new CorruptError("object metadata lookup returned an invalid source");
       }
       if (
@@ -6704,46 +6992,136 @@ export class CheckoutStore implements IndexStore {
         row.type !== "commit" &&
         row.type !== "tag"
       ) {
-        throw new CorruptError(`object ${row.oid} has an invalid indexed type`);
+        throw new CorruptError(`object ${oid} has an invalid indexed type`);
       }
-      const size = row.size;
+      const { size } = row;
       if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
-        throw new CorruptError(`object ${row.oid} has an invalid indexed size`);
+        throw new CorruptError(`object ${oid} has an invalid indexed size`);
       }
-      if (bytes + size > budget) {
-        if (selected.length === 0) {
-          throw new GitError("EFBIG", `object ${row.oid} exceeds the ${budget}-byte read budget`);
+      let stored: "raw" | "zlib" | null;
+      if (source === "loose") {
+        if (row.stored !== "raw" && row.stored !== "zlib") {
+          throw new CorruptError(`object ${oid} has invalid storage metadata`);
         }
-        break;
+        stored = row.stored;
+      } else {
+        if (row.stored !== null) {
+          throw new CorruptError(`object ${oid} has invalid storage metadata`);
+        }
+        stored = null;
       }
-      selected.push(row);
-      bytes += size;
+      metadata.push({
+        ordinal: index,
+        oid,
+        source,
+        type: row.type,
+        size,
+        stored,
+      });
     }
 
-    const looseRows = selected.filter((row) => row.source === "loose");
-    const packedOids = selected.filter((row) => row.source === "pack").map((row) => row.oid);
-    const looseObjects = this.#readLooseObjectRows(looseRows);
-    const packed = this.#packs.readObjects(packedOids);
-    const objects = new Map<string, RawObject>();
-    for (const row of selected) {
-      const object = (row.source === "loose" ? looseObjects : packed).get(row.oid);
-      if (object === undefined || object.type !== row.type || object.data.length !== row.size) {
-        throw new CorruptError(`object ${row.oid} did not produce its indexed bytes`);
+    const selectionMemory = reservation.scope();
+    let selectionBytes = 256;
+    selectionMemory.set("other", selectionBytes);
+    const selected: ObjectReadMetadata[] = [];
+    let bytes = 0;
+    for (const row of metadata) {
+      if (row.size > Number.MAX_SAFE_INTEGER - bytes) {
+        throw new GitError("E2BIG", "object read retained-memory accounting overflow");
       }
-      objects.set(row.oid, object);
+      if (selected.length > 0 && bytes + row.size > budget) break;
+      selectionBytes = blobIdRetainedTotal(selectionBytes, 200, "object read selection");
+      selectionMemory.set("other", selectionBytes);
+      selected.push(row);
+      bytes += row.size;
+      if (bytes >= budget) break;
     }
-    return { objects, remaining: wanted.slice(selected.length), bytes };
+
+    let sourceArrayBytes = selectionBytes;
+    let looseOutputBytes = 0;
+    let packedOutputBytes = 0;
+    const looseRows: ObjectReadMetadata[] = [];
+    const packedOids: string[] = [];
+    for (const row of selected) {
+      sourceArrayBytes = blobIdRetainedTotal(
+        sourceArrayBytes,
+        row.source === "loose" ? 8 : 8 + retainedStringBytes(row.oid),
+        "object read source arrays",
+      );
+      selectionMemory.set("other", sourceArrayBytes);
+      if (row.source === "loose") {
+        looseOutputBytes = blobIdRetainedTotal(looseOutputBytes, row.size, "loose object output");
+        looseRows.push(row);
+      } else {
+        packedOutputBytes = blobIdRetainedTotal(
+          packedOutputBytes,
+          row.size,
+          "packed object output",
+        );
+        packedOids.push(row.oid);
+      }
+    }
+
+    const remainingCount = wanted.length - selected.length;
+    const outputBytes =
+      512 + selected.length * 256 + remainingCount * 8 + looseOutputBytes + packedOutputBytes;
+    if (!Number.isSafeInteger(outputBytes)) {
+      throw new GitError("E2BIG", "object read output memory accounting overflow");
+    }
+    const outputMemory = reservation.scope();
+    const initialOutputBytes = 512 + selected.length * 256 + remainingCount * 8 + looseOutputBytes;
+    outputMemory.set("other", initialOutputBytes);
+    const remaining = wanted.slice(selected.length);
+    const looseOperation = reservation.scope();
+    const packedOperation = reservation.scope();
+    const packedOutput = reservation.scope();
+    try {
+      const looseObjects = this.#readLooseObjectRows(looseRows, {
+        operation: looseOperation,
+        output: outputMemory,
+      });
+      const packed =
+        packedOids.length === 0
+          ? new Map<string, RawObject>()
+          : this.#packs.readObjects(packedOids, null, {
+              operation: packedOperation,
+              output: packedOutput,
+            });
+      const objects = new Map<string, RawObject>();
+      for (const row of selected) {
+        const object = (row.source === "loose" ? looseObjects : packed).get(row.oid);
+        if (object === undefined || object.type !== row.type || object.data.length !== row.size) {
+          throw new CorruptError(`object ${row.oid} did not produce its indexed bytes`);
+        }
+        objects.set(row.oid, object);
+      }
+      packed.clear();
+      packedOutput.transfer("flat", outputMemory, "other");
+      outputMemory.set("other", outputBytes);
+      return { objects, remaining, bytes };
+    } finally {
+      packedOutput.dispose();
+      packedOperation.dispose();
+      looseOperation.dispose();
+    }
   }
 
   /** Read a deduplicated prefix of blobs under an explicit byte budget. */
   readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
-    const batch = this.readObjects(oids, options);
-    const blobs = new Map<string, Uint8Array>();
-    for (const [oid, object] of batch.objects) {
-      if (object.type !== "blob") throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
-      blobs.set(oid, object.data);
+    const reservation = this.reserveMemory();
+    try {
+      const batch = this.#readObjectsOwned(oids, options, reservation);
+      reservation.set("metadata", 128 + batch.objects.size * 128);
+      const blobs = new Map<string, Uint8Array>();
+      for (const [oid, object] of batch.objects) {
+        if (object.type !== "blob")
+          throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
+        blobs.set(oid, object.data);
+      }
+      return { blobs, remaining: batch.remaining, bytes: batch.bytes };
+    } finally {
+      reservation.dispose();
     }
-    return { blobs, remaining: batch.remaining, bytes: batch.bytes };
   }
 
   /** Stream every non-tree entry in raw Git DFS order with one SQL statement. */
@@ -6809,154 +7187,41 @@ export class CheckoutStore implements IndexStore {
   }
 
   write(type: ObjectType, data: Uint8Array): string {
-    const oid = hashObject(type, data);
-    const commitEntry =
-      type === "commit" ? prepareCommitCache({ repoId: this.#repoId, oid, data }) : undefined;
-    if (this.has(oid)) {
-      if (commitEntry !== undefined) {
-        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-      }
-      return oid;
-    }
-    const stored = looseEncoding(data.length);
-    const storedData = encodeLoose(data, stored);
-    const createdMs = this.#nowMilliseconds();
-    this.#db.transactionSync(() => {
-      this.#db.run(
-        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
-        this.#repoId,
-        oid,
-        type,
-        data.length,
-        stored,
-      );
-      this.#db.run(
-        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-         VALUES (?, ?, ?)`,
-        this.#repoId,
-        oid,
-        createdMs,
-      );
-      this.#db.run(
-        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
-        this.#repoId,
-        oid,
-      );
-      for (
-        let seq = 0, offset = 0;
-        offset < storedData.length || seq === 0;
-        seq++, offset += OBJECT_CHUNK
-      ) {
-        const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
-        if (part.length === 0) {
-          this.#db.run(
-            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, zeroblob(0))",
-            this.#repoId,
-            oid,
-            seq,
-          );
-        } else {
-          this.#db.run(
-            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-            this.#repoId,
-            oid,
-            seq,
-            blob(part),
-          );
+    const reservation = this.reserveMemory();
+    const commitMemory = reservation.scope();
+    const storageMemory = reservation.scope();
+    try {
+      const oid = hashObject(type, data);
+      const commitEntry =
+        type === "commit"
+          ? prepareCommitCacheOwned({ repoId: this.#repoId, oid, data }, commitMemory)
+          : undefined;
+      if (this.has(oid)) {
+        if (commitEntry !== undefined) {
+          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
         }
+        return oid;
       }
-      if (type === "tree") {
-        const treeMemory = this.reserveMemory();
-        try {
-          indexSeededTreeSource(
-            this.#db,
-            {
-              repoId: this.#repoId,
-              treeOid: oid,
-              storage: "loose",
-              sourceId: 0,
-              objectSize: data.length,
-            },
-            [data],
-            treeMemory,
-          );
-        } finally {
-          treeMemory.dispose();
-        }
-      }
-      if (commitEntry !== undefined) {
-        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-      }
-    });
-    this.shared.markLoose();
-    this.#objects.set(this.#objectCacheKey(oid), { type, data });
-    return oid;
-  }
-
-  /**
-   * Write a loose object from a stream of chunks. `chunks` is a factory
-   * because the content is read twice: once to hash it, which is how the oid
-   * is known and how `has` can short-circuit before a single row is written,
-   * and once to deflate and store it. Nothing larger than one chunk is ever
-   * live, so the peak does not follow the object's size.
-   */
-  writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
-    if (type === "commit" && size > MAX_INDEXED_COMMIT_BYTES) {
-      throw new GitError("E2BIG", "commit exceeds the 1 MiB cache limit");
-    }
-    const hash = new Sha1().update(objectHeader(type, size));
-    const commitData =
-      type === "commit" && size <= MAX_INDEXED_COMMIT_BYTES ? new Uint8Array(size) : undefined;
-    let hashed = 0;
-    for (const chunk of chunks()) {
-      if (hashed + chunk.length <= size) commitData?.set(chunk, hashed);
-      hashed += chunk.length;
-      hash.update(chunk);
-    }
-    if (hashed !== size) {
-      throw new CorruptError(`streamed ${hashed} bytes for a ${type} declared as ${size}`);
-    }
-    const oid = toHex(hash.digest());
-    const commitEntry =
-      commitData === undefined
-        ? undefined
-        : prepareCommitCache({ repoId: this.#repoId, oid, data: commitData });
-    if (this.has(oid)) {
-      if (commitEntry !== undefined) {
-        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-      }
-      return oid;
-    }
-
-    const stored = looseEncoding(size);
-    if (stored === "raw") {
-      const data = commitData ?? new Uint8Array(size);
-      const storageHash = new Sha1().update(objectHeader(type, size));
-      let offset = 0;
-      for (const chunk of chunks()) {
-        if (offset + chunk.length > size) {
-          throw new CorruptError(`stream changed after hashing ${oid}`);
-        }
-        data.set(chunk, offset);
-        storageHash.update(chunk);
-        offset += chunk.length;
-      }
-      if (offset !== size) throw new CorruptError(`stream changed after hashing ${oid}`);
-      if (toHex(storageHash.digest()) !== oid) {
-        throw new CorruptError(`stream changed after hashing ${oid}`);
-      }
+      const stored = looseEncoding(data.length);
+      storageMemory.set(
+        "other",
+        stored === "raw" ? data.length : maximumDeflatedBytes(data.length),
+      );
+      const storedData = encodeLoose(data, stored);
+      storageMemory.set("other", storedData.length);
       const createdMs = this.#nowMilliseconds();
       this.#db.transactionSync(() => {
         this.#db.run(
-          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
+          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, ?)",
           this.#repoId,
           oid,
           type,
-          size,
+          data.length,
+          stored,
         );
         this.#db.run(
           `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
-           VALUES (?, ?, ?)`,
+         VALUES (?, ?, ?)`,
           this.#repoId,
           oid,
           createdMs,
@@ -6966,22 +7231,31 @@ export class CheckoutStore implements IndexStore {
           this.#repoId,
           oid,
         );
-        if (data.length === 0) {
-          this.#db.run(
-            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
-            this.#repoId,
-            oid,
-          );
-        } else {
-          this.#db.run(
-            "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
-            this.#repoId,
-            oid,
-            blob(data),
-          );
+        for (
+          let seq = 0, offset = 0;
+          offset < storedData.length || seq === 0;
+          seq++, offset += OBJECT_CHUNK
+        ) {
+          const part = storedData.subarray(offset, offset + OBJECT_CHUNK);
+          if (part.length === 0) {
+            this.#db.run(
+              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, zeroblob(0))",
+              this.#repoId,
+              oid,
+              seq,
+            );
+          } else {
+            this.#db.run(
+              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+              this.#repoId,
+              oid,
+              seq,
+              blob(part),
+            );
+          }
         }
         if (type === "tree") {
-          const treeMemory = this.reserveMemory();
+          const treeMemory = reservation.scope();
           try {
             indexSeededTreeSource(
               this.#db,
@@ -6990,7 +7264,7 @@ export class CheckoutStore implements IndexStore {
                 treeOid: oid,
                 storage: "loose",
                 sourceId: 0,
-                objectSize: size,
+                objectSize: data.length,
               },
               [data],
               treeMemory,
@@ -7004,112 +7278,245 @@ export class CheckoutStore implements IndexStore {
         }
       });
       this.shared.markLoose();
+      this.#objects.set(this.#objectCacheKey(oid), { type, data });
       return oid;
+    } finally {
+      storageMemory.dispose();
+      commitMemory.dispose();
+      reservation.dispose();
     }
+  }
 
-    const rows: Uint8Array[] = [];
-    const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
-    deflate.onData = (chunk) => {
-      if (!(chunk instanceof Uint8Array))
-        throw new CorruptError("deflate produced a non-binary chunk");
-      rows.push(chunk);
-    };
+  /**
+   * Write a loose object from a stream of chunks. `chunks` is a factory
+   * because the content is read twice: once to hash it, which is how the oid
+   * is known and how `has` can short-circuit before a single row is written,
+   * and once to deflate and store it. Nothing larger than one chunk is ever
+   * live, so the peak does not follow the object's size.
+   */
+  writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new GitError("EINVAL", "streamed object size must be a safe nonnegative integer");
+    }
+    const reservation = this.reserveMemory();
+    const sourceMemory = reservation.scope();
+    const parserMemory = reservation.scope();
+    const storageMemory = reservation.scope();
+    try {
+      const hash = new Sha1().update(objectHeader(type, size));
+      if (type === "commit") sourceMemory.set("other", size);
+      const commitData = type === "commit" ? new Uint8Array(size) : undefined;
+      let hashed = 0;
+      for (const chunk of chunks()) {
+        if (hashed + chunk.length <= size) commitData?.set(chunk, hashed);
+        hashed += chunk.length;
+        hash.update(chunk);
+      }
+      if (hashed !== size) {
+        throw new CorruptError(`streamed ${hashed} bytes for a ${type} declared as ${size}`);
+      }
+      const oid = toHex(hash.digest());
+      const commitEntry =
+        commitData === undefined
+          ? undefined
+          : prepareCommitCacheOwned({ repoId: this.#repoId, oid, data: commitData }, parserMemory);
+      if (this.has(oid)) {
+        if (commitEntry !== undefined) {
+          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+        }
+        return oid;
+      }
 
-    const createdMs = this.#nowMilliseconds();
-    this.#db.transactionSync(() => {
-      this.#db.run(
-        "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
-        this.#repoId,
-        oid,
-        type,
-        size,
-      );
-      this.#db.run(
-        `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+      const stored = looseEncoding(size);
+      if (stored === "raw") {
+        if (commitData === undefined) storageMemory.set("other", size);
+        const data = commitData ?? new Uint8Array(size);
+        const storageHash = new Sha1().update(objectHeader(type, size));
+        let offset = 0;
+        for (const chunk of chunks()) {
+          if (offset + chunk.length > size) {
+            throw new CorruptError(`stream changed after hashing ${oid}`);
+          }
+          data.set(chunk, offset);
+          storageHash.update(chunk);
+          offset += chunk.length;
+        }
+        if (offset !== size) throw new CorruptError(`stream changed after hashing ${oid}`);
+        if (toHex(storageHash.digest()) !== oid) {
+          throw new CorruptError(`stream changed after hashing ${oid}`);
+        }
+        const createdMs = this.#nowMilliseconds();
+        this.#db.transactionSync(() => {
+          this.#db.run(
+            "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'raw')",
+            this.#repoId,
+            oid,
+            type,
+            size,
+          );
+          this.#db.run(
+            `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
+           VALUES (?, ?, ?)`,
+            this.#repoId,
+            oid,
+            createdMs,
+          );
+          this.#db.run(
+            "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+            this.#repoId,
+            oid,
+          );
+          if (data.length === 0) {
+            this.#db.run(
+              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, zeroblob(0))",
+              this.#repoId,
+              oid,
+            );
+          } else {
+            this.#db.run(
+              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, 0, ?)",
+              this.#repoId,
+              oid,
+              blob(data),
+            );
+          }
+          if (type === "tree") {
+            const treeMemory = reservation.scope();
+            try {
+              indexSeededTreeSource(
+                this.#db,
+                {
+                  repoId: this.#repoId,
+                  treeOid: oid,
+                  storage: "loose",
+                  sourceId: 0,
+                  objectSize: size,
+                },
+                [data],
+                treeMemory,
+              );
+            } finally {
+              treeMemory.dispose();
+            }
+          }
+          if (commitEntry !== undefined) {
+            requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
+          }
+        });
+        this.shared.markLoose();
+        return oid;
+      }
+
+      const rows: Uint8Array[] = [];
+      storageMemory.set("other", 2 * STREAM_CHUNK);
+      const deflate = new pako.Deflate({ chunkSize: STREAM_CHUNK });
+      deflate.onData = (chunk) => {
+        if (!(chunk instanceof Uint8Array))
+          throw new CorruptError("deflate produced a non-binary chunk");
+        rows.push(chunk);
+      };
+
+      const createdMs = this.#nowMilliseconds();
+      this.#db.transactionSync(() => {
+        this.#db.run(
+          "INSERT OR REPLACE INTO git_objects (repo_id, oid, type, size, stored) VALUES (?, ?, ?, ?, 'zlib')",
+          this.#repoId,
+          oid,
+          type,
+          size,
+        );
+        this.#db.run(
+          `INSERT INTO git_loose_object_lifecycle (repo_id, oid, created_ms)
          VALUES (?, ?, ?)`,
-        this.#repoId,
-        oid,
-        createdMs,
-      );
-      this.#db.run(
-        "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
-        this.#repoId,
-        oid,
-      );
-      let seq = 0;
-      const drain = (): void => {
-        for (const row of rows) {
+          this.#repoId,
+          oid,
+          createdMs,
+        );
+        this.#db.run(
+          "DELETE FROM git_object_chunks WHERE repo_id = ? AND oid = ?",
+          this.#repoId,
+          oid,
+        );
+        let seq = 0;
+        const drain = (): void => {
+          for (const row of rows) {
+            this.#db.run(
+              "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
+              this.#repoId,
+              oid,
+              seq++,
+              blob(row),
+            );
+          }
+          rows.length = 0;
+        };
+        const storageChunks = function* (): Generator<Uint8Array> {
+          const storageHash = new Sha1().update(objectHeader(type, size));
+          let streamed = 0;
+          for (const chunk of chunks()) {
+            const offset = streamed;
+            streamed += chunk.length;
+            if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
+            commitData?.set(chunk, offset);
+            storageHash.update(chunk);
+            deflate.push(chunk, false);
+            if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+            drain();
+            yield chunk;
+          }
+          deflate.push(new Uint8Array(0), true);
+          if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
+          drain();
+          if (streamed !== size || toHex(storageHash.digest()) !== oid) {
+            throw new CorruptError(`stream changed after hashing ${oid}`);
+          }
+        };
+        const storage = storageChunks();
+        if (type === "tree") {
+          const treeMemory = reservation.scope();
+          try {
+            indexSeededTreeSource(
+              this.#db,
+              {
+                repoId: this.#repoId,
+                treeOid: oid,
+                storage: "loose",
+                sourceId: 0,
+                objectSize: size,
+              },
+              storage,
+              treeMemory,
+            );
+          } finally {
+            treeMemory.dispose();
+          }
+        } else {
+          for (const _chunk of storage) {
+            // Storage and hashing advance together without retaining the object.
+          }
+        }
+        // An empty object still deserves one row, matching `write`.
+        if (seq === 0) {
           this.#db.run(
             "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
             this.#repoId,
             oid,
-            seq++,
-            blob(row),
+            0,
+            blob(new Uint8Array(0)),
           );
         }
-        rows.length = 0;
-      };
-      const storageChunks = function* (): Generator<Uint8Array> {
-        const storageHash = new Sha1().update(objectHeader(type, size));
-        let streamed = 0;
-        for (const chunk of chunks()) {
-          const offset = streamed;
-          streamed += chunk.length;
-          if (streamed > size) throw new CorruptError(`stream changed after hashing ${oid}`);
-          commitData?.set(chunk, offset);
-          storageHash.update(chunk);
-          deflate.push(chunk, false);
-          if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
-          drain();
-          yield chunk;
+        if (commitEntry !== undefined) {
+          requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
         }
-        deflate.push(new Uint8Array(0), true);
-        if (deflate.err !== 0) throw new CorruptError(`deflate failed: ${deflate.msg}`);
-        drain();
-        if (streamed !== size || toHex(storageHash.digest()) !== oid) {
-          throw new CorruptError(`stream changed after hashing ${oid}`);
-        }
-      };
-      const storage = storageChunks();
-      if (type === "tree") {
-        const treeMemory = this.reserveMemory();
-        try {
-          indexSeededTreeSource(
-            this.#db,
-            {
-              repoId: this.#repoId,
-              treeOid: oid,
-              storage: "loose",
-              sourceId: 0,
-              objectSize: size,
-            },
-            storage,
-            treeMemory,
-          );
-        } finally {
-          treeMemory.dispose();
-        }
-      } else {
-        for (const _chunk of storage) {
-          // Storage and hashing advance together without retaining the object.
-        }
-      }
-      // An empty object still deserves one row, matching `write`.
-      if (seq === 0) {
-        this.#db.run(
-          "INSERT INTO git_object_chunks (repo_id, oid, seq, data) VALUES (?, ?, ?, ?)",
-          this.#repoId,
-          oid,
-          0,
-          blob(new Uint8Array(0)),
-        );
-      }
-      if (commitEntry !== undefined) {
-        requireCommitCacheWrites(insertCommitCaches(this.#db, [commitEntry]), 1);
-      }
-    });
-    this.shared.markLoose();
-    return oid;
+      });
+      this.shared.markLoose();
+      return oid;
+    } finally {
+      storageMemory.dispose();
+      parserMemory.dispose();
+      sourceMemory.dispose();
+      reservation.dispose();
+    }
   }
 
   /**
@@ -7238,10 +7645,20 @@ export class CheckoutStore implements IndexStore {
 
   /** Run `body` with a batch, flushing what it staged when it returns. */
   writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
-    const batch = this.writeBatch(options);
-    const result = body(batch);
-    batch.flush();
-    return result;
+    const reservation = this.reserveMemory();
+    const batch = this.#createWriteBatch(options, reservation);
+    try {
+      const result = body(batch);
+      if (isThenableResult(result)) {
+        void Promise.resolve(result).catch(() => {});
+        throw new GitError("EINVAL", "object batch callback must be synchronous");
+      }
+      batch.flush();
+      return result;
+    } finally {
+      batch.dispose();
+      reservation.dispose();
+    }
   }
 
   #flushObjects(
@@ -7472,23 +7889,11 @@ export class CheckoutStore implements IndexStore {
     if (!this.shared.hasLoose) return null;
     const row = this.#looseRow(oid);
     if (row === null) return null;
-    const chunks = this.#db.all<{ data: unknown }>(
-      "SELECT data FROM git_object_chunks WHERE repo_id = ? AND oid = ? ORDER BY seq",
-      this.#repoId,
-      oid,
-    );
-    const object: RawObject = {
-      type: row.type,
-      data:
-        parseLooseEncoding(row.stored) === "raw"
-          ? concat(chunks.map((chunk) => readBlob(chunk.data)))
-          : inflate(concat(chunks.map((chunk) => readBlob(chunk.data)))),
-    };
-    this.#objects.set(this.#objectCacheKey(oid), object);
-    return object;
+    return this.#readLooseObjectRows([{ oid, ...row }]).get(oid) ?? null;
   }
 
-  #readLooseObjects(oids: readonly string[]): Map<string, RawObject> {
+  #readLooseObjects(oids: readonly string[], ownership: PackReadOwnership): Map<string, RawObject> {
+    this.#validateLooseReadOwnership(ownership);
     if (oids.length === 0) return new Map();
     const rows = this.#db.all<{
       oid: string;
@@ -7502,7 +7907,7 @@ export class CheckoutStore implements IndexStore {
       JSON.stringify(oids),
       this.#repoId,
     );
-    return this.#readLooseObjectRows(rows);
+    return this.#readLooseObjectRows(rows, ownership);
   }
 
   #looseObjectMetadata(oids: readonly string[]): Map<string, { type: ObjectType; size: number }> {
@@ -7537,18 +7942,65 @@ export class CheckoutStore implements IndexStore {
       size: number | null;
       stored: string | null;
     }[],
+    ownership?: PackReadOwnership,
+    callerOwnsLiveSet = false,
   ): Map<string, RawObject> {
     if (rows.length === 0) return new Map();
-    const wanted = rows.map((row) => row.oid);
-    const gate = this.#db.all<{
-      oid: string;
-      chunks: number;
-      first_seq: number | null;
-      last_seq: number | null;
-      largest_chunk: number;
-      stored_bytes: number;
-    }>(
-      `WITH wanted(ordinal, oid) AS (
+    if (callerOwnsLiveSet && ownership === undefined) {
+      throw new GitError("EINVAL", "pre-admitted loose object read ownership is missing");
+    }
+    let localOperation: MemoryReservation | undefined;
+    let localOutput: MemoryReservation | undefined;
+    if (ownership === undefined) {
+      let outputBytes = 512 + rows.length * 256;
+      for (const row of rows) {
+        if (typeof row.size !== "number" || !Number.isSafeInteger(row.size) || row.size < 0) {
+          throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
+        }
+        outputBytes = blobIdRetainedTotal(outputBytes, row.size, "loose object output");
+      }
+      localOperation = this.reserveMemory();
+      localOutput = localOperation.scope();
+      try {
+        localOutput.set("other", outputBytes);
+      } catch (error) {
+        localOutput.dispose();
+        localOperation.dispose();
+        throw error;
+      }
+      ownership = { operation: localOperation, output: localOutput };
+    } else {
+      this.#validateLooseReadOwnership(ownership);
+    }
+    const reservation = ownership.operation.scope();
+    try {
+      const inputMemory = reservation.scope();
+      if (!callerOwnsLiveSet) inputMemory.set("other", 256 + rows.length * 512);
+      const wanted = rows.map((row) => row.oid);
+      let wantedJsonUnits = 2 + Math.max(0, wanted.length - 1);
+      for (const oid of wanted) {
+        wantedJsonUnits = blobIdRetainedTotal(
+          wantedJsonUnits,
+          jsonStringMaxUnits(oid),
+          "loose object input JSON",
+        );
+      }
+      const jsonMemory = reservation.scope();
+      if (!callerOwnsLiveSet) {
+        jsonMemory.set("other", 128 + retainedStringUnits(wantedJsonUnits));
+      }
+      const encodedWanted = JSON.stringify(wanted);
+      const gateMemory = reservation.scope();
+      if (!callerOwnsLiveSet) gateMemory.set("other", 256 + rows.length * 384);
+      const gate = this.#db.all<{
+        oid: string;
+        chunks: number;
+        first_seq: number | null;
+        last_seq: number | null;
+        largest_chunk: number;
+        stored_bytes: number;
+      }>(
+        `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
        SELECT w.oid, COUNT(c.seq) AS chunks, MIN(c.seq) AS first_seq,
@@ -7558,124 +8010,149 @@ export class CheckoutStore implements IndexStore {
          LEFT JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
         GROUP BY w.ordinal, w.oid
         ORDER BY w.ordinal`,
-      JSON.stringify(wanted),
-      this.#repoId,
-    );
-    let storedBytes = 0;
-    let outputBytes = 0;
-    if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
-    for (let index = 0; index < gate.length; index++) {
-      const checked = gate[index]!;
-      const source = rows[index]!;
-      const chunks = Number(checked.chunks);
-      const size = source.size;
-      if (
-        checked.oid !== source.oid ||
-        !isObjectType(source.type) ||
-        typeof size !== "number" ||
-        !Number.isSafeInteger(size) ||
-        size < 0 ||
-        size > MAX_PACK_DELTA_WORKING_BYTES ||
-        !Number.isSafeInteger(chunks) ||
-        chunks <= 0 ||
-        checked.first_seq !== 0 ||
-        checked.last_seq !== chunks - 1 ||
-        !Number.isSafeInteger(checked.largest_chunk) ||
-        checked.largest_chunk < 0 ||
-        checked.largest_chunk > OBJECT_CHUNK ||
-        !Number.isSafeInteger(checked.stored_bytes) ||
-        checked.stored_bytes < 0
-      ) {
-        throw new CorruptError(`loose blob ${source.oid} has invalid chunk metadata`);
+        encodedWanted,
+        this.#repoId,
+      );
+      let storedBytes = 0;
+      let rawOutputBytes = 0;
+      let inflatedOutputBytes = 0;
+      if (gate.length !== rows.length) throw new CorruptError("loose blob gate lost an object");
+      for (let index = 0; index < gate.length; index++) {
+        const checked = gate[index]!;
+        const source = rows[index]!;
+        const chunks = Number(checked.chunks);
+        const size = source.size;
+        const stored = parseLooseEncoding(source.stored ?? "");
+        if (
+          checked.oid !== source.oid ||
+          !isObjectType(source.type) ||
+          typeof size !== "number" ||
+          !Number.isSafeInteger(size) ||
+          size < 0 ||
+          size > MAX_PACK_DELTA_WORKING_BYTES ||
+          !Number.isSafeInteger(chunks) ||
+          chunks <= 0 ||
+          checked.first_seq !== 0 ||
+          checked.last_seq !== chunks - 1 ||
+          !Number.isSafeInteger(checked.largest_chunk) ||
+          checked.largest_chunk < 0 ||
+          checked.largest_chunk > OBJECT_CHUNK ||
+          !Number.isSafeInteger(checked.stored_bytes) ||
+          checked.stored_bytes < 0 ||
+          (stored === "raw" && checked.stored_bytes !== size) ||
+          (stored === "zlib" && checked.stored_bytes === 0)
+        ) {
+          throw new CorruptError(`loose blob ${source.oid} has invalid chunk metadata`);
+        }
+        storedBytes += checked.stored_bytes;
+        if (!Number.isSafeInteger(storedBytes)) {
+          throw new GitError("E2BIG", "loose object storage memory accounting overflow");
+        }
+        if (stored === "raw") rawOutputBytes += size;
+        else inflatedOutputBytes += size;
+        if (!Number.isSafeInteger(rawOutputBytes) || !Number.isSafeInteger(inflatedOutputBytes)) {
+          throw new GitError("E2BIG", "loose object output memory accounting overflow");
+        }
       }
-      storedBytes += checked.stored_bytes;
-      if (!Number.isSafeInteger(storedBytes) || storedBytes > MAX_BLOB_BATCH_BYTES + 64 * 1024) {
-        throw new GitError("E2BIG", "loose blob storage exceeds the bounded batch limit");
+      const materializationBytes = 1_024 + rows.length * 512 + 2 * storedBytes - rawOutputBytes;
+      if (!Number.isSafeInteger(materializationBytes)) {
+        throw new GitError("E2BIG", "loose object materialization memory accounting overflow");
       }
-      outputBytes += size;
-      if (
-        !Number.isSafeInteger(outputBytes) ||
-        (rows.length > 1 && outputBytes > MAX_BLOB_BATCH_BYTES)
-      ) {
-        throw new GitError("E2BIG", "loose object output exceeds the bounded batch limit");
-      }
-    }
+      if (!callerOwnsLiveSet) reservation.set("other", materializationBytes);
 
-    const parts = new Map<string, Uint8Array[]>();
-    for (const row of this.#db.iterate(
-      `WITH wanted(ordinal, oid) AS (
+      const parts = new Map<string, Uint8Array[]>();
+      for (const row of this.#db.iterate(
+        `WITH wanted(ordinal, oid) AS (
          SELECT CAST(key AS INTEGER), value FROM json_each(?)
        )
        SELECT w.oid, c.seq, c.data
          FROM wanted w
          JOIN git_object_chunks c ON c.repo_id = ? AND c.oid = w.oid
         ORDER BY w.ordinal, c.seq`,
-      JSON.stringify(wanted),
-      this.#repoId,
-    )) {
-      if (typeof row.oid !== "string" || !Number.isSafeInteger(row.seq)) {
-        throw new CorruptError("loose blob query returned invalid chunk metadata");
+        encodedWanted,
+        this.#repoId,
+      )) {
+        if (typeof row.oid !== "string" || !Number.isSafeInteger(row.seq)) {
+          throw new CorruptError("loose blob query returned invalid chunk metadata");
+        }
+        const list = parts.get(row.oid);
+        if (list === undefined) parts.set(row.oid, [readBlob(row.data)]);
+        else list.push(readBlob(row.data));
       }
-      const list = parts.get(row.oid);
-      if (list === undefined) parts.set(row.oid, [readBlob(row.data)]);
-      else list.push(readBlob(row.data));
-    }
 
-    const result = new Map<string, RawObject>();
-    for (const row of rows) {
-      if (!isObjectType(row.type)) throw new CorruptError(`${row.oid} has an invalid object type`);
-      const size = row.size;
-      if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
-        throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
-      }
-      if (size > MAX_PACK_DELTA_WORKING_BYTES) {
-        throw new GitError("E2BIG", `loose blob ${row.oid} exceeds the bounded inflate limit`);
-      }
-      const stored = parseLooseEncoding(row.stored ?? "");
-      const encoded = concat(parts.get(row.oid) ?? []);
-      let data: Uint8Array;
-      if (stored === "raw") {
-        data = encoded;
-      } else {
-        const stream = new InflateInto(size);
-        let consumed = 0;
-        while (!stream.ended && consumed < encoded.length) {
-          const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
-          let used: number;
-          try {
-            used = stream.push(input);
-          } catch (error) {
-            if (error instanceof InflateSizeError) {
-              throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
-                cause: error,
-              });
+      const result = new Map<string, RawObject>();
+      for (const row of rows) {
+        if (!isObjectType(row.type))
+          throw new CorruptError(`${row.oid} has an invalid object type`);
+        const size = row.size;
+        if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) {
+          throw new CorruptError(`loose blob ${row.oid} has an invalid size`);
+        }
+        if (size > MAX_PACK_DELTA_WORKING_BYTES) {
+          throw new GitError("E2BIG", `loose blob ${row.oid} exceeds the bounded inflate limit`);
+        }
+        const stored = parseLooseEncoding(row.stored ?? "");
+        const encoded = concat(parts.get(row.oid) ?? []);
+        let data: Uint8Array;
+        if (stored === "raw") {
+          data = encoded;
+        } else {
+          const stream = new InflateInto(size);
+          let consumed = 0;
+          while (!stream.ended && consumed < encoded.length) {
+            const input = encoded.subarray(consumed, consumed + INFLATE_FEED);
+            let used: number;
+            try {
+              used = stream.push(input);
+            } catch (error) {
+              if (error instanceof InflateSizeError) {
+                throw new CorruptError(`loose object ${row.oid} exceeds its indexed size`, {
+                  cause: error,
+                });
+              }
+              throw error;
             }
-            throw error;
+            consumed += used;
+            if (!stream.ended && used !== input.length) {
+              throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
+            }
           }
-          consumed += used;
-          if (!stream.ended && used !== input.length) {
-            throw new CorruptError(`loose object ${row.oid} inflater made no progress`);
+          if (!stream.ended || consumed !== encoded.length) {
+            throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
+          }
+          try {
+            data = stream.finish();
+          } catch (error) {
+            throw new CorruptError(`loose object ${row.oid} size does not match its metadata`, {
+              cause: error,
+            });
           }
         }
-        if (!stream.ended || consumed !== encoded.length) {
-          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`);
+        if (data.length !== size) {
+          throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
         }
-        try {
-          data = stream.finish();
-        } catch (error) {
-          throw new CorruptError(`loose object ${row.oid} size does not match its metadata`, {
-            cause: error,
-          });
-        }
+        const object: RawObject = { type: row.type, data };
+        this.#objects.set(this.#objectCacheKey(row.oid), object);
+        result.set(row.oid, object);
       }
-      if (data.length !== size) {
-        throw new CorruptError(`loose blob ${row.oid} size does not match its metadata`);
-      }
-      const object: RawObject = { type: row.type, data };
-      this.#objects.set(this.#objectCacheKey(row.oid), object);
-      result.set(row.oid, object);
+      return result;
+    } finally {
+      reservation.dispose();
+      localOutput?.dispose();
+      localOperation?.dispose();
     }
-    return result;
+  }
+
+  #validateLooseReadOwnership(ownership: PackReadOwnership): void {
+    if (
+      ownership.operation === ownership.output ||
+      ownership.operation.disposed ||
+      ownership.output.disposed ||
+      !this.#memoryCoordinator.owns(ownership.operation) ||
+      !this.#memoryCoordinator.owns(ownership.output)
+    ) {
+      throw new GitError("EINVAL", "loose object read ownership is invalid");
+    }
   }
 
   // -- refs -----------------------------------------------------------
@@ -7928,13 +8405,13 @@ export class CheckoutStore implements IndexStore {
       throw new CorruptError("tracking observation metadata is invalid");
     }
     const reservation = this.#sharedStore.reserveMemory();
-    reservation.set(
-      "other",
-      256 + 2 * metadata.ref_name_bytes + retainedStringUnits(metadata.ref_name_bytes),
-    );
     let matched = 0;
     let previousNameBytes: Uint8Array | null = null;
     try {
+      reservation.set(
+        "other",
+        256 + 2 * metadata.ref_name_bytes + retainedStringUnits(metadata.ref_name_bytes),
+      );
       for (const row of this.#db.iterate(
         `SELECT repo_id, typeof(ref_name) AS ref_name_type,
                 CAST(ref_name AS BLOB) AS ref_name_blob, revision
@@ -8243,7 +8720,11 @@ export class CheckoutStore implements IndexStore {
     trackingPrefix: string,
     candidateExactRefs: Iterable<string> = [],
     owningReservation?: MemoryReservation,
+    owner?: RefMutationMemoryOwner,
   ): FetchPublicationToken {
+    if (owner !== undefined) {
+      validateRefMutationMemoryOwner(this.#sharedStore, owner, "fetch publication");
+    }
     if (owningReservation !== undefined) {
       if (owningReservation.disposed) {
         throw new GitError("EINVAL", "fetch publication reservation is disposed");
@@ -8278,7 +8759,10 @@ export class CheckoutStore implements IndexStore {
         if (candidates.has(name)) {
           throw new GitError("EINVAL", `duplicate fetch exact ref candidate ${name}`);
         }
-        budget.charge(REF_MUTATION_ITEM_RETAINED_BYTES + retainedStringBytes(name));
+        budget.charge(
+          REF_MUTATION_ITEM_RETAINED_BYTES +
+            (owner?.owns(name) === true ? 0 : retainedStringBytes(name)),
+        );
         candidates.set(name, null);
       }
 
@@ -8480,6 +8964,7 @@ export class CheckoutStore implements IndexStore {
           checkoutRevision,
           budget,
           reservation,
+          owner,
           disposed: false,
         };
         return {
@@ -8498,7 +8983,10 @@ export class CheckoutStore implements IndexStore {
         snapshot.shallowRows,
         snapshot.trackingRows,
         snapshot.exactRows,
-        () => snapshot.state.disposed || snapshot.state.reservation.disposed,
+        () =>
+          snapshot.state.disposed ||
+          snapshot.state.reservation.disposed ||
+          snapshot.state.owner?.memoryReservation().disposed === true,
         () => {
           if (snapshot.state.disposed) return;
           snapshot.state.disposed = true;
@@ -8524,6 +9012,7 @@ export class CheckoutStore implements IndexStore {
     token: FetchPublicationToken,
     plan: FetchPublicationPlan,
     metadata: RefLogMetadata,
+    owner?: RefMutationMemoryOwner,
   ): boolean {
     if (!this.#issuedFetchPublications.has(token)) {
       throw staleFetch("fetch publication token was not issued by this repository");
@@ -8532,10 +9021,21 @@ export class CheckoutStore implements IndexStore {
     if (state === undefined || state.disposed || state.reservation.disposed) {
       throw staleFetch("fetch publication token is no longer active");
     }
-    const publicationReservation = state.reservation.scope();
+    if (state.owner?.memoryReservation().disposed === true) {
+      throw staleFetch("fetch publication memory owner is no longer active");
+    }
+    if (owner !== state.owner) {
+      throw new GitError("EINVAL", "fetch publication requires its issued memory owner");
+    }
+    const ownerReservation =
+      owner === undefined
+        ? undefined
+        : validateRefMutationMemoryOwner(this.#sharedStore, owner, "fetch publication");
+    const publicationReservation =
+      ownerReservation === undefined ? state.reservation.scope() : ownerReservation.scope();
     try {
       const budget = new RefMutationBudget(publicationReservation);
-      const normalized = normalizeFetchPublication(state, plan, budget);
+      const normalized = normalizeFetchPublication(state, plan, budget, owner);
       const checkedMetadata = validateRefLogMetadata(metadata);
       budget.charge(refLogMetadataRetainedBytes(checkedMetadata));
       const shallowTouched =
@@ -9454,17 +9954,17 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("E2BIG", "repository ref state exceeds its retained row bound");
     }
     const rowMemory = reservation.scope();
-    rowMemory.set(
-      "other",
-      256 +
-        2 * measured.nameBytes +
-        measured.targetBytes +
-        retainedStringUnits(measured.nameBytes) +
-        retainedStringUnits(measured.targetBytes),
-    );
     let rows = 0;
     let previousNameBytes: Uint8Array | null = null;
     try {
+      rowMemory.set(
+        "other",
+        256 +
+          2 * measured.nameBytes +
+          measured.targetBytes +
+          retainedStringUnits(measured.nameBytes) +
+          retainedStringUnits(measured.targetBytes),
+      );
       for (const row of this.#db.iterate(
         `SELECT repo_id, typeof(name) AS name_type, CAST(name AS BLOB) AS name_blob,
                 typeof(target) AS target_type, CAST(target AS BLOB) AS target_blob
@@ -10545,141 +11045,234 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "config section source and destination must differ");
     }
 
-    this.#db.transactionSync(() => {
-      let destinationCandidates = 0;
-      for (const row of this.#db.iterate(
-        configSectionMetadataSql(),
-        this.#repoId,
-        destination,
-        nextPrefix(destination),
-      )) {
-        destinationCandidates++;
-        if (destinationCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
-          throw new GitError(
-            "E2BIG",
-            `config section ${destination} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
-          );
-        }
-        const candidate = requireConfigSectionMetadata(row, this.#repoId, destination);
-        if (configSectionVariable(candidate.path, destination) !== null) {
-          throw new GitError("EEXIST", `config section ${destination} already exists`);
-        }
-      }
-
-      const metadata: ConfigSectionMoveMetadata[] = [];
-      let sourceCandidates = 0;
-      let textBytes = 0;
-      for (const row of this.#db.iterate(
-        configSectionMetadataSql(),
-        this.#repoId,
-        source,
-        nextPrefix(source),
-      )) {
-        sourceCandidates++;
-        if (sourceCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
-          throw new GitError(
-            "E2BIG",
-            `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
-          );
-        }
-        const candidate = requireConfigSectionMetadata(row, this.#repoId, source);
-        const variable = configSectionVariable(candidate.path, source);
-        if (variable === null) continue;
-        if (
-          candidate.valueType !== "text" ||
-          candidate.valueBytes === null ||
-          candidate.valueBytes < 0
-        ) {
-          throw new CorruptError(`config section ${source} has an invalid stored value`);
-        }
-        const destinationBytes = configSectionDestinationBytes(destination, variable);
-        if (destinationBytes > MAX_INDEX_PATH_BYTES) {
-          throw new GitError(
-            "E2BIG",
-            `moved config path exceeds its ${MAX_INDEX_PATH_BYTES} byte bound`,
-          );
-        }
-        textBytes += candidate.pathBytes + candidate.valueBytes;
-        if (!Number.isSafeInteger(textBytes) || textBytes > MAX_CONFIG_SECTION_MOVE_TEXT_BYTES) {
-          throw new GitError(
-            "E2BIG",
-            `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_TEXT_BYTES} text bytes`,
-          );
-        }
-        metadata.push({ ...candidate, valueBytes: candidate.valueBytes });
-      }
-
-      const buffered: ConfigSectionMoveRow[] = [];
-      let verifiedBytes = 0;
-      for (const row of this.#db.iterate(
-        `SELECT repo_id, seq, CAST(path AS BLOB) AS path_blob,
-                CAST(value AS BLOB) AS value_blob
-           FROM git_config
-          WHERE repo_id = ? AND path >= ? AND path < ?
-            AND length(path) > length(?)
-            AND instr(substr(path, length(?) + 1), '.') = 0
-          ORDER BY path COLLATE BINARY, seq
-          LIMIT ${MAX_CONFIG_SECTION_MOVE_ROWS + 1}`,
-        this.#repoId,
-        source,
-        nextPrefix(source),
-        source,
-        source,
-      )) {
-        const expected = metadata[buffered.length];
-        if (expected === undefined || row.repo_id !== this.#repoId || row.seq !== expected.seq) {
-          throw new CorruptError(`config section ${source} changed after validation`);
-        }
-        const pathBytes = readBlob(row.path_blob);
-        const valueBytes = readBlob(row.value_blob);
-        const path = decodeConfigText(pathBytes, `config path in ${source}`);
-        const value = decodeConfigText(valueBytes, `config value at ${path}`);
-        if (
-          path !== expected.path ||
-          pathBytes.byteLength !== expected.pathBytes ||
-          valueBytes.byteLength !== expected.valueBytes ||
-          configSectionVariable(path, source) === null
-        ) {
-          throw new CorruptError(`config section ${source} changed after validation`);
-        }
-        verifiedBytes += pathBytes.byteLength + valueBytes.byteLength;
-        if (
-          !Number.isSafeInteger(verifiedBytes) ||
-          verifiedBytes > MAX_CONFIG_SECTION_MOVE_TEXT_BYTES
-        ) {
-          throw new CorruptError(`config section ${source} changed after validation`);
-        }
-        buffered.push({ path, seq: expected.seq, value });
-      }
-      if (buffered.length !== metadata.length || verifiedBytes !== textBytes) {
-        throw new CorruptError(`config section ${source} changed after validation`);
-      }
-      if (buffered.length === 0) return;
-
-      let changedRows = 0;
-      for (const page of jsonPages(
-        buffered.map((row) => ({ path: row.path, seq: row.seq })),
-        "config section move",
-      )) {
-        this.#db.run(
-          CONFIG_SECTION_MOVE_UPDATE_SQL,
+    const reservation = this.reserveMemory();
+    const metadataMemory = reservation.scope();
+    const valueMemory = reservation.scope();
+    try {
+      reservation.set(
+        "other",
+        512 + retainedStringBytes(source) + retainedStringBytes(destination),
+      );
+      this.#db.transactionSync(() => {
+        let destinationCandidates = 0;
+        valueMemory.set("other", currentTextRowRetainedBytes(MAX_INDEX_PATH_BYTES, 2));
+        for (const row of this.#db.iterate(
+          configSectionMetadataSql(),
+          this.#repoId,
           destination,
-          source,
+          nextPrefix(destination),
+        )) {
+          destinationCandidates++;
+          if (destinationCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
+            throw new GitError(
+              "E2BIG",
+              `config section ${destination} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
+            );
+          }
+          const candidate = requireConfigSectionMetadata(row, this.#repoId, destination);
+          if (configSectionVariable(candidate.path, destination) !== null) {
+            throw new GitError("EEXIST", `config section ${destination} already exists`);
+          }
+        }
+        valueMemory.clear("other");
+
+        const metadata: ConfigSectionMoveMetadata[] = [];
+        let sourceCandidates = 0;
+        let metadataBytes = 256;
+        metadataMemory.set("other", metadataBytes);
+        valueMemory.set("other", currentTextRowRetainedBytes(MAX_INDEX_PATH_BYTES, 2));
+        for (const row of this.#db.iterate(
+          configSectionMetadataSql(),
           this.#repoId,
           source,
           nextPrefix(source),
-          page,
-        );
-        const changed = this.#db.scalar<unknown>("SELECT changes()");
-        if (typeof changed !== "number" || !Number.isSafeInteger(changed) || changed < 0) {
-          throw new CorruptError(`config section ${source} returned an invalid change count`);
+        )) {
+          sourceCandidates++;
+          if (sourceCandidates > MAX_CONFIG_SECTION_MOVE_ROWS) {
+            throw new GitError(
+              "E2BIG",
+              `config section ${source} exceeds ${MAX_CONFIG_SECTION_MOVE_ROWS} inspected rows`,
+            );
+          }
+          const candidate = requireConfigSectionMetadata(row, this.#repoId, source);
+          const variable = configSectionVariable(candidate.path, source);
+          if (variable === null) continue;
+          if (
+            candidate.valueType !== "text" ||
+            candidate.valueBytes === null ||
+            candidate.valueBytes < 0
+          ) {
+            throw new CorruptError(`config section ${source} has an invalid stored value`);
+          }
+          configSectionDestinationBytes(destination, variable);
+          metadataBytes = blobIdRetainedTotal(
+            metadataBytes,
+            192 + retainedStringBytes(candidate.path),
+            "config section metadata",
+          );
+          metadataMemory.set("other", metadataBytes);
+          metadata.push({ ...candidate, valueBytes: candidate.valueBytes });
         }
-        changedRows += changed;
-      }
-      if (changedRows !== buffered.length) {
-        throw new CorruptError(`config section ${source} changed during its move`);
-      }
-    });
+        valueMemory.clear("other");
+
+        function* validationRows(): Generator<{
+          ordinal: number;
+          path: string;
+          seq: number;
+          valueBytes: number;
+        }> {
+          for (let ordinal = 0; ordinal < metadata.length; ordinal++) {
+            const candidate = metadata[ordinal];
+            if (candidate === undefined)
+              throw new CorruptError("config section metadata is sparse");
+            yield {
+              ordinal,
+              path: candidate.path,
+              seq: candidate.seq,
+              valueBytes: candidate.valueBytes,
+            };
+          }
+        }
+        let validatedValues = 0;
+        for (const page of jsonPages(validationRows(), "config section value validation", {
+          reservation,
+          maxUnits: (row) => 128 + jsonStringMaxUnits(row.path),
+        })) {
+          valueMemory.set("other", 512 + 4 * OBJECT_PAYLOAD);
+          let currentOrdinal = -1;
+          let expectedOffset = 0;
+          let decoder = new TextDecoder("utf-8", { fatal: true });
+          const finishDecoder = (candidate: ConfigSectionMoveMetadata): void => {
+            try {
+              decoder.decode();
+            } catch (error) {
+              throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
+                cause: error,
+              });
+            }
+          };
+          try {
+            for (const row of this.#db.iterate(
+              `WITH RECURSIVE wanted(ordinal, path, seq, value_bytes) AS MATERIALIZED (
+                 SELECT json_extract(value, '$.ordinal'), json_extract(value, '$.path'),
+                        json_extract(value, '$.seq'), json_extract(value, '$.valueBytes')
+                   FROM json_each(?)
+               ), chunks(ordinal, path, seq, value_bytes, offset) AS (
+                 SELECT ordinal, path, seq, value_bytes, 0 FROM wanted
+                 UNION ALL
+                 SELECT ordinal, path, seq, value_bytes, offset + ${OBJECT_PAYLOAD}
+                   FROM chunks WHERE offset + ${OBJECT_PAYLOAD} < value_bytes
+               )
+               SELECT chunks.ordinal, chunks.path, chunks.seq, chunks.offset,
+                      typeof(config.value) AS value_type,
+                      length(CAST(config.value AS BLOB)) AS value_bytes,
+                      substr(CAST(config.value AS BLOB), chunks.offset + 1,
+                             min(${OBJECT_PAYLOAD}, chunks.value_bytes - chunks.offset)) AS chunk
+                 FROM chunks
+                 JOIN git_config config
+                   ON config.repo_id = ? AND config.path = chunks.path AND config.seq = chunks.seq
+                ORDER BY chunks.ordinal, chunks.offset`,
+              page,
+              this.#repoId,
+            )) {
+              const ordinal = row.ordinal;
+              if (
+                typeof ordinal !== "number" ||
+                !Number.isSafeInteger(ordinal) ||
+                ordinal < 0 ||
+                ordinal >= metadata.length
+              ) {
+                throw new CorruptError(`config section ${source} changed after validation`);
+              }
+              const candidate = metadata[ordinal];
+              if (candidate === undefined) {
+                throw new CorruptError(`config section ${source} changed after validation`);
+              }
+              if (ordinal !== currentOrdinal) {
+                if (currentOrdinal >= 0) {
+                  const previous = metadata[currentOrdinal];
+                  if (previous === undefined || expectedOffset !== previous.valueBytes) {
+                    throw new CorruptError(`config section ${source} changed after validation`);
+                  }
+                  finishDecoder(previous);
+                }
+                currentOrdinal = ordinal;
+                expectedOffset = 0;
+                decoder = new TextDecoder("utf-8", { fatal: true });
+                validatedValues++;
+              }
+              const chunk = readBlob(row.chunk);
+              const expectedChunkBytes = Math.min(
+                OBJECT_PAYLOAD,
+                candidate.valueBytes - expectedOffset,
+              );
+              if (
+                row.path !== candidate.path ||
+                row.seq !== candidate.seq ||
+                row.offset !== expectedOffset ||
+                row.value_type !== "text" ||
+                row.value_bytes !== candidate.valueBytes ||
+                chunk.byteLength !== expectedChunkBytes
+              ) {
+                throw new CorruptError(`config section ${source} changed after validation`);
+              }
+              try {
+                decoder.decode(chunk, { stream: true });
+              } catch (error) {
+                throw new CorruptError(`config value at ${candidate.path} is not canonical UTF-8`, {
+                  cause: error,
+                });
+              }
+              expectedOffset += chunk.byteLength;
+            }
+            if (currentOrdinal >= 0) {
+              const current = metadata[currentOrdinal];
+              if (current === undefined || expectedOffset !== current.valueBytes) {
+                throw new CorruptError(`config section ${source} changed after validation`);
+              }
+              finishDecoder(current);
+            }
+          } finally {
+            valueMemory.clear("other");
+          }
+        }
+        if (validatedValues !== metadata.length) {
+          throw new CorruptError(`config section ${source} changed after validation`);
+        }
+        if (metadata.length === 0) return;
+
+        function* updateRows(): Generator<{ path: string; seq: number }> {
+          for (const row of metadata) yield { path: row.path, seq: row.seq };
+        }
+        let changedRows = 0;
+        for (const page of jsonPages(updateRows(), "config section move", {
+          reservation,
+          maxUnits: (row) => 64 + jsonStringMaxUnits(row.path),
+        })) {
+          this.#db.run(
+            CONFIG_SECTION_MOVE_UPDATE_SQL,
+            destination,
+            source,
+            this.#repoId,
+            source,
+            nextPrefix(source),
+            page,
+          );
+          const changed = this.#db.scalar<unknown>("SELECT changes()");
+          if (typeof changed !== "number" || !Number.isSafeInteger(changed) || changed < 0) {
+            throw new CorruptError(`config section ${source} returned an invalid change count`);
+          }
+          changedRows += changed;
+        }
+        if (changedRows !== metadata.length) {
+          throw new CorruptError(`config section ${source} changed during its move`);
+        }
+      });
+    } finally {
+      valueMemory.dispose();
+      metadataMemory.dispose();
+      reservation.dispose();
+    }
   }
 
   // -- integration operation journal --------------------------------
@@ -11307,7 +11900,6 @@ export class CheckoutStore implements IndexStore {
       if (step === undefined) throw new CorruptError("one-commit replay lost its source step");
       this.#validateOperationCommitBodies(
         [step.sourceOid],
-        0,
         (_oid, source) => {
           this.#validateReplayParentSelection(step, source.commit.parent);
         },
@@ -11318,9 +11910,8 @@ export class CheckoutStore implements IndexStore {
     }
     let expectedSourceParent = journal.state.baseOid;
     let sourceOrdinal = 0;
-    let retainedBytes = this.#validateOperationCommitBodies(
+    this.#validateOperationCommitBodies(
       journal.steps.map((step) => step.sourceOid),
-      0,
       (_oid, source) => {
         const step = journal.steps[sourceOrdinal++];
         if (step === undefined) throw new CorruptError("rebase source sequence is incomplete");
@@ -11345,12 +11936,11 @@ export class CheckoutStore implements IndexStore {
     const applied = journal.steps.filter((step) => step.outcome === "applied");
     let expectedResultParent = journal.state.upstreamOid;
     let resultOrdinal = 0;
-    retainedBytes = this.#validateOperationCommitBodies(
+    this.#validateOperationCommitBodies(
       applied.map((step) => {
         if (step.resultOid === null) throw new CorruptError("applied rebase step lost its result");
         return step.resultOid;
       }),
-      retainedBytes,
       (_oid, result) => {
         const step = applied[resultOrdinal++];
         if (step === undefined || step.resultOid === null) {
@@ -11364,95 +11954,79 @@ export class CheckoutStore implements IndexStore {
       reservation,
       objectSizes,
     );
-    if (retainedBytes > MAX_LOG_STATE_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
-      );
-    }
   }
 
   #validateOperationCommitBodies(
     oids: readonly string[],
-    initialBytes: number,
     visit: (oid: string, commit: CommitCacheEntry) => void,
     reservation: MemoryReservation,
     objectSizes: ReadonlyMap<string, number>,
-  ): number {
-    let retainedBytes = initialBytes;
+  ): void {
     const seen = new Set<string>();
-    const batchMemory = reservation.scope();
+    const objectMemory = reservation.scope();
+    const parserMemory = reservation.scope();
     try {
       for (let offset = 0; offset < oids.length; offset += MAX_BLOB_BATCH_OIDS) {
         const page = oids.slice(offset, offset + MAX_BLOB_BATCH_OIDS);
+        objectMemory.set(
+          "other",
+          256 +
+            page.length * (8 + 160) +
+            page.reduce((bytes, oid) => bytes + retainedStringBytes(oid), 0),
+        );
         for (const oid of page) {
           if (seen.has(oid)) throw new CorruptError("operation commit sequence contains a cycle");
           seen.add(oid);
         }
         let remaining = page;
         while (remaining.length > 0) {
-          const available = MAX_LOG_STATE_BYTES - retainedBytes;
-          if (available <= 0) {
-            throw new GitError(
-              "E2BIG",
-              `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
-            );
-          }
-          const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, available);
-          let selectedBytes = 0;
-          let largestBytes = 0;
-          let selectedCount = 0;
           for (const oid of remaining) {
-            const size = objectSizes.get(oid);
-            if (size === undefined) {
+            if (objectSizes.get(oid) === undefined) {
               throw new CorruptError(`operation commit ${oid} lost its validated size`);
             }
-            if (size > budgetBytes - selectedBytes) break;
-            selectedBytes += size;
-            largestBytes = Math.max(largestBytes, size);
-            selectedCount++;
           }
-          if (selectedCount > 0) {
-            batchMemory.set(
-              "other",
-              512 +
-                selectedCount * 256 +
-                selectedBytes +
-                currentTextRowRetainedBytes(largestBytes, 8),
-            );
-          }
-          let batch: ObjectReadBatch;
+          const batchMemory = objectMemory.scope();
           try {
-            batch = this.readObjects(remaining, {
-              budgetBytes,
-            });
-          } catch (error) {
-            if (hasErrorCode(error, "EFBIG")) {
-              throw new GitError(
-                "E2BIG",
-                `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
-                { cause: error },
+            const batch = this.#readObjectsOwned(
+              remaining,
+              { budgetBytes: PACK_BLOB_BATCH_TARGET_BYTES },
+              batchMemory,
+            );
+            remaining = [];
+            objectMemory.clear("other");
+            if (batch.objects.size === 0 || batch.bytes <= 0) {
+              throw new CorruptError("operation commit validation made no progress");
+            }
+            for (const [oid, object] of batch.objects) {
+              if (object.type !== "commit") {
+                throw new CorruptError("operation step did not produce a complete commit object");
+              }
+              visit(
+                oid,
+                prepareCommitCacheOwned(
+                  { repoId: this.#repoId, oid, data: object.data },
+                  parserMemory,
+                ),
               );
+              parserMemory.clear("commit");
             }
-            throw error;
+            const nextRemaining = batch.remaining;
+            objectMemory.set(
+              "other",
+              256 +
+                nextRemaining.length * (8 + 160) +
+                nextRemaining.reduce((bytes, oid) => bytes + retainedStringBytes(oid), 0),
+            );
+            remaining = nextRemaining;
+          } finally {
+            batchMemory.dispose();
           }
-          if (batch.objects.size === 0 || batch.bytes <= 0) {
-            throw new CorruptError("operation commit validation made no progress");
-          }
-          retainedBytes += batch.bytes;
-          for (const [oid, object] of batch.objects) {
-            if (object.type !== "commit") {
-              throw new CorruptError("operation step did not produce a complete commit object");
-            }
-            visit(oid, prepareCommitCache({ repoId: this.#repoId, oid, data: object.data }));
-          }
-          remaining = batch.remaining;
-          batchMemory.clear("other");
         }
+        objectMemory.clear("other");
       }
-      return retainedBytes;
     } finally {
-      batchMemory.dispose();
+      parserMemory.dispose();
+      objectMemory.dispose();
     }
   }
 
@@ -12329,14 +12903,6 @@ function configSectionDestinationBytes(destination: string, variable: string): n
     throw new CorruptError("config section has an invalid stored variable name", { cause: error });
   }
   return destinationBytes + variableBytes;
-}
-
-function decodeConfigText(bytes: Uint8Array, label: string): string {
-  try {
-    return CONFIG_TEXT_DECODER.decode(bytes);
-  } catch (error) {
-    throw new CorruptError(`${label} is not canonical UTF-8`, { cause: error });
-  }
 }
 
 function decodeCanonicalText(bytes: Uint8Array, label: string): string {

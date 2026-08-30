@@ -13,6 +13,7 @@ import {
   lsFilesWithWorktree,
   MAX_LS_FILES_EXCLUDE_ROOTS,
 } from "../src/core/ops/staging.js";
+import { WORKTREE_SCAN_PAGE } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type {
@@ -817,7 +818,7 @@ describe("ls-files selection", () => {
     `);
 
     expect(
-      lsFilesWithWorktree(synthetic.workspace.repo, synthetic.workspace.worktree, {
+      lsFilesWithWorktree(synthetic.workspace.repo, synthetic.worktree, {
         cached: true,
         others: true,
         paths: ["*selected"],
@@ -827,26 +828,32 @@ describe("ls-files selection", () => {
     expect(walked).toBeLessThanOrEqual(100_000);
     expect(indexed + walked).toBe(100_002);
     expect(synthetic.scanCalls()).toBe(51);
+    expect(synthetic.scannedRows()).toBe(walked);
+    expect(synthetic.maxScanLimit()).toBe(WORKTREE_SCAN_PAGE);
   });
 
   it("continues after the former 100,000-row worktree scan ceiling", () => {
     const formerLimit = 100_000;
     const exact = syntheticWorktreeSelection(formerLimit);
-    const result = lsFilesWithWorktree(exact.workspace.repo, exact.workspace.worktree, {
+    const result = lsFilesWithWorktree(exact.workspace.repo, exact.worktree, {
       others: true,
       paths: ["never"],
     });
     expect(result).toEqual([]);
     expect(exact.scanCalls()).toBe(101);
+    expect(exact.scannedRows()).toBe(formerLimit);
+    expect(exact.maxScanLimit()).toBe(WORKTREE_SCAN_PAGE);
 
-    const excess = syntheticWorktreeSelection(formerLimit + 1);
+    const excess = syntheticWorktreeSelection(formerLimit + 1, { selectedLast: true });
     expect(
-      lsFilesWithWorktree(excess.workspace.repo, excess.workspace.worktree, {
+      lsFilesWithWorktree(excess.workspace.repo, excess.worktree, {
         others: true,
-        paths: ["never"],
+        paths: ["*selected"],
       }),
-    ).toEqual([]);
+    ).toEqual(["z-selected"]);
     expect(excess.scanCalls()).toBe(101);
+    expect(excess.scannedRows()).toBe(formerLimit + 1);
+    expect(excess.maxScanLimit()).toBe(WORKTREE_SCAN_PAGE);
   });
 });
 
@@ -855,13 +862,19 @@ function syntheticWorktreeSelection(
   fixtureOptions: { prefix?: string; selectedLast?: boolean } = {},
 ): {
   workspace: TestRepository;
+  worktree: Worktree;
   scanCalls(): number;
+  scannedRows(): number;
+  maxScanLimit(): number;
 } {
   const workspace = makeRepo("/");
   const prefix = fixtureOptions.prefix ?? "p";
   let calls = 0;
+  let rows = 0;
+  let maxLimit = 0;
   const scan = (_root: string, options: ScanOptions): ScanEntry[] => {
     calls++;
+    maxLimit = Math.max(maxLimit, options.limit);
     const prior = options.after;
     const start = prior === undefined ? 0 : Number.parseInt(prior.slice(2), 10) + 1;
     const end = Math.min(total, start + options.limit);
@@ -883,8 +896,16 @@ function syntheticWorktreeSelection(
         contentId: null,
       });
     }
+    rows += page.length;
     return page;
   };
-  Object.defineProperty(workspace.worktree, "scan", { value: scan });
-  return { workspace, scanCalls: () => calls };
+  const worktree = new CountingWorktree(workspace.worktree);
+  Object.defineProperty(worktree, "scan", { value: scan });
+  return {
+    workspace,
+    worktree,
+    scanCalls: () => calls,
+    scannedRows: () => rows,
+    maxScanLimit: () => maxLimit,
+  };
 }

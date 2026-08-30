@@ -29,6 +29,8 @@ import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
 const fixtures: GitFixture[] = [];
 
 class GraphPressureRepository extends Repository {
+  #typeChecks = 0;
+
   constructor(
     repo: Repository,
     private readonly beginGraph: () => () => void,
@@ -36,10 +38,12 @@ class GraphPressureRepository extends Repository {
     super(repo.checkout);
   }
 
-  override *walkIndexed(oid: string, limits = {}) {
+  override typeOf(oid: string) {
+    this.#typeChecks++;
+    if (this.#typeChecks === 1) return super.typeOf(oid);
     const release = this.beginGraph();
     try {
-      yield* super.walkIndexed(oid, limits);
+      return super.typeOf(oid);
     } finally {
       release();
     }

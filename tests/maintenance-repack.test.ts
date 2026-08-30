@@ -10,7 +10,7 @@ import {
   type MaintenanceRepackOptions,
   settleMaintenanceRepackForRestart,
 } from "../src/sqlite/maintenance/repack.js";
-import { type CompletePackObject, MAX_PACK_BLOB_BATCH_BYTES } from "../src/sqlite/packs.js";
+import { type CompletePackObject, PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/packs.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
@@ -151,7 +151,7 @@ interface SharedOversizedDeltaFixture {
 async function sharedOversizedDeltaFixture(
   store: ReturnType<typeof open>["store"],
 ): Promise<SharedOversizedDeltaFixture> {
-  const base = deterministicBytes(MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024);
+  const base = deterministicBytes(PACK_BLOB_BATCH_TARGET_BYTES + 64 * 1024);
   const baseOid = hashObject("blob", base);
   const basePack = await store.packs.ingest(slices(fullObjectPack("blob", base), 64 * 1024));
   const targetSize = 2 * 1024 * 1024 + 64 * 1024;
@@ -174,7 +174,7 @@ async function sharedOversizedDeltaFixture(
     basePack.packId,
     baseOid,
   );
-  if (compressedBase === undefined || compressedBase <= MAX_PACK_BLOB_BATCH_BYTES) {
+  if (compressedBase === undefined || compressedBase <= PACK_BLOB_BATCH_TARGET_BYTES) {
     throw new Error("maintenance shared delta base is not oversized");
   }
   return { basePackId: basePack.packId, deltaPackId: deltaPack.packId, targets };
@@ -995,7 +995,7 @@ describe("maintenance repack", () => {
 
   it("finalizes an incompressible packed source beyond the bulk read boundary", async () => {
     const { db, checkout, store } = open();
-    const data = deterministicBytes(MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024);
+    const data = deterministicBytes(PACK_BLOB_BATCH_TARGET_BYTES + 64 * 1024);
     const oid = store.write("blob", data);
     seedRepack(db, checkout.repoId, [{ oid }]);
     await advanceWithinStatementTarget(db, store.shared);
@@ -1008,7 +1008,7 @@ describe("maintenance repack", () => {
         published.packId,
         oid,
       ),
-    ).toBeGreaterThan(MAX_PACK_BLOB_BATCH_BYTES);
+    ).toBeGreaterThan(PACK_BLOB_BATCH_TARGET_BYTES);
 
     const reopened = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
     const cold = reopened.openCheckout(checkout.id);

@@ -463,8 +463,9 @@ describe("SQLite sparse workspace source", () => {
     const fallbackSource = createSqliteSelectedPathSource(fallback.database.db);
     const histogram = new Map<string, number>();
     fallback.storage.histogram = histogram;
-    const expectGeneral = (
+    const expectBranch = (
       specs: Array<{ path: string; recursive: boolean }>,
+      branch: "exact" | "general",
       maxRetainedBytes?: number,
     ): void => {
       fallback.storage.resetCounters();
@@ -480,34 +481,40 @@ describe("SQLite sparse workspace source", () => {
       expect(fallback.storage.statementCount).toBe(2);
       expect(
         [...histogram.keys()].some((query) => query.includes("WITH wanted(relative, recursive)")),
-      ).toBe(true);
+      ).toBe(branch === "general");
+      expect(
+        [...histogram.keys()].some((query) => query.startsWith("WITH wanted(relative) AS")),
+      ).toBe(branch === "exact");
     };
 
     const deepPrefix = Array.from({ length: 40 }, (_, index) => `d${index}`).join("/");
-    expectGeneral(
+    expectBranch(
       Array.from({ length: 1_000 }, (_, index) => ({
         path: `${deepPrefix}/f${index.toString().padStart(4, "0")}`,
         recursive: false,
       })).sort((left, right) => comparePaths(left.path, right.path)),
+      "general",
     );
 
     const longSegments = ["a", "b", "c", "d"].map((letter) => letter.repeat(200));
-    expectGeneral(
+    expectBranch(
       Array.from({ length: 1_000 }, (_, index) => ({
         path: `j${index.toString().padStart(4, "0")}/${longSegments.join("/")}`,
         recursive: false,
       })).sort((left, right) => comparePaths(left.path, right.path)),
+      "exact",
     );
 
     const retainedPrefix = Array.from(
       { length: 5 },
       (_, index) => `retained-segment-${index.toString().padStart(2, "0")}`,
     ).join("/");
-    expectGeneral(
+    expectBranch(
       Array.from({ length: 1_000 }, (_, index) => ({
         path: `${retainedPrefix}/f${index.toString().padStart(4, "0")}`,
         recursive: false,
       })),
+      "general",
       2 * 1024 * 1024,
     );
   });
@@ -984,10 +991,15 @@ describe("SQLite sparse workspace source", () => {
       (_, index) => `q${index.toString().padStart(4, "0")}${"\u0001".repeat(175)}`,
     );
     workspace.storage.resetCounters();
-    expect(() =>
-      lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: escaped }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(workspace.storage.statementCount).toBe(0);
+    recorded.query = "";
+    const escapedResult = lookup({
+      checkoutId: workspace.repo.checkout.checkoutId,
+      ancestors: escaped,
+    });
+    expect(JSON.stringify(escaped).length).toBeGreaterThan(1024 * 1024);
+    expect(escapedResult.facts).toHaveLength(1_000);
+    expect(workspace.storage.statementCount).toBe(1);
+    expect(recorded.query).toContain("exact_index_ancestor_rows");
   });
 
   it("falls back for symlink ancestors and bounds selected request count", () => {

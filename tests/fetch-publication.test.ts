@@ -7,7 +7,11 @@ import {
   type SQLCursorLike,
   type SQLStorageLike,
 } from "../src/sqlite/db.js";
-import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
+import {
+  createRefMutationMemoryOwner,
+  SqliteGitDatabase,
+  type StoreOptions,
+} from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
@@ -637,6 +641,111 @@ describe("exact fetch publication", () => {
       expect(store.reflog(branch)).toEqual([]);
     } finally {
       token.dispose();
+    }
+    expectIdle(store);
+  });
+
+  it("rejects foreign and disposed publication owners before SQL", () => {
+    const { db, database, store } = open();
+    const token = store.beginFetchPublication("refs/remotes/origin/");
+    const otherCheckout = database.createRepository("/other", "ref: refs/heads/main");
+    const other = database.openCheckout(otherCheckout);
+    const foreignOwner = createRefMutationMemoryOwner(other.shared);
+    const disposedOwner = createRefMutationMemoryOwner(store.shared);
+    disposedOwner.dispose();
+    try {
+      db.storage.resetCounters();
+      expect(() =>
+        store.beginFetchPublication("refs/remotes/foreign-owner/", [], undefined, foreignOwner),
+      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+      expect(db.storage.statementCount).toBe(0);
+
+      db.storage.resetCounters();
+      expect(() =>
+        store.beginFetchPublication("refs/remotes/disposed-owner/", [], undefined, disposedOwner),
+      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+      expect(db.storage.statementCount).toBe(0);
+
+      db.storage.resetCounters();
+      expect(() => store.publishFetchRefs(token, {}, metadata, foreignOwner)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(db.storage.statementCount).toBe(0);
+
+      db.storage.resetCounters();
+      expect(() => store.publishFetchRefs(token, {}, metadata, disposedOwner)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(db.storage.statementCount).toBe(0);
+
+      expect(store.publishFetchRefs(token, {}, metadata)).toBe(false);
+    } finally {
+      token.dispose();
+      foreignOwner.dispose();
+      disposedOwner.dispose();
+    }
+    expectIdle(store);
+    expectIdle(other);
+  });
+
+  it("binds owned candidate aliases to the issuing owner until token disposal", () => {
+    const { db, store } = open();
+    const owner = createRefMutationMemoryOwner(store.shared);
+    const candidateText = "refs/tags/owned-candidate";
+    const candidate = owner.construct(candidateText.length, () => candidateText);
+    const token = store.beginFetchPublication(
+      "refs/remotes/origin/",
+      [candidate],
+      undefined,
+      owner,
+    );
+    try {
+      db.storage.resetCounters();
+      expect(() => store.publishFetchRefs(token, {}, metadata)).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(db.storage.statementCount).toBe(0);
+
+      owner.dispose();
+      expect(token.disposed).toBe(true);
+      db.storage.resetCounters();
+      expect(() => store.publishFetchRefs(token, {}, metadata, owner)).toThrowError(
+        expect.objectContaining({ code: "ESTALEFETCH" }),
+      );
+      expect(db.storage.statementCount).toBe(0);
+    } finally {
+      token.dispose();
+      owner.dispose();
+    }
+    expectIdle(store);
+  });
+
+  it("charges mixed non-owned plan strings while accepting the internal owner seam", () => {
+    const { store } = open();
+    const owner = createRefMutationMemoryOwner(store.shared);
+    const candidateText = "refs/tags/mixed-owner";
+    const candidate = owner.construct(candidateText.length, () => candidateText);
+    const target = "1".repeat(40);
+    expect(owner.owns(candidate)).toBe(true);
+    expect(owner.owns(target)).toBe(false);
+    const token = store.beginFetchPublication(
+      "refs/remotes/origin/",
+      [candidate],
+      undefined,
+      owner,
+    );
+    try {
+      expect(
+        store.publishFetchRefs(
+          token,
+          { globalTagPuts: [{ name: candidate, target }] },
+          metadata,
+          owner,
+        ),
+      ).toBe(true);
+    } finally {
+      token.dispose();
+      owner.dispose();
     }
     expectIdle(store);
   });

@@ -147,19 +147,17 @@ export function add(
 ): void {
   const operation = repo.store.reserveMemory();
   try {
-    repo.store.runScratchAwareOperation(() =>
-      repo.store.db.transactionSync(() => {
-        runAdd(
-          repo,
-          worktree,
-          options,
-          normalizeAddSpecs(options.paths, operation),
-          context,
-          index,
-          operation,
-        );
-      }),
-    );
+    repo.store.runScratchAwareOperation(() => {
+      runAdd(
+        repo,
+        worktree,
+        options,
+        normalizeAddSpecs(options.paths, operation),
+        context,
+        index,
+        operation,
+      );
+    });
   } finally {
     operation.dispose();
   }
@@ -174,40 +172,23 @@ export function addLiteralPaths(
 ): AddLiteralPathsResult {
   const operation = repo.store.reserveMemory();
   try {
-    return repo.store.runScratchAwareOperation(() =>
-      repo.store.db.transactionSync(() => {
-        if (options.all === true) {
-          throw new GitError("EINVAL", "literal add requires explicit paths");
-        }
-        const validationMemory = operation.scope();
-        try {
-          compilePathspecsOwned(options.paths, validationMemory);
-        } finally {
-          validationMemory.dispose();
-        }
-        const specs = uniqueSpecs(options.paths, operation);
-        const preflight = preflightLiteralAdd(
-          repo,
-          worktree,
-          specs,
-          options.excludeRoots,
-          operation,
-        );
-        runAdd(
-          repo,
-          worktree,
-          options,
-          specs,
-          context,
-          repo.checkout,
-          operation,
-          preflight.ignores,
-        );
-        return preflight.ignored.length === 0
-          ? { outcome: "staged" }
-          : { outcome: "ignored", paths: preflight.ignored };
-      }),
-    );
+    return repo.store.runScratchAwareOperation(() => {
+      if (options.all === true) {
+        throw new GitError("EINVAL", "literal add requires explicit paths");
+      }
+      const validationMemory = operation.scope();
+      try {
+        compilePathspecsOwned(options.paths, validationMemory);
+      } finally {
+        validationMemory.dispose();
+      }
+      const specs = uniqueSpecs(options.paths, operation);
+      const preflight = preflightLiteralAdd(repo, worktree, specs, options.excludeRoots, operation);
+      runAdd(repo, worktree, options, specs, context, repo.checkout, operation, preflight.ignores);
+      return preflight.ignored.length === 0
+        ? { outcome: "staged" }
+        : { outcome: "ignored", paths: preflight.ignored };
+    });
   } finally {
     operation.dispose();
   }

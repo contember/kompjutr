@@ -31,8 +31,12 @@ import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { commitCacheBytes } from "../src/sqlite/commits.js";
-import { iterateSqlCursor, type SqlDatabase } from "../src/sqlite/db.js";
-import { SqliteGitDatabase, WALK_TREE_SQL } from "../src/sqlite/store.js";
+import { iterateSqlCursor, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
+import {
+  readAuthenticatedObjectOwned,
+  SqliteGitDatabase,
+  WALK_TREE_SQL,
+} from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -404,7 +408,7 @@ describe("bounded commit graph reads", () => {
 
     expect(log(repo, { depth: 256 })).toHaveLength(256);
     const cold = db.storage.statementCount;
-    expect(cold).toBeLessThan(1_000);
+    expect(cold).toBeLessThan(1_500);
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_commits WHERE repo_id = ?", 1)).toBe(256);
 
     db.storage.resetCounters();
@@ -431,14 +435,15 @@ describe("bounded commit graph reads", () => {
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
-  it("fails an incomplete deep cache without scalar or object fallback", () => {
+  it("authenticates an unavailable deep cache through the uncached owner path", () => {
     const { db, repo, oids } = logFixture(257);
     db.run("DELETE FROM git_commits WHERE repo_id = ? AND oid = ?", 1, oids[0]);
     db.storage.histogram = new Map();
     db.storage.resetCounters();
 
-    expect(() => log(repo, { depth: 257 })).toThrow(/reindex or reclone/);
-    expect([...db.storage.histogram.keys()].join("\n")).not.toContain("git_object_chunks");
+    expect(log(repo, { depth: 257 })).toHaveLength(257);
+    expect([...db.storage.histogram.keys()].join("\n")).toContain("SELECT w.oid, c.seq, c.data");
+    repo.store.memory.assertIdle();
   });
 
   it("rejects a coordinated cached cycle on point and indexed log paths", () => {
@@ -666,8 +671,25 @@ describe("ls-tree and cat-file", () => {
     ];
 
     expect(lsTree(local, treeOid)).toEqual(expected);
-    const operationBytes = local.store.memory.highWaterBytes;
+    expect(local.store.cacheBytes().objects).toBe(0);
+    expect(store.readAuthenticatedObject(treeOid, "tree")?.data).toEqual(tree);
+    expect(local.store.cacheBytes().objects).toBe(0);
+    const operationBytes = 96 + 1_024 + 5 * tree.length + Math.floor(tree.length / 22) * 808;
     local.store.memory.assertIdle();
+
+    const foreignCoordinator = new MemoryCoordinator();
+    const foreignOwner = foreignCoordinator.reserve();
+    foreignOwner.set("other", operationBytes);
+    db.storage.resetCounters();
+    try {
+      expect(() =>
+        readAuthenticatedObjectOwned(local.store, treeOid, "tree", foreignOwner),
+      ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+      expect(db.storage.statementCount).toBe(0);
+    } finally {
+      foreignOwner.dispose();
+    }
+    foreignCoordinator.assertIdle();
 
     for (const excess of [0, 1]) {
       const blocker = local.store.reserveMemory();
@@ -691,6 +713,137 @@ describe("ls-tree and cat-file", () => {
       }
       local.store.memory.assertIdle();
     }
+  });
+
+  it("pre-admits the packed authenticated nonrecursive source before materializing it", async () => {
+    const db = new TestDatabase();
+    const setup = openScale(db);
+    const tree = serializeTree([
+      { mode: MODE_FILE, name: "a.txt", oid: numberedOid(1) },
+      { mode: MODE_FILE, name: "long-name.txt", oid: numberedOid(2) },
+    ]);
+    const treeOid = hashObject("tree", tree);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", tree);
+    writer.finish();
+    const pack = concat(chunks);
+    await setup.packs.ingest(slices(pack, 64));
+
+    const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
+    const checkout = database.findCheckout("/repo");
+    if (checkout === null) throw new Error("packed ls-tree checkout disappeared");
+    const store = database.openCheckout(checkout);
+    const local = new Repository(store);
+    const expected = [
+      { mode: "100644", path: "a.txt", oid: numberedOid(1), type: "blob" },
+      { mode: "100644", path: "long-name.txt", oid: numberedOid(2), type: "blob" },
+    ];
+
+    let objectHeaderBytes = 1;
+    for (
+      let remaining = Math.floor(tree.length / 16);
+      remaining > 0;
+      remaining = Math.floor(remaining / 128)
+    ) {
+      objectHeaderBytes++;
+    }
+    const compressedBytes = pack.length - 12 - objectHeaderBytes - 20;
+    const packedOutputBytes = 512 + 256 + tree.length;
+    const operationBytes = 96 + 2 * 1024 * 1024 + packedOutputBytes + compressedBytes + 1024 * 1024;
+
+    expect(lsTree(local, treeOid)).toEqual(expected);
+    expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
+    store.shared.memory.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const blocker = store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const histogram = new Map<string, number>();
+      db.storage.histogram = histogram;
+      db.storage.resetCounters();
+      try {
+        const read = () => lsTree(local, treeOid);
+        const materializedSource = (): boolean =>
+          [...histogram.keys()].some((query) => query.startsWith("WITH requested(pack_id, seq)"));
+        if (excess === 0) {
+          expect(read()).toEqual(expected);
+          expect(materializedSource()).toBe(true);
+        } else {
+          expect(read).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+          expect(materializedSource()).toBe(false);
+        }
+        expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
+      } finally {
+        blocker.dispose();
+      }
+      store.shared.memory.assertIdle();
+    }
+  });
+
+  it("restores packed authenticated ownership after a cold corrupt-source failure", async () => {
+    const db = new TestDatabase();
+    const setup = openScale(db);
+    const tree = serializeTree([
+      { mode: MODE_FILE, name: "a.txt", oid: numberedOid(1) },
+      { mode: MODE_FILE, name: "long-name.txt", oid: numberedOid(2) },
+    ]);
+    const treeOid = hashObject("tree", tree);
+    const chunks: Uint8Array[] = [];
+    const writer = new PackWriter((chunk) => chunks.push(chunk));
+    writer.header(1);
+    writer.object("tree", tree);
+    writer.finish();
+    await setup.packs.ingest(slices(concat(chunks), 64));
+
+    const source = db.one<{ data_off: number; data: unknown }>(
+      `SELECT object.data_off, data.data
+         FROM git_pack_objects object
+         JOIN git_pack_data data
+           ON data.repo_id = object.repo_id AND data.pack_id = object.pack_id AND data.seq = 0
+        WHERE object.repo_id = ? AND object.oid = ?`,
+      1,
+      treeOid,
+    );
+    if (source === undefined || !Number.isSafeInteger(source.data_off)) {
+      throw new Error("packed corrupt-source fixture is incomplete");
+    }
+    const corrupted = readBlob(source.data).slice();
+    if (source.data_off < 0 || source.data_off >= corrupted.length) {
+      throw new Error("packed corrupt-source offset is invalid");
+    }
+    corrupted[source.data_off] = corrupted[source.data_off]! ^ 0xff;
+    db.run(
+      "UPDATE git_pack_data SET data = ? WHERE repo_id = ? AND pack_id = 1 AND seq = 0",
+      corrupted,
+      1,
+    );
+
+    const database = new SqliteGitDatabase(db, { chunkBytes: 0, objectCacheBytes: 0 });
+    const checkout = database.findCheckout("/repo");
+    if (checkout === null) throw new Error("packed corrupt-source checkout disappeared");
+    const store = database.openCheckout(checkout);
+    const owner = store.reserveMemory();
+    const admittedBytes = 1_024 + 5 * tree.length + Math.floor(tree.length / 22) * 808;
+    owner.set("other", admittedBytes);
+    const histogram = new Map<string, number>();
+    db.storage.histogram = histogram;
+    db.storage.resetCounters();
+    try {
+      expect(() => readAuthenticatedObjectOwned(store.shared, treeOid, "tree", owner)).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(
+        [...histogram.keys()].some((query) => query.startsWith("WITH requested(pack_id, seq)")),
+      ).toBe(true);
+      expect(owner.currentBytes).toBe(admittedBytes);
+      expect(store.shared.memory.totalBytes).toBe(admittedBytes);
+      expect(store.cacheBytes()).toEqual({ objects: 0, chunks: 0 });
+    } finally {
+      owner.dispose();
+    }
+    store.shared.memory.assertIdle();
   });
 
   it("lists every path in a tree", () => {

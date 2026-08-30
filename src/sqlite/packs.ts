@@ -16,12 +16,17 @@ import {
   objectHeader,
   type RawObject,
 } from "../core/objects.js";
-import { type ByteSource, type ChunkedBytes, ChunkPool } from "../core/pack/chunks.js";
+import {
+  type ByteSource,
+  type ChunkedBytes,
+  ChunkPool,
+  chunkFootprint,
+} from "../core/pack/chunks.js";
 import { applyDelta, DeltaApplier } from "../core/pack/delta.js";
 import { Sha1 } from "../core/sha1.js";
 import { InflateInto, InflateSizeError, InflateStream, inflatePrefix } from "../core/zlib.js";
 import type { MemoryCoordinator, MemoryReservation } from "../memory.js";
-import { MAX_COMMIT_CACHE_BYTES, MAX_INDEXED_COMMIT_BYTES } from "./commits.js";
+import { COMMIT_CACHE_FLUSH_BYTES } from "./commits.js";
 import { blob, readBlob, type SqlDatabase } from "./db.js";
 import {
   PACK_COMMIT_PAYLOAD_BYTES,
@@ -46,7 +51,6 @@ export const PACK_CHUNK = 1024 * 1024;
 export const MAX_PACK_MEMBERSHIP_OBJECTS = 2_048;
 export const MAX_PACK_DELETE_BATCH = 48;
 export const PACK_INGEST_LEASE_MS = 5 * 60 * 1_000;
-const MAX_PACK_FALLBACK_AUDIT_BYTES = 48 * 1024 * 1024;
 const MAX_PACK_FALLBACK_AUDIT_PACKS = 128;
 const MAX_PACK_INGEST_OBJECTS = 128 * 1024;
 const PACK_MEMBERSHIP_DIGEST_BYTES = 20;
@@ -60,8 +64,8 @@ const PACK_FALLBACK_AUDIT_METADATA_BYTES = 2 * 1024 * 1024;
  */
 export const MAX_DELTA_DEPTH = 50_000;
 
-/** Output and compressed graph bytes admitted by one bulk blob read. */
-export const MAX_PACK_BLOB_BATCH_BYTES = 4 * 1024 * 1024;
+/** Non-refusing target for buffered object, compressed, and base batches. */
+export const PACK_BLOB_BATCH_TARGET_BYTES = 4 * 1024 * 1024;
 const MAX_PACK_BLOB_GRAPH_ENTRIES = 4096;
 const MAX_PACK_BLOB_INPUTS = 4096;
 
@@ -77,6 +81,8 @@ export interface PackCacheOptions {
   cacheEntryLimit?: number;
   /** Test seam; production uses `MAX_DELTA_DEPTH`. */
   maxDeltaDepth?: number;
+  /** Test seam; production discovers 4,096 union-graph rows per page. */
+  graphPageEntries?: number;
   /** Test seam for durable ingest lease expiry. */
   now?: () => number;
 }
@@ -92,11 +98,55 @@ const PACK_RANGE_BATCH_BYTES = 1024 * 1024;
 // Four conservative JSON copies plus request, map, result and view wrappers.
 const PACK_RANGE_REQUEST_MEMORY_BYTES = 832;
 const PACK_INFLATE_HEADROOM_BYTES = 16 * 1024 * 1024;
-const MAX_PACK_AUTH_COMPRESSED_BYTES = MAX_PACK_DELTA_WORKING_BYTES + PACK_INFLATE_HEADROOM_BYTES;
 const PACK_SHARED_OBJECT_CACHE_BYTES = 8 * 1024 * 1024;
 const PACK_INFLATE_OUTPUT_CHUNK_BYTES = 16 * 1024;
 const PACK_BLOB_GRAPH_METADATA_BYTES = 2 * 1024 * 1024;
-const PACK_EXTERNAL_BASE_BYTES = MAX_PACK_BLOB_BATCH_BYTES + 64 * 1024;
+const PACK_EXTERNAL_BASE_BYTES = PACK_BLOB_BATCH_TARGET_BYTES + 64 * 1024;
+export const PACK_DELTA_OBJECT_WRAPPER_BYTES = 256;
+const PACK_READ_OUTPUT_MAP_BYTES = 512;
+const PACK_READ_OUTPUT_ENTRY_BYTES = 256;
+const PACK_PAGER_STATE_BYTES = 512;
+const PACK_PAGER_ROOT_STATE_BYTES = 1_024;
+const PACK_PAGER_PAGE_BYTES = 512;
+const PACK_PAGER_PAGE_ROOT_BYTES = 128;
+const PACK_PAGER_CHECKPOINT_BYTES = 128;
+const PACK_PAGER_TRANSITION_BYTES = 512;
+const PACK_PAGER_TRANSITION_ENTRY_BYTES = 384;
+const PACK_PAGER_PAGE_LOCAL_BYTES = 2_048;
+const PACK_PAGER_PAGE_LOCAL_ENTRY_BYTES = 1_024;
+const PACK_PAGER_JSON_OID_BYTES = 96;
+
+function checkedPackReadBytes(left: number, right: number, label: string): number {
+  if (
+    !Number.isSafeInteger(left) ||
+    !Number.isSafeInteger(right) ||
+    left < 0 ||
+    right < 0 ||
+    right > Number.MAX_SAFE_INTEGER - left
+  ) {
+    throw new GitError("E2BIG", `packed object ${label} memory accounting overflow`);
+  }
+  return left + right;
+}
+
+function packPagerBytes(fixed: number, entries: number, perEntry: number, label: string): number {
+  if (
+    !Number.isSafeInteger(entries) ||
+    entries < 0 ||
+    entries > Math.floor((Number.MAX_SAFE_INTEGER - fixed) / perEntry)
+  ) {
+    throw new GitError("E2BIG", `packed object ${label} memory accounting overflow`);
+  }
+  return fixed + entries * perEntry;
+}
+
+function isPackGraphLimit(error: unknown): error is GitError {
+  return (
+    error instanceof GitError &&
+    error.code === "E2BIG" &&
+    error.message === "packed blob dependency graph exceeds the bounded entry limit"
+  );
+}
 
 // Charged JS-owned state includes both database-wide shared caches once.
 const PACK_MEMORY_MODEL_BYTES =
@@ -105,11 +155,10 @@ const PACK_MEMORY_MODEL_BYTES =
   DEFAULT_CHUNK_BYTES +
   PACK_SHARED_OBJECT_CACHE_BYTES +
   PACK_TREE_BATCH_BYTES +
-  MAX_COMMIT_CACHE_BYTES +
+  COMMIT_CACHE_FLUSH_BYTES +
   PACK_INDEX_MEMORY_BYTES +
   PACK_PENDING_PAGE_MEMORY_BYTES +
   PACK_OFFSET_WINDOW_BYTES +
-  2 * MAX_INDEXED_COMMIT_BYTES +
   PACK_INFLATE_HEADROOM_BYTES;
 if (PACK_MEMORY_MODEL_BYTES > 100 * 1024 * 1024) {
   throw new Error("pack memory model exceeds 100 MiB");
@@ -124,7 +173,7 @@ export const PACK_BLOB_MEMORY_MODEL_BYTES =
   PACK_READ_BYTES +
   DEFAULT_CHUNK_BYTES +
   PACK_SHARED_OBJECT_CACHE_BYTES +
-  MAX_PACK_BLOB_BATCH_BYTES * 2 +
+  PACK_BLOB_BATCH_TARGET_BYTES * 2 +
   PACK_EXTERNAL_BASE_BYTES +
   PACK_BLOB_GRAPH_METADATA_BYTES +
   PACK_INFLATE_HEADROOM_BYTES +
@@ -146,6 +195,20 @@ function pushExactInflate(stream: InflateInto, input: Uint8Array, label: string)
 
 function isObjectType(value: string): value is ObjectType {
   return value === "blob" || value === "tree" || value === "commit" || value === "tag";
+}
+
+function validatePackReadInputs(oids: readonly string[], expectedType: ObjectType | null): void {
+  if (oids.length > MAX_PACK_BLOB_INPUTS) {
+    throw new GitError("E2BIG", `blob batch exceeds ${MAX_PACK_BLOB_INPUTS} packed inputs`);
+  }
+  if (expectedType !== null && !isObjectType(expectedType)) {
+    throw new GitError("EINVAL", "packed object read type is invalid");
+  }
+  for (const oid of oids) {
+    if (typeof oid !== "string" || !isOid(oid)) {
+      throw new GitError("EINVAL", "packed object read contains an invalid object id");
+    }
+  }
 }
 
 function packRangeBatchMemory(bytes: number, requests: number): number {
@@ -265,14 +328,12 @@ interface FallbackPackAudit {
 
 interface FallbackAuditBudget {
   readonly packIds: Set<number>;
-  bytes: number;
   entries: number;
 }
 
 function fallbackAuditBudget(): FallbackAuditBudget {
   return {
     packIds: new Set(),
-    bytes: 0,
     entries: 0,
   };
 }
@@ -522,9 +583,16 @@ function requireLifecycleResult(result: unknown, hook: string): void {
   throw new Error(`pack lifecycle ${hook} hook must return undefined`);
 }
 
-/** Resolves an oid the pack index does not hold (loose storage, thin-pack bases). */
-export type ExternalResolver = (oid: string) => RawObject | null;
-export type ExternalBatchResolver = (oids: readonly string[]) => Map<string, RawObject>;
+export interface PackReadOwnership {
+  /** Transient graph, SQL, compressed, inflate, external-base, and delta work. */
+  readonly operation: MemoryReservation;
+  /** Returned payloads and their map/object wrappers. PackStore sizes this scope. */
+  readonly output: MemoryReservation;
+}
+export type ExternalBatchResolver = (
+  oids: readonly string[],
+  ownership: PackReadOwnership,
+) => Map<string, RawObject>;
 export interface ExternalObjectMetadata {
   type: ObjectType;
   size: number;
@@ -533,13 +601,25 @@ export type ExternalMetadataResolver = (
   oids: readonly string[],
 ) => Map<string, ExternalObjectMetadata>;
 
-interface BulkPackRow extends PackObjectRow {
-  oid: string;
-}
-
 interface CompressedEntry {
   bytes: Uint8Array;
   filled: number;
+}
+
+interface PackGraphOrigin {
+  readonly rootOid: string;
+  depth: number;
+  readonly checkpoints: Set<string>;
+}
+
+interface PackGraphPage {
+  readonly roots: readonly string[];
+  readonly entryLimit: number;
+}
+
+interface PackGraphExit {
+  readonly oid: string | null;
+  readonly distance: number;
 }
 
 interface PackRangeRequest {
@@ -566,7 +646,11 @@ interface IngestBase {
  * checksum. A sender that pads beyond this still works — the read window
  * grows and retries — but this bound gets the common case in one pass.
  */
-function checkDeltaWorkingSet(base: Uint8Array, delta: Uint8Array): void {
+function validateDeltaWorkingSet(
+  base: Uint8Array,
+  delta: Uint8Array,
+  expectedTargetSize: number,
+): number {
   let at = 0;
   const varint = (): number => {
     let value = 0;
@@ -584,9 +668,12 @@ function checkDeltaWorkingSet(base: Uint8Array, delta: Uint8Array): void {
   const sourceSize = varint();
   const targetSize = varint();
   if (sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
-  if (base.length + delta.length + targetSize > MAX_PACK_DELTA_WORKING_BYTES) {
+  if (targetSize !== expectedTargetSize) throw new CorruptError("delta target size mismatch");
+  const workingBytes = base.length + delta.length + targetSize + PACK_DELTA_OBJECT_WRAPPER_BYTES;
+  if (!Number.isSafeInteger(workingBytes) || workingBytes > MAX_PACK_DELTA_WORKING_BYTES) {
     throw new CorruptError("delta working set exceeds 48 MiB");
   }
+  return targetSize;
 }
 
 function checkDeltaInflateBudget(base: Uint8Array, deltaSize: number): void {
@@ -605,6 +692,10 @@ class DeltaHeaderProbe {
   #field = 0;
   #sourceSize: number | null = null;
   #targetSize: number | null = null;
+
+  get complete(): boolean {
+    return this.#targetSize !== null;
+  }
 
   update(bytes: Uint8Array): void {
     if (this.#targetSize !== null) return;
@@ -642,6 +733,7 @@ class SequentialPackBytes {
   #loadedRows = 0;
   #loadedBytes = 0;
   #finished = false;
+  #closed = false;
 
   constructor(
     db: SqlDatabase,
@@ -665,6 +757,15 @@ class SequentialPackBytes {
   }
 
   read(offset: number, length: number): Uint8Array {
+    try {
+      return this.#read(offset, length);
+    } catch (error) {
+      this.dispose();
+      throw error;
+    }
+  }
+
+  #read(offset: number, length: number): Uint8Array {
     if (
       this.#finished ||
       !Number.isSafeInteger(offset) ||
@@ -698,16 +799,26 @@ class SequentialPackBytes {
   finish(): void {
     if (this.#finished) throw new CorruptError(`pack ${this.packId}: byte audit was reused`);
     this.#finished = true;
-    const extra = this.#rows.next();
-    if (
-      !extra.done ||
-      this.#loadedRows !== this.#expectedRows ||
-      this.#loadedBytes !== this.limit ||
-      this.#tail.length !== 20 ||
-      toHex(this.#tail) !== toHex(this.#sha.digest())
-    ) {
-      throw new CorruptError(`pack ${this.packId}: stored checksum or chunk layout is invalid`);
+    try {
+      const extra = this.#rows.next();
+      if (
+        !extra.done ||
+        this.#loadedRows !== this.#expectedRows ||
+        this.#loadedBytes !== this.limit ||
+        this.#tail.length !== 20 ||
+        toHex(this.#tail) !== toHex(this.#sha.digest())
+      ) {
+        throw new CorruptError(`pack ${this.packId}: stored checksum or chunk layout is invalid`);
+      }
+    } finally {
+      this.dispose();
     }
+  }
+
+  dispose(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#rows.return?.();
   }
 
   #load(seq: number): Uint8Array {
@@ -747,7 +858,6 @@ class SequentialPackBytes {
 export class PackStore {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
-  readonly #external: ExternalResolver;
   readonly #externalBatch: ExternalBatchResolver;
   readonly #externalMetadata: ExternalMetadataResolver;
   readonly #objects: ByteLru<string, RawObject>;
@@ -764,6 +874,7 @@ export class PackStore {
   readonly #maxBufferedEntry: number;
   readonly #cacheEntryLimit: number;
   readonly #maxDeltaDepth: number;
+  readonly #graphPageEntries: number;
   constructor(
     db: SqlDatabase,
     repoId: number,
@@ -772,14 +883,12 @@ export class PackStore {
     memory: MemoryCoordinator,
     scopeMemory: (reservation: MemoryReservation) => MemoryReservation,
     cacheNamespace: string,
-    external: ExternalResolver,
     externalBatch: ExternalBatchResolver,
     externalMetadata: ExternalMetadataResolver,
     options: PackCacheOptions = {},
   ) {
     this.#db = db;
     this.#repoId = repoId;
-    this.#external = external;
     this.#externalBatch = externalBatch;
     this.#externalMetadata = externalMetadata;
     this.#objects = objects;
@@ -801,6 +910,15 @@ export class PackStore {
       throw new RangeError("maxDeltaDepth must be a finite non-negative integer");
     }
     this.#maxDeltaDepth = Math.min(maxDeltaDepth, MAX_DELTA_DEPTH);
+    const graphPageEntries = options.graphPageEntries ?? MAX_PACK_BLOB_GRAPH_ENTRIES;
+    if (
+      !Number.isFinite(graphPageEntries) ||
+      !Number.isInteger(graphPageEntries) ||
+      graphPageEntries < 1
+    ) {
+      throw new RangeError("graphPageEntries must be a finite positive integer");
+    }
+    this.#graphPageEntries = Math.min(graphPageEntries, MAX_PACK_BLOB_GRAPH_ENTRIES);
   }
 
   /** Bytes the chunk cache currently holds. */
@@ -907,90 +1025,98 @@ export class PackStore {
    * most two inflated buffers at a time.
    */
   read(oid: string): RawObject | null {
-    const first = this.lookup(oid);
-    if (first === null) return null;
-    const cached = this.#objects.get(this.#objectCacheKey(first.packId, oid));
-    if (cached !== undefined) return cached;
-
-    const chain: PackedEntry[] = [];
-    const seen = new Set<string>();
-    let base: RawObject | null = null;
-    let current: PackedEntry = first;
-    for (;;) {
-      if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
-      seen.add(current.oid);
-      if (current.baseOid === null) {
-        base = { type: current.type, data: this.#inflateEntry(current) };
-        this.#cacheObject(current.packId, current.oid, base);
-        break;
-      }
-      if (chain.length >= this.#maxDeltaDepth) {
-        throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
-      }
-      chain.push(current);
-      const next = this.lookup(current.baseOid);
-      if (next === null) {
-        const external = this.#external(current.baseOid);
-        if (external === null) {
-          throw new CorruptError(`missing delta base ${current.baseOid} for ${current.oid}`);
-        }
-        base = external;
-        break;
-      }
-      const cachedBase = this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
-      if (cachedBase !== undefined) {
-        base = cachedBase;
-        break;
-      }
-      current = next;
-    }
-
-    let object = base;
-    for (let i = chain.length - 1; i >= 0; i--) {
-      const entry = chain[i]!;
-      checkDeltaInflateBudget(object.data, entry.entrySize);
-      const delta = this.#inflateEntry(entry);
-      checkDeltaWorkingSet(object.data, delta);
-      object = { type: base.type, data: applyDelta(object.data, delta) };
-      this.#cacheObject(entry.packId, entry.oid, object);
-    }
-    if (chain.length === 0) this.#cacheObject(first.packId, oid, object);
-    return object;
+    validatePackReadInputs([oid], null);
+    return this.#withReadOwnership(
+      undefined,
+      (ownership) =>
+        this.#readObjectsBounded([oid], null, null, true, new Map(), false, ownership).get(oid) ??
+        null,
+    );
   }
 
   /** Resolve packed blobs with one graph query and one physical chunk cursor. */
   readBlobs(oids: readonly string[]): Map<string, Uint8Array> {
-    const objects = this.#readObjects(oids, null, "blob", false);
-    const blobs = new Map<string, Uint8Array>();
-    for (const [oid, object] of objects) {
-      if (object.type !== "blob") throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
-      blobs.set(oid, object.data);
-    }
-    return blobs;
+    validatePackReadInputs(oids, "blob");
+    return this.#withReadOwnership(undefined, (ownership) => {
+      const objects = this.#readObjectsBounded(
+        oids,
+        null,
+        "blob",
+        false,
+        new Map(),
+        false,
+        ownership,
+      );
+      const conversion = ownership.operation.scope();
+      try {
+        conversion.set(
+          "other",
+          PACK_READ_OUTPUT_MAP_BYTES + objects.size * PACK_READ_OUTPUT_ENTRY_BYTES,
+        );
+        const blobs = new Map<string, Uint8Array>();
+        for (const [oid, object] of objects) {
+          if (object.type !== "blob")
+            throw new CorruptError(`${oid} is a ${object.type}, not a blob`);
+          blobs.set(oid, object.data);
+        }
+        return blobs;
+      } finally {
+        conversion.dispose();
+      }
+    });
   }
 
-  /** Resolve a bounded mixed-object batch in physical pack order. */
+  /**
+   * Resolve a bounded mixed-object batch in physical pack order. An explicit
+   * owner keeps returned payloads live; direct calls use local scopes and
+   * return ordinary caller-owned values after those scopes are released.
+   */
   readObjects(
     oids: readonly string[],
     expectedType: ObjectType | null = null,
+    ownership?: PackReadOwnership,
   ): Map<string, RawObject> {
-    return this.#readObjects(oids, null, expectedType, false);
+    validatePackReadInputs(oids, expectedType);
+    return this.#withReadOwnership(ownership, (readOwnership) =>
+      this.#readObjectsBounded(oids, null, expectedType, false, new Map(), false, readOwnership),
+    );
   }
 
   /** Cold-read and hash one canonical object from a complete pack. */
-  readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
-    if (!isOid(oid)) throw new CorruptError(`invalid object id ${oid}`);
-    const object = this.#readObjects([oid], null, expectedType, true, new Map(), true).get(oid);
-    if (object === undefined) return null;
-    if (hashObject(object.type, object.data) !== oid) {
-      throw new CorruptError(`packed ${expectedType} ${oid} does not match its bytes`);
-    }
-    return object;
+  readAuthenticatedObject(
+    oid: string,
+    expectedType: ObjectType,
+    ownership?: PackReadOwnership,
+  ): RawObject | null {
+    validatePackReadInputs([oid], expectedType);
+    return this.#withReadOwnership(ownership, (readOwnership) => {
+      const object = this.#readObjectsBounded(
+        [oid],
+        null,
+        expectedType,
+        true,
+        new Map(),
+        true,
+        readOwnership,
+      ).get(oid);
+      if (object === undefined) return null;
+      if (hashObject(object.type, object.data) !== oid) {
+        throw new CorruptError(`packed ${expectedType} ${oid} does not match its bytes`);
+      }
+      return object;
+    });
   }
 
   /** Cold-read and hash exact canonical complete-pack sources. */
   authenticateCompleteSources(
     objects: readonly { oid: string; type: ObjectType; size: number; packId: number }[],
+  ): void {
+    this.#withMemoryReservation((memory) => this.#authenticateCompleteSources(objects, memory));
+  }
+
+  #authenticateCompleteSources(
+    objects: readonly { oid: string; type: ObjectType; size: number; packId: number }[],
+    memory: MemoryReservation,
   ): void {
     if (objects.length < 1 || objects.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
       throw new GitError(
@@ -998,8 +1124,8 @@ export class PackStore {
         `packed source authentication exceeds ${MAX_PACK_MEMBERSHIP_OBJECTS} objects`,
       );
     }
+    memory.set("metadata", PACK_BLOB_GRAPH_METADATA_BYTES);
     const requested = new Set<string>();
-    let requestedBytes = 0;
     for (const object of objects) {
       if (
         !isOid(object.oid) ||
@@ -1016,10 +1142,6 @@ export class PackStore {
         throw new CorruptError("canonical packed source request contains a duplicate object id");
       }
       requested.add(object.oid);
-      requestedBytes += object.size;
-      if (!Number.isSafeInteger(requestedBytes) || requestedBytes > MAX_PACK_DELTA_WORKING_BYTES) {
-        throw new GitError("E2BIG", "packed source authentication exceeds its output byte limit");
-      }
     }
     const encoded = JSON.stringify(objects);
     let sources = 0;
@@ -1105,84 +1227,84 @@ export class PackStore {
       throw new CorruptError("canonical packed source authentication is incomplete");
     }
 
-    let compressedBytes = 0;
-    for (const source of authenticated) {
-      compressedBytes += source.dataLen;
-      if (
-        !Number.isSafeInteger(compressedBytes) ||
-        compressedBytes > MAX_PACK_AUTH_COMPRESSED_BYTES
-      ) {
-        throw new GitError(
-          "E2BIG",
-          "packed source authentication exceeds its compressed byte limit",
-        );
-      }
-    }
-
     let page: AuthenticatedPackSource[] = [];
     let pageBytes = 0;
     const authenticatePage = (): void => {
       if (page.length === 0) return;
       const only = page.length === 1 ? page[0] : undefined;
-      if (only !== undefined && only.dataLen > MAX_PACK_BLOB_BATCH_BYTES && only.baseOid === null) {
+      if (
+        only !== undefined &&
+        only.dataLen > PACK_BLOB_BATCH_TARGET_BYTES &&
+        only.baseOid === null
+      ) {
         this.#authenticateFullPackSourceStreaming(
           only,
           "canonical packed source bytes disagree with their object id",
+          memory,
         );
         page = [];
         pageBytes = 0;
         return;
       }
-      const read = this.#readObjects(
-        page.map((object) => object.oid),
-        only?.packId ?? null,
-        null,
-        false,
-        new Map(),
-        true,
-      );
-      if (read.size !== page.length) {
-        throw new CorruptError("canonical packed source authentication is incomplete");
-      }
-      for (const expected of page) {
-        const object = read.get(expected.oid);
-        if (
-          object === undefined ||
-          object.type !== expected.type ||
-          object.data.length !== expected.size ||
-          hashObject(object.type, object.data) !== expected.oid
-        ) {
-          throw new CorruptError("canonical packed source bytes disagree with their object id");
+      this.#withChildReadOwnership(memory, (ownership) => {
+        const read = this.#readObjectsBounded(
+          page.map((object) => object.oid),
+          only?.packId ?? null,
+          null,
+          false,
+          new Map(),
+          true,
+          ownership,
+        );
+        if (read.size !== page.length) {
+          throw new CorruptError("canonical packed source authentication is incomplete");
         }
-      }
+        for (const expected of page) {
+          const object = read.get(expected.oid);
+          if (
+            object === undefined ||
+            object.type !== expected.type ||
+            object.data.length !== expected.size ||
+            hashObject(object.type, object.data) !== expected.oid
+          ) {
+            throw new CorruptError("canonical packed source bytes disagree with their object id");
+          }
+        }
+      });
       page = [];
       pageBytes = 0;
     };
     for (const object of authenticated) {
       if (
         page.length > 0 &&
-        (object.size > MAX_PACK_BLOB_BATCH_BYTES - pageBytes ||
-          object.dataLen > MAX_PACK_BLOB_BATCH_BYTES)
+        (object.size > PACK_BLOB_BATCH_TARGET_BYTES - pageBytes ||
+          object.dataLen > PACK_BLOB_BATCH_TARGET_BYTES)
       ) {
         authenticatePage();
       }
       page.push(object);
       pageBytes += object.size;
-      if (object.size > MAX_PACK_BLOB_BATCH_BYTES || object.dataLen > MAX_PACK_BLOB_BATCH_BYTES) {
+      if (
+        object.size > PACK_BLOB_BATCH_TARGET_BYTES ||
+        object.dataLen > PACK_BLOB_BATCH_TARGET_BYTES
+      ) {
         authenticatePage();
       }
     }
     authenticatePage();
   }
 
-  #authenticateFullPackSourceStreaming(source: AuthenticatedPackSource, message: string): void {
+  #authenticateFullPackSourceStreaming(
+    source: AuthenticatedPackSource,
+    message: string,
+    memory?: MemoryReservation,
+  ): void {
     if (source.baseOid !== null || source.entrySize !== source.size || source.dataLen < 1) {
       throw new CorruptError(message);
     }
-    if (source.dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
-      throw new GitError("E2BIG", "packed source compressed bytes exceed the streaming limit");
-    }
     const sha = new Sha1().update(objectHeader(source.type, source.size));
+    memory?.set("flat", Math.min(source.size, PACK_INFLATE_OUTPUT_CHUNK_BYTES));
+    memory?.set("packRow", PACK_READ_BYTES);
     let produced = 0;
     const stream = new InflateStream((chunk) => {
       produced += chunk.length;
@@ -1210,9 +1332,342 @@ export class PackStore {
     ) {
       throw new CorruptError(message);
     }
+    memory?.clear("packRow");
+    memory?.clear("flat");
   }
 
-  /** Resolve ingest bases in bounded graph and physical pack order. */
+  /** Use the fast union read, then page the same union graph only on structural overflow. */
+  #readObjectsBounded(
+    oids: readonly string[],
+    pendingPackId: number | null,
+    expectedType: ObjectType | null,
+    allowMissing: boolean,
+    seeds: ReadonlyMap<string, RawObject>,
+    bypassCache: boolean,
+    ownership: PackReadOwnership,
+  ): Map<string, RawObject> {
+    try {
+      return this.#readObjects(
+        oids,
+        pendingPackId,
+        expectedType,
+        allowMissing,
+        seeds,
+        bypassCache,
+        ownership,
+      );
+    } catch (error) {
+      if (!isPackGraphLimit(error)) throw error;
+      ownership.operation.clear("other");
+      ownership.operation.clear("metadata");
+      ownership.output.clear("flat");
+    }
+    return this.#readObjectsPaged(
+      oids,
+      pendingPackId,
+      expectedType,
+      allowMissing,
+      seeds,
+      bypassCache,
+      ownership,
+    );
+  }
+
+  /** Discover one bounded union graph and resolve its checkpoint pages in reverse. */
+  #readObjectsPaged(
+    oids: readonly string[],
+    pendingPackId: number | null,
+    expectedType: ObjectType | null,
+    allowMissing: boolean,
+    seeds: ReadonlyMap<string, RawObject>,
+    bypassCache: boolean,
+    ownership: PackReadOwnership,
+  ): Map<string, RawObject> {
+    const stateMemory = ownership.operation.scope();
+    const seedBindingMemory = ownership.operation.scope();
+    let checkpointOutput: MemoryReservation | null = null;
+    try {
+      let stateBytes = packPagerBytes(
+        PACK_PAGER_STATE_BYTES,
+        oids.length,
+        PACK_PAGER_ROOT_STATE_BYTES,
+        "pager root state",
+      );
+      stateMemory.set("metadata", stateBytes);
+      const wanted = [...new Set(oids)];
+      let frontier = new Map<string, PackGraphOrigin[]>();
+      for (const oid of wanted) {
+        frontier.set(oid, [{ rootOid: oid, depth: 0, checkpoints: new Set([oid]) }]);
+      }
+      const pages: PackGraphPage[] = [];
+      seedBindingMemory.set(
+        "metadata",
+        packPagerBytes(128, seeds.size, PACK_PAGER_JSON_OID_BYTES, "pager seed binding"),
+      );
+      const seedJson = JSON.stringify([...seeds.keys()]);
+      const visiblePendingPackId = pendingPackId ?? -1;
+
+      while (frontier.size > 0) {
+        let originCount = 0;
+        for (const origins of frontier.values()) originCount += origins.length;
+        if (!Number.isSafeInteger(originCount) || originCount < 1 || originCount > wanted.length) {
+          throw new CorruptError("paged pack frontier state is invalid");
+        }
+        const entryLimit = Math.max(this.#graphPageEntries, frontier.size);
+        const pageBytes = packPagerBytes(
+          PACK_PAGER_PAGE_BYTES,
+          frontier.size,
+          PACK_PAGER_PAGE_ROOT_BYTES,
+          "pager checkpoints",
+        );
+        stateBytes = checkedPackReadBytes(stateBytes, pageBytes, "pager retained checkpoints");
+        stateMemory.set("metadata", stateBytes);
+        const pageRoots = [...frontier.keys()];
+        pages.push({ roots: pageRoots, entryLimit });
+
+        const pageMemory = ownership.operation.scope();
+        const transitionMemory = ownership.operation.scope();
+        try {
+          const localEntries = checkedPackReadBytes(
+            entryLimit,
+            originCount,
+            "pager page-local entries",
+          );
+          const localBytes = packPagerBytes(
+            PACK_PAGER_PAGE_LOCAL_BYTES,
+            localEntries,
+            PACK_PAGER_PAGE_LOCAL_ENTRY_BYTES,
+            "pager page-local state",
+          );
+          const jsonBytes = packPagerBytes(
+            128,
+            pageRoots.length + seeds.size,
+            PACK_PAGER_JSON_OID_BYTES,
+            "pager JSON bindings",
+          );
+          pageMemory.set(
+            "other",
+            checkedPackReadBytes(localBytes, jsonBytes, "pager page-local JSON"),
+          );
+          const rootJson = JSON.stringify(pageRoots);
+          const links = new Map<string, string | null>();
+          let rowCount = 0;
+          for (const row of this.#db.iterate(
+            `WITH RECURSIVE /* pack-graph-page */
+               frontier(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
+               seeds(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
+               reachable(oid) AS (
+                 SELECT object.oid
+                   FROM frontier
+                   JOIN git_pack_objects object
+                     ON object.repo_id = ? AND object.oid = frontier.oid
+                   JOIN git_pack_meta pack
+                     ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
+                    AND (pack.state = 'complete' OR object.pack_id = ?)
+                 UNION
+                 SELECT base.oid
+                   FROM reachable
+                   JOIN git_pack_objects child
+                     ON child.repo_id = ? AND child.oid = reachable.oid
+                   JOIN git_pack_meta child_pack
+                     ON child_pack.repo_id = child.repo_id
+                    AND child_pack.pack_id = child.pack_id
+                    AND (child_pack.state = 'complete' OR child.pack_id = ?)
+                   JOIN git_pack_objects base
+                     ON base.repo_id = child.repo_id AND base.oid = child.base_oid
+                   JOIN git_pack_meta base_pack
+                     ON base_pack.repo_id = base.repo_id AND base_pack.pack_id = base.pack_id
+                    AND (base_pack.state = 'complete' OR base.pack_id = ?)
+                  WHERE NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
+                  LIMIT ${entryLimit}
+               )
+             SELECT object.oid, object.base_oid
+               FROM reachable
+               JOIN git_pack_objects object
+                 ON object.repo_id = ? AND object.oid = reachable.oid`,
+            rootJson,
+            seedJson,
+            this.#repoId,
+            visiblePendingPackId,
+            this.#repoId,
+            visiblePendingPackId,
+            visiblePendingPackId,
+            this.#repoId,
+          )) {
+            rowCount++;
+            const oid = row.oid;
+            const baseOid = row.base_oid;
+            if (
+              rowCount > entryLimit ||
+              typeof oid !== "string" ||
+              !isOid(oid) ||
+              (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid))) ||
+              links.has(oid)
+            ) {
+              throw new CorruptError("paged pack graph contains invalid metadata");
+            }
+            links.set(oid, baseOid);
+          }
+
+          const memo = new Map<string, PackGraphExit>();
+          const visiting = new Set<string>();
+          const pageExit = (start: string): PackGraphExit | null => {
+            if (!links.has(start)) return null;
+            const path: string[] = [];
+            let current = start;
+            for (;;) {
+              const known = memo.get(current);
+              if (known !== undefined) break;
+              if (visiting.has(current)) throw new CorruptError(`cyclic delta chain at ${current}`);
+              visiting.add(current);
+              path.push(current);
+              const base = links.get(current);
+              if (base === null || base === undefined || !links.has(base)) break;
+              current = base;
+            }
+            for (let index = path.length - 1; index >= 0; index--) {
+              const oid = path[index]!;
+              const base = links.get(oid);
+              let exit: PackGraphExit;
+              if (base === null || base === undefined) exit = { oid: null, distance: 0 };
+              else if (!links.has(base)) exit = { oid: base, distance: 1 };
+              else {
+                const next = memo.get(base);
+                if (next === undefined) {
+                  throw new CorruptError("paged pack graph did not resolve a local dependency");
+                }
+                exit = { oid: next.oid, distance: next.distance + 1 };
+              }
+              memo.set(oid, exit);
+              visiting.delete(oid);
+            }
+            return memo.get(start) ?? null;
+          };
+
+          const moves: { origin: PackGraphOrigin; exit: string; depth: number }[] = [];
+          for (const [root, origins] of frontier) {
+            const exit = pageExit(root);
+            if (exit === null) continue;
+            for (const origin of origins) {
+              const depth = origin.depth + exit.distance;
+              if (!Number.isSafeInteger(depth) || depth > this.#maxDeltaDepth) {
+                throw new CorruptError(
+                  `delta chain deeper than ${this.#maxDeltaDepth} at ${origin.rootOid}`,
+                );
+              }
+              if (exit.oid !== null && !seeds.has(exit.oid)) {
+                moves.push({ origin, exit: exit.oid, depth });
+              }
+            }
+          }
+          if (moves.length === 0) break;
+
+          stateBytes = checkedPackReadBytes(
+            stateBytes,
+            moves.length * PACK_PAGER_CHECKPOINT_BYTES,
+            "pager origin checkpoints",
+          );
+          stateMemory.set("metadata", stateBytes);
+          transitionMemory.set(
+            "other",
+            packPagerBytes(
+              PACK_PAGER_TRANSITION_BYTES,
+              moves.length,
+              PACK_PAGER_TRANSITION_ENTRY_BYTES,
+              "pager frontier transition",
+            ),
+          );
+          const nextFrontier = new Map<string, PackGraphOrigin[]>();
+          for (const move of moves) {
+            if (move.origin.checkpoints.has(move.exit)) {
+              throw new CorruptError(`cyclic delta chain at ${move.exit}`);
+            }
+            move.origin.depth = move.depth;
+            move.origin.checkpoints.add(move.exit);
+            const origins = nextFrontier.get(move.exit);
+            if (origins === undefined) nextFrontier.set(move.exit, [move.origin]);
+            else origins.push(move.origin);
+          }
+          if (nextFrontier.size === 0) {
+            throw new CorruptError("paged pack graph traversal made no progress");
+          }
+          frontier = nextFrontier;
+        } finally {
+          transitionMemory.dispose();
+          pageMemory.dispose();
+        }
+      }
+      seedBindingMemory.dispose();
+
+      let checkpoint: Map<string, RawObject> | null = null;
+      for (let index = pages.length - 1; index >= 0; index--) {
+        const page = pages[index]!;
+        const seedMemory = ownership.operation.scope();
+        const pageOperation = ownership.operation.scope();
+        const pageOutput = ownership.operation.scope();
+        let pageResult: Map<string, RawObject>;
+        try {
+          let pageSeeds = seeds;
+          if (checkpoint !== null) {
+            seedMemory.set(
+              "metadata",
+              packPagerBytes(
+                PACK_PAGER_STATE_BYTES,
+                seeds.size + checkpoint.size,
+                PACK_READ_OUTPUT_ENTRY_BYTES,
+                "pager resolution seeds",
+              ),
+            );
+            const combined = new Map(seeds);
+            for (const [oid, object] of checkpoint) combined.set(oid, object);
+            pageSeeds = combined;
+          }
+          try {
+            pageResult = this.#readObjects(
+              page.roots,
+              pendingPackId,
+              index === 0 ? expectedType : null,
+              index === 0 ? allowMissing : true,
+              pageSeeds,
+              bypassCache,
+              { operation: pageOperation, output: pageOutput },
+              page.entryLimit,
+            );
+          } catch (error) {
+            if (isPackGraphLimit(error)) {
+              throw new CorruptError("paged packed dependency graph exceeded its discovered page");
+            }
+            throw error;
+          }
+        } catch (error) {
+          pageOutput.dispose();
+          throw error;
+        } finally {
+          pageOperation.dispose();
+          seedMemory.dispose();
+        }
+        checkpointOutput?.dispose();
+        checkpointOutput = pageOutput;
+        checkpoint = pageResult;
+      }
+      if (checkpoint === null || checkpointOutput === null) {
+        throw new CorruptError("paged pack graph produced no resolution page");
+      }
+      checkpointOutput.transfer("flat", ownership.output);
+      checkpointOutput.dispose();
+      checkpointOutput = null;
+      return checkpoint;
+    } catch (error) {
+      ownership.output.clear("flat");
+      throw error;
+    } finally {
+      checkpointOutput?.dispose();
+      seedBindingMemory.dispose();
+      stateMemory.dispose();
+    }
+  }
+
+  /** Resolve requested objects in one bounded graph and physical pack cursor. */
   #readObjects(
     oids: readonly string[],
     pendingPackId: number | null,
@@ -1220,14 +1675,32 @@ export class PackStore {
     allowMissing: boolean,
     seeds: ReadonlyMap<string, RawObject> = new Map(),
     bypassCache = false,
+    ownership: PackReadOwnership,
+    graphEntryLimit = this.#graphPageEntries,
   ): Map<string, RawObject> {
+    const { operation, output } = ownership;
+    if (
+      !Number.isSafeInteger(graphEntryLimit) ||
+      graphEntryLimit < 1 ||
+      graphEntryLimit > MAX_PACK_BLOB_GRAPH_ENTRIES
+    ) {
+      throw new CorruptError("packed blob graph entry limit is invalid");
+    }
+    operation.set(
+      "other",
+      checkedPackReadBytes(this.#objects.budget, this.#chunks.budget, "cache coexistence"),
+    );
+    operation.set("metadata", PACK_BLOB_GRAPH_METADATA_BYTES);
     const wanted = [...new Set(oids)];
-    if (wanted.length === 0) return new Map();
+    if (wanted.length === 0) {
+      output.set("flat", PACK_READ_OUTPUT_MAP_BYTES);
+      return new Map();
+    }
     if (wanted.length > MAX_PACK_BLOB_INPUTS) {
       throw new GitError("E2BIG", `blob batch exceeds ${MAX_PACK_BLOB_INPUTS} packed inputs`);
     }
 
-    const rows = this.#db.all<BulkPackRow>(
+    const rows = this.#db.iterate(
       `WITH RECURSIVE
          roots(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
          seeds(oid) AS MATERIALIZED (SELECT value FROM json_each(?)),
@@ -1252,16 +1725,16 @@ export class PackStore {
               AND (child_meta.state = 'complete' OR child.pack_id = ?)
               AND base.repo_id = child.repo_id AND base.oid = child.base_oid
               AND base_meta.repo_id = base.repo_id
-              AND base_meta.pack_id = base.pack_id
-              AND (base_meta.state = 'complete' OR base.pack_id = ?)
-              AND NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
-         )
+               AND base_meta.pack_id = base.pack_id
+               AND (base_meta.state = 'complete' OR base.pack_id = ?)
+               AND NOT EXISTS (SELECT 1 FROM seeds WHERE seeds.oid = base.oid)
+             LIMIT ${graphEntryLimit + 1}
+          )
        SELECT o.oid, o.pack_id, o.offset, o.data_off, o.data_len, o.type,
               o.size, o.entry_size, o.base_oid
          FROM reachable r
          CROSS JOIN git_pack_objects o
-        WHERE o.repo_id = ? AND o.oid = r.oid
-        LIMIT ${MAX_PACK_BLOB_GRAPH_ENTRIES + 1}`,
+        WHERE o.repo_id = ? AND o.oid = r.oid`,
       JSON.stringify(wanted),
       JSON.stringify([...seeds.keys()]),
       this.#repoId,
@@ -1271,51 +1744,67 @@ export class PackStore {
       pendingPackId ?? -1,
       this.#repoId,
     );
-    if (rows.length > MAX_PACK_BLOB_GRAPH_ENTRIES) {
-      throw new GitError("E2BIG", "packed blob dependency graph exceeds the bounded entry limit");
-    }
 
     const entries = new Map<string, PackedEntry>();
+    let rowCount = 0;
     for (const row of rows) {
+      rowCount++;
+      if (rowCount > graphEntryLimit) {
+        throw new GitError("E2BIG", "packed blob dependency graph exceeds the bounded entry limit");
+      }
+      const oid = row.oid;
+      const packId = row.pack_id;
+      const offset = row.offset;
+      const dataOff = row.data_off;
+      const dataLen = row.data_len;
+      const type = row.type;
+      const size = row.size;
+      const entrySize = row.entry_size;
+      const baseOid = row.base_oid;
       if (
-        typeof row.oid !== "string" ||
-        row.oid.length !== 40 ||
-        !isObjectType(row.type) ||
-        !Number.isSafeInteger(row.pack_id) ||
-        !Number.isSafeInteger(row.offset) ||
-        !Number.isSafeInteger(row.data_off) ||
-        !Number.isSafeInteger(row.data_len) ||
-        !Number.isSafeInteger(row.size) ||
-        !Number.isSafeInteger(row.entry_size) ||
-        row.pack_id < 0 ||
-        row.offset < 0 ||
-        row.data_off < 0 ||
-        row.data_len < 0 ||
-        !Number.isSafeInteger(row.data_off + row.data_len) ||
-        row.size < 0 ||
-        row.entry_size < 0 ||
-        (row.base_oid !== null && (typeof row.base_oid !== "string" || row.base_oid.length !== 40))
+        typeof oid !== "string" ||
+        !isOid(oid) ||
+        typeof packId !== "number" ||
+        !Number.isSafeInteger(packId) ||
+        typeof offset !== "number" ||
+        !Number.isSafeInteger(offset) ||
+        typeof dataOff !== "number" ||
+        !Number.isSafeInteger(dataOff) ||
+        typeof dataLen !== "number" ||
+        !Number.isSafeInteger(dataLen) ||
+        typeof type !== "string" ||
+        !isObjectType(type) ||
+        typeof size !== "number" ||
+        !Number.isSafeInteger(size) ||
+        typeof entrySize !== "number" ||
+        !Number.isSafeInteger(entrySize) ||
+        packId < 0 ||
+        offset < 0 ||
+        dataOff < 0 ||
+        dataLen < 0 ||
+        !Number.isSafeInteger(dataOff + dataLen) ||
+        size < 0 ||
+        size > MAX_PACK_DELTA_WORKING_BYTES ||
+        entrySize < 0 ||
+        entrySize > MAX_PACK_DELTA_WORKING_BYTES ||
+        (baseOid !== null && (typeof baseOid !== "string" || !isOid(baseOid)))
       ) {
         throw new CorruptError("packed blob index contains invalid metadata");
       }
-      entries.set(row.oid, {
-        oid: row.oid,
-        packId: row.pack_id,
-        offset: row.offset,
-        dataOff: row.data_off,
-        dataLen: row.data_len,
-        type: row.type,
-        size: row.size,
-        entrySize: row.entry_size,
-        baseOid: row.base_oid,
+      entries.set(oid, {
+        oid,
+        packId,
+        offset,
+        dataOff,
+        dataLen,
+        type,
+        size,
+        entrySize,
+        baseOid,
       });
     }
     const available: string[] = [];
     let outputBytes = 0;
-    const outputLimit =
-      wanted.length === 1 && (pendingPackId !== null || bypassCache)
-        ? MAX_PACK_DELTA_WORKING_BYTES
-        : MAX_PACK_BLOB_BATCH_BYTES;
     for (const oid of wanted) {
       const entry = entries.get(oid);
       if (entry === undefined) {
@@ -1325,12 +1814,16 @@ export class PackStore {
       if (expectedType !== null && entry.type !== expectedType) {
         throw new CorruptError(`${oid} is a ${entry.type}, not a ${expectedType}`);
       }
-      outputBytes += entry.size;
-      if (!Number.isSafeInteger(outputBytes) || outputBytes > outputLimit) {
-        throw new GitError("E2BIG", "packed object output exceeds the bounded batch limit");
-      }
+      outputBytes = checkedPackReadBytes(outputBytes, entry.size, "output");
       available.push(oid);
     }
+    const outputOwnershipBytes = checkedPackReadBytes(
+      checkedPackReadBytes(outputBytes, PACK_READ_OUTPUT_MAP_BYTES, "output map"),
+      available.length * PACK_READ_OUTPUT_ENTRY_BYTES,
+      "output wrappers",
+    );
+    output.set("flat", outputOwnershipBytes);
+    const availableOids = new Set(available);
 
     const needed = new Map<string, PackedEntry>();
     const externalOids = new Set<string>();
@@ -1369,30 +1862,20 @@ export class PackStore {
       }
     }
 
-    let oversizedEntries = 0;
-    for (const entry of needed.values()) {
-      if (entry.dataLen <= MAX_PACK_BLOB_BATCH_BYTES) continue;
-      if (entry.dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
-        throw new GitError("E2BIG", "packed entry compressed bytes exceed the streaming limit");
-      }
-      oversizedEntries++;
-    }
-    if (oversizedEntries > 0 && (wanted.length !== 1 || oversizedEntries !== 1)) {
-      throw new GitError("E2BIG", "packed blob compressed graph exceeds the 4 MiB batch limit");
-    }
     let compressedBytes = 0;
     const streamedCompressed = new Set<string>();
     const compressed = new Map<string, CompressedEntry>();
     const consumers = new Map<string, { entry: PackedEntry; output: CompressedEntry }[]>();
     for (const entry of needed.values()) {
-      if (entry.dataLen > MAX_PACK_BLOB_BATCH_BYTES) {
+      if (entry.dataLen > PACK_BLOB_BATCH_TARGET_BYTES - compressedBytes) {
         streamedCompressed.add(entry.oid);
         continue;
       }
-      compressedBytes += entry.dataLen;
-      if (!Number.isSafeInteger(compressedBytes) || compressedBytes > MAX_PACK_BLOB_BATCH_BYTES) {
-        throw new GitError("E2BIG", "packed blob compressed graph exceeds the 4 MiB batch limit");
-      }
+      compressedBytes = checkedPackReadBytes(compressedBytes, entry.dataLen, "compressed input");
+    }
+    operation.set("compressed", compressedBytes);
+    for (const entry of needed.values()) {
+      if (streamedCompressed.has(entry.oid)) continue;
       const output = { bytes: new Uint8Array(entry.dataLen), filled: 0 };
       compressed.set(entry.oid, output);
       if (entry.dataLen === 0) continue;
@@ -1431,6 +1914,7 @@ export class PackStore {
     missingChunks.sort((left, right) => left.p - right.p || left.q - right.q);
     const returned = new Set<string>();
     if (missingChunks.length > 0) {
+      operation.set("packRow", PACK_CHUNK);
       for (const row of this.#db.iterate(
         `WITH requested(pack_id, seq) AS (
            SELECT json_extract(value, '$.p'), json_extract(value, '$.q') FROM json_each(?)
@@ -1455,6 +1939,7 @@ export class PackStore {
         if (!bypassCache) this.#chunks.set(this.#chunkCacheKey(packId, seq), data);
         copyChunk(packId, seq, data);
       }
+      operation.clear("packRow");
     }
     for (const chunk of missingChunks) {
       if (!returned.has(`${chunk.p}:${chunk.q}`)) {
@@ -1467,85 +1952,211 @@ export class PackStore {
       }
     }
 
-    const external = this.#externalBatch([...externalOids]);
-    const result = new Map<string, RawObject>();
-    for (const oid of available) {
-      const first = entries.get(oid)!;
-      const cached = bypassCache
-        ? undefined
-        : this.#objects.get(this.#objectCacheKey(first.packId, oid));
-      if (cached !== undefined) {
-        result.set(oid, cached);
-        continue;
+    let externalBytes = 0;
+    const externalMetadata = new Map<string, ExternalObjectMetadata>();
+    if (externalOids.size > 0) {
+      const resolvedMetadata = this.#externalMetadata([...externalOids]);
+      for (const oid of externalOids) {
+        const object = resolvedMetadata.get(oid);
+        if (object === undefined) continue;
+        if (
+          !isObjectType(object.type) ||
+          !Number.isSafeInteger(object.size) ||
+          object.size < 0 ||
+          object.size > MAX_PACK_DELTA_WORKING_BYTES
+        ) {
+          throw new CorruptError("loose base metadata is invalid");
+        }
+        externalMetadata.set(oid, object);
+        externalBytes = checkedPackReadBytes(externalBytes, object.size, "external base");
       }
-      const chain: PackedEntry[] = [];
-      const seen = new Set<string>();
-      let current = first;
-      let object: RawObject | undefined;
-      for (;;) {
-        if (seen.has(current.oid)) throw new CorruptError(`cyclic delta chain at ${current.oid}`);
-        seen.add(current.oid);
-        if (current.baseOid === null) {
-          if (current.entrySize !== current.size) {
-            throw new CorruptError(
-              `pack entry at ${current.offset} has inconsistent size metadata`,
-            );
-          }
-          object = {
-            type: current.type,
-            data: this.#inflateCompressed(
-              current,
-              compressed.get(current.oid)?.bytes,
-              streamedCompressed.has(current.oid),
-              bypassCache,
-            ),
-          };
-          if (!bypassCache) this.#cacheObject(current.packId, current.oid, object);
-          break;
-        }
-        if (chain.length >= this.#maxDeltaDepth) {
-          throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
-        }
-        chain.push(current);
-        const next = entries.get(current.baseOid);
-        if (next === undefined) {
-          object = seeds.get(current.baseOid) ?? external.get(current.baseOid);
-          if (object === undefined) {
-            throw new CorruptError(`missing delta base ${current.baseOid} for ${current.oid}`);
-          }
-          break;
-        }
-        const cachedBase = bypassCache
-          ? undefined
-          : this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
-        if (cachedBase !== undefined) {
-          object = cachedBase;
-          break;
-        }
-        current = next;
-      }
-      for (let index = chain.length - 1; index >= 0; index--) {
-        const entry = chain[index]!;
-        checkDeltaInflateBudget(object.data, entry.entrySize);
-        const delta = this.#inflateCompressed(
-          entry,
-          compressed.get(entry.oid)?.bytes,
-          streamedCompressed.has(entry.oid),
-          bypassCache,
-        );
-        checkDeltaWorkingSet(object.data, delta);
-        object = { type: object.type, data: applyDelta(object.data, delta) };
-        if (object.data.length !== entry.size || object.type !== entry.type) {
-          throw new CorruptError(`pack entry at ${entry.offset} has inconsistent type or size`);
-        }
-        if (!bypassCache) this.#cacheObject(entry.packId, entry.oid, object);
-      }
-      if (object.type !== first.type || object.data.length !== first.size) {
-        throw new CorruptError(`packed object ${oid} has inconsistent type or size`);
-      }
-      result.set(oid, object);
     }
-    return result;
+    const externalOperation = operation.scope();
+    const externalOutput = operation.scope();
+    try {
+      let external = new Map<string, RawObject>();
+      if (externalMetadata.size > 0) {
+        externalOutput.set(
+          "flat",
+          checkedPackReadBytes(
+            checkedPackReadBytes(externalBytes, PACK_READ_OUTPUT_MAP_BYTES, "external output map"),
+            externalMetadata.size * PACK_READ_OUTPUT_ENTRY_BYTES,
+            "external output wrappers",
+          ),
+        );
+        external = this.#externalBatch([...externalMetadata.keys()], {
+          operation: externalOperation,
+          output: externalOutput,
+        });
+      }
+      for (const [oid, object] of external) {
+        const metadata = externalMetadata.get(oid);
+        if (
+          metadata === undefined ||
+          metadata.type !== object.type ||
+          metadata.size !== object.data.length
+        ) {
+          throw new CorruptError("materialized loose base disagrees with its admitted metadata");
+        }
+      }
+      const result = new Map<string, RawObject>();
+      const resolved = new Map<string, RawObject>();
+      for (const oid of available) {
+        const first = entries.get(oid)!;
+        const cached =
+          resolved.get(oid) ??
+          (bypassCache ? undefined : this.#objects.get(this.#objectCacheKey(first.packId, oid)));
+        if (cached !== undefined) {
+          result.set(oid, cached);
+          continue;
+        }
+        const chain: PackedEntry[] = [];
+        const seen = new Set<string>();
+        let current = first;
+        let object: RawObject | undefined;
+        let transientOwner = operation.scope();
+        let objectOwnership: "output" | "external" | "shared" | "transient" = "shared";
+        try {
+          for (;;) {
+            if (seen.has(current.oid))
+              throw new CorruptError(`cyclic delta chain at ${current.oid}`);
+            seen.add(current.oid);
+            const resolvedBase = resolved.get(current.oid);
+            if (resolvedBase !== undefined) {
+              object = resolvedBase;
+              objectOwnership = availableOids.has(current.oid) ? "output" : "shared";
+              break;
+            }
+            if (current.baseOid === null) {
+              if (current.entrySize !== current.size) {
+                throw new CorruptError(
+                  `pack entry at ${current.offset} has inconsistent size metadata`,
+                );
+              }
+              const requestedOutput = availableOids.has(current.oid);
+              if (!requestedOutput) {
+                transientOwner.set(
+                  "flat",
+                  checkedPackReadBytes(
+                    current.size,
+                    PACK_DELTA_OBJECT_WRAPPER_BYTES,
+                    "transient full object wrapper",
+                  ),
+                );
+              }
+              object = {
+                type: current.type,
+                data: this.#inflateCompressed(
+                  current,
+                  compressed.get(current.oid)?.bytes,
+                  streamedCompressed.has(current.oid),
+                  bypassCache,
+                ),
+              };
+              objectOwnership = requestedOutput ? "output" : "transient";
+              if (requestedOutput) resolved.set(current.oid, object);
+              if (!bypassCache) this.#cacheObject(current.packId, current.oid, object);
+              break;
+            }
+            if (chain.length >= this.#maxDeltaDepth) {
+              throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
+            }
+            chain.push(current);
+            const next = entries.get(current.baseOid);
+            if (next === undefined) {
+              const seeded = seeds.get(current.baseOid);
+              object = seeded ?? external.get(current.baseOid);
+              if (object === undefined) {
+                throw new CorruptError(`missing delta base ${current.baseOid} for ${current.oid}`);
+              }
+              objectOwnership = seeded === undefined ? "external" : "shared";
+              break;
+            }
+            const cachedBase = bypassCache
+              ? undefined
+              : this.#objects.get(this.#objectCacheKey(next.packId, next.oid));
+            if (cachedBase !== undefined) {
+              object = cachedBase;
+              objectOwnership = "shared";
+              break;
+            }
+            current = next;
+          }
+          if (object === undefined) {
+            throw new CorruptError(`packed object ${oid} did not resolve a base`);
+          }
+          let resolvedObject = object;
+          for (let index = chain.length - 1; index >= 0; index--) {
+            const entry = chain[index]!;
+            checkDeltaInflateBudget(resolvedObject.data, entry.entrySize);
+            const targetOutputOwned = availableOids.has(entry.oid);
+            const allocation = operation.scope();
+            let allocationTransferred = false;
+            const targetAllocationBytes = targetOutputOwned
+              ? 0
+              : checkedPackReadBytes(
+                  entry.size,
+                  PACK_DELTA_OBJECT_WRAPPER_BYTES,
+                  "transient delta target wrapper",
+                );
+            allocation.set(
+              "pool",
+              checkedPackReadBytes(entry.entrySize, targetAllocationBytes, "delta allocation"),
+            );
+            try {
+              const delta = this.#inflateCompressed(
+                entry,
+                compressed.get(entry.oid)?.bytes,
+                streamedCompressed.has(entry.oid),
+                bypassCache,
+              );
+              const targetSize = validateDeltaWorkingSet(resolvedObject.data, delta, entry.size);
+              const target: RawObject = {
+                type: resolvedObject.type,
+                data: applyDelta(resolvedObject.data, delta),
+              };
+              if (targetSize !== target.data.length) {
+                throw new CorruptError(
+                  `pack entry at ${entry.offset} has inconsistent size metadata`,
+                );
+              }
+              resolvedObject = target;
+              if (targetOutputOwned) {
+                transientOwner.dispose();
+                transientOwner = operation.scope();
+                objectOwnership = "output";
+                resolved.set(entry.oid, resolvedObject);
+              } else {
+                allocation.set("pool", targetAllocationBytes);
+                transientOwner.dispose();
+                transientOwner = allocation;
+                allocationTransferred = true;
+                objectOwnership = "transient";
+              }
+              if (resolvedObject.data.length !== entry.size || resolvedObject.type !== entry.type) {
+                throw new CorruptError(
+                  `pack entry at ${entry.offset} has inconsistent type or size`,
+                );
+              }
+              if (!bypassCache) this.#cacheObject(entry.packId, entry.oid, resolvedObject);
+            } finally {
+              if (!allocationTransferred) allocation.dispose();
+            }
+          }
+          if (resolvedObject.type !== first.type || resolvedObject.data.length !== first.size) {
+            throw new CorruptError(`packed object ${oid} has inconsistent type or size`);
+          }
+          result.set(oid, resolvedObject);
+          if (objectOwnership === "output") resolved.set(oid, resolvedObject);
+        } finally {
+          transientOwner.dispose();
+        }
+      }
+      return result;
+    } finally {
+      externalOutput.dispose();
+      externalOperation.dispose();
+    }
   }
 
   #inflateCompressed(
@@ -1614,17 +2225,6 @@ export class PackStore {
     return `${this.#cacheNamespace}:${this.#sharedState.cacheGeneration}:row:${packId}:${seq}`;
   }
 
-  /** Inflate one indexed entry, whose compressed length is already known. */
-  #inflateEntry(entry: PackedEntry): Uint8Array {
-    return this.#inflateStoredEntry(
-      entry.packId,
-      entry.dataOff,
-      entry.dataLen,
-      entry.entrySize,
-      `pack entry at ${entry.offset}`,
-    );
-  }
-
   #inflateStoredEntry(
     packId: number,
     dataOff: number,
@@ -1641,9 +2241,6 @@ export class PackStore {
       expectedSize > MAX_PACK_DELTA_WORKING_BYTES
     ) {
       throw new CorruptError(`${label} exceeds the bounded inflate limit`);
-    }
-    if (dataLen > MAX_PACK_AUTH_COMPRESSED_BYTES) {
-      throw new GitError("E2BIG", `${label} compressed bytes exceed the streaming limit`);
     }
     const stream = new InflateInto(expectedSize);
     let consumed = 0;
@@ -1883,6 +2480,73 @@ export class PackStore {
       return closure(reservation);
     } finally {
       reservation.dispose();
+    }
+  }
+
+  #withReadOwnership<T>(
+    ownership: PackReadOwnership | undefined,
+    closure: (ownership: PackReadOwnership) => T,
+  ): T {
+    if (ownership === undefined) {
+      const operation = this.#memory.reserve();
+      const output = operation.scope();
+      try {
+        return closure({ operation, output });
+      } finally {
+        output.dispose();
+        operation.dispose();
+      }
+    }
+    this.#validateReadOwnership(ownership);
+    const operation = this.#scopeMemory(ownership.operation);
+    try {
+      return closure({ operation, output: ownership.output });
+    } catch (error) {
+      ownership.output.clear("flat");
+      throw error;
+    } finally {
+      operation.dispose();
+    }
+  }
+
+  #withChildReadOwnership<T>(
+    parent: MemoryReservation,
+    closure: (ownership: PackReadOwnership) => T,
+  ): T {
+    const operation = parent.scope();
+    const output = parent.scope();
+    try {
+      return closure({ operation, output });
+    } finally {
+      output.dispose();
+      operation.dispose();
+    }
+  }
+
+  #validateReadOwnership(ownership: PackReadOwnership): void {
+    if (
+      ownership === null ||
+      typeof ownership !== "object" ||
+      ownership.operation === undefined ||
+      ownership.output === undefined
+    ) {
+      throw new GitError("EINVAL", "packed read ownership is invalid");
+    }
+    if (ownership.operation === ownership.output) {
+      throw new GitError("EINVAL", "packed read operation and output ownership must be distinct");
+    }
+    if (ownership.operation.disposed || ownership.output.disposed) {
+      throw new GitError("EINVAL", "packed read ownership is disposed");
+    }
+    if (ownership.output.currentBytes !== 0) {
+      throw new GitError("EINVAL", "packed read output ownership must be empty");
+    }
+    const operationProbe = this.#scopeMemory(ownership.operation);
+    try {
+      const outputProbe = this.#scopeMemory(ownership.output);
+      outputProbe.dispose();
+    } finally {
+      operationProbe.dispose();
     }
   }
 
@@ -2427,12 +3091,10 @@ export class PackStore {
     for (const pack of pending) {
       if (
         budget.packIds.size >= MAX_PACK_FALLBACK_AUDIT_PACKS ||
-        budget.bytes > MAX_PACK_FALLBACK_AUDIT_BYTES - pack.size ||
         budget.entries > MAX_PACK_MEMBERSHIP_OBJECTS - pack.count
       ) {
         throw new GitError("E2BIG", "fallback pack audit exceeds its bounded budget");
       }
-      budget.bytes += pack.size;
       budget.entries += pack.count;
       budget.packIds.add(pack.packId);
     }
@@ -2566,93 +3228,105 @@ export class PackStore {
         throw new CorruptError(`pack ${pack.packId}: fallback physical index count disagrees`);
       }
       const stored = new SequentialPackBytes(this.#db, this.#repoId, pack.packId, pack.size);
-      const reader = new PackReader(
-        (offset, length) => stored.read(offset, length),
-        pack.packId,
-        pack.size,
-      );
-      const magic = reader.take(4);
-      const version = reader.uint32();
-      const count = reader.uint32();
-      if (
-        magic[0] !== 0x50 ||
-        magic[1] !== 0x41 ||
-        magic[2] !== 0x43 ||
-        magic[3] !== 0x4b ||
-        (version !== 2 && version !== 3) ||
-        count !== pack.count
-      ) {
-        throw new CorruptError(`pack ${pack.packId}: fallback header is invalid`);
-      }
-      const offsets = new Map<number, string>();
-      for (let ordinal = 0; ordinal < count; ordinal++) {
-        const header = reader.entryHeader();
-        const indexed = entries.get(header.offset);
-        const fullType = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
-        let decoded: {
-          data: Uint8Array | null;
-          consumed: number;
-          streamedOid: string | null;
-          deltaTargetSize: number | null;
-        };
-        try {
-          decoded = this.#inflateAt(reader, header.dataOff, header.entrySize, fullType ?? null);
-        } catch (error) {
-          throw new CorruptError(`pack ${pack.packId}: fallback pack bytes are invalid`, {
-            cause: error,
-          });
-        }
-        const baseOid =
-          header.kind === null
-            ? null
-            : header.kind === "ref"
-              ? header.baseOid
-              : (offsets.get(header.offset - (header.baseDelta ?? 0)) ?? null);
-        if (header.kind !== null && baseOid === null) {
-          throw new CorruptError(`pack ${pack.packId}: fallback delta base is missing`);
-        }
+      try {
+        const reader = new PackReader(
+          (offset, length) => stored.read(offset, length),
+          pack.packId,
+          pack.size,
+        );
+        const magic = reader.take(4);
+        const version = reader.uint32();
+        const count = reader.uint32();
         if (
-          indexed === undefined ||
-          indexed.packId !== pack.packId ||
-          indexed.offset !== header.offset ||
-          indexed.dataOff !== header.dataOff ||
-          indexed.dataLen !== decoded.consumed ||
-          indexed.entrySize !== header.entrySize ||
-          indexed.baseOid !== baseOid
+          magic[0] !== 0x50 ||
+          magic[1] !== 0x41 ||
+          magic[2] !== 0x43 ||
+          magic[3] !== 0x4b ||
+          (version !== 2 && version !== 3) ||
+          count !== pack.count
         ) {
-          throw new CorruptError(`pack ${pack.packId}: fallback index disagrees with pack bytes`);
+          throw new CorruptError(`pack ${pack.packId}: fallback header is invalid`);
         }
-        if (header.kind === null) {
-          if (fullType === undefined) {
-            throw new CorruptError(`pack ${pack.packId}: fallback object type is invalid`);
+        const offsets = new Map<number, string>();
+        for (let ordinal = 0; ordinal < count; ordinal++) {
+          const header = reader.entryHeader();
+          const indexed = entries.get(header.offset);
+          const fullType = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
+          let decoded: {
+            data: Uint8Array | null;
+            consumed: number;
+            streamedOid: string | null;
+            deltaTargetSize: number | null;
+          };
+          try {
+            decoded = this.#inflateAt(reader, header.dataOff, header.entrySize, fullType ?? null);
+          } catch (error) {
+            throw new CorruptError(`pack ${pack.packId}: fallback pack bytes are invalid`, {
+              cause: error,
+            });
           }
-          const oid =
-            decoded.data === null
-              ? (decoded.streamedOid ?? "")
-              : hashObject(fullType, decoded.data);
+          const baseOid =
+            header.kind === null
+              ? null
+              : header.kind === "ref"
+                ? header.baseOid
+                : (offsets.get(header.offset - (header.baseDelta ?? 0)) ?? null);
+          if (header.kind !== null && baseOid === null) {
+            throw new CorruptError(`pack ${pack.packId}: fallback delta base is missing`);
+          }
           if (
-            indexed.oid !== oid ||
-            indexed.type !== fullType ||
-            indexed.size !== header.entrySize
+            indexed === undefined ||
+            indexed.packId !== pack.packId ||
+            indexed.offset !== header.offset ||
+            indexed.dataOff !== header.dataOff ||
+            indexed.dataLen !== decoded.consumed ||
+            indexed.entrySize !== header.entrySize ||
+            indexed.baseOid !== baseOid
           ) {
             throw new CorruptError(`pack ${pack.packId}: fallback index disagrees with pack bytes`);
           }
+          if (header.kind === null) {
+            if (fullType === undefined) {
+              throw new CorruptError(`pack ${pack.packId}: fallback object type is invalid`);
+            }
+            const oid =
+              decoded.data === null
+                ? (decoded.streamedOid ?? "")
+                : hashObject(fullType, decoded.data);
+            if (
+              indexed.oid !== oid ||
+              indexed.type !== fullType ||
+              indexed.size !== header.entrySize
+            ) {
+              throw new CorruptError(
+                `pack ${pack.packId}: fallback index disagrees with pack bytes`,
+              );
+            }
+          }
+          offsets.set(header.offset, indexed.oid);
         }
-        offsets.set(header.offset, indexed.oid);
-      }
-      if (reader.position !== pack.size - 20 || offsets.size !== pack.count) {
-        throw new CorruptError(`pack ${pack.packId}: fallback pack traversal is incomplete`);
-      }
-      reader.take(20);
-      try {
-        stored.finish();
-      } catch (error) {
-        throw new CorruptError(`pack ${pack.packId}: fallback checksum mismatch`, { cause: error });
+        if (reader.position !== pack.size - 20 || offsets.size !== pack.count) {
+          throw new CorruptError(`pack ${pack.packId}: fallback pack traversal is incomplete`);
+        }
+        reader.take(20);
+        try {
+          stored.finish();
+        } catch (error) {
+          throw new CorruptError(`pack ${pack.packId}: fallback checksum mismatch`, {
+            cause: error,
+          });
+        }
+      } finally {
+        stored.dispose();
       }
     }
   }
 
-  #auditPromotedFallbacks(deletingPackId: number, rows: readonly AuthenticatedPackSource[]): void {
+  #auditPromotedFallbacks(
+    deletingPackId: number,
+    rows: readonly AuthenticatedPackSource[],
+    memory: MemoryReservation,
+  ): void {
     if (rows.length > MAX_PACK_MEMBERSHIP_OBJECTS) {
       throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
     }
@@ -2662,7 +3336,11 @@ export class PackStore {
     const auditPage = (): void => {
       if (page.length === 0) return;
       const only = page.length === 1 ? page[0] : undefined;
-      if (only !== undefined && only.dataLen > MAX_PACK_BLOB_BATCH_BYTES && only.baseOid === null) {
+      if (
+        only !== undefined &&
+        only.dataLen > PACK_BLOB_BATCH_TARGET_BYTES &&
+        only.baseOid === null
+      ) {
         this.#authenticateFullPackSourceStreaming(
           only,
           `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
@@ -2671,56 +3349,55 @@ export class PackStore {
         pageBytes = 0;
         return;
       }
-      const objects = this.#readObjects(
-        page.map((entry) => entry.oid),
-        only?.packId ?? null,
-        null,
-        false,
-        new Map(),
-        true,
-      );
-      if (objects.size !== page.length) {
-        throw new CorruptError(`pack ${deletingPackId}: promoted fallback audit is incomplete`);
-      }
-      for (const expected of page) {
-        const object = objects.get(expected.oid);
-        if (
-          object === undefined ||
-          object.type !== expected.type ||
-          object.data.length !== expected.size ||
-          hashObject(object.type, object.data) !== expected.oid
-        ) {
-          throw new CorruptError(
-            `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
-          );
+      this.#withChildReadOwnership(memory, (ownership) => {
+        const objects = this.#readObjectsBounded(
+          page.map((entry) => entry.oid),
+          only?.packId ?? null,
+          null,
+          false,
+          new Map(),
+          true,
+          ownership,
+        );
+        if (objects.size !== page.length) {
+          throw new CorruptError(`pack ${deletingPackId}: promoted fallback audit is incomplete`);
         }
-      }
+        for (const expected of page) {
+          const object = objects.get(expected.oid);
+          if (
+            object === undefined ||
+            object.type !== expected.type ||
+            object.data.length !== expected.size ||
+            hashObject(object.type, object.data) !== expected.oid
+          ) {
+            throw new CorruptError(
+              `pack ${deletingPackId}: promoted fallback disagrees with its object id`,
+            );
+          }
+        }
+      });
       page = [];
       pageBytes = 0;
     };
     for (const row of rows) {
       if (
         page.length > 0 &&
-        (row.size > MAX_PACK_BLOB_BATCH_BYTES - pageBytes ||
-          row.dataLen > MAX_PACK_BLOB_BATCH_BYTES ||
+        (row.size > PACK_BLOB_BATCH_TARGET_BYTES - pageBytes ||
+          row.dataLen > PACK_BLOB_BATCH_TARGET_BYTES ||
           page.length >= MAX_PACK_MEMBERSHIP_OBJECTS)
       ) {
         auditPage();
       }
       page.push(row);
       pageBytes += row.size;
-      if (row.size > MAX_PACK_BLOB_BATCH_BYTES || row.dataLen > MAX_PACK_BLOB_BATCH_BYTES) {
+      if (row.size > PACK_BLOB_BATCH_TARGET_BYTES || row.dataLen > PACK_BLOB_BATCH_TARGET_BYTES) {
         auditPage();
       }
     }
     auditPage();
   }
 
-  #authenticateLooseDeltaBases(
-    deletingPackId: number,
-    deletingPackIds: readonly number[],
-    budget: FallbackAuditBudget,
-  ): void {
+  #authenticateLooseDeltaBases(deletingPackId: number, deletingPackIds: readonly number[]): void {
     const bases: CompletePackObject[] = [];
     for (const row of this.#db.iterate(
       `SELECT DISTINCT base.oid, base.type, base.size,
@@ -2769,11 +3446,6 @@ export class PackStore {
       bases.push({ oid: row.oid, type: row.type, size: row.size });
     }
     if (bases.length === 0) return;
-    const bytes = bases.reduce((total, base) => total + base.size, 0);
-    if (!Number.isSafeInteger(bytes) || bytes > MAX_PACK_FALLBACK_AUDIT_BYTES - budget.bytes) {
-      throw new GitError("E2BIG", "surviving loose delta closure exceeds its byte limit");
-    }
-    budget.bytes += bytes;
     this.#authenticateLooseObjects(deletingPackId, bases);
   }
 
@@ -2907,9 +3579,6 @@ export class PackStore {
     auditBudget: FallbackAuditBudget,
     memory: MemoryReservation,
   ): void {
-    memory.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
-    memory.set("base", MAX_PACK_BLOB_BATCH_BYTES);
-    memory.set("compressed", MAX_PACK_BLOB_BATCH_BYTES);
     memory.set("metadata", PACK_FALLBACK_AUDIT_METADATA_BYTES);
     const encodedDeletingPackIds = JSON.stringify(deletingPackIds);
     const invalidFallback = this.#db.scalar<unknown>(
@@ -3061,8 +3730,8 @@ export class PackStore {
         throw new GitError("E2BIG", "promoted fallback audit exceeds its object limit");
       }
     }
-    this.#auditPromotedFallbacks(packId, promoted);
-    this.#authenticateLooseDeltaBases(packId, deletingPackIds, auditBudget);
+    this.#auditPromotedFallbacks(packId, promoted, memory);
+    this.#authenticateLooseDeltaBases(packId, deletingPackIds);
     this.#db.run(
       `DELETE FROM git_commits
         WHERE repo_id = ?
@@ -3166,7 +3835,7 @@ export class PackStore {
         options.reservation === undefined
           ? this.#memory.reserve()
           : this.#scopeMemory(options.reservation);
-      const pool = new ChunkPool(MAX_PACK_DELTA_WORKING_BYTES);
+      const pool = new ChunkPool();
       memory = { reservation: memoryReservation, pool };
       const reservation = this.#reservePending(
         requireIngestTime(now),
@@ -3191,7 +3860,6 @@ export class PackStore {
         memory,
       );
       heartbeat();
-      memoryReservation.set("pool", MAX_PACK_DELTA_WORKING_BYTES);
       const { count, commits, membership } = await this.#indexPack(
         reservation.packId,
         total,
@@ -3388,56 +4056,60 @@ export class PackStore {
     expected: ExpectedPackMembership,
   ): void {
     const stored = new SequentialPackBytes(this.#db, this.#repoId, packId, expectedBytes);
-    const reader = new PackReader(
-      (offset, length) => stored.read(offset, length),
-      packId,
-      expectedBytes,
-    );
-    const magic = reader.take(4);
-    const version = reader.uint32();
-    const storedCount = reader.uint32();
-    if (
-      magic[0] !== 0x50 ||
-      magic[1] !== 0x41 ||
-      magic[2] !== 0x43 ||
-      magic[3] !== 0x4b ||
-      (version !== 2 && version !== 3) ||
-      storedCount !== expectedCount
-    ) {
-      throw new CorruptError(`pack ${packId}: publication bytes have an invalid header`);
-    }
-    for (let byteOrdinal = 0; byteOrdinal < storedCount; byteOrdinal++) {
-      const header = reader.entryHeader();
-      const type = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
-      if (header.kind === null && type === undefined) {
-        throw new CorruptError(`pack ${packId}: publication bytes have an invalid object type`);
+    try {
+      const reader = new PackReader(
+        (offset, length) => stored.read(offset, length),
+        packId,
+        expectedBytes,
+      );
+      const magic = reader.take(4);
+      const version = reader.uint32();
+      const storedCount = reader.uint32();
+      if (
+        magic[0] !== 0x50 ||
+        magic[1] !== 0x41 ||
+        magic[2] !== 0x43 ||
+        magic[3] !== 0x4b ||
+        (version !== 2 && version !== 3) ||
+        storedCount !== expectedCount
+      ) {
+        throw new CorruptError(`pack ${packId}: publication bytes have an invalid header`);
       }
-      const inflated = this.#inflateAt(reader, header.dataOff, header.entrySize, type ?? null);
-      const oid =
-        type === undefined
-          ? null
-          : inflated.data === null
-            ? inflated.streamedOid
-            : hashObject(type, inflated.data);
-      expected.verifyBytes(byteOrdinal, {
-        offset: header.offset,
-        dataOff: header.dataOff,
-        dataLen: inflated.consumed,
-        entrySize: header.entrySize,
-        kind: header.kind,
-        baseDelta: header.baseDelta,
-        baseOid: header.baseOid,
-        type: type ?? null,
-        size: type === undefined ? (inflated.deltaTargetSize ?? -1) : header.entrySize,
-        oid,
-        compressedDigest: inflated.compressedDigest,
-      });
+      for (let byteOrdinal = 0; byteOrdinal < storedCount; byteOrdinal++) {
+        const header = reader.entryHeader();
+        const type = header.kind === null ? NUMBER_TYPE[header.type] : undefined;
+        if (header.kind === null && type === undefined) {
+          throw new CorruptError(`pack ${packId}: publication bytes have an invalid object type`);
+        }
+        const inflated = this.#inflateAt(reader, header.dataOff, header.entrySize, type ?? null);
+        const oid =
+          type === undefined
+            ? null
+            : inflated.data === null
+              ? inflated.streamedOid
+              : hashObject(type, inflated.data);
+        expected.verifyBytes(byteOrdinal, {
+          offset: header.offset,
+          dataOff: header.dataOff,
+          dataLen: inflated.consumed,
+          entrySize: header.entrySize,
+          kind: header.kind,
+          baseDelta: header.baseDelta,
+          baseOid: header.baseOid,
+          type: type ?? null,
+          size: type === undefined ? (inflated.deltaTargetSize ?? -1) : header.entrySize,
+          oid,
+          compressedDigest: inflated.compressedDigest,
+        });
+      }
+      if (reader.position !== expectedBytes - 20) {
+        throw new CorruptError(`pack ${packId}: publication byte traversal is incomplete`);
+      }
+      reader.take(20);
+      stored.finish();
+    } finally {
+      stored.dispose();
     }
-    if (reader.position !== expectedBytes - 20) {
-      throw new CorruptError(`pack ${packId}: publication byte traversal is incomplete`);
-    }
-    reader.take(20);
-    stored.finish();
 
     let ordinal = 0;
     for (const row of this.#db.iterate(
@@ -3741,6 +4413,7 @@ export class PackStore {
       packId,
       objectIndex,
       memory.reservation,
+      memory.pool,
     );
     const missingBases = new Set<string>();
     const offsetToOid = (offset: number): string | null => {
@@ -3820,7 +4493,12 @@ export class PackStore {
             : this.#objects.get(this.#objectCacheKey(packId, baseOid));
           if (base === undefined) missingBases.add(baseOid);
           if (base !== undefined) {
-            const target = this.#applyDeltaBytes(base.data, entry.data, memory.pool);
+            const target = this.#applyDeltaBytes(
+              base.data,
+              entry.data,
+              memory.pool,
+              memory.reservation,
+            );
             try {
               const oid = hashByteSource(base.type, target);
               const row: PackObjectInput = [
@@ -3873,6 +4551,7 @@ export class PackStore {
             } finally {
               target.release();
               memory.pool.dispose();
+              memory.reservation.clear("pool");
             }
           }
         }
@@ -3951,14 +4630,14 @@ export class PackStore {
       for (;;) {
         const page = this.#db.all<PendingRow>(
           `SELECT pending.offset, pending.data_off, pending.data_len, pending.entry_size,
-                  pending.base_oid, pending.base_offset,
-                  COALESCE(pending.base_oid, base.oid) AS resolved_oid
+                   pending.base_oid, pending.base_offset,
+                   COALESCE(pending.base_oid, base.oid) AS resolved_oid
              FROM git_pack_pending pending
              LEFT JOIN git_pack_objects base
-               ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
-              AND base.offset = pending.base_offset
-            WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
-            ORDER BY pending.offset LIMIT ${PACK_PENDING_PAGE_ROWS}`,
+                ON base.repo_id = pending.repo_id AND base.pack_id = pending.pack_id
+               AND base.offset = pending.base_offset
+             WHERE pending.repo_id = ? AND pending.pack_id = ? AND pending.offset > ?
+             ORDER BY pending.offset LIMIT ${PACK_PENDING_PAGE_ROWS}`,
           this.#repoId,
           packId,
           after,
@@ -3991,225 +4670,272 @@ export class PackStore {
           }
         }
         const baseOids = [...baseOidSet];
-        const packedMetadata = this.#packedBaseMetadata(baseOids, packId);
-        const externalOids = baseOids.filter((oid) => !packedMetadata.has(oid));
-        const externalMetadata = this.#externalMetadata(externalOids);
-        this.#checkBaseAdmission(packedMetadata, externalMetadata);
-        let admittedBaseBytes = 0;
-        for (const metadata of [...packedMetadata.values(), ...externalMetadata.values()]) {
-          admittedBaseBytes += metadata.size;
-        }
-        memory.reservation.set(
-          "base",
-          packedMetadata.size + externalMetadata.size > 1 ? admittedBaseBytes : 0,
+        const allPackedMetadata = this.#packedBaseMetadata(baseOids, packId);
+        const externalOids = baseOids.filter((oid) => !allPackedMetadata.has(oid));
+        const allExternalMetadata = this.#externalMetadata(externalOids);
+        const admittedOids = this.#selectBaseGroup(
+          baseOids,
+          allPackedMetadata,
+          allExternalMetadata,
         );
-        const materialized = this.#readBaseBatch([...packedMetadata.keys()], packId);
-        for (const [oid, object] of materialized) {
-          const metadata = packedMetadata.get(oid);
-          if (
-            metadata === undefined ||
-            metadata.type !== object.type ||
-            metadata.size !== object.data.length
-          ) {
-            throw new CorruptError("materialized pack base disagrees with its admitted metadata");
-          }
+        const packedMetadata = new Map<string, ExternalObjectMetadata>();
+        const externalMetadata = new Map<string, ExternalObjectMetadata>();
+        for (const oid of admittedOids) {
+          const packed = allPackedMetadata.get(oid);
+          const external = allExternalMetadata.get(oid);
+          if (packed !== undefined) packedMetadata.set(oid, packed);
+          else if (external !== undefined) externalMetadata.set(oid, external);
         }
-        for (const [oid, object] of this.#externalBatch([...externalMetadata.keys()])) {
-          const metadata = externalMetadata.get(oid);
-          if (
-            metadata === undefined ||
-            metadata.type !== object.type ||
-            metadata.size !== object.data.length
-          ) {
-            throw new CorruptError("materialized loose base disagrees with its admitted metadata");
-          }
-          materialized.set(oid, object);
+        let externalBaseBytes = 0;
+        for (const metadata of externalMetadata.values()) {
+          externalBaseBytes += metadata.size;
         }
-        const bases = new Map<string, IngestBase>();
-        for (const [oid, object] of materialized) {
-          bases.set(oid, {
-            type: object.type,
-            source: new FlatByteSource(object.data),
-            owned: null,
+        const packedReadOperation = memory.reservation.scope();
+        const packedReadOutput = memory.reservation.scope();
+        const externalOperation = memory.reservation.scope();
+        const externalOutput = memory.reservation.scope();
+        const intermediateBaseMemory = memory.reservation.scope();
+        try {
+          const materialized = this.#readBaseBatch([...packedMetadata.keys()], packId, {
+            operation: packedReadOperation,
+            output: packedReadOutput,
           });
-        }
-        let retainedBaseBytes = 0;
-        for (const object of bases.values()) retainedBaseBytes += object.source.length;
-        if (
-          !Number.isSafeInteger(retainedBaseBytes) ||
-          (bases.size > 1 && retainedBaseBytes > MAX_PACK_BLOB_BATCH_BYTES) ||
-          retainedBaseBytes > MAX_PACK_DELTA_WORKING_BYTES
-        ) {
-          throw new GitError("E2BIG", "pack ingest bases exceed the bounded live-set limit");
-        }
-        const remainingUses = new Map<string, number>();
-        for (const [oid, children] of byBaseOid) {
-          remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + children.length);
-        }
-        for (const [offset, oid] of resolvedOffsets) {
-          remainingUses.set(
-            oid,
-            (remainingUses.get(oid) ?? 0) + (byBaseOffset.get(offset)?.length ?? 0),
-          );
-        }
-
-        const ready: { row: PendingRow; baseOid: string }[] = [];
-        const queued = new Set<number>();
-        const enqueue = (row: PendingRow, baseOid: string): void => {
-          if (queued.has(row.offset)) return;
-          queued.add(row.offset);
-          ready.push({ row, baseOid });
-        };
-        for (const [oid, children] of byBaseOid) {
-          if (bases.has(oid)) for (const row of children) enqueue(row, oid);
-        }
-        for (const [offset, oid] of resolvedOffsets) {
-          if (bases.has(oid)) {
-            for (const row of byBaseOffset.get(offset) ?? []) enqueue(row, oid);
+          for (const [oid, object] of materialized) {
+            const metadata = packedMetadata.get(oid);
+            if (
+              metadata === undefined ||
+              metadata.type !== object.type ||
+              metadata.size !== object.data.length
+            ) {
+              throw new CorruptError("materialized pack base disagrees with its admitted metadata");
+            }
           }
-        }
-
-        const completed: number[] = [];
-        let compressedBatch = new Map<number, Uint8Array>();
-        let compressedBatchBytes = 0;
-        for (const row of page) {
-          compressedBatchBytes += row.data_len;
-          if (!Number.isSafeInteger(compressedBatchBytes)) {
-            throw new CorruptError("pending pack page has invalid compressed size");
+          if (externalMetadata.size > 0) {
+            externalOutput.set(
+              "flat",
+              checkedPackReadBytes(
+                checkedPackReadBytes(
+                  externalBaseBytes,
+                  PACK_READ_OUTPUT_MAP_BYTES,
+                  "ingest external output map",
+                ),
+                externalMetadata.size * PACK_READ_OUTPUT_ENTRY_BYTES,
+                "ingest external output wrappers",
+              ),
+            );
           }
-        }
-        if (compressedBatchBytes > 0 && compressedBatchBytes <= PACK_RANGE_BATCH_BYTES) {
-          memory.reservation.set(
-            "compressed",
-            packRangeBatchMemory(compressedBatchBytes, page.length),
-          );
-          const requests: PackRangeRequest[] = [];
-          for (const row of page) {
-            requests.push({
-              ordinal: requests.length,
-              offset: row.offset,
-              position: row.data_off,
-              length: row.data_len,
+          for (const [oid, object] of this.#externalBatch([...externalMetadata.keys()], {
+            operation: externalOperation,
+            output: externalOutput,
+          })) {
+            const metadata = externalMetadata.get(oid);
+            if (
+              metadata === undefined ||
+              metadata.type !== object.type ||
+              metadata.size !== object.data.length
+            ) {
+              throw new CorruptError(
+                "materialized loose base disagrees with its admitted metadata",
+              );
+            }
+            materialized.set(oid, object);
+          }
+          const bases = new Map<string, IngestBase>();
+          for (const [oid, object] of materialized) {
+            bases.set(oid, {
+              type: object.type,
+              source: new FlatByteSource(object.data),
+              owned: null,
             });
           }
-          compressedBatch = this.#readRangeBatch(packId, requests);
-        } else {
-          compressedBatchBytes = 0;
-        }
-        try {
-          for (let cursor = 0; cursor < ready.length; cursor++) {
-            const { row, baseOid } = ready[cursor]!;
-            const base = bases.get(baseOid);
-            if (base === undefined) continue;
-            const compressed = compressedBatch.get(row.offset) ?? null;
-            const uses = (remainingUses.get(baseOid) ?? 1) - 1;
-            remainingUses.set(baseOid, uses);
-            const target = this.#applyStoredDelta(
-              packId,
-              row.data_off,
-              row.data_len,
-              row.entry_size,
-              `delta at ${row.offset}`,
-              base.source,
-              memory.pool,
-              compressed,
+          materialized.clear();
+          let retainedBaseBytes = 0;
+          let retainedIntermediateWrapperBytes = 0;
+          for (const object of bases.values()) retainedBaseBytes += object.source.length;
+          if (
+            !Number.isSafeInteger(retainedBaseBytes) ||
+            retainedBaseBytes > MAX_PACK_DELTA_WORKING_BYTES
+          ) {
+            throw new GitError("E2BIG", "pack ingest bases exceed the bounded live-set limit");
+          }
+          const remainingUses = new Map<string, number>();
+          for (const [oid, children] of byBaseOid) {
+            remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + children.length);
+          }
+          for (const [offset, oid] of resolvedOffsets) {
+            remainingUses.set(
+              oid,
+              (remainingUses.get(oid) ?? 0) + (byBaseOffset.get(offset)?.length ?? 0),
             );
-            if (uses === 0 && bases.delete(baseOid)) {
-              retainedBaseBytes -= base.source.length;
-              base.owned?.release();
-              memory.reservation.set("base", bases.size > 1 ? retainedBaseBytes : 0);
-            }
-            let retainedTarget = false;
-            try {
-              const oid = hashByteSource(base.type, target);
-              const offsetChildren = byBaseOffset.get(row.offset) ?? [];
-              const oidChildren = byBaseOid.get(oid) ?? [];
-              const hasChildren = oidChildren.length > 0 || offsetChildren.length > 0;
-              const objectRow: PackObjectInput = [
-                oid,
-                packId,
-                row.offset,
-                row.data_off,
-                row.data_len,
-                base.type,
-                target.length,
-                row.entry_size,
-                baseOid,
-              ];
-              if (base.type === "commit") {
-                memory.reservation.set("flat", target.length);
-              }
-              this.#insertResolved(
-                objectRow,
-                packId,
-                oid,
-                base.type,
-                null,
-                treeIndex,
-                commitIndex,
-                row.data_off,
-                row.data_len,
-                target.length,
-                objectIndex,
-                target,
-                memory.reservation,
-                0,
-              );
-              if (base.type === "commit") memory.reservation.clear("flat");
-              this.#syncIndexMemory(treeIndex, commitIndex, memory.reservation);
-              completed.push(row.offset);
-              offsets.set(row.offset, oid);
-              if (offsetChildren.length > 0) {
-                remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + offsetChildren.length);
-              }
-              if (hasChildren && !bases.has(oid)) {
-                if (
-                  target.length > MAX_PACK_DELTA_WORKING_BYTES ||
-                  (retainedBaseBytes > 0 &&
-                    retainedBaseBytes + target.length > MAX_PACK_BLOB_BATCH_BYTES)
-                ) {
-                  throw new GitError(
-                    "E2BIG",
-                    "pack ingest bases exceed the bounded live-set limit",
-                  );
-                }
-                memory.reservation.set(
-                  "base",
-                  bases.size > 0 ? retainedBaseBytes + target.length : 0,
-                );
-                bases.set(oid, { type: base.type, source: target, owned: target });
-                retainedBaseBytes += target.length;
-                retainedTarget = true;
-              }
-              if (hasChildren) {
-                for (const child of oidChildren) enqueue(child, oid);
-                for (const child of offsetChildren) enqueue(child, oid);
-              }
-              if (target.length <= this.#cacheEntryLimit) {
-                this.#cacheChunked(packId, oid, base.type, target, 0, memory.reservation);
-              }
-              progressed++;
-            } finally {
-              if (!retainedTarget) target.release();
+          }
+
+          const ready: { row: PendingRow; baseOid: string }[] = [];
+          const queued = new Set<number>();
+          const enqueue = (row: PendingRow, baseOid: string): void => {
+            if (queued.has(row.offset)) return;
+            queued.add(row.offset);
+            ready.push({ row, baseOid });
+          };
+          for (const [oid, children] of byBaseOid) {
+            if (bases.has(oid)) for (const row of children) enqueue(row, oid);
+          }
+          for (const [offset, oid] of resolvedOffsets) {
+            if (bases.has(oid)) {
+              for (const row of byBaseOffset.get(offset) ?? []) enqueue(row, oid);
             }
           }
+
+          const completed: number[] = [];
+          let compressedBatch = new Map<number, Uint8Array>();
+          let compressedBatchBytes = 0;
+          for (const row of page) {
+            compressedBatchBytes += row.data_len;
+            if (!Number.isSafeInteger(compressedBatchBytes)) {
+              throw new CorruptError("pending pack page has invalid compressed size");
+            }
+          }
+          if (compressedBatchBytes > 0 && compressedBatchBytes <= PACK_RANGE_BATCH_BYTES) {
+            memory.reservation.set(
+              "compressed",
+              packRangeBatchMemory(compressedBatchBytes, page.length),
+            );
+            const requests: PackRangeRequest[] = [];
+            for (const row of page) {
+              requests.push({
+                ordinal: requests.length,
+                offset: row.offset,
+                position: row.data_off,
+                length: row.data_len,
+              });
+            }
+            compressedBatch = this.#readRangeBatch(packId, requests);
+          } else {
+            compressedBatchBytes = 0;
+          }
+          try {
+            for (let cursor = 0; cursor < ready.length; cursor++) {
+              const { row, baseOid } = ready[cursor]!;
+              const base = bases.get(baseOid);
+              if (base === undefined) continue;
+              const compressed = compressedBatch.get(row.offset) ?? null;
+              const uses = (remainingUses.get(baseOid) ?? 1) - 1;
+              remainingUses.set(baseOid, uses);
+              const target = this.#applyStoredDelta(
+                packId,
+                row.data_off,
+                row.data_len,
+                row.entry_size,
+                `delta at ${row.offset}`,
+                base.source,
+                memory.pool,
+                memory.reservation,
+                compressed,
+              );
+              if (uses === 0 && bases.delete(baseOid)) {
+                retainedBaseBytes -= base.source.length;
+                if (base.owned !== null) {
+                  retainedIntermediateWrapperBytes -= PACK_DELTA_OBJECT_WRAPPER_BYTES;
+                  base.owned.release();
+                  intermediateBaseMemory.set("base", retainedIntermediateWrapperBytes);
+                }
+              }
+              let retainedTarget = false;
+              try {
+                const oid = hashByteSource(base.type, target);
+                const offsetChildren = byBaseOffset.get(row.offset) ?? [];
+                const oidChildren = byBaseOid.get(oid) ?? [];
+                const hasChildren = oidChildren.length > 0 || offsetChildren.length > 0;
+                const objectRow: PackObjectInput = [
+                  oid,
+                  packId,
+                  row.offset,
+                  row.data_off,
+                  row.data_len,
+                  base.type,
+                  target.length,
+                  row.entry_size,
+                  baseOid,
+                ];
+                if (base.type === "commit") {
+                  memory.reservation.set("flat", target.length);
+                }
+                this.#insertResolved(
+                  objectRow,
+                  packId,
+                  oid,
+                  base.type,
+                  null,
+                  treeIndex,
+                  commitIndex,
+                  row.data_off,
+                  row.data_len,
+                  target.length,
+                  objectIndex,
+                  target,
+                  memory.reservation,
+                  0,
+                );
+                if (base.type === "commit") memory.reservation.clear("flat");
+                this.#syncIndexMemory(treeIndex, commitIndex, memory.reservation);
+                completed.push(row.offset);
+                offsets.set(row.offset, oid);
+                if (offsetChildren.length > 0) {
+                  remainingUses.set(oid, (remainingUses.get(oid) ?? 0) + offsetChildren.length);
+                }
+                if (hasChildren && !bases.has(oid)) {
+                  const nextBaseBytes = retainedBaseBytes + target.length;
+                  if (
+                    Number.isSafeInteger(nextBaseBytes) &&
+                    (retainedBaseBytes === 0 || nextBaseBytes <= PACK_BLOB_BATCH_TARGET_BYTES)
+                  ) {
+                    // The pool continuously owns the target chunks; retaining the
+                    // ChunkedBytes as a base adds only its JS wrapper state.
+                    intermediateBaseMemory.set(
+                      "base",
+                      retainedIntermediateWrapperBytes + PACK_DELTA_OBJECT_WRAPPER_BYTES,
+                    );
+                    bases.set(oid, { type: base.type, source: target, owned: target });
+                    retainedBaseBytes = nextBaseBytes;
+                    retainedIntermediateWrapperBytes += PACK_DELTA_OBJECT_WRAPPER_BYTES;
+                    retainedTarget = true;
+                  }
+                }
+                if (retainedTarget) {
+                  for (const child of oidChildren) enqueue(child, oid);
+                  for (const child of offsetChildren) enqueue(child, oid);
+                }
+                if (target.length <= this.#cacheEntryLimit) {
+                  this.#cacheChunked(packId, oid, base.type, target, 0, memory.reservation);
+                }
+                progressed++;
+              } finally {
+                if (!retainedTarget) target.release();
+              }
+            }
+          } finally {
+            memory.reservation.clear("compressed");
+            for (const base of bases.values()) base.owned?.release();
+            bases.clear();
+          }
+          if (completed.length > 0) {
+            objectIndex.flush();
+            this.#db.run(
+              "DELETE FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset IN (SELECT value FROM json_each(?))",
+              this.#repoId,
+              packId,
+              JSON.stringify(completed),
+            );
+          }
         } finally {
-          memory.reservation.clear("compressed");
-          for (const base of bases.values()) base.owned?.release();
-          bases.clear();
-          memory.reservation.clear("base");
-        }
-        if (completed.length > 0) {
-          objectIndex.flush();
-          this.#db.run(
-            "DELETE FROM git_pack_pending WHERE repo_id = ? AND pack_id = ? AND offset IN (SELECT value FROM json_each(?))",
-            this.#repoId,
-            packId,
-            JSON.stringify(completed),
-          );
+          intermediateBaseMemory.dispose();
+          externalOutput.dispose();
+          externalOperation.dispose();
+          packedReadOutput.dispose();
+          packedReadOperation.dispose();
         }
         memory.pool.assertIdle();
         memory.pool.dispose();
+        memory.reservation.clear("pool");
         await yieldNow();
         heartbeat();
       }
@@ -4257,129 +4983,107 @@ export class PackStore {
     return result;
   }
 
-  #checkBaseAdmission(
+  #selectBaseGroup(
+    oids: readonly string[],
     packed: ReadonlyMap<string, ExternalObjectMetadata>,
     external: ReadonlyMap<string, ExternalObjectMetadata>,
-  ): void {
+  ): string[] {
+    const group: string[] = [];
     let bytes = 0;
-    const sources = packed.size + external.size;
-    for (const metadata of [...packed.values(), ...external.values()]) {
+    for (const oid of oids) {
+      const metadata = packed.get(oid) ?? external.get(oid);
+      if (metadata === undefined) continue;
+      if (group.length > 0 && metadata.size > PACK_BLOB_BATCH_TARGET_BYTES - bytes) break;
+      group.push(oid);
       bytes += metadata.size;
-      if (!Number.isSafeInteger(bytes) || (sources > 1 && bytes > MAX_PACK_BLOB_BATCH_BYTES)) {
-        throw new GitError("E2BIG", "pack ingest bases exceed the 4 MiB batch limit");
+      if (!Number.isSafeInteger(bytes)) {
+        throw new CorruptError("pack ingest base group size is not representable");
       }
+      if (bytes > PACK_BLOB_BATCH_TARGET_BYTES) break;
     }
+    return group;
   }
 
-  #readBaseBatch(oids: readonly string[], packId: number): Map<string, RawObject> {
+  #readBaseBatch(
+    oids: readonly string[],
+    packId: number,
+    ownership: PackReadOwnership,
+  ): Map<string, RawObject> {
     const wanted = [...new Set(oids)];
     if (wanted.length === 0) return new Map();
     const result = new Map<string, RawObject>();
     const uncached: string[] = [];
+    let resultBytes = 0;
     for (const oid of wanted) {
       const cached = this.#objects.get(this.#objectCacheKey(packId, oid));
       if (cached === undefined) uncached.push(oid);
-      else result.set(oid, cached);
+      else {
+        resultBytes = checkedPackReadBytes(
+          resultBytes === 0 ? PACK_READ_OUTPUT_MAP_BYTES : resultBytes,
+          PACK_READ_OUTPUT_ENTRY_BYTES + cached.data.length,
+          "cached ingest base output",
+        );
+        ownership.output.set("flat", resultBytes);
+        result.set(oid, cached);
+      }
     }
-    for (const [oid, object] of this.#readBaseBatchParts(uncached, packId)) {
-      result.set(oid, object);
+    if (result.size === 0) {
+      return this.#readObjectsBounded(uncached, packId, null, true, new Map(), false, ownership);
     }
-    return result;
-  }
+    if (uncached.length === 0) return result;
 
-  #readBaseBatchParts(oids: readonly string[], packId: number): Map<string, RawObject> {
-    if (oids.length === 0) return new Map();
+    const partsOperation = ownership.operation.scope();
+    const partsOutput = ownership.operation.scope();
     try {
-      return this.#readObjects(oids, packId, null, true);
-    } catch (error) {
-      if (!(error instanceof GitError) || error.code !== "E2BIG") throw error;
-      if (oids.length === 1) {
-        const oid = oids[0]!;
-        const object = this.#readBasePaged(oid, packId);
-        return object === null ? new Map() : new Map([[oid, object]]);
-      }
-      const middle = Math.ceil(oids.length / 2);
-      const result = this.#readBaseBatchParts(oids.slice(0, middle), packId);
-      for (const [oid, object] of this.#readBaseBatchParts(oids.slice(middle), packId)) {
-        result.set(oid, object);
-      }
+      const parts = this.#readObjectsBounded(uncached, packId, null, true, new Map(), false, {
+        operation: partsOperation,
+        output: partsOutput,
+      });
+      resultBytes = this.#mergeReadMaps(
+        result,
+        parts,
+        resultBytes,
+        ownership,
+        partsOutput,
+        "mixed cached ingest base output",
+      );
       return result;
+    } catch (error) {
+      ownership.output.clear("flat");
+      throw error;
+    } finally {
+      partsOutput.dispose();
+      partsOperation.dispose();
     }
   }
 
-  /** Resolve a deep ingest base as bounded graph segments joined by one live checkpoint. */
-  #readBasePaged(oid: string, packId: number): RawObject | null {
-    const roots: string[] = [];
-    let current = oid;
-    let depth = 0;
-    for (;;) {
-      const tail = this.#db.one<{ oid: string; base_oid: string | null; depth: number }>(
-        `WITH RECURSIVE chain(oid, base_oid, depth) AS (
-           SELECT object.oid, object.base_oid, 0
-             FROM git_pack_objects object
-             JOIN git_pack_meta pack
-               ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-              AND (pack.state = 'complete' OR object.pack_id = ?)
-            WHERE object.repo_id = ? AND object.oid = ?
-           UNION ALL
-           SELECT base.oid, base.base_oid, chain.depth + 1
-             FROM chain
-             JOIN git_pack_objects base ON base.repo_id = ? AND base.oid = chain.base_oid
-             JOIN git_pack_meta pack
-               ON pack.repo_id = base.repo_id AND pack.pack_id = base.pack_id
-              AND (pack.state = 'complete' OR base.pack_id = ?)
-            WHERE chain.depth < ${MAX_PACK_BLOB_GRAPH_ENTRIES - 1}
-         )
-         SELECT oid, base_oid, depth FROM chain ORDER BY depth DESC LIMIT 1`,
-        packId,
-        this.#repoId,
-        current,
-        this.#repoId,
-        packId,
-      );
-      if (tail === undefined) return null;
-      if (
-        !isOid(tail.oid) ||
-        (tail.base_oid !== null && !isOid(tail.base_oid)) ||
-        !Number.isSafeInteger(tail.depth) ||
-        tail.depth < 0 ||
-        tail.depth >= MAX_PACK_BLOB_GRAPH_ENTRIES
-      ) {
-        throw new CorruptError("paged pack base traversal returned invalid metadata");
-      }
-      roots.push(current);
-      if (tail.base_oid === null || tail.depth < MAX_PACK_BLOB_GRAPH_ENTRIES - 1) {
-        depth += tail.depth + (tail.base_oid === null ? 0 : 1);
-        break;
-      }
-      depth += tail.depth + 1;
-      if (depth > this.#maxDeltaDepth) {
-        throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
-      }
-      current = tail.base_oid;
+  #mergeReadMaps(
+    destination: Map<string, RawObject>,
+    source: Map<string, RawObject>,
+    destinationOutputBytes: number,
+    ownership: PackReadOwnership,
+    sourceOutput: MemoryReservation,
+    label: string,
+  ): number {
+    if (sourceOutput.currentBytes < PACK_READ_OUTPUT_MAP_BYTES) {
+      throw new CorruptError(`${label} omitted its map ownership`);
     }
-    if (depth > this.#maxDeltaDepth) {
-      throw new CorruptError(`delta chain deeper than ${this.#maxDeltaDepth} at ${oid}`);
+    const combinedOutputBytes = checkedPackReadBytes(
+      destinationOutputBytes,
+      sourceOutput.currentBytes - PACK_READ_OUTPUT_MAP_BYTES,
+      label,
+    );
+    const mergeMemory = ownership.operation.scope();
+    try {
+      mergeMemory.set("other", source.size * PACK_READ_OUTPUT_ENTRY_BYTES);
+      for (const [oid, object] of source) destination.set(oid, object);
+      source.clear();
+      sourceOutput.transfer("flat", ownership.output);
+      ownership.output.set("flat", combinedOutputBytes);
+      return combinedOutputBytes;
+    } finally {
+      mergeMemory.dispose();
     }
-
-    let checkpoint: { oid: string; object: RawObject } | null = null;
-    for (let index = roots.length - 1; index >= 0; index--) {
-      const root = roots[index]!;
-      const seeds: ReadonlyMap<string, RawObject> =
-        checkpoint === null
-          ? new Map<string, RawObject>()
-          : new Map<string, RawObject>([[checkpoint.oid, checkpoint.object]]);
-      const object: RawObject | undefined = this.#readObjects(
-        [root],
-        packId,
-        null,
-        true,
-        seeds,
-      ).get(root);
-      if (object === undefined) return null;
-      checkpoint = { oid: root, object };
-    }
-    return checkpoint?.object ?? null;
   }
 
   #reserveFlat(
@@ -4431,8 +5135,19 @@ export class PackStore {
     }
   }
 
-  #applyDeltaBytes(base: Uint8Array, delta: Uint8Array, pool: ChunkPool): ChunkedBytes {
+  #applyDeltaBytes(
+    base: Uint8Array,
+    delta: Uint8Array,
+    pool: ChunkPool,
+    reservation: MemoryReservation,
+  ): ChunkedBytes {
+    const probe = new DeltaHeaderProbe();
+    probe.update(delta);
+    const header = probe.finish();
+    if (header.sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
+    this.#reservePoolTarget(base.length, header.targetSize, pool, reservation);
     const applier = new DeltaApplier(new FlatByteSource(base), pool, {
+      expectedTargetSize: header.targetSize,
       maxWorkingBytes: MAX_PACK_DELTA_WORKING_BYTES,
       maxInstructionBytes: MAX_PACK_DELTA_WORKING_BYTES,
     });
@@ -4458,6 +5173,7 @@ export class PackStore {
     label: string,
     base: ByteSource,
     pool: ChunkPool,
+    reservation: MemoryReservation,
     compressed: Uint8Array | null = null,
   ): ChunkedBytes {
     if (
@@ -4469,7 +5185,12 @@ export class PackStore {
     ) {
       throw new CorruptError(`${label} exceeds the bounded working set`);
     }
+    const header = this.#probeStoredDeltaHeader(packId, dataOff, dataLen, label, compressed);
+    if (header.sourceSize !== base.length) throw new CorruptError("delta base size mismatch");
+    const targetSize = header.targetSize;
+    this.#reservePoolTarget(base.length, targetSize, pool, reservation);
     const applier = new DeltaApplier(base, pool, {
+      expectedTargetSize: targetSize,
       maxWorkingBytes: MAX_PACK_DELTA_WORKING_BYTES,
       maxInstructionBytes: MAX_PACK_DELTA_WORKING_BYTES,
     });
@@ -4517,6 +5238,59 @@ export class PackStore {
     }
   }
 
+  #probeStoredDeltaHeader(
+    packId: number,
+    dataOff: number,
+    dataLen: number,
+    label: string,
+    compressed: Uint8Array | null,
+  ): { sourceSize: number; targetSize: number } {
+    if (compressed !== null && compressed.length !== dataLen) {
+      throw new CorruptError(`${label} compressed range has the wrong size`);
+    }
+    const probe = new DeltaHeaderProbe();
+    const stream = new InflateStream((chunk) => probe.update(chunk));
+    let consumed = 0;
+    while (!probe.complete && !stream.ended && consumed < dataLen) {
+      const length = Math.min(PACK_RANGE_SLICE_BYTES, dataLen - consumed);
+      const input =
+        compressed === null
+          ? this.readRaw(packId, dataOff + consumed, length)
+          : compressed.subarray(consumed, consumed + length);
+      let used: number;
+      try {
+        used = stream.push(input);
+      } catch (error) {
+        if (error instanceof CorruptError) throw error;
+        throw new CorruptError(`${label} is not a valid zlib stream`, { cause: error });
+      }
+      consumed += used;
+      if (!stream.ended && used !== input.length) {
+        throw new CorruptError(`${label} inflater stopped before the stream ended`);
+      }
+    }
+    return probe.finish();
+  }
+
+  #reservePoolTarget(
+    baseSize: number,
+    targetSize: number,
+    pool: ChunkPool,
+    reservation: MemoryReservation,
+  ): void {
+    const baseBytes = chunkFootprint(baseSize);
+    const targetBytes = chunkFootprint(targetSize);
+    if (
+      baseBytes > MAX_PACK_DELTA_WORKING_BYTES ||
+      targetBytes > MAX_PACK_DELTA_WORKING_BYTES - baseBytes
+    ) {
+      throw new CorruptError("delta working set exceeds 48 MiB");
+    }
+    const freeBytes = pool.allocatedBytes - pool.checkedOutBytes;
+    const allocationBytes = Math.max(0, targetBytes - freeBytes);
+    reservation.set("pool", pool.allocatedBytes + allocationBytes);
+  }
+
   #insertResolved(
     row: PackObjectInput,
     packId: number,
@@ -4535,12 +5309,6 @@ export class PackStore {
   ): void {
     objectIndex.add(row);
     if (type === "commit") {
-      if (objectSize > MAX_INDEXED_COMMIT_BYTES) {
-        throw new GitError(
-          "E2BIG",
-          `packed commit ${oid} exceeds the ${MAX_INDEXED_COMMIT_BYTES}-byte index limit`,
-        );
-      }
       let commitData: Uint8Array;
       if (data !== null) {
         commitData = data;

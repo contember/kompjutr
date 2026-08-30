@@ -3,11 +3,14 @@
 
 import type { MemoryReservation } from "../memory.js";
 import {
+  COMMIT_CACHE_FLUSH_BYTES,
   type CommitCacheEntry,
   type CommitGraphLimits,
-  MAX_COMMIT_CACHE_BYTES,
+  commitCacheFlushTransientBytes,
+  commitCacheReadMemory,
+  commitPreparationTransientBytes,
   MAX_LOG_COMMITS,
-  MAX_LOG_STATE_BYTES,
+  prepareCommitCacheOwned,
   readCommitGraphOwned,
 } from "../sqlite/commits.js";
 import { requireRefName } from "../sqlite/ref-validation.js";
@@ -26,9 +29,19 @@ import type {
   WalkTreeDiffEntry,
   WalkTreeDiffObject,
 } from "../sqlite/store.js";
-import { createRefMutationMemoryOwner, readShallowOwned } from "../sqlite/store.js";
+import {
+  createRefMutationMemoryOwner,
+  mutateRefsOwned,
+  readShallowOwned,
+} from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
-import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
+import {
+  CorruptError,
+  GitError,
+  hasErrorCode,
+  ObjectNotFoundError,
+  RefNotFoundError,
+} from "./errors.js";
 import {
   type Commit,
   isTreeMode,
@@ -244,24 +257,45 @@ class CommitFillBuffer {
   readonly #pending: CommitCacheEntry[] = [];
   #bytes = 0;
 
-  constructor(private readonly store: SharedRepoStore) {}
+  constructor(
+    private readonly store: SharedRepoStore,
+    private readonly reservation: MemoryReservation,
+  ) {}
 
   add(entry: CommitCacheEntry): void {
-    if (this.#pending.length > 0 && this.#bytes + entry.cacheBytes > MAX_COMMIT_CACHE_BYTES) {
+    if (
+      entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES ||
+      (this.#pending.length > 0 && this.#bytes + entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES)
+    ) {
       this.flush();
     }
+    if (entry.cacheBytes > COMMIT_CACHE_FLUSH_BYTES) return;
     this.#pending.push(entry);
     this.#bytes += entry.cacheBytes;
-    if (this.#bytes >= MAX_COMMIT_CACHE_BYTES) this.flush();
+    if (this.#bytes >= COMMIT_CACHE_FLUSH_BYTES) this.flush();
   }
 
   flush(): void {
     if (this.#pending.length === 0) return;
-    this.store.cacheCommits(this.#pending);
+    const transientBytes = commitCacheFlushTransientBytes(this.#pending);
+    if (transientBytes <= this.reservation.remainingBytes) {
+      const transient = this.reservation.scope();
+      try {
+        transient.set("commit", transientBytes);
+        this.store.cacheCommits(this.#pending);
+      } finally {
+        transient.dispose();
+      }
+    }
     this.#pending.length = 0;
     this.#bytes = 0;
   }
 }
+
+type OwnedWalk = (
+  oid: string,
+  reservation: MemoryReservation,
+) => Iterable<{ oid: string; commit: Commit }>;
 
 type OwnedIndexedWalk = (
   oid: string,
@@ -270,6 +304,18 @@ type OwnedIndexedWalk = (
 ) => Iterable<{ oid: string; commit: Commit }>;
 
 const OWNED_INDEXED_WALKS = new WeakMap<Repository, OwnedIndexedWalk>();
+const OWNED_WALKS = new WeakMap<Repository, OwnedWalk>();
+
+/** Internal point walk retained under an existing repository operation. */
+export function walkOwned(
+  repo: Repository,
+  oid: string,
+  reservation: MemoryReservation,
+): Iterable<{ oid: string; commit: Commit }> {
+  const walk = OWNED_WALKS.get(repo);
+  if (walk === undefined) throw new GitError("EINVAL", "repository graph owner is unavailable");
+  return walk(oid, reservation);
+}
 
 /** Internal graph walk retained under an existing repository operation. */
 export function walkIndexedOwned(
@@ -291,6 +337,7 @@ export class Repository {
     OWNED_INDEXED_WALKS.set(this, (oid, reservation, limits) =>
       this.#walkIndexedOwned(oid, reservation, limits),
     );
+    OWNED_WALKS.set(this, (oid, reservation) => this.#walkOwned(oid, reservation));
   }
 
   get root(): string {
@@ -299,7 +346,12 @@ export class Repository {
 
   /** Commits whose parents this repository deliberately does not have. */
   shallow(): Set<string> {
-    return this.store.shallow();
+    const reservation = this.store.reserveMemory();
+    try {
+      return readShallowOwned(this.store, reservation);
+    } finally {
+      reservation.dispose();
+    }
   }
 
   invalidateShallow(): void {
@@ -325,26 +377,120 @@ export class Repository {
   }
 
   readCommit(oid: string): Commit {
-    return this.#readCommitEntry(oid).commit;
+    const reservation = this.store.reserveMemory();
+    try {
+      return this.#readCommitEntryOwned(oid, reservation).commit;
+    } finally {
+      reservation.dispose();
+    }
   }
 
   /** Read, hash, and parse a commit from its authoritative physical source. */
   readAuthenticatedCommit(oid: string): Commit {
-    const object = this.store.readAuthenticatedObject(oid, "commit");
-    if (object === null) throw new ObjectNotFoundError(oid);
-    return this.store.prepareCommit(oid, object.data).commit;
+    const reservation = this.store.reserveMemory();
+    try {
+      return this.readAuthenticatedCommitOwned(oid, reservation);
+    } finally {
+      reservation.dispose();
+    }
   }
 
-  #readCommitEntry(oid: string, fill?: CommitFillBuffer): CommitCacheEntry {
-    const cached = this.store.cachedCommit(oid);
-    if (cached !== null) return cached;
-    const object = this.read(oid);
-    if (object.type !== "commit")
-      throw new CorruptError(`${oid} is a ${object.type}, not a commit`);
-    const prepared = this.store.prepareCommit(oid, object.data);
-    if (fill === undefined) this.store.cacheCommits([prepared]);
-    else fill.add(prepared);
+  /** Authenticate and parse one exact commit under an existing operation owner. */
+  readAuthenticatedCommitOwned(oid: string, reservation: MemoryReservation): Commit {
+    if (!this.store.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "commit reservation belongs to another repository");
+    }
+    return this.#readAuthenticatedCommitEntryOwned(oid, reservation).commit;
+  }
+
+  #readAuthenticatedCommitEntryOwned(
+    oid: string,
+    reservation: MemoryReservation,
+  ): CommitCacheEntry {
+    const source = reservation.scope();
+    let retained = false;
+    try {
+      const metadata = this.store.typeAndSize(oid);
+      if (metadata === null) throw new ObjectNotFoundError(oid);
+      if (metadata.type !== "commit") {
+        throw new CorruptError(`${oid} is a ${metadata.type}, not a commit`);
+      }
+      source.set("commit", commitPreparationTransientBytes(metadata.size));
+      const object = this.store.readAuthenticatedObject(oid, "commit");
+      if (object === null) throw new ObjectNotFoundError(oid);
+      if (object.data.length !== metadata.size) {
+        throw new CorruptError(`commit ${oid} does not match its authoritative size`);
+      }
+      const entry = prepareCommitCacheOwned(
+        { repoId: this.store.repoId, oid, data: object.data },
+        source,
+      );
+      retained = true;
+      return entry;
+    } finally {
+      if (!retained) source.dispose();
+    }
+  }
+
+  #readCommitEntryOwned(
+    oid: string,
+    reservation: MemoryReservation,
+    fill?: CommitFillBuffer,
+  ): CommitCacheEntry {
+    const cacheMemory = commitCacheReadMemory(this.store.db, this.store.repoId, oid);
+    if (cacheMemory !== null) {
+      const cacheRead = reservation.scope();
+      let retained = false;
+      try {
+        cacheRead.set("commit", cacheMemory.materializationBytes);
+        const cached = this.store.cachedCommit(oid);
+        if (cached === null) throw new CorruptError("commit cache source changed during read");
+        if (cached.cacheBytes > cacheMemory.retainedBytes) {
+          throw new CorruptError("commit cache exceeds its validated retained memory");
+        }
+        if (cacheMemory.eligible) {
+          cacheRead.set("commit", cached.cacheBytes);
+          retained = true;
+          return cached;
+        }
+      } finally {
+        if (!retained) cacheRead.dispose();
+      }
+    }
+    const prepared = this.#readAuthenticatedCommitEntryOwned(oid, reservation);
+    if (fill === undefined) {
+      if (prepared.cacheBytes <= COMMIT_CACHE_FLUSH_BYTES) {
+        const transientBytes = commitCacheFlushTransientBytes([prepared]);
+        if (transientBytes <= reservation.remainingBytes) {
+          const transient = reservation.scope();
+          try {
+            transient.set("commit", transientBytes);
+            this.store.cacheCommits([prepared]);
+          } finally {
+            transient.dispose();
+          }
+        }
+      }
+    } else {
+      fill.add(prepared);
+    }
     return prepared;
+  }
+
+  #probeCommitCacheOwned(oid: string, reservation: MemoryReservation): void {
+    const cacheMemory = commitCacheReadMemory(this.store.db, this.store.repoId, oid);
+    if (cacheMemory === null) return;
+    const probe = reservation.scope();
+    try {
+      probe.set("commit", cacheMemory.materializationBytes);
+      const cached = this.store.cachedCommit(oid);
+      if (cached === null) throw new CorruptError("commit cache source changed during read");
+      if (cached.cacheBytes > cacheMemory.retainedBytes) {
+        throw new CorruptError("commit cache exceeds its validated retained memory");
+      }
+    } finally {
+      probe.dispose();
+    }
   }
 
   readTree(oid: string): TreeEntry[] {
@@ -438,8 +584,14 @@ export class Repository {
     return ref === "HEAD" ? this.checkout.reflog(ref, options) : this.store.reflog(ref, options);
   }
 
-  mutateRefs(mutation: RefMutation, metadata: RefLogMetadata): boolean {
-    return this.checkout.mutateRefs(mutation, metadata);
+  mutateRefs(
+    mutation: RefMutation,
+    metadata: RefLogMetadata,
+    owner?: RefMutationMemoryOwner,
+  ): boolean {
+    return owner === undefined
+      ? this.checkout.mutateRefs(mutation, metadata)
+      : mutateRefsOwned(this.checkout, mutation, metadata, owner);
   }
 
   beginFetchPublication(
@@ -763,36 +915,51 @@ export class Repository {
 
   /** Commits reachable from `oid`, first-parent-first, in commit-date order. */
   *walk(oid: string): Generator<{ oid: string; commit: Commit }> {
-    const seen = new Set<string>();
-    const queue = new CommitHeap();
-    const fill = new CommitFillBuffer(this.store);
-    let sequence = 0;
-    let stateBytes = 0;
-    const push = (candidate: string): void => {
-      if (seen.has(candidate)) return;
-      if (seen.size >= MAX_LOG_COMMITS) {
-        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-      }
-      const entry = this.#readCommitEntry(candidate, fill);
-      if (stateBytes + entry.cacheBytes > MAX_LOG_STATE_BYTES) {
-        throw new GitError("E2BIG", "commit graph exceeds the 32 MiB retained-state limit");
-      }
-      stateBytes += entry.cacheBytes;
-      seen.add(candidate);
-      queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
-    };
-
+    const reservation = this.store.reserveMemory();
     try {
+      yield* this.#walkOwned(oid, reservation);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  *#walkOwned(
+    oid: string,
+    reservation: MemoryReservation,
+  ): Generator<{ oid: string; commit: Commit }> {
+    if (!this.store.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "commit graph reservation belongs to another repository");
+    }
+    const graphMemory = this.store.scopeMemoryReservation(reservation);
+    const boundaryMemory = this.store.scopeMemoryReservation(reservation);
+    const fill = new CommitFillBuffer(this.store, reservation);
+    try {
+      const seen = new Set<string>();
+      const queue = new CommitHeap();
+      let sequence = 0;
+      const push = (candidate: string): void => {
+        if (seen.has(candidate)) return;
+        if (seen.size >= MAX_LOG_COMMITS) {
+          throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+        }
+        const entry = this.#readCommitEntryOwned(candidate, graphMemory, fill);
+        seen.add(candidate);
+        queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
+      };
+
       push(this.peel(oid));
-      const boundary = this.shallow();
+      const boundary = readShallowOwned(this.store, boundaryMemory);
       while (queue.size > 0) {
-        const next = queue.pop()!;
+        const next = queue.pop();
+        if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
         yield { oid: next.oid, commit: next.commit };
         if (boundary.has(next.oid)) continue;
         for (const parent of next.commit.parent) push(parent);
       }
     } finally {
       fill.flush();
+      boundaryMemory.dispose();
+      graphMemory.dispose();
     }
   }
 
@@ -801,31 +968,117 @@ export class Repository {
     oid: string,
     limits: CommitGraphLimits = {},
   ): Generator<{ oid: string; commit: Commit }> {
-    const root = this.peel(oid);
-    const boundary = this.shallow();
-    const entries = new Map<string, CommitCacheEntry>();
-    let stateBytes = 0;
-    const maxBytes = Math.min(limits.maxBytes ?? MAX_LOG_STATE_BYTES, MAX_LOG_STATE_BYTES);
-    const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
-    for (const entry of this.store.commitGraph(root, limits)) {
-      if (entries.has(entry.oid)) throw new CorruptError("commit graph yielded a duplicate oid");
-      if (entries.size >= maxCommits) {
-        throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-      }
-      if (stateBytes + entry.cacheBytes > maxBytes) {
-        throw new GitError("E2BIG", "commit graph exceeds the 32 MiB retained-state limit");
-      }
-      stateBytes += entry.cacheBytes;
-      entries.set(entry.oid, entry);
+    const reservation = this.store.reserveMemory();
+    try {
+      yield* this.#walkIndexedOwned(oid, reservation, limits);
+    } finally {
+      reservation.dispose();
     }
-    if (!entries.has(root)) {
-      throw new GitError(
-        "E2BIG",
-        "commit graph cache is incomplete; reindex or reclone the repository",
-      );
-    }
-    this.#validateCommitGraph(root, entries, boundary, true);
+  }
 
+  *#walkIndexedOwned(
+    oid: string,
+    reservation: MemoryReservation,
+    limits: CommitGraphLimits = {},
+  ): Generator<{ oid: string; commit: Commit }> {
+    if (!this.store.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "commit graph reservation belongs to another repository");
+    }
+    const boundaryMemory = this.store.scopeMemoryReservation(reservation);
+    try {
+      const root = this.peel(oid);
+      const boundary = readShallowOwned(this.store, boundaryMemory);
+      const graphMemory = this.store.scopeMemoryReservation(reservation);
+      const entries = new Map<string, CommitCacheEntry>();
+      const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
+      try {
+        try {
+          for (const entry of readCommitGraphOwned(
+            this.store.db,
+            this.store.repoId,
+            root,
+            graphMemory,
+            limits,
+          )) {
+            if (entries.has(entry.oid)) {
+              throw new CorruptError("commit graph yielded a duplicate oid");
+            }
+            if (entries.size >= maxCommits) {
+              throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+            }
+            entries.set(entry.oid, entry);
+          }
+        } catch (error) {
+          if (!hasErrorCode(error, "ECACHEMISS")) throw error;
+          graphMemory.dispose();
+          yield* this.#walkUncachedOwned(root, boundary, reservation, limits);
+          return;
+        }
+        if (!entries.has(root)) throw new CorruptError("commit graph omitted its cached root");
+        this.#validateCommitGraph(root, entries, boundary, true);
+
+        yield* this.#orderedCommitGraph(root, entries, boundary);
+      } finally {
+        graphMemory.dispose();
+      }
+    } finally {
+      boundaryMemory.dispose();
+    }
+  }
+
+  *#walkUncachedOwned(
+    root: string,
+    boundary: ReadonlySet<string>,
+    reservation: MemoryReservation,
+    limits: CommitGraphLimits,
+  ): Generator<{ oid: string; commit: Commit }> {
+    const graphMemory = this.store.scopeMemoryReservation(reservation);
+    try {
+      const entries = new Map<string, CommitCacheEntry>();
+      const pending = [root];
+      const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
+      const requestedBytes = limits.maxBytes;
+      if (
+        requestedBytes !== undefined &&
+        (!Number.isSafeInteger(requestedBytes) || requestedBytes < 1)
+      ) {
+        throw new RangeError("commit graph byte limit must be a positive safe integer");
+      }
+      const maxBytes = Math.min(
+        requestedBytes ?? graphMemory.remainingBytes,
+        graphMemory.remainingBytes,
+      );
+      let retainedBytes = 0;
+      while (pending.length > 0) {
+        const candidate = pending.pop();
+        if (candidate === undefined || entries.has(candidate)) continue;
+        if (entries.size >= maxCommits) {
+          throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+        }
+        this.#probeCommitCacheOwned(candidate, graphMemory);
+        const entry = this.#readAuthenticatedCommitEntryOwned(candidate, graphMemory);
+        if (entry.cacheBytes > maxBytes - retainedBytes) {
+          throw new GitError("E2BIG", "commit graph exceeds its retained-memory capacity");
+        }
+        retainedBytes += entry.cacheBytes;
+        entries.set(candidate, entry);
+        if (!boundary.has(candidate)) {
+          for (const parent of entry.commit.parent) pending.push(parent);
+        }
+      }
+      if (!entries.has(root)) throw new CorruptError("commit graph omitted its root");
+      this.#validateCommitGraph(root, entries, boundary, true);
+      yield* this.#orderedCommitGraph(root, entries, boundary);
+    } finally {
+      graphMemory.dispose();
+    }
+  }
+
+  *#orderedCommitGraph(
+    root: string,
+    entries: ReadonlyMap<string, CommitCacheEntry>,
+    boundary: ReadonlySet<string>,
+  ): Generator<{ oid: string; commit: Commit }> {
     const seen = new Set<string>();
     const queue = new CommitHeap();
     let sequence = 0;
@@ -838,67 +1091,11 @@ export class Repository {
     };
     push(root);
     while (queue.size > 0) {
-      const next = queue.pop()!;
+      const next = queue.pop();
+      if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
       yield { oid: next.oid, commit: next.commit };
       if (boundary.has(next.oid)) continue;
       for (const parent of next.commit.parent) push(parent);
-    }
-  }
-
-  *#walkIndexedOwned(
-    oid: string,
-    reservation: MemoryReservation,
-    limits: CommitGraphLimits = {},
-  ): Generator<{ oid: string; commit: Commit }> {
-    const graphMemory = this.store.scopeMemoryReservation(reservation);
-    const boundaryMemory = this.store.scopeMemoryReservation(reservation);
-    try {
-      const root = this.peel(oid);
-      const boundary = readShallowOwned(this.store, boundaryMemory);
-      const entries = new Map<string, CommitCacheEntry>();
-      const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
-      for (const entry of readCommitGraphOwned(
-        this.store.db,
-        this.store.repoId,
-        root,
-        graphMemory,
-        limits,
-      )) {
-        if (entries.has(entry.oid)) throw new CorruptError("commit graph yielded a duplicate oid");
-        if (entries.size >= maxCommits) {
-          throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
-        }
-        entries.set(entry.oid, entry);
-      }
-      if (!entries.has(root)) {
-        throw new GitError(
-          "E2BIG",
-          "commit graph cache is incomplete; reindex or reclone the repository",
-        );
-      }
-      this.#validateCommitGraph(root, entries, boundary, true);
-
-      const seen = new Set<string>();
-      const queue = new CommitHeap();
-      let sequence = 0;
-      const push = (candidate: string): void => {
-        if (seen.has(candidate)) return;
-        const entry = entries.get(candidate);
-        if (entry === undefined) throw new CorruptError("commit graph is missing a parent row");
-        seen.add(candidate);
-        queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
-      };
-      push(root);
-      while (queue.size > 0) {
-        const next = queue.pop();
-        if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
-        yield { oid: next.oid, commit: next.commit };
-        if (boundary.has(next.oid)) continue;
-        for (const parent of next.commit.parent) push(parent);
-      }
-    } finally {
-      boundaryMemory.dispose();
-      graphMemory.dispose();
     }
   }
 

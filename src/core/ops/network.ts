@@ -7,11 +7,15 @@
 // existing ref valid and one reclaimable pending pack.
 
 import type { MemoryReservation } from "../../memory.js";
+import { commitPreparationTransientBytes } from "../../sqlite/commits.js";
 import {
   type CheckoutStore,
+  createRefMutationMemoryOwner,
+  type FetchPublicationPlan,
   type FetchPublicationToken,
   listCheckoutsOwned,
-  MAX_BLOB_BATCH_BYTES,
+  PACK_BLOB_BATCH_TARGET_BYTES,
+  type RefMutationMemoryOwner,
 } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
@@ -34,7 +38,7 @@ import {
   uploadPack,
 } from "../protocol/remote.js";
 import { type AuthCallback, type GitAuth, RemoteAuthSession } from "../protocol/transport.js";
-import { Repository } from "../repository.js";
+import { Repository, walkOwned } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
 import { joinSorted } from "../streams.js";
 import { checkoutTree, matchesPaths, type TargetEntry } from "./checkout.js";
@@ -61,12 +65,26 @@ const FETCH_ROOT_AUTH_MEMORY_PART = "fetch-root-auth";
 const FETCH_ROOT_TYPES_MEMORY_PART = "fetch-root-types";
 const FETCH_TAG_AUTH_MEMORY_PART = "fetch-tag-auth";
 const FETCH_TARGETS_MEMORY_PART = "fetch-targets";
+const FETCH_COMMIT_PARSE_MEMORY_PART = "fetch-commit-parse";
+const PROTOCOL_DISCOVERY_MEMORY_PART = "protocol-discovery";
 const FETCH_OPTIONS_FIXED_BYTES = 192;
 const FETCH_HEADER_FIXED_BYTES = 64;
 const FETCH_ROOT_TYPES_FIXED_BYTES = 192;
 const FETCH_ROOT_TYPE_ENTRY_BYTES = 96;
 const FETCH_TARGET_ENTRY_BYTES = 96;
+const FETCH_PUBLICATION_OBJECT_BYTES = 128;
+const FETCH_PUBLICATION_ARRAY_BYTES = 128;
+const FETCH_PUBLICATION_ARRAY_SLOT_BYTES = 8;
+const FETCH_PUBLICATION_ROW_BYTES = 128;
+const FETCH_PUBLICATION_SET_BYTES = 128;
+const FETCH_PUBLICATION_SET_ENTRY_BYTES = 72;
+const FETCH_PUBLICATION_ITERABLE_BYTES = 64;
+const FETCH_PUBLICATION_COPY_CACHE_FIXED_BYTES =
+  FETCH_PUBLICATION_OBJECT_BYTES + FETCH_PUBLICATION_ITERABLE_BYTES;
+const FETCH_PUBLICATION_COPY_CACHE_ENTRY_BYTES = 72;
+const FETCH_STRING_COPY_FIXED_BYTES = 64;
 const tagHeaderDecoder = new TextDecoder("utf-8", { fatal: true });
+const stringCopyDecoder = new TextDecoder("utf-16le", { fatal: true, ignoreBOM: true });
 
 function authenticatedObjectRetainedBytes(bytes: number): number {
   if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 256) / 2) {
@@ -209,6 +227,73 @@ interface AdvertisedTag {
   peeledOid: string;
 }
 
+interface LegacyFetchResult {
+  readonly mode: "legacy";
+  readonly defaultBranch: string | null;
+  readonly fetchHead: string | null;
+  readonly updates: readonly [];
+}
+
+function copyPublicationString(owner: RefMutationMemoryOwner, value: string): string {
+  return owner.construct(value.length, () => {
+    const transient = owner.memoryReservation().scope();
+    try {
+      transient.set("other", FETCH_STRING_COPY_FIXED_BYTES + 2 * value.length);
+      const bytes = new Uint8Array(2 * value.length);
+      for (let index = 0; index < value.length; index++) {
+        const unit = value.charCodeAt(index);
+        bytes[2 * index] = unit & 0xff;
+        bytes[2 * index + 1] = unit >>> 8;
+      }
+      const copy = stringCopyDecoder.decode(bytes);
+      if (copy !== value) throw new CorruptError("fetch publication string copy changed text");
+      return copy;
+    } finally {
+      transient.dispose();
+    }
+  });
+}
+
+function copyPublicationNullable(
+  owner: RefMutationMemoryOwner,
+  value: string | null,
+): string | null {
+  return value === null ? null : copyPublicationString(owner, value);
+}
+
+function publicationArrayBytes(length: number): number {
+  const bytes =
+    FETCH_PUBLICATION_ARRAY_BYTES +
+    FETCH_PUBLICATION_ITERABLE_BYTES +
+    length * FETCH_PUBLICATION_ARRAY_SLOT_BYTES;
+  if (!Number.isSafeInteger(bytes)) {
+    throw new GitError("E2BIG", "fetch publication array memory accounting overflow");
+  }
+  return bytes;
+}
+
+function legacyPublicationSourceBytes(input: {
+  trackingPuts: number;
+  trackingKeep: number | undefined;
+  globalTagPuts: number;
+  shallowAdd: number;
+  shallowRemove: number;
+}): number {
+  const rowCount = input.trackingPuts + input.globalTagPuts;
+  const bytes =
+    FETCH_PUBLICATION_OBJECT_BYTES +
+    publicationArrayBytes(input.trackingPuts) +
+    (input.trackingKeep === undefined ? 0 : publicationArrayBytes(input.trackingKeep)) +
+    publicationArrayBytes(input.globalTagPuts) +
+    publicationArrayBytes(input.shallowAdd) +
+    publicationArrayBytes(input.shallowRemove) +
+    rowCount * FETCH_PUBLICATION_ROW_BYTES;
+  if (!Number.isSafeInteger(rowCount) || !Number.isSafeInteger(bytes)) {
+    throw new GitError("E2BIG", "fetch publication source memory accounting overflow");
+  }
+  return bytes;
+}
+
 export function remoteUrlFor(repo: Repository, remote: string): string | undefined {
   return repo.store.configGet(`remote.${remote}.url`);
 }
@@ -316,38 +401,11 @@ function readTagObjects(
       if (entry === undefined || oid === undefined || entry.oid !== oid) {
         throw new CorruptError("tag authentication metadata is incomplete");
       }
-      if (selectedBytes + entry.size > MAX_BLOB_BATCH_BYTES) break;
+      if (selected > 0 && entry.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
+        break;
+      }
       selectedBytes += entry.size;
       selected++;
-    }
-    if (selected === 0) {
-      const entry = info[0];
-      const oid = page[0];
-      if (entry === undefined || oid === undefined || entry.oid !== oid) {
-        throw new CorruptError("tag authentication lost its oversized object");
-      }
-      operationBudget.setMemory(
-        FETCH_TAG_AUTH_MEMORY_PART,
-        authenticatedObjectRetainedBytes(retainedBytes + entry.size),
-      );
-      const object = repo.store.readAuthenticatedObject(oid, entry.type);
-      if (object === null) {
-        throw new GitError("EFETCHFAIL", `fetch did not receive complete tag object ${oid}`);
-      }
-      if (object.data.length !== entry.size) {
-        throw new CorruptError(`tag object ${oid} does not match its indexed size`);
-      }
-      if (hashObject(object.type, object.data) !== oid) {
-        throw new CorruptError(`tag object ${oid} does not match its bytes`);
-      }
-      objects.set(oid, object);
-      retainedBytes += object.data.length;
-      operationBudget.setMemory(
-        FETCH_TAG_AUTH_MEMORY_PART,
-        authenticatedObjectRetainedBytes(retainedBytes),
-      );
-      pending = [...page.slice(1), ...tail];
-      continue;
     }
     const selectedOids = page.slice(0, selected);
     operationBudget.setMemory(
@@ -523,7 +581,7 @@ function authenticateTags(
 }
 
 /** Recent commits from every local ref, as negotiation `have`s. */
-function collectHaves(repo: Repository): string[] {
+function collectHaves(repo: Repository, reservation: MemoryReservation): string[] {
   const haves: string[] = [];
   const seen = new Set<string>();
   const tips = repo.store
@@ -537,7 +595,7 @@ function collectHaves(repo: Repository): string[] {
   for (const tip of unique) {
     if (!present.has(tip)) continue;
     try {
-      for (const { oid } of repo.walk(tip)) {
+      for (const { oid } of walkOwned(repo, tip, reservation)) {
         if (seen.has(oid)) break;
         seen.add(oid);
         haves.push(oid);
@@ -598,7 +656,7 @@ async function transferPack(
   try {
     const haves = [
       ...new Set([
-        ...(request.useLocalHaves === false ? [] : collectHaves(repo)),
+        ...(request.useLocalHaves === false ? [] : collectHaves(repo, reservation)),
         ...(request.haves ?? []),
       ]),
     ];
@@ -640,17 +698,36 @@ async function* fetchPackStream(source: AsyncIterable<Uint8Array>): AsyncGenerat
   }
 }
 
+interface ShallowPublicationMemory {
+  readonly reservation: MemoryReservation;
+  retained: number;
+}
+
+function addPublicationSetValue(
+  values: Set<string>,
+  value: string,
+  memory: ShallowPublicationMemory,
+): void {
+  if (values.has(value)) return;
+  memory.retained += FETCH_PUBLICATION_SET_ENTRY_BYTES + retainedStringBytes(value);
+  memory.reservation.set("other", memory.retained);
+  values.add(value);
+}
+
 function accumulateShallow(
   target: { add: Set<string>; remove: Set<string> },
   source: { shallow: readonly string[]; unshallow: readonly string[] },
+  memory?: ShallowPublicationMemory,
 ): void {
   for (const oid of source.unshallow) {
     target.add.delete(oid);
-    target.remove.add(oid);
+    if (memory === undefined) target.remove.add(oid);
+    else addPublicationSetValue(target.remove, oid, memory);
   }
   for (const oid of source.shallow) {
     target.remove.delete(oid);
-    target.add.add(oid);
+    if (memory === undefined) target.add.add(oid);
+    else addPublicationSetValue(target.add, oid, memory);
   }
 }
 
@@ -900,12 +977,25 @@ function preflightMappedUpdates(
   }
 }
 
-function validateMappedObject(oid: string, object: RawObject): void {
+function validateMappedObject(
+  oid: string,
+  object: RawObject,
+  budget: TransportOperationBudget,
+): void {
   if (hashObject(object.type, object.data) !== oid) {
     throw new CorruptError(`fetched object ${oid} does not match its bytes`);
   }
-  if (object.type === "commit") parseCommit(object.data);
-  else if (object.type === "tree") parseTree(object.data);
+  if (object.type === "commit") {
+    budget.setMemory(
+      FETCH_COMMIT_PARSE_MEMORY_PART,
+      commitPreparationTransientBytes(object.data.length),
+    );
+    try {
+      parseCommit(object.data);
+    } finally {
+      budget.clearMemory(FETCH_COMMIT_PARSE_MEMORY_PART);
+    }
+  } else if (object.type === "tree") parseTree(object.data);
   else if (object.type === "tag") parseAuthenticatedTag(oid, object.data);
 }
 
@@ -928,55 +1018,57 @@ function authenticateMappedRoots(
   let remaining = [...new Set(refs.map((ref) => ref.oid))];
   try {
     while (remaining.length > 0) {
+      let info: ReturnType<Repository["store"]["objectInfo"]>;
+      try {
+        info = repo.store.objectInfo(remaining);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOTFOUND")) {
+          throw new GitError("EFETCHFAIL", "fetch did not receive every selected object", {
+            cause: error,
+          });
+        }
+        throw error;
+      }
+      let selected = 0;
+      let selectedBytes = 0;
+      while (selected < info.length) {
+        const object = info[selected];
+        const oid = remaining[selected];
+        if (object === undefined || oid === undefined || object.oid !== oid) {
+          throw new CorruptError("fetch authentication metadata is incomplete");
+        }
+        if (selected > 0 && object.size > PACK_BLOB_BATCH_TARGET_BYTES - selectedBytes) {
+          break;
+        }
+        selectedBytes += object.size;
+        selected++;
+      }
       try {
         budget.setMemory(
           FETCH_ROOT_AUTH_MEMORY_PART,
-          authenticatedObjectRetainedBytes(MAX_BLOB_BATCH_BYTES),
+          authenticatedObjectRetainedBytes(selectedBytes),
         );
-        let batch: ReturnType<Repository["readObjects"]>;
-        try {
-          batch = repo.readObjects(remaining, { budgetBytes: MAX_BLOB_BATCH_BYTES });
-        } catch (error) {
-          if (hasErrorCode(error, "ENOTFOUND")) {
-            throw new GitError("EFETCHFAIL", "fetch did not receive every selected object", {
-              cause: error,
-            });
-          }
-          if (!hasErrorCode(error, "EFBIG")) throw error;
-          const first = remaining[0];
-          if (first === undefined) throw new CorruptError("fetch authentication lost its root");
-          const info = repo.store.objectInfo([first])[0];
-          if (info === undefined) {
-            throw new GitError("EFETCHFAIL", `fetch did not receive selected object ${first}`);
-          }
-          budget.setMemory(
-            FETCH_ROOT_AUTH_MEMORY_PART,
-            authenticatedObjectRetainedBytes(info.size),
-          );
-          const object = repo.store.readAuthenticatedObject(first, info.type);
-          if (object === null) {
-            throw new GitError("EFETCHFAIL", `fetch did not receive selected object ${first}`);
-          }
-          if (object.data.length !== info.size) {
-            throw new CorruptError(`fetched object ${first} does not match its indexed size`);
-          }
-          validateMappedObject(first, object);
-          rememberType(first, object.type);
-          remaining = remaining.slice(1);
-          continue;
-        }
+        const selectedOids = remaining.slice(0, selected);
+        const batch = repo.readObjects(selectedOids, { budgetBytes: Math.max(1, selectedBytes) });
         budget.setMemory(
           FETCH_ROOT_AUTH_MEMORY_PART,
           authenticatedObjectRetainedBytes(batch.bytes),
         );
-        if (batch.objects.size === 0 || batch.remaining.length >= remaining.length) {
+        if (batch.objects.size !== selectedOids.length || batch.remaining.length !== 0) {
           throw new CorruptError("fetch object authentication made no progress");
         }
         for (const [oid, object] of batch.objects) {
-          validateMappedObject(oid, object);
+          validateMappedObject(oid, object, budget);
           rememberType(oid, object.type);
         }
-        remaining = batch.remaining;
+        remaining = remaining.slice(selected);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOTFOUND")) {
+          throw new GitError("EFETCHFAIL", "fetch did not receive every selected object", {
+            cause: error,
+          });
+        }
+        throw error;
       } finally {
         budget.clearMemory(FETCH_ROOT_AUTH_MEMORY_PART);
       }
@@ -1047,7 +1139,7 @@ export async function fetchInto(
     const auth = fetchAuth(context, options, url, budget);
     const beforeDiscovery = behavior.checkpoint?.("before-discovery");
     if (beforeDiscovery !== undefined) await beforeDiscovery;
-    const advertisement = await fetchAdvertisement(url, auth);
+    let advertisement: Advertisement | null = await fetchAdvertisement(url, auth);
     if (isMappedFetchOptions(options)) {
       if (compiler === undefined) throw new Error("mapped fetch lost its compiled refspecs");
       return await fetchMappedInto(
@@ -1065,6 +1157,10 @@ export async function fetchInto(
         budget,
       );
     }
+    const releaseAdvertisement = (): void => {
+      advertisement = null;
+      budget.clearMemory(PROTOCOL_DISCOVERY_MEMORY_PART);
+    };
     return await fetchLegacyInto(
       context,
       repo,
@@ -1077,6 +1173,7 @@ export async function fetchInto(
       auth,
       reservation,
       budget,
+      releaseAdvertisement,
     );
   } finally {
     compiler?.dispose();
@@ -1180,19 +1277,28 @@ async function fetchMappedInto(
   }
 }
 
-async function fetchLegacyInto(
+interface PreparedLegacyFetchPublication {
+  readonly publication: FetchPublicationToken;
+  plan: FetchPublicationPlan | null;
+  readonly result: LegacyFetchResult;
+  readonly publicationOwner: RefMutationMemoryOwner;
+  readonly publicationStructures: MemoryReservation;
+  readonly resultOwner: RefMutationMemoryOwner;
+}
+
+async function prepareLegacyFetchPublication(
   context: GitContext,
   repo: Repository,
   options: FetchOperationOptions & LegacyFetchSelection,
   behavior: FetchBehavior,
-  refLogReason: "fetch" | "clone: fetch",
   remote: string,
   url: string,
   advertisement: Advertisement,
   auth: Parameters<typeof uploadPack>[1],
   reservation: MemoryReservation,
   budget: TransportOperationBudget,
-): Promise<FetchResult> {
+): Promise<PreparedLegacyFetchPublication> {
+  const defaultBranch = advertisement.headRef;
   const requestedRef = options.remoteRef ?? options.ref;
   const coverageRef = behavior.coverageRef ?? requestedRef;
   const selection = selectRefs(advertisement, {
@@ -1204,6 +1310,7 @@ async function fetchLegacyInto(
       : { resultRef: behavior.resultRef }),
     singleBranch: options.singleBranch ?? false,
   });
+  const fetchHead = selection.result?.oid ?? null;
   const autoTags = options.tags === undefined && (behavior.autoTags ?? requestedRef === undefined);
   const allTags = options.tags === true;
   const tags = advertisedTags(advertisement);
@@ -1213,11 +1320,46 @@ async function fetchLegacyInto(
   const requiredTags = tags.filter((tag) => allTags || selectedTagNames.has(tag.ref.name));
   const candidateTags = allTags || autoTags ? tags : requiredTags;
   const trackingPrefix = `refs/remotes/${remote}/`;
-  const publication = repo.store.beginFetchPublication(
-    trackingPrefix,
-    candidateTags.map((tag) => tag.ref.name),
-    reservation,
-  );
+  const publicationOwner = createRefMutationMemoryOwner(repo.store);
+  const copyCacheMemory = publicationOwner.memoryReservation().scope();
+  let copyCacheBytes = FETCH_PUBLICATION_COPY_CACHE_FIXED_BYTES;
+  let copies: Map<string, string>;
+  try {
+    copyCacheMemory.set("other", copyCacheBytes);
+    copies = new Map<string, string>();
+  } catch (error) {
+    copyCacheMemory.dispose();
+    publicationOwner.dispose();
+    throw error;
+  }
+  const copy = (value: string): string => {
+    const existing = copies.get(value);
+    if (existing !== undefined) return existing;
+    const retained = copyPublicationString(publicationOwner, value);
+    copyCacheBytes += FETCH_PUBLICATION_COPY_CACHE_ENTRY_BYTES;
+    copyCacheMemory.set("other", copyCacheBytes);
+    copies.set(value, retained);
+    return retained;
+  };
+  const candidateStructures = publicationOwner.memoryReservation().scope();
+  let publication: FetchPublicationToken;
+  try {
+    candidateStructures.set("other", publicationArrayBytes(candidateTags.length));
+    const candidateNames = candidateTags.map((tag) => copy(tag.ref.name));
+    publication = repo.store.beginFetchPublication(
+      trackingPrefix,
+      candidateNames,
+      reservation,
+      publicationOwner,
+    );
+    candidateStructures.dispose();
+  } catch (error) {
+    candidateStructures.dispose();
+    copyCacheMemory.dispose();
+    publicationOwner.dispose();
+    throw error;
+  }
+  let resultOwner: RefMutationMemoryOwner | null = null;
 
   try {
     preflightAllTags(publication, requiredTags);
@@ -1246,6 +1388,14 @@ async function fetchLegacyInto(
         ? [...new Set(wantedOids)]
         : repo.store.missing(wantedOids);
     const shallows = [...publication.shallow];
+    const shallowStructures = publicationOwner.memoryReservation().scope();
+    const shallowMemory: ShallowPublicationMemory = {
+      reservation: shallowStructures,
+      retained:
+        FETCH_PUBLICATION_OBJECT_BYTES +
+        2 * (FETCH_PUBLICATION_SET_BYTES + FETCH_PUBLICATION_ITERABLE_BYTES),
+    };
+    shallowStructures.set("other", shallowMemory.retained);
     const shallow = { add: new Set<string>(), remove: new Set<string>() };
     accumulateShallow(
       shallow,
@@ -1265,6 +1415,7 @@ async function fetchLegacyInto(
         say,
         behavior.checkpoint,
       ),
+      shallowMemory,
     );
 
     // A server without include-tag may omit annotated tag objects. Once their
@@ -1290,6 +1441,7 @@ async function fetchLegacyInto(
           say,
           behavior.checkpoint,
         ),
+        shallowMemory,
       );
     }
 
@@ -1329,33 +1481,119 @@ async function fetchLegacyInto(
     } else if (options.prune === true) {
       remoteHead = null;
     }
-
     const beforeRefs = behavior.checkpoint?.("before-ref-publication");
     if (beforeRefs !== undefined) await beforeRefs;
-    repo.publishFetchRefs(
-      publication,
-      {
-        trackingPuts,
-        ...(trackingKeep === undefined ? {} : { trackingKeep }),
-        ...(remoteHead === undefined ? {} : { remoteHead }),
-        globalTagPuts: selectedTags.map((tag) => ({ name: tag.ref.name, target: tag.ref.oid })),
-        shallowAdd: shallow.add,
-        shallowRemove: shallow.remove,
-      },
-      operationRefLogMetadata(context, repo, refLogReason),
+    resultOwner = createRefMutationMemoryOwner(repo.store);
+    const resultStructures = resultOwner.memoryReservation().scope();
+    resultStructures.set("other", FETCH_PUBLICATION_OBJECT_BYTES + publicationArrayBytes(0));
+    const updates: [] = [];
+    const result: LegacyFetchResult = {
+      mode: "legacy",
+      defaultBranch: copyPublicationNullable(resultOwner, defaultBranch),
+      fetchHead: copyPublicationNullable(resultOwner, fetchHead),
+      updates,
+    };
+    const publicationStructures = publicationOwner.memoryReservation().scope();
+    publicationStructures.set(
+      "other",
+      legacyPublicationSourceBytes({
+        trackingPuts: trackingPuts.length,
+        trackingKeep: trackingKeep?.length,
+        globalTagPuts: selectedTags.length,
+        shallowAdd: shallow.add.size,
+        shallowRemove: shallow.remove.size,
+      }),
     );
+    const plan: FetchPublicationPlan = {
+      trackingPuts: trackingPuts.map((row) => ({
+        name: copy(row.name),
+        target: copy(row.target),
+      })),
+      ...(trackingKeep === undefined
+        ? {}
+        : { trackingKeep: trackingKeep.map((name) => copy(name)) }),
+      ...(remoteHead === undefined
+        ? {}
+        : { remoteHead: remoteHead === null ? null : copy(remoteHead) }),
+      globalTagPuts: selectedTags.map((tag) => ({
+        name: copy(tag.ref.name),
+        target: copy(tag.ref.oid),
+      })),
+      shallowAdd: Array.from(shallow.add, (oid) => copy(oid)),
+      shallowRemove: Array.from(shallow.remove, (oid) => copy(oid)),
+    };
+    shallowStructures.dispose();
+    copyCacheMemory.dispose();
+    return {
+      publication,
+      plan,
+      result,
+      publicationOwner,
+      publicationStructures,
+      resultOwner,
+    };
+  } catch (error) {
     publication.dispose();
+    copyCacheMemory.dispose();
+    resultOwner?.dispose();
+    publicationOwner.dispose();
+    throw error;
+  }
+}
+
+async function fetchLegacyInto(
+  context: GitContext,
+  repo: Repository,
+  options: FetchOperationOptions & LegacyFetchSelection,
+  behavior: FetchBehavior,
+  refLogReason: "fetch" | "clone: fetch",
+  remote: string,
+  url: string,
+  advertisement: Advertisement | null,
+  auth: Parameters<typeof uploadPack>[1],
+  reservation: MemoryReservation,
+  budget: TransportOperationBudget,
+  releaseAdvertisement: () => void,
+): Promise<FetchResult> {
+  if (advertisement === null) throw new Error("legacy fetch lost its advertisement");
+  const prepared = await prepareLegacyFetchPublication(
+    context,
+    repo,
+    options,
+    behavior,
+    remote,
+    url,
+    advertisement,
+    auth,
+    reservation,
+    budget,
+  );
+  let plan = prepared.plan;
+  try {
+    advertisement = null;
+    releaseAdvertisement();
+    if (plan === null) throw new Error("legacy fetch lost its publication plan");
+    repo.store.publishFetchRefs(
+      prepared.publication,
+      plan,
+      operationRefLogMetadata(context, repo, refLogReason),
+      prepared.publicationOwner,
+    );
+    prepared.publication.dispose();
+    plan = null;
+    prepared.plan = null;
+    prepared.publicationStructures.dispose();
+    prepared.publicationOwner.dispose();
     const afterRefs = behavior.checkpoint?.("after-ref-publication");
     if (afterRefs !== undefined) await afterRefs;
-
-    return {
-      mode: "legacy",
-      defaultBranch: advertisement.headRef,
-      fetchHead: selection.result?.oid ?? null,
-      updates: [],
-    };
+    return prepared.result;
   } finally {
-    publication.dispose();
+    prepared.publication.dispose();
+    plan = null;
+    prepared.plan = null;
+    prepared.publicationStructures.dispose();
+    prepared.publicationOwner.dispose();
+    prepared.resultOwner.dispose();
   }
 }
 

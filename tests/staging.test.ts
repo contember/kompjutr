@@ -1122,7 +1122,7 @@ describe("add", () => {
     ]);
   });
 
-  it("rolls back first-window index and object writes when the second read window fails", () => {
+  it("keeps the first durable index page when the second read window fails", () => {
     class SecondWindowFailureWorktree extends CountingWorktree {
       calls = 0;
 
@@ -1149,8 +1149,18 @@ describe("add", () => {
     );
 
     expect(worktree.calls).toBe(2);
-    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
-    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    expect(
+      workspace.repo.checkout.indexEntries().map((entry) => ({
+        path: entry.path,
+        oid: entry.oid,
+      })),
+    ).toEqual(
+      Array.from({ length: 512 }, (_, index) => ({
+        path: `f${index.toString().padStart(4, "0")}.txt`,
+        oid: hashObject("blob", bytes),
+      })),
+    );
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects + 1);
     workspace.repo.store.memory.assertIdle();
   });
 

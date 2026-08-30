@@ -9,7 +9,7 @@ import {
   type IndexSink,
   type IndexStore,
   indexScanOwned,
-  MAX_BLOB_BATCH_BYTES,
+  PACK_BLOB_BATCH_TARGET_BYTES,
   readOperationStateOwned,
   replaceOperationJournalOwned,
   writeObjectsOwned,
@@ -56,6 +56,8 @@ const COLLECTION_ENTRY_BYTES = 96;
 const OBJECT_BYTES = 192;
 const ARRAY_SLOT_BYTES = 8;
 const OBJECT_INFO_PAGE = 4_096;
+const BLOB_READ_FIXED_BYTES = 640;
+const BLOB_READ_ENTRY_BYTES = 640;
 const OPERATION_STATE_FIXED_BYTES = 2 * 1024;
 const TOUCHED_DRAFT_FIXED_BYTES = 1024;
 
@@ -822,9 +824,6 @@ function collectBlobMetadata<T>(
           if (object.type !== "blob") {
             throw new CorruptError(`${label} object ${object.oid} is not a blob`);
           }
-          if (object.size > MAX_BLOB_BATCH_BYTES) {
-            throw new GitError("E2BIG", `merge blob object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
-          }
           retainedBytes = checkedMemoryBytes(
             retainedBytes,
             COLLECTION_ENTRY_BYTES + retainedStringBytes(object.oid),
@@ -945,7 +944,7 @@ function readAdmittedBlobBatch<T>(
       const nextPayload = selected.has(oid)
         ? payloadBytes
         : checkedMemoryBytes(payloadBytes, size, label);
-      if (nextPayload > MAX_BLOB_BATCH_BYTES && end > start) break;
+      if (nextPayload > PACK_BLOB_BATCH_TARGET_BYTES && end > start) break;
       const nextOids = selected.has(oid) ? selected.size : selected.size + 1;
       if (nextOids > OBJECT_INFO_PAGE && end > start) break;
       const nextBytes = blobBatchRetainedBytes(
@@ -973,11 +972,17 @@ function readAdmittedBlobBatch<T>(
         reservation.remainingBytes,
         label,
       );
-      if (nextBytes > availableBytes) {
-        if (end === start) memory.set("other", nextBytes);
+      const admittedBytes = checkedMemoryBytes(
+        nextBytes,
+        BLOB_READ_FIXED_BYTES + nextOids * BLOB_READ_ENTRY_BYTES,
+        label,
+      );
+      if (admittedBytes > availableBytes) {
+        if (end === start) memory.set("other", admittedBytes);
         break;
       }
-      memory.set("other", nextBytes);
+      memory.set("other", admittedBytes);
+      memory.set("other", nextBytes - nextPayload);
       selected.add(oid);
       payloadBytes = nextPayload;
       end++;
