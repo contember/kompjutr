@@ -13,6 +13,9 @@ import type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "../tr
 import {
   type CheckoutStore,
   isThenableResult,
+  OWNED_AUTHENTICATED_OBJECT_READERS,
+  OWNED_CONFIG_GETTERS,
+  OWNED_OBJECT_BATCHES,
   requireBooleanProbe,
   requireScratchIndexName,
   ScratchIndexStore,
@@ -29,6 +32,7 @@ import type {
   ObjectBatchOptions,
   ObjectReadBatch,
   ObjectReadInfo,
+  OwnedObjectBatch,
   RefLogEntry,
   RefLogMetadata,
   RefLogReadOptions,
@@ -37,6 +41,16 @@ import type {
   RefRow,
   TrackingRefPublicationToken,
 } from "./contracts.js";
+
+export interface SharedRepoOwnedOperations {
+  objectBatch(reservation: MemoryReservation, options: ObjectBatchOptions): OwnedObjectBatch;
+  authenticatedObject(
+    oid: string,
+    expectedType: ObjectType,
+    reservation: MemoryReservation,
+  ): RawObject | null;
+  configValue(path: string, owner: RefMutationMemoryOwner): string | undefined;
+}
 
 interface ScratchStorageCache {
   revalidateStorageCaches(): void;
@@ -112,6 +126,7 @@ export class SharedRepoStore {
   readonly #scratchTransactions: ScratchTransactionCoordinator;
   #packs: PackStore | null = null;
   #operations: CheckoutStore | null = null;
+  #ownedOperations: SharedRepoOwnedOperations | null = null;
   #cacheGeneration = 0;
   #hasLoose: boolean;
   #shallow: Set<string> | null = null;
@@ -143,6 +158,13 @@ export class SharedRepoStore {
       throw new CorruptError("shared store availability probe returned an invalid value");
     }
     this.#hasLoose = availability.has_loose === 1;
+    OWNED_OBJECT_BATCHES.set(this, (reservation, options) =>
+      this.#ownedOps().objectBatch(reservation, options),
+    );
+    OWNED_AUTHENTICATED_OBJECT_READERS.set(this, (oid, expectedType, reservation) =>
+      this.#ownedOps().authenticatedObject(oid, expectedType, reservation),
+    );
+    OWNED_CONFIG_GETTERS.set(this, (path, owner) => this.#ownedOps().configValue(path, owner));
   }
 
   installPacks(packs: PackStore): PackStore {
@@ -150,11 +172,17 @@ export class SharedRepoStore {
     return this.#packs;
   }
 
-  installOperations(operations: CheckoutStore): void {
+  installOperations(operations: CheckoutStore, ownedOperations: SharedRepoOwnedOperations): void {
     if (operations.sharedRepoId !== this.repoId) {
       throw new CorruptError("shared operations facade belongs to another repository");
     }
-    if (this.#operations === null) this.#operations = operations;
+    if (this.#operations === null) {
+      if (!operations.isPrimary) {
+        throw new CorruptError("shared operations facade must use the primary checkout");
+      }
+      this.#operations = operations;
+      this.#ownedOperations = ownedOperations;
+    }
   }
 
   /** Poison an owning scratch transaction when a nested operation fails. */
@@ -257,6 +285,13 @@ export class SharedRepoStore {
       throw new CorruptError("shared repository operations facade is unavailable");
     }
     return this.#operations;
+  }
+
+  #ownedOps(): SharedRepoOwnedOperations {
+    if (this.#ownedOperations === null) {
+      throw new CorruptError("shared repository owned operations are unavailable");
+    }
+    return this.#ownedOperations;
   }
 
   get packs(): PackStore {

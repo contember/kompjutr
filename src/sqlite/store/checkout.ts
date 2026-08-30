@@ -139,7 +139,7 @@ import {
   retainedStringUnits,
   TrackingRefPublicationToken,
 } from "./contracts.js";
-import type { SharedRepoStore } from "./shared.js";
+import type { SharedRepoOwnedOperations, SharedRepoStore } from "./shared.js";
 
 /** Bytes per `git_object_chunks` row. */
 export const OBJECT_CHUNK = 1024 * 1024;
@@ -3615,15 +3615,6 @@ export class CheckoutStore implements IndexStore {
     OWNED_REF_MUTATIONS.set(this, (mutation, metadata, owner) =>
       this.#mutateRefsOwned(mutation, metadata, owner),
     );
-    OWNED_OBJECT_BATCHES.set(shared, (reservation, batchOptions) =>
-      this.#writeBatchOwned(reservation, batchOptions),
-    );
-    OWNED_AUTHENTICATED_OBJECT_READERS.set(shared, (oid, expectedType, reservation) =>
-      this.#readAuthenticatedObjectOwned(oid, expectedType, reservation),
-    );
-    if (!OWNED_CONFIG_GETTERS.has(shared)) {
-      OWNED_CONFIG_GETTERS.set(shared, (path, owner) => this.#configGetOwned(path, owner));
-    }
     OWNED_INDEX_SCANS.set(this, (reservation, scanOptions) =>
       scanIndexOwned(
         this.#db,
@@ -3649,7 +3640,14 @@ export class CheckoutStore implements IndexStore {
           reservation,
         ),
     });
-    shared.installOperations(this);
+    const ownedOperations: SharedRepoOwnedOperations = {
+      objectBatch: (reservation, batchOptions) =>
+        this.#writeBatchOwned(reservation, batchOptions),
+      authenticatedObject: (oid, expectedType, reservation) =>
+        this.#readAuthenticatedObjectOwned(oid, expectedType, reservation),
+      configValue: (path, owner) => this.#configGetOwned(path, owner),
+    };
+    shared.installOperations(this, ownedOperations);
   }
 
   #requireActive(): void {

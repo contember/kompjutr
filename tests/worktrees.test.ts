@@ -629,6 +629,21 @@ describe("worktree remove", () => {
     expect(workspace.repo.has(later.oid)).toBe(true);
   });
 
+  it("keeps primary object writes active after removing a secondary checkout", async () => {
+    const workspace = makeRepo("/");
+    seedMain(workspace);
+    const git = bindGit(workspace);
+    await git.worktreeAdd({ root: "/wt", target: { kind: "new-branch", name: "wt" } });
+    await git.worktreeRemove({ root: "/wt" });
+
+    writeWorkFile(workspace, "/file.txt", "primary after removal\n");
+    await git.add({ dir: "/", paths: ["file.txt"] });
+    const committed = await git.commit({ dir: "/", message: "primary after removal" });
+
+    expect(workspace.repo.store.getRef("refs/heads/main")).toBe(committed.oid);
+    expect(workspace.repo.has(committed.oid)).toBe(true);
+  });
+
   it("removes a clean checkout and rejects modified, staged, and untracked roots without force", async () => {
     const mutations: readonly ("clean" | "modified" | "staged" | "untracked")[] = [
       "clean",
