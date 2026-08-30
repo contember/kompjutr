@@ -23,13 +23,8 @@ import {
 import { compileGlob, sqlGlobFor } from "./glob.js";
 
 const ARGUMENT_COUNT_MAX = 10_000;
-const ARGUMENT_BYTES_MAX = 1_000_000;
-const STDIN_BYTES_MAX = 1024 * 1024;
 const ENV_ENTRY_MAX = 256;
-const ENV_BYTES_MAX = 1024 * 1024;
 const PATH_PAGE_MAX = 1_000;
-// Filesystem.writeFileStream enforces this atomically before publishing a redirect.
-const ATOMIC_REDIRECT_BYTES_MAX = 96 * 1024 * 1024;
 const ENCODER = new TextEncoder();
 
 export interface ExecOptions {
@@ -177,8 +172,7 @@ function runPipeline(pipeline: PlannedPipeline, env: PipelineEnvironment): numbe
       try {
         produced = command(context);
       } catch (error) {
-        expanded.release();
-        throw error;
+        rethrowAfterCommandCleanup(error, expanded, mergedErrors);
       }
       const output = stageOutput(produced.stdout, mergedErrors, () => {
         try {
@@ -327,8 +321,8 @@ function measureEnvironment(
     if (typeof value !== "string") {
       throw new ShellLimitError("arguments", "caller env values must be strings");
     }
-    bytes = addUtf8Bytes(bytes, key, ENV_BYTES_MAX, "caller env");
-    bytes = addUtf8Bytes(bytes, value, ENV_BYTES_MAX, "caller env");
+    bytes = addUtf8Bytes(bytes, key, "caller env");
+    bytes = addUtf8Bytes(bytes, value, "caller env");
   }
   return { entries, bytes };
 }
@@ -349,17 +343,23 @@ function snapshotEnvironment(
     if (typeof value !== "string") {
       throw new ShellLimitError("arguments", "caller env values must be strings");
     }
-    bytes = addUtf8Bytes(bytes, key, measured.bytes, "caller env snapshot");
-    bytes = addUtf8Bytes(bytes, value, measured.bytes, "caller env snapshot");
+    bytes = addUtf8Bytes(bytes, key, "caller env snapshot");
+    bytes = addUtf8Bytes(bytes, value, "caller env snapshot");
+    if (bytes > measured.bytes) {
+      throw new ShellLimitError("arguments", "caller env changed while it was snapshotted");
+    }
     entries.push([key, value]);
+  }
+  if (entries.length !== measured.entries || bytes !== measured.bytes) {
+    throw new ShellLimitError("arguments", "caller env changed while it was snapshotted");
   }
   return Object.freeze(Object.fromEntries(entries));
 }
 
-function addUtf8Bytes(current: number, value: string, maximum: number, label: string): number {
-  const bytes = boundedUtf8Bytes(value, maximum - current);
-  if (bytes === null) {
-    throw new ShellLimitError("arguments", `${label} exceeds ${maximum} bytes`);
+function addUtf8Bytes(current: number, value: string, label: string): number {
+  const bytes = utf8Bytes(value);
+  if (bytes > Number.MAX_SAFE_INTEGER - current) {
+    throw new ShellLimitError("arguments", `${label} has an invalid retained size`);
   }
   return current + bytes;
 }
@@ -369,21 +369,14 @@ function stdinBytes(stdin: Uint8Array | string): number {
     if (!(stdin instanceof Uint8Array)) {
       throw new ShellLimitError("arguments", "caller stdin must be a string or Uint8Array");
     }
-    if (stdin.byteLength > STDIN_BYTES_MAX) {
-      throw new ShellLimitError("arguments", `caller stdin exceeds ${STDIN_BYTES_MAX} bytes`);
-    }
     return stdin.byteLength;
   }
 
-  const bytes = boundedUtf8Bytes(stdin, STDIN_BYTES_MAX);
-  if (bytes === null) {
-    throw new ShellLimitError("arguments", `caller stdin exceeds ${STDIN_BYTES_MAX} bytes`);
-  }
-  return bytes;
+  return utf8Bytes(stdin);
 }
 
 /** Match TextEncoder's replacement of unpaired surrogates without allocating. */
-function boundedUtf8Bytes(value: string, maximum: number): number | null {
+function utf8Bytes(value: string): number {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const code = value.charCodeAt(index);
@@ -396,7 +389,6 @@ function boundedUtf8Bytes(value: string, maximum: number): number | null {
         index++;
       } else bytes += 3;
     } else bytes += 3;
-    if (bytes > maximum) return null;
   }
   return bytes;
 }
@@ -466,12 +458,7 @@ function commandOutput(
   env: PipelineEnvironment,
 ): CommandContext["output"] {
   const destination = planned.stdout !== null ? "redirect" : lastStage ? "terminal" : "pipeline";
-  const destinationBytes =
-    destination === "terminal"
-      ? env.out.remaining
-      : destination === "redirect"
-        ? ATOMIC_REDIRECT_BYTES_MAX
-        : Number.MAX_SAFE_INTEGER;
+  const destinationBytes = destination === "terminal" ? env.out.remaining : Number.MAX_SAFE_INTEGER;
   const maxStdoutBytes = Math.min(destinationBytes, env.fs.retained.available);
   const discardStderr = planned.stderr === "drop";
   const maxStderrBytes = discardStderr
@@ -499,6 +486,28 @@ function safeSum(left: number, right: number): number {
 interface HeldChunk {
   readonly bytes: Uint8Array;
   release(): void;
+}
+
+function rethrowAfterCommandCleanup(
+  error: unknown,
+  expanded: ExpandedArguments,
+  mergedErrors: HeldChunk[],
+): never {
+  try {
+    expanded.release();
+  } catch {
+    // Cleanup must not replace the command's observable failure.
+  }
+  for (;;) {
+    const held = mergedErrors.pop();
+    if (held === undefined) break;
+    try {
+      held.release();
+    } catch {
+      // Keep releasing later owners, then rethrow the command failure.
+    }
+  }
+  throw error;
 }
 
 /** Interleave diagnostics emitted while pulling a command with its stdout. */
@@ -605,19 +614,16 @@ interface ExpandedArguments {
 function expandArguments(args: readonly Argument[], fs: BoundedFs, cwd: string): ExpandedArguments {
   const out: string[] = [];
   const releases: Array<() => void> = [];
-  let bytes = 0;
   const push = (value: string): void => {
-    const valueBytes = ENCODER.encode(value).byteLength;
-    const nextBytes = bytes + valueBytes;
-    if (out.length >= ARGUMENT_COUNT_MAX || nextBytes > ARGUMENT_BYTES_MAX) {
+    if (out.length >= ARGUMENT_COUNT_MAX) {
       throw new ShellLimitError(
         "arguments",
-        `E2BIG: expanded argv exceeds ${ARGUMENT_COUNT_MAX} entries or ${ARGUMENT_BYTES_MAX} bytes`,
+        `E2BIG: expanded argv exceeds ${ARGUMENT_COUNT_MAX} entries`,
       );
     }
+    const valueBytes = utf8Bytes(value);
     releases.push(fs.retained.retain(valueBytes, "command arguments"));
     out.push(value);
-    bytes = nextBytes;
   };
 
   try {

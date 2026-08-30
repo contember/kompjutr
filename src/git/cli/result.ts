@@ -1,9 +1,9 @@
 import { GitError } from "../../core/errors.js";
+import { retainedStringBytes } from "../../core/retained.js";
+import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import {
   GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
   GIT_CLI_MAX_LOG_COUNT,
-  GIT_CLI_MAX_STDERR_BYTES,
-  GIT_CLI_MAX_STDOUT_BYTES,
   type GitCliResult,
   type ResolvedGitCliRunOptions,
 } from "./types.js";
@@ -15,6 +15,7 @@ const OPTION_KEYS = new Set([
   "discardStderr",
   "logLimitHint",
 ]);
+const RESULT_FIXED_BYTES = 64;
 
 const USAGE = {
   status:
@@ -43,6 +44,11 @@ const PUSH_REFUSAL =
 
 export type GitCliUsageCommand = keyof typeof USAGE;
 
+export interface GitCliOutputContext {
+  readonly options: ResolvedGitCliRunOptions;
+  readonly reservation: MemoryReservation;
+}
+
 export function gitCliResult(stdout: string, stderr: string, exitCode: number): GitCliResult {
   validateResultString(stdout, "stdout");
   validateResultString(stderr, "stderr");
@@ -52,45 +58,85 @@ export function gitCliResult(stdout: string, stderr: string, exitCode: number): 
   return { stdout, stderr, exitCode };
 }
 
-export function gitCliUsageFailure(command: GitCliUsageCommand, detail: string): GitCliResult {
-  return gitCliResult("", `error: ${detail}\n${USAGE[command]}`, 129);
+export function gitCliUsageFailure(
+  command: GitCliUsageCommand,
+  detail: string,
+  context?: GitCliOutputContext,
+): GitCliResult {
+  return gitCliDiagnosticResult("error: ", detail, `\n${USAGE[command]}`, 129, context);
 }
 
 export function gitCliUnknownOptionFailure(
   command: GitCliUsageCommand,
   option: string,
+  context?: GitCliOutputContext,
 ): GitCliResult {
-  if (command === "rev-list") return gitCliResult("", USAGE[command], 129);
-  if (command === "diff") {
-    return gitCliResult("", `error: invalid option: ${option}\n${USAGE[command]}`, 129);
+  if (command === "rev-list") {
+    return gitCliDiagnosticResult(USAGE[command], "", "", 129, context);
   }
-  const label = option.startsWith("--") ? option.slice(2) : option.slice(1);
-  return gitCliResult("", `error: unknown option \`${label}'\n${USAGE[command]}`, 129);
+  if (command === "diff") {
+    return gitCliDiagnosticResult(
+      "error: invalid option: ",
+      option,
+      `\n${USAGE[command]}`,
+      129,
+      context,
+    );
+  }
+  if (context?.options.discardStderr === true) return emptyDiagnostic(129, context);
+  const offset = option.startsWith("--") ? 2 : 1;
+  return gitCliDiagnosticSliceResult(
+    "error: unknown option `",
+    option,
+    offset,
+    `'\n${USAGE[command]}`,
+    129,
+    context,
+  );
 }
 
-export function gitCliCommitMessageRequired(): GitCliResult {
-  return gitCliResult("", "error: switch `m' requires a value\n", 129);
+export function gitCliCommitMessageRequired(context?: GitCliOutputContext): GitCliResult {
+  return gitCliDiagnosticResult("error: switch `m' requires a value\n", "", "", 129, context);
 }
 
-export function gitCliLogFailure(detail: string): GitCliResult {
-  return gitCliResult("", `fatal: ${detail}\n`, 128);
+export function gitCliLogFailure(detail: string, context?: GitCliOutputContext): GitCliResult {
+  return gitCliDiagnosticResult("fatal: ", detail, "\n", 128, context);
 }
 
-export function gitCliUnknownCommand(command: string | undefined): GitCliResult {
-  if (command === undefined) return gitCliResult("", "git: no command specified\n", 1);
-  return gitCliResult("", `git: '${command}' is not a git command. See 'git --help'.\n`, 1);
+export function gitCliUnknownCommand(
+  command: string | undefined,
+  context?: GitCliOutputContext,
+): GitCliResult {
+  if (command === undefined) {
+    return gitCliDiagnosticResult("git: no command specified\n", "", "", 1, context);
+  }
+  return gitCliDiagnosticResult(
+    "git: '",
+    command,
+    "' is not a git command. See 'git --help'.\n",
+    1,
+    context,
+  );
 }
 
-export function gitCliNetworkRefusal(command: string): GitCliResult {
-  if (command === "push") return gitCliResult("", PUSH_REFUSAL, 128);
-  return gitCliResult("", `fatal: network command '${command}' is not supported\n`, 128);
+export function gitCliNetworkRefusal(command: string, context?: GitCliOutputContext): GitCliResult {
+  if (command === "push") {
+    return gitCliDiagnosticResult(PUSH_REFUSAL, "", "", 128, context);
+  }
+  return gitCliDiagnosticResult(
+    "fatal: network command '",
+    command,
+    "' is not supported\n",
+    128,
+    context,
+  );
 }
 
 export function resolveGitCliRunOptions(value: unknown): ResolvedGitCliRunOptions {
   if (value === undefined) {
     return {
-      maxStdoutBytes: GIT_CLI_MAX_STDOUT_BYTES,
-      maxStderrBytes: GIT_CLI_MAX_STDERR_BYTES,
+      maxStdoutBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
+      maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
       maxCombinedOutputBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
       discardStderr: false,
     };
@@ -99,8 +145,16 @@ export function resolveGitCliRunOptions(value: unknown): ResolvedGitCliRunOption
     throw new GitError("EINVAL", "git CLI run options must be a plain object");
   }
   validateOptionKeys(value);
-  const maxStdoutBytes = optionalCeiling(value, "maxStdoutBytes", GIT_CLI_MAX_STDOUT_BYTES);
-  const maxStderrBytes = optionalCeiling(value, "maxStderrBytes", GIT_CLI_MAX_STDERR_BYTES);
+  const maxStdoutBytes = optionalCeiling(
+    value,
+    "maxStdoutBytes",
+    GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
+  );
+  const maxStderrBytes = optionalCeiling(
+    value,
+    "maxStderrBytes",
+    GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
+  );
   const maxCombinedOutputBytes = optionalCeiling(
     value,
     "maxCombinedOutputBytes",
@@ -134,35 +188,61 @@ export function resolveGitCliRunOptions(value: unknown): ResolvedGitCliRunOption
 export function boundedGitCliResult(
   result: GitCliResult,
   options: ResolvedGitCliRunOptions,
+  owningReservation?: MemoryReservation,
 ): GitCliResult {
-  if (typeof result !== "object" || result === null || Array.isArray(result)) {
-    throw new GitError("EINVAL", "git CLI handler result must be an object");
-  }
-  const checked = gitCliResult(result.stdout, result.stderr, result.exitCode);
-  const stdoutBytes = gitCliUtf8ByteLength(checked.stdout, "git CLI stdout", false);
-  if (stdoutBytes > options.maxStdoutBytes) {
-    throw new GitError("E2BIG", `git CLI stdout exceeds ${options.maxStdoutBytes} bytes`);
-  }
-  if (options.discardStderr) {
-    if (stdoutBytes > options.maxCombinedOutputBytes) {
+  const reservation = owningReservation ?? new MemoryCoordinator().reserve();
+  try {
+    if (typeof result !== "object" || result === null || Array.isArray(result)) {
+      throw new GitError("EINVAL", "git CLI handler result must be an object");
+    }
+    const stdout: unknown = Reflect.get(result, "stdout");
+    const stderr: unknown = Reflect.get(result, "stderr");
+    const exitCode: unknown = Reflect.get(result, "exitCode");
+    validateResultString(stdout, "stdout");
+    validateResultString(stderr, "stderr");
+    validateExitCode(exitCode);
+    const initialRetained = gitCliResultRetainedBytes(stdout, stderr);
+    reservation.set("flat", initialRetained);
+    const stdoutBytes = gitCliUtf8ByteLength(stdout, "git CLI stdout", false);
+    if (stdoutBytes > options.maxStdoutBytes) {
+      throw new GitError("E2BIG", `git CLI stdout exceeds ${options.maxStdoutBytes} bytes`);
+    }
+    if (options.discardStderr) {
+      if (stdoutBytes > options.maxCombinedOutputBytes) {
+        throw new GitError(
+          "E2BIG",
+          `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
+        );
+      }
+      const retained = gitCliResultRetainedBytes(stdout, "");
+      reservation.set("flat", initialRetained + RESULT_FIXED_BYTES);
+      const discarded = { stdout, stderr: "", exitCode };
+      result = discarded;
+      reservation.set("flat", retained);
+      return result;
+    }
+    const stderrBytes = gitCliUtf8ByteLength(stderr, "git CLI stderr", false);
+    if (stderrBytes > options.maxStderrBytes) {
+      throw new GitError("E2BIG", `git CLI stderr exceeds ${options.maxStderrBytes} bytes`);
+    }
+    if (stderrBytes > options.maxCombinedOutputBytes - stdoutBytes) {
       throw new GitError(
         "E2BIG",
         `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
       );
     }
-    return { stdout: checked.stdout, stderr: "", exitCode: checked.exitCode };
+    reservation.set("flat", initialRetained + RESULT_FIXED_BYTES);
+    const checked = { stdout, stderr, exitCode };
+    result = checked;
+    reservation.set("flat", initialRetained);
+    return result;
+  } finally {
+    if (owningReservation === undefined) reservation.dispose();
   }
-  const stderrBytes = gitCliUtf8ByteLength(checked.stderr, "git CLI stderr", false);
-  if (stderrBytes > options.maxStderrBytes) {
-    throw new GitError("E2BIG", `git CLI stderr exceeds ${options.maxStderrBytes} bytes`);
-  }
-  if (stderrBytes > options.maxCombinedOutputBytes - stdoutBytes) {
-    throw new GitError(
-      "E2BIG",
-      `git CLI combined output exceeds ${options.maxCombinedOutputBytes} bytes`,
-    );
-  }
-  return checked;
+}
+
+export function gitCliResultRetainedBytes(stdout: string, stderr: string): number {
+  return RESULT_FIXED_BYTES + retainedStringBytes(stdout) + retainedStringBytes(stderr);
 }
 
 export function gitCliUtf8ByteLength(value: string, label: string, rejectNul: boolean): number {
@@ -191,6 +271,132 @@ function validateResultString(value: unknown, stream: string): asserts value is 
   if (typeof value !== "string") {
     throw new GitError("EINVAL", `git CLI ${stream} must be a string`);
   }
+}
+
+function validateExitCode(exitCode: unknown): asserts exitCode is number {
+  if (
+    typeof exitCode !== "number" ||
+    !Number.isSafeInteger(exitCode) ||
+    exitCode < 0 ||
+    exitCode > 255
+  ) {
+    throw new GitError("EINVAL", "git CLI exit code must be a safe integer from 0 through 255");
+  }
+}
+
+export function gitCliDiagnosticResult(
+  prefix: string,
+  value: string,
+  suffix: string,
+  exitCode: number,
+  context?: GitCliOutputContext,
+): GitCliResult {
+  return gitCliDiagnosticResultParts(prefix, value, "", "", suffix, exitCode, context);
+}
+
+export function gitCliDiagnosticResultParts(
+  first: string,
+  second: string,
+  third: string,
+  fourth: string,
+  fifth: string,
+  exitCode: number,
+  context?: GitCliOutputContext,
+): GitCliResult {
+  if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode, context);
+  if (context !== undefined) {
+    const stderrBytes =
+      gitCliUtf8ByteLength(first, "git CLI stderr", false) +
+      gitCliUtf8ByteLength(second, "git CLI stderr", false) +
+      gitCliUtf8ByteLength(third, "git CLI stderr", false) +
+      gitCliUtf8ByteLength(fourth, "git CLI stderr", false) +
+      gitCliUtf8ByteLength(fifth, "git CLI stderr", false);
+    if (stderrBytes > context.options.maxStderrBytes) {
+      throw new GitError("E2BIG", `git CLI stderr exceeds ${context.options.maxStderrBytes} bytes`);
+    }
+    if (stderrBytes > context.options.maxCombinedOutputBytes) {
+      throw new GitError(
+        "E2BIG",
+        `git CLI combined output exceeds ${context.options.maxCombinedOutputBytes} bytes`,
+      );
+    }
+    context.reservation.set(
+      "flat",
+      diagnosticRetainedBytes(
+        first.length + second.length + third.length + fourth.length + fifth.length,
+      ),
+    );
+  }
+  return gitCliResult("", `${first}${second}${third}${fourth}${fifth}`, exitCode);
+}
+
+export function gitCliDiagnosticSliceResult(
+  prefix: string,
+  source: string,
+  start: number,
+  suffix: string,
+  exitCode: number,
+  context?: GitCliOutputContext,
+): GitCliResult {
+  if (context?.options.discardStderr === true) return emptyDiagnostic(exitCode, context);
+  const sliceBytes = retainedStringUnits(source.length - start);
+  if (context !== undefined) {
+    const stderrBytes =
+      gitCliUtf8ByteLength(prefix, "git CLI stderr", false) +
+      gitCliUtf8ByteLengthRange(source, start, "git CLI stderr") +
+      gitCliUtf8ByteLength(suffix, "git CLI stderr", false);
+    if (stderrBytes > context.options.maxStderrBytes) {
+      throw new GitError("E2BIG", `git CLI stderr exceeds ${context.options.maxStderrBytes} bytes`);
+    }
+    if (stderrBytes > context.options.maxCombinedOutputBytes) {
+      throw new GitError(
+        "E2BIG",
+        `git CLI combined output exceeds ${context.options.maxCombinedOutputBytes} bytes`,
+      );
+    }
+    context.reservation.set(
+      "flat",
+      diagnosticRetainedBytes(prefix.length + source.length - start + suffix.length) + sliceBytes,
+    );
+  }
+  let value = source.slice(start);
+  const result = gitCliResult("", `${prefix}${value}${suffix}`, exitCode);
+  value = "";
+  context?.reservation.set("flat", gitCliResultRetainedBytes(result.stdout, result.stderr));
+  return result;
+}
+
+function emptyDiagnostic(exitCode: number, context: GitCliOutputContext): GitCliResult {
+  context.reservation.set("flat", gitCliResultRetainedBytes("", ""));
+  return gitCliResult("", "", exitCode);
+}
+
+function diagnosticRetainedBytes(stderrUnits: number): number {
+  return RESULT_FIXED_BYTES + retainedStringBytes("") + retainedStringUnits(stderrUnits);
+}
+
+function retainedStringUnits(codeUnits: number): number {
+  return retainedStringBytes("") + codeUnits * 2;
+}
+
+function gitCliUtf8ByteLengthRange(value: string, start: number, label: string): number {
+  let bytes = 0;
+  for (let index = start; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff)) {
+        throw new GitError("EINVAL", `${label} must be well-formed UTF-16`);
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new GitError("EINVAL", `${label} must be well-formed UTF-16`);
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+  }
+  return bytes;
 }
 
 function validateOptionKeys(value: object): void {

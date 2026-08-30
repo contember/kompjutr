@@ -13,15 +13,20 @@ import { eagerStatus } from "../../core/ops/status.js";
 import { formatCommitRefusalStatus, statusFormatOptions } from "../../core/ops/status-format.js";
 import { joinPath, normalizePath, relativeTo } from "../../core/paths.js";
 import type { Repository, ResolvedHead } from "../../core/repository.js";
+import type { MemoryReservation } from "../../memory.js";
 import { MAX_BLOB_BATCH_BYTES, type WalkTreeDiffEntry } from "../../sqlite/store.js";
-import { boundedGitCliResult, gitCliResult, gitCliUtf8ByteLength } from "./result.js";
 import {
-  GIT_CLI_MAX_STDERR_BYTES,
-  GIT_CLI_MAX_STDOUT_BYTES,
-  type GitCliEnvironment,
-  type GitCliHandlers,
-  type GitCliResult,
-  type ResolvedGitCliRunOptions,
+  boundedGitCliResult,
+  type GitCliOutputContext,
+  gitCliDiagnosticResult,
+  gitCliResult,
+  gitCliUtf8ByteLength,
+} from "./result.js";
+import type {
+  GitCliEnvironment,
+  GitCliHandlers,
+  GitCliResult,
+  ResolvedGitCliRunOptions,
 } from "./types.js";
 
 const HEADS = "refs/heads/";
@@ -63,12 +68,14 @@ interface RootSummaryRow {
 
 export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
   return {
-    add(invocation, options) {
-      return withRepository(context, invocation.cwd, options, (repo) => {
+    add(invocation, options, reservation) {
+      const output = outputContext(options, reservation);
+      return withRepository(context, invocation.cwd, options, reservation, (repo) => {
         let paths: ResolvedAddPath[] = [];
         return runMutation(
           repo,
           options,
+          reservation,
           () => {
             paths = resolveAddPaths(repo, invocation.cwd, invocation.command.paths);
             return addLiteralPaths(
@@ -82,15 +89,16 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
             );
           },
           (outcome) => formatAddResult(outcome, options),
-          (error) => mapAddFailure(error, paths),
+          (error) => mapAddFailure(error, paths, output),
         );
       });
     },
-    commit(invocation, options) {
-      return withRepository(context, invocation.cwd, options, (repo) =>
+    commit(invocation, options, reservation) {
+      return withRepository(context, invocation.cwd, options, reservation, (repo) =>
         runMutation(
           repo,
           options,
+          reservation,
           () => {
             if (!repo.checkout.hasConflicts()) repo.checkout.requireNoOperationState();
             const previousHead = repo.head();
@@ -115,13 +123,14 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         ),
       );
     },
-    rebase(invocation, options) {
-      return withRepository(context, invocation.cwd, options, (repo) => {
+    rebase(invocation, options, reservation) {
+      return withRepository(context, invocation.cwd, options, reservation, (repo) => {
         requireTransactionalWorktree(context, repo);
         if (invocation.command.action === "abort") {
           return runMutation(
             repo,
             options,
+            reservation,
             () => rebaseAbortExcluding(repo, context.worktree, nestedRoots(context, repo.root)),
             () => gitCliResult("", "", 0),
             mapRebaseFailure,
@@ -130,6 +139,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
         return runMutation(
           repo,
           options,
+          reservation,
           () => {
             const before = repo.checkout.requireOperationState("rebase");
             const result = rebaseContinueExcluding(
@@ -152,6 +162,7 @@ export function createGitCliWriteHandlers(context: GitContext): WriteHandlers {
 function runMutation<Outcome>(
   repo: Repository,
   options: ResolvedGitCliRunOptions,
+  reservation: MemoryReservation,
   operation: () => Outcome,
   formatSuccess: (outcome: Outcome) => GitCliResult,
   mapOperationFailure: (error: unknown) => GitCliResult | undefined,
@@ -164,14 +175,14 @@ function runMutation<Outcome>(
       phase = "format-success";
       const result = formatSuccess(outcome);
       phase = "preflight";
-      return boundedGitCliResult(result, options);
+      return boundedGitCliResult(result, options, reservation);
     });
   } catch (error) {
     repo.store.revalidateStorageCaches();
     if (phase !== "native-operation") throw error;
     const mapped = mapOperationFailure(error);
     if (mapped === undefined) throw error;
-    return boundedGitCliResult(mapped, options);
+    return boundedGitCliResult(mapped, options, reservation);
   }
 }
 
@@ -179,6 +190,7 @@ function withRepository(
   context: GitContext,
   cwd: string,
   options: ResolvedGitCliRunOptions,
+  reservation: MemoryReservation,
   body: (repo: Repository) => GitCliResult,
 ): GitCliResult {
   let repo: Repository;
@@ -193,6 +205,7 @@ function withRepository(
         128,
       ),
       options,
+      reservation,
     );
   }
   return body(repo);
@@ -232,6 +245,7 @@ function formatAddResult(
   options: ResolvedGitCliRunOptions,
 ): GitCliResult {
   if (result.outcome === "staged") return gitCliResult("", "", 0);
+  if (options.discardStderr) return gitCliResult("", "", 1);
   const stderr = new BoundedSummaryOutput(retainedStderrCeiling(options), "git CLI add stderr");
   stderr.append("The following paths are ignored by one of your .gitignore files:\n");
   for (const path of result.paths) stderr.append(`${path}\n`);
@@ -243,18 +257,35 @@ function formatAddResult(
 function mapAddFailure(
   error: unknown,
   paths: readonly ResolvedAddPath[],
+  output: GitCliOutputContext,
 ): GitCliResult | undefined {
   const message = untrustedErrorMessage(error);
   if (hasErrorCode(error, "EPATHOUTSIDE") && message !== undefined) {
-    return gitCliResult("", `fatal: ${message}\n`, 128);
+    return gitCliDiagnosticResult("fatal: ", message, "\n", 128, output);
   }
   if (hasErrorCode(error, "EPATHSPEC") && message !== undefined) {
+    if (output.options.discardStderr) {
+      return gitCliDiagnosticResult("", "", "", 128, output);
+    }
     for (const path of paths) {
-      if (message === `pathspec '${path.path}' did not match any files`) {
-        return gitCliResult("", `fatal: pathspec '${path.input}' did not match any files\n`, 128);
+      const prefix = "pathspec '";
+      const suffix = "' did not match any files";
+      if (
+        message.length === prefix.length + path.path.length + suffix.length &&
+        message.startsWith(prefix) &&
+        message.startsWith(path.path, prefix.length) &&
+        message.endsWith(suffix)
+      ) {
+        return gitCliDiagnosticResult(
+          "fatal: pathspec '",
+          path.input,
+          "' did not match any files\n",
+          128,
+          output,
+        );
       }
     }
-    return gitCliResult("", `fatal: ${message}\n`, 128);
+    return gitCliDiagnosticResult("fatal: ", message, "\n", 128, output);
   }
   return undefined;
 }
@@ -679,22 +710,29 @@ function formatRebaseContinue(
   options: ResolvedGitCliRunOptions,
 ): GitCliResult {
   const before = mutation.before;
-  const stderr = new BoundedSummaryOutput(retainedStderrCeiling(options), "git CLI rebase stderr");
-  appendRebaseProgress(stderr, before.state.currentStep, before.steps.length, mutation.result);
-  if (mutation.result.outcome === "completed") {
-    stderr.append(`Successfully rebased and updated ${before.state.originalHeadRef}.\n`);
-  } else if (mutation.result.outcome === "conflicted") {
-    const current = repo.checkout.requireOperationState("rebase");
-    const step = current.steps[current.state.currentStep];
-    if (step === undefined) throw new Error("conflicted rebase has no current step");
-    const source = repo.readCommit(step.sourceOid);
-    stderr.append(
-      `error: could not apply ${step.sourceOid.slice(0, 7)}... ${subject(source.message)}\n`,
-    );
-  } else {
+  if (mutation.result.outcome !== "completed" && mutation.result.outcome !== "conflicted") {
     throw new Error(`rebase continuation returned ${mutation.result.outcome}`);
   }
-  const formattedStderr = stderr.finish();
+  let formattedStderr = "";
+  if (!options.discardStderr) {
+    const stderr = new BoundedSummaryOutput(
+      retainedStderrCeiling(options),
+      "git CLI rebase stderr",
+    );
+    appendRebaseProgress(stderr, before.state.currentStep, before.steps.length, mutation.result);
+    if (mutation.result.outcome === "completed") {
+      stderr.append(`Successfully rebased and updated ${before.state.originalHeadRef}.\n`);
+    } else if (mutation.result.outcome === "conflicted") {
+      const current = repo.checkout.requireOperationState("rebase");
+      const step = current.steps[current.state.currentStep];
+      if (step === undefined) throw new Error("conflicted rebase has no current step");
+      const source = repo.readCommit(step.sourceOid);
+      stderr.append(
+        `error: could not apply ${step.sourceOid.slice(0, 7)}... ${subject(source.message)}\n`,
+      );
+    }
+    formattedStderr = stderr.finish();
+  }
   const commitOid = continuedCommitOid(repo, mutation);
   const stdout =
     commitOid === undefined
@@ -797,21 +835,28 @@ function summaryRetainedCeiling(maximum: number): number {
 function retainedStdoutCeiling(options: ResolvedGitCliRunOptions, stderrBytes: number): number {
   const retainedStderr = options.discardStderr ? 0 : stderrBytes;
   return Math.min(
-    GIT_CLI_MAX_STDOUT_BYTES,
     options.maxStdoutBytes,
     Math.max(0, options.maxCombinedOutputBytes - retainedStderr),
   );
 }
 
 function retainedStderrCeiling(options: ResolvedGitCliRunOptions): number {
-  if (options.discardStderr) return GIT_CLI_MAX_STDOUT_BYTES;
-  return Math.min(GIT_CLI_MAX_STDERR_BYTES, options.maxStderrBytes, options.maxCombinedOutputBytes);
+  if (options.discardStderr) return Number.MAX_SAFE_INTEGER;
+  return Math.min(options.maxStderrBytes, options.maxCombinedOutputBytes);
 }
 
 function boundedFailureStderr(value: string, options: ResolvedGitCliRunOptions): string {
+  if (options.discardStderr) return "";
   const out = new BoundedSummaryOutput(retainedStderrCeiling(options), "git CLI failure stderr");
   out.append(value);
   return out.finish();
+}
+
+function outputContext(
+  options: ResolvedGitCliRunOptions,
+  reservation: MemoryReservation,
+): GitCliOutputContext {
+  return { options, reservation };
 }
 
 class BoundedSummaryOutput {

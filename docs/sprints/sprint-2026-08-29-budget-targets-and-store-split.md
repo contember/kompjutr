@@ -629,6 +629,22 @@ shape exceptions, store import topology and proportional per-WU review.
   diff-check, build, public exports and package smoke passed. The 166/166 routine
   smoke gate passed in 13.76 s under a two-vCPU lease; the full suite remains
   deferred to sprint closure.
+- 2026-08-30 — WU6f removed the reviewed Git CLI argv, env, stdin, cwd, commit-
+  message, log-format, stdout and stderr component ceilings plus the shell argv,
+  env, stdin and cumulative redirect limits. One CLI invocation reservation now
+  owns parser-created copies, built-in handler construction and combined returned
+  output; shell caller snapshots, expanded argv, pipeline state and cleanup share
+  its existing retained owner. Caller-provided lower output options, structural
+  entry limits and syntax checks remain. A >96 MiB shell redirect streams through
+  `BoundedFs` without retaining the total and remains atomic on late source or
+  filesystem failure. Independent review-to-clean closed allocation-before-
+  admission, retained-string sizing, mutable-input, discarded-diagnostic,
+  output-builder coexistence, error-precedence and synchronous pipeline-cleanup
+  findings; both CLI and shell verdicts were CLEAN. Focused CLI and shell input,
+  combined-output, redirect and cleanup witnesses, typecheck, Biome, diff-check,
+  build and package smoke passed. The 166/166 routine smoke gate passed in 13.65 s
+  under a two-vCPU lease; no projected statement-count barrier was added and the
+  full suite remains deferred to sprint closure.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

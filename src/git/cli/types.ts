@@ -1,14 +1,8 @@
+import type { MemoryReservation } from "../../memory.js";
+
 export const GIT_CLI_MAX_ARGV_ENTRIES = 256;
-export const GIT_CLI_MAX_ARGV_BYTES = 1024 * 1024;
 export const GIT_CLI_MAX_ENV_ENTRIES = 256;
-export const GIT_CLI_MAX_ENV_BYTES = 1024 * 1024;
-export const GIT_CLI_MAX_STDIN_BYTES = 1024 * 1024;
-export const GIT_CLI_MAX_CWD_BYTES = 4 * 1024;
-export const GIT_CLI_MAX_COMMIT_MESSAGE_BYTES = 1024 * 1024;
-export const GIT_CLI_MAX_LOG_FORMAT_BYTES = 64 * 1024;
 export const GIT_CLI_MAX_LOG_COUNT = 50_000;
-export const GIT_CLI_MAX_STDOUT_BYTES = 16 * 1024 * 1024;
-export const GIT_CLI_MAX_STDERR_BYTES = 1024 * 1024;
 export const GIT_CLI_MAX_COMBINED_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 export interface GitCliInput {
@@ -121,6 +115,7 @@ export interface GitCliInvocation<Command extends ParsedGitCliCommand = ParsedGi
 export type GitCliCommandHandler<Command extends ParsedGitCliCommand> = (
   invocation: GitCliInvocation<Command>,
   options: ResolvedGitCliRunOptions,
+  reservation: MemoryReservation,
 ) => GitCliResult;
 
 export interface GitCliHandlers {

@@ -4,15 +4,16 @@ import type { Filesystem } from "../../src/fs/types.js";
 import type { GitCliRunner } from "../../src/git/cli/types.js";
 import { createGitCommand } from "../../src/git/shell.js";
 import type { ByteStream } from "../../src/shell/exec/bytes.js";
-import { type Command, result } from "../../src/shell/exec/context.js";
+import { type Command, RetainedBudget, result } from "../../src/shell/exec/context.js";
 import { RunInputOwner } from "../../src/shell/exec/execute.js";
 import { createShell, type Shell } from "../../src/shell/index.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 
-const STDIN_BYTES_MAX = 1024 * 1024;
+const FORMER_ARGUMENT_BYTES_MAX = 1_000_000;
+const FORMER_STDIN_BYTES_MAX = 1024 * 1024;
 const ENV_ENTRY_MAX = 256;
-const ENV_BYTES_MAX = 1024 * 1024;
+const FORMER_ENV_BYTES_MAX = 1024 * 1024;
 const ENCODER = new TextEncoder();
 
 interface Fixture {
@@ -168,7 +169,7 @@ describe("caller stdin", () => {
     const env: Record<string, string> = {};
     for (let index = 0; index <= ENV_ENTRY_MAX; index++) env[`K${index}`] = "";
     const run = subject.shell.run("'unterminated", {
-      stdin: new Uint8Array(STDIN_BYTES_MAX + 1),
+      stdin: new Uint8Array(FORMER_STDIN_BYTES_MAX + 1),
       env,
     });
 
@@ -178,13 +179,14 @@ describe("caller stdin", () => {
     close.mockRestore();
   });
 
-  it("accepts the exact byte cap and rejects its first excess before work", () => {
+  it("accepts caller-owned stdin beyond the former component limit", () => {
     let calls = 0;
     const called: Command = () => {
       calls++;
       return result(empty());
     };
-    const exact = createShell({
+    const supplied = new Uint8Array(FORMER_STDIN_BYTES_MAX + 1);
+    const shell = createShell({
       fs: fixture().filesystem,
       cwd: "/repo",
       commands: new Map([["called", called]]),
@@ -192,32 +194,28 @@ describe("caller stdin", () => {
         maxOutputBytes: 1_000_000,
         maxOperations: 10,
         readBudget: 1_000,
-        maxRetainedBytes: STDIN_BYTES_MAX,
+        maxRetainedBytes: supplied.length,
       },
     });
 
-    expect(exact.run("called", { stdin: new Uint8Array(STDIN_BYTES_MAX) })).toMatchObject({
+    expect(shell.run("called", { stdin: supplied })).toMatchObject({
       exitCode: 0,
       operations: 0,
-      peakRetainedBytes: STDIN_BYTES_MAX,
+      peakRetainedBytes: supplied.length,
     });
-    expect(calls).toBe(1);
-
-    const excess = exact.run("called", { stdin: new Uint8Array(STDIN_BYTES_MAX + 1) });
-    expect(excess).toMatchObject({ exitCode: 2, operations: 0, peakRetainedBytes: 0 });
-    expect(excess.stderr).toContain("caller stdin exceeds");
     expect(calls).toBe(1);
   });
 
   it("measures UTF-8 before encoding and enforces configured retained memory", () => {
     const subject = fixture();
-    const exact = `${"a".repeat(STDIN_BYTES_MAX - 4)}😀`;
+    const exact = `${"a".repeat(FORMER_STDIN_BYTES_MAX - 4)}😀`;
 
-    expect(subject.shell.run("true", { stdin: exact }).peakRetainedBytes).toBe(STDIN_BYTES_MAX);
+    expect(subject.shell.run("true", { stdin: exact }).peakRetainedBytes).toBe(
+      FORMER_STDIN_BYTES_MAX,
+    );
     expect(subject.shell.run("true", { stdin: `${exact}a` })).toMatchObject({
-      exitCode: 2,
-      operations: 0,
-      peakRetainedBytes: 0,
+      exitCode: 0,
+      peakRetainedBytes: FORMER_STDIN_BYTES_MAX + 1,
     });
 
     let called = false;
@@ -252,6 +250,88 @@ describe("caller stdin", () => {
     const subject = fixture();
 
     expect(subject.shell.run("pwd")).toEqual(subject.shell.run("pwd", {}));
+  });
+
+  it("releases the shared input and pipeline owner on success, error, and early close", () => {
+    let retained: RetainedBudget | undefined;
+    const observe: Command = (context) => {
+      retained = context.fs.retained;
+      return result(context.stdin ?? empty());
+    };
+    const fail: Command = (context) => {
+      retained = context.fs.retained;
+      throw new Error("injected command failure");
+    };
+    const subject = fixture(
+      new Map([
+        ["observe", observe],
+        ["fail", fail],
+      ]),
+    );
+
+    expect(subject.shell.run("observe", { stdin: "success" }).exitCode).toBe(0);
+    expect(retained?.available).toBe(retained?.max);
+
+    expect(() => subject.shell.run("fail", { stdin: "error" })).toThrow("injected command failure");
+    expect(retained?.available).toBe(retained?.max);
+
+    expect(subject.shell.run("observe | head -0", { stdin: "early" }).exitCode).toBe(0);
+    expect(retained?.available).toBe(retained?.max);
+  });
+
+  it("releases merged diagnostics when a command warns and then throws synchronously", () => {
+    const failure = new Error("injected failure after warning");
+    let retained: RetainedBudget | undefined;
+    const warnThenFail: Command = (context) => {
+      retained = context.fs.retained;
+      context.warn("retained warning");
+      throw failure;
+    };
+    const subject = fixture(new Map([["warn-then-fail", warnThenFail]]));
+
+    expect(() => subject.shell.run("warn-then-fail argument 2>&1")).toThrow(failure);
+    expect(retained?.available).toBe(retained?.max);
+  });
+
+  it("releases earlier expanded arguments when a later argument exceeds the aggregate", () => {
+    let calls = 0;
+    const called: Command = () => {
+      calls++;
+      return result(empty());
+    };
+    const subject = fixture();
+    const bounded = createShell({
+      fs: subject.filesystem,
+      cwd: "/repo",
+      commands: new Map([["called", called]]),
+      limits: {
+        maxOutputBytes: 100,
+        maxOperations: 10,
+        readBudget: 100,
+        maxRetainedBytes: 8,
+      },
+    });
+    const originalRetain = RetainedBudget.prototype.retain;
+    let retained: RetainedBudget | undefined;
+    const retain = vi.spyOn(RetainedBudget.prototype, "retain").mockImplementation(function (
+      this: RetainedBudget,
+      bytes,
+      label,
+    ) {
+      retained = this;
+      return originalRetain.call(this, bytes, label);
+    });
+
+    try {
+      const run = bounded.run("called abc defghi");
+      expect(run.exitCode).toBe(2);
+      expect(run.stderr).toContain("retained-memory limit");
+      expect(run.peakRetainedBytes).toBe(3);
+      expect(calls).toBe(0);
+      expect(retained?.available).toBe(8);
+    } finally {
+      retain.mockRestore();
+    }
   });
 });
 
@@ -290,7 +370,7 @@ describe("caller environment", () => {
     expect(direct).toBeUndefined();
   });
 
-  it("accepts exact entry and UTF-8 byte caps and rejects their first excesses", () => {
+  it("keeps the entry cap but accepts env beyond the former byte component limit", () => {
     let calls = 0;
     const called: Command = () => {
       calls++;
@@ -311,16 +391,10 @@ describe("caller environment", () => {
     });
     expect(calls).toBe(1);
 
-    const exactBytes = { K: `${"a".repeat(ENV_BYTES_MAX - 5)}😀` };
-    expect(subject.shell.run("called", { env: exactBytes })).toMatchObject({
+    const formerExcess = { K: "a".repeat(FORMER_ENV_BYTES_MAX) };
+    expect(subject.shell.run("called", { env: formerExcess })).toMatchObject({
       exitCode: 0,
-      peakRetainedBytes: ENV_BYTES_MAX,
-    });
-    expect(calls).toBe(2);
-    expect(subject.shell.run("called", { env: { ...exactBytes, X: "" } })).toMatchObject({
-      exitCode: 2,
-      operations: 0,
-      peakRetainedBytes: 0,
+      peakRetainedBytes: FORMER_ENV_BYTES_MAX + 1,
     });
     expect(calls).toBe(2);
   });
@@ -364,5 +438,54 @@ describe("caller environment", () => {
     } finally {
       close.mockRestore();
     }
+  });
+
+  it("charges stdin, env, and expanded argv to one exact aggregate owner", () => {
+    let calls = 0;
+    const called: Command = () => {
+      calls++;
+      return result(empty());
+    };
+    const subject = fixture();
+    const withLimit = (maxRetainedBytes: number): Shell =>
+      createShell({
+        fs: subject.filesystem,
+        cwd: "/repo",
+        commands: new Map([["called", called]]),
+        limits: {
+          maxOutputBytes: 100,
+          maxOperations: 10,
+          readBudget: 100,
+          maxRetainedBytes,
+        },
+      });
+    const options = { stdin: "1234", env: { E: "env" } };
+
+    expect(withLimit(16).run("called 12345678", options)).toMatchObject({
+      exitCode: 0,
+      peakRetainedBytes: 16,
+    });
+    expect(calls).toBe(1);
+
+    const excess = withLimit(16).run("called 123456789", options);
+    expect(excess).toMatchObject({ exitCode: 2, peakRetainedBytes: 8 });
+    expect(excess.stderr).toContain("retained-memory limit");
+    expect(calls).toBe(1);
+  });
+
+  it("accepts expanded argv beyond the former byte component limit", () => {
+    let length = 0;
+    const inspect: Command = (context) => {
+      length = context.argv[0]?.length ?? 0;
+      return result(empty());
+    };
+    const subject = fixture(new Map([["inspect", inspect]]));
+    const argument = "a".repeat(FORMER_ARGUMENT_BYTES_MAX + 1);
+
+    expect(subject.shell.run(`inspect ${argument}`)).toMatchObject({
+      exitCode: 0,
+      peakRetainedBytes: argument.length,
+    });
+    expect(length).toBe(argument.length);
   });
 });

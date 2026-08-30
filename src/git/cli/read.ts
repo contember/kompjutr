@@ -1,6 +1,7 @@
 import { type GitContext, nestedRoots, openRepository } from "../../core/context.js";
 import { GitError, hasErrorCode } from "../../core/errors.js";
 import { diff } from "../../core/ops/diff.js";
+import type { StatusEntry } from "../../core/ops/kinds.js";
 import { divergence } from "../../core/ops/merge-base.js";
 import { readRef } from "../../core/ops/plumbing.js";
 import { type CommitView, linearLogRange, log } from "../../core/ops/reads.js";
@@ -10,13 +11,22 @@ import {
   formatShort,
   statusFormatOptions,
 } from "../../core/ops/status-format.js";
-import { gitCliResult, gitCliUtf8ByteLength } from "./result.js";
+import { retainedStringBytes } from "../../core/retained.js";
+import type { MemoryReservation } from "../../memory.js";
+import {
+  type GitCliOutputContext,
+  gitCliDiagnosticResult,
+  gitCliDiagnosticResultParts,
+  gitCliDiagnosticSliceResult,
+  gitCliResult,
+  gitCliUtf8ByteLength,
+} from "./result.js";
 import {
   GIT_CLI_MAX_LOG_COUNT,
-  GIT_CLI_MAX_STDOUT_BYTES,
   type GitCliHandlers,
   type GitCliResult,
   type GitCliRevision,
+  type ResolvedGitCliRunOptions,
 } from "./types.js";
 
 const HEADS = "refs/heads/";
@@ -29,47 +39,65 @@ type ReadHandlers = Pick<GitCliHandlers, "status" | "diff" | "log" | "revList" |
 
 export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
   return {
-    status(invocation) {
-      return withRepository(context, invocation.cwd, (repo) => {
-        const rows = eagerStatus(
-          repo,
-          context.worktree,
-          { excludeRoots: nestedRoots(context, repo.root) },
-          context,
-        );
-        const options = statusFormatOptions(repo);
-        const stdout =
-          invocation.command.format === "short"
-            ? formatShort(rows, options)
-            : formatPorcelainV1(rows, options);
-        return gitCliResult(stdout, "", 0);
-      });
+    status(invocation, runOptions, reservation) {
+      return withRepository(
+        context,
+        invocation.cwd,
+        outputContext(runOptions, reservation),
+        (repo) => {
+          const rows = eagerStatus(
+            repo,
+            context.worktree,
+            { excludeRoots: nestedRoots(context, repo.root) },
+            context,
+          );
+          const options = statusFormatOptions(repo);
+          preflightStatusOutput(
+            rows,
+            options.quotePath ?? true,
+            Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
+          );
+          const stdout =
+            invocation.command.format === "short"
+              ? formatShort(rows, options)
+              : formatPorcelainV1(rows, options);
+          return gitCliResult(stdout, "", 0);
+        },
+      );
     },
-    diff(invocation, runOptions) {
-      return withRepository(context, invocation.cwd, (repo) => {
-        const quotePath = statusFormatOptions(repo).quotePath ?? true;
-        return gitCliResult(
-          diff(repo, context.worktree, {}, context.sparseWorkspace, {
-            quotePaths: true,
-            quoteNonAscii: quotePath,
-            indexBase: true,
-            maxOutputBytes: Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
-          }),
-          "",
-          0,
-        );
-      });
+    diff(invocation, runOptions, reservation) {
+      return withRepository(
+        context,
+        invocation.cwd,
+        outputContext(runOptions, reservation),
+        (repo) => {
+          const quotePath = statusFormatOptions(repo).quotePath ?? true;
+          return gitCliResult(
+            diff(repo, context.worktree, {}, context.sparseWorkspace, {
+              quotePaths: true,
+              quoteNonAscii: quotePath,
+              indexBase: true,
+              maxOutputBytes: Math.min(
+                runOptions.maxStdoutBytes,
+                runOptions.maxCombinedOutputBytes,
+              ),
+            }),
+            "",
+            0,
+          );
+        },
+      );
     },
-    log(invocation) {
-      return withRepository(context, invocation.cwd, (repo) => {
+    log(invocation, runOptions, reservation) {
+      const output = outputContext(runOptions, reservation);
+      return withRepository(context, invocation.cwd, output, (repo) => {
         const command = invocation.command;
         const revision = command.revision;
         if (revision === undefined && repo.head().oid === null) {
-          return unbornLogFailure(repo.head().ref);
+          return unbornLogFailure(repo.head().ref, output);
         }
         if (revision !== undefined) {
-          const missing = missingRevision(repo, revision);
-          if (missing !== undefined) return ambiguousRevision(missing);
+          if (missingRevision(repo, revision)) return ambiguousRevision(revision, output);
         }
         let commits: CommitView[];
         if (revision?.kind === "range") {
@@ -82,10 +110,12 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
             );
           } catch (error) {
             if (hasErrorCode(error, "EUNSUPPORTED")) {
-              return gitCliResult(
-                "",
+              return gitCliDiagnosticResult(
                 "fatal: log range is not a complete single-parent chain\n",
+                "",
+                "",
                 128,
+                output,
               );
             }
             throw error;
@@ -98,17 +128,29 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
             depth: command.count,
           });
         }
-        return gitCliResult(formatLog(commits, command.format), "", 0);
+        return gitCliResult(
+          formatLog(
+            commits,
+            command.format,
+            Math.min(runOptions.maxStdoutBytes, runOptions.maxCombinedOutputBytes),
+            reservation,
+          ),
+          "",
+          0,
+        );
       });
     },
-    revList(invocation) {
-      return withRepository(context, invocation.cwd, (repo) => {
-        const expression = `${invocation.command.left}..${invocation.command.right}`;
+    revList(invocation, runOptions, reservation) {
+      const output = outputContext(runOptions, reservation);
+      return withRepository(context, invocation.cwd, output, (repo) => {
         if (
           repo.tryRevParse(invocation.command.left) === undefined ||
           repo.tryRevParse(invocation.command.right) === undefined
         ) {
-          return ambiguousRevision(expression);
+          return ambiguousRevision(
+            { kind: "range", left: invocation.command.left, right: invocation.command.right },
+            output,
+          );
         }
         const result = divergence(repo, {
           current: invocation.command.left,
@@ -117,24 +159,27 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
         return gitCliResult(`${result.behind}\n`, "", 0);
       });
     },
-    symbolicRef(invocation) {
-      return withRepository(context, invocation.cwd, (repo) => {
+    symbolicRef(invocation, runOptions, reservation) {
+      const output = outputContext(runOptions, reservation);
+      return withRepository(context, invocation.cwd, output, (repo) => {
         const ref = invocation.command.ref;
-        if (ref !== "HEAD" && !ref.startsWith(REFS)) return notSymbolicRef(ref);
+        if (ref !== "HEAD" && !ref.startsWith(REFS)) return notSymbolicRef(ref, output);
         const seen = new Set<string>();
         let current = ref;
         let followed = false;
         for (let hops = 0; hops < 8; hops++) {
-          if (seen.has(current)) return missingSymbolicRef(ref);
+          if (seen.has(current)) return missingSymbolicRef(ref, output);
           seen.add(current);
           const target = readRef(repo, { ref: current });
           if (target.kind !== "symbolic") {
-            return followed ? gitCliResult(`${shortRef(current)}\n`, "", 0) : notSymbolicRef(ref);
+            return followed
+              ? gitCliResult(`${shortRef(current)}\n`, "", 0)
+              : notSymbolicRef(ref, output);
           }
           followed = true;
           current = target.target;
         }
-        return missingSymbolicRef(ref);
+        return missingSymbolicRef(ref, output);
       });
     },
   };
@@ -143,16 +188,19 @@ export function createGitCliReadHandlers(context: GitContext): ReadHandlers {
 function withRepository(
   context: GitContext,
   cwd: string,
+  output: GitCliOutputContext,
   body: (repo: ReturnType<typeof openRepository>) => GitCliResult,
 ): GitCliResult {
   try {
     return body(openRepository(context, cwd));
   } catch (error) {
     if (hasErrorCode(error, "ENOTAREPO")) {
-      return gitCliResult(
-        "",
+      return gitCliDiagnosticResult(
         "fatal: not a git repository (or any of the parent directories): .git\n",
+        "",
+        "",
         128,
+        output,
       );
     }
     throw error;
@@ -162,44 +210,68 @@ function withRepository(
 function missingRevision(
   repo: ReturnType<typeof openRepository>,
   revision: GitCliRevision,
-): string | undefined {
+): boolean {
   if (revision.kind === "ref") {
-    return repo.tryRevParse(revision.ref) === undefined ? revision.ref : undefined;
+    return repo.tryRevParse(revision.ref) === undefined;
   }
   if (
     repo.tryRevParse(revision.left) === undefined ||
     repo.tryRevParse(revision.right) === undefined
   ) {
-    return `${revision.left}..${revision.right}`;
+    return true;
   }
-  return undefined;
+  return false;
 }
 
-function ambiguousRevision(expression: string): GitCliResult {
-  return gitCliResult(
-    "",
-    `fatal: ambiguous argument '${expression}': unknown revision or path not in the working tree.\n` +
-      "Use '--' to separate paths from revisions, like this:\n" +
-      "'git <command> [<revision>...] -- [<file>...]'\n",
+function ambiguousRevision(revision: GitCliRevision, output: GitCliOutputContext): GitCliResult {
+  const suffix =
+    "': unknown revision or path not in the working tree.\n" +
+    "Use '--' to separate paths from revisions, like this:\n" +
+    "'git <command> [<revision>...] -- [<file>...]'\n";
+  return gitCliDiagnosticResultParts(
+    "fatal: ambiguous argument '",
+    revision.kind === "ref" ? revision.ref : revision.left,
+    revision.kind === "ref" ? "" : "..",
+    revision.kind === "ref" ? "" : revision.right,
+    suffix,
     128,
+    output,
   );
 }
 
-function unbornLogFailure(ref: string | null): GitCliResult {
-  const branch = ref?.startsWith(HEADS) === true ? ref.slice(HEADS.length) : "HEAD";
-  return gitCliResult(
-    "",
-    `fatal: your current branch '${branch}' does not have any commits yet\n`,
+function unbornLogFailure(ref: string | null, output: GitCliOutputContext): GitCliResult {
+  if (ref?.startsWith(HEADS) === true) {
+    return gitCliDiagnosticSliceResult(
+      "fatal: your current branch '",
+      ref,
+      HEADS.length,
+      "' does not have any commits yet\n",
+      128,
+      output,
+    );
+  }
+  return gitCliDiagnosticResult(
+    "fatal: your current branch '",
+    "HEAD",
+    "' does not have any commits yet\n",
     128,
+    output,
   );
 }
 
-function notSymbolicRef(ref: string): GitCliResult {
-  return gitCliResult("", `fatal: ref ${ref} is not a symbolic ref\n`, 128);
+function outputContext(
+  options: ResolvedGitCliRunOptions,
+  reservation: MemoryReservation,
+): GitCliOutputContext {
+  return { options, reservation };
 }
 
-function missingSymbolicRef(ref: string): GitCliResult {
-  return gitCliResult("", `fatal: No such ref: ${ref}\n`, 128);
+function notSymbolicRef(ref: string, output: GitCliOutputContext): GitCliResult {
+  return gitCliDiagnosticResult("fatal: ref ", ref, " is not a symbolic ref\n", 128, output);
+}
+
+function missingSymbolicRef(ref: string, output: GitCliOutputContext): GitCliResult {
+  return gitCliDiagnosticResult("fatal: No such ref: ", ref, "\n", 128, output);
 }
 
 function shortRef(ref: string): string {
@@ -207,6 +279,107 @@ function shortRef(ref: string): string {
   if (ref.startsWith("refs/tags/")) return ref.slice("refs/tags/".length);
   if (ref.startsWith("refs/remotes/")) return ref.slice("refs/remotes/".length);
   return ref.startsWith(REFS) ? ref.slice(REFS.length) : ref;
+}
+
+function preflightStatusOutput(
+  rows: readonly StatusEntry[],
+  quotePath: boolean,
+  maximum: number,
+): void {
+  for (const row of rows) {
+    validateStatusPath(row.path);
+    if (row.originalPath !== undefined) validateStatusPath(row.originalPath);
+  }
+  let bytes = 0;
+  const addRow = (row: StatusEntry, prefixBytes: number): void => {
+    bytes = statusOutputAdd(bytes, prefixBytes, maximum);
+    if (row.originalPath === undefined) {
+      bytes = statusOutputAdd(bytes, statusPathBytes(row.path, quotePath, true, false), maximum);
+    } else {
+      bytes = statusOutputAdd(
+        bytes,
+        statusPathBytes(row.originalPath, quotePath, true, true),
+        maximum,
+      );
+      bytes = statusOutputAdd(bytes, 4, maximum);
+      bytes = statusOutputAdd(bytes, statusPathBytes(row.path, quotePath, true, true), maximum);
+    }
+    bytes = statusOutputAdd(bytes, 1, maximum);
+  };
+  for (const row of rows) {
+    if (row.worktree === "?" || row.worktree === "!") continue;
+    addRow(row, 3);
+  }
+  for (const row of rows) {
+    if (row.worktree === "?") addRow(row, 3);
+  }
+  for (const row of rows) {
+    if (row.worktree === "!") addRow(row, 3);
+  }
+}
+
+function validateStatusPath(path: string): void {
+  for (let index = 0; index < path.length; index++) {
+    const code = path.charCodeAt(index);
+    if (code === 0) throw invalidStatusPath();
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const low = path.charCodeAt(index + 1);
+      if (low < 0xdc00 || low > 0xdfff) throw invalidStatusPath();
+      index++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw invalidStatusPath();
+    }
+  }
+}
+
+function invalidStatusPath(): GitError {
+  return new GitError("EINVAL", "status paths must be NUL-free well-formed UTF-16");
+}
+
+function statusPathBytes(
+  path: string,
+  quotePath: boolean,
+  quoteEdgeSpaces: boolean,
+  quoteRenameSeparator: boolean,
+): number {
+  let quoted =
+    (quoteEdgeSpaces && (path.startsWith(" ") || path.endsWith(" "))) ||
+    (quoteRenameSeparator && path.includes(" -> "));
+  let bytes = 0;
+  for (let index = 0; index < path.length; index++) {
+    const code = path.charCodeAt(index);
+    if (code < 0x80) {
+      const escapedBytes = statusAsciiBytes(code);
+      if (escapedBytes !== 1) quoted = true;
+      bytes += escapedBytes;
+      continue;
+    }
+    let sourceBytes = code <= 0x7ff ? 2 : 3;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      sourceBytes = 4;
+      index++;
+    }
+    if (quotePath) {
+      quoted = true;
+      bytes += sourceBytes * 4;
+    } else {
+      bytes += sourceBytes;
+    }
+  }
+  return bytes + (quoted ? 2 : 0);
+}
+
+function statusAsciiBytes(code: number): number {
+  if ((code >= 0x07 && code <= 0x0d) || code === 0x22 || code === 0x5c) return 2;
+  if (code < 0x20 || code === 0x7f) return 4;
+  return 1;
+}
+
+function statusOutputAdd(current: number, additional: number, maximum: number): number {
+  if (additional > maximum - current) {
+    throw new GitError("E2BIG", `git CLI status output exceeds ${maximum} bytes`);
+  }
+  return current + additional;
 }
 
 function formatLog(
@@ -218,8 +391,10 @@ function formatLog(
         readonly kind: "template";
         readonly template: string;
       },
+  maximum: number,
+  reservation: MemoryReservation,
 ): string {
-  const out = new BoundedLogOutput();
+  const out = new BoundedLogOutput(maximum, reservation);
   if (format.kind === "template" && format.template === "") return "";
   let operations = 0;
   for (let index = 0; index < commits.length; index++) {
@@ -228,7 +403,10 @@ function formatLog(
       if (index > 0) out.append("\n");
       appendDefaultCommit(out, commit);
     } else if (format.kind === "oneline") {
-      out.append(`${commit.oid.slice(0, 7)} ${subject(commit.message)}\n`);
+      out.appendSlice(commit.oid, 0, Math.min(7, commit.oid.length));
+      out.append(" ");
+      appendSubject(out, commit.message);
+      out.append("\n");
     } else {
       operations = appendTemplate(out, commit, format.template, operations);
       out.append("\n");
@@ -239,34 +417,90 @@ function formatLog(
 
 class BoundedLogOutput {
   #bytes = 0;
-  #chunks: string[] = [];
+  #codeUnits = 0;
+  #retainedBytes = 64;
+  readonly #chunks: string[];
+  readonly #memory: MemoryReservation;
+
+  constructor(
+    private readonly maximum: number,
+    private readonly outputMemory: MemoryReservation,
+  ) {
+    this.#memory = outputMemory.scope();
+    this.#memory.set("other", this.#retainedBytes);
+    this.#chunks = [];
+  }
 
   append(value: string): void {
     if (value === "") return;
     const bytes = gitCliUtf8ByteLength(value, "git CLI log output", false);
-    if (bytes > GIT_CLI_MAX_STDOUT_BYTES - this.#bytes) {
-      throw new GitError("E2BIG", `git CLI log output exceeds ${GIT_CLI_MAX_STDOUT_BYTES} bytes`);
-    }
-    this.#bytes += bytes;
+    this.#append(value, bytes);
+  }
+
+  appendSlice(value: string, start: number, end = value.length): void {
+    if (start === end) return;
+    const bytes = utf8RangeBytes(value, start, end);
+    this.#admit(end - start, bytes);
+    const chunk = value.slice(start, end);
+    this.#chunks.push(chunk);
+  }
+
+  #append(value: string, bytes: number): void {
+    this.#admit(value.length, bytes);
     this.#chunks.push(value);
   }
 
+  #admit(codeUnits: number, bytes: number): void {
+    if (bytes > this.maximum - this.#bytes) {
+      throw new GitError("E2BIG", `git CLI log output exceeds ${this.maximum} bytes`);
+    }
+    this.#retainedBytes += 8 + retainedStringBytes("") + codeUnits * 2;
+    this.#memory.set("other", this.#retainedBytes);
+    this.#bytes += bytes;
+    this.#codeUnits += codeUnits;
+  }
+
   finish(): string {
-    return this.#chunks.join("");
+    this.outputMemory.set("flat", retainedStringBytes("") + this.#codeUnits * 2);
+    const output = this.#chunks.join("");
+    this.#memory.dispose();
+    return output;
   }
 }
 
 function appendDefaultCommit(out: BoundedLogOutput, commit: CommitView): void {
-  out.append(`commit ${commit.oid}\n`);
-  if (commit.parent.length > 1) {
-    out.append(`Merge: ${commit.parent.map((oid) => oid.slice(0, 7)).join(" ")}\n`);
-  }
-  out.append(`Author: ${commit.author.name} <${commit.author.email}>\n`);
-  out.append(`Date:   ${mediumDate(commit.author)}\n`);
-  const message = commit.message.replace(/\n+$/, "");
-  if (message === "") return;
+  out.append("commit ");
+  out.append(commit.oid);
   out.append("\n");
-  for (const line of message.split("\n")) out.append(`    ${line}\n`);
+  if (commit.parent.length > 1) {
+    out.append("Merge: ");
+    for (let index = 0; index < commit.parent.length; index++) {
+      if (index > 0) out.append(" ");
+      const oid = commit.parent[index]!;
+      out.appendSlice(oid, 0, Math.min(7, oid.length));
+    }
+    out.append("\n");
+  }
+  out.append("Author: ");
+  out.append(commit.author.name);
+  out.append(" <");
+  out.append(commit.author.email);
+  out.append(">\nDate:   ");
+  out.append(mediumDate(commit.author));
+  out.append("\n");
+  let messageEnd = commit.message.length;
+  while (messageEnd > 0 && commit.message.charCodeAt(messageEnd - 1) === 0x0a) messageEnd--;
+  if (messageEnd === 0) return;
+  out.append("\n");
+  let lineStart = 0;
+  while (lineStart < messageEnd) {
+    const newline = commit.message.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 || newline > messageEnd ? messageEnd : newline;
+    out.append("    ");
+    out.appendSlice(commit.message, lineStart, lineEnd);
+    out.append("\n");
+    lineStart = lineEnd + 1;
+  }
 }
 
 function mediumDate(person: CommitView["author"]): string {
@@ -302,17 +536,26 @@ function timezone(offsetMinutes: number): string {
   return `${sign}${twoDigits(Math.floor(absolute / 60))}${twoDigits(absolute % 60)}`;
 }
 
-function subject(message: string): string {
-  const lines = message.split("\n");
-  const parts: string[] = [];
-  for (const line of lines) {
-    if (line.trim() === "") {
-      if (parts.length > 0) break;
-      continue;
+function appendSubject(out: BoundedLogOutput, message: string): void {
+  let appended = false;
+  let lineStart = 0;
+  while (lineStart <= message.length) {
+    const newline = message.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? message.length : newline;
+    let trimmedEnd = lineEnd;
+    while (trimmedEnd > lineStart && isTrimWhitespace(message.charCodeAt(trimmedEnd - 1))) {
+      trimmedEnd--;
     }
-    parts.push(line.trimEnd());
+    if (trimmedEnd === lineStart) {
+      if (appended) return;
+    } else {
+      if (appended) out.append(" ");
+      out.appendSlice(message, lineStart, trimmedEnd);
+      appended = true;
+    }
+    if (newline < 0) return;
+    lineStart = newline + 1;
   }
-  return parts.join(" ").trimEnd();
 }
 
 function appendTemplate(
@@ -326,16 +569,16 @@ function appendTemplate(
   for (let index = 0; index < template.length; index++) {
     if (template.charCodeAt(index) !== 0x25) continue;
     operations = nextFormatOperation(operations);
-    out.append(template.slice(literalStart, index));
+    out.appendSlice(template, literalStart, index);
     const first = template[index + 1]!;
     let token = `%${first}`;
     if (first === "a" || first === "c") token += template[index + 2]!;
-    out.append(templateValue(commit, token));
+    appendTemplateValue(out, commit, token);
     index += token.length - 1;
     literalStart = index + 1;
   }
   operations = nextFormatOperation(operations);
-  out.append(template.slice(literalStart));
+  out.appendSlice(template, literalStart);
   return operations;
 }
 
@@ -349,19 +592,59 @@ function nextFormatOperation(current: number): number {
   return current + 1;
 }
 
-function templateValue(commit: CommitView, token: string): string {
-  if (token === "%H") return commit.oid;
-  if (token === "%h") return commit.oid.slice(0, 7);
-  if (token === "%P") return commit.parent.join(" ");
-  if (token === "%s") return subject(commit.message);
-  if (token === "%B") return commit.message;
-  if (token === "%an") return commit.author.name;
-  if (token === "%ae") return commit.author.email;
-  if (token === "%at") return String(commit.author.timestamp);
-  if (token === "%cn") return commit.committer.name;
-  if (token === "%ce") return commit.committer.email;
-  if (token === "%ct") return String(commit.committer.timestamp);
-  if (token === "%n") return "\n";
-  if (token === "%%") return "%";
-  throw new GitError("EINVAL", `unsupported git CLI log placeholder ${token}`);
+function appendTemplateValue(out: BoundedLogOutput, commit: CommitView, token: string): void {
+  if (token === "%H") out.append(commit.oid);
+  else if (token === "%h") out.appendSlice(commit.oid, 0, Math.min(7, commit.oid.length));
+  else if (token === "%P") {
+    for (let index = 0; index < commit.parent.length; index++) {
+      if (index > 0) out.append(" ");
+      out.append(commit.parent[index]!);
+    }
+  } else if (token === "%s") appendSubject(out, commit.message);
+  else if (token === "%B") out.append(commit.message);
+  else if (token === "%an") out.append(commit.author.name);
+  else if (token === "%ae") out.append(commit.author.email);
+  else if (token === "%at") out.append(String(commit.author.timestamp));
+  else if (token === "%cn") out.append(commit.committer.name);
+  else if (token === "%ce") out.append(commit.committer.email);
+  else if (token === "%ct") out.append(String(commit.committer.timestamp));
+  else if (token === "%n") out.append("\n");
+  else if (token === "%%") out.append("%");
+  else throw new GitError("EINVAL", `unsupported git CLI log placeholder ${token}`);
+}
+
+function isTrimWhitespace(code: number): boolean {
+  return (
+    (code >= 0x09 && code <= 0x0d) ||
+    code === 0x20 ||
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+function utf8RangeBytes(value: string, start: number, end: number): number {
+  let bytes = 0;
+  for (let index = start; index < end; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff) || index + 1 >= end) {
+        throw new GitError("EINVAL", "git CLI log output must be well-formed UTF-16");
+      }
+      index++;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new GitError("EINVAL", "git CLI log output must be well-formed UTF-16");
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+  }
+  return bytes;
 }

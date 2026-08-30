@@ -2,24 +2,18 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
+import { retainedStringBytes } from "../src/core/retained.js";
 import {
   boundedGitCliResult,
   createGitCliRunner,
-  GIT_CLI_MAX_ARGV_BYTES,
   GIT_CLI_MAX_ARGV_ENTRIES,
   GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
-  GIT_CLI_MAX_COMMIT_MESSAGE_BYTES,
-  GIT_CLI_MAX_CWD_BYTES,
-  GIT_CLI_MAX_ENV_BYTES,
   GIT_CLI_MAX_ENV_ENTRIES,
   GIT_CLI_MAX_LOG_COUNT,
-  GIT_CLI_MAX_LOG_FORMAT_BYTES,
-  GIT_CLI_MAX_STDERR_BYTES,
-  GIT_CLI_MAX_STDIN_BYTES,
-  GIT_CLI_MAX_STDOUT_BYTES,
   type GitCliHandlers,
   type GitCliResult,
   gitCliResult,
+  gitCliResultRetainedBytes,
   type ParsedGitCliCommand,
   parseGitCliCommand,
   parseGitCliInput,
@@ -27,6 +21,7 @@ import {
   resolveGitCliRunOptions,
   validateGitCliInput,
 } from "../src/git/cli/index.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 
 const ENCODER = new TextEncoder();
 
@@ -229,44 +224,71 @@ describe("git argv grammar", () => {
 });
 
 describe("git CLI runtime validation and bounds", () => {
-  it("pins exact and first-excess argv bounds", () => {
+  it("keeps argv cardinality structural without a byte-component refusal", () => {
     expect(
       validateGitCliInput({ argv: Array(GIT_CLI_MAX_ARGV_ENTRIES).fill("") }).argv,
     ).toHaveLength(GIT_CLI_MAX_ARGV_ENTRIES);
     expect(() =>
       validateGitCliInput({ argv: Array(GIT_CLI_MAX_ARGV_ENTRIES + 1).fill("") }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(validateGitCliInput({ argv: ["x".repeat(GIT_CLI_MAX_ARGV_BYTES)] }).argv).toHaveLength(
-      1,
-    );
-    expect(() =>
-      validateGitCliInput({ argv: ["x".repeat(GIT_CLI_MAX_ARGV_BYTES + 1)] }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const argument = "x".repeat(1024 * 1024 + 1);
+    expect(validateGitCliInput({ argv: [argument] }).argv).toEqual([argument]);
+    expect(createGitCliRunner({}).runCli({ argv: [argument] }).exitCode).toBe(1);
   });
 
-  it("pins exact and first-excess cwd, stdin, and env byte bounds", () => {
-    const exactCwd = `/${"x".repeat(GIT_CLI_MAX_CWD_BYTES - 1)}`;
-    expect(validateGitCliInput({ argv: [], cwd: exactCwd }).cwd).toBe(exactCwd);
-    expect(() => validateGitCliInput({ argv: [], cwd: `${exactCwd}x` })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
+  it("rejects argv mutation after capturing its checked length", () => {
+    const memory = new MemoryCoordinator();
+    let calls = 0;
+    const runner = createGitCliRunner(
+      {
+        status() {
+          calls++;
+          return gitCliResult("", "", 0);
+        },
+      },
+      memory,
     );
-    expect(
-      validateGitCliInput({ argv: [], stdin: "x".repeat(GIT_CLI_MAX_STDIN_BYTES) }).stdin,
-    ).toHaveLength(GIT_CLI_MAX_STDIN_BYTES);
-    expect(() =>
-      validateGitCliInput({ argv: [], stdin: "x".repeat(GIT_CLI_MAX_STDIN_BYTES + 1) }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-
-    const exactEnv = { K: "x".repeat(GIT_CLI_MAX_ENV_BYTES - 1) };
-    expect(validateGitCliInput({ argv: [], env: exactEnv }).env).toEqual({
-      GIT_AUTHOR_NAME: undefined,
-      GIT_AUTHOR_EMAIL: undefined,
-      GIT_COMMITTER_NAME: undefined,
-      GIT_COMMITTER_EMAIL: undefined,
+    const argv = ["status", "--porcelain"];
+    Object.defineProperty(argv, 0, {
+      configurable: true,
+      get() {
+        argv.push(...Array(GIT_CLI_MAX_ARGV_ENTRIES).fill("extra"));
+        return "status";
+      },
     });
-    expect(() => validateGitCliInput({ argv: [], env: { K: `${exactEnv.K}x` } })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
+
+    expect(() => runner.runCli({ argv })).toThrowError(
+      expect.objectContaining({
+        code: "EINVAL",
+        message: "git CLI argv changed during validation",
+      }),
     );
+    expect(calls).toBe(0);
+    memory.assertIdle();
+  });
+
+  it("accepts cwd, stdin, and env crossing their former component thresholds", () => {
+    const cwd = `/${"x".repeat(4 * 1024)}`;
+    const stdin = "x".repeat(1024 * 1024 + 1);
+    const env = { K: "x".repeat(1024 * 1024 + 1) };
+    expect(validateGitCliInput({ argv: [], cwd, stdin, env })).toEqual({
+      argv: [],
+      cwd,
+      env: {
+        GIT_AUTHOR_NAME: undefined,
+        GIT_AUTHOR_EMAIL: undefined,
+        GIT_COMMITTER_NAME: undefined,
+        GIT_COMMITTER_EMAIL: undefined,
+      },
+      stdin,
+    });
+    expect(
+      createGitCliRunner({
+        status(invocation) {
+          return gitCliResult(invocation.cwd, "", 0);
+        },
+      }).runCli({ argv: ["status", "--porcelain"], cwd, stdin, env }),
+    ).toEqual({ stdout: cwd, stderr: "", exitCode: 0 });
     const entries: Array<readonly [string, string]> = [];
     for (let index = 0; index < GIT_CLI_MAX_ENV_ENTRIES; index++) entries.push([`K${index}`, ""]);
     expect(validateGitCliInput({ argv: [], env: Object.fromEntries(entries) }).env).toBeDefined();
@@ -276,56 +298,127 @@ describe("git CLI runtime validation and bounds", () => {
     );
   });
 
-  it("accounts multibyte UTF-8 at exact and first-excess input bounds", () => {
-    const exactCwd = `/${"é".repeat((GIT_CLI_MAX_CWD_BYTES - 2) / 2)}x`;
-    expect(ENCODER.encode(exactCwd)).toHaveLength(GIT_CLI_MAX_CWD_BYTES);
-    expect(validateGitCliInput({ argv: [], cwd: exactCwd }).cwd).toBe(exactCwd);
-    expect(() => validateGitCliInput({ argv: [], cwd: `${exactCwd}x` })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-
-    const exactEnvValue = `${"é".repeat((GIT_CLI_MAX_ENV_BYTES - 2) / 2)}x`;
-    expect(ENCODER.encode(`K${exactEnvValue}`)).toHaveLength(GIT_CLI_MAX_ENV_BYTES);
-    expect(validateGitCliInput({ argv: [], env: { K: exactEnvValue } }).env).toBeDefined();
-    expect(() => validateGitCliInput({ argv: [], env: { K: `${exactEnvValue}x` } })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-
-    const exactStdin = "é".repeat(GIT_CLI_MAX_STDIN_BYTES / 2);
-    expect(ENCODER.encode(exactStdin)).toHaveLength(GIT_CLI_MAX_STDIN_BYTES);
-    expect(validateGitCliInput({ argv: [], stdin: exactStdin }).stdin).toBe(exactStdin);
-    expect(() => validateGitCliInput({ argv: [], stdin: `${exactStdin}x` })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-  });
-
-  it("pins commit-message and format bounds independently of aggregate argv", () => {
-    expect(parsed(["commit", "-m", "x".repeat(GIT_CLI_MAX_COMMIT_MESSAGE_BYTES)])).toMatchObject({
-      kind: "commit",
-    });
-    expect(() =>
-      parsed(["commit", "-m", "x".repeat(GIT_CLI_MAX_COMMIT_MESSAGE_BYTES + 1)]),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(parsed(["log", `--format=${"x".repeat(GIT_CLI_MAX_LOG_FORMAT_BYTES)}`])).toMatchObject({
+  it("accepts commit messages and log formats crossing their former component thresholds", () => {
+    const message = "é".repeat((1024 * 1024) / 2 + 1);
+    const format = "é".repeat((64 * 1024) / 2 + 1);
+    expect(parsed(["commit", "-m", message])).toMatchObject({ kind: "commit", message });
+    expect(parsed(["log", `--format=${format}`])).toMatchObject({
       kind: "log",
+      format: { kind: "template", template: format },
     });
-    expect(() =>
-      parsed(["log", `--format=${"x".repeat(GIT_CLI_MAX_LOG_FORMAT_BYTES + 1)}`]),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const runner = createGitCliRunner({
+      commit(invocation) {
+        return gitCliResult(String(invocation.command.message.length), "", 0);
+      },
+      log(invocation) {
+        const retained = invocation.command.format;
+        return gitCliResult(
+          retained.kind === "template" ? String(retained.template.length) : "",
+          "",
+          0,
+        );
+      },
+    });
+    expect(runner.runCli({ argv: ["commit", "-m", message] }).exitCode).toBe(0);
+    expect(runner.runCli({ argv: ["log", `--format=${format}`] }).exitCode).toBe(0);
   });
 
-  it("accounts multibyte commit messages and formats at exact and first excess", () => {
-    const exactMessage = "é".repeat(GIT_CLI_MAX_COMMIT_MESSAGE_BYTES / 2);
-    expect(parsed(["commit", "-m", exactMessage])).toMatchObject({ kind: "commit" });
-    expect(() => parsed(["commit", "-m", `${exactMessage}x`])).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+  it("pre-admits parser-created message, format, and range slices", () => {
+    const copied = "x".repeat(4_096);
+    const cases = [
+      {
+        argv: ["commit", `--message=${copied}`],
+        handlers: { commit: () => gitCliResult("", "", 0) },
+      },
+      {
+        argv: ["log", `--format=${copied}`, "left..right"],
+        handlers: { log: () => gitCliResult("", "", 0) },
+      },
+      {
+        argv: ["rev-list", "--count", `${copied}..right`],
+        handlers: { revList: () => gitCliResult("", "", 0) },
+      },
+    ] satisfies Array<{ argv: string[]; handlers: GitCliHandlers }>;
 
-    const exactFormat = "é".repeat(GIT_CLI_MAX_LOG_FORMAT_BYTES / 2);
-    expect(parsed(["log", `--format=${exactFormat}`])).toMatchObject({ kind: "log" });
-    expect(() => parsed(["log", `--format=${exactFormat}x`])).toThrowError(
+    for (const testCase of cases) {
+      const measured = new MemoryCoordinator();
+      expect(
+        createGitCliRunner(testCase.handlers, measured).runCli({ argv: testCase.argv }).exitCode,
+      ).toBe(0);
+      expect(measured.highWaterBytes).toBeGreaterThan(retainedStringBytes(copied));
+      measured.assertIdle();
+    }
+
+    const input = { argv: ["commit", `--message=${copied}`] };
+    let handlerCalls = 0;
+    const handlers: GitCliHandlers = {
+      commit: () => {
+        handlerCalls++;
+        return gitCliResult("", "", 0);
+      },
+    };
+    const calibration = new MemoryCoordinator();
+    createGitCliRunner(handlers, calibration).runCli(input);
+    const peak = calibration.highWaterBytes;
+
+    const exact = new MemoryCoordinator();
+    const exactBlocker = exact.reserve();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - peak);
+    expect(createGitCliRunner(handlers, exact).runCli(input).exitCode).toBe(0);
+    expect(exact.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    exactBlocker.dispose();
+    exact.assertIdle();
+
+    const excess = new MemoryCoordinator();
+    const excessBlocker = excess.reserve();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - peak + 1);
+    const callsBeforeExcess = handlerCalls;
+    expect(() => createGitCliRunner(handlers, excess).runCli(input)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
+    expect(handlerCalls).toBe(callsBeforeExcess);
+    excessBlocker.dispose();
+    excess.assertIdle();
+  });
+
+  it("keeps a parser-owned message copy live with handler output at the coordinator boundary", () => {
+    const copied = "m".repeat(2 * 1024 * 1024);
+    const stdout = "o".repeat(2 * 1024 * 1024);
+    const input = { argv: ["commit", `--message=${copied}`] };
+    let handlerCalls = 0;
+    let retainedAtHandler = 0;
+    const handlers: GitCliHandlers = {
+      commit(_invocation, _options, reservation) {
+        handlerCalls++;
+        retainedAtHandler = Math.max(retainedAtHandler, reservation.currentBytes);
+        return gitCliResult(stdout, "", 0);
+      },
+    };
+    const calibration = new MemoryCoordinator();
+    expect(createGitCliRunner(handlers, calibration).runCli(input).stdout).toBe(stdout);
+    const peak = calibration.highWaterBytes;
+    expect(retainedAtHandler).toBeGreaterThanOrEqual(retainedStringBytes(copied));
+    expect(peak).toBeGreaterThanOrEqual(retainedAtHandler + gitCliResultRetainedBytes(stdout, ""));
+    calibration.assertIdle();
+
+    const exact = new MemoryCoordinator();
+    const exactBlocker = exact.reserve();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - peak);
+    expect(createGitCliRunner(handlers, exact).runCli(input).exitCode).toBe(0);
+    expect(exact.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    exactBlocker.dispose();
+    exact.assertIdle();
+
+    const callsBeforeExcess = handlerCalls;
+    const excess = new MemoryCoordinator();
+    const excessBlocker = excess.reserve();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - peak + 1);
+    expect(() => createGitCliRunner(handlers, excess).runCli(input)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(handlerCalls).toBe(callsBeforeExcess + 1);
+    excessBlocker.dispose();
+    excess.assertIdle();
   });
 
   it("accepts NUL only in ignored stdin and output-compatible strings", () => {
@@ -490,15 +583,15 @@ describe("git CLI runtime validation and bounds", () => {
   it("runtime-validates every run option at its intrinsic bound", () => {
     expect(
       resolveGitCliRunOptions({
-        maxStdoutBytes: GIT_CLI_MAX_STDOUT_BYTES,
-        maxStderrBytes: GIT_CLI_MAX_STDERR_BYTES,
+        maxStdoutBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
+        maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
         maxCombinedOutputBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
         discardStderr: true,
         logLimitHint: GIT_CLI_MAX_LOG_COUNT,
       }),
     ).toEqual({
-      maxStdoutBytes: GIT_CLI_MAX_STDOUT_BYTES,
-      maxStderrBytes: GIT_CLI_MAX_STDERR_BYTES,
+      maxStdoutBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
+      maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
       maxCombinedOutputBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
       discardStderr: true,
       logLimitHint: GIT_CLI_MAX_LOG_COUNT,
@@ -509,8 +602,8 @@ describe("git CLI runtime validation and bounds", () => {
       { unknown: true },
       { maxStdoutBytes: -1 },
       { maxStdoutBytes: 1.5 },
-      { maxStdoutBytes: GIT_CLI_MAX_STDOUT_BYTES + 1 },
-      { maxStderrBytes: GIT_CLI_MAX_STDERR_BYTES + 1 },
+      { maxStdoutBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES + 1 },
+      { maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES + 1 },
       { maxCombinedOutputBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES + 1 },
       { discardStderr: 1 },
       { logLimitHint: GIT_CLI_MAX_LOG_COUNT + 1 },
@@ -522,8 +615,8 @@ describe("git CLI runtime validation and bounds", () => {
   });
 
   it.each([
-    ["maxStdoutBytes", GIT_CLI_MAX_STDOUT_BYTES],
-    ["maxStderrBytes", GIT_CLI_MAX_STDERR_BYTES],
+    ["maxStdoutBytes", GIT_CLI_MAX_COMBINED_OUTPUT_BYTES],
+    ["maxStderrBytes", GIT_CLI_MAX_COMBINED_OUTPUT_BYTES],
     ["maxCombinedOutputBytes", GIT_CLI_MAX_COMBINED_OUTPUT_BYTES],
     ["logLimitHint", GIT_CLI_MAX_LOG_COUNT],
   ])("pins zero, exact, first-excess, and fraction for %s", (field, maximum) => {
@@ -566,6 +659,32 @@ describe("git CLI runtime validation and bounds", () => {
 });
 
 describe("git CLI result accounting and dispatch", () => {
+  it("does not construct or retain a discarded huge parser diagnostic", () => {
+    const memory = new MemoryCoordinator();
+    const command = "x".repeat(GIT_CLI_MAX_COMBINED_OUTPUT_BYTES + 1);
+    const runner = createGitCliRunner({}, memory);
+
+    expect(
+      runner.runCli(
+        { argv: [command] },
+        {
+          discardStderr: true,
+          maxStdoutBytes: 0,
+          maxStderrBytes: 0,
+          maxCombinedOutputBytes: 0,
+        },
+      ),
+    ).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+    expect(memory.highWaterBytes).toBeLessThan(4_096);
+    memory.assertIdle();
+
+    expect(() => runner.runCli({ argv: [command] }, { maxCombinedOutputBytes: 1 })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(memory.highWaterBytes).toBeLessThan(4_096);
+    memory.assertIdle();
+  });
+
   it("preflights stdout, stderr, and the combined ceiling", () => {
     const options = resolveGitCliRunOptions({
       maxStdoutBytes: 3,
@@ -585,6 +704,73 @@ describe("git CLI result accounting and dispatch", () => {
     );
     expect(() => boundedGitCliResult(gitCliResult("abc", "def", 1), options)).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
+    );
+  });
+
+  it("snapshots mutable handler result fields once and returns a fresh plain result", () => {
+    const reads = { stdout: 0, stderr: 0, exitCode: 0 };
+    let stdout = "first stdout";
+    let stderr = "first stderr";
+    let exitCode = 7;
+    const source: GitCliResult = { stdout: "", stderr: "", exitCode: 0 };
+    Object.defineProperties(source, {
+      stdout: {
+        get() {
+          reads.stdout++;
+          const snapshot = stdout;
+          stdout = "later stdout";
+          return snapshot;
+        },
+      },
+      stderr: {
+        get() {
+          reads.stderr++;
+          const snapshot = stderr;
+          stderr = "later stderr";
+          return snapshot;
+        },
+      },
+      exitCode: {
+        get() {
+          reads.exitCode++;
+          const snapshot = exitCode;
+          exitCode = 9;
+          return snapshot;
+        },
+      },
+    });
+
+    const checked = boundedGitCliResult(source, resolveGitCliRunOptions(undefined));
+    const snapshotReads = { ...reads };
+    expect(checked).toEqual({ stdout: "first stdout", stderr: "first stderr", exitCode: 7 });
+    expect(checked).not.toBe(source);
+    expect(Object.getPrototypeOf(checked)).toBe(Object.prototype);
+    expect(snapshotReads).toEqual({ stdout: 1, stderr: 1, exitCode: 1 });
+  });
+
+  it.each([
+    ["direct", ["unknown-command"]],
+    ["sliced", ["status", "--unknown-option"]],
+  ])("preserves stderr then combined diagnostic precedence for %s diagnostics", (_name, argv) => {
+    const runner = createGitCliRunner({});
+    expect(() =>
+      runner.runCli({ argv }, { maxStderrBytes: 2, maxCombinedOutputBytes: 1 }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: "git CLI stderr exceeds 2 bytes",
+      }),
+    );
+    expect(() =>
+      runner.runCli(
+        { argv },
+        { maxStderrBytes: GIT_CLI_MAX_COMBINED_OUTPUT_BYTES, maxCombinedOutputBytes: 1 },
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: "git CLI combined output exceeds 1 bytes",
+      }),
     );
   });
 
@@ -613,7 +799,89 @@ describe("git CLI result accounting and dispatch", () => {
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
   });
 
-  it("does not retain or charge discarded stderr", () => {
+  it("owns exact combined stdout and stderr together and rejects the first excess", () => {
+    const memory = new MemoryCoordinator();
+    const stdout = "o".repeat(GIT_CLI_MAX_COMBINED_OUTPUT_BYTES / 2);
+    const stderr = "e".repeat(GIT_CLI_MAX_COMBINED_OUTPUT_BYTES / 2);
+    let excess = false;
+    let handlerSawReservation = false;
+    const runner = createGitCliRunner(
+      {
+        status(_invocation, _options, reservation) {
+          handlerSawReservation = !reservation.disposed;
+          return gitCliResult(stdout, excess ? `${stderr}x` : stderr, 0);
+        },
+      },
+      memory,
+    );
+
+    expect(runner.runCli({ argv: ["status", "--porcelain"] })).toEqual({
+      stdout,
+      stderr,
+      exitCode: 0,
+    });
+    expect(handlerSawReservation).toBe(true);
+    expect(memory.highWaterBytes).toBeGreaterThanOrEqual(gitCliResultRetainedBytes(stdout, stderr));
+    memory.assertIdle();
+
+    excess = true;
+    expect(() => runner.runCli({ argv: ["status", "--porcelain"] })).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    memory.assertIdle();
+  });
+
+  it("releases invocation ownership on parser, handler, and output errors", () => {
+    const memory = new MemoryCoordinator();
+    const runner = createGitCliRunner(
+      {
+        status() {
+          throw new Error("handler failed");
+        },
+      },
+      memory,
+    );
+
+    expect(runner.runCli({ argv: ["unknown"] }).exitCode).toBe(1);
+    memory.assertIdle();
+    expect(() => runner.runCli({ argv: [String.fromCharCode(0xd800)] })).toThrowError(
+      expect.objectContaining({ code: "EINVAL" }),
+    );
+    memory.assertIdle();
+    expect(() => runner.runCli({ argv: ["status", "--porcelain"] })).toThrow("handler failed");
+    memory.assertIdle();
+
+    const outputRunner = createGitCliRunner(
+      {
+        status() {
+          return gitCliResult("xx", "", 0);
+        },
+      },
+      memory,
+    );
+    expect(() =>
+      outputRunner.runCli({ argv: ["status", "--porcelain"] }, { maxStdoutBytes: 1 }),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    memory.assertIdle();
+
+    const slicedOutputRunner = createGitCliRunner(
+      {
+        commit() {
+          return gitCliResult("output", "", 0);
+        },
+      },
+      memory,
+    );
+    expect(() =>
+      slicedOutputRunner.runCli(
+        { argv: ["commit", `--message=${"x".repeat(4_096)}`] },
+        { maxStdoutBytes: 1 },
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    memory.assertIdle();
+  });
+
+  it("does not return or UTF-8 validate discarded stderr", () => {
     const result = boundedGitCliResult(
       gitCliResult("abc", "diagnostic larger than every configured bound", 128),
       resolveGitCliRunOptions({
@@ -637,6 +905,27 @@ describe("git CLI result accounting and dispatch", () => {
         }),
       ),
     ).toEqual({ stdout: "é", stderr: "", exitCode: 1 });
+
+    const memory = new MemoryCoordinator();
+    const injectedStderr = "diagnostic".repeat(1_000);
+    const runner = createGitCliRunner(
+      {
+        status() {
+          return gitCliResult("", injectedStderr, 1);
+        },
+      },
+      memory,
+    );
+    expect(
+      runner.runCli(
+        { argv: ["status", "--porcelain"] },
+        { discardStderr: true, maxStderrBytes: 0 },
+      ),
+    ).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+    expect(memory.highWaterBytes).toBeGreaterThanOrEqual(
+      gitCliResultRetainedBytes("", injectedStderr),
+    );
+    memory.assertIdle();
   });
 
   it("validates result runtime shapes and exit status", () => {

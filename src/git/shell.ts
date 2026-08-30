@@ -2,8 +2,6 @@ import type { ByteStream } from "../shell/exec/bytes.js";
 import { type Command, ShellLimitError } from "../shell/exec/context.js";
 import {
   GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
-  GIT_CLI_MAX_STDERR_BYTES,
-  GIT_CLI_MAX_STDOUT_BYTES,
   type GitCliResult,
   type GitCliRunner,
   type GitCliRunOptions,
@@ -94,8 +92,8 @@ class GitOutput implements ByteStream {
 
 function runOptions(context: Parameters<Command>[0]): GitCliRunOptions {
   const base: GitCliRunOptions = {
-    maxStdoutBytes: Math.min(context.output.maxStdoutBytes, GIT_CLI_MAX_STDOUT_BYTES),
-    maxStderrBytes: Math.min(context.output.maxStderrBytes, GIT_CLI_MAX_STDERR_BYTES),
+    maxStdoutBytes: Math.min(context.output.maxStdoutBytes, GIT_CLI_MAX_COMBINED_OUTPUT_BYTES),
+    maxStderrBytes: Math.min(context.output.maxStderrBytes, GIT_CLI_MAX_COMBINED_OUTPUT_BYTES),
     maxCombinedOutputBytes: Math.min(
       context.output.maxCombinedOutputBytes,
       GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,

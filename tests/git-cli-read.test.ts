@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { checkoutTree } from "../src/core/ops/checkout.js";
+import { commit } from "../src/core/ops/commit.js";
 import {
   diff as coreDiff,
   DIFF_COMBINED_MAX_LINES,
@@ -14,9 +15,11 @@ import {
 import { rebase } from "../src/core/ops/rebase.js";
 import { add } from "../src/core/ops/staging.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
-import { runGitCli } from "../src/git/cli/index.js";
+import { retainedStringBytes } from "../src/core/retained.js";
+import { gitCliResultRetainedBytes, runGitCli } from "../src/git/cli/index.js";
 import { createGitCliReadHandlers } from "../src/git/cli/read.js";
 import type { GitCliResult } from "../src/git/cli/types.js";
+import { MemoryCoordinator } from "../src/memory.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -208,6 +211,22 @@ describe("read-only git argv handlers", () => {
     }
   });
 
+  it("accounts builder chunks together with flattened log output", () => {
+    const argv = ["log", "--format=%H|%an|%ae|%s"];
+    const expected = fixture.gitBinary(...argv).toString("utf8");
+    const memory = new MemoryCoordinator();
+    expect(
+      runGitCli(
+        { argv, cwd: "/repo" },
+        createGitCliReadHandlers(workspace.context),
+        undefined,
+        memory,
+      ),
+    ).toEqual({ stdout: expected, stderr: "", exitCode: 0 });
+    expect(memory.highWaterBytes).toBeGreaterThan(gitCliResultRetainedBytes(expected, ""));
+    memory.assertIdle();
+  });
+
   it("matches rev-list count and symbolic-ref from a nested cwd", () => {
     expect(nativeRun(workspace, ["rev-list", "--count", "base..HEAD"], "/repo/src")).toEqual({
       stdout: gitBytesAt(fixture, "src", ["rev-list", "--count", "base..HEAD"]),
@@ -249,6 +268,36 @@ describe("read-only git argv handlers", () => {
     });
   });
 
+  it("does not construct or retain a discarded huge read diagnostic", () => {
+    const target = makeRepo("/repo");
+    const ref = `not-a-ref-${"x".repeat(2 * 1024 * 1024)}`;
+    const handlers = createGitCliReadHandlers(target.context);
+    const memory = new MemoryCoordinator();
+    const input = { argv: ["symbolic-ref", "--short", ref], cwd: "/repo" };
+
+    expect(
+      runGitCli(
+        input,
+        handlers,
+        {
+          discardStderr: true,
+          maxStdoutBytes: 0,
+          maxStderrBytes: 0,
+          maxCombinedOutputBytes: 0,
+        },
+        memory,
+      ),
+    ).toEqual({ stdout: "", stderr: "", exitCode: 128 });
+    expect(memory.highWaterBytes).toBeLessThan(4_096);
+    memory.assertIdle();
+
+    expect(() =>
+      runGitCli(input, handlers, { maxStderrBytes: 1, maxCombinedOutputBytes: 1 }, memory),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(memory.highWaterBytes).toBeLessThan(4_096);
+    memory.assertIdle();
+  });
+
   it("preflights stdout bounds without a partial result", () => {
     const argv = ["log", "-1", "--oneline"];
     const expected = fixture.gitBinary(...argv).toString("utf8");
@@ -263,6 +312,59 @@ describe("read-only git argv handlers", () => {
     expect(() =>
       runGitCli({ argv, cwd: "/repo" }, handlers, { maxStdoutBytes: bytes - 1 }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+  });
+
+  it("preflights a lower status ceiling before constructing its complete output", () => {
+    const target = makeRepo("/repo");
+    writeWorkFile(target, "/repo/untracked.txt", "content\n");
+    const handlers = createGitCliReadHandlers(target.context);
+    const expected = "?? untracked.txt\n";
+    const bytes = ENCODER.encode(expected).byteLength;
+
+    expect(
+      runGitCli({ argv: ["status", "--porcelain"], cwd: "/repo" }, handlers, {
+        maxStdoutBytes: bytes,
+        maxCombinedOutputBytes: bytes,
+      }),
+    ).toEqual({ stdout: expected, stderr: "", exitCode: 0 });
+    expect(() =>
+      runGitCli({ argv: ["status", "--porcelain"], cwd: "/repo" }, handlers, {
+        maxStdoutBytes: bytes - 1,
+        maxCombinedOutputBytes: bytes - 1,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: `git CLI status output exceeds ${bytes - 1} bytes`,
+      }),
+    );
+  });
+
+  it("rejects large subject and message output before retaining derived strings", () => {
+    const target = makeRepo("/repo");
+    const message = `${"large subject ".repeat(16 * 1024)}\n\n${"large body ".repeat(16 * 1024)}`;
+    const identity = { name: "Large Message", email: "large@example.test" };
+    commit(target.context, target.repo, {
+      message,
+      author: identity,
+      committer: identity,
+      allowEmpty: true,
+    });
+    const handlers = createGitCliReadHandlers(target.context);
+
+    for (const format of ["%s", "%B"]) {
+      const memory = new MemoryCoordinator();
+      expect(() =>
+        runGitCli(
+          { argv: ["log", "-1", `--format=${format}`], cwd: "/repo" },
+          handlers,
+          { maxStdoutBytes: 1, maxCombinedOutputBytes: 1 },
+          memory,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(memory.highWaterBytes).toBeLessThan(retainedStringBytes(message));
+      memory.assertIdle();
+    }
   });
 
   it("proves a linear range with one bounded indexed graph read", () => {
