@@ -11,6 +11,7 @@ decisions → reference → archive.
 - [`decisions/`](decisions/README.md) — ADRs (the *why*), immutable.
 - [`backlog/`](backlog/README.md) — decided work, not yet scheduled.
 - [`sprints/`](sprints/README.md) — active thematic work-plans.
+- [`specs/`](specs/README.md) — accepted pre-build and frozen specs.
 - [`archive/`](archive/README.md) — shipped sprints + reference-worthy records.
 
 ## Active sprints
@@ -18,6 +19,12 @@ decisions → reference → archive.
 - [`sprints/sprint-2026-08-29-budget-targets-and-store-split.md`](sprints/sprint-2026-08-29-budget-targets-and-store-split.md)
   — measured statement targets, evidence-backed byte limits, and an internal
   table-family split behind the unchanged SQLite store facade.
+
+## Specs
+
+- [`specs/budget-targets-evidence-ledger.md`](specs/budget-targets-evidence-ledger.md)
+  — accepted statement-barrier and byte-limit evidence incorporated by the
+  active budget-targets sprint.
 
 ## What's hot
 
