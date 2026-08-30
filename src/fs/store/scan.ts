@@ -7,6 +7,7 @@
 // so the physical scan order IS the output order and `ORDER BY path` costs
 // nothing.
 
+import type { MemoryReservation } from "../../memory.js";
 import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
 import { MAX_ROUTING_CHECKOUTS, MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../sqlite/schema.js";
 import { comparePaths, dirname, normalize, subtreeSuccessor } from "../path.js";
@@ -66,6 +67,11 @@ export const DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES =
   2 * DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES;
 
 const PERMISSION_BITS = 0o7777;
+const OWNED_SCAN_METADATA_BYTES = 512;
+const OWNED_SCAN_RANGE_BYTES = 128;
+const OWNED_SCAN_ARRAY_BYTES = 128;
+const OWNED_SCAN_ROW_BYTES = 256;
+const OWNED_STRING_BYTES = 48;
 
 const TYPE_BITS: Record<EntryType, number> = {
   file: S_IFREG,
@@ -112,7 +118,12 @@ function boundedUtf8Bytes(value: string, limit: number): number {
 // it; a column costs nothing, and six inherited cases assert on it.
 const SELECT_PAGE = `SELECT fs_paths.path AS path,
        fs_paths.inode AS inode,
-       fs_nodes.type AS type,
+       CASE
+         WHEN typeof(fs_nodes.type) = 'text' AND fs_nodes.type = 'dir' THEN 'dir'
+         WHEN typeof(fs_nodes.type) = 'text' AND fs_nodes.type = 'file' THEN 'file'
+         WHEN typeof(fs_nodes.type) = 'text' AND fs_nodes.type = 'symlink' THEN 'symlink'
+         ELSE ''
+       END AS type,
        fs_nodes.mode AS mode,
        fs_nodes.mtime AS mtime,
        fs_nodes.size AS size,
@@ -143,6 +154,40 @@ const SCAN_FILES_INCLUSIVE_SQL = `${SELECT_PAGE}
    AND fs_nodes.type <> 'dir'
  ORDER BY fs_paths.path
  LIMIT ?`;
+
+const SELECT_PAGE_METADATA = `SELECT length(CAST(fs_paths.path AS BLOB)) AS path_bytes,
+       length(CAST(fs_nodes.type AS BLOB)) AS type_bytes,
+       length(CAST(coalesce(fs_nodes.link_target, '') AS BLOB)) AS target_bytes,
+       coalesce(length(fs_nodes.content_id), 0) AS content_id_bytes
+  FROM fs_paths
+  JOIN fs_nodes ON fs_nodes.inode = fs_paths.inode
+ WHERE fs_paths.path > ? AND fs_paths.path < ?`;
+
+function aggregateScanMetadata(select: string): string {
+  return `SELECT count(*) AS row_count,
+       coalesce(sum(page.path_bytes), 0) AS path_bytes,
+       coalesce(sum(page.type_bytes), 0) AS type_bytes,
+       coalesce(sum(page.target_bytes), 0) AS target_bytes,
+       coalesce(sum(page.content_id_bytes), 0) AS content_id_bytes
+  FROM (${select}) page`;
+}
+
+const SCAN_METADATA_SQL = aggregateScanMetadata(`${SELECT_PAGE_METADATA}
+ ORDER BY fs_paths.path
+ LIMIT ?`);
+const SCAN_FILES_METADATA_SQL = aggregateScanMetadata(`${SELECT_PAGE_METADATA}
+   AND fs_nodes.type <> 'dir'
+ ORDER BY fs_paths.path
+ LIMIT ?`);
+const SCAN_INCLUSIVE_METADATA_SQL = aggregateScanMetadata(`${SELECT_PAGE_METADATA}
+   AND fs_paths.path >= ?
+ ORDER BY fs_paths.path
+ LIMIT ?`);
+const SCAN_FILES_INCLUSIVE_METADATA_SQL = aggregateScanMetadata(`${SELECT_PAGE_METADATA}
+   AND fs_paths.path >= ?
+   AND fs_nodes.type <> 'dir'
+ ORDER BY fs_paths.path
+ LIMIT ?`);
 
 const GLOB_SQL = `SELECT fs_paths.path AS path
   FROM fs_paths
@@ -360,6 +405,14 @@ interface ScanRow {
   content_id: Uint8Array | ArrayBuffer | null;
 }
 
+interface ScanMetadataRow {
+  row_count: unknown;
+  path_bytes: unknown;
+  type_bytes: unknown;
+  target_bytes: unknown;
+  content_id_bytes: unknown;
+}
+
 interface FileHandleRow {
   path: RealPath;
   inode: number;
@@ -388,10 +441,9 @@ interface ListRow {
   content_id: unknown;
 }
 
-/** The CHECK constraint guarantees this; the throw keeps the type honest. */
 function entryType(value: string): EntryType {
   if (value === "file" || value === "dir" || value === "symlink") return value;
-  throw new Error(`fs_nodes.type is not a known entry type: ${value}`);
+  throw new Error("fs_nodes.type is not a known entry type");
 }
 
 function toEntry(row: ScanRow): ScanEntry {
@@ -485,6 +537,103 @@ function toListItem(row: ListRow): ListItem {
  */
 function subtreeBounds(root: RealPath): { lower: string; upper: string } {
   return { lower: root === "/" ? "/" : `${root}/`, upper: subtreeSuccessor(root) };
+}
+
+function retainedStringUnits(units: number): number {
+  return OWNED_STRING_BYTES + units * 2;
+}
+
+function scanRangeRetainedBytes(root: RealPath, options: ScanOptions): number {
+  const rootBound = retainedStringUnits(root.length + 1) * 2;
+  const resumeBound =
+    options.afterSubtree === undefined ? 0 : retainedStringUnits(options.afterSubtree.length + 1);
+  return OWNED_SCAN_RANGE_BYTES + rootBound + resumeBound;
+}
+
+function requireScanMetadataInteger(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`scan: ${field} metadata is not a safe nonnegative integer`);
+  }
+  return value;
+}
+
+function scanMetadata(db: SqlDatabase, root: RealPath, options: ScanOptions): ScanMetadataRow {
+  const { lower, upper } = subtreeBounds(root);
+  let row: ScanMetadataRow | undefined;
+  if (options.afterSubtree !== undefined) {
+    const resume = subtreeSuccessor(options.afterSubtree);
+    const inclusive = comparePaths(resume, lower) > 0 ? resume : lower;
+    const sql =
+      options.filesOnly === true ? SCAN_FILES_INCLUSIVE_METADATA_SQL : SCAN_INCLUSIVE_METADATA_SQL;
+    row = db.one<ScanMetadataRow>(sql, lower, upper, inclusive, options.limit);
+  } else {
+    const after =
+      options.after !== undefined && comparePaths(options.after, lower) > 0 ? options.after : lower;
+    const sql = options.filesOnly === true ? SCAN_FILES_METADATA_SQL : SCAN_METADATA_SQL;
+    row = db.one<ScanMetadataRow>(sql, after, upper, options.limit);
+  }
+  if (row === undefined) throw new Error("scan: metadata query returned no row");
+  return row;
+}
+
+function predictedScanPageBytes(row: ScanMetadataRow, limit: number): number {
+  const count = requireScanMetadataInteger(row.row_count, "row count");
+  const pathBytes = requireScanMetadataInteger(row.path_bytes, "path bytes");
+  const typeBytes = requireScanMetadataInteger(row.type_bytes, "type bytes");
+  const targetBytes = requireScanMetadataInteger(row.target_bytes, "target bytes");
+  const contentIdBytes = requireScanMetadataInteger(row.content_id_bytes, "content-id bytes");
+  if (count > limit) throw new Error("scan: metadata row count exceeds the requested page");
+  return (
+    OWNED_SCAN_ARRAY_BYTES * 2 +
+    count * OWNED_SCAN_ROW_BYTES * 2 +
+    count * OWNED_STRING_BYTES * 4 +
+    (pathBytes + typeBytes + targetBytes) * 2 +
+    contentIdBytes
+  );
+}
+
+/** Retained native page after its physical SQL rows have been released. */
+export function scanPageRetainedBytes(page: readonly ScanEntry[]): number {
+  let bytes = OWNED_SCAN_ARRAY_BYTES;
+  for (const entry of page) {
+    bytes +=
+      OWNED_SCAN_ROW_BYTES +
+      retainedStringUnits(entry.path.length) +
+      retainedStringUnits(entry.target?.length ?? 0) +
+      (entry.contentId?.byteLength ?? 0);
+  }
+  return bytes;
+}
+
+/** Native SQLite page whose metadata is admitted before payload materialization. */
+export function scanOwned(
+  db: SqlDatabase,
+  root: RealPath,
+  options: ScanOptions,
+  reservation: MemoryReservation,
+): ScanEntry[] {
+  const metadataMemory = reservation.scope();
+  metadataMemory.set("other", OWNED_SCAN_METADATA_BYTES + scanRangeRetainedBytes(root, options));
+  let predicted: number;
+  try {
+    predicted = predictedScanPageBytes(scanMetadata(db, root, options), options.limit);
+  } finally {
+    metadataMemory.dispose();
+  }
+
+  reservation.set("other", predicted);
+  const rangeMemory = reservation.scope();
+  try {
+    rangeMemory.set("other", scanRangeRetainedBytes(root, options));
+    const page = scan(db, root, options);
+    reservation.set("other", scanPageRetainedBytes(page));
+    return page;
+  } catch (error) {
+    reservation.clear("other");
+    throw error;
+  } finally {
+    rangeMemory.dispose();
+  }
 }
 
 /**

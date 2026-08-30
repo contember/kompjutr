@@ -19,11 +19,7 @@ import {
   writeTree,
 } from "../src/core/ops/plumbing.js";
 import { add } from "../src/core/ops/staging.js";
-import {
-  MAX_TREE_BUILD_LEAF_ENTRIES,
-  MAX_TREE_BUILD_OBJECTS,
-  MAX_TREE_BUILD_TOTAL_PATH_BYTES,
-} from "../src/core/ops/tree-build.js";
+import { MAX_TREE_BUILD_LEAF_ENTRIES, MAX_TREE_BUILD_OBJECTS } from "../src/core/ops/tree-build.js";
 import { retainedStringBytes } from "../src/core/retained.js";
 import { comparePaths } from "../src/core/streams.js";
 import type { Worktree } from "../src/core/worktree.js";
@@ -432,7 +428,6 @@ describe("tree and index write plumbing", () => {
   it("preflights corrupt and first-over-limit indexes without partial objects", () => {
     const workspace = makeRepo("/");
     const blob = workspace.repo.store.write("blob", new Uint8Array(0));
-    const suffix = "x".repeat(500);
     const cases: Array<() => IterableIterator<IndexEntry>> = [
       () => [indexed("b", blob), indexed("a", blob)].values(),
       () => [indexed("bad-mode", blob, 0o100600)].values(),
@@ -440,12 +435,6 @@ describe("tree and index write plumbing", () => {
       function* () {
         for (let index = 0; index <= MAX_TREE_BUILD_LEAF_ENTRIES; index++) {
           yield indexed(`f${index.toString().padStart(5, "0")}`, blob);
-        }
-      },
-      function* () {
-        const count = Math.ceil(MAX_TREE_BUILD_TOTAL_PATH_BYTES / (suffix.length + 7)) + 1;
-        for (let index = 0; index < count; index++) {
-          yield indexed(`${index.toString().padStart(6, "0")}-${suffix}`, blob);
         }
       },
       function* () {
@@ -487,6 +476,122 @@ describe("tree and index write plumbing", () => {
     expect(statements).toBeLessThan(1_000);
     expect(controlState(workspace)).toEqual(beforeControl);
     expect(worktreeState(workspace)).toEqual([]);
+  });
+
+  it("writes beyond the former cumulative path and serialized-tree ceilings", () => {
+    const workspace = makeRepo("/");
+    const blob = workspace.repo.store.write("blob", new Uint8Array(0));
+    const suffix = "x".repeat(2_100);
+    const rows = function* (): Generator<IndexEntry> {
+      for (let directory = 0; directory < 4_000; directory++) {
+        const name = `d${directory.toString().padStart(4, "0")}`;
+        yield indexed(`${name}/a-${suffix}`, blob);
+        yield indexed(`${name}/b-${suffix}`, blob);
+      }
+    };
+    const beforeObjects = workspace.repo.store.objectCount();
+
+    const oid = writeTree(workspace.repo, readOnlyIndex(rows));
+
+    expect(workspace.repo.readTree(oid)).toHaveLength(4_000);
+    expect(workspace.repo.store.objectCount() - beforeObjects).toBe(2);
+    expect(workspace.repo.store.memory.activeCount).toBe(0);
+    expect(workspace.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("composes current-tree and staged-subtree allocations at the exact shared ceiling", () => {
+    const suffix = "x".repeat(1_800);
+    const prepare = (): { workspace: TestRepository; index: IndexStore } => {
+      const workspace = makeRepo("/");
+      const rows: IndexEntry[] = [];
+      for (let ordinal = 0; ordinal < 128; ordinal++) {
+        const directory = `d${ordinal.toString().padStart(3, "0")}`;
+        const blob = workspace.repo.store.write("blob", utf8.encode(`content-${ordinal}\n`));
+        rows.push(indexed(`${directory}/file-${suffix}`, blob));
+      }
+      const index = readOnlyIndex(() => rows.values());
+      return { workspace, index };
+    };
+
+    const measured = prepare();
+    const measuredObjects = measured.workspace.repo.store.objectCount();
+    writeTree(measured.workspace.repo, measured.index);
+    const operationBytes = measured.workspace.repo.store.memory.highWaterBytes;
+    expect(measured.workspace.repo.store.objectCount() - measuredObjects).toBe(129);
+    expect(measured.workspace.repo.store.memory.activeCount).toBe(0);
+
+    const exact = prepare();
+    const exactBlocker = exact.workspace.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      writeTree(exact.workspace.repo, exact.index);
+      expect(exact.workspace.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    expect(exact.workspace.repo.store.memory.activeCount).toBe(0);
+
+    const excess = prepare();
+    const beforeObjects = excess.workspace.repo.store.objectCount();
+    const excessBlocker = excess.workspace.repo.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => writeTree(excess.workspace.repo, excess.index)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(excess.workspace.repo.store.objectCount()).toBe(beforeObjects);
+    } finally {
+      excessBlocker.dispose();
+    }
+    expect(excess.workspace.repo.store.memory.activeCount).toBe(0);
+    expect(excess.workspace.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("composes one full index page and retained unique oids at the shared ceiling", () => {
+    const prepare = (): TestRepository => {
+      const workspace = makeRepo("/");
+      const oids: string[] = [];
+      workspace.repo.store.writeObjects((batch) => {
+        for (let ordinal = 0; ordinal < 2_048; ordinal++) {
+          oids.push(batch.write("blob", utf8.encode(`unique-${ordinal}\n`)));
+        }
+      });
+      workspace.repo.checkout.indexReplace(
+        oids.map((oid, ordinal) => indexed(`file-${ordinal.toString().padStart(4, "0")}`, oid)),
+      );
+      return workspace;
+    };
+
+    const measured = prepare();
+    writeTree(measured.repo);
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(measured.repo.store.memory.activeCount).toBe(0);
+    expect(measured.repo.store.memory.totalBytes).toBe(0);
+
+    const exact = prepare();
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      writeTree(exact.repo);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    expect(exact.repo.store.memory.activeCount).toBe(0);
+    expect(exact.repo.store.memory.totalBytes).toBe(0);
+
+    const excess = prepare();
+    const beforeObjects = excess.repo.store.objectCount();
+    const excessBlocker = excess.repo.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => writeTree(excess.repo)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(excess.repo.store.objectCount()).toBe(beforeObjects);
+    } finally {
+      excessBlocker.dispose();
+    }
+    expect(excess.repo.store.memory.activeCount).toBe(0);
+    expect(excess.repo.store.memory.totalBytes).toBe(0);
   });
 
   it("matches Git commit-tree for exact messages and zero, one, and two parents", async () => {

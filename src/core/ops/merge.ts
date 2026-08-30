@@ -1,6 +1,6 @@
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
-import type { IndexEntry, ObjectBatch } from "../../sqlite/store.js";
+import { type IndexEntry, type ObjectBatch, writeObjectsOwned } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
 import { hashObject, serializeCommit } from "../objects.js";
@@ -185,10 +185,15 @@ function materializeVirtualCommit(
   currentOid: string,
   incomingOid: string,
   plan: IntegrationPlan,
+  reservation: ReturnType<Repository["store"]["reserveMemory"]>,
 ): string {
   const currentTree = commitTree(repo, currentOid);
-  return repo.store.writeObjects((batch) => {
-    const tree = buildTreeInBatch(batch, virtualTreeEntries(repo, batch, currentTree, plan));
+  return writeObjectsOwned(repo.store, reservation, (batch) => {
+    const tree = buildTreeInBatch(
+      batch,
+      virtualTreeEntries(repo, batch, currentTree, plan),
+      reservation,
+    );
     return batch.write(
       "commit",
       serializeCommit({
@@ -208,7 +213,10 @@ function requireBoundedVirtualTree(
   plan: IntegrationPlan,
 ): void {
   const currentTree = commitTree(repo, currentOid);
-  requireBoundedIntegrationTree(virtualTreeEntries(repo, batchForIdentity(), currentTree, plan));
+  requireBoundedIntegrationTree(
+    repo,
+    virtualTreeEntries(repo, batchForIdentity(), currentTree, plan),
+  );
 }
 
 function batchForIdentity(): ObjectBatch {
@@ -260,7 +268,7 @@ function synthesizeVirtualPair(
   const reservation = reserveIntegrationPlan(repo, plan);
   try {
     requireBoundedVirtualTree(repo, currentOid, plan);
-    return materializeVirtualCommit(repo, currentOid, incomingOid, plan);
+    return materializeVirtualCommit(repo, currentOid, incomingOid, plan, reservation);
   } finally {
     reservation.dispose();
   }
@@ -566,7 +574,9 @@ function mergeInTransaction(
       throw compatibilityConflict(conflicts);
     }
     if (!isFastForward) {
-      requireBoundedIntegrationTree(prospectiveIntegrationIndexEntries(repo, projected));
+      requireBoundedIntegrationTree(repo, (reservation) =>
+        prospectiveIntegrationIndexEntries(repo, projected, reservation),
+      );
     }
 
     const current = repo.head();

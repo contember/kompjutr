@@ -9,7 +9,6 @@ import {
   MAX_MERGE_LABEL_BYTES,
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_REF_BYTES,
-  MAX_MERGE_STATE_BYTES,
   MAX_MERGE_TOUCHED_PATHS,
   type MergeJournal,
   type MergeSavedIdentity,
@@ -398,21 +397,9 @@ export function operationJournalRetainedBytes(
   let bytes = validateSequencedState(state, sequence);
   for (const step of sequence) {
     bytes = checkedAdd(bytes, validateOperationStepMetadata(step));
-    if (bytes > MAX_MERGE_STATE_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `operation journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`,
-      );
-    }
   }
   for (const entry of touched) {
     bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
-    if (bytes > MAX_MERGE_STATE_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `operation journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`,
-      );
-    }
   }
   return bytes;
 }

@@ -5,7 +5,6 @@ import { CorruptError, GitError } from "../errors.js";
 import { hashObject } from "../objects.js";
 
 export const MAX_MERGE_TOUCHED_PATHS = 1_000;
-export const MAX_MERGE_STATE_BYTES = 4 * 1024 * 1024;
 export const MAX_MERGE_PATH_BYTES = 2_200;
 export const MAX_MERGE_REF_BYTES = 1_024;
 export const MAX_MERGE_LABEL_BYTES = 256;
@@ -403,9 +402,6 @@ export function mergeJournalRetainedBytes(
   let bytes = validateMergeStateMetadata(state);
   for (const entry of touched) {
     bytes = checkedAdd(bytes, validateMergeTouchedPath(entry));
-    if (bytes > MAX_MERGE_STATE_BYTES) {
-      throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`);
-    }
   }
   return bytes;
 }

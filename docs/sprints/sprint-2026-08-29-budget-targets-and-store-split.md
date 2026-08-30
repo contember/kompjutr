@@ -578,6 +578,16 @@ shape exceptions, store import topology and proportional per-WU review.
   topological correction after two review rounds. WU6c-pre now lands internal
   owner-aware tree, graph, hash/checkout-guard and journal seams; later WUs skip
   only landed seam/call-site work, never an incomplete stable key.
+- 2026-08-30 — WU6c-pre now routes tree construction, object writes, commit-
+  graph state, journals, and worktree hashing through one caller-owned memory
+  reservation. Native filesystem realpath and scan reads pre-admit their live
+  rows; the compatibility-provider fallback remains unchanged and outside the
+  native store contract. Review caught and closed an accidental generic tree
+  cardinality gate, allocation-before-admission gaps, and unbounded corrupt
+  `fs_nodes.type` materialization. Ohm's final independent verdict was CLEAN.
+  The 111-test filesystem/worktree slice, typecheck, Biome, build, public-export
+  snapshot, and 157/157 routine smoke gate passed; the smoke gate took 12.55 s
+  under a two-vCPU lease.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

@@ -6,7 +6,6 @@ import {
   MAX_MERGE_BASE_COMMITS,
   MAX_MERGE_BASE_RETAINED_BYTES,
 } from "../src/core/ops/merge-base.js";
-import { MAX_MERGE_STATE_BYTES } from "../src/core/ops/merge-state.js";
 import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
 import { planRebase } from "../src/core/ops/rebase-plan.js";
 import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/core/ops/replay.js";
@@ -235,12 +234,13 @@ describe("bounded rebase planner", () => {
     }
   });
 
-  it("rejects planner limits that attempt to disable or raise hard bounds", () => {
+  it("rejects invalid planner limits and attempts to raise structural hard bounds", () => {
     const { repo } = harness();
     const invalidLimits = [
       { maxSteps: 0 },
       { maxSteps: MAX_OPERATION_STEPS + 1 },
-      { maxRetainedBytes: MAX_MERGE_STATE_BYTES + 1 },
+      { maxRetainedBytes: 0 },
+      { maxRetainedBytes: Number.MAX_SAFE_INTEGER + 1 },
       { maxGraphCommits: MAX_MERGE_BASE_COMMITS + 1 },
       { maxGraphRetainedBytes: MAX_MERGE_BASE_RETAINED_BYTES + 1 },
     ];

@@ -7,6 +7,7 @@ import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/co
 import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { deflate } from "../src/core/zlib.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
 import { blob, readBlob } from "../src/sqlite/db.js";
 import {
@@ -28,6 +29,7 @@ import {
   MAX_REF_MUTATION_RETAINED_BYTES,
   SqliteGitDatabase,
   type StoreOptions,
+  writeBatchOwned,
 } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
@@ -40,12 +42,8 @@ function open(options: StoreOptions = {}) {
 }
 
 function assertMemoryCoordinatorIdle(store: ReturnType<typeof open>["store"]): void {
-  const probe = store.reserveMemory();
-  try {
-    probe.set("other", MAX_REF_MUTATION_RETAINED_BYTES);
-  } finally {
-    probe.dispose();
-  }
+  expect(store.shared.memory.activeCount).toBe(0);
+  expect(store.shared.memory.totalBytes).toBe(0);
 }
 
 function insertRawBlob(db: TestDatabase, repoId: number, data: Uint8Array): string {
@@ -1061,6 +1059,168 @@ describe("object batches", () => {
     batch.flush();
     expect(store.has(oid)).toBe(true);
     expect(store.read(oid)?.data).toEqual(data);
+  });
+
+  it("charges owned staged payloads across writes and clears on flush and error", () => {
+    const { store } = open();
+    const owner = store.reserveMemory();
+    const batch = writeBatchOwned(store.shared, owner, {
+      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
+      flushEvery: 16,
+    });
+    try {
+      const first = utf8.encode("first staged object\n");
+      const second = new Uint8Array(randomBytes(8_192));
+      const firstOid = batch.write("blob", first);
+      const firstBytes = owner.currentBytes;
+      expect(firstBytes).toBeGreaterThan(first.byteLength);
+      const secondOid = batch.write("blob", second);
+      expect(owner.currentBytes).toBeGreaterThan(firstBytes + second.byteLength);
+      expect(store.has(firstOid)).toBe(false);
+      expect(store.has(secondOid)).toBe(false);
+
+      batch.flush();
+      expect(owner.currentBytes).toBe(0);
+      expect(store.has(firstOid)).toBe(true);
+      expect(store.has(secondOid)).toBe(true);
+
+      expect(() => batch.write("commit", utf8.encode("not a commit"))).toThrowError(
+        expect.objectContaining({ code: "ECORRUPT" }),
+      );
+      expect(owner.currentBytes).toBe(0);
+    } finally {
+      batch.dispose();
+      owner.dispose();
+    }
+    store.shared.memory.assertIdle();
+  });
+
+  it("admits commit parsing at the exact input-derived transient boundary", () => {
+    const person = {
+      name: "Commit Parser",
+      email: "parser@example.test",
+      timestamp: 1_700_000_000,
+      timezoneOffset: 0,
+    };
+    const data = serializeCommit({
+      tree: "1".repeat(40),
+      parent: [],
+      author: person,
+      committer: person,
+      message: `${"parsed commit body ".repeat(4_096)}\n`,
+    });
+
+    const measured = open();
+    const probe = measured.store.reserveMemory();
+    const measuredBatch = writeBatchOwned(measured.store.shared, probe, {
+      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
+      flushEvery: 2,
+    });
+    try {
+      measuredBatch.write("commit", data);
+    } finally {
+      measuredBatch.dispose();
+    }
+    const operationBytes = probe.highWaterBytes;
+    probe.dispose();
+    measured.store.shared.memory.assertIdle();
+
+    const exact = open();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = exact.store.reserveMemory();
+    const exactBatch = writeBatchOwned(exact.store.shared, exactOwner, {
+      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
+      flushEvery: 2,
+    });
+    try {
+      exactBatch.write("commit", data);
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBatch.dispose();
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    exact.store.shared.memory.assertIdle();
+
+    const excess = open();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessOwner = excess.store.reserveMemory();
+    const excessBatch = writeBatchOwned(excess.store.shared, excessOwner, {
+      payloadBytes: MAX_OPERATION_MEMORY_BYTES,
+      flushEvery: 2,
+    });
+    try {
+      expect(() => excessBatch.write("commit", data)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(excessOwner.currentBytes).toBe(0);
+      expect(excess.db.scalar<number>("SELECT count(*) FROM git_objects")).toBe(0);
+      expect(excess.db.scalar<number>("SELECT count(*) FROM git_commits")).toBe(0);
+    } finally {
+      excessBatch.dispose();
+      excessOwner.dispose();
+      excessBlocker.dispose();
+    }
+    excess.store.shared.memory.assertIdle();
+  });
+
+  it("owns multi-object flush transients through exact commit or atomic failure", () => {
+    const objects = [
+      new Uint8Array(randomBytes(24_000)),
+      new Uint8Array(randomBytes(32_000)),
+      new Uint8Array(randomBytes(40_000)),
+    ];
+    const options = { payloadBytes: MAX_OPERATION_MEMORY_BYTES, flushEvery: 4 };
+
+    const measured = open();
+    const probe = measured.store.reserveMemory();
+    const measuredBatch = writeBatchOwned(measured.store.shared, probe, options);
+    for (const data of objects) measuredBatch.write("blob", data);
+    const stagedBytes = probe.highWaterBytes;
+    measuredBatch.flush();
+    const operationBytes = probe.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(stagedBytes + 1);
+    expect(probe.currentBytes).toBe(0);
+    measuredBatch.dispose();
+    probe.dispose();
+    measured.store.shared.memory.assertIdle();
+
+    const exact = open();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = exact.store.reserveMemory();
+    const exactBatch = writeBatchOwned(exact.store.shared, exactOwner, options);
+    try {
+      for (const data of objects) exactBatch.write("blob", data);
+      exactBatch.flush();
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exact.db.scalar<number>("SELECT count(*) FROM git_objects")).toBe(objects.length);
+    } finally {
+      exactBatch.dispose();
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    exact.store.shared.memory.assertIdle();
+
+    const excess = open();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessOwner = excess.store.reserveMemory();
+    const excessBatch = writeBatchOwned(excess.store.shared, excessOwner, options);
+    try {
+      for (const data of objects) excessBatch.write("blob", data);
+      expect(() => excessBatch.flush()).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(excessOwner.currentBytes).toBe(0);
+      expect(excess.db.scalar<number>("SELECT count(*) FROM git_objects")).toBe(0);
+      expect(excess.db.scalar<number>("SELECT count(*) FROM git_object_chunks")).toBe(0);
+    } finally {
+      excessBatch.dispose();
+      excessOwner.dispose();
+      excessBlocker.dispose();
+    }
+    excess.store.shared.memory.assertIdle();
   });
 
   it("owns raw and zlib blob bytes before the caller can mutate them", () => {
@@ -2786,7 +2946,7 @@ describe("refs, config and index", () => {
     expect(name(0)).toHaveLength(nameBytes);
 
     const measured = open({ now: () => 1_800_000_000_000 });
-    expect(measured.store.shared.memory.highWaterBytes).toBe(0);
+    assertMemoryCoordinatorIdle(measured.store);
     measured.db.storage.resetCounters();
     measured.store.updateRefs(puts());
     const measuredHighWater = measured.store.shared.memory.highWaterBytes;

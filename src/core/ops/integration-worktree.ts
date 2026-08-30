@@ -1,6 +1,7 @@
 // Shared bounded index, worktree, projection, and commit preflight for integration operations.
 
-import type { IndexEntry } from "../../sqlite/store.js";
+import type { MemoryReservation } from "../../memory.js";
+import { type IndexEntry, indexScanOwned } from "../../sqlite/store.js";
 import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import { comparePaths, joinSorted } from "../streams.js";
@@ -13,22 +14,16 @@ import { checkoutBlockers, checkoutBlockersAgainst } from "./refs.js";
 import {
   MAX_TREE_BUILD_LEAF_ENTRIES,
   MAX_TREE_BUILD_OBJECTS,
-  MAX_TREE_BUILD_SERIALIZED_BYTES,
-  MAX_TREE_BUILD_TOTAL_PATH_BYTES,
   preflightTreeBuild,
-  TREE_BUILD_EXECUTION_MEMORY_BYTES,
   type TreeBuildPreflightStats,
 } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
 import { type DirtyPathLimits, dirtyPathStream, walkWorktreeEntriesStream } from "./worktree-io.js";
 
 export const MAX_INTEGRATION_INDEX_ENTRIES = MAX_TREE_BUILD_LEAF_ENTRIES;
-export const MAX_INTEGRATION_INDEX_PATH_BYTES = MAX_TREE_BUILD_TOTAL_PATH_BYTES;
 export const MAX_INTEGRATION_TREE_OBJECTS = MAX_TREE_BUILD_OBJECTS;
-export const MAX_INTEGRATION_SERIALIZED_TREE_BYTES = MAX_TREE_BUILD_SERIALIZED_BYTES;
 const MAX_REPOSITORY_ROWS = 50_000;
 const MAX_GUARD_HASH_BYTES = 32 * 1024 * 1024;
-export const INTEGRATION_EXECUTION_HEADROOM_BYTES = TREE_BUILD_EXECUTION_MEMORY_BYTES;
 const MAX_RELOCATION_COLLISIONS = 1_000;
 
 function dirtyPathLimits(): DirtyPathLimits {
@@ -60,14 +55,23 @@ function indexEntry(path: string, mode: string, oid: string): IndexEntry {
 }
 
 export function requireBoundedIntegrationTree(
-  entries: Iterable<IndexEntry>,
+  repo: Repository,
+  source: Iterable<IndexEntry> | ((reservation: MemoryReservation) => Iterable<IndexEntry>),
 ): TreeBuildPreflightStats {
-  return preflightTreeBuild(entries, {
-    maxLeafEntries: MAX_INTEGRATION_INDEX_ENTRIES,
-    maxTotalPathBytes: MAX_INTEGRATION_INDEX_PATH_BYTES,
-    maxTreeObjects: MAX_INTEGRATION_TREE_OBJECTS,
-    maxSerializedTreeBytes: MAX_INTEGRATION_SERIALIZED_TREE_BYTES,
-  });
+  const reservation = repo.store.reserveMemory();
+  try {
+    const entries = typeof source === "function" ? source(reservation) : source;
+    return preflightTreeBuild(
+      entries,
+      {
+        maxEntriesPerTree: MAX_INTEGRATION_INDEX_ENTRIES,
+        maxTreeObjects: MAX_INTEGRATION_TREE_OBJECTS,
+      },
+      reservation,
+    );
+  } finally {
+    reservation.dispose();
+  }
 }
 
 function projectedIdentity(entry: ProjectedMergeEntry): { mode: string; oid: string } | null {
@@ -79,9 +83,10 @@ function projectedIdentity(entry: ProjectedMergeEntry): { mode: string; oid: str
 export function* prospectiveIntegrationIndexEntries(
   repo: Repository,
   projected: readonly ProjectedMergeEntry[],
+  reservation: MemoryReservation,
 ): Generator<IndexEntry> {
   const owned = new Set(projectedTouchedShape(projected).map((entry) => entry.path));
-  for (const row of joinSorted(repo.checkout.indexScan(), projected, {
+  for (const row of joinSorted(indexScanOwned(repo.checkout, reservation), projected, {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
   })) {
@@ -94,9 +99,12 @@ export function* prospectiveIntegrationIndexEntries(
   }
 }
 
-function* continuationIndexEntries(repo: Repository): Generator<IndexEntry> {
+function* continuationIndexEntries(
+  repo: Repository,
+  reservation: MemoryReservation,
+): Generator<IndexEntry> {
   let previous: string | null = null;
-  for (const entry of repo.checkout.indexScan()) {
+  for (const entry of indexScanOwned(repo.checkout, reservation)) {
     if (entry.path === previous) continue;
     previous = entry.path;
     yield entry.stage === 0 ? entry : { ...entry, stage: 0 };
@@ -104,7 +112,9 @@ function* continuationIndexEntries(repo: Repository): Generator<IndexEntry> {
 }
 
 export function requireBoundedIntegrationIndex(repo: Repository): TreeBuildPreflightStats {
-  return requireBoundedIntegrationTree(continuationIndexEntries(repo));
+  return requireBoundedIntegrationTree(repo, (reservation) =>
+    continuationIndexEntries(repo, reservation),
+  );
 }
 
 export function reserveIntegrationPlan(
@@ -113,19 +123,14 @@ export function reserveIntegrationPlan(
   callerRetainedBytes = 0,
 ): ReturnType<Repository["store"]["reserveMemory"]> {
   const reservation = repo.store.reserveMemory();
-  reservation.set(
-    "other",
-    callerRetainedBytes + plan.retainedBytes + INTEGRATION_EXECUTION_HEADROOM_BYTES,
-  );
+  reservation.set("other", callerRetainedBytes + plan.retainedBytes);
   return reservation;
 }
 
 export function reserveIntegrationExecution(
   repo: Repository,
 ): ReturnType<Repository["store"]["reserveMemory"]> {
-  const reservation = repo.store.reserveMemory();
-  reservation.set("other", INTEGRATION_EXECUTION_HEADROOM_BYTES);
-  return reservation;
+  return repo.store.reserveMemory();
 }
 
 export function requireCleanIntegrationIndex(

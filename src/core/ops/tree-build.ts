@@ -7,7 +7,8 @@
 // bottom-up pass, so the only thing held live is the directory stack of
 // the path currently being visited.
 
-import type { IndexEntry, ObjectBatch } from "../../sqlite/store.js";
+import type { MemoryReservation } from "../../memory.js";
+import { type IndexEntry, type ObjectBatch, writeObjectsOwned } from "../../sqlite/store.js";
 import { CorruptError, GitError } from "../errors.js";
 import {
   compareTreeEntries,
@@ -17,15 +18,14 @@ import {
   type TreeEntry,
 } from "../objects.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import type { CommitTreeSnapshotResult } from "../sparse-workspace.js";
 import { comparePaths } from "../streams.js";
 
 export const MAX_TREE_BUILD_PATH_BYTES = 2_200;
+/** Maximum entries retained in one materialized tree object. */
 export const MAX_TREE_BUILD_LEAF_ENTRIES = 10_000;
-export const MAX_TREE_BUILD_TOTAL_PATH_BYTES = 4 * 1024 * 1024;
 export const MAX_TREE_BUILD_OBJECTS = 4_096;
-export const MAX_TREE_BUILD_SERIALIZED_BYTES = 16 * 1024 * 1024;
-export const TREE_BUILD_EXECUTION_MEMORY_BYTES = 24 * 1024 * 1024;
 
 const INDEX_DIRTY = 1;
 const MAX_SPARSE_TREE_PATHS = 1_000;
@@ -34,10 +34,8 @@ const MAX_SPARSE_TREE_RETAINED_BYTES = 8 * 1024 * 1024;
 const MAX_SPARSE_TREE_PLAN_BYTES = 16 * 1024 * 1024;
 
 export interface TreeBuildPreflightLimits {
-  maxLeafEntries: number;
-  maxTotalPathBytes: number;
+  maxEntriesPerTree: number;
   maxTreeObjects: number;
-  maxSerializedTreeBytes: number;
 }
 
 export interface TreeBuildPreflightStats {
@@ -65,10 +63,97 @@ type CommitTreeSnapshot = Extract<CommitTreeSnapshotResult, { available: true }>
 interface OpenDirectory {
   name: string;
   entries: TreeEntry[];
+  retainedBytes: number;
+  serializedBytes: number;
 }
 
 interface PreflightDirectory {
   serializedBytes: number;
+  entries: number;
+}
+
+const ARRAY_FIXED_BYTES = 64;
+const ARRAY_SLOT_BYTES = 8;
+const PREFLIGHT_FIXED_BYTES = 384;
+const PREFLIGHT_DIRECTORY_BYTES = 32;
+const PREFLIGHT_STATS_BYTES = 96;
+const BUILD_FIXED_BYTES = 384;
+const OPEN_DIRECTORY_FIXED_BYTES = 128;
+const TREE_ENTRY_FIXED_BYTES = 96;
+const SERIALIZE_PART_FIXED_BYTES = 64;
+const SERIALIZED_OBJECT_FIXED_BYTES = 64;
+const BUILD_RESULT_BYTES = 96;
+const OID_RETAINED_BYTES = 48 + 40 * 2;
+const MODE_RETAINED_BYTES = 48 + 6 * 2;
+
+function checkedBytes(total: number, bytes: number, label: string): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > Number.MAX_SAFE_INTEGER - total) {
+    throw new GitError("E2BIG", `tree-build ${label} size overflows`);
+  }
+  return total + bytes;
+}
+
+function segmentAllocationBytes(path: string): number {
+  let segments = 1;
+  for (let index = 0; index < path.length; index++) {
+    if (path.charCodeAt(index) === 0x2f) segments++;
+  }
+  return ARRAY_FIXED_BYTES + segments * (ARRAY_SLOT_BYTES + 48) + path.length * 2;
+}
+
+function pathSegmentCount(path: string): number {
+  let segments = 1;
+  for (let index = 0; index < path.length; index++) {
+    if (path.charCodeAt(index) === 0x2f) segments++;
+  }
+  return segments;
+}
+
+function directoryRetainedBytes(name: string): number {
+  return OPEN_DIRECTORY_FIXED_BYTES + ARRAY_FIXED_BYTES + retainedStringBytes(name);
+}
+
+function treeEntryRetainedBytes(mode: string, name: string, oid: string): number {
+  return (
+    TREE_ENTRY_FIXED_BYTES +
+    ARRAY_SLOT_BYTES +
+    retainedStringBytes(mode) +
+    retainedStringBytes(name) +
+    retainedStringBytes(oid)
+  );
+}
+
+function serializationWorkingBytes(entries: readonly TreeEntry[], serializedBytes: number): number {
+  let longestHeaderUnits = 0;
+  for (const entry of entries) {
+    longestHeaderUnits = Math.max(longestHeaderUnits, entry.mode.length + entry.name.length + 2);
+  }
+  return (
+    2 * ARRAY_FIXED_BYTES +
+    entries.length * (3 * ARRAY_SLOT_BYTES + 2 * SERIALIZE_PART_FIXED_BYTES) +
+    serializedBytes * 2 +
+    48 +
+    longestHeaderUnits * 2
+  );
+}
+
+function preflightRetainedBytes(
+  open: readonly string[],
+  previousEntryPath: string | null,
+  previousPath: string | null,
+): number {
+  let bytes =
+    PREFLIGHT_FIXED_BYTES +
+    2 * ARRAY_FIXED_BYTES +
+    open.length * (2 * ARRAY_SLOT_BYTES + PREFLIGHT_DIRECTORY_BYTES);
+  for (const name of open) bytes = checkedBytes(bytes, retainedStringBytes(name), "memory");
+  if (previousEntryPath !== null) {
+    bytes = checkedBytes(bytes, retainedStringBytes(previousEntryPath), "memory");
+  }
+  if (previousPath !== null && previousPath !== previousEntryPath) {
+    bytes = checkedBytes(bytes, retainedStringBytes(previousPath), "memory");
+  }
+  return bytes;
 }
 
 function requireLimit(value: number, label: string): number {
@@ -526,19 +611,17 @@ function validatePath(path: string): string[] {
 export function preflightTreeBuild(
   entries: Iterable<IndexEntry>,
   limits: TreeBuildPreflightLimits,
+  reservation: MemoryReservation,
 ): TreeBuildPreflightStats {
-  const maxLeafEntries = requireLimit(limits.maxLeafEntries, "leaf-entry");
-  const maxTotalPathBytes = requireLimit(limits.maxTotalPathBytes, "path-byte");
+  const maxEntriesPerTree = requireLimit(limits.maxEntriesPerTree, "tree-entry");
   const maxTreeObjects = requireLimit(limits.maxTreeObjects, "tree-object");
-  const maxSerializedTreeBytes = requireLimit(
-    limits.maxSerializedTreeBytes,
-    "serialized-tree-byte",
-  );
   if (maxTreeObjects < 1) throw new GitError("E2BIG", "tree build requires its root tree");
 
-  const stack: PreflightDirectory[] = [{ serializedBytes: 0 }];
+  reservation.set("tree", PREFLIGHT_FIXED_BYTES + 2 * ARRAY_FIXED_BYTES);
+  const stack: PreflightDirectory[] = [{ serializedBytes: 0, entries: 0 }];
   const open: string[] = [];
-  let previousEntry: { path: string; stage: number } | null = null;
+  let previousEntryPath: string | null = null;
+  let previousEntryStage: number | null = null;
   let previousPath: string | null = null;
   let leafEntries = 0;
   let totalPathBytes = 0;
@@ -546,14 +629,17 @@ export function preflightTreeBuild(
   let serializedTreeBytes = 0;
   let maxSingleTreeBytes = 0;
 
-  const retainSerialized = (bytes: number): void => {
-    serializedTreeBytes = checkedAdd(
-      serializedTreeBytes,
-      bytes,
-      maxSerializedTreeBytes,
-      "serialized tree bytes",
-    );
+  const retainEntry = (directory: PreflightDirectory, bytes: number): void => {
+    if (directory.entries >= maxEntriesPerTree) {
+      throw new GitError(
+        "E2BIG",
+        `tree build exceeds ${maxEntriesPerTree} entries in one tree object`,
+      );
+    }
+    directory.entries++;
+    directory.serializedBytes += bytes;
   };
+
   const closeTo = (depth: number): void => {
     while (open.length > depth) {
       const finished = stack.pop();
@@ -564,20 +650,29 @@ export function preflightTreeBuild(
   };
 
   for (const entry of entries) {
+    if (typeof entry.path !== "string") {
+      throw new CorruptError("tree-build index path is invalid");
+    }
+    reservation.set(
+      "tree",
+      checkedBytes(
+        preflightRetainedBytes(open, previousEntryPath, previousPath),
+        retainedStringBytes(entry.path) + segmentAllocationBytes(entry.path),
+        "memory",
+      ),
+    );
     if (!Number.isSafeInteger(entry.stage) || entry.stage < 0 || entry.stage > 3) {
       throw new CorruptError("tree-build index stage is invalid");
     }
-    if (previousEntry !== null) {
-      const order = comparePaths(previousEntry.path, entry.path);
-      if (order > 0 || (order === 0 && previousEntry.stage >= entry.stage)) {
+    if (previousEntryPath !== null && previousEntryStage !== null) {
+      const order = comparePaths(previousEntryPath, entry.path);
+      if (order > 0 || (order === 0 && previousEntryStage >= entry.stage)) {
         throw new CorruptError("tree-build index entries are not in strict Git order");
       }
     }
-    previousEntry = { path: entry.path, stage: entry.stage };
+    previousEntryPath = entry.path;
+    previousEntryStage = entry.stage;
     if (entry.stage !== 0) continue;
-    if (leafEntries >= maxLeafEntries) {
-      throw new GitError("E2BIG", `tree build exceeds ${maxLeafEntries} leaf entries`);
-    }
     const pathLength = utf8Length(entry.path, "tree-build index path");
     if (pathLength > MAX_TREE_BUILD_PATH_BYTES) {
       throw new GitError(
@@ -585,7 +680,7 @@ export function preflightTreeBuild(
         `tree-build index path exceeds ${MAX_TREE_BUILD_PATH_BYTES} UTF-8 bytes`,
       );
     }
-    totalPathBytes = checkedAdd(totalPathBytes, pathLength, maxTotalPathBytes, "full-path bytes");
+    totalPathBytes = checkedBytes(totalPathBytes, pathLength, "full-path diagnostic");
     if (previousPath !== null) {
       if (comparePaths(previousPath, entry.path) >= 0) {
         throw new CorruptError("tree-build stage-zero paths are not in strict Git order");
@@ -608,11 +703,11 @@ export function preflightTreeBuild(
       const name = segments[level];
       if (name === undefined) throw new CorruptError("tree-build directory segment is missing");
       const bytes = serializedEntryBytes(5, utf8Length(name, "tree-build directory name"));
-      retainSerialized(bytes);
+      serializedTreeBytes = checkedBytes(serializedTreeBytes, bytes, "serialized diagnostic");
       const parent = stack[stack.length - 1];
       if (parent === undefined) throw new CorruptError("tree-build preflight lost its parent");
-      parent.serializedBytes += bytes;
-      stack.push({ serializedBytes: 0 });
+      retainEntry(parent, bytes);
+      stack.push({ serializedBytes: 0, entries: 0 });
       open.push(name);
       treeObjects++;
     }
@@ -623,18 +718,20 @@ export function preflightTreeBuild(
       serializedLeafModeBytes(entry.mode),
       utf8Length(name, "tree-build leaf name"),
     );
-    retainSerialized(leafBytes);
+    serializedTreeBytes = checkedBytes(serializedTreeBytes, leafBytes, "serialized diagnostic");
     const parent = stack[stack.length - 1];
     if (parent === undefined) throw new CorruptError("tree-build preflight lost its leaf parent");
-    parent.serializedBytes += leafBytes;
+    retainEntry(parent, leafBytes);
     leafEntries++;
     previousPath = entry.path;
+    reservation.set("tree", preflightRetainedBytes(open, previousEntryPath, previousPath));
   }
 
   closeTo(0);
   const root = stack[0];
   if (root === undefined) throw new CorruptError("tree-build preflight lost its root");
   maxSingleTreeBytes = Math.max(maxSingleTreeBytes, root.serializedBytes);
+  reservation.set("tree", PREFLIGHT_STATS_BYTES);
   return {
     leafEntries,
     totalPathBytes,
@@ -655,50 +752,180 @@ export function preflightTreeBuild(
  * nothing.
  */
 export function buildTree(repo: Repository, entries: Iterable<IndexEntry>): string {
-  return repo.store.writeObjects((batch) => buildTreeInBatch(batch, entries));
+  const reservation = repo.store.reserveMemory();
+  try {
+    return writeObjectsOwned(repo.store, reservation, (batch) =>
+      buildTreeInBatch(batch, entries, reservation),
+    );
+  } finally {
+    reservation.dispose();
+  }
 }
 
 /** Build trees in a caller-owned batch so a commit can share the same flush. */
-export function buildTreeInBatch(batch: ObjectBatch, entries: Iterable<IndexEntry>): string {
-  const stack: OpenDirectory[] = [{ name: "", entries: [] }];
+export function buildTreeInBatch(
+  batch: ObjectBatch,
+  entries: Iterable<IndexEntry>,
+  reservation: MemoryReservation,
+): string {
+  let retainedBytes =
+    BUILD_FIXED_BYTES + 2 * ARRAY_FIXED_BYTES + ARRAY_SLOT_BYTES + directoryRetainedBytes("");
+  reservation.set("tree", retainedBytes);
+  const stack: OpenDirectory[] = [
+    { name: "", entries: [], retainedBytes: directoryRetainedBytes(""), serializedBytes: 0 },
+  ];
   // Segment names of the directories currently open below the root.
   const open: string[] = [];
-
   for (const entry of entries) {
     if (entry.stage !== 0) continue;
-    const segments = entry.path.split("/");
+    if (typeof entry.path !== "string") {
+      throw new CorruptError("tree-build index path is invalid");
+    }
+    const segmentCount = pathSegmentCount(entry.path);
+    reservation.set(
+      "tree",
+      checkedBytes(
+        retainedBytes,
+        retainedStringBytes(entry.path) +
+          segmentAllocationBytes(entry.path) +
+          segmentCount * (OPEN_DIRECTORY_FIXED_BYTES + ARRAY_FIXED_BYTES + 2 * ARRAY_SLOT_BYTES) +
+          TREE_ENTRY_FIXED_BYTES +
+          ARRAY_SLOT_BYTES +
+          MODE_RETAINED_BYTES +
+          OID_RETAINED_BYTES,
+        "memory",
+      ),
+    );
+    const segments = validatePath(entry.path);
     const depth = segments.length - 1;
 
     let shared = 0;
     while (shared < depth && shared < open.length && open[shared] === segments[shared]) shared++;
-    while (open.length > shared) closeTop(batch, stack, open);
+    while (open.length > shared) {
+      retainedBytes = closeTop(batch, stack, open, reservation, retainedBytes);
+    }
     for (let level = shared; level < depth; level++) {
-      stack.push({ name: segments[level]!, entries: [] });
-      open.push(segments[level]!);
+      const name = segments[level];
+      if (name === undefined) throw new CorruptError("tree-build directory segment is missing");
+      const directoryBytes = directoryRetainedBytes(name);
+      retainedBytes = checkedBytes(retainedBytes, directoryBytes + 2 * ARRAY_SLOT_BYTES, "memory");
+      reservation.set("tree", retainedBytes);
+      stack.push({ name, entries: [], retainedBytes: directoryBytes, serializedBytes: 0 });
+      open.push(name);
     }
 
-    stack[stack.length - 1]!.entries.push({
-      mode: entry.mode.toString(8),
-      name: segments[depth]!,
+    const parent = stack[stack.length - 1];
+    const name = segments[depth];
+    if (parent === undefined || name === undefined) {
+      throw new CorruptError("tree-build execution lost its leaf parent");
+    }
+    serializedLeafModeBytes(entry.mode);
+    if (!validOid(entry.oid)) throw new CorruptError("tree-build index oid is invalid");
+    const mode = entry.mode.toString(8);
+    const entryBytes = treeEntryRetainedBytes(mode, name, entry.oid);
+    retainedBytes = checkedBytes(retainedBytes, entryBytes, "memory");
+    reservation.set("tree", retainedBytes);
+    parent.entries.push({
+      mode,
+      name,
       oid: entry.oid,
     });
+    parent.retainedBytes = checkedBytes(parent.retainedBytes, entryBytes, "memory");
+    parent.serializedBytes = checkedBytes(
+      parent.serializedBytes,
+      serializedEntryBytes(
+        serializedLeafModeBytes(entry.mode),
+        utf8Length(name, "tree-build entry name"),
+      ),
+      "serialized object",
+    );
   }
 
-  while (open.length > 0) closeTop(batch, stack, open);
-  return writeTree(batch, stack[0]!.entries);
+  while (open.length > 0) {
+    retainedBytes = closeTop(batch, stack, open, reservation, retainedBytes);
+  }
+  const root = stack[0];
+  if (root === undefined) throw new CorruptError("tree-build execution lost its root");
+  return writeTree(batch, root.entries, root.serializedBytes, reservation, retainedBytes, true);
 }
 
-function closeTop(batch: ObjectBatch, stack: OpenDirectory[], open: string[]): void {
-  const finished = stack.pop()!;
+function closeTop(
+  batch: ObjectBatch,
+  stack: OpenDirectory[],
+  open: string[],
+  reservation: MemoryReservation,
+  retainedBytes: number,
+): number {
+  const finished = stack[stack.length - 1];
+  const parent = stack[stack.length - 2];
+  if (finished === undefined || parent === undefined) {
+    throw new CorruptError("tree-build execution stack is invalid");
+  }
+  const prospectiveBytes =
+    TREE_ENTRY_FIXED_BYTES +
+    ARRAY_SLOT_BYTES +
+    retainedStringBytes(MODE_TREE) +
+    retainedStringBytes(finished.name) +
+    OID_RETAINED_BYTES;
+  const oid = writeTree(
+    batch,
+    finished.entries,
+    finished.serializedBytes,
+    reservation,
+    checkedBytes(retainedBytes, prospectiveBytes, "memory"),
+    false,
+  );
+  stack.pop();
   open.pop();
-  stack[stack.length - 1]!.entries.push({
+  parent.entries.push({
     mode: MODE_TREE,
     name: finished.name,
-    oid: writeTree(batch, finished.entries),
+    oid,
   });
+  parent.retainedBytes = checkedBytes(parent.retainedBytes, prospectiveBytes, "memory");
+  parent.serializedBytes = checkedBytes(
+    parent.serializedBytes,
+    serializedEntryBytes(5, utf8Length(finished.name, "tree-build directory name")),
+    "serialized object",
+  );
+  const released = finished.retainedBytes + 2 * ARRAY_SLOT_BYTES;
+  if (released > retainedBytes) throw new CorruptError("tree-build memory accounting underflow");
+  const next = retainedBytes - released + prospectiveBytes;
+  reservation.set("tree", next);
+  return next;
 }
 
 /** The batch hashes before flushing, and its insert ignores objects already present. */
-function writeTree(batch: ObjectBatch, entries: TreeEntry[]): string {
-  return batch.write("tree", serializeTree(entries));
+function writeTree(
+  batch: ObjectBatch,
+  entries: TreeEntry[],
+  serializedBytes: number,
+  reservation: MemoryReservation,
+  retainedBytes: number,
+  root: boolean,
+): string {
+  const resultBytes = root ? BUILD_RESULT_BYTES + OID_RETAINED_BYTES : 0;
+  reservation.set(
+    "tree",
+    checkedBytes(
+      retainedBytes,
+      serializationWorkingBytes(entries, serializedBytes) + resultBytes,
+      "memory",
+    ),
+  );
+  const data = serializeTree(entries);
+  if (data.length !== serializedBytes) {
+    throw new CorruptError("tree-build serialized size is inconsistent");
+  }
+  reservation.set(
+    "tree",
+    checkedBytes(
+      retainedBytes,
+      SERIALIZED_OBJECT_FIXED_BYTES + serializedBytes + resultBytes,
+      "memory",
+    ),
+  );
+  const oid = batch.write("tree", data);
+  if (root) reservation.set("tree", BUILD_RESULT_BYTES + retainedStringBytes(oid));
+  return oid;
 }

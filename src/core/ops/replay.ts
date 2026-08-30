@@ -621,7 +621,10 @@ export function replaySnapshot(
     const conflicts = snapshotConflicts(plan.integration, projected);
     if (conflicts.length > 0) return { outcome: "conflicted", conflicts };
 
-    requireBoundedIntegrationTree(prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected));
+    requireBoundedIntegrationTree(
+      repo,
+      prospectiveSnapshotIndex(repo, plan.currentTreeOid, projected),
+    );
     validateSnapshotResultObjects(repo, plan.currentTreeOid, projected);
     return repo.store.runScratchAwareOperation(() =>
       repo.store.db.transactionSync(() => {

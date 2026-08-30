@@ -8,6 +8,7 @@ import {
   MAX_COMMIT_CACHE_BYTES,
   MAX_LOG_COMMITS,
   MAX_LOG_STATE_BYTES,
+  readCommitGraphOwned,
 } from "../sqlite/commits.js";
 import { requireRefName } from "../sqlite/ref-validation.js";
 import type {
@@ -25,7 +26,7 @@ import type {
   WalkTreeDiffEntry,
   WalkTreeDiffObject,
 } from "../sqlite/store.js";
-import { createRefMutationMemoryOwner } from "../sqlite/store.js";
+import { createRefMutationMemoryOwner, readShallowOwned } from "../sqlite/store.js";
 import { isAbbreviatedOid, isOid } from "./bytes.js";
 import { CorruptError, GitError, ObjectNotFoundError, RefNotFoundError } from "./errors.js";
 import {
@@ -262,11 +263,34 @@ class CommitFillBuffer {
   }
 }
 
+type OwnedIndexedWalk = (
+  oid: string,
+  reservation: MemoryReservation,
+  limits?: CommitGraphLimits,
+) => Iterable<{ oid: string; commit: Commit }>;
+
+const OWNED_INDEXED_WALKS = new WeakMap<Repository, OwnedIndexedWalk>();
+
+/** Internal graph walk retained under an existing repository operation. */
+export function walkIndexedOwned(
+  repo: Repository,
+  oid: string,
+  reservation: MemoryReservation,
+  limits: CommitGraphLimits = {},
+): Iterable<{ oid: string; commit: Commit }> {
+  const walk = OWNED_INDEXED_WALKS.get(repo);
+  if (walk === undefined) throw new GitError("EINVAL", "repository graph owner is unavailable");
+  return walk(oid, reservation, limits);
+}
+
 export class Repository {
   readonly store: SharedRepoStore;
 
   constructor(readonly checkout: CheckoutStore) {
     this.store = checkout.shared;
+    OWNED_INDEXED_WALKS.set(this, (oid, reservation, limits) =>
+      this.#walkIndexedOwned(oid, reservation, limits),
+    );
   }
 
   get root(): string {
@@ -818,6 +842,63 @@ export class Repository {
       yield { oid: next.oid, commit: next.commit };
       if (boundary.has(next.oid)) continue;
       for (const parent of next.commit.parent) push(parent);
+    }
+  }
+
+  *#walkIndexedOwned(
+    oid: string,
+    reservation: MemoryReservation,
+    limits: CommitGraphLimits = {},
+  ): Generator<{ oid: string; commit: Commit }> {
+    const graphMemory = this.store.scopeMemoryReservation(reservation);
+    const boundaryMemory = this.store.scopeMemoryReservation(reservation);
+    try {
+      const root = this.peel(oid);
+      const boundary = readShallowOwned(this.store, boundaryMemory);
+      const entries = new Map<string, CommitCacheEntry>();
+      const maxCommits = Math.min(limits.maxCommits ?? MAX_LOG_COMMITS, MAX_LOG_COMMITS);
+      for (const entry of readCommitGraphOwned(
+        this.store.db,
+        this.store.repoId,
+        root,
+        graphMemory,
+        limits,
+      )) {
+        if (entries.has(entry.oid)) throw new CorruptError("commit graph yielded a duplicate oid");
+        if (entries.size >= maxCommits) {
+          throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+        }
+        entries.set(entry.oid, entry);
+      }
+      if (!entries.has(root)) {
+        throw new GitError(
+          "E2BIG",
+          "commit graph cache is incomplete; reindex or reclone the repository",
+        );
+      }
+      this.#validateCommitGraph(root, entries, boundary, true);
+
+      const seen = new Set<string>();
+      const queue = new CommitHeap();
+      let sequence = 0;
+      const push = (candidate: string): void => {
+        if (seen.has(candidate)) return;
+        const entry = entries.get(candidate);
+        if (entry === undefined) throw new CorruptError("commit graph is missing a parent row");
+        seen.add(candidate);
+        queue.push({ oid: candidate, commit: entry.commit, sequence: sequence++ });
+      };
+      push(root);
+      while (queue.size > 0) {
+        const next = queue.pop();
+        if (next === undefined) throw new CorruptError("commit graph heap lost its next row");
+        yield { oid: next.oid, commit: next.commit };
+        if (boundary.has(next.oid)) continue;
+        for (const parent of next.commit.parent) push(parent);
+      }
+    } finally {
+      boundaryMemory.dispose();
+      graphMemory.dispose();
     }
   }
 

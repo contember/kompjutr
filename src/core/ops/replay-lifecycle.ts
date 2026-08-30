@@ -305,7 +305,9 @@ export function startReplay(
         plan.integration.entries.map((entry) => entry.path),
         policy.kind,
       );
-      requireBoundedIntegrationTree(prospectiveIntegrationIndexEntries(repo, projected));
+      requireBoundedIntegrationTree(repo, (reservation) =>
+        prospectiveIntegrationIndexEntries(repo, projected, reservation),
+      );
       const conflicted = conflicts(plan.integration.entries);
       const current = repo.head();
       if (current.ref !== head.ref || current.oid !== head.oid) {

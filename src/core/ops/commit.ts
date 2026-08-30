@@ -2,6 +2,7 @@
 // and the ref HEAD points at moves to it.
 
 import { MAX_INDEXED_COMMIT_BYTES } from "../../sqlite/commits.js";
+import { indexScanOwned, writeObjectsOwned } from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError, hasErrorCode, MissingIdentityError } from "../errors.js";
 import { type Commit, hashObject, type Person, serializeCommit } from "../objects.js";
@@ -150,20 +151,29 @@ function writeCommitObjects(
     context === undefined || baselineTreeOid === undefined
       ? null
       : sparseTreePlan(context, repo, baselineTreeOid);
-  if (sparse !== null) {
-    const tree = sparse.tree;
-    const commitData = serializedCommit(options, message, tree);
-    return repo.store.writeObjects((batch) => {
-      writeSparseTreePlanInBatch(batch, sparse);
-      return { oid: batch.write("commit", commitData), tree };
+  const reservation = repo.store.reserveMemory();
+  try {
+    if (sparse !== null) {
+      const tree = sparse.tree;
+      const commitData = serializedCommit(options, message, tree);
+      return writeObjectsOwned(repo.store, reservation, (batch) => {
+        writeSparseTreePlanInBatch(batch, sparse);
+        return { oid: batch.write("commit", commitData), tree };
+      });
+    }
+    // A paged scan, so the index never exists as one array alongside the build.
+    return writeObjectsOwned(repo.store, reservation, (batch) => {
+      const tree = buildTreeInBatch(
+        batch,
+        indexScanOwned(repo.checkout, reservation, { pageSize: 2048 }),
+        reservation,
+      );
+      const oid = batch.write("commit", serializedCommit(options, message, tree));
+      return { oid, tree };
     });
+  } finally {
+    reservation.dispose();
   }
-  // A paged scan, so the index never exists as one array alongside the build.
-  return repo.store.writeObjects((batch) => {
-    const tree = buildTreeInBatch(batch, repo.checkout.indexScan({ pageSize: 2048 }));
-    const oid = batch.write("commit", serializedCommit(options, message, tree));
-    return { oid, tree };
-  });
 }
 
 function serializedCommit(

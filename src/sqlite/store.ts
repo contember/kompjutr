@@ -13,7 +13,6 @@ import {
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_PATH_BYTES,
   MAX_MERGE_REF_BYTES,
-  MAX_MERGE_STATE_BYTES,
   MAX_MERGE_TOUCHED_PATHS,
   type MergeIndexSnapshot,
   type MergeJournal,
@@ -60,6 +59,8 @@ import {
   type CommitCacheEntry,
   type CommitCacheWriteResult,
   type CommitGraphLimits,
+  commitCacheFlushTransientBytes,
+  commitPreparationTransientBytes,
   indexCommitSource,
   insertCommitCaches,
   MAX_INDEXED_COMMIT_BYTES,
@@ -369,6 +370,83 @@ export function mutateRefsOwned(
   const mutate = OWNED_REF_MUTATIONS.get(store);
   if (mutate === undefined) throw new GitError("EINVAL", "checkout store is not active");
   return mutate(mutation, metadata, owner);
+}
+
+interface OwnedOperationJournalAccess {
+  read(reservation: MemoryReservation): OperationJournal | null;
+  write(
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+    reservation: MemoryReservation,
+  ): void;
+  replaceState(
+    expectedIntegrityOid: string,
+    state: OperationStateMetadata,
+    reservation: MemoryReservation,
+  ): void;
+  replaceJournal(
+    expectedIntegrityOid: string,
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+    reservation: MemoryReservation,
+  ): void;
+}
+
+const OWNED_OPERATION_JOURNALS = new WeakMap<CheckoutStore, OwnedOperationJournalAccess>();
+
+function operationJournalAccess(store: CheckoutStore): OwnedOperationJournalAccess {
+  const access = OWNED_OPERATION_JOURNALS.get(store);
+  if (access === undefined) throw new GitError("EINVAL", "checkout store is not active");
+  return access;
+}
+
+/** Internal journal read retained under an existing repository operation. */
+export function readOperationStateOwned(
+  store: CheckoutStore,
+  reservation: MemoryReservation,
+): OperationJournal | null {
+  return operationJournalAccess(store).read(reservation);
+}
+
+/** Internal journal creation retained under an existing repository operation. */
+export function writeOperationJournalOwned(
+  store: CheckoutStore,
+  state: OperationStateMetadata,
+  steps: readonly OperationStepMetadata[],
+  touched: readonly MergeTouchedPath[],
+  reservation: MemoryReservation,
+): void {
+  operationJournalAccess(store).write(state, steps, touched, reservation);
+}
+
+/** Internal metadata replacement retained under an existing repository operation. */
+export function replaceOperationStateOwned(
+  store: CheckoutStore,
+  expectedIntegrityOid: string,
+  state: OperationStateMetadata,
+  reservation: MemoryReservation,
+): void {
+  operationJournalAccess(store).replaceState(expectedIntegrityOid, state, reservation);
+}
+
+/** Internal whole-journal replacement retained under an existing repository operation. */
+export function replaceOperationJournalOwned(
+  store: CheckoutStore,
+  expectedIntegrityOid: string,
+  state: OperationStateMetadata,
+  steps: readonly OperationStepMetadata[],
+  touched: readonly MergeTouchedPath[],
+  reservation: MemoryReservation,
+): void {
+  operationJournalAccess(store).replaceJournal(
+    expectedIntegrityOid,
+    state,
+    steps,
+    touched,
+    reservation,
+  );
 }
 
 export interface FetchPublicationExpectedRef {
@@ -699,6 +777,134 @@ export interface ObjectBatch {
   flush(): void;
 }
 
+/** Internal staged-write scope tied to an existing repository operation. */
+export interface OwnedObjectBatch extends ObjectBatch {
+  dispose(): void;
+}
+
+type OwnedObjectBatchFactory = (
+  reservation: MemoryReservation,
+  options: ObjectBatchOptions,
+) => OwnedObjectBatch;
+
+const OWNED_OBJECT_BATCHES = new WeakMap<SharedRepoStore, OwnedObjectBatchFactory>();
+
+function ownedObjectBatchFactory(store: SharedRepoStore): OwnedObjectBatchFactory {
+  const factory = OWNED_OBJECT_BATCHES.get(store);
+  if (factory === undefined)
+    throw new GitError("EINVAL", "repository object writer is unavailable");
+  return factory;
+}
+
+/** Internal object batch whose staged allocations remain charged until flush. */
+export function writeBatchOwned(
+  store: SharedRepoStore,
+  reservation: MemoryReservation,
+  options: ObjectBatchOptions = {},
+): OwnedObjectBatch {
+  return ownedObjectBatchFactory(store)(reservation, options);
+}
+
+/** Internal scoped object writer retained under an existing operation owner. */
+export function writeObjectsOwned<T>(
+  store: SharedRepoStore,
+  reservation: MemoryReservation,
+  body: (batch: ObjectBatch) => T,
+  options: ObjectBatchOptions = {},
+): T {
+  const batch = writeBatchOwned(store, reservation, options);
+  try {
+    const result = body(batch);
+    if (isThenableResult(result)) {
+      void Promise.resolve(result).catch(() => {});
+      throw new GitError("EINVAL", "object batch callback must be synchronous");
+    }
+    batch.flush();
+    return result;
+  } finally {
+    batch.dispose();
+  }
+}
+
+/** Internal shallow-boundary snapshot retained under an existing graph owner. */
+export function readShallowOwned(
+  store: SharedRepoStore,
+  reservation: MemoryReservation,
+): Set<string> {
+  if (!store.ownsMemoryReservation(reservation)) {
+    throw new GitError("EINVAL", "shallow reservation belongs to another repository");
+  }
+  const metadata = store.db.one<{
+    rows: unknown;
+    text_bytes: unknown;
+    max_oid_bytes: unknown;
+  }>(
+    `SELECT count(*) AS rows,
+            coalesce(sum(length(CAST(oid AS BLOB))), 0) AS text_bytes,
+            coalesce(max(length(CAST(oid AS BLOB))), 0) AS max_oid_bytes
+       FROM git_shallow WHERE repo_id = ?`,
+    store.repoId,
+  );
+  if (
+    metadata === undefined ||
+    typeof metadata.rows !== "number" ||
+    !Number.isSafeInteger(metadata.rows) ||
+    metadata.rows < 0 ||
+    typeof metadata.text_bytes !== "number" ||
+    !Number.isSafeInteger(metadata.text_bytes) ||
+    metadata.text_bytes < 0 ||
+    typeof metadata.max_oid_bytes !== "number" ||
+    !Number.isSafeInteger(metadata.max_oid_bytes) ||
+    metadata.max_oid_bytes < 0 ||
+    (metadata.rows === 0) !== (metadata.max_oid_bytes === 0)
+  ) {
+    throw new CorruptError("shallow boundary metadata is invalid");
+  }
+  const retainedBytes = 256 + metadata.rows * (64 + 48) + 2 * metadata.text_bytes;
+  const peakBytes =
+    retainedBytes +
+    (metadata.max_oid_bytes === 0 ? 0 : currentTextRowRetainedBytes(metadata.max_oid_bytes));
+  if (!Number.isSafeInteger(retainedBytes) || !Number.isSafeInteger(peakBytes)) {
+    throw new GitError("E2BIG", "shallow boundary retained-memory accounting overflow");
+  }
+  reservation.set("other", peakBytes);
+  const boundary = new Set<string>();
+  let previous: string | null = null;
+  let observedBytes = 0;
+  for (const row of store.db.iterate(
+    `SELECT repo_id, typeof(oid) AS oid_type,
+            length(CAST(oid AS BLOB)) AS oid_bytes,
+            CAST(oid AS BLOB) AS oid_blob
+       FROM git_shallow WHERE repo_id = ? ORDER BY oid`,
+    store.repoId,
+  )) {
+    if (row.repo_id !== store.repoId || boundary.size >= metadata.rows) {
+      throw new CorruptError("shallow boundary crossed repositories or changed cardinality");
+    }
+    const oidBytes = requireStoredTextByteLength(
+      row.oid_type,
+      row.oid_bytes,
+      "stored shallow object id",
+    );
+    if (oidBytes > metadata.max_oid_bytes) {
+      throw new CorruptError("shallow boundary changed after metadata preflight");
+    }
+    const oid = requireCanonicalStoredText(row.oid_type, row.oid_blob, "stored shallow object id");
+    if (!isOid(oid)) throw new CorruptError(`invalid shallow object id ${oid}`);
+    if (previous !== null && comparePaths(previous, oid) >= 0) {
+      throw new CorruptError("shallow object ids are not in strict byte order");
+    }
+    boundary.add(oid);
+    previous = oid;
+    observedBytes += oidBytes;
+  }
+  if (boundary.size !== metadata.rows || observedBytes !== metadata.text_bytes) {
+    throw new CorruptError("shallow boundary changed after metadata preflight");
+  }
+  reservation.set("other", retainedBytes);
+  return boundary;
+}
+
 type LooseEncoding = "raw" | "zlib";
 
 /** One object staged in a batch, already hashed and encoded for storage. */
@@ -878,6 +1084,132 @@ function encodeLoose(data: Uint8Array, stored: LooseEncoding): Uint8Array {
   return stored === "raw" ? data : deflate(data);
 }
 
+function maximumDeflatedBytes(bytes: number): number {
+  const maximum =
+    bytes +
+    Math.floor(bytes / 4_096) +
+    Math.floor(bytes / 16_384) +
+    Math.floor(bytes / 33_554_432) +
+    13;
+  if (!Number.isSafeInteger(maximum)) {
+    throw new GitError("E2BIG", "object compression memory accounting overflow");
+  }
+  return maximum;
+}
+
+function* stagedCommitEntries(objects: Iterable<StagedObject>): Generator<CommitCacheEntry> {
+  for (const object of objects) {
+    if (object.commitEntry !== undefined) yield object.commitEntry;
+  }
+}
+
+function objectFlushInitialRetainedBytes(objectCount: number): number {
+  const retained = 64 + objectCount * 8;
+  if (!Number.isSafeInteger(retained)) {
+    throw new GitError("E2BIG", "object flush memory accounting overflow");
+  }
+  return retained;
+}
+
+function objectFlushTransientBytes(objects: readonly StagedObject[], payloadBytes: number): number {
+  let metadataUnits = 2;
+  let metadataBytes = 2;
+  let oidUnits = 2;
+  let oidBytes = 2;
+  let treeCount = 0;
+  let commitCount = 0;
+  let chunkRows = 0;
+  let payloadCount = 1;
+  let currentPayloadBytes = 0;
+  let currentPayloadRows = 0;
+  let largestPayloadBytes = 0;
+  let largestPayloadRows = 0;
+  let maximumPayloadRowUnits = 0;
+  let maximumPayloadRowBytes = 0;
+  for (let objectIndex = 0; objectIndex < objects.length; objectIndex++) {
+    const object = objects[objectIndex];
+    if (object === undefined) throw new CorruptError("object flush input is sparse");
+    const separator = objectIndex === 0 ? 0 : 1;
+    metadataUnits +=
+      separator +
+      64 +
+      jsonStringMaxUnits(object.oid) +
+      jsonStringMaxUnits(object.type) +
+      jsonStringMaxUnits(object.stored) +
+      24;
+    metadataBytes +=
+      separator +
+      64 +
+      jsonStringEncodedBytes(object.oid) +
+      jsonStringEncodedBytes(object.type) +
+      jsonStringEncodedBytes(object.stored) +
+      24;
+    oidUnits += separator + jsonStringMaxUnits(object.oid);
+    oidBytes += separator + jsonStringEncodedBytes(object.oid);
+    if (object.treeData !== undefined) treeCount++;
+    if (object.commitEntry !== undefined) commitCount++;
+    maximumPayloadRowUnits = Math.max(
+      maximumPayloadRowUnits,
+      64 + jsonStringMaxUnits(object.oid) + 3 * 24,
+    );
+    maximumPayloadRowBytes = Math.max(
+      maximumPayloadRowBytes,
+      64 + jsonStringEncodedBytes(object.oid) + 3 * 24,
+    );
+    for (
+      let offset = 0, sequence = 0;
+      offset < object.storedData.length || sequence === 0;
+      offset += OBJECT_CHUNK, sequence++
+    ) {
+      const partBytes = Math.min(OBJECT_CHUNK, Math.max(0, object.storedData.length - offset));
+      if (currentPayloadBytes > 0 && currentPayloadBytes + partBytes > payloadBytes) {
+        largestPayloadBytes = Math.max(largestPayloadBytes, currentPayloadBytes);
+        largestPayloadRows = Math.max(largestPayloadRows, currentPayloadRows);
+        payloadCount++;
+        currentPayloadBytes = 0;
+        currentPayloadRows = 0;
+      }
+      currentPayloadBytes += partBytes;
+      currentPayloadRows++;
+      chunkRows++;
+    }
+  }
+  largestPayloadBytes = Math.max(largestPayloadBytes, currentPayloadBytes);
+  largestPayloadRows = Math.max(largestPayloadRows, currentPayloadRows);
+  const payloadRowUnits =
+    2 + largestPayloadRows * maximumPayloadRowUnits + Math.max(0, largestPayloadRows - 1);
+  const payloadRowBytes =
+    2 + largestPayloadRows * maximumPayloadRowBytes + Math.max(0, largestPayloadRows - 1);
+  const collections =
+    1_024 +
+    objects.length * (256 + 128 + 8 + 8) +
+    commitCount * 8 +
+    payloadCount * 384 +
+    chunkRows * (96 + 192) +
+    treeCount * 384;
+  const retained =
+    collections +
+    retainedStringUnits(metadataUnits) +
+    metadataBytes +
+    retainedStringUnits(oidUnits) +
+    oidBytes +
+    retainedStringUnits(payloadRowUnits) +
+    payloadRowBytes +
+    largestPayloadBytes +
+    commitCacheFlushTransientBytes(stagedCommitEntries(objects));
+  if (
+    !Number.isSafeInteger(metadataUnits) ||
+    !Number.isSafeInteger(metadataBytes) ||
+    !Number.isSafeInteger(oidUnits) ||
+    !Number.isSafeInteger(oidBytes) ||
+    !Number.isSafeInteger(collections) ||
+    !Number.isSafeInteger(retained)
+  ) {
+    throw new GitError("E2BIG", "object flush memory accounting overflow");
+  }
+  return retained;
+}
+
 function parseLooseEncoding(stored: string): LooseEncoding {
   if (stored === "raw" || stored === "zlib") return stored;
   throw new CorruptError(`loose object has unknown storage encoding '${stored}'`);
@@ -973,6 +1305,39 @@ function jsonStringMaxUnits(value: string): number {
     }
   }
   return units;
+}
+
+function jsonStringEncodedBytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (
+      unit === 0x22 ||
+      unit === 0x5c ||
+      unit === 0x08 ||
+      unit === 0x09 ||
+      unit === 0x0a ||
+      unit === 0x0c ||
+      unit === 0x0d
+    ) {
+      bytes += 2;
+    } else if (unit < 0x20) {
+      bytes += 6;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 6;
+      }
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      bytes += 6;
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+  }
+  return bytes;
 }
 
 function refRowJsonMaxUnits(row: RefRow): number {
@@ -1984,6 +2349,93 @@ function operationStepFromRow(row: OperationStepRow): OperationStepMetadata {
   };
 }
 
+function operationJournalReadBytes(
+  retainedBytes: number,
+  stateTextBytes: number,
+  stepTextBytes: number,
+  touchedTextBytes: number,
+): number {
+  const currentRowBytes = Math.max(
+    currentTextRowRetainedBytes(stateTextBytes, 19),
+    stepTextBytes === 0 ? 0 : currentTextRowRetainedBytes(stepTextBytes, 4),
+    touchedTextBytes === 0 ? 0 : currentTextRowRetainedBytes(touchedTextBytes, 6),
+  );
+  const retained = retainedBytes + currentRowBytes;
+  if (!Number.isSafeInteger(retained)) {
+    throw new GitError("E2BIG", "operation journal retained-memory accounting overflow");
+  }
+  return retained;
+}
+
+function operationJournalIntegrityBytes(
+  state: OperationStateMetadata,
+  steps: readonly OperationStepMetadata[],
+  touched: readonly MergeTouchedPath[],
+  retainedBytes: number,
+): number {
+  let jsonUnits = 2_048 + steps.length * 256 + touched.length * 512;
+  let jsonBytes = jsonUnits;
+  const add = (value: string | null): void => {
+    if (value === null) {
+      jsonUnits += 4;
+      jsonBytes += 4;
+      return;
+    }
+    jsonUnits += jsonStringMaxUnits(value);
+    jsonBytes += jsonStringEncodedBytes(value);
+  };
+  add(state.kind);
+  add(state.originalHeadRef);
+  add(state.originalHeadOid);
+  add(state.currentLabel);
+  add(state.incomingLabel);
+  add(state.message);
+  add(state.author?.name ?? null);
+  add(state.author?.email ?? null);
+  add(state.committer?.name ?? null);
+  add(state.committer?.email ?? null);
+  if (state.kind === "merge") {
+    add(state.currentParentOid);
+    add(state.incomingParentOid);
+    add(state.phase);
+    add(state.mode);
+    add(state.mergeOrigin);
+  } else if (state.kind === "rebase") {
+    add(state.phase);
+    add(state.upstreamOid);
+    add(state.baseOid);
+    add(state.currentParentOid);
+  } else {
+    add(state.phase);
+    add(state.emptyReason);
+    add(state.sourceOid);
+    add(state.selectedParentOid);
+  }
+  for (const step of steps) {
+    add(step.sourceOid);
+    add(step.selectedParentOid);
+    add(step.outcome);
+    add(step.resultOid);
+  }
+  for (const entry of touched) {
+    add(entry.path);
+    add(entry.logicalPath);
+    add(entry.purpose);
+    add(entry.index?.oid ?? null);
+    add(entry.worktree.kind);
+    add(
+      entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
+        ? entry.worktree.oid
+        : null,
+    );
+  }
+  const bytes = retainedBytes + retainedStringUnits(jsonUnits) + jsonBytes + 512;
+  if (!Number.isSafeInteger(bytes)) {
+    throw new GitError("E2BIG", "operation journal integrity accounting overflow");
+  }
+  return bytes;
+}
+
 function operationMetadataFromRow(
   row: OperationStateRow,
   steps: readonly OperationStepMetadata[],
@@ -2384,6 +2836,65 @@ export interface IndexStore {
   hasConflicts(): boolean;
 }
 
+type OwnedIndexScan = (
+  reservation: MemoryReservation,
+  options: IndexScanOptions,
+) => IterableIterator<IndexEntry>;
+
+const OWNED_INDEX_SCANS = new WeakMap<IndexStore, OwnedIndexScan>();
+
+/** Internal ordered scan whose current persisted row is charged to the caller. */
+export function indexScanOwned(
+  index: IndexStore,
+  reservation: MemoryReservation,
+  options: IndexScanOptions = {},
+): IterableIterator<IndexEntry> {
+  const scan = OWNED_INDEX_SCANS.get(index);
+  return scan === undefined
+    ? scanGenericIndexOwned(index.indexScan(options), reservation)
+    : scan(reservation, options);
+}
+
+function* scanGenericIndexOwned(
+  entries: IterableIterator<IndexEntry>,
+  reservation: MemoryReservation,
+): Generator<IndexEntry> {
+  const rowMemory = reservation.scope();
+  let previousPath: string | null = null;
+  let previousStage = -1;
+  try {
+    for (const raw of entries) {
+      const entry = requireStoredIndexEntry({
+        path: raw.path,
+        stage: raw.stage,
+        mode: raw.mode,
+        oid: raw.oid,
+        size: raw.size,
+        mtime: raw.mtime,
+        ino: raw.ino,
+        rev: raw.rev ?? null,
+      });
+      if (
+        previousPath !== null &&
+        (comparePaths(previousPath, entry.path) > 0 ||
+          (previousPath === entry.path && previousStage >= entry.stage))
+      ) {
+        throw new CorruptError("index scan rows are not in strict path and stage order");
+      }
+      rowMemory.set(
+        "other",
+        256 + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid),
+      );
+      previousPath = entry.path;
+      previousStage = entry.stage;
+      yield entry;
+      rowMemory.clear("other");
+    }
+  } finally {
+    rowMemory.dispose();
+  }
+}
+
 function requireIndexPageSize(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1 || value > MAX_INDEX_SCAN_PAGE) {
     throw new GitError("EINVAL", `index scan page size must be from 1 to ${MAX_INDEX_SCAN_PAGE}`);
@@ -2429,6 +2940,192 @@ function requireStoredIndexEntry(row: Record<string, unknown>): IndexEntry {
     ino: requireStoredIndexFact(row.ino, "inode"),
     rev: requireStoredIndexFact(row.rev, "revision"),
   };
+}
+
+type OwnedIndexSource =
+  | { kind: "checkout"; repoId: number; checkoutId: number }
+  | { kind: "scratch"; repoId: number; name: string };
+
+function* scanIndexOwned(
+  db: SqlDatabase,
+  source: OwnedIndexSource,
+  reservation: MemoryReservation,
+  ownsReservation: (reservation: MemoryReservation) => boolean,
+  requireActive: () => void,
+  options: IndexScanOptions,
+): Generator<IndexEntry> {
+  requireActive();
+  if (!ownsReservation(reservation)) {
+    throw new GitError("EINVAL", "index scan reservation belongs to another repository");
+  }
+  const rowMemory = reservation.scope();
+  const progressMemory = reservation.scope();
+  try {
+    const pageSize = requireIndexPageSize(options.pageSize ?? DEFAULT_INDEX_PAGE);
+    const prefix = options.prefix;
+    let path = options.after?.path ?? "";
+    let stage = options.after?.stage ?? -1;
+    let previousPath: string | null = null;
+    let previousStage = -1;
+    for (;;) {
+      requireActive();
+      const query =
+        source.kind === "checkout"
+          ? prefix === undefined || prefix === ""
+            ? `SELECT checkout.repo_id,
+                      typeof(entry.path) AS path_type,
+                      length(CAST(entry.path AS BLOB)) AS path_bytes,
+                      CAST(entry.path AS BLOB) AS path_blob,
+                      entry.stage, entry.mode,
+                      typeof(entry.oid) AS oid_type,
+                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
+                      CAST(entry.oid AS BLOB) AS oid_blob,
+                      entry.size, entry.mtime, entry.ino, entry.rev
+                 FROM git_index entry
+                 JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
+                WHERE entry.checkout_id = ?
+                  AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
+                ORDER BY entry.path, entry.stage LIMIT ?`
+            : `SELECT checkout.repo_id,
+                      typeof(entry.path) AS path_type,
+                      length(CAST(entry.path AS BLOB)) AS path_bytes,
+                      CAST(entry.path AS BLOB) AS path_blob,
+                      entry.stage, entry.mode,
+                      typeof(entry.oid) AS oid_type,
+                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
+                      CAST(entry.oid AS BLOB) AS oid_blob,
+                      entry.size, entry.mtime, entry.ino, entry.rev
+                 FROM git_index entry
+                 JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
+                WHERE entry.checkout_id = ?
+                  AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
+                  AND (entry.path = ? OR (entry.path >= ? AND entry.path < ?))
+                ORDER BY entry.path, entry.stage LIMIT ?`
+          : prefix === undefined || prefix === ""
+            ? `SELECT entry.repo_id,
+                      typeof(entry.path) AS path_type,
+                      length(CAST(entry.path AS BLOB)) AS path_bytes,
+                      CAST(entry.path AS BLOB) AS path_blob,
+                      entry.stage, entry.mode,
+                      typeof(entry.oid) AS oid_type,
+                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
+                      CAST(entry.oid AS BLOB) AS oid_blob,
+                      entry.size, entry.mtime, entry.ino, entry.rev
+                 FROM git_scratch_index_entries entry
+                WHERE entry.repo_id = ? AND entry.name = ?
+                  AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
+                ORDER BY entry.path, entry.stage LIMIT ?`
+            : `SELECT entry.repo_id,
+                      typeof(entry.path) AS path_type,
+                      length(CAST(entry.path AS BLOB)) AS path_bytes,
+                      CAST(entry.path AS BLOB) AS path_blob,
+                      entry.stage, entry.mode,
+                      typeof(entry.oid) AS oid_type,
+                      length(CAST(entry.oid AS BLOB)) AS oid_bytes,
+                      CAST(entry.oid AS BLOB) AS oid_blob,
+                      entry.size, entry.mtime, entry.ino, entry.rev
+                 FROM git_scratch_index_entries entry
+                WHERE entry.repo_id = ? AND entry.name = ?
+                  AND (entry.path > ? OR (entry.path = ? AND entry.stage > ?))
+                  AND (entry.path = ? OR (entry.path >= ? AND entry.path < ?))
+                ORDER BY entry.path, entry.stage LIMIT ?`;
+      const bindings: (string | number)[] =
+        source.kind === "checkout"
+          ? prefix === undefined || prefix === ""
+            ? [source.checkoutId, path, path, stage, pageSize]
+            : [
+                source.checkoutId,
+                path,
+                path,
+                stage,
+                prefix,
+                `${prefix}/`,
+                nextPrefix(`${prefix}/`),
+                pageSize,
+              ]
+          : prefix === undefined || prefix === ""
+            ? [source.repoId, source.name, path, path, stage, pageSize]
+            : [
+                source.repoId,
+                source.name,
+                path,
+                path,
+                stage,
+                prefix,
+                `${prefix}/`,
+                nextPrefix(`${prefix}/`),
+                pageSize,
+              ];
+      let pageRows = 0;
+      let last: IndexEntry | undefined;
+      const maximumRowBytes = currentTextRowRetainedBytes(MAX_INDEX_PATH_BYTES + 40, 2);
+      rowMemory.set("other", maximumRowBytes);
+      const rows = db.iterate(query, ...bindings)[Symbol.iterator]();
+      try {
+        for (;;) {
+          requireActive();
+          rowMemory.set("other", maximumRowBytes);
+          const next = rows.next();
+          if (next.done) {
+            rowMemory.clear("other");
+            break;
+          }
+          const row = next.value;
+          if (row.repo_id !== source.repoId || pageRows >= pageSize) {
+            throw new CorruptError("index scan returned invalid repository or page cardinality");
+          }
+          const pathBytes = requireStoredTextByteLength(
+            row.path_type,
+            row.path_bytes,
+            "stored index path",
+          );
+          const oidBytes = requireStoredTextByteLength(
+            row.oid_type,
+            row.oid_bytes,
+            "stored index oid",
+          );
+          if (pathBytes > MAX_INDEX_PATH_BYTES || oidBytes !== 40) {
+            throw new CorruptError("stored index path or oid exceeds its structural bound");
+          }
+          rowMemory.set("other", currentTextRowRetainedBytes(pathBytes + oidBytes, 2));
+          const entry = requireStoredIndexEntry({
+            path: requireCanonicalStoredText(row.path_type, row.path_blob, "stored index path"),
+            stage: row.stage,
+            mode: row.mode,
+            oid: requireCanonicalStoredText(row.oid_type, row.oid_blob, "stored index oid"),
+            size: row.size,
+            mtime: row.mtime,
+            ino: row.ino,
+            rev: row.rev,
+          });
+          if (
+            previousPath !== null &&
+            (comparePaths(previousPath, entry.path) > 0 ||
+              (previousPath === entry.path && previousStage >= entry.stage))
+          ) {
+            throw new CorruptError("index scan rows are not in strict path and stage order");
+          }
+          previousPath = entry.path;
+          previousStage = entry.stage;
+          progressMemory.set("other", 128 + retainedStringBytes(entry.path));
+          last = entry;
+          pageRows++;
+          yield entry;
+        }
+      } finally {
+        if (rows.return !== undefined) rows.return();
+        rowMemory.clear("other");
+      }
+      if (pageRows === 0) return;
+      if (last === undefined) throw new CorruptError("index scan page lost its last row");
+      path = last.path;
+      stage = last.stage;
+      if (pageRows < pageSize) return;
+    }
+  } finally {
+    progressMemory.dispose();
+    rowMemory.dispose();
+  }
 }
 
 /** Canonicalise an absolute workspace path without consulting the filesystem. */
@@ -2842,7 +3539,7 @@ export class SharedRepoStore {
           checkedName,
         );
         opened = true;
-        const scratch = new ScratchIndexStore(this.db, this.repoId, checkedName);
+        const scratch = new ScratchIndexStore(this, checkedName);
         try {
           const result = body(scratch);
           if (isThenableResult(result)) {
@@ -4754,12 +5451,24 @@ class ScratchIndexStore implements IndexStore {
   readonly #db: SqlDatabase;
   readonly #repoId: number;
   readonly #name: string;
+  readonly #shared: SharedRepoStore;
   #active = true;
 
-  constructor(db: SqlDatabase, repoId: number, name: string) {
-    this.#db = db;
-    this.#repoId = repoId;
+  constructor(shared: SharedRepoStore, name: string) {
+    this.#shared = shared;
+    this.#db = shared.db;
+    this.#repoId = shared.repoId;
     this.#name = name;
+    OWNED_INDEX_SCANS.set(this, (reservation, options) =>
+      scanIndexOwned(
+        this.#db,
+        { kind: "scratch", repoId: this.#repoId, name: this.#name },
+        reservation,
+        (candidate) => this.#shared.ownsMemoryReservation(candidate),
+        () => this.#requireActive(),
+        options,
+      ),
+    );
   }
 
   revoke(): void {
@@ -5035,6 +5744,34 @@ export class CheckoutStore implements IndexStore {
     OWNED_REF_MUTATIONS.set(this, (mutation, metadata, owner) =>
       this.#mutateRefsOwned(mutation, metadata, owner),
     );
+    OWNED_OBJECT_BATCHES.set(shared, (reservation, batchOptions) =>
+      this.#writeBatchOwned(reservation, batchOptions),
+    );
+    OWNED_INDEX_SCANS.set(this, (reservation, scanOptions) =>
+      scanIndexOwned(
+        this.#db,
+        { kind: "checkout", repoId: this.#repoId, checkoutId: this.#checkoutId },
+        reservation,
+        (candidate) => this.#sharedStore.ownsMemoryReservation(candidate),
+        () => this.#requireActive(),
+        scanOptions,
+      ),
+    );
+    OWNED_OPERATION_JOURNALS.set(this, {
+      read: (reservation) => this.#readOperationStateOwned(reservation),
+      write: (state, steps, touched, reservation) =>
+        this.#writeOperationJournalOwned(state, steps, touched, reservation),
+      replaceState: (expectedIntegrityOid, state, reservation) =>
+        this.#replaceOperationStateOwned(expectedIntegrityOid, state, reservation),
+      replaceJournal: (expectedIntegrityOid, state, steps, touched, reservation) =>
+        this.#replaceOperationJournalOwned(
+          expectedIntegrityOid,
+          state,
+          steps,
+          touched,
+          reservation,
+        ),
+    });
     shared.installOperations(this);
   }
 
@@ -5869,6 +6606,20 @@ export class CheckoutStore implements IndexStore {
    * cannot forget the final flush.
    */
   writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
+    return this.#createWriteBatch(options);
+  }
+
+  #writeBatchOwned(reservation: MemoryReservation, options: ObjectBatchOptions): OwnedObjectBatch {
+    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "object batch reservation belongs to another repository");
+    }
+    return this.#createWriteBatch(options, reservation);
+  }
+
+  #createWriteBatch(
+    options: ObjectBatchOptions,
+    reservation?: MemoryReservation,
+  ): OwnedObjectBatch {
     const payloadBytes = options.payloadBytes ?? OBJECT_PAYLOAD;
     const flushEvery = options.flushEvery ?? DEFAULT_OBJECT_FLUSH;
     // Keyed by oid: a tree build re-emits identical subtrees, and one
@@ -5876,43 +6627,97 @@ export class CheckoutStore implements IndexStore {
     const staged = new Map<string, StagedObject>();
     let bytes = 0;
     let commitBytes = 0;
-    const flush = (): void => {
-      if (staged.size === 0) return;
-      this.#flushObjects([...staged.values()], payloadBytes);
+    let active = true;
+    const stageMemory = reservation?.scope();
+    const requireActive = (): void => {
+      if (!active) throw new GitError("EINVAL", "object batch is disposed");
+    };
+    const charge = (
+      nextBytes = bytes,
+      nextCommitBytes = commitBytes,
+      count = staged.size,
+    ): void => {
+      const retained = 512 + count * 256 + nextBytes + nextCommitBytes;
+      if (!Number.isSafeInteger(retained)) {
+        throw new GitError("E2BIG", "object batch retained-memory accounting overflow");
+      }
+      stageMemory?.set("other", retained);
+    };
+    const clear = (): void => {
       staged.clear();
       bytes = 0;
       commitBytes = 0;
+      stageMemory?.clear("other");
+    };
+    const flush = (): void => {
+      requireActive();
+      if (staged.size === 0) return;
+      const flushMemory = reservation?.scope();
+      try {
+        flushMemory?.set("other", objectFlushInitialRetainedBytes(staged.size));
+        this.#flushObjects([...staged.values()], payloadBytes, flushMemory);
+      } finally {
+        flushMemory?.dispose();
+        clear();
+      }
     };
     return {
       write: (type: ObjectType, data: Uint8Array): string => {
-        const oid = hashObject(type, data);
-        if (staged.has(oid)) return oid;
-        const stored = looseEncoding(data.length);
-        const storedData = stored === "raw" ? data.slice() : encodeLoose(data, stored);
-        const object: StagedObject = { oid, type, size: data.length, stored, storedData };
-        if (type === "tree") object.treeData = stored === "raw" ? storedData : data.slice();
-        if (type === "commit") {
-          const commitEntry = prepareCommitCache({ repoId: this.#repoId, oid, data });
-          object.commitEntry = commitEntry;
+        requireActive();
+        try {
+          const oid = hashObject(type, data);
+          if (staged.has(oid)) return oid;
+          const stored = looseEncoding(data.length);
+          const maximumStoredBytes =
+            stored === "raw" ? data.length : maximumDeflatedBytes(data.length);
+          const maximumTreeBytes = type === "tree" && stored !== "raw" ? data.length : 0;
+          const commitPreparationBytes =
+            type === "commit" ? commitPreparationTransientBytes(data.length) : 0;
+          charge(
+            bytes + maximumStoredBytes + maximumTreeBytes,
+            commitBytes + commitPreparationBytes,
+            staged.size + 1,
+          );
+          const storedData = stored === "raw" ? data.slice() : encodeLoose(data, stored);
+          const object: StagedObject = { oid, type, size: data.length, stored, storedData };
+          if (type === "tree") object.treeData = stored === "raw" ? storedData : data.slice();
+          if (type === "commit") {
+            const commitEntry = prepareCommitCache({ repoId: this.#repoId, oid, data });
+            object.commitEntry = commitEntry;
+          }
+          const nextBytes =
+            bytes +
+            storedData.length +
+            (object.treeData !== undefined && object.treeData !== storedData
+              ? object.treeData.length
+              : 0);
+          const nextCommitBytes = commitBytes + (object.commitEntry?.cacheBytes ?? 0);
+          charge(nextBytes, nextCommitBytes, staged.size + 1);
+          staged.set(oid, object);
+          bytes = nextBytes;
+          commitBytes = nextCommitBytes;
+          // After staging, never before: an object's chunks and its metadata
+          // row have to land in the same flush, whatever its size.
+          if (
+            bytes >= payloadBytes ||
+            commitBytes >= COMMIT_STAGE_CACHE_BYTES ||
+            staged.size >= flushEvery
+          ) {
+            flush();
+          }
+          return oid;
+        } catch (error) {
+          clear();
+          throw error;
         }
-        staged.set(oid, object);
-        bytes += storedData.length;
-        if (object.treeData !== undefined && object.treeData !== storedData) {
-          bytes += object.treeData.length;
-        }
-        if (object.commitEntry !== undefined) commitBytes += object.commitEntry.cacheBytes;
-        // After staging, never before: an object's chunks and its metadata
-        // row have to land in the same flush, whatever its size.
-        if (
-          bytes >= payloadBytes ||
-          commitBytes >= COMMIT_STAGE_CACHE_BYTES ||
-          staged.size >= flushEvery
-        ) {
-          flush();
-        }
-        return oid;
       },
       flush,
+      dispose: (): void => {
+        if (!active) return;
+        clear();
+        active = false;
+        stageMemory?.dispose();
+      },
     };
   }
 
@@ -5924,7 +6729,12 @@ export class CheckoutStore implements IndexStore {
     return result;
   }
 
-  #flushObjects(staged: StagedObject[], payloadBytes: number): void {
+  #flushObjects(
+    staged: StagedObject[],
+    payloadBytes: number,
+    transientMemory?: MemoryReservation,
+  ): void {
+    transientMemory?.set("other", objectFlushTransientBytes(staged, payloadBytes));
     const byOid = new Map(staged.map((object) => [object.oid, object]));
     const commitEntries = staged.flatMap((object) =>
       object.commitEntry === undefined ? [] : [object.commitEntry],
@@ -9229,6 +10039,93 @@ export class CheckoutStore implements IndexStore {
 
   /** Read and validate the one durable incomplete integration operation. */
   readOperationState(): OperationJournal | null {
+    const reservation = this.reserveMemory();
+    try {
+      return this.#readOperationStateOwned(reservation);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  #readOperationStateOwned(reservation: MemoryReservation): OperationJournal | null {
+    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
+    }
+    const metadata = this.#db.one<{
+      step_count: unknown;
+      touched_count: unknown;
+      retained_bytes: unknown;
+      state_text_bytes: unknown;
+      step_text_bytes: unknown;
+      touched_text_bytes: unknown;
+    }>(
+      `SELECT state.step_count, state.touched_count, state.retained_bytes,
+              coalesce(length(CAST(state.kind AS BLOB)), 0) +
+              coalesce(length(CAST(state.original_head_ref AS BLOB)), 0) +
+              coalesce(length(CAST(state.original_head_oid AS BLOB)), 0) +
+              coalesce(length(CAST(state.current_parent_oid AS BLOB)), 0) +
+              coalesce(length(CAST(state.incoming_parent_oid AS BLOB)), 0) +
+              coalesce(length(CAST(state.upstream_oid AS BLOB)), 0) +
+              coalesce(length(CAST(state.base_oid AS BLOB)), 0) +
+              coalesce(length(CAST(state.phase AS BLOB)), 0) +
+              coalesce(length(CAST(state.empty_reason AS BLOB)), 0) +
+              coalesce(length(CAST(state.mode AS BLOB)), 0) +
+              coalesce(length(CAST(state.merge_origin AS BLOB)), 0) +
+              coalesce(length(CAST(state.current_label AS BLOB)), 0) +
+              coalesce(length(CAST(state.incoming_label AS BLOB)), 0) +
+              coalesce(length(CAST(state.message AS BLOB)), 0) +
+              coalesce(length(CAST(state.author_name AS BLOB)), 0) +
+              coalesce(length(CAST(state.author_email AS BLOB)), 0) +
+              coalesce(length(CAST(state.committer_name AS BLOB)), 0) +
+              coalesce(length(CAST(state.committer_email AS BLOB)), 0) +
+              coalesce(length(CAST(state.integrity_oid AS BLOB)), 0)
+                AS state_text_bytes,
+              coalesce((SELECT max(
+                coalesce(length(CAST(source_oid AS BLOB)), 0) +
+                coalesce(length(CAST(selected_parent_oid AS BLOB)), 0) +
+                coalesce(length(CAST(outcome AS BLOB)), 0) +
+                coalesce(length(CAST(result_oid AS BLOB)), 0)
+              ) FROM git_operation_steps WHERE checkout_id = state.checkout_id), 0)
+                AS step_text_bytes,
+              coalesce((SELECT max(
+                coalesce(length(CAST(path AS BLOB)), 0) +
+                coalesce(length(CAST(logical_path AS BLOB)), 0) +
+                coalesce(length(CAST(purpose AS BLOB)), 0) +
+                coalesce(length(CAST(index_oid AS BLOB)), 0) +
+                coalesce(length(CAST(worktree_kind AS BLOB)), 0) +
+                coalesce(length(CAST(worktree_oid AS BLOB)), 0)
+              ) FROM git_operation_touched WHERE checkout_id = state.checkout_id), 0)
+                AS touched_text_bytes
+         FROM git_operation_state state WHERE state.checkout_id = ?`,
+      this.#checkoutId,
+    );
+    if (metadata !== undefined) {
+      const stepCount = requireMergeInteger(metadata.step_count, "step count");
+      const touchedCount = requireMergeInteger(metadata.touched_count, "touched-path count");
+      const retainedBytes = requireMergeInteger(metadata.retained_bytes, "retained-byte count");
+      const stateTextBytes = requireMergeInteger(
+        metadata.state_text_bytes,
+        "state text byte count",
+      );
+      const stepTextBytes = requireMergeInteger(metadata.step_text_bytes, "step text byte count");
+      const touchedTextBytes = requireMergeInteger(
+        metadata.touched_text_bytes,
+        "touched-path text byte count",
+      );
+      if (stepCount > MAX_OPERATION_STEPS) {
+        throw new GitError("E2BIG", `operation journal exceeds ${MAX_OPERATION_STEPS} steps`);
+      }
+      if (touchedCount > MAX_MERGE_TOUCHED_PATHS) {
+        throw new GitError(
+          "E2BIG",
+          `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`,
+        );
+      }
+      reservation.set(
+        "other",
+        operationJournalReadBytes(retainedBytes, stateTextBytes, stepTextBytes, touchedTextBytes),
+      );
+    }
     const row = this.#db.one<OperationStateRow>(
       `SELECT
               CASE WHEN typeof(kind) = 'text' AND length(CAST(kind AS BLOB)) <= 11
@@ -9329,9 +10226,6 @@ export class CheckoutStore implements IndexStore {
     const storedBytes = requireMergeInteger(row.retained_bytes, "retained-byte count");
     if (touchedCount > MAX_MERGE_TOUCHED_PATHS) {
       throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
-    }
-    if (storedBytes > MAX_MERGE_STATE_BYTES) {
-      throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_STATE_BYTES} retained bytes`);
     }
     const steps: OperationStepMetadata[] = [];
     for (const raw of this.#db.iterate(
@@ -9447,11 +10341,13 @@ export class CheckoutStore implements IndexStore {
       throw new CorruptError("merge journal retained-byte count does not match its rows");
     }
     const integrityOid = requireMergeOid(row.integrity_oid, "journal integrity oid");
+    reservation.set("other", operationJournalIntegrityBytes(state, steps, touched, retainedBytes));
     if (operationJournalIntegrityOid(state, touched, steps) !== integrityOid) {
       throw new CorruptError("operation journal integrity identity does not match its rows");
     }
     const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
-    this.#validateOperationObjects(journal);
+    this.#validateOperationObjects(journal, reservation);
+    reservation.set("other", retainedBytes);
     return journal;
   }
 
@@ -9469,9 +10365,28 @@ export class CheckoutStore implements IndexStore {
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
   ): void {
+    const reservation = this.reserveMemory();
+    try {
+      this.#writeOperationJournalOwned(state, steps, touched, reservation);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  #writeOperationJournalOwned(
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+    reservation: MemoryReservation,
+  ): void {
+    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
+    }
     if (state.kind === "rebase") requireInitialRebaseJournal(state, steps, touched);
     const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
+    reservation.set("other", operationJournalIntegrityBytes(state, steps, touched, retainedBytes));
     const integrityOid = operationJournalIntegrityOid(state, touched, steps);
+    reservation.set("other", retainedBytes);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
@@ -9481,13 +10396,25 @@ export class CheckoutStore implements IndexStore {
     }
 
     this.#db.transactionSync(() => {
-      this.requireNoOperationState();
-      const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
-      this.#validateOperationObjects(journal);
-      this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
-      this.#insertOperationSteps(steps);
-      this.#insertOperationTouched(touched);
-      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+      const activeMemory = reservation.scope();
+      try {
+        const active = this.#readOperationStateOwned(activeMemory);
+        if (active !== null) throw operationAlreadyActive(active.state.kind);
+        const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
+        this.#validateOperationObjects(journal, reservation);
+        this.#insertOperationHeader(
+          state,
+          steps.length,
+          touched.length,
+          retainedBytes,
+          integrityOid,
+        );
+        this.#insertOperationSteps(steps, reservation);
+        this.#insertOperationTouched(touched, reservation);
+        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+      } finally {
+        activeMemory.dispose();
+      }
     });
   }
 
@@ -9533,7 +10460,10 @@ export class CheckoutStore implements IndexStore {
     );
   }
 
-  #insertOperationSteps(steps: readonly OperationStepMetadata[]): void {
+  #insertOperationSteps(
+    steps: readonly OperationStepMetadata[],
+    reservation: MemoryReservation,
+  ): void {
     function* rows(): Generator<PersistedOperationStep> {
       for (let ordinal = 0; ordinal < steps.length; ordinal++) {
         const step = steps[ordinal];
@@ -9541,7 +10471,15 @@ export class CheckoutStore implements IndexStore {
         yield persistedOperationStep(step, ordinal);
       }
     }
-    for (const page of jsonPages(rows(), "operation step")) {
+    for (const page of jsonPages(rows(), "operation step", {
+      reservation,
+      maxUnits: (row) =>
+        256 +
+        jsonStringMaxUnits(row.sourceOid) +
+        (row.selectedParentOid === null ? 4 : jsonStringMaxUnits(row.selectedParentOid)) +
+        jsonStringMaxUnits(row.outcome) +
+        (row.resultOid === null ? 4 : jsonStringMaxUnits(row.resultOid)),
+    })) {
       this.#db.run(
         `INSERT INTO git_operation_steps
            (checkout_id, ordinal, source_oid, selected_parent_oid, mainline, outcome, result_oid)
@@ -9559,7 +10497,10 @@ export class CheckoutStore implements IndexStore {
     }
   }
 
-  #insertOperationTouched(touched: readonly MergeTouchedPath[]): void {
+  #insertOperationTouched(
+    touched: readonly MergeTouchedPath[],
+    reservation: MemoryReservation,
+  ): void {
     function* rows(): Generator<PersistedOperationTouched> {
       for (let ordinal = 0; ordinal < touched.length; ordinal++) {
         const entry = touched[ordinal];
@@ -9567,7 +10508,17 @@ export class CheckoutStore implements IndexStore {
         yield persistedOperationTouched(entry, ordinal);
       }
     }
-    for (const page of jsonPages(rows(), "operation touched path")) {
+    for (const page of jsonPages(rows(), "operation touched path", {
+      reservation,
+      maxUnits: (row) =>
+        512 +
+        jsonStringMaxUnits(row.path) +
+        jsonStringMaxUnits(row.logicalPath) +
+        jsonStringMaxUnits(row.purpose) +
+        (row.indexOid === null ? 4 : jsonStringMaxUnits(row.indexOid)) +
+        jsonStringMaxUnits(row.worktreeKind) +
+        (row.worktreeOid === null ? 4 : jsonStringMaxUnits(row.worktreeOid)),
+    })) {
       this.#db.run(
         `INSERT INTO git_operation_touched
            (checkout_id, ordinal, path, logical_path, purpose,
@@ -9597,8 +10548,17 @@ export class CheckoutStore implements IndexStore {
     }
   }
 
-  #validateOperationObjects(journal: OperationJournal): void {
+  #validateOperationObjects(journal: OperationJournal, reservation: MemoryReservation): void {
+    const validationMemory = reservation.scope();
+    const rowMemory = reservation.scope();
+    const candidateCount =
+      1 +
+      (journal.state.kind === "merge" ? 2 : journal.state.kind === "rebase" ? 3 : 0) +
+      journal.steps.length * 3 +
+      journal.touched.length * 2;
+    validationMemory.set("other", 512 + candidateCount * 256);
     const expected = new Map<string, ExpectedOperationObject>();
+    const objectSizes = new Map<string, number>();
     const add = (object: ExpectedOperationObject): void => {
       const previous = expected.get(object.oid);
       if (previous !== undefined && previous.type !== object.type) {
@@ -9647,43 +10607,66 @@ export class CheckoutStore implements IndexStore {
       }
     }
 
-    let page: string[] = [];
-    const validatePage = (): void => {
-      if (page.length === 0) return;
-      let info: ObjectReadInfo[];
-      try {
-        info = this.objectInfo(page);
-      } catch (error) {
-        if (hasErrorCode(error, "ENOTFOUND")) {
-          throw new CorruptError("operation journal references a missing object", { cause: error });
+    try {
+      let page: string[] = [];
+      const validatePage = (): void => {
+        if (page.length === 0) return;
+        const jsonUnits = 2 + page.length * 43 - 1;
+        rowMemory.set("other", 512 + page.length * 256 + retainedStringUnits(jsonUnits));
+        let info: ObjectReadInfo[];
+        try {
+          info = this.objectInfo(page);
+        } catch (error) {
+          if (hasErrorCode(error, "ENOTFOUND")) {
+            throw new CorruptError("operation journal references a missing object", {
+              cause: error,
+            });
+          }
+          throw error;
         }
-        throw error;
-      }
-      for (const object of info) {
-        const wanted = expected.get(object.oid);
-        if (wanted === undefined || object.type !== wanted.type) {
-          throw new CorruptError(
-            `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
-          );
+        for (const object of info) {
+          const wanted = expected.get(object.oid);
+          if (wanted === undefined || object.type !== wanted.type) {
+            throw new CorruptError(
+              `operation ${wanted?.label ?? "journal"} references ${object.type} object ${object.oid}`,
+            );
+          }
+          objectSizes.set(object.oid, object.size);
         }
+        page = [];
+        rowMemory.clear("other");
+      };
+      for (const oid of expected.keys()) {
+        page.push(oid);
+        if (page.length === MAX_BLOB_BATCH_OIDS) validatePage();
       }
-      page = [];
-    };
-    for (const oid of expected.keys()) {
-      page.push(oid);
-      if (page.length === MAX_BLOB_BATCH_OIDS) validatePage();
+      validatePage();
+      if (journal.kind !== "merge") {
+        this.#validateReplayTopology(journal, reservation, objectSizes);
+      }
+    } finally {
+      rowMemory.dispose();
+      validationMemory.dispose();
     }
-    validatePage();
-    if (journal.kind !== "merge") this.#validateReplayTopology(journal);
   }
 
-  #validateReplayTopology(journal: CherryPickJournal | RevertJournal | RebaseJournal): void {
+  #validateReplayTopology(
+    journal: CherryPickJournal | RevertJournal | RebaseJournal,
+    reservation: MemoryReservation,
+    objectSizes: ReadonlyMap<string, number>,
+  ): void {
     if (journal.kind !== "rebase") {
       const step = journal.steps[0];
       if (step === undefined) throw new CorruptError("one-commit replay lost its source step");
-      this.#validateOperationCommitBodies([step.sourceOid], 0, (_oid, source) => {
-        this.#validateReplayParentSelection(step, source.commit.parent);
-      });
+      this.#validateOperationCommitBodies(
+        [step.sourceOid],
+        0,
+        (_oid, source) => {
+          this.#validateReplayParentSelection(step, source.commit.parent);
+        },
+        reservation,
+        objectSizes,
+      );
       return;
     }
     let expectedSourceParent = journal.state.baseOid;
@@ -9705,6 +10688,8 @@ export class CheckoutStore implements IndexStore {
         }
         expectedSourceParent = step.sourceOid;
       },
+      reservation,
+      objectSizes,
     );
     if (expectedSourceParent !== journal.state.originalHeadOid) {
       throw new CorruptError("rebase source sequence does not end at the original HEAD");
@@ -9729,6 +10714,8 @@ export class CheckoutStore implements IndexStore {
         }
         expectedResultParent = step.resultOid;
       },
+      reservation,
+      objectSizes,
     );
     if (retainedBytes > MAX_LOG_STATE_BYTES) {
       throw new GitError(
@@ -9742,53 +10729,84 @@ export class CheckoutStore implements IndexStore {
     oids: readonly string[],
     initialBytes: number,
     visit: (oid: string, commit: CommitCacheEntry) => void,
+    reservation: MemoryReservation,
+    objectSizes: ReadonlyMap<string, number>,
   ): number {
     let retainedBytes = initialBytes;
     const seen = new Set<string>();
-    for (let offset = 0; offset < oids.length; offset += MAX_BLOB_BATCH_OIDS) {
-      const page = oids.slice(offset, offset + MAX_BLOB_BATCH_OIDS);
-      for (const oid of page) {
-        if (seen.has(oid)) throw new CorruptError("operation commit sequence contains a cycle");
-        seen.add(oid);
-      }
-      let remaining = page;
-      while (remaining.length > 0) {
-        const available = MAX_LOG_STATE_BYTES - retainedBytes;
-        if (available <= 0) {
-          throw new GitError(
-            "E2BIG",
-            `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
-          );
+    const batchMemory = reservation.scope();
+    try {
+      for (let offset = 0; offset < oids.length; offset += MAX_BLOB_BATCH_OIDS) {
+        const page = oids.slice(offset, offset + MAX_BLOB_BATCH_OIDS);
+        for (const oid of page) {
+          if (seen.has(oid)) throw new CorruptError("operation commit sequence contains a cycle");
+          seen.add(oid);
         }
-        let batch: ObjectReadBatch;
-        try {
-          batch = this.readObjects(remaining, {
-            budgetBytes: Math.min(MAX_BLOB_BATCH_BYTES, available),
-          });
-        } catch (error) {
-          if (hasErrorCode(error, "EFBIG")) {
+        let remaining = page;
+        while (remaining.length > 0) {
+          const available = MAX_LOG_STATE_BYTES - retainedBytes;
+          if (available <= 0) {
             throw new GitError(
               "E2BIG",
               `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
-              { cause: error },
             );
           }
-          throw error;
-        }
-        if (batch.objects.size === 0 || batch.bytes <= 0) {
-          throw new CorruptError("operation commit validation made no progress");
-        }
-        retainedBytes += batch.bytes;
-        for (const [oid, object] of batch.objects) {
-          if (object.type !== "commit") {
-            throw new CorruptError("operation step did not produce a complete commit object");
+          const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, available);
+          let selectedBytes = 0;
+          let largestBytes = 0;
+          let selectedCount = 0;
+          for (const oid of remaining) {
+            const size = objectSizes.get(oid);
+            if (size === undefined) {
+              throw new CorruptError(`operation commit ${oid} lost its validated size`);
+            }
+            if (size > budgetBytes - selectedBytes) break;
+            selectedBytes += size;
+            largestBytes = Math.max(largestBytes, size);
+            selectedCount++;
           }
-          visit(oid, prepareCommitCache({ repoId: this.#repoId, oid, data: object.data }));
+          if (selectedCount > 0) {
+            batchMemory.set(
+              "other",
+              512 +
+                selectedCount * 256 +
+                selectedBytes +
+                currentTextRowRetainedBytes(largestBytes, 8),
+            );
+          }
+          let batch: ObjectReadBatch;
+          try {
+            batch = this.readObjects(remaining, {
+              budgetBytes,
+            });
+          } catch (error) {
+            if (hasErrorCode(error, "EFBIG")) {
+              throw new GitError(
+                "E2BIG",
+                `operation journal commit bodies exceed ${MAX_LOG_STATE_BYTES} bytes`,
+                { cause: error },
+              );
+            }
+            throw error;
+          }
+          if (batch.objects.size === 0 || batch.bytes <= 0) {
+            throw new CorruptError("operation commit validation made no progress");
+          }
+          retainedBytes += batch.bytes;
+          for (const [oid, object] of batch.objects) {
+            if (object.type !== "commit") {
+              throw new CorruptError("operation step did not produce a complete commit object");
+            }
+            visit(oid, prepareCommitCache({ repoId: this.#repoId, oid, data: object.data }));
+          }
+          remaining = batch.remaining;
+          batchMemory.clear("other");
         }
-        remaining = batch.remaining;
       }
+      return retainedBytes;
+    } finally {
+      batchMemory.dispose();
     }
-    return retainedBytes;
   }
 
   #validateReplayParentSelection(step: OperationStepMetadata, parents: readonly string[]): void {
@@ -9818,6 +10836,22 @@ export class CheckoutStore implements IndexStore {
 
   /** Replace authenticated metadata while retaining the exact touched snapshot. */
   replaceOperationState(expectedIntegrityOid: string, state: OperationStateMetadata): void {
+    const reservation = this.reserveMemory();
+    try {
+      this.#replaceOperationStateOwned(expectedIntegrityOid, state, reservation);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  #replaceOperationStateOwned(
+    expectedIntegrityOid: string,
+    state: OperationStateMetadata,
+    reservation: MemoryReservation,
+  ): void {
+    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
+    }
     if (state.kind === "rebase") {
       throw new GitError("EOPMISMATCH", "rebase replacement requires a whole-journal transition");
     }
@@ -9825,51 +10859,62 @@ export class CheckoutStore implements IndexStore {
       throw new GitError("EINVAL", "expected operation integrity identity is invalid");
     }
     this.#db.transactionSync(() => {
-      const current = this.readOperationState();
-      if (current === null) throw operationNotActive(state.kind);
-      if (current.state.kind !== state.kind) {
-        throw operationKindMismatch(state.kind, current.state.kind);
-      }
-      if (current.integrityOid !== expectedIntegrityOid) {
-        throw new GitError("EOPMISMATCH", "operation state changed before replacement");
-      }
-      const retainedBytes = operationJournalRetainedBytes(state, current.touched, current.steps);
-      const integrityOid = operationJournalIntegrityOid(state, current.touched, current.steps);
-      this.#validateOperationObjects(
-        operationJournal(state, current.steps, current.touched, retainedBytes, integrityOid),
-      );
-      this.#db.run(
-        `UPDATE git_operation_state
+      const currentMemory = reservation.scope();
+      try {
+        const current = this.#readOperationStateOwned(currentMemory);
+        if (current === null) throw operationNotActive(state.kind);
+        if (current.state.kind !== state.kind) {
+          throw operationKindMismatch(state.kind, current.state.kind);
+        }
+        if (current.integrityOid !== expectedIntegrityOid) {
+          throw new GitError("EOPMISMATCH", "operation state changed before replacement");
+        }
+        const retainedBytes = operationJournalRetainedBytes(state, current.touched, current.steps);
+        reservation.set(
+          "other",
+          operationJournalIntegrityBytes(state, current.steps, current.touched, retainedBytes),
+        );
+        const integrityOid = operationJournalIntegrityOid(state, current.touched, current.steps);
+        reservation.set("other", retainedBytes);
+        this.#validateOperationObjects(
+          operationJournal(state, current.steps, current.touched, retainedBytes, integrityOid),
+          reservation,
+        );
+        this.#db.run(
+          `UPDATE git_operation_state
             SET original_head_ref = ?, original_head_oid = ?, phase = ?, empty_reason = ?,
                 current_parent_oid = ?, incoming_parent_oid = ?, upstream_oid = ?, base_oid = ?,
                 mode = ?, merge_origin = ?, current_step = ?, current_label = ?, incoming_label = ?,
                 message = ?, author_name = ?, author_email = ?, committer_name = ?,
                 committer_email = ?, retained_bytes = ?, integrity_oid = ?
           WHERE checkout_id = ? AND integrity_oid = ?`,
-        state.originalHeadRef,
-        state.originalHeadOid,
-        state.phase,
-        state.kind === "cherry-pick" || state.kind === "revert" ? state.emptyReason : null,
-        state.kind === "merge" ? state.currentParentOid : null,
-        state.kind === "merge" ? state.incomingParentOid : null,
-        null,
-        null,
-        state.kind === "merge" ? state.mode : null,
-        state.kind === "merge" ? state.mergeOrigin : null,
-        0,
-        state.currentLabel,
-        state.incomingLabel,
-        state.message,
-        state.author?.name ?? null,
-        state.author?.email ?? null,
-        state.committer?.name ?? null,
-        state.committer?.email ?? null,
-        retainedBytes,
-        integrityOid,
-        this.#checkoutId,
-        expectedIntegrityOid,
-      );
-      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+          state.originalHeadRef,
+          state.originalHeadOid,
+          state.phase,
+          state.kind === "cherry-pick" || state.kind === "revert" ? state.emptyReason : null,
+          state.kind === "merge" ? state.currentParentOid : null,
+          state.kind === "merge" ? state.incomingParentOid : null,
+          null,
+          null,
+          state.kind === "merge" ? state.mode : null,
+          state.kind === "merge" ? state.mergeOrigin : null,
+          0,
+          state.currentLabel,
+          state.incomingLabel,
+          state.message,
+          state.author?.name ?? null,
+          state.author?.email ?? null,
+          state.committer?.name ?? null,
+          state.committer?.email ?? null,
+          retainedBytes,
+          integrityOid,
+          this.#checkoutId,
+          expectedIntegrityOid,
+        );
+        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+      } finally {
+        currentMemory.dispose();
+      }
     });
   }
 
@@ -9880,11 +10925,31 @@ export class CheckoutStore implements IndexStore {
     steps: readonly OperationStepMetadata[],
     touched: readonly MergeTouchedPath[],
   ): void {
+    const reservation = this.reserveMemory();
+    try {
+      this.#replaceOperationJournalOwned(expectedIntegrityOid, state, steps, touched, reservation);
+    } finally {
+      reservation.dispose();
+    }
+  }
+
+  #replaceOperationJournalOwned(
+    expectedIntegrityOid: string,
+    state: OperationStateMetadata,
+    steps: readonly OperationStepMetadata[],
+    touched: readonly MergeTouchedPath[],
+    reservation: MemoryReservation,
+  ): void {
+    if (!this.#sharedStore.ownsMemoryReservation(reservation)) {
+      throw new GitError("EINVAL", "operation journal reservation belongs to another repository");
+    }
     if (!isOid(expectedIntegrityOid)) {
       throw new GitError("EINVAL", "expected operation integrity identity is invalid");
     }
     const retainedBytes = operationJournalRetainedBytes(state, touched, steps);
+    reservation.set("other", operationJournalIntegrityBytes(state, steps, touched, retainedBytes));
     const integrityOid = operationJournalIntegrityOid(state, touched, steps);
+    reservation.set("other", retainedBytes);
     let previousPath: string | null = null;
     for (const entry of touched) {
       if (previousPath !== null && comparePaths(previousPath, entry.path) >= 0) {
@@ -9893,29 +10958,40 @@ export class CheckoutStore implements IndexStore {
       previousPath = entry.path;
     }
     this.#db.transactionSync(() => {
-      const current = this.readOperationState();
-      if (current === null) throw operationNotActive(state.kind);
-      if (current.kind !== state.kind) throw operationKindMismatch(state.kind, current.kind);
-      if (current.integrityOid !== expectedIntegrityOid) {
-        throw new GitError("EOPMISMATCH", "operation state changed before replacement");
+      const currentMemory = reservation.scope();
+      try {
+        const current = this.#readOperationStateOwned(currentMemory);
+        if (current === null) throw operationNotActive(state.kind);
+        if (current.kind !== state.kind) throw operationKindMismatch(state.kind, current.kind);
+        if (current.integrityOid !== expectedIntegrityOid) {
+          throw new GitError("EOPMISMATCH", "operation state changed before replacement");
+        }
+        if (current.kind === "rebase") {
+          if (state.kind !== "rebase") throw operationKindMismatch(state.kind, current.kind);
+          requireRebaseJournalTransition(current, state, steps, touched);
+        }
+        const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
+        this.#validateOperationObjects(journal, reservation);
+        this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
+        this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
+        this.#db.run(
+          "DELETE FROM git_operation_state WHERE checkout_id = ? AND integrity_oid = ?",
+          this.#checkoutId,
+          expectedIntegrityOid,
+        );
+        this.#insertOperationHeader(
+          state,
+          steps.length,
+          touched.length,
+          retainedBytes,
+          integrityOid,
+        );
+        this.#insertOperationSteps(steps, reservation);
+        this.#insertOperationTouched(touched, reservation);
+        bumpMaintenanceRootEpoch(this.#db, this.#repoId);
+      } finally {
+        currentMemory.dispose();
       }
-      if (current.kind === "rebase") {
-        if (state.kind !== "rebase") throw operationKindMismatch(state.kind, current.kind);
-        requireRebaseJournalTransition(current, state, steps, touched);
-      }
-      const journal = operationJournal(state, steps, touched, retainedBytes, integrityOid);
-      this.#validateOperationObjects(journal);
-      this.#db.run("DELETE FROM git_operation_touched WHERE checkout_id = ?", this.#checkoutId);
-      this.#db.run("DELETE FROM git_operation_steps WHERE checkout_id = ?", this.#checkoutId);
-      this.#db.run(
-        "DELETE FROM git_operation_state WHERE checkout_id = ? AND integrity_oid = ?",
-        this.#checkoutId,
-        expectedIntegrityOid,
-      );
-      this.#insertOperationHeader(state, steps.length, touched.length, retainedBytes, integrityOid);
-      this.#insertOperationSteps(steps);
-      this.#insertOperationTouched(touched);
-      bumpMaintenanceRootEpoch(this.#db, this.#repoId);
     });
   }
 

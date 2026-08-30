@@ -31,6 +31,7 @@ import {
   branchList,
   branchRename,
   checkout,
+  checkoutBlockersOwned,
   currentBranch,
   switchBranch,
   tag,
@@ -1236,6 +1237,184 @@ describe("checkout", () => {
     fixture.git("checkout", "-f", "-q", "side");
     expectSameTree();
     expect(ws.repo.head().ref).toBe("refs/heads/side");
+  });
+
+  it("streams a dirty checkout guard beyond the former 32 MiB hash admission", () => {
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
+    const bytes = new Uint8Array(32 * 1024 * 1024 + 1).fill(0x6c);
+    ws.worktree.writeFile("/modified.txt", bytes);
+    const beforeHead = ws.repo.head();
+    const beforeIndex = ws.repo.checkout.indexGet("modified.txt");
+    const worktree = new CountingWorktree(ws.worktree);
+
+    expect(() => checkout(ws.context, ws.repo, worktree, { ref: "side" })).toThrowError(
+      expect.objectContaining({ code: "ECHECKOUTFAIL" }),
+    );
+
+    expect(worktree.rangeReads).toBe(513);
+    expect(ws.repo.head()).toEqual(beforeHead);
+    expect(ws.repo.checkout.indexGet("modified.txt")).toEqual(beforeIndex);
+    expect(ws.worktree.stat("/modified.txt")?.size).toBe(bytes.byteLength);
+    expect(ws.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("releases checkout guard hashing after an injected range failure", () => {
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
+    const bytes = new Uint8Array(4 * 1024 * 1024 + 1).fill(0x72);
+    ws.worktree.writeFile("/modified.txt", bytes);
+    const beforeHead = ws.repo.head();
+    const beforeIndex = ws.repo.checkout.indexGet("modified.txt");
+    class FailingRangeWorktree extends CountingWorktree {
+      override readRange(path: string, offset: number, length: number): Uint8Array {
+        if (this.rangeReads === 1) {
+          this.rangeReads++;
+          throw new Error("injected checkout range failure");
+        }
+        return super.readRange(path, offset, length);
+      }
+    }
+    const worktree = new FailingRangeWorktree(ws.worktree);
+
+    expect(() => checkout(ws.context, ws.repo, worktree, { ref: "side" })).toThrow(
+      "injected checkout range failure",
+    );
+
+    expect(worktree.rangeReads).toBe(2);
+    expect(ws.repo.head()).toEqual(beforeHead);
+    expect(ws.repo.checkout.indexGet("modified.txt")).toEqual(beforeIndex);
+    expect(ws.worktree.stat("/modified.txt")?.size).toBe(bytes.byteLength);
+    expect(ws.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("composes checkout guard aggregate state at the exact shared-memory boundary", () => {
+    checkout(ws.context, ws.repo, ws.worktree, { ref: "main" });
+    writeWorkFile(ws, "/modified.txt", "locally changed content\n");
+    const side = ws.repo.resolveRef("refs/heads/side");
+    if (side === null) throw new Error("side branch is missing");
+    const sideTree = ws.repo.readCommit(side).tree;
+
+    const measured = ws.repo.store.reserveMemory();
+    const measuredResult = checkoutBlockersOwned(
+      ws.repo,
+      ws.worktree,
+      sideTree,
+      undefined,
+      true,
+      measured,
+    );
+    const operationBytes = measured.highWaterBytes;
+    expect(measuredResult.tracked).toContain("modified.txt");
+    measured.dispose();
+
+    const exactBlocker = ws.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = ws.repo.store.reserveMemory();
+    try {
+      expect(
+        checkoutBlockersOwned(ws.repo, ws.worktree, sideTree, undefined, true, exactOwner).tracked,
+      ).toContain("modified.txt");
+      expect(exactOwner.highWaterBytes + exactBlocker.currentBytes).toBe(
+        MAX_OPERATION_MEMORY_BYTES,
+      );
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+
+    const overBlocker = ws.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const overOwner = ws.repo.store.reserveMemory();
+    try {
+      expect(() =>
+        checkoutBlockersOwned(ws.repo, ws.worktree, sideTree, undefined, true, overOwner),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    } finally {
+      overOwner.dispose();
+      overBlocker.dispose();
+    }
+    expect(ws.repo.head().ref).toBe("refs/heads/main");
+    expect(ws.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("owns full index and worktree guard pages at the exact shared-memory boundary", () => {
+    const workspace = makeRepo("/");
+    workspace.repo.store.configSet("user.name", "Fixture");
+    workspace.repo.store.configSet("user.email", "fixture@example.com");
+    const body = utf8.encode("page\n");
+    const oid = workspace.repo.store.write("blob", body);
+    const paths = Array.from(
+      { length: 1_000 },
+      (_, index) => `page-${index.toString().padStart(4, "0")}.txt`,
+    );
+    workspace.worktree.writeFiles(
+      paths.map((path) => ({ path: `/${path}`, bytes: body, contentId: fromHex(oid) })),
+    );
+    const stats = new Map(
+      workspace.worktree
+        .scan("/", { filesOnly: true, limit: paths.length + 1 })
+        .map((entry) => [entry.path.slice(1), entry]),
+    );
+    workspace.repo.checkout.indexReplace(
+      paths.map((path): IndexEntry => {
+        const stat = stats.get(path);
+        if (stat === undefined) throw new Error(`full-page path was not written: ${path}`);
+        return {
+          path,
+          stage: 0,
+          mode: 0o100644,
+          oid,
+          size: stat.size,
+          mtime: stat.mtime,
+          ino: stat.ino,
+        };
+      }),
+    );
+    const current = commit(workspace.context, workspace.repo, { message: "full page" });
+    const tree = workspace.repo.readCommit(current.oid).tree;
+
+    const measured = workspace.repo.store.reserveMemory();
+    expect(
+      checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true, measured),
+    ).toEqual({ tracked: [], untracked: [] });
+    const operationBytes = measured.highWaterBytes;
+    measured.dispose();
+
+    const exactBlocker = workspace.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = workspace.repo.store.reserveMemory();
+    try {
+      expect(
+        checkoutBlockersOwned(
+          workspace.repo,
+          workspace.worktree,
+          tree,
+          undefined,
+          true,
+          exactOwner,
+        ),
+      ).toEqual({ tracked: [], untracked: [] });
+      expect(exactOwner.highWaterBytes + exactBlocker.currentBytes).toBe(
+        MAX_OPERATION_MEMORY_BYTES,
+      );
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+
+    const overBlocker = workspace.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const overOwner = workspace.repo.store.reserveMemory();
+    try {
+      expect(() =>
+        checkoutBlockersOwned(workspace.repo, workspace.worktree, tree, undefined, true, overOwner),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    } finally {
+      overOwner.dispose();
+      overBlocker.dispose();
+    }
+    expect(workspace.repo.head().oid).toBe(current.oid);
+    expect(workspace.repo.checkout.indexEntries()).toHaveLength(paths.length);
+    expect(workspace.repo.store.memory.totalBytes).toBe(0);
   });
 
   it("preserves local changes when the target keeps the index entry", () => {

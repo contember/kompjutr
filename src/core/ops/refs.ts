@@ -2,10 +2,12 @@
 // that goes with moving HEAD. Refs are rows; HEAD is a column on the
 // repository row, so nothing here writes a file.
 
+import type { MemoryReservation } from "../../memory.js";
 import {
   contentIdKey,
   createRefMutationMemoryOwner,
   type IndexEntry,
+  indexScanOwned,
   mutateRefsOwned,
   type RefMutationMemoryOwner,
 } from "../../sqlite/store.js";
@@ -26,19 +28,20 @@ import { operationRefLogMetadata } from "./ref-log.js";
 import { trySparseCleanCheckout } from "./sparse-checkout.js";
 import { treeStream } from "./tree-stream.js";
 import {
-  hashWorktreePaths,
+  hashWorktreePathsOwned,
   indexMatchesStat,
   type WorktreePath,
-  walkWorktreeEntriesStream,
+  walkWorktreeEntriesStreamOwned,
 } from "./worktree-io.js";
 
 const HEADS = "refs/heads/";
 const TAGS = "refs/tags/";
-const CHECKOUT_GUARD_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_GUARD_BATCH = 1_000;
 const INDEX_ENTRY_BYTES = 256;
 const WORKTREE_ENTRY_BYTES = 256;
 const DIRECTORY_ENTRY_BYTES = 96;
+const HASH_LOOKUP_ENTRY_BYTES = 128;
+const HASH_OID_BYTES = retainedStringBytes("0".repeat(40));
 
 export interface BranchOptions {
   name: string;
@@ -620,7 +623,34 @@ export function checkoutBlockers(
   prune: boolean,
   limits?: CheckoutBlockerLimits,
 ): CheckoutBlockers {
-  return checkoutBlockersAgainst(repo, worktree, repo.headTree(), tree, paths, prune, limits);
+  const reservation = repo.store.reserveMemory();
+  try {
+    return checkoutBlockersOwned(repo, worktree, tree, paths, prune, reservation, limits);
+  } finally {
+    reservation.dispose();
+  }
+}
+
+/** Internal checkout guard under a caller-owned dedicated reservation. */
+export function checkoutBlockersOwned(
+  repo: Repository,
+  worktree: Worktree,
+  tree: string | null,
+  paths: string[] | undefined,
+  prune: boolean,
+  reservation: MemoryReservation,
+  limits?: CheckoutBlockerLimits,
+): CheckoutBlockers {
+  return checkoutBlockersAgainstOwned(
+    repo,
+    worktree,
+    repo.headTree(),
+    tree,
+    paths,
+    prune,
+    reservation,
+    limits,
+  );
 }
 
 /** Checkout safety when an operation's checked-out baseline is not the published HEAD tree. */
@@ -634,6 +664,39 @@ export function checkoutBlockersAgainst(
   limits?: CheckoutBlockerLimits,
   excludeRoots: string[] = [],
 ): CheckoutBlockers {
+  const reservation = repo.store.reserveMemory();
+  try {
+    return checkoutBlockersAgainstOwned(
+      repo,
+      worktree,
+      baselineTree,
+      tree,
+      paths,
+      prune,
+      reservation,
+      limits,
+      excludeRoots,
+    );
+  } finally {
+    reservation.dispose();
+  }
+}
+
+/** Internal checkout guard with an explicit baseline and caller-owned reservation. */
+export function checkoutBlockersAgainstOwned(
+  repo: Repository,
+  worktree: Worktree,
+  baselineTree: string | null,
+  tree: string | null,
+  paths: string[] | undefined,
+  prune: boolean,
+  reservation: MemoryReservation,
+  limits?: CheckoutBlockerLimits,
+  excludeRoots: string[] = [],
+): CheckoutBlockers {
+  if (!repo.store.ownsMemoryReservation(reservation)) {
+    throw new GitError("EINVAL", "checkout guard reservation belongs to another repository");
+  }
   return checkoutBlockersAgainstMode(
     repo,
     worktree,
@@ -644,6 +707,7 @@ export function checkoutBlockersAgainst(
     limits,
     false,
     excludeRoots,
+    reservation,
   );
 }
 
@@ -656,6 +720,35 @@ export function hardResetBlockersAgainst(
   limits: CheckoutBlockerLimits,
   excludeRoots: string[] = [],
 ): CheckoutBlockers {
+  const reservation = repo.store.reserveMemory();
+  try {
+    return hardResetBlockersAgainstOwned(
+      repo,
+      worktree,
+      baselineTree,
+      tree,
+      reservation,
+      limits,
+      excludeRoots,
+    );
+  } finally {
+    reservation.dispose();
+  }
+}
+
+/** Internal hard-reset guard under a caller-owned dedicated reservation. */
+export function hardResetBlockersAgainstOwned(
+  repo: Repository,
+  worktree: Worktree,
+  baselineTree: string | null,
+  tree: string | null,
+  reservation: MemoryReservation,
+  limits: CheckoutBlockerLimits,
+  excludeRoots: string[] = [],
+): CheckoutBlockers {
+  if (!repo.store.ownsMemoryReservation(reservation)) {
+    throw new GitError("EINVAL", "checkout guard reservation belongs to another repository");
+  }
   return checkoutBlockersAgainstMode(
     repo,
     worktree,
@@ -666,6 +759,7 @@ export function hardResetBlockersAgainst(
     limits,
     true,
     excludeRoots,
+    reservation,
   );
 }
 
@@ -679,6 +773,7 @@ function checkoutBlockersAgainstMode(
   limits: CheckoutBlockerLimits | undefined,
   discardTrackedChanges: boolean,
   excludeRoots: string[],
+  reservation: MemoryReservation,
 ): CheckoutBlockers {
   const tracked: string[] = [];
   const untracked: string[] = [];
@@ -686,9 +781,16 @@ function checkoutBlockersAgainstMode(
   const pendingTargets: PendingTarget[] = [];
   const pendingTrackedPaths: PendingTarget[] = [];
   const untrackedAncestors: PendingTarget[] = [];
-  const budget = new CheckoutGuardBudget();
+  const budget = new CheckoutGuardBudget(reservation);
 
-  for (const row of checkoutGuardRows(repo, worktree, baselineTree, tree, excludeRoots)) {
+  for (const row of checkoutGuardRows(
+    repo,
+    worktree,
+    baselineTree,
+    tree,
+    excludeRoots,
+    reservation,
+  )) {
     if (limits !== undefined) {
       if (limits.rows >= limits.maxRows) {
         throw new GitError("E2BIG", `checkout guard exceeds ${limits.maxRows} source rows`);
@@ -783,10 +885,13 @@ function checkoutBlockersAgainstMode(
     budget.add(bytes);
     dirtyCandidates.push({ entry: existing, worktree: row.worktree, bytes });
     if (dirtyCandidates.length >= CHECKOUT_GUARD_BATCH) {
-      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget, limits);
+      flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget, limits, reservation);
     }
   }
-  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget, limits);
+  flushGuardCandidates(repo, worktree, dirtyCandidates, tracked, budget, limits, reservation);
+  releaseRanges(pendingTargets, budget);
+  releaseRanges(pendingTrackedPaths, budget);
+  releaseRanges(untrackedAncestors, budget);
   tracked.sort(comparePaths);
   untracked.sort(comparePaths);
   return { tracked, untracked };
@@ -800,33 +905,85 @@ interface CheckoutGuardRow {
   worktree: WorktreePath | undefined;
 }
 
+function checkoutGuardRowRetainedBytes(
+  path: string,
+  target: TargetEntry | undefined,
+  head: TargetEntry | undefined,
+  index: IndexEntry | undefined,
+  worktree: WorktreePath | undefined,
+): number {
+  let bytes = 256 + retainedStringBytes(path);
+  for (const entry of [target, head]) {
+    if (entry !== undefined) {
+      bytes +=
+        128 +
+        retainedStringBytes(entry.path) +
+        retainedStringBytes(entry.mode) +
+        retainedStringBytes(entry.oid);
+    }
+  }
+  if (index !== undefined) {
+    bytes += INDEX_ENTRY_BYTES + retainedStringBytes(index.path) + retainedStringBytes(index.oid);
+  }
+  if (worktree !== undefined) {
+    bytes +=
+      WORKTREE_ENTRY_BYTES +
+      retainedStringBytes(worktree.path) +
+      retainedStringBytes(worktree.stat.target ?? "") +
+      (worktree.stat.contentId?.byteLength ?? 0);
+  }
+  return bytes;
+}
+
 function* checkoutGuardRows(
   repo: Repository,
   worktree: Worktree,
   baselineTree: string | null,
   tree: string | null,
   excludeRoots: string[],
+  reservation: MemoryReservation,
 ): Generator<CheckoutGuardRow> {
+  const indexMemory = reservation.scope();
+  const worktreeMemory = reservation.scope();
   const trees = joinSorted(treeStream(repo, tree), treeStream(repo, baselineTree), {
     left: (entry) => entry.path,
     right: (entry) => entry.path,
   });
   const current = joinSorted(
-    stageZero(repo.checkout.indexScan()),
-    walkWorktreeEntriesStream(worktree, repo.root, { excludeRoots }),
+    stageZero(indexScanOwned(repo.checkout, indexMemory)),
+    walkWorktreeEntriesStreamOwned(worktree, repo.root, worktreeMemory, { excludeRoots }),
     { left: (entry) => entry.path, right: (entry) => entry.path },
   );
-  for (const row of joinSorted(trees, current, {
-    left: (entry) => entry.path,
-    right: (entry) => entry.path,
-  })) {
-    yield {
-      path: row.path,
-      target: row.left?.left,
-      head: row.left?.right,
-      index: row.right?.left,
-      worktree: row.right?.right,
-    };
+  try {
+    for (const row of joinSorted(trees, current, {
+      left: (entry) => entry.path,
+      right: (entry) => entry.path,
+    })) {
+      const target = row.left?.left;
+      const head = row.left?.right;
+      const index = row.right?.left;
+      const worktreeEntry = row.right?.right;
+      const rowMemory = reservation.scope();
+      rowMemory.set(
+        "other",
+        checkoutGuardRowRetainedBytes(row.path, target, head, index, worktreeEntry),
+      );
+      const result = {
+        path: row.path,
+        target,
+        head,
+        index,
+        worktree: worktreeEntry,
+      };
+      try {
+        yield result;
+      } finally {
+        rowMemory.dispose();
+      }
+    }
+  } finally {
+    worktreeMemory.dispose();
+    indexMemory.dispose();
   }
 }
 
@@ -843,17 +1000,39 @@ interface PendingTarget {
 }
 
 class CheckoutGuardBudget {
-  #bytes = 0;
+  readonly #reservation: MemoryReservation;
+  #bytes = 256;
+
+  constructor(reservation: MemoryReservation) {
+    this.#reservation = reservation;
+    this.#reservation.set("other", this.#bytes);
+  }
 
   add(bytes: number): void {
-    if (bytes > CHECKOUT_GUARD_BYTES - this.#bytes) {
-      throw new GitError("E2BIG", `checkout guard state exceeds ${CHECKOUT_GUARD_BYTES} bytes`);
+    const next = this.#bytes + bytes;
+    this.#reservation.set("other", next);
+    this.#bytes = next;
+  }
+
+  construct(units: number, construct: () => string): string {
+    const predicted = 48 + units * 2;
+    this.add(predicted);
+    try {
+      const value = construct();
+      const actual = retainedStringBytes(value);
+      if (actual > predicted) this.add(actual - predicted);
+      else if (actual < predicted) this.release(predicted - actual);
+      return value;
+    } catch (error) {
+      this.release(predicted);
+      throw error;
     }
-    this.#bytes += bytes;
   }
 
   release(bytes: number): void {
     this.#bytes -= bytes;
+    if (this.#bytes < 256) throw new Error("checkout guard memory accounting is corrupt");
+    this.#reservation.set("other", this.#bytes);
   }
 }
 
@@ -863,16 +1042,27 @@ function retainBlocker(paths: string[], path: string, budget: CheckoutGuardBudge
 }
 
 function retainRange(ranges: PendingTarget[], path: string, budget: CheckoutGuardBudget): void {
-  const upper = `${path}0`;
-  const bytes = DIRECTORY_ENTRY_BYTES + retainedStringBytes(path) + retainedStringBytes(upper);
-  budget.add(bytes);
-  ranges.push({ path, upper, bytes });
+  const retainedPathBytes = DIRECTORY_ENTRY_BYTES + retainedStringBytes(path);
+  budget.add(retainedPathBytes);
+  try {
+    const upper = budget.construct(path.length + 1, () => `${path}0`);
+    const bytes = retainedPathBytes + retainedStringBytes(upper);
+    ranges.push({ path, upper, bytes });
+  } catch (error) {
+    budget.release(retainedPathBytes);
+    throw error;
+  }
 }
 
 function expireRanges(ranges: PendingTarget[], path: string, budget: CheckoutGuardBudget): void {
   while (ranges.length > 0 && comparePaths(path, ranges[ranges.length - 1]!.upper) >= 0) {
     budget.release(ranges.pop()!.bytes);
   }
+}
+
+function releaseRanges(ranges: PendingTarget[], budget: CheckoutGuardBudget): void {
+  for (const range of ranges) budget.release(range.bytes);
+  ranges.length = 0;
 }
 
 function findAncestor(ranges: PendingTarget[], path: string): PendingTarget | undefined {
@@ -901,65 +1091,72 @@ function flushGuardCandidates(
   tracked: string[],
   budget: CheckoutGuardBudget,
   limits: CheckoutBlockerLimits | undefined,
+  reservation: MemoryReservation,
 ): void {
   if (candidates.length === 0) return;
-  const identities = repo.store.lookupBlobIds(
-    candidates.flatMap((candidate) =>
-      candidate.worktree.stat.contentId === null ? [] : [candidate.worktree.stat.contentId],
-    ),
-  );
-  const needsHash: GuardCandidate[] = [];
-  for (const candidate of candidates) {
-    const contentId = candidate.worktree.stat.contentId;
-    const mapped = contentId === null ? undefined : identities.get(contentIdKey(contentId));
-    if (
-      mapped === candidate.entry.oid &&
-      candidate.entry.mode === Number.parseInt(gitModeFor(candidate.worktree.stat), 8)
-    ) {
-      continue;
-    }
-    needsHash.push(candidate);
-  }
-  if (limits !== undefined) {
-    if (needsHash.length > 0) {
-      if (needsHash.length > limits.maxHashCandidates - limits.hashCandidates) {
-        throw new GitError(
-          "E2BIG",
-          `checkout guard hashing exceeds ${limits.maxHashCandidates} paths`,
-        );
+  const current = reservation.scope();
+  current.set("other", candidates.length * (HASH_LOOKUP_ENTRY_BYTES + 32 + HASH_OID_BYTES));
+  try {
+    const identities = repo.store.lookupBlobIds(
+      candidates.flatMap((candidate) =>
+        candidate.worktree.stat.contentId === null ? [] : [candidate.worktree.stat.contentId],
+      ),
+    );
+    const needsHash: GuardCandidate[] = [];
+    for (const candidate of candidates) {
+      const contentId = candidate.worktree.stat.contentId;
+      const mapped = contentId === null ? undefined : identities.get(contentIdKey(contentId));
+      if (
+        mapped === candidate.entry.oid &&
+        candidate.entry.mode === Number.parseInt(gitModeFor(candidate.worktree.stat), 8)
+      ) {
+        continue;
       }
-      limits.hashCandidates += needsHash.length;
+      needsHash.push(candidate);
     }
-    for (const candidate of needsHash) {
-      const size = candidate.worktree.stat.size;
-      if (size > limits.maxHashBytes - limits.hashBytes) {
-        throw new GitError("E2BIG", `checkout guard hashing exceeds ${limits.maxHashBytes} bytes`);
+    if (limits !== undefined) {
+      if (needsHash.length > 0) {
+        if (needsHash.length > limits.maxHashCandidates - limits.hashCandidates) {
+          throw new GitError(
+            "E2BIG",
+            `checkout guard hashing exceeds ${limits.maxHashCandidates} paths`,
+          );
+        }
+        limits.hashCandidates += needsHash.length;
       }
-      limits.hashBytes += size;
+      for (const candidate of needsHash) limits.hashBytes += candidate.worktree.stat.size;
     }
-  }
-  const hashed = hashWorktreePaths(
-    repo,
-    worktree,
-    needsHash.map((candidate) => candidate.worktree),
-    { write: false },
-  );
-  const dirty = new Set<string>();
-  for (const candidate of needsHash) {
-    const actual = hashed.get(candidate.entry.path);
-    if (
-      actual === undefined ||
-      actual.oid !== candidate.entry.oid ||
-      Number.parseInt(actual.mode, 8) !== candidate.entry.mode
-    ) {
-      dirty.add(candidate.entry.path);
+    const hashReservation = reservation.scope();
+    try {
+      const hashed = hashWorktreePathsOwned(
+        repo,
+        worktree,
+        needsHash.map((candidate) => candidate.worktree),
+        hashReservation,
+        { write: false },
+      );
+      const dirty = new Set<string>();
+      for (const candidate of needsHash) {
+        const actual = hashed.get(candidate.entry.path);
+        if (
+          actual === undefined ||
+          actual.oid !== candidate.entry.oid ||
+          Number.parseInt(actual.mode, 8) !== candidate.entry.mode
+        ) {
+          dirty.add(candidate.entry.path);
+        }
+      }
+      for (const candidate of candidates) {
+        budget.release(candidate.bytes);
+        if (dirty.has(candidate.entry.path)) retainBlocker(tracked, candidate.entry.path, budget);
+      }
+      candidates.length = 0;
+    } finally {
+      hashReservation.dispose();
     }
+  } finally {
+    current.dispose();
   }
-  for (const candidate of candidates) {
-    budget.release(candidate.bytes);
-    if (dirty.has(candidate.entry.path)) retainBlocker(tracked, candidate.entry.path, budget);
-  }
-  candidates.length = 0;
 }
 
 function differsFromHead(entry: IndexEntry, head: TargetEntry | undefined): boolean {

@@ -358,13 +358,19 @@ at-most-1,000-statement target; a miss is optimization evidence. The transaction
 fails only for its real memory, format, corruption, CAS, or structural bounds.
 
 Merge preflights the current, projected, and final index shape before tree
-construction. The operation accepts at most 10,000 leaf paths, 4 MiB of full
-path bytes, 4,096 tree objects, and 16 MiB of serialized tree data. Worktree
-overwrite checks scan at most 50,000 source rows and retain bounded candidate
-and hash state. Hash batches and large-file range reads may continue while they
-make progress; their accumulated count does not reject the operation. The
-retained integration plan stays reserved with 24 MiB of execution headroom
-through projection, application, and commit.
+construction. The operation accepts at most 10,000 entries in one materialized
+tree object and 4,096 tree objects. Cumulative full-path and serialized-tree
+bytes do not reject the operation. The shared operation owner instead charges
+the live directory stack, current serialization, staged objects, integration
+plan, and worktree state while they coexist. Worktree overwrite checks scan at
+most 50,000 source rows and retain bounded candidate and hash state. Hash
+batches and large-file range reads may continue while they make progress; their
+accumulated count does not reject the operation.
+
+Native SQLite worktree reads use a private registered capability: realpath
+results and exact scan-page metadata are admitted before result materialization.
+The Computer compatibility worktree keeps its legacy materializing fallback;
+that adapter is not an owner-safe worktree scan source.
 
 Clean divergent merges create a commit with ordered current/incoming parents.
 `commit: false` and conflicts persist authenticated merge metadata plus bounded

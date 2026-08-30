@@ -6,7 +6,9 @@ import {
   createRefMutationMemoryOwner,
   type IndexEntry,
   type IndexStore,
+  indexScanOwned,
   mutateRefsOwned,
+  writeObjectsOwned,
 } from "../../sqlite/store.js";
 import { isOid, utf8 } from "../bytes.js";
 import { type GitContext, type GitIdentity, openRepository } from "../context.js";
@@ -18,6 +20,7 @@ import {
   resolveHeadOwned,
   symbolicTargetOwned,
 } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, indexFromTree } from "./checkout.js";
 import {
@@ -32,10 +35,7 @@ import {
   buildTreeInBatch,
   MAX_TREE_BUILD_LEAF_ENTRIES,
   MAX_TREE_BUILD_OBJECTS,
-  MAX_TREE_BUILD_SERIALIZED_BYTES,
-  MAX_TREE_BUILD_TOTAL_PATH_BYTES,
   preflightTreeBuild,
-  TREE_BUILD_EXECUTION_MEMORY_BYTES,
 } from "./tree-build.js";
 
 const READ_TREE_MAX_ROWS_PER_STREAM = 50_000;
@@ -46,6 +46,8 @@ export const MAX_COMMIT_TREE_REVISION_TRAVERSALS = 8;
 export const MAX_COMMIT_TREE_MESSAGE_BYTES = MAX_MERGE_MESSAGE_BYTES;
 export const MAX_COMMIT_TREE_INPUT_BYTES = MAX_INDEXED_COMMIT_BYTES;
 const COMMIT_TREE_EXECUTION_MEMORY_BYTES = 24 * 1024 * 1024;
+const REQUIRED_OBJECTS_FIXED_BYTES = 192;
+const REQUIRED_OBJECT_ENTRY_BYTES = 64;
 
 export interface HashObjectOptions {
   content: Uint8Array | string;
@@ -144,30 +146,45 @@ export function writeTree(repo: Repository, index: IndexStore = repo.checkout): 
     repo.store.db.transactionSync(() => {
       const reservation = repo.store.reserveMemory();
       try {
-        reservation.set("tree", TREE_BUILD_EXECUTION_MEMORY_BYTES);
+        let requiredObjectBytes = REQUIRED_OBJECTS_FIXED_BYTES;
+        reservation.set("other", requiredObjectBytes);
         if (index.hasConflicts()) {
           throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
         }
         const requiredObjects = new Set<string>();
         const entries = function* (): Generator<IndexEntry> {
-          for (const entry of index.indexScan({ pageSize: WRITE_TREE_INDEX_PAGE })) {
+          for (const entry of indexScanOwned(index, reservation, {
+            pageSize: WRITE_TREE_INDEX_PAGE,
+          })) {
             if (entry.stage !== 0) {
               throw new GitError("EUNMERGED", "cannot write tree: the index has unmerged paths");
             }
-            if (entry.mode !== 0o160000) requiredObjects.add(entry.oid);
+            if (entry.mode !== 0o160000 && !requiredObjects.has(entry.oid)) {
+              const next =
+                requiredObjectBytes + REQUIRED_OBJECT_ENTRY_BYTES + retainedStringBytes(entry.oid);
+              reservation.set("other", next);
+              requiredObjects.add(entry.oid);
+              requiredObjectBytes = next;
+            }
             yield entry;
           }
         };
-        preflightTreeBuild(entries(), {
-          maxLeafEntries: MAX_TREE_BUILD_LEAF_ENTRIES,
-          maxTotalPathBytes: MAX_TREE_BUILD_TOTAL_PATH_BYTES,
-          maxTreeObjects: MAX_TREE_BUILD_OBJECTS,
-          maxSerializedTreeBytes: MAX_TREE_BUILD_SERIALIZED_BYTES,
-        });
+        preflightTreeBuild(
+          entries(),
+          {
+            maxEntriesPerTree: MAX_TREE_BUILD_LEAF_ENTRIES,
+            maxTreeObjects: MAX_TREE_BUILD_OBJECTS,
+          },
+          reservation,
+        );
         const missing = repo.store.missing(requiredObjects);
         if (missing[0] !== undefined) throw new ObjectNotFoundError(missing[0]);
-        return repo.store.writeObjects((batch) =>
-          buildTreeInBatch(batch, index.indexScan({ pageSize: WRITE_TREE_INDEX_PAGE })),
+        return writeObjectsOwned(repo.store, reservation, (batch) =>
+          buildTreeInBatch(
+            batch,
+            indexScanOwned(index, reservation, { pageSize: WRITE_TREE_INDEX_PAGE }),
+            reservation,
+          ),
         );
       } finally {
         reservation.dispose();
@@ -209,7 +226,7 @@ export function commitTree(
       try {
         reservation.set("commit", COMMIT_TREE_EXECUTION_MEMORY_BYTES);
         const tree = repo.revParse(input.tree);
-        authenticateCommitTreeObject(repo, tree, "tree", MAX_TREE_BUILD_SERIALIZED_BYTES);
+        authenticateCommitTreeObject(repo, tree, "tree", reservation);
 
         const parent: string[] = [];
         const seen = new Set<string>();
@@ -217,7 +234,7 @@ export function commitTree(
           const oid = repo.revParse(expression);
           if (seen.has(oid)) continue;
           seen.add(oid);
-          authenticateCommitTreeObject(repo, oid, "commit", MAX_INDEXED_COMMIT_BYTES);
+          authenticateCommitTreeObject(repo, oid, "commit", reservation, MAX_INDEXED_COMMIT_BYTES);
           parent.push(oid);
         }
 
@@ -246,22 +263,28 @@ function authenticateCommitTreeObject(
   repo: Repository,
   oid: string,
   expectedType: "tree" | "commit",
-  maxBytes: number,
+  reservation: ReturnType<Repository["store"]["reserveMemory"]>,
+  maxBytes?: number,
 ): void {
   const info = repo.store.typeAndSize(oid);
   if (info === null) throw new ObjectNotFoundError(oid);
   if (info.type !== expectedType) {
     throw new CorruptError(`${oid} is a ${info.type}, not a ${expectedType}`);
   }
-  if (info.size > maxBytes) {
+  if (maxBytes !== undefined && info.size > maxBytes) {
     throw new GitError("E2BIG", `${expectedType} ${oid} exceeds ${maxBytes} bytes`);
   }
   if (expectedType === "commit") {
     repo.readAuthenticatedCommit(oid);
     return;
   }
-  if (repo.store.readAuthenticatedObject(oid, expectedType) === null) {
-    throw new ObjectNotFoundError(oid);
+  reservation.set("tree", info.size);
+  try {
+    if (repo.store.readAuthenticatedObject(oid, expectedType) === null) {
+      throw new ObjectNotFoundError(oid);
+    }
+  } finally {
+    reservation.clear("tree");
   }
 }
 

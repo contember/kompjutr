@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import { utf8 } from "../src/core/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/core/objects.js";
 import type { MergeTouchedPath } from "../src/core/ops/merge-state.js";
-import { MAX_MERGE_STATE_BYTES } from "../src/core/ops/merge-state.js";
 import {
   MAX_OPERATION_STEPS,
   type OperationStepMetadata,
@@ -13,7 +12,13 @@ import {
   type RebaseStateMetadata,
   type ReplayStateMetadata,
 } from "../src/core/ops/operation-state.js";
-import { MAX_LOG_STATE_BYTES, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import {
+  MAX_LOG_STATE_BYTES,
+  readOperationStateOwned,
+  SqliteGitDatabase,
+  writeOperationJournalOwned,
+} from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE_BYTES = serializeTree([]);
@@ -222,6 +227,61 @@ describe("durable operation journal", () => {
     expect(() => store.requireMergeState()).toThrowError(
       expect.objectContaining({ code: "EOPMISMATCH" }),
     );
+  });
+
+  it("charges incoming and active journals additively at the exact conflict boundary", () => {
+    const incoming = replay("revert");
+    const incomingSteps = operationStepsForState(incoming);
+    const activeStore = () => {
+      const prepared = open();
+      prepared.store.writeOperationState(replay(), []);
+      const store = new SqliteGitDatabase(prepared.db).openCheckout(prepared.repository);
+      return { db: prepared.db, store };
+    };
+
+    const measured = activeStore();
+    const probe = measured.store.reserveMemory();
+    try {
+      expect(() =>
+        writeOperationJournalOwned(measured.store, incoming, incomingSteps, [], probe),
+      ).toThrowError(expect.objectContaining({ code: "EOPACTIVE" }));
+    } finally {
+      probe.dispose();
+    }
+    const operationBytes = measured.store.shared.memory.highWaterBytes;
+    measured.store.shared.memory.assertIdle();
+    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+
+    const exact = activeStore();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = exact.store.reserveMemory();
+    try {
+      expect(() =>
+        writeOperationJournalOwned(exact.store, incoming, incomingSteps, [], exactOwner),
+      ).toThrowError(expect.objectContaining({ code: "EOPACTIVE" }));
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    expect(exact.db.scalar<number>("SELECT count(*) FROM git_operation_state")).toBe(1);
+    exact.store.shared.memory.assertIdle();
+
+    const excess = activeStore();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessOwner = excess.store.reserveMemory();
+    try {
+      expect(() =>
+        writeOperationJournalOwned(excess.store, incoming, incomingSteps, [], excessOwner),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    } finally {
+      excessOwner.dispose();
+      excessBlocker.dispose();
+    }
+    expect(excess.db.scalar<number>("SELECT count(*) FROM git_operation_state")).toBe(1);
+    excess.store.shared.memory.assertIdle();
   });
 
   it("replaces only the authenticated operation metadata and retains snapshots", () => {
@@ -493,64 +553,124 @@ describe("durable operation journal", () => {
     }
   });
 
-  it("accepts exact step and retained-byte limits and rejects the next unit", () => {
+  it("keeps structural limits while journals above the former aggregate cap round-trip", () => {
     const step = rebaseSteps()[0]!;
     const exactSteps = Array.from({ length: MAX_OPERATION_STEPS }, () => step);
-    expect(operationJournalRetainedBytes(rebase(), [], exactSteps)).toBeLessThanOrEqual(
-      MAX_MERGE_STATE_BYTES,
-    );
+    expect(operationJournalRetainedBytes(rebase(), [], exactSteps)).toBeGreaterThan(0);
     expect(() => operationJournalRetainedBytes(rebase(), [], [...exactSteps, step])).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
 
-    const entryCount = 500;
-    let state = replay("cherry-pick", { message: "" });
-    let remaining = 0;
-    for (let adjustment = 0; adjustment < 4; adjustment++) {
-      state = replay("cherry-pick", { message: "x".repeat(adjustment) });
-      const base = operationJournalRetainedBytes(state, []);
-      const minimumEntry: MergeTouchedPath = {
-        path: "0000/x",
-        logicalPath: "0000/x",
-        purpose: "primary",
-        index: null,
-        worktree: { kind: "absent" },
-      };
-      const entryBytes = operationJournalRetainedBytes(state, [minimumEntry]) - base;
-      remaining = MAX_MERGE_STATE_BYTES - base - entryBytes * entryCount;
-      if (remaining >= 0 && remaining % 4 === 0) break;
-    }
-    expect(remaining).toBeGreaterThanOrEqual(0);
-    expect(remaining % 4).toBe(0);
-    let extraCharacters = remaining / 4;
-    const exactTouched: MergeTouchedPath[] = [];
-    for (let ordinal = 0; ordinal < entryCount; ordinal++) {
-      const extra = Math.min(extraCharacters, 2_193);
-      extraCharacters -= extra;
-      const path = `${ordinal.toString().padStart(4, "0")}/${"x".repeat(extra + 1)}`;
-      exactTouched.push({
+    const state = replay("cherry-pick", { message: "large journal\n" });
+    const largeTouched = Array.from({ length: 1_000 }, (_, ordinal): MergeTouchedPath => {
+      const path = `${ordinal.toString().padStart(4, "0")}/${"x".repeat(2_100)}`;
+      return {
         path,
         logicalPath: path,
         purpose: "primary",
         index: null,
         worktree: { kind: "absent" },
-      });
-    }
-    expect(extraCharacters).toBe(0);
-    expect(operationJournalRetainedBytes(state, exactTouched)).toBe(MAX_MERGE_STATE_BYTES);
-    open().store.writeOperationState(state, exactTouched);
+      };
+    });
+    const retainedBytes = operationJournalRetainedBytes(state, largeTouched);
+    expect(retainedBytes).toBeGreaterThan(4 * 1024 * 1024);
 
-    const last = exactTouched[exactTouched.length - 1];
-    if (last === undefined) throw new Error("expected retained-byte boundary fixture");
-    const over = [
-      ...exactTouched.slice(0, -1),
-      { ...last, path: `${last.path}x`, logicalPath: `${last.logicalPath}x` },
-    ];
-    const { db, store } = open();
-    expect(() => store.writeOperationState(state, over)).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
+    const written = open();
+    written.store.writeOperationState(state, largeTouched);
+    const cold = new SqliteGitDatabase(written.db).openCheckout(written.repository);
+    expect(cold.requireOperationState("cherry-pick")).toMatchObject({
+      retainedBytes,
+      touched: largeTouched,
+    });
+
+    const measuredRead = new SqliteGitDatabase(written.db).openCheckout(written.repository);
+    const readProbe = measuredRead.reserveMemory();
+    expect(readOperationStateOwned(measuredRead, readProbe)).toMatchObject({ retainedBytes });
+    const readBytes = readProbe.highWaterBytes;
+    expect(readProbe.currentBytes).toBe(retainedBytes);
+    readProbe.dispose();
+    measuredRead.shared.memory.assertIdle();
+
+    const exactRead = new SqliteGitDatabase(written.db).openCheckout(written.repository);
+    const exactReadBlocker = exactRead.reserveMemory();
+    exactReadBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - readBytes);
+    const exactReadOwner = exactRead.reserveMemory();
+    try {
+      expect(readOperationStateOwned(exactRead, exactReadOwner)).toMatchObject({ retainedBytes });
+      expect(exactRead.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactReadOwner.dispose();
+      exactReadBlocker.dispose();
+    }
+    exactRead.shared.memory.assertIdle();
+
+    const excessRead = new SqliteGitDatabase(written.db).openCheckout(written.repository);
+    const excessReadBlocker = excessRead.reserveMemory();
+    excessReadBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - readBytes + 1);
+    const excessReadOwner = excessRead.reserveMemory();
+    try {
+      expect(() => readOperationStateOwned(excessRead, excessReadOwner)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+    } finally {
+      excessReadOwner.dispose();
+      excessReadBlocker.dispose();
+    }
+    excessRead.shared.memory.assertIdle();
+
+    const measured = open();
+    const probe = measured.store.reserveMemory();
+    writeOperationJournalOwned(
+      measured.store,
+      state,
+      operationStepsForState(state),
+      largeTouched,
+      probe,
     );
-    expect(db.scalar<number>("SELECT COUNT(*) FROM git_operation_state")).toBe(0);
+    const operationBytes = probe.highWaterBytes;
+    probe.dispose();
+    measured.store.shared.memory.assertIdle();
+    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+
+    const exact = open();
+    const exactBlocker = exact.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = exact.store.reserveMemory();
+    try {
+      writeOperationJournalOwned(
+        exact.store,
+        state,
+        operationStepsForState(state),
+        largeTouched,
+        exactOwner,
+      );
+      expect(exact.store.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    exact.store.shared.memory.assertIdle();
+
+    const excess = open();
+    const excessBlocker = excess.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessOwner = excess.store.reserveMemory();
+    try {
+      expect(() =>
+        writeOperationJournalOwned(
+          excess.store,
+          state,
+          operationStepsForState(state),
+          largeTouched,
+          excessOwner,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    } finally {
+      excessOwner.dispose();
+      excessBlocker.dispose();
+    }
+    expect(excess.db.scalar<number>("SELECT count(*) FROM git_operation_state")).toBe(0);
+    excess.store.shared.memory.assertIdle();
   });
 
   it("pages exact-limit object validation and enforces 32 MiB across body pages", () => {

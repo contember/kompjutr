@@ -5,6 +5,7 @@ import { createFilesystemOps } from "./ops.js";
 import { initializeFsSchema } from "./schema.js";
 import { COPY_ENTRY_LIMIT, copyFiles as copyStoredFiles } from "./store/copy.js";
 import { currentRev } from "./store/meta.js";
+import { registerNativeOwnedReads } from "./store/owned-read.js";
 import { readFileHandles, readFiles as readStoredFiles } from "./store/read.js";
 import { removeFiles as removeStoredFiles } from "./store/remove.js";
 import { realpath, realpaths, realpathsNoFollow } from "./store/resolve.js";
@@ -95,7 +96,7 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     return { files, remaining };
   };
 
-  return {
+  const filesystem: Filesystem = {
     db,
     rev: () => currentRev(db),
     realpath: (path) => realpath(db, path),
@@ -246,4 +247,6 @@ export function createFilesystem(db: SqlDatabase, options: FilesystemOptions = {
     },
     withReadScope: (work) => work(),
   };
+  registerNativeOwnedReads(filesystem, db);
+  return filesystem;
 }

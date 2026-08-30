@@ -1,6 +1,5 @@
 // Restart-safe execution of one authenticated linear rebase sequence.
 
-import { MAX_OPERATION_MEMORY_BYTES } from "../../memory.js";
 import type { IndexEntry } from "../../sqlite/store.js";
 import { utf8 } from "../bytes.js";
 import type { GitContext, GitIdentity } from "../context.js";
@@ -11,9 +10,7 @@ import { comparePaths, joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, checkoutTreeExcluding } from "./checkout.js";
 import { resolveIdentity, writeUnpublishedCommit } from "./commit.js";
-import { MAX_INTEGRATION_STRUCTURE_BYTES } from "./integration.js";
 import {
-  INTEGRATION_EXECUTION_HEADROOM_BYTES,
   integrationIndexMatchesTree,
   projectedTouchedShape,
   projectIntegrationWithCollisions,
@@ -28,7 +25,6 @@ import {
 import type { RebaseResult } from "./kinds.js";
 import { applyProjectedRebaseTransition } from "./merge-apply.js";
 import { selectMergeBases } from "./merge-base.js";
-import { MAX_MERGE_STATE_BYTES } from "./merge-state.js";
 import type {
   OperationStepMetadata,
   RebaseJournal,
@@ -42,7 +38,6 @@ import {
   hardResetBlockersAgainst,
 } from "./refs.js";
 import {
-  MAX_REPLAY_PLAN_METADATA_BYTES,
   planRetainedFixedReplayStep,
   preflightReplayCommitObjects,
   type ReplayPlan,
@@ -53,20 +48,8 @@ import { treeStream } from "./tree-stream.js";
 const REBASE_BASELINE_MAX_ENTRIES = 4_096;
 const REBASE_BASELINE_MAX_BYTES = 32 * 1024 * 1024;
 const REBASE_INTEGRATION_PLAN_BYTES = 20 * 1024 * 1024;
-const REBASE_INTEGRATION_OVERHEAD_BYTES = 2 * 1024 * 1024;
 const REBASE_EXCLUDE_ROOTS = 64;
 const REBASE_EXCLUDE_BYTES = 1024 * 1024;
-if (
-  MAX_MERGE_STATE_BYTES +
-    MAX_REPLAY_PLAN_METADATA_BYTES +
-    MAX_INTEGRATION_STRUCTURE_BYTES +
-    REBASE_INTEGRATION_PLAN_BYTES +
-    REBASE_INTEGRATION_OVERHEAD_BYTES +
-    INTEGRATION_EXECUTION_HEADROOM_BYTES >=
-  MAX_OPERATION_MEMORY_BYTES
-) {
-  throw new Error("rebase journal and execution reservations exceed operation memory");
-}
 
 export interface RebaseStartOptions {
   upstream: string;
@@ -134,8 +117,11 @@ function requireRebaseIndex(repo: Repository) {
   return stats;
 }
 
-function requireRebaseTree(entries: Iterable<IndexEntry>) {
-  const stats = requireBoundedIntegrationTree(entries);
+function requireRebaseTree(
+  repo: Repository,
+  entries: Parameters<typeof requireBoundedIntegrationTree>[1],
+) {
+  const stats = requireBoundedIntegrationTree(repo, entries);
   if (stats.leafEntries > REBASE_BASELINE_MAX_ENTRIES) {
     throw new GitError("E2BIG", `rebase result exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`);
   }
@@ -299,7 +285,7 @@ function preflightBaselineTransition(repo: Repository, treeOid: string): Baselin
       };
     }
   };
-  requireRebaseTree(entries());
+  requireRebaseTree(repo, entries());
   const unique = new Set(oids);
   const sizes = new Map<string, number>();
   for (const object of repo.store.objectInfo([...unique])) {
@@ -502,7 +488,9 @@ function applyOneStep(
             "rebase",
             currentTree,
           );
-          requireRebaseTree(prospectiveIntegrationIndexEntries(repo, projected));
+          requireRebaseTree(repo, (reservation) =>
+            prospectiveIntegrationIndexEntries(repo, projected, reservation),
+          );
           const conflicted = plan.integration.entries.some((entry) => entry.kind === "conflict");
           const transition = applyProjectedRebaseTransition<"advanced">(repo, worktree, projected, {
             expectedIntegrityOid: journal.integrityOid,

@@ -10,7 +10,6 @@ import {
   type MergeBaseSelection,
   selectMergeBases,
 } from "./merge-base.js";
-import { MAX_MERGE_STATE_BYTES } from "./merge-state.js";
 import {
   MAX_OPERATION_STEPS,
   type OperationStepMetadata,
@@ -58,14 +57,18 @@ function boundedLimit(value: number | undefined, ceiling: number, label: string)
   return value;
 }
 
+function retainedLimit(value: number | undefined): number {
+  if (value === undefined) return Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError("invalid rebase retained byte limit");
+  }
+  return value;
+}
+
 function resolveLimits(limits: RebasePlanLimits | undefined): ResolvedLimits {
   return {
     maxSteps: boundedLimit(limits?.maxSteps, MAX_OPERATION_STEPS, "step"),
-    maxRetainedBytes: boundedLimit(
-      limits?.maxRetainedBytes,
-      MAX_MERGE_STATE_BYTES,
-      "retained byte",
-    ),
+    maxRetainedBytes: retainedLimit(limits?.maxRetainedBytes),
     graph: {
       maxCommits: boundedLimit(limits?.maxGraphCommits, MAX_MERGE_BASE_COMMITS, "graph commit"),
       maxRetainedBytes: boundedLimit(

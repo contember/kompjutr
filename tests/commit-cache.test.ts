@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { utf8 } from "../src/core/bytes.js";
 import { GitError } from "../src/core/errors.js";
 import { type Commit, hashObject, parseCommit, serializeCommit } from "../src/core/objects.js";
+import { Repository, walkIndexedOwned } from "../src/core/repository.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import {
   commitCacheBytes,
   commitGraphBytes,
@@ -15,7 +17,7 @@ import {
   WALK_COMMIT_GRAPH_SQL,
 } from "../src/sqlite/commits.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { readShallowOwned, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
 class MeasuredDatabase implements SqlDatabase {
@@ -517,6 +519,94 @@ describe("parsed commit cache", () => {
     expect(() => [...store.commitGraph(oid, { maxBytes: bytes - 1 })]).toThrow(
       /32 MiB retained-state limit/,
     );
+  });
+
+  it("retains an owned graph at the exact shared-memory boundary and releases it", () => {
+    const measure = open();
+    const oid = commitChain(measure, 1)[0]!;
+    const commit = measure.cachedCommit(oid)!.commit;
+    const rowBytes =
+      utf8.encode(commit.tree).byteLength +
+      utf8.encode(JSON.stringify(commit.parent)).byteLength +
+      utf8.encode(commit.author.name).byteLength +
+      utf8.encode(commit.author.email).byteLength +
+      utf8.encode(commit.committer.name).byteLength +
+      utf8.encode(commit.committer.email).byteLength +
+      utf8.encode(commit.message).byteLength +
+      (commit.gpgsig === undefined ? 0 : utf8.encode(commit.gpgsig).byteLength);
+    const operationBytes = 256 + commitCacheBytes(commit) + rowBytes;
+
+    const exactBlocker = measure.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = measure.reserveMemory();
+    try {
+      expect([...walkIndexedOwned(new Repository(measure), oid, exactOwner)]).toHaveLength(1);
+      expect(exactOwner.currentBytes).toBe(0);
+      expect(measure.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    measure.shared.memory.assertIdle();
+
+    const excess = open();
+    const excessOid = commitChain(excess, 1)[0]!;
+    const excessBlocker = excess.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessOwner = excess.reserveMemory();
+    try {
+      expect(() => [
+        ...walkIndexedOwned(new Repository(excess), excessOid, excessOwner),
+      ]).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(excessOwner.currentBytes).toBe(0);
+    } finally {
+      excessOwner.dispose();
+      excessBlocker.dispose();
+    }
+    excess.shared.memory.assertIdle();
+  });
+
+  it("streams a full shallow boundary at the exact shared-memory limit", () => {
+    const boundaries = Array.from({ length: 2_048 }, (_, index) =>
+      index.toString(16).padStart(40, "0"),
+    );
+    const measured = open();
+    measured.setShallow(boundaries);
+    const probe = measured.reserveMemory();
+    expect(readShallowOwned(measured.shared, probe)).toEqual(new Set(boundaries));
+    const operationBytes = probe.highWaterBytes;
+    expect(probe.currentBytes).toBeLessThan(operationBytes);
+    probe.dispose();
+    measured.shared.memory.assertIdle();
+
+    const exact = open();
+    exact.setShallow(boundaries);
+    const exactBlocker = exact.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = exact.reserveMemory();
+    try {
+      expect(readShallowOwned(exact.shared, exactOwner)).toEqual(new Set(boundaries));
+      expect(exact.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    exact.shared.memory.assertIdle();
+
+    const excess = open();
+    excess.setShallow(boundaries);
+    const excessBlocker = excess.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessOwner = excess.reserveMemory();
+    try {
+      expect(() => readShallowOwned(excess.shared, excessOwner)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+    } finally {
+      excessOwner.dispose();
+      excessBlocker.dispose();
+    }
+    excess.shared.memory.assertIdle();
   });
 
   it("rejects understated oversized payload metadata without returning its BLOB", () => {
