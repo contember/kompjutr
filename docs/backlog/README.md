@@ -48,7 +48,9 @@ not effort: a wrong answer outranks a missing one.
   on a projected SQL statement count start succeeding.
   [62](62-sparse-status-rename-classification.md) is performance: a
   tracker-backed `status` still pays a whole-repository join for rename
-  detection.
+  detection. [63](63-bound-packed-dependency-graph-traversal.md) and
+  [64](64-harden-owned-reads-and-blob-id-sql-rows.md) retain non-regression
+  scaling and internal hardening found while closing WU6g.
 
 ## Consumer demand
 
@@ -144,3 +146,5 @@ units over the same files, and a long sprint does not make that safe.
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [60 — Make the SQL budget a measured target and split the store](60-budget-targets-and-store-split.md)
 - [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
+- [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
+- [64 — Harden owned reads and blob-id SQL rows](64-harden-owned-reads-and-blob-id-sql-rows.md)
