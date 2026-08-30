@@ -1,4 +1,5 @@
 import { CorruptError, GitError } from "../../core/errors.js";
+import { decodeRow, int, nullable, oneOf, text } from "../../core/rows.js";
 import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../db.js";
 import { type MaintenanceRootSource, validateMaintenanceRootCursor } from "./roots.js";
@@ -44,8 +45,6 @@ const ABSENT_RUN_FIELDS = [
   "root_source",
   "cursor_checkout_id",
   "cursor_text",
-  "cursor_text_type",
-  "cursor_text_bytes",
   "cursor_ordinal",
   "reachable_objects",
   "queued_objects",
@@ -56,59 +55,6 @@ const ABSENT_RUN_FIELDS = [
   "next_eligible_ms",
   "restarted",
 ];
-
-function safeInteger(
-  value: unknown,
-  label: string,
-  minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < minimum ||
-    value > maximum
-  ) {
-    throw new CorruptError(`${label} is not a bounded safe integer`);
-  }
-  return value;
-}
-
-function nullableInteger(value: unknown, label: string, minimum = 0): number | null {
-  return value === null ? null : safeInteger(value, label, minimum);
-}
-
-function phaseField(value: unknown): MaintenancePhase {
-  if (
-    value !== "roots" &&
-    value !== "mark" &&
-    value !== "classify-loose" &&
-    value !== "repack" &&
-    value !== "classify-packs" &&
-    value !== "sweep-loose" &&
-    value !== "sweep-packs" &&
-    value !== "finish"
-  ) {
-    throw new CorruptError("maintenance phase is invalid");
-  }
-  return value;
-}
-
-function rootSourceField(value: unknown): MaintenanceRootSource {
-  if (
-    value !== "refs" &&
-    value !== "heads" &&
-    value !== "reflogs" &&
-    value !== "index" &&
-    value !== "index-baseline" &&
-    value !== "shallow" &&
-    value !== "operations" &&
-    value !== "done"
-  ) {
-    throw new CorruptError("maintenance root source is invalid");
-  }
-  return value;
-}
 
 function cursorMemoryBytes(bytes: number): number {
   if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 256) / 3) {
@@ -134,37 +80,9 @@ function utf8ByteLength(value: string): number {
   return bytes;
 }
 
-function cursorMetadata(row: Record<string, unknown>): number | null {
-  if (row.cursor_text_type === null || row.cursor_text_type === "null") {
-    if (row.cursor_text_bytes !== null) {
-      throw new CorruptError("absent maintenance text cursor returned byte metadata");
-    }
-    return null;
-  }
-  if (row.cursor_text_type !== "text") {
-    throw new CorruptError("maintenance text cursor storage type is invalid");
-  }
-  return safeInteger(row.cursor_text_bytes, "maintenance text cursor bytes", 0);
-}
-
-function cursorTextField(
-  row: Record<string, unknown>,
-  admittedCursorBytes: number | null,
-): string | null {
-  if (admittedCursorBytes === null) {
-    if (row.cursor_text !== null || row.cursor_text_bytes !== null) {
-      throw new CorruptError("absent maintenance text cursor returned metadata");
-    }
-    return null;
-  }
-  if (
-    row.cursor_text_type !== "text" ||
-    typeof row.cursor_text !== "string" ||
-    utf8ByteLength(row.cursor_text) !== admittedCursorBytes
-  ) {
-    throw new CorruptError("maintenance text cursor is invalid");
-  }
-  return row.cursor_text;
+function requiredField<Value>(value: Value | null, message: string): Value {
+  if (value === null) throw new CorruptError(message);
+  return value;
 }
 
 function validateRepositoryId(repoId: number): void {
@@ -173,16 +91,118 @@ function validateRepositoryId(repoId: number): void {
   }
 }
 
-function requireRunView(
-  row: Record<string, unknown>,
-  repoId: number,
-  admittedCursorBytes: number | null,
-): MaintenanceRunView | null {
-  if (row.repository_id !== repoId) {
+function requireRunView(row: Record<string, unknown>, repoId: number): MaintenanceRunView | null {
+  const decoded = decodeRow(
+    row,
+    {
+      repository_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance repository id is invalid"),
+      control_repo_id: nullable(
+        int(1, Number.MAX_SAFE_INTEGER, "maintenance control repository id is invalid"),
+      ),
+      root_epoch: nullable(
+        int(0, Number.MAX_SAFE_INTEGER, "maintenance root epoch is not a bounded safe integer"),
+      ),
+      next_run_id: nullable(
+        int(1, Number.MAX_SAFE_INTEGER, "maintenance next run id is not a bounded safe integer"),
+      ),
+      run_repo_id: nullable(
+        int(1, Number.MAX_SAFE_INTEGER, "maintenance run repository id is invalid"),
+      ),
+      run_id: nullable(
+        int(1, Number.MAX_SAFE_INTEGER, "maintenance run id is not a bounded safe integer"),
+      ),
+      observed_root_epoch: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance observed root epoch is not a bounded safe integer",
+        ),
+      ),
+      phase: nullable(
+        oneOf(
+          [
+            "roots",
+            "mark",
+            "classify-loose",
+            "repack",
+            "classify-packs",
+            "sweep-loose",
+            "sweep-packs",
+            "finish",
+          ],
+          "maintenance phase is invalid",
+        ),
+      ),
+      started_ms: nullable(
+        int(0, Number.MAX_SAFE_INTEGER, "maintenance start time is not a bounded safe integer"),
+      ),
+      root_source: nullable(
+        oneOf(
+          ["refs", "heads", "reflogs", "index", "index-baseline", "shallow", "operations", "done"],
+          "maintenance root source is invalid",
+        ),
+      ),
+      cursor_checkout_id: nullable(
+        int(
+          1,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance checkout cursor is not a bounded safe integer",
+        ),
+      ),
+      cursor_text: nullable(text("maintenance text cursor is invalid")),
+      cursor_ordinal: nullable(
+        int(0, Number.MAX_SAFE_INTEGER, "maintenance ordinal cursor is not a bounded safe integer"),
+      ),
+      reachable_objects: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance reachable count is not a bounded safe integer",
+        ),
+      ),
+      queued_objects: nullable(
+        int(0, Number.MAX_SAFE_INTEGER, "maintenance queued count is not a bounded safe integer"),
+      ),
+      repacked_objects: nullable(
+        int(0, Number.MAX_SAFE_INTEGER, "maintenance repacked count is not a bounded safe integer"),
+      ),
+      reclaimed_objects: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance reclaimed object count is not a bounded safe integer",
+        ),
+      ),
+      reclaimed_packs: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance reclaimed pack count is not a bounded safe integer",
+        ),
+      ),
+      reclaimed_bytes: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance reclaimed byte count is not a bounded safe integer",
+        ),
+      ),
+      next_eligible_ms: nullable(
+        int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance next eligible time is not a bounded safe integer",
+        ),
+      ),
+      restarted: nullable(int(0, 1, "maintenance restart marker is invalid")),
+    },
+    "maintenance state row is malformed",
+  );
+  if (decoded.repository_id !== repoId) {
     throw new CorruptError("maintenance state crossed repositories");
   }
-  if (row.control_repo_id === null) {
-    if (row.root_epoch !== null || row.next_run_id !== null) {
+  if (decoded.control_repo_id === null) {
+    if (decoded.root_epoch !== null || decoded.next_run_id !== null) {
       throw new CorruptError("absent maintenance control returned state");
     }
     for (const field of ABSENT_RUN_FIELDS) {
@@ -190,12 +210,18 @@ function requireRunView(
     }
     return null;
   }
-  if (row.control_repo_id !== repoId) {
+  if (decoded.control_repo_id !== repoId) {
     throw new CorruptError("maintenance control crossed repositories");
   }
-  const rootEpoch = safeInteger(row.root_epoch, "maintenance root epoch", 0);
-  const nextRunId = safeInteger(row.next_run_id, "maintenance next run id", 1);
-  if (row.run_repo_id === null) {
+  const rootEpoch = requiredField(
+    decoded.root_epoch,
+    "maintenance root epoch is not a bounded safe integer",
+  );
+  const nextRunId = requiredField(
+    decoded.next_run_id,
+    "maintenance next run id is not a bounded safe integer",
+  );
+  if (decoded.run_repo_id === null) {
     for (const field of ABSENT_RUN_FIELDS) {
       if (row[field] !== null) throw new CorruptError("absent maintenance run returned state");
     }
@@ -204,50 +230,67 @@ function requireRunView(
     }
     return null;
   }
-  if (row.run_repo_id !== repoId) throw new CorruptError("maintenance run crossed repositories");
-  const runId = safeInteger(row.run_id, "maintenance run id", 1);
+  if (decoded.run_repo_id !== repoId) {
+    throw new CorruptError("maintenance run crossed repositories");
+  }
+  const runId = requiredField(decoded.run_id, "maintenance run id is not a bounded safe integer");
   if (nextRunId !== runId + 1) {
     throw new CorruptError("maintenance run allocator is inconsistent");
   }
-  const phase = phaseField(row.phase);
-  const rootSource = rootSourceField(row.root_source);
-  const cursorCheckoutId = nullableInteger(
-    row.cursor_checkout_id,
-    "maintenance checkout cursor",
-    1,
-  );
-  if (cursorMetadata(row) !== admittedCursorBytes) {
-    throw new CorruptError("maintenance text cursor changed after metadata preflight");
-  }
-  const cursorText = cursorTextField(row, admittedCursorBytes);
-  const cursorOrdinal = nullableInteger(row.cursor_ordinal, "maintenance ordinal cursor");
-  const nextEligibleMs = nullableInteger(row.next_eligible_ms, "maintenance next eligible time");
+  const phase = requiredField(decoded.phase, "maintenance phase is invalid");
+  const rootSource = requiredField(decoded.root_source, "maintenance root source is invalid");
+  const cursorCheckoutId = decoded.cursor_checkout_id;
+  const cursorText = decoded.cursor_text;
+  const cursorOrdinal = decoded.cursor_ordinal;
+  const nextEligibleMs = decoded.next_eligible_ms;
   if (phase !== "sweep-packs" && phase !== "finish" && nextEligibleMs !== null) {
     throw new CorruptError("maintenance phase retained an eligibility time");
   }
-  if (row.restarted !== 0 && row.restarted !== 1) {
-    throw new CorruptError("maintenance restart marker is invalid");
-  }
+  const restarted = requiredField(decoded.restarted, "maintenance restart marker is invalid");
   const view: MaintenanceRunView = {
     repoId,
     runId,
-    observedRootEpoch: safeInteger(row.observed_root_epoch, "maintenance observed root epoch", 0),
+    observedRootEpoch: requiredField(
+      decoded.observed_root_epoch,
+      "maintenance observed root epoch is not a bounded safe integer",
+    ),
     rootEpoch,
     nextRunId,
     phase,
-    startedMs: safeInteger(row.started_ms, "maintenance start time", 0),
+    startedMs: requiredField(
+      decoded.started_ms,
+      "maintenance start time is not a bounded safe integer",
+    ),
     rootSource,
     cursorCheckoutId,
     cursorText,
     cursorOrdinal,
-    reachableObjects: safeInteger(row.reachable_objects, "maintenance reachable count", 0),
-    queuedObjects: safeInteger(row.queued_objects, "maintenance queued count", 0),
-    repackedObjects: safeInteger(row.repacked_objects, "maintenance repacked count", 0),
-    reclaimedObjects: safeInteger(row.reclaimed_objects, "maintenance reclaimed object count", 0),
-    reclaimedPacks: safeInteger(row.reclaimed_packs, "maintenance reclaimed pack count", 0),
-    reclaimedBytes: safeInteger(row.reclaimed_bytes, "maintenance reclaimed byte count", 0),
+    reachableObjects: requiredField(
+      decoded.reachable_objects,
+      "maintenance reachable count is not a bounded safe integer",
+    ),
+    queuedObjects: requiredField(
+      decoded.queued_objects,
+      "maintenance queued count is not a bounded safe integer",
+    ),
+    repackedObjects: requiredField(
+      decoded.repacked_objects,
+      "maintenance repacked count is not a bounded safe integer",
+    ),
+    reclaimedObjects: requiredField(
+      decoded.reclaimed_objects,
+      "maintenance reclaimed object count is not a bounded safe integer",
+    ),
+    reclaimedPacks: requiredField(
+      decoded.reclaimed_packs,
+      "maintenance reclaimed pack count is not a bounded safe integer",
+    ),
+    reclaimedBytes: requiredField(
+      decoded.reclaimed_bytes,
+      "maintenance reclaimed byte count is not a bounded safe integer",
+    ),
     nextEligibleMs,
-    restarted: row.restarted === 1,
+    restarted: restarted === 1,
   };
   validateMaintenanceRootCursor(view);
   if (phase === "roots" && (view.reachableObjects !== 0 || view.queuedObjects !== 0)) {
@@ -266,35 +309,11 @@ export function readMaintenanceRunView(
   reservation: MemoryReservation,
 ): MaintenanceRunView | null {
   validateRepositoryId(repoId);
-  const metadata = db.one<Record<string, unknown>>(
-    `SELECT repository.id AS repository_id,
-            CASE WHEN run.repo_id IS NOT NULL THEN typeof(run.cursor_text) END
-              AS cursor_text_type,
-            CASE WHEN run.repo_id IS NOT NULL
-              THEN length(CAST(run.cursor_text AS BLOB)) END AS cursor_text_bytes
-       FROM git_repositories repository
-       LEFT JOIN git_maintenance_runs run ON run.repo_id = repository.id
-      WHERE repository.id = ?`,
-    repoId,
-  );
-  if (metadata === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
-  if (metadata.repository_id !== repoId) {
-    throw new CorruptError("maintenance state metadata crossed repositories");
-  }
-  const admittedCursorBytes = cursorMetadata(metadata);
-  reservation.set(
-    "other",
-    admittedCursorBytes === null ? 0 : cursorMemoryBytes(admittedCursorBytes),
-  );
   const row = db.one<Record<string, unknown>>(
     `SELECT repository.id AS repository_id,
             control.repo_id AS control_repo_id, control.root_epoch, control.next_run_id,
             run.repo_id AS run_repo_id, run.run_id, run.observed_root_epoch, run.phase,
             run.started_ms, run.root_source, run.cursor_checkout_id,
-            CASE WHEN run.repo_id IS NOT NULL THEN typeof(run.cursor_text) END
-              AS cursor_text_type,
-            CASE WHEN run.repo_id IS NOT NULL
-              THEN length(CAST(run.cursor_text AS BLOB)) END AS cursor_text_bytes,
             run.cursor_text,
             run.cursor_ordinal, run.reachable_objects, run.queued_objects,
             run.repacked_objects, run.reclaimed_objects, run.reclaimed_packs,
@@ -305,10 +324,12 @@ export function readMaintenanceRunView(
       WHERE repository.id = ?`,
     repoId,
   );
-  if (row === undefined) {
-    throw new CorruptError("maintenance state changed after metadata preflight");
-  }
-  return requireRunView(row, repoId, admittedCursorBytes);
+  if (row === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
+  const view = requireRunView(row, repoId);
+  const cursorBytes =
+    view?.cursorText === null || view === null ? null : utf8ByteLength(view.cursorText);
+  reservation.set("other", cursorBytes === null ? 0 : cursorMemoryBytes(cursorBytes));
+  return view;
 }
 
 function clearRunOwnedReachability(db: SqlDatabase, repoId: number, runId: number): void {
@@ -354,7 +375,7 @@ export function resetMaintenanceRunForRootChange(
     );
     if (owned !== 0) throw new CorruptError("maintenance restart retained an owned repack batch");
     clearRunOwnedReachability(db, repoId, expectedRunId);
-    const updated = db.one<Record<string, unknown>>(
+    const updatedRow = db.one<Record<string, unknown>>(
       `UPDATE git_maintenance_runs
           SET observed_root_epoch = ?, phase = 'roots', root_source = 'refs',
               cursor_checkout_id = NULL, cursor_text = NULL, cursor_ordinal = NULL,
@@ -368,8 +389,31 @@ export function resetMaintenanceRunForRootChange(
       expectedRunId,
       before.observedRootEpoch,
     );
+    if (updatedRow === undefined) {
+      throw new CorruptError("maintenance restart was not published atomically");
+    }
+    const updated = decodeRow(
+      updatedRow,
+      {
+        repo_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance restart repository is invalid"),
+        run_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance restart run id is invalid"),
+        observed_root_epoch: int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance restart root epoch is invalid",
+        ),
+        phase: oneOf(["roots"], "maintenance restart phase is invalid"),
+        root_source: oneOf(["refs"], "maintenance restart root source is invalid"),
+        reachable_objects: int(0, 0, "maintenance restart reachable count is invalid"),
+        queued_objects: int(0, 0, "maintenance restart queued count is invalid"),
+        next_eligible_ms: nullable(
+          int(0, Number.MAX_SAFE_INTEGER, "maintenance restart eligibility is invalid"),
+        ),
+        restarted: int(0, 1, "maintenance restart marker is invalid"),
+      },
+      "maintenance restart result is malformed",
+    );
     if (
-      updated === undefined ||
       updated.repo_id !== repoId ||
       updated.run_id !== expectedRunId ||
       updated.observed_root_epoch !== before.rootEpoch ||
@@ -423,36 +467,64 @@ export function rolloverFinishedMaintenanceRun(
       expectedRunId,
     );
     if (owned !== 0) throw new CorruptError("finished maintenance run retained a repack batch");
-    const allocated = db.one<Record<string, unknown>>(
+    const allocatedRow = db.one<Record<string, unknown>>(
       `UPDATE git_maintenance_control SET next_run_id = next_run_id + 1
         WHERE repo_id = ? AND next_run_id < ?
         RETURNING repo_id, root_epoch, next_run_id`,
       repoId,
       Number.MAX_SAFE_INTEGER,
     );
-    if (allocated === undefined) {
+    if (allocatedRow === undefined) {
       throw new GitError("E2BIG", "maintenance run id space is exhausted");
     }
+    const allocated = decodeRow(
+      allocatedRow,
+      {
+        repo_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance allocation repository is invalid"),
+        root_epoch: int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance rollover root epoch is not a bounded safe integer",
+        ),
+        next_run_id: int(
+          2,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance rollover next run id is not a bounded safe integer",
+        ),
+      },
+      "maintenance allocation result is malformed",
+    );
     if (allocated.repo_id !== repoId) {
       throw new CorruptError("maintenance rollover allocation crossed repositories");
     }
-    const rootEpoch = safeInteger(allocated.root_epoch, "maintenance rollover root epoch", 0);
+    const rootEpoch = allocated.root_epoch;
     if (rootEpoch !== before.rootEpoch) {
       throw new CorruptError("maintenance rollover allocation changed the root epoch");
     }
-    const nextRunId = safeInteger(allocated.next_run_id, "maintenance rollover next run id", 2);
+    const nextRunId = allocated.next_run_id;
     const runId = nextRunId - 1;
     if (runId !== before.nextRunId) {
       throw new CorruptError("maintenance rollover allocation skipped a run id");
     }
-    const removed = db.one<Record<string, unknown>>(
+    const removedRow = db.one<Record<string, unknown>>(
       `DELETE FROM git_maintenance_runs
         WHERE repo_id = ? AND run_id = ? AND phase = 'finish'
         RETURNING repo_id, run_id`,
       repoId,
       expectedRunId,
     );
-    if (removed?.repo_id !== repoId || removed.run_id !== expectedRunId) {
+    if (removedRow === undefined) {
+      throw new CorruptError("maintenance rollover did not delete its exact finished run");
+    }
+    const removed = decodeRow(
+      removedRow,
+      {
+        repo_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance removal repository is invalid"),
+        run_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance removal run id is invalid"),
+      },
+      "maintenance removal result is malformed",
+    );
+    if (removed.repo_id !== repoId || removed.run_id !== expectedRunId) {
       throw new CorruptError("maintenance rollover did not delete its exact finished run");
     }
     const retained = db.scalar<unknown>(
@@ -471,7 +543,7 @@ export function rolloverFinishedMaintenanceRun(
       expectedRunId,
     );
     if (retained !== 0) throw new CorruptError("maintenance rollover retained old run rows");
-    const inserted = db.one<Record<string, unknown>>(
+    const insertedRow = db.one<Record<string, unknown>>(
       `INSERT INTO git_maintenance_runs
          (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
        VALUES (?, ?, ?, 'roots', ?, 'refs')
@@ -483,8 +555,36 @@ export function rolloverFinishedMaintenanceRun(
       rootEpoch,
       nowMs,
     );
+    if (insertedRow === undefined) {
+      throw new CorruptError("maintenance rollover did not publish a zeroed run");
+    }
+    const inserted = decodeRow(
+      insertedRow,
+      {
+        repo_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance rollover repository is invalid"),
+        run_id: int(1, Number.MAX_SAFE_INTEGER, "maintenance rollover run id is invalid"),
+        observed_root_epoch: int(
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "maintenance rollover root epoch is invalid",
+        ),
+        phase: oneOf(["roots"], "maintenance rollover phase is invalid"),
+        started_ms: int(0, Number.MAX_SAFE_INTEGER, "maintenance rollover start time is invalid"),
+        root_source: oneOf(["refs"], "maintenance rollover root source is invalid"),
+        reachable_objects: int(0, 0, "maintenance rollover reachable count is invalid"),
+        queued_objects: int(0, 0, "maintenance rollover queued count is invalid"),
+        repacked_objects: int(0, 0, "maintenance rollover repacked count is invalid"),
+        reclaimed_objects: int(0, 0, "maintenance rollover reclaimed object count is invalid"),
+        reclaimed_packs: int(0, 0, "maintenance rollover reclaimed pack count is invalid"),
+        reclaimed_bytes: int(0, 0, "maintenance rollover reclaimed byte count is invalid"),
+        next_eligible_ms: nullable(
+          int(0, Number.MAX_SAFE_INTEGER, "maintenance rollover eligibility is invalid"),
+        ),
+        restarted: int(0, 1, "maintenance rollover restart marker is invalid"),
+      },
+      "maintenance rollover result is malformed",
+    );
     if (
-      inserted === undefined ||
       inserted.repo_id !== repoId ||
       inserted.run_id !== runId ||
       inserted.observed_root_epoch !== rootEpoch ||

@@ -22,16 +22,39 @@ import { isOid } from "../bytes.js";
 import type { GitContext } from "../context.js";
 import { GitError, hasErrorCode, PathspecNotFoundError } from "../errors.js";
 import { type IgnoreMatcher, loadIgnoreMatcher } from "../ignore/index.js";
-import { joinPath, relativeTo } from "../paths.js";
+import {
+  comparePaths,
+  isCanonicalAbsolutePath,
+  isCanonicalGitPath,
+  isNestedPath,
+  isPathRoot,
+  joinPath,
+  relativeTo,
+} from "../paths.js";
 import type { Repository } from "../repository.js";
 import { retainedStringBytes } from "../retained.js";
+import {
+  array,
+  blob,
+  bool,
+  int,
+  nullable,
+  number as numeric,
+  OptionsSchema,
+  object,
+  oneOf,
+  optional,
+  RowShape,
+  text,
+  unknownArray,
+} from "../rows.js";
 import type {
   SelectedPathRequest,
   SelectedPathResult,
   SelectedPathSpec,
   SelectedWorktreeFact,
 } from "../sparse-workspace.js";
-import { comparePaths, joinSorted, joinSorted3 } from "../streams.js";
+import { joinSorted, joinSorted3 } from "../streams.js";
 import { gitModeFor, type Worktree } from "../worktree.js";
 import {
   type CompiledPathspecMatcher,
@@ -111,6 +134,71 @@ interface StageCandidateBatch {
   memory: MemoryReservation;
   retainedBytes: number;
 }
+
+const MALFORMED_SELECTED_INDEX_ROW = "selected add index source returned a malformed row";
+const SELECTED_INDEX_ROW = new RowShape(
+  {
+    path: text(MALFORMED_SELECTED_INDEX_ROW).where(
+      isCanonicalGitPath,
+      MALFORMED_SELECTED_INDEX_ROW,
+    ),
+    stage: int(0, 3, MALFORMED_SELECTED_INDEX_ROW),
+    mode: int(Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_INDEX_ROW).where(
+      (mode) => [0o100644, 0o100755, 0o120000, 0o160000].includes(mode),
+      MALFORMED_SELECTED_INDEX_ROW,
+    ),
+    oid: text(MALFORMED_SELECTED_INDEX_ROW).where(isOid, MALFORMED_SELECTED_INDEX_ROW),
+    size: nullable(int(0, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_INDEX_ROW)),
+    mtime: nullable(
+      int(Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_INDEX_ROW),
+    ),
+    ino: nullable(int(1, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_INDEX_ROW)),
+    rev: optional(nullable(int(0, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_INDEX_ROW))),
+  },
+  MALFORMED_SELECTED_INDEX_ROW,
+);
+
+const MALFORMED_SELECTED_WORKTREE_ROW = "selected add worktree source returned a malformed row";
+const SELECTED_WORKTREE_ROW = new RowShape(
+  {
+    path: text(MALFORMED_SELECTED_WORKTREE_ROW).where(
+      isCanonicalGitPath,
+      MALFORMED_SELECTED_WORKTREE_ROW,
+    ),
+    stat: object(
+      {
+        type: oneOf(["file", "dir", "symlink"], MALFORMED_SELECTED_WORKTREE_ROW),
+        mode: int(0, 0o7777, MALFORMED_SELECTED_WORKTREE_ROW),
+        size: int(0, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_WORKTREE_ROW),
+        mtime: int(
+          Number.MIN_SAFE_INTEGER,
+          Number.MAX_SAFE_INTEGER,
+          MALFORMED_SELECTED_WORKTREE_ROW,
+        ),
+        ino: int(1, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_WORKTREE_ROW),
+        nlink: int(1, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_WORKTREE_ROW),
+        rev: int(0, Number.MAX_SAFE_INTEGER, MALFORMED_SELECTED_WORKTREE_ROW),
+        target: nullable(text(MALFORMED_SELECTED_WORKTREE_ROW)),
+        contentId: nullable(blob(MALFORMED_SELECTED_WORKTREE_ROW)),
+      },
+      MALFORMED_SELECTED_WORKTREE_ROW,
+    ),
+  },
+  MALFORMED_SELECTED_WORKTREE_ROW,
+);
+
+const MALFORMED_SELECTED_ANCESTOR_FACT = "selected add ancestor source returned malformed facts";
+const SELECTED_ANCESTOR_FACT_ROW = new RowShape(
+  {
+    path: text(MALFORMED_SELECTED_ANCESTOR_FACT).where(
+      isCanonicalGitPath,
+      MALFORMED_SELECTED_ANCESTOR_FACT,
+    ),
+    exact: bool(MALFORMED_SELECTED_ANCESTOR_FACT),
+    descendant: bool(MALFORMED_SELECTED_ANCESTOR_FACT),
+  },
+  MALFORMED_SELECTED_ANCESTOR_FACT,
+);
 
 export interface AddOptions {
   /** Repo-relative pathspecs. Empty is a no-op, like `git add` with no arguments. */
@@ -594,69 +682,56 @@ function validateSelectedAncestorResult(
   retainedLimit: number,
   validationMemory: MemoryReservation,
 ): ValidatedSelectedAncestorResult | null {
-  if (typeof result !== "object" || result === null || Array.isArray(result)) {
-    throw new GitError("ECORRUPT", "selected add ancestor source returned a malformed result");
-  }
-  const facts = Reflect.get(result, "facts");
-  const retainedBytes = Reflect.get(result, "retainedBytes");
-  const factsLength = Array.isArray(facts) ? Reflect.get(facts, "length") : undefined;
-  if (
-    !Array.isArray(facts) ||
-    typeof factsLength !== "number" ||
-    !Number.isSafeInteger(factsLength) ||
-    factsLength !== expected.length ||
-    typeof retainedBytes !== "number" ||
-    !Number.isSafeInteger(retainedBytes) ||
-    retainedBytes < 0 ||
-    retainedBytes > retainedLimit
-  ) {
+  const decoded = new RowShape(
+    {
+      facts: unknownArray("selected add ancestor source returned invalid retained state"),
+      retainedBytes: int(
+        0,
+        retainedLimit,
+        "selected add ancestor source returned invalid retained state",
+      ),
+    },
+    "selected add ancestor source returned a malformed result",
+  ).decode(result);
+  const factsLength = decoded.facts.length;
+  if (factsLength !== expected.length) {
     throw new GitError("ECORRUPT", "selected add ancestor source returned invalid retained state");
   }
   let minimumRetained = SELECTED_ANCESTOR_RESULT_FIXED_BYTES + SELECTED_ANCESTOR_ARRAY_FIXED_BYTES;
   minimumRetained = addSelectedRetained(
     minimumRetained,
     factsLength * SELECTED_ANCESTOR_SLOT_BYTES,
-    retainedBytes,
+    decoded.retainedBytes,
   );
   validationMemory.set("other", minimumRetained);
-  if (retainedBytes > retainedLimit - minimumRetained) return null;
+  if (decoded.retainedBytes > retainedLimit - minimumRetained) return null;
   const snapshot: ValidatedSelectedAncestorFact[] = [];
   let previous: string | undefined;
   for (let ordinal = 0; ordinal < factsLength; ordinal++) {
-    if (!Object.hasOwn(facts, ordinal)) {
+    if (!Object.hasOwn(decoded.facts, ordinal)) {
       throw new GitError("ECORRUPT", "selected add ancestor source returned sparse facts");
     }
-    const candidate: unknown = Reflect.get(facts, String(ordinal));
-    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
-      throw new GitError("ECORRUPT", "selected add ancestor source returned malformed facts");
-    }
-    const path = Reflect.get(candidate, "path");
-    const exact = Reflect.get(candidate, "exact");
-    const descendant = Reflect.get(candidate, "descendant");
+    const fact = SELECTED_ANCESTOR_FACT_ROW.decode(decoded.facts[ordinal]);
     const expectedPath = expected[ordinal];
     if (
-      typeof path !== "string" ||
       expectedPath === undefined ||
-      path !== expectedPath ||
-      !validSelectedPath(path) ||
-      typeof exact !== "boolean" ||
-      typeof descendant !== "boolean" ||
-      exact !== hasExactSelectedIndexPath(exactIndex, path) ||
-      (previous !== undefined && comparePaths(previous, path) >= 0)
+      fact.path !== expectedPath ||
+      fact.exact !== hasExactSelectedIndexPath(exactIndex, fact.path) ||
+      (previous !== undefined && comparePaths(previous, fact.path) >= 0)
     ) {
       throw new GitError("ECORRUPT", "selected add ancestor source returned malformed facts");
     }
     minimumRetained = addSelectedRetained(
       minimumRetained,
-      SELECTED_ANCESTOR_FACT_FIXED_BYTES + path.length * 2,
-      retainedBytes,
+      SELECTED_ANCESTOR_FACT_FIXED_BYTES + fact.path.length * 2,
+      decoded.retainedBytes,
     );
     validationMemory.set("other", minimumRetained);
-    if (retainedBytes > retainedLimit - minimumRetained) return null;
-    snapshot.push({ path, exact, descendant });
-    previous = path;
+    if (decoded.retainedBytes > retainedLimit - minimumRetained) return null;
+    snapshot.push(fact);
+    previous = fact.path;
   }
-  return { facts: snapshot, retainedBytes: retainedBytes + minimumRetained };
+  return { facts: snapshot, retainedBytes: decoded.retainedBytes + minimumRetained };
 }
 
 function validateSelectedAddResult(
@@ -667,35 +742,25 @@ function validateSelectedAddResult(
   maxRetainedBytes: number,
   validationMemory: MemoryReservation,
 ): AvailableSelectedPaths | null {
-  if (typeof selected !== "object" || selected === null || Array.isArray(selected)) {
-    throw new GitError("ECORRUPT", "selected add source returned a malformed result");
-  }
-  const available = Reflect.get(selected, "available");
-  if (available === false) return null;
-  if (available !== true) {
-    throw new GitError("ECORRUPT", "selected add source returned invalid availability");
-  }
-  const index = Reflect.get(selected, "index");
-  const worktree = Reflect.get(selected, "worktree");
-  const retainedBytes = Reflect.get(selected, "retainedBytes");
-  const indexLength = Array.isArray(index) ? Reflect.get(index, "length") : undefined;
-  const worktreeLength = Array.isArray(worktree) ? Reflect.get(worktree, "length") : undefined;
-  if (
-    !Array.isArray(index) ||
-    !Array.isArray(worktree) ||
-    typeof indexLength !== "number" ||
-    !Number.isSafeInteger(indexLength) ||
-    indexLength < 0 ||
-    typeof worktreeLength !== "number" ||
-    !Number.isSafeInteger(worktreeLength) ||
-    worktreeLength < 0 ||
-    typeof retainedBytes !== "number" ||
-    !Number.isSafeInteger(retainedBytes) ||
-    retainedBytes < 0 ||
-    retainedBytes > maxRetainedBytes
-  ) {
-    throw new GitError("ECORRUPT", "selected add source returned invalid retained state");
-  }
+  const availability = new RowShape(
+    { available: bool("selected add source returned invalid availability") },
+    "selected add source returned a malformed result",
+  ).decode(selected);
+  if (!availability.available) return null;
+  const decoded = new RowShape(
+    {
+      index: unknownArray("selected add source returned invalid retained state"),
+      worktree: unknownArray("selected add source returned invalid retained state"),
+      retainedBytes: int(
+        0,
+        maxRetainedBytes,
+        "selected add source returned invalid retained state",
+      ),
+    },
+    "selected add source returned a malformed result",
+  ).decode(selected);
+  const indexLength = decoded.index.length;
+  const worktreeLength = decoded.worktree.length;
   if (indexLength > maxIndexRows || worktreeLength > maxWorktreeRows) {
     throw new GitError("ECORRUPT", "selected add source returned excessive facts");
   }
@@ -703,21 +768,17 @@ function validateSelectedAddResult(
   minimumRetained = addSelectedRetained(
     minimumRetained,
     (indexLength + worktreeLength) * SELECTED_ARRAY_SLOT_BYTES,
-    retainedBytes,
+    decoded.retainedBytes,
   );
   validationMemory.set("other", minimumRetained);
-  if (retainedBytes > maxRetainedBytes - minimumRetained) return null;
+  if (decoded.retainedBytes > maxRetainedBytes - minimumRetained) return null;
   const snapshotIndex: IndexEntry[] = [];
   let previousIndex: IndexEntry | undefined;
   for (let ordinal = 0; ordinal < indexLength; ordinal++) {
-    if (!Object.hasOwn(index, ordinal)) {
+    if (!Object.hasOwn(decoded.index, ordinal)) {
       throw new GitError("ECORRUPT", "selected add index source returned sparse rows");
     }
-    const candidate: unknown = Reflect.get(index, String(ordinal));
-    const entry = snapshotSelectedIndexEntry(candidate);
-    if (entry === null) {
-      throw new GitError("ECORRUPT", "selected add index source returned a malformed row");
-    }
+    const entry = SELECTED_INDEX_ROW.decode(decoded.index[ordinal]);
     if (
       !matches(entry.path) ||
       (previousIndex !== undefined &&
@@ -729,24 +790,20 @@ function validateSelectedAddResult(
     minimumRetained = addSelectedRetained(
       minimumRetained,
       SELECTED_INDEX_FIXED_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.oid),
-      retainedBytes,
+      decoded.retainedBytes,
     );
     validationMemory.set("other", minimumRetained);
-    if (retainedBytes > maxRetainedBytes - minimumRetained) return null;
+    if (decoded.retainedBytes > maxRetainedBytes - minimumRetained) return null;
     snapshotIndex.push(entry);
     previousIndex = entry;
   }
   const snapshotWorktree: SelectedWorktreeFact[] = [];
   let previousWorktree: SelectedWorktreeFact | undefined;
   for (let ordinal = 0; ordinal < worktreeLength; ordinal++) {
-    if (!Object.hasOwn(worktree, ordinal)) {
+    if (!Object.hasOwn(decoded.worktree, ordinal)) {
       throw new GitError("ECORRUPT", "selected add worktree source returned sparse rows");
     }
-    const candidate: unknown = Reflect.get(worktree, String(ordinal));
-    const fields = validateSelectedWorktreeFields(candidate);
-    if (fields === null) {
-      throw new GitError("ECORRUPT", "selected add worktree source returned a malformed row");
-    }
+    const fields = decodeSelectedWorktreeFields(decoded.worktree[ordinal]);
     if (
       !matches(fields.path) ||
       (previousWorktree !== undefined && comparePaths(previousWorktree.path, fields.path) >= 0)
@@ -759,10 +816,10 @@ function validateSelectedAddResult(
         retainedStringBytes(fields.path) +
         retainedStringBytes(fields.target ?? "") +
         fields.contentBytes,
-      retainedBytes,
+      decoded.retainedBytes,
     );
     validationMemory.set("other", minimumRetained);
-    if (retainedBytes > maxRetainedBytes - minimumRetained) return null;
+    if (decoded.retainedBytes > maxRetainedBytes - minimumRetained) return null;
     const entry = snapshotSelectedWorktreeFact(fields);
     snapshotWorktree.push(entry);
     previousWorktree = entry;
@@ -771,7 +828,7 @@ function validateSelectedAddResult(
     available: true,
     index: snapshotIndex,
     worktree: snapshotWorktree,
-    retainedBytes: retainedBytes + minimumRetained,
+    retainedBytes: decoded.retainedBytes + minimumRetained,
   };
 }
 
@@ -780,26 +837,6 @@ function addSelectedRetained(current: number, added: number, reported: number): 
     throw new GitError("ECORRUPT", "selected add source underreported retained state");
   }
   return current + added;
-}
-
-function validSelectedPath(path: string): boolean {
-  if (path === "" || path.startsWith("/") || path.endsWith("/")) return false;
-  let segmentStart = 0;
-  for (let index = 0; index <= path.length; index++) {
-    if (index !== path.length && path.charCodeAt(index) !== 0x2f) continue;
-    const segmentLength = index - segmentStart;
-    if (
-      segmentLength === 0 ||
-      (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
-      (segmentLength === 2 &&
-        path.charCodeAt(segmentStart) === 0x2e &&
-        path.charCodeAt(segmentStart + 1) === 0x2e)
-    ) {
-      return false;
-    }
-    segmentStart = index + 1;
-  }
-  return selectedUtf8Bytes(path) !== null;
 }
 
 function selectedUtf8Bytes(value: string): number | null {
@@ -820,44 +857,6 @@ function selectedUtf8Bytes(value: string): number | null {
   return bytes;
 }
 
-function validNullableIndexNumber(value: unknown, minimum: number): boolean {
-  return (
-    value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= minimum)
-  );
-}
-
-function snapshotSelectedIndexEntry(value: unknown): IndexEntry | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const path = Reflect.get(value, "path");
-  const stage = Reflect.get(value, "stage");
-  const mode = Reflect.get(value, "mode");
-  const oid = Reflect.get(value, "oid");
-  const size = Reflect.get(value, "size");
-  const mtime = Reflect.get(value, "mtime");
-  const ino = Reflect.get(value, "ino");
-  const rev = Reflect.get(value, "rev");
-  if (
-    typeof path !== "string" ||
-    !validSelectedPath(path) ||
-    typeof stage !== "number" ||
-    !Number.isSafeInteger(stage) ||
-    stage < 0 ||
-    stage > 3 ||
-    typeof mode !== "number" ||
-    !Number.isSafeInteger(mode) ||
-    ![0o100644, 0o100755, 0o120000, 0o160000].includes(mode) ||
-    typeof oid !== "string" ||
-    !isOid(oid) ||
-    !validNullableIndexNumber(size, 0) ||
-    !validNullableIndexNumber(mtime, Number.MIN_SAFE_INTEGER) ||
-    !validNullableIndexNumber(ino, 1) ||
-    (rev !== undefined && !validNullableIndexNumber(rev, 0))
-  ) {
-    return null;
-  }
-  return { path, stage, mode, oid, size, mtime, ino, ...(rev === undefined ? {} : { rev }) };
-}
-
 interface ValidatedSelectedWorktreeFields {
   path: string;
   type: "file" | "dir" | "symlink";
@@ -872,62 +871,26 @@ interface ValidatedSelectedWorktreeFields {
   contentBytes: number;
 }
 
-function validateSelectedWorktreeFields(value: unknown): ValidatedSelectedWorktreeFields | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const path = Reflect.get(value, "path");
-  const stat = Reflect.get(value, "stat");
-  if (
-    typeof path !== "string" ||
-    !validSelectedPath(path) ||
-    typeof stat !== "object" ||
-    stat === null ||
-    Array.isArray(stat)
-  ) {
-    return null;
+function decodeSelectedWorktreeFields(value: unknown): ValidatedSelectedWorktreeFields {
+  const row = SELECTED_WORKTREE_ROW.decode(value);
+  const { path, stat } = row;
+  const { type, mode, size, mtime, ino, nlink, rev, target, contentId } = stat;
+  if (type === "dir" && (size !== 0 || target !== null || contentId !== null)) {
+    throw new GitError("ECORRUPT", MALFORMED_SELECTED_WORKTREE_ROW);
   }
-  const type = Reflect.get(stat, "type");
-  const mode = Reflect.get(stat, "mode");
-  const size = Reflect.get(stat, "size");
-  const mtime = Reflect.get(stat, "mtime");
-  const ino = Reflect.get(stat, "ino");
-  const nlink = Reflect.get(stat, "nlink");
-  const rev = Reflect.get(stat, "rev");
-  const target = Reflect.get(stat, "target");
-  const contentId = Reflect.get(stat, "contentId");
-  if (
-    (type !== "file" && type !== "dir" && type !== "symlink") ||
-    typeof mode !== "number" ||
-    !Number.isSafeInteger(mode) ||
-    mode < 0 ||
-    mode > 0o7777 ||
-    typeof size !== "number" ||
-    !Number.isSafeInteger(size) ||
-    size < 0 ||
-    typeof mtime !== "number" ||
-    !Number.isSafeInteger(mtime) ||
-    typeof ino !== "number" ||
-    !Number.isSafeInteger(ino) ||
-    ino <= 0 ||
-    typeof nlink !== "number" ||
-    !Number.isSafeInteger(nlink) ||
-    nlink <= 0 ||
-    typeof rev !== "number" ||
-    !Number.isSafeInteger(rev) ||
-    rev < 0 ||
-    (contentId !== null && !(contentId instanceof Uint8Array))
-  ) {
-    return null;
+  if (type === "file" && target !== null) {
+    throw new GitError("ECORRUPT", MALFORMED_SELECTED_WORKTREE_ROW);
   }
-  if (type === "dir" && (size !== 0 || target !== null || contentId !== null)) return null;
-  if (type === "file" && target !== null) return null;
   if (
     type === "symlink" &&
     (typeof target !== "string" || selectedUtf8Bytes(target) !== size || contentId !== null)
   ) {
-    return null;
+    throw new GitError("ECORRUPT", MALFORMED_SELECTED_WORKTREE_ROW);
   }
   const contentBytes = contentId === null ? 0 : selectedContentIdBytes(contentId);
-  if (contentBytes === null) return null;
+  if (contentBytes === null) {
+    throw new GitError("ECORRUPT", MALFORMED_SELECTED_WORKTREE_ROW);
+  }
   return {
     path,
     type,
@@ -1141,7 +1104,7 @@ function assertSelectedPathspecsMatch(
     if (hasExactSelectedPath(selected.worktree, spec)) continue;
     const at = lowerBoundSelectedPath(selected.index, spec);
     const path = selected.index[at]?.path;
-    if (path !== undefined && isSameOrDescendantPath(path, spec)) continue;
+    if (path !== undefined && isPathRoot(spec, path)) continue;
     throw new PathspecNotFoundError(spec);
   }
 }
@@ -1388,7 +1351,7 @@ function relativeExcludeRoots(
 }
 
 function isExcluded(path: string, roots: readonly string[]): boolean {
-  return roots.some((root) => isSameOrDescendantPath(path, root));
+  return roots.some((root) => isPathRoot(root, path));
 }
 
 export interface RmOptions {
@@ -2069,6 +2032,33 @@ interface LsFilesSelection {
   excludeStandard: boolean;
 }
 
+const LS_FILES_WORKTREE_OPTIONS = new OptionsSchema(
+  {
+    paths: optional(
+      array(text("ls-files paths must be strings"), "ls-files paths must be an array"),
+    ),
+    limits: optional(
+      object(
+        {
+          maxWildcardTokens: optional(numeric("ls-files limits must be numbers")),
+          maxMatcherWork: optional(numeric("ls-files limits must be numbers")),
+        },
+        "ls-files limits must be an object",
+      ),
+    ),
+    cached: optional(bool("ls-files cached must be a boolean")),
+    others: optional(bool("ls-files others must be a boolean")),
+    excludeStandard: optional(bool("ls-files excludeStandard must be a boolean")),
+    excludeRoots: optional(
+      array(
+        text("ls-files exclude roots must be strings"),
+        "ls-files excludeRoots must be an array",
+      ),
+    ),
+  },
+  "ls-files options must be an object",
+);
+
 /** Unique cached paths. Literal selectors stay on indexed prefix scans. */
 export function lsFiles(repo: Repository, options: LsFilesOptions = {}): string[] {
   const operation = repo.store.reserveMemory();
@@ -2092,9 +2082,22 @@ export function lsFilesWithWorktree(
 ): string[] {
   const operation = repo.store.reserveMemory();
   try {
-    const selection = lsFilesSelection(options);
+    const decodedOptions = LS_FILES_WORKTREE_OPTIONS.decode(options);
+    const others = decodedOptions.others === true;
+    const selection: LsFilesSelection = {
+      cached: decodedOptions.cached ?? !others,
+      others,
+      excludeStandard: decodedOptions.excludeStandard === true,
+    };
+    if (selection.excludeStandard && !selection.others) {
+      throw new GitError("EINVAL", "ls-files excludeStandard requires others");
+    }
+    const pathspecOptions: LsFilesOptions = {
+      paths: decodedOptions.paths,
+      limits: decodedOptions.limits,
+    };
     if (!selection.others) {
-      const pathspec = compileReadPathspec(lsFilesPathspecOptions(options), operation);
+      const pathspec = compileReadPathspec(pathspecOptions, operation);
       try {
         return selection.cached
           ? pathspec.collect(indexPaths(repo, pathspec.scanPrefixes, operation))
@@ -2103,12 +2106,8 @@ export function lsFilesWithWorktree(
         pathspec.release();
       }
     }
-    const excludeRoots = lsFilesExcludeRoots(
-      repo.root,
-      Reflect.get(options, "excludeRoots"),
-      operation,
-    );
-    const pathspec = compileReadPathspec(lsFilesPathspecOptions(options), operation);
+    const excludeRoots = lsFilesExcludeRoots(repo.root, decodedOptions.excludeRoots, operation);
+    const pathspec = compileReadPathspec(pathspecOptions, operation);
     try {
       const ignores = selection.excludeStandard
         ? loadIgnoreMatcher(worktree, repo.root, { excludeRoots })
@@ -2128,47 +2127,22 @@ export function lsFilesWithWorktree(
   }
 }
 
-function lsFilesPathspecOptions(options: LsFilesWorktreeOptions): LsFilesOptions {
-  return { paths: options.paths, limits: options.limits };
-}
-
-function lsFilesSelection(options: unknown): LsFilesSelection {
-  if (typeof options !== "object" || options === null || Array.isArray(options)) {
-    throw new GitError("EINVAL", "ls-files options must be an object");
-  }
-  const cached = optionalLsFilesBoolean(options, "cached");
-  const others = optionalLsFilesBoolean(options, "others") === true;
-  const excludeStandard = optionalLsFilesBoolean(options, "excludeStandard") === true;
-  if (excludeStandard && !others) {
-    throw new GitError("EINVAL", "ls-files excludeStandard requires others");
-  }
-  return { cached: cached ?? !others, others, excludeStandard };
-}
-
-function optionalLsFilesBoolean(
-  options: object,
-  key: "cached" | "others" | "excludeStandard",
-): boolean | undefined {
-  const value = Reflect.get(options, key);
-  if (value !== undefined && typeof value !== "boolean") {
-    throw new GitError("EINVAL", `ls-files ${key} must be a boolean`);
-  }
-  return value;
-}
-
-function lsFilesExcludeRoots(root: string, paths: unknown, operation: MemoryReservation): string[] {
+function lsFilesExcludeRoots(
+  root: string,
+  paths: readonly string[] | undefined,
+  operation: MemoryReservation,
+): string[] {
   if (paths === undefined) return [];
-  if (!Array.isArray(paths)) throw new GitError("EINVAL", "ls-files excludeRoots must be an array");
   const retainedMemory = operation.scope();
   let retainedBytes = 2 * LS_FILES_ARRAY_BYTES;
   retainedMemory.set("other", retainedBytes);
   const roots: string[] = [];
   for (let index = 0; index < paths.length; index++) {
-    const path = Reflect.get(paths, index);
-    if (typeof path !== "string") {
+    const path = paths[index];
+    if (path === undefined) {
       throw new GitError("EINVAL", "ls-files exclude roots must be strings");
     }
-    if (!isCanonicalAbsolutePath(path) || !isNestedAbsolutePath(root, path)) {
+    if (!isCanonicalAbsolutePath(path) || !isNestedPath(root, path)) {
       throw new GitError("EINVAL", "ls-files exclude roots must be canonical nested paths");
     }
     retainedBytes += LS_FILES_ARRAY_SLOT_BYTES;
@@ -2183,7 +2157,7 @@ function lsFilesExcludeRoots(root: string, paths: unknown, operation: MemoryRese
   const coalesced: string[] = [];
   for (const path of roots) {
     const parent = coalesced[coalesced.length - 1];
-    if (parent !== undefined && isSameOrDescendantPath(path, parent)) continue;
+    if (parent !== undefined && isPathRoot(parent, path)) continue;
     if (coalesced.length >= MAX_LS_FILES_EXCLUDE_ROOTS) {
       throw new GitError("E2BIG", `ls-files exclude roots exceeds ${MAX_LS_FILES_EXCLUDE_ROOTS}`);
     }
@@ -2192,52 +2166,6 @@ function lsFilesExcludeRoots(root: string, paths: unknown, operation: MemoryRese
     coalesced.push(path);
   }
   return coalesced;
-}
-
-function isCanonicalAbsolutePath(path: string): boolean {
-  if (path.length < 2 || path.charCodeAt(0) !== 0x2f || path.charCodeAt(path.length - 1) === 0x2f) {
-    return false;
-  }
-  let segmentStart = 1;
-  for (let index = 1; index <= path.length; index++) {
-    const unit = path.charCodeAt(index);
-    if (index === path.length || unit === 0x2f) {
-      const length = index - segmentStart;
-      if (
-        length === 0 ||
-        (length === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
-        (length === 2 &&
-          path.charCodeAt(segmentStart) === 0x2e &&
-          path.charCodeAt(segmentStart + 1) === 0x2e)
-      ) {
-        return false;
-      }
-      segmentStart = index + 1;
-      continue;
-    }
-    if (unit === 0) return false;
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = path.charCodeAt(++index);
-      if (low < 0xdc00 || low > 0xdfff) return false;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
-  }
-  return true;
-}
-
-function isNestedAbsolutePath(root: string, path: string): boolean {
-  if (root === "/") return path.length > 1;
-  return (
-    path.length > root.length && path.startsWith(root) && path.charCodeAt(root.length) === 0x2f
-  );
-}
-
-function isSameOrDescendantPath(path: string, parent: string): boolean {
-  return (
-    path === parent ||
-    (path.length > parent.length &&
-      path.startsWith(parent) &&
-      path.charCodeAt(parent.length) === 0x2f)
-  );
 }
 
 function* uniqueIndexPaths(
