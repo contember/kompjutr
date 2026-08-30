@@ -1,5 +1,6 @@
 // Bounded outbound closure and replayable full-object pack generation.
 
+import { MAX_OPERATION_MEMORY_BYTES } from "../../memory.js";
 import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
@@ -13,15 +14,15 @@ import {
 } from "../objects.js";
 import { streamFullObjectPack } from "../pack/full-object-stream.js";
 import { ZERO_OID } from "../protocol/receive-pack.js";
-import { checkRefText, hasCanonicalRefSyntax, MAX_REF_NAME_BYTES } from "../ref-name.js";
-import type { Repository } from "../repository.js";
+import { checkRefText, hasCanonicalRefSyntax } from "../ref-name.js";
+import { type Repository, walkIndexedOwned } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 import type { PushPlanningUpdate } from "./refspec.js";
 import type { TransportOperationBudget } from "./transport-budget.js";
 
 export const MAX_PUSH_COMMITS = 512;
 export const MAX_PUSH_OBJECTS = 100_000;
-export const MAX_PUSH_PLAN_BYTES = 16 * 1024 * 1024;
 export const MAX_PUSH_BRANCH_TARGETS = 1_024;
 
 const PUSH_PLAN_OBJECT_BYTES = 160;
@@ -33,7 +34,6 @@ const PUSH_PLAN_MEMORY_PART = "push-plan";
 const PUSH_AUTH_MEMORY_PART = "push-plan-auth";
 const PUSH_BRANCH_AUTH_MEMORY_PART = "push-branch-target-auth";
 const PUSH_BRANCH_AUTH_READ_MEMORY_PART = "push-branch-target-auth-read";
-const PUSH_GRAPH_MEMORY_PART = "push-plan-graph";
 const PUSH_PACK_PREFLIGHT_MEMORY_PART = "push-pack-preflight";
 const PUSH_PACK_FIRST_MEMORY_PART = "push-pack-first-read";
 const PUSH_PACK_REPLAY_MEMORY_PART = "push-pack-replay-read";
@@ -63,7 +63,6 @@ export interface PushPlan {
 export interface PushPlanOptions {
   readonly maxObjects?: number;
   readonly maxCommits?: number;
-  readonly maxRetainedBytes?: number;
   readonly remoteOids?: readonly string[];
 }
 
@@ -104,7 +103,6 @@ interface PushPlanBudgetState {
 interface NormalizedPushPlanOptions {
   readonly maxObjects: number;
   readonly maxCommits: number;
-  readonly maxRetainedBytes: number;
   readonly remoteOids: readonly string[];
 }
 
@@ -115,7 +113,6 @@ class PushRetainedTracker {
 
   constructor(
     private readonly budget: TransportOperationBudget | undefined,
-    private readonly limit: number,
     private readonly memoryPart = PUSH_PLAN_MEMORY_PART,
   ) {}
 
@@ -133,8 +130,11 @@ class PushRetainedTracker {
     }
     const prior = this.#parts.get(part) ?? 0;
     const next = this.#total - prior + bytes;
-    if (!Number.isSafeInteger(next) || next > this.limit) {
-      throw new GitError("E2BIG", "push plan exceeds the retained-state limit");
+    if (
+      !Number.isSafeInteger(next) ||
+      (this.budget === undefined && next > MAX_OPERATION_MEMORY_BYTES)
+    ) {
+      throw new GitError("E2BIG", "push plan exceeds the operation memory limit");
     }
     this.budget?.setMemory(this.memoryPart, next);
     if (bytes === 0) this.#parts.delete(part);
@@ -148,8 +148,12 @@ class PushRetainedTracker {
     const currentTo = this.#parts.get(to) ?? 0;
     if (fromBytes > currentFrom) throw new CorruptError("push retained transfer underflow");
     const next = this.#total - currentFrom - currentTo + (currentFrom - fromBytes) + toBytes;
-    if (!Number.isSafeInteger(next) || next < 0 || next > this.limit) {
-      throw new GitError("E2BIG", "push plan exceeds the retained-state limit");
+    if (
+      !Number.isSafeInteger(next) ||
+      next < 0 ||
+      (this.budget === undefined && next > MAX_OPERATION_MEMORY_BYTES)
+    ) {
+      throw new GitError("E2BIG", "push plan exceeds the operation memory limit");
     }
     this.budget?.setMemory(this.memoryPart, next);
     const nextFrom = currentFrom - fromBytes;
@@ -189,21 +193,17 @@ const stateByPlan = new WeakMap<PushPlan, PushPlanBudgetState>();
 function validatePushPlanBounds(
   objectCount: number,
   newCommitCount: number,
-  retainedBytes: number,
   limits: NormalizedPushPlanOptions = {
     maxObjects: MAX_PUSH_OBJECTS,
     maxCommits: MAX_PUSH_COMMITS,
-    maxRetainedBytes: MAX_PUSH_PLAN_BYTES,
     remoteOids: NO_REMOTE_OIDS,
   },
 ): void {
   if (
     !Number.isSafeInteger(objectCount) ||
     !Number.isSafeInteger(newCommitCount) ||
-    !Number.isSafeInteger(retainedBytes) ||
     objectCount < 0 ||
-    newCommitCount < 0 ||
-    retainedBytes < 0
+    newCommitCount < 0
   ) {
     throw new GitError("EINVAL", "push plan bounds must be safe nonnegative integers");
   }
@@ -212,9 +212,6 @@ function validatePushPlanBounds(
   }
   if (newCommitCount > limits.maxCommits) {
     throw new GitError("E2BIG", `push exceeds ${limits.maxCommits} new commits`);
-  }
-  if (retainedBytes > limits.maxRetainedBytes) {
-    throw new GitError("E2BIG", "push plan exceeds the retained-state limit");
   }
 }
 
@@ -226,11 +223,6 @@ function normalizedOptions(options: PushPlanOptions): NormalizedPushPlanOptions 
   };
   requireLimit(options.maxObjects ?? MAX_PUSH_OBJECTS, MAX_PUSH_OBJECTS, "object");
   requireLimit(options.maxCommits ?? MAX_PUSH_COMMITS, MAX_PUSH_COMMITS, "commit");
-  requireLimit(
-    options.maxRetainedBytes ?? MAX_PUSH_PLAN_BYTES,
-    MAX_PUSH_PLAN_BYTES,
-    "retained byte",
-  );
   const remoteOids = options.remoteOids ?? NO_REMOTE_OIDS;
   if (!Array.isArray(remoteOids) || remoteOids.length > MAX_PUSH_OBJECTS) {
     throw new GitError("E2BIG", `push remote object list exceeds ${MAX_PUSH_OBJECTS} entries`);
@@ -242,7 +234,6 @@ function normalizedOptions(options: PushPlanOptions): NormalizedPushPlanOptions 
   return {
     maxObjects: options.maxObjects ?? MAX_PUSH_OBJECTS,
     maxCommits: options.maxCommits ?? MAX_PUSH_COMMITS,
-    maxRetainedBytes: options.maxRetainedBytes ?? MAX_PUSH_PLAN_BYTES,
     remoteOids,
   };
 }
@@ -260,7 +251,7 @@ function addObject(
   }
   if (prior !== undefined) return;
   const count = objects.size + 1;
-  validatePushPlanBounds(count, 0, tracker.total, limits);
+  validatePushPlanBounds(count, 0, limits);
   tracker.set("object-map", CONTAINER_BASE_BYTES + count * PUSH_PLAN_OBJECT_BYTES);
   objects.set(oid, type);
 }
@@ -461,11 +452,7 @@ export function authenticatePushBranchTargets(
     throw new GitError("EINVAL", "push branch target authentication is already active");
   }
 
-  const tracker = new PushRetainedTracker(
-    operationBudget,
-    MAX_PUSH_PLAN_BYTES,
-    PUSH_BRANCH_AUTH_MEMORY_PART,
-  );
+  const tracker = new PushRetainedTracker(operationBudget, PUSH_BRANCH_AUTH_MEMORY_PART);
   try {
     tracker.set(
       "target-input",
@@ -611,6 +598,8 @@ function validatePlanningUpdates(
   if (updates.length > MAX_PUSH_UPDATES) {
     throw new GitError("E2BIG", `push update list exceeds ${MAX_PUSH_UPDATES} commands`);
   }
+  let updateBytes = CONTAINER_BASE_BYTES + updates.length * ARRAY_SLOT_BYTES;
+  tracker.set("update-input", updateBytes);
   tracker.set("validation-destinations", CONTAINER_BASE_BYTES);
   try {
     const destinations = new Set<string>();
@@ -621,7 +610,7 @@ function validatePlanningUpdates(
       }
       if (
         typeof update.destination !== "string" ||
-        checkRefText(update.destination, MAX_REF_NAME_BYTES).problem !== null ||
+        checkRefText(update.destination).problem !== null ||
         !update.destination.startsWith("refs/") ||
         !hasCanonicalRefSyntax(update.destination)
       ) {
@@ -645,6 +634,11 @@ function validatePlanningUpdates(
         if (update.source !== null || update.oid !== null || update.force) {
           throw new GitError("EINVAL", `push deletion ${index + 1} is malformed`);
         }
+        updateBytes +=
+          ROOT_ENTRY_BYTES +
+          retainedStringBytes(update.destination) +
+          retainedStringBytes(update.oldOid);
+        tracker.set("update-input", updateBytes);
         continue;
       }
       if (typeof update.source !== "string" || !isOid(update.oid)) {
@@ -655,12 +649,19 @@ function validatePlanningUpdates(
           throw new GitError("EINVAL", `push update ${index + 1} object-id source changed`);
         }
       } else if (
-        checkRefText(update.source, MAX_REF_NAME_BYTES).problem !== null ||
+        checkRefText(update.source).problem !== null ||
         !update.source.startsWith("refs/") ||
         !hasCanonicalRefSyntax(update.source)
       ) {
         throw new GitError("EINVALIDREF", `invalid push source ${update.source}`);
       }
+      updateBytes +=
+        ROOT_ENTRY_BYTES +
+        retainedStringBytes(update.source) +
+        retainedStringBytes(update.destination) +
+        retainedStringBytes(update.oid) +
+        retainedStringBytes(update.oldOid);
+      tracker.set("update-input", updateBytes);
     }
   } finally {
     tracker.clear("validation-destinations");
@@ -678,24 +679,36 @@ function sameCommit(left: PlannedCommit, tree: string, parents: readonly string[
 function collectCommitGraphs(
   repo: Repository,
   roots: Iterable<string>,
+  operationBudget: TransportOperationBudget | undefined,
   tracker: PushRetainedTracker,
 ): Map<string, PlannedCommit> {
   tracker.set("commit-map", CONTAINER_BASE_BYTES);
   const commits = new Map<string, PlannedCommit>();
   let retainedBytes = CONTAINER_BASE_BYTES;
   for (const root of roots) {
-    for (const { oid, commit } of repo.walkIndexed(root, { maxBytes: MAX_PUSH_PLAN_BYTES })) {
-      const prior = commits.get(oid);
-      if (prior !== undefined) {
-        if (!sameCommit(prior, commit.tree, commit.parent)) {
-          throw new CorruptError(`commit ${oid} changed between push graph walks`);
-        }
-        continue;
+    const graphMemory = operationBudget?.scopeMemory() ?? repo.store.reserveMemory();
+    try {
+      const graphBytes = operationBudget?.remainingMemoryBytes ?? graphMemory.remainingBytes;
+      if (graphBytes < 1) {
+        throw new GitError("E2BIG", "push commit graph has no operation memory capacity");
       }
-      retainedBytes += COMMIT_ENTRY_BYTES + commit.parent.length * COMMIT_PARENT_BYTES;
-      tracker.set("commit-map", retainedBytes);
-      const planned = { oid, tree: commit.tree, parents: commit.parent };
-      commits.set(oid, planned);
+      for (const { oid, commit } of walkIndexedOwned(repo, root, graphMemory, {
+        maxBytes: graphBytes,
+      })) {
+        const prior = commits.get(oid);
+        if (prior !== undefined) {
+          if (!sameCommit(prior, commit.tree, commit.parent)) {
+            throw new CorruptError(`commit ${oid} changed between push graph walks`);
+          }
+          continue;
+        }
+        retainedBytes += COMMIT_ENTRY_BYTES + commit.parent.length * COMMIT_PARENT_BYTES;
+        tracker.set("commit-map", retainedBytes);
+        const planned = { oid, tree: commit.tree, parents: commit.parent };
+        commits.set(oid, planned);
+      }
+    } finally {
+      graphMemory.dispose();
     }
   }
   return commits;
@@ -855,7 +868,7 @@ function planUpdateSet(
   requestedOptions: PushPlanOptions = {},
 ): PushPlan | null {
   const options = normalizedOptions(requestedOptions);
-  const tracker = new PushRetainedTracker(operationBudget, options.maxRetainedBytes);
+  const tracker = new PushRetainedTracker(operationBudget);
   try {
     validatePlanningUpdates(updates, tracker);
     tracker.set("ordered", CONTAINER_BASE_BYTES + updates.length * ARRAY_SLOT_BYTES);
@@ -872,7 +885,7 @@ function planUpdateSet(
       tracker.clearAll();
       return null;
     }
-    tracker.set("verified-refs", CONTAINER_BASE_BYTES + nonDeletes.length * (MAP_ENTRY_BYTES + 80));
+    tracker.set("verified-refs", CONTAINER_BASE_BYTES + nonDeletes.length * MAP_ENTRY_BYTES);
     const verifiedRefs = new Map<string, string>();
     for (const update of nonDeletes) {
       const source = update.source;
@@ -916,10 +929,8 @@ function planUpdateSet(
       commitRootOids.add(root.finalOid);
     }
 
-    // Repository graph-walk state is additive to the separate 16 MiB retained-plan limit.
-    operationBudget?.setMemory(PUSH_GRAPH_MEMORY_PART, MAX_PUSH_PLAN_BYTES);
     const shallow = repo.shallow();
-    const commits = collectCommitGraphs(repo, commitRootOids, tracker);
+    const commits = collectCommitGraphs(repo, commitRootOids, operationBudget, tracker);
     commitRootOids.clear();
     tracker.clear("commit-roots");
     const boundaries = requireNamespaceRules(
@@ -940,7 +951,7 @@ function planUpdateSet(
     const wanted: PlannedCommit[] = [];
     for (const commit of commits.values()) {
       if (excluded.has(commit.oid)) continue;
-      validatePushPlanBounds(0, wanted.length + 1, tracker.total, options);
+      validatePushPlanBounds(0, wanted.length + 1, options);
       tracker.set("wanted", CONTAINER_BASE_BYTES + (wanted.length + 1) * ARRAY_SLOT_BYTES);
       wanted.push(commit);
     }
@@ -951,7 +962,6 @@ function planUpdateSet(
       }
     }
     shallow.clear();
-    operationBudget?.clearMemory(PUSH_GRAPH_MEMORY_PART);
     boundaries.clear();
     excluded.clear();
     tracker.clear("boundaries");
@@ -1005,11 +1015,12 @@ function planUpdateSet(
     tracker.clear("roots");
 
     const hydrated = hydrateObjects(repo, objects, tracker);
-    validatePushPlanBounds(hydrated.length, newCommitCount, tracker.total, options);
+    validatePushPlanBounds(hydrated.length, newCommitCount, options);
     ordered.length = 0;
     nonDeletes.length = 0;
     tracker.clear("ordered");
     tracker.clear("non-deletes");
+    tracker.clear("update-input");
     tracker.set("plan-state", PUSH_PLAN_FIXED_BYTES);
     tracker.keepOnly("hydrated-plan", "plan-state");
     const packMemoryBytes = packGenerationMemoryBytes(hydrated);
@@ -1029,7 +1040,6 @@ function planUpdateSet(
     return plan;
   } catch (error) {
     operationBudget?.clearMemory(PUSH_AUTH_MEMORY_PART);
-    operationBudget?.clearMemory(PUSH_GRAPH_MEMORY_PART);
     operationBudget?.clearMemory(PUSH_PACK_PREFLIGHT_MEMORY_PART);
     tracker.clearAll();
     return localPushError(error);

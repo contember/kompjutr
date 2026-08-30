@@ -275,6 +275,29 @@ function createRemoteAnnotatedTags(fixture: GitFixture, count: number, oid: stri
   if (result.status !== 0) throw new Error(result.stderr || "git fast-import failed");
 }
 
+function createAnnotatedTagChain(
+  fixture: GitFixture,
+  name: string,
+  target: string,
+  hops: number,
+  messageBytes: number,
+): string {
+  const message = "x".repeat(messageBytes);
+  let current = target;
+  let type = "commit";
+  for (let index = 0; index < hops; index++) {
+    const data = packetEncoder.encode(
+      `object ${current}\ntype ${type}\ntag ${name}-${index}\n` +
+        "tagger Fixture <fixture@example.com> 1 +0000\n\n" +
+        message,
+    );
+    current = fixture.writeObject("tag", data);
+    type = "tag";
+  }
+  fixture.git("update-ref", `refs/tags/${name}`, current);
+  return current;
+}
+
 function tableRows<Row extends object>(workspace: TestWorkspace, query: string): Row[] {
   return workspace.storage.sql.exec<Row>(query).toArray();
 }
@@ -1588,6 +1611,54 @@ describe("fetch", () => {
       fixture.dispose();
     }
   }, 180_000);
+
+  it("authenticates more than 64 MiB across tag hops without retaining prior hops", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "tag chains\n");
+    const commit = fixture.commit("tag chains");
+    const hops = 15;
+    const messageBytes = 2_300_000;
+    const first = createAnnotatedTagChain(fixture, "large-a", commit, hops, messageBytes);
+    const second = createAnnotatedTagChain(fixture, "large-b", commit, hops, messageBytes);
+    fixture.git("config", "pack.window", "0");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    workspace.repo.store.configSet("remote.origin.url", server.url);
+    try {
+      await fetchInto(workspace.context, workspace.repo, { tags: true });
+
+      expect(messageBytes * hops * 2).toBeGreaterThan(64 * 1024 * 1024);
+      expect(workspace.repo.store.getRef("refs/tags/large-a")).toBe(first);
+      expect(workspace.repo.store.getRef("refs/tags/large-b")).toBe(second);
+      expect(workspace.repo.peel(first)).toBe(commit);
+      expect(workspace.repo.peel(second)).toBe(commit);
+      expect(workspace.repo.store.memory.highWaterBytes).toBeLessThan(64 * 1024 * 1024);
+      workspace.repo.store.memory.assertIdle();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  }, 30_000);
+
+  it("keeps the tag peel depth bound after removing cumulative byte admission", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("README.md", "deep tag\n");
+    const commit = fixture.commit("deep tag");
+    createAnnotatedTagChain(fixture, "too-deep", commit, 16, 0);
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    workspace.repo.store.configSet("remote.origin.url", server.url);
+    try {
+      await expect(
+        fetchInto(workspace.context, workspace.repo, { tags: true }),
+      ).rejects.toMatchObject({ code: "ECORRUPT" });
+      expect(workspace.repo.store.getRef("refs/tags/too-deep")).toBeNull();
+      workspace.repo.store.memory.assertIdle();
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
 
   it("rejects an over-limit advertisement before publishing any ref", async () => {
     const fixture = new GitFixture().init();

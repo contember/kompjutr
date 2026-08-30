@@ -11,17 +11,16 @@ import {
   disposePushPlan,
   MAX_PUSH_BRANCH_TARGETS,
   MAX_PUSH_COMMITS,
-  MAX_PUSH_PLAN_BYTES,
   openPushPack,
   type PushPlan,
   planPushUpdates,
   pushPlanHasObject,
   pushPlanObjectCount,
   pushPlanObjectOidAt,
-  pushPlanRetainedPeakBytes,
 } from "../src/core/ops/push-plan.js";
 import type { PushPlanningUpdate } from "../src/core/ops/refspec.js";
 import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
+import { FLUSH, pkt } from "../src/core/protocol/pktline.js";
 import { receivePack, ZERO_OID } from "../src/core/protocol/receive-pack.js";
 import { discover } from "../src/core/protocol/remote.js";
 import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
@@ -55,6 +54,10 @@ async function collect(body: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   for await (const chunk of body) chunks.push(chunk);
   return concat(chunks);
+}
+
+async function* once(body: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield body;
 }
 
 async function collectBody(
@@ -562,7 +565,7 @@ describe("multi-ref push planning", () => {
     shallowOperation.reservation.dispose();
   });
 
-  it("enforces exact union commit, object and retained-byte limits", () => {
+  it("enforces exact union commit and object limits", () => {
     const objectWorkspace = makeRepo();
     const firstBlob = objectWorkspace.repo.store.write("blob", new TextEncoder().encode("a\n"));
     const secondBlob = objectWorkspace.repo.store.write("blob", new TextEncoder().encode("b\n"));
@@ -583,7 +586,6 @@ describe("multi-ref push planning", () => {
       ),
     );
     expect(pushPlanObjectCount(exactObjects)).toBe(3);
-    const retainedPeak = pushPlanRetainedPeakBytes(exactObjects);
     disposePushPlan(exactObjects);
     exactObjectsOperation.reservation.dispose();
 
@@ -598,31 +600,6 @@ describe("multi-ref push planning", () => {
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     expect(excessObjectsOperation.budget.memory("push-plan")).toBe(0);
     excessObjectsOperation.reservation.dispose();
-
-    const exactBytesOperation = operation(objectWorkspace.repo);
-    const exactBytes = requirePlan(
-      planPushUpdates(
-        objectWorkspace.repo,
-        [update(objectTree, "refs/checkpoints/exact-bytes", objectTree)],
-        exactBytesOperation.budget,
-        { maxRetainedBytes: retainedPeak },
-      ),
-    );
-    expect(pushPlanRetainedPeakBytes(exactBytes)).toBe(retainedPeak);
-    disposePushPlan(exactBytes);
-    exactBytesOperation.reservation.dispose();
-
-    const excessBytesOperation = operation(objectWorkspace.repo);
-    expect(() =>
-      planPushUpdates(
-        objectWorkspace.repo,
-        [update(objectTree, "refs/checkpoints/excess-bytes", objectTree)],
-        excessBytesOperation.budget,
-        { maxRetainedBytes: retainedPeak - 1 },
-      ),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
-    expect(excessBytesOperation.budget.memory("push-plan")).toBe(0);
-    excessBytesOperation.reservation.dispose();
 
     const exactWorkspace = makeRepo();
     const tree = exactWorkspace.repo.store.write("tree", serializeTree([]));
@@ -670,6 +647,84 @@ describe("multi-ref push planning", () => {
       ),
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     excessOperation.reservation.dispose();
+  });
+
+  it("admits graph work above the former 16 MiB plan threshold", () => {
+    const workspace = makeRepo();
+    const tree = workspace.repo.store.write("tree", serializeTree([]));
+    const message = "x".repeat(900_000);
+    let tip = "";
+    for (let index = 0; index < 10; index++) {
+      tip = workspace.repo.store.write(
+        "commit",
+        serializeCommit({
+          tree,
+          parent: tip === "" ? [] : [tip],
+          author: person,
+          committer: person,
+          message,
+        }),
+      );
+    }
+    const currentTip = tip;
+    const current = operation(workspace.repo);
+    const plan = requirePlan(
+      planPushUpdates(
+        workspace.repo,
+        [update(currentTip, "refs/heads/large-graph", currentTip)],
+        current.budget,
+      ),
+    );
+
+    expect(workspace.repo.store.memory.highWaterBytes).toBeGreaterThan(16 * 1024 * 1024);
+    disposePushPlan(plan);
+    expect(current.budget.retainedBytes).toBe(0);
+    current.reservation.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("lets a long canonical source and destination reach receive-pack framing", async () => {
+    const workspace = makeRepo();
+    const blob = workspace.repo.store.write("blob", new TextEncoder().encode("long ref\n"));
+    const components = Array.from(
+      { length: 8 },
+      (_, index) => `${String(index).padStart(2, "0")}-${"r".repeat(140)}`,
+    ).join("/");
+    const source = `refs/checkpoints/source/${components}`;
+    const destination = `refs/checkpoints/destination/${components}`;
+    const current = operation(workspace.repo);
+    const plan = requirePlan(
+      planPushUpdates(workspace.repo, [update(source, destination, blob)], current.budget),
+    );
+    let requestBody: Uint8Array | undefined;
+    const http: GitHttpClient = async (request) => {
+      requestBody = await collectBody(request.body);
+      return {
+        status: 200,
+        statusText: "OK",
+        headers: { "content-type": "application/x-git-receive-pack-result" },
+        body: once(concat([pkt("unpack ok\n"), pkt(`ok ${destination}\n`), FLUSH])),
+      };
+    };
+
+    const result = await receivePack(
+      {
+        url: "http://host/repo",
+        commands: [{ oldOid: ZERO_OID, newOid: blob, ref: destination }],
+        advertised: new Set(["report-status"]),
+      },
+      { http, operationBudget: current.budget },
+    );
+
+    expect(destination.length).toBeGreaterThan(1_024);
+    expect(result.refs.get(destination)).toEqual({ ok: true });
+    if (requestBody === undefined) throw new Error("receive-pack did not send a request body");
+    expect(new TextDecoder().decode(requestBody)).toContain(destination);
+    disposePushPlan(plan);
+    current.budget.clearAllMemory();
+    expect(current.budget.retainedBytes).toBe(0);
+    current.reservation.dispose();
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("does not reach receive-pack when local preflight fails", async () => {
@@ -747,7 +802,7 @@ describe("caller-owned push budget", () => {
     expect(packBytes).toBeGreaterThan(0);
     await calibrationStream.return(undefined);
     const operationPeak = calibrationOperation.reservation.highWaterBytes;
-    expect(operationPeak).toBeGreaterThan(MAX_PUSH_PLAN_BYTES);
+    expect(operationPeak).toBeGreaterThan(packBytes);
     disposePushPlan(calibrationPlan);
     calibrationOperation.reservation.dispose();
 
@@ -791,6 +846,7 @@ describe("caller-owned push budget", () => {
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     expect(excessOperation.budget.memory("push-plan")).toBe(0);
     excessOperation.reservation.dispose();
+    excess.repo.store.memory.assertIdle();
 
     const concurrent = makeRepo();
     const concurrentBlob = concurrent.repo.store.write(

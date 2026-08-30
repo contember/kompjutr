@@ -1,7 +1,5 @@
-import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../../memory.js";
+import type { MemoryReservation } from "../../memory.js";
 import { GitError } from "../errors.js";
-
-export const MAX_TRANSPORT_MEMORY_BYTES = MAX_OPERATION_MEMORY_BYTES;
 
 function invalidCount(label: string): GitError {
   return new GitError("EINVAL", `${label} must be a safe nonnegative integer`);
@@ -18,6 +16,16 @@ export class TransportOperationBudget {
     return this.#retainedBytes;
   }
 
+  /** Exact capacity left across every owner sharing the operation coordinator. */
+  get remainingMemoryBytes(): number {
+    return this.reservation.remainingBytes;
+  }
+
+  /** Create an independently disposable scope under the transport operation. */
+  scopeMemory(): MemoryReservation {
+    return this.reservation.scope();
+  }
+
   memory(part: string): number {
     return this.#memory.get(part) ?? 0;
   }
@@ -30,11 +38,8 @@ export class TransportOperationBudget {
     const previous = this.memory(part);
     if (previous === bytes) return;
     const withoutPrevious = this.#retainedBytes - previous;
-    if (bytes > MAX_TRANSPORT_MEMORY_BYTES - withoutPrevious) {
-      throw new GitError(
-        "E2BIG",
-        `transport operation exceeds the ${MAX_TRANSPORT_MEMORY_BYTES}-byte memory limit`,
-      );
+    if (bytes > Number.MAX_SAFE_INTEGER - withoutPrevious) {
+      throw invalidCount("transport memory bytes");
     }
     const next = withoutPrevious + bytes;
     this.reservation.set("protocol", next);

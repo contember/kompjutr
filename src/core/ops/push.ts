@@ -7,7 +7,6 @@ import type { GitContext } from "../context.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import { progressSink } from "../protocol/progress.js";
 import {
-  MAX_RECEIVE_PACK_RESULT_BYTES,
   type ReceivePackCommand,
   type ReceivePackStatus,
   receivePack,
@@ -84,7 +83,6 @@ const PUSH_JOIN_MEMORY_PART = "push-advertisement-join";
 const PUSH_UPDATES_MEMORY_PART = "push-updates";
 const PUSH_ACTIVE_UPDATES_MEMORY_PART = "push-active-updates";
 const PUSH_COMMANDS_MEMORY_PART = "push-commands";
-const PUSH_RESULT_PREFLIGHT_MEMORY_PART = "push-result-preflight";
 const PUSH_RESULT_MEMORY_PART = "push-result";
 const PUSH_TRACKING_MEMORY_PART = "push-tracking";
 const PROTOCOL_DISCOVERY_MEMORY_PART = "protocol-discovery";
@@ -104,7 +102,6 @@ const RESULT_FIXED_BYTES = 256;
 const RESULT_REF_BYTES = 128;
 const TRACKING_FIXED_BYTES = 256;
 const TRACKING_ENTRY_BYTES = 192;
-const PUSH_RESULT_PREFLIGHT_BYTES = 2 * MAX_RECEIVE_PACK_RESULT_BYTES;
 
 function emptyPushResult(): PushResult {
   return {
@@ -375,13 +372,7 @@ function confirmedResult(
       throw new CorruptError(`confirmed push result omitted ${update.destination}`);
     }
     const error = status.ok ? null : (status.error ?? "remote rejected ref");
-    retained +=
-      RESULT_REF_BYTES +
-      retainedStringBytes(update.destination) +
-      (error === null ? 0 : retainedStringBytes(error));
-    if (retained > MAX_RECEIVE_PACK_RESULT_BYTES) {
-      throw new GitError("E2BIG", "push result exceeds the retained-state limit");
-    }
+    retained += RESULT_REF_BYTES;
     budget.setMemory(PUSH_RESULT_MEMORY_PART, retained);
     refs.push({ ref: update.destination, ok: status.ok, error });
   }
@@ -575,9 +566,6 @@ export async function push(
         reservation,
       );
     }
-    budget.setMemory(PUSH_RESULT_PREFLIGHT_MEMORY_PART, PUSH_RESULT_PREFLIGHT_BYTES);
-    budget.clearMemory(PUSH_RESULT_PREFLIGHT_MEMORY_PART);
-
     let wire: ReceivePackStatus | null = null;
     if (commands.length > 0) {
       const hasNonDeletion = commands.some((command) => command.newOid !== ZERO_OID);

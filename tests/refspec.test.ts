@@ -8,11 +8,8 @@ import {
   type PushRefspec,
   type RefspecSourceRef,
 } from "../src/core/ops/refspec.js";
-import {
-  MAX_TRANSPORT_MEMORY_BYTES,
-  TransportOperationBudget,
-} from "../src/core/ops/transport-budget.js";
-import { MemoryCoordinator } from "../src/memory.js";
+import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { requireRefName } from "../src/sqlite/ref-validation.js";
 
 const OID = "1".repeat(40);
@@ -358,15 +355,17 @@ describe("structured refspecs", () => {
 describe("transport operation budget", () => {
   it("composes named memory against one 64 MiB operation reservation", () => {
     const { coordinator, reservation, budget } = fixture();
-    budget.setMemory("compiled", MAX_TRANSPORT_MEMORY_BYTES - 1);
+    budget.setMemory("compiled", MAX_OPERATION_MEMORY_BYTES - 1);
     budget.setMemory("expanded", 1);
-    expect(budget.retainedBytes).toBe(MAX_TRANSPORT_MEMORY_BYTES);
+    expect(budget.retainedBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(budget.remainingMemoryBytes).toBe(0);
     expectCode(() => budget.setMemory("expanded", 2), "E2BIG");
-    expect(budget.retainedBytes).toBe(MAX_TRANSPORT_MEMORY_BYTES);
+    expect(budget.retainedBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
     budget.clearAllMemory();
 
     reservation.set("other", 1);
-    expectCode(() => budget.setMemory("protocol", MAX_TRANSPORT_MEMORY_BYTES), "E2BIG");
+    expect(budget.remainingMemoryBytes).toBe(MAX_OPERATION_MEMORY_BYTES - 1);
+    expectCode(() => budget.setMemory("protocol", MAX_OPERATION_MEMORY_BYTES), "E2BIG");
     expect(budget.retainedBytes).toBe(0);
     reservation.clear("other");
     reservation.dispose();

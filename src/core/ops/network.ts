@@ -55,7 +55,6 @@ import { walkWorktreeEntriesStream } from "./worktree-io.js";
 const HAVE_BUDGET = 256;
 const TAG_OBJECT_PAGE = 4_096;
 const TAG_PEEL_HOPS = 16;
-const TAG_AUTH_BYTES = 64 * 1024 * 1024;
 const FETCH_OPTIONS_MEMORY_PART = "fetch-options";
 const FETCH_CHECKOUTS_MEMORY_PART = "fetch-checkouts";
 const FETCH_ROOT_AUTH_MEMORY_PART = "fetch-root-auth";
@@ -299,46 +298,82 @@ function preflightAllTags(snapshot: FetchPublicationToken, tags: readonly Advert
   }
 }
 
-interface TagAuthBudget {
-  bytes: number;
-}
-
 function readTagObjects(
   repo: Repository,
   oids: readonly string[],
-  budget: TagAuthBudget,
   operationBudget: TransportOperationBudget,
 ): Map<string, RawObject> {
   const objects = new Map<string, RawObject>();
   let retainedBytes = 0;
   let pending = [...new Set(oids)];
   while (pending.length > 0) {
-    if (budget.bytes >= TAG_AUTH_BYTES) {
-      throw new GitError("E2BIG", `tag authentication exceeds ${TAG_AUTH_BYTES} bytes`);
-    }
     const page = pending.slice(0, TAG_OBJECT_PAGE);
     const tail = pending.slice(TAG_OBJECT_PAGE);
-    const readBudget = Math.min(MAX_BLOB_BATCH_BYTES, TAG_AUTH_BYTES - budget.bytes);
+    const info = repo.store.objectInfo(page);
+    let selected = 0;
+    let selectedBytes = 0;
+    while (selected < info.length) {
+      const entry = info[selected];
+      const oid = page[selected];
+      if (entry === undefined || oid === undefined || entry.oid !== oid) {
+        throw new CorruptError("tag authentication metadata is incomplete");
+      }
+      if (selectedBytes + entry.size > MAX_BLOB_BATCH_BYTES) break;
+      selectedBytes += entry.size;
+      selected++;
+    }
+    if (selected === 0) {
+      const entry = info[0];
+      const oid = page[0];
+      if (entry === undefined || oid === undefined || entry.oid !== oid) {
+        throw new CorruptError("tag authentication lost its oversized object");
+      }
+      operationBudget.setMemory(
+        FETCH_TAG_AUTH_MEMORY_PART,
+        authenticatedObjectRetainedBytes(retainedBytes + entry.size),
+      );
+      const object = repo.store.readAuthenticatedObject(oid, entry.type);
+      if (object === null) {
+        throw new GitError("EFETCHFAIL", `fetch did not receive complete tag object ${oid}`);
+      }
+      if (object.data.length !== entry.size) {
+        throw new CorruptError(`tag object ${oid} does not match its indexed size`);
+      }
+      if (hashObject(object.type, object.data) !== oid) {
+        throw new CorruptError(`tag object ${oid} does not match its bytes`);
+      }
+      objects.set(oid, object);
+      retainedBytes += object.data.length;
+      operationBudget.setMemory(
+        FETCH_TAG_AUTH_MEMORY_PART,
+        authenticatedObjectRetainedBytes(retainedBytes),
+      );
+      pending = [...page.slice(1), ...tail];
+      continue;
+    }
+    const selectedOids = page.slice(0, selected);
     operationBudget.setMemory(
       FETCH_TAG_AUTH_MEMORY_PART,
-      authenticatedObjectRetainedBytes(retainedBytes + readBudget),
+      authenticatedObjectRetainedBytes(retainedBytes + selectedBytes),
     );
-    const batch = repo.readObjects(page, {
-      budgetBytes: readBudget,
+    const batch = repo.readObjects(selectedOids, {
+      budgetBytes: Math.max(1, selectedBytes),
     });
+    if (batch.remaining.length > 0 || batch.objects.size !== selectedOids.length) {
+      throw new CorruptError("tag authentication made no progress");
+    }
     for (const [oid, object] of batch.objects) {
       if (hashObject(object.type, object.data) !== oid) {
         throw new CorruptError(`tag object ${oid} does not match its bytes`);
       }
       objects.set(oid, object);
     }
-    budget.bytes += batch.bytes;
     retainedBytes += batch.bytes;
     operationBudget.setMemory(
       FETCH_TAG_AUTH_MEMORY_PART,
       authenticatedObjectRetainedBytes(retainedBytes),
     );
-    pending = [...batch.remaining, ...tail];
+    pending = [...page.slice(selected), ...tail];
   }
   return objects;
 }
@@ -431,7 +466,6 @@ function authenticateTags(
     }
   }
   let pending = pendingRoots;
-  const budget = { bytes: 0 };
   try {
     for (let hop = 0; hop < TAG_PEEL_HOPS && pending.length > 0; hop++) {
       const frontier = new Set(pending.map((state) => state.current));
@@ -444,7 +478,7 @@ function authenticateTags(
           );
         }
       }
-      const objects = readTagObjects(repo, [...frontier], budget, operationBudget);
+      const objects = readTagObjects(repo, [...frontier], operationBudget);
       const next: TagPeelState[] = [];
       for (const state of pending) {
         const object = objects.get(state.current);

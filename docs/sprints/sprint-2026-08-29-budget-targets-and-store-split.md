@@ -615,6 +615,20 @@ shape exceptions, store import topology and proportional per-WU review.
   typecheck, Biome, diff-check, build, public exports and package smoke passed.
   The 166/166 routine smoke gate passed in 14.05 s under a two-vCPU lease; the
   full suite remains deferred to sprint closure.
+- 2026-08-30 — WU6e removed the reviewed fixed transport, protocol, push-plan,
+  receive-pack and cumulative tag-auth byte ceilings. Request frames, protocol
+  parsing, push graphs, status results and tag hops now charge simultaneously
+  live state to one caller-owned reservation; streamed source chunks and prior
+  tag hops do not accumulate. Ref names are bounded by real pkt framing and
+  structural tag depth remains enforced. `ByteReader` now pre-admits frame state
+  and finalizes its source exactly once on success, malformed input and callback
+  failure. Independent review-to-clean closed allocation-order, ownership,
+  retry-cleanup and iterator-finalization gaps across all three WU6e lanes. No
+  projected statement-count runtime barrier was added. Focused protocol,
+  receive-pack, push/refspec and tag-chain witnesses, typecheck, Biome,
+  diff-check, build, public exports and package smoke passed. The 166/166 routine
+  smoke gate passed in 13.76 s under a two-vCPU lease; the full suite remains
+  deferred to sprint closure.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

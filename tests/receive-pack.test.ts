@@ -4,11 +4,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { concat, utf8, ZERO_OID } from "../src/core/bytes.js";
 import { TransportOperationBudget } from "../src/core/ops/transport-budget.js";
-import { FLUSH, pkt } from "../src/core/protocol/pktline.js";
+import { FLUSH, MAX_PKT_PAYLOAD_BYTES, pkt } from "../src/core/protocol/pktline.js";
 import {
-  MAX_PUSH_OPTION_BYTES,
   MAX_PUSH_OPTIONS,
-  MAX_PUSH_OPTIONS_BYTES,
   MAX_RECEIVE_PACK_COMMANDS,
   type ReceivePackCommand,
   type ReceivePackRequest,
@@ -210,15 +208,14 @@ describe("receive-pack request validation", () => {
     expect(validatePushOptions([])).toEqual([]);
     expect(validatePushOptions(["carriage\rreturn"])).toEqual([15]);
 
-    const exact = Array.from({ length: MAX_PUSH_OPTIONS }, () => "x".repeat(MAX_PUSH_OPTION_BYTES));
-    const exactBytes = validatePushOptions(exact);
-    expect(exactBytes).toHaveLength(MAX_PUSH_OPTIONS);
-    expect(exactBytes.reduce((total, bytes) => total + bytes, 0)).toBe(MAX_PUSH_OPTIONS_BYTES);
+    const exact = "x".repeat(MAX_PKT_PAYLOAD_BYTES);
+    expect(validatePushOptions([exact])).toEqual([MAX_PKT_PAYLOAD_BYTES]);
+    expect(validatePushOptions(["a".repeat(40_000), "b".repeat(40_000)])).toEqual([40_000, 40_000]);
 
-    expect(() => validatePushOptions([...exact, ""])).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(() => validatePushOptions(["x".repeat(MAX_PUSH_OPTION_BYTES + 1)])).toThrowError(
+    expect(() =>
+      validatePushOptions(Array.from({ length: MAX_PUSH_OPTIONS + 1 }, () => "")),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(() => validatePushOptions([`${exact}x`])).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
     for (const malformed of ["not-an-array", [7], ["bad\0option"], ["bad\noption"], ["\ud800"]]) {
@@ -266,11 +263,6 @@ describe("receive-pack request validation", () => {
     await expect(
       receivePack(baseRequest([{ ...command(), ref: "refs/heads/bad..ref" }]), { http }),
     ).rejects.toMatchObject({ code: "EINVALIDREF" });
-    await expect(
-      receivePack(baseRequest([{ ...command(), ref: `refs/heads/${"x".repeat(1_025)}` }]), {
-        http,
-      }),
-    ).rejects.toMatchObject({ code: "E2BIG" });
     expect(posts).toBe(0);
   });
 
@@ -289,29 +281,36 @@ describe("receive-pack request validation", () => {
 
       const stringBytes = (value: string): number => 48 + value.length * 2;
       let requestBytes = 256;
-      let resultBytes = 192 + stringBytes("ok");
+      const resultBytes = 192 + stringBytes("ok") + commands.length * 96;
       for (const [index, item] of commands.entries()) {
-        requestBytes +=
-          96 + stringBytes(item.oldOid) + stringBytes(item.newOid) + stringBytes(item.ref);
+        requestBytes += 96;
         const capabilities = index === 0 ? "\0report-status" : "";
         requestBytes +=
-          utf8.encode(`${item.oldOid} ${item.newOid} ${item.ref}${capabilities}\n`).length + 4;
-        resultBytes += 96 + stringBytes(item.ref);
+          32 + utf8.encode(`${item.oldOid} ${item.newOid} ${item.ref}${capabilities}\n`).length + 4;
       }
       expect(budget.memory("receive-pack-request")).toBe(0);
       expect(budget.memory("receive-pack-result")).toBe(resultBytes);
       expect(budget.retainedBytes).toBe(resultBytes);
       expect(reservation.currentBytes).toBe(resultBytes);
-      expect(coordinator.highWaterBytes).toBe(requestBytes + resultBytes);
+      expect(coordinator.highWaterBytes).toBeGreaterThan(requestBytes + resultBytes);
+      expect(coordinator.highWaterBytes).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
     } finally {
       reservation.dispose();
     }
     coordinator.assertIdle();
   });
 
-  it("accepts a 1,024-byte destination and rejects its first excess before POST", async () => {
+  it("accepts a destination at the command pkt limit and rejects its first excess", async () => {
     const prefix = "refs/x/";
-    const exact = { ...command(), ref: `${prefix}${"x".repeat(1_024 - prefix.length)}` };
+    const template = command();
+    const suffix = "\0report-status\n";
+    const fixedBytes = utf8.encode(
+      `${template.oldOid} ${template.newOid} ${prefix}${suffix}`,
+    ).length;
+    const exact = {
+      ...template,
+      ref: `${prefix}${"x".repeat(MAX_PKT_PAYLOAD_BYTES - fixedBytes)}`,
+    };
     let posts = 0;
     const http: GitHttpClient = async () => {
       posts++;
@@ -357,21 +356,36 @@ describe("receive-pack request validation", () => {
 
   it("validates push-option count, UTF-8 bytes and text before POST", async () => {
     let posts = 0;
-    const http: GitHttpClient = async () => {
+    let framedBytes = 0;
+    let ownedRequestBytes = 0;
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const budget = new TransportOperationBudget(reservation);
+    const http: GitHttpClient = async (request) => {
       posts++;
+      ownedRequestBytes = budget.memory("receive-pack-request");
+      framedBytes = (await collectBody(request.body)).length;
       return response(report([command()]));
     };
-    const exact = Array.from({ length: MAX_PUSH_OPTIONS }, () => "x".repeat(MAX_PUSH_OPTION_BYTES));
-    await expect(
-      receivePack(
-        baseRequest([command()], {
-          advertised: new Set(["report-status", "push-options"]),
-          pushOptions: exact,
-        }),
-        { http },
-      ),
-    ).resolves.toMatchObject({ unpack: "ok" });
-    expect(posts).toBe(1);
+    const exact = ["x".repeat(40_000), "y".repeat(40_000)];
+    try {
+      await expect(
+        receivePack(
+          baseRequest([command()], {
+            advertised: new Set(["report-status", "push-options"]),
+            pushOptions: exact,
+          }),
+          { http, operationBudget: budget },
+        ),
+      ).resolves.toMatchObject({ unpack: "ok" });
+      expect(posts).toBe(1);
+      expect(framedBytes).toBeGreaterThan(64 * 1024);
+      expect(ownedRequestBytes).toBeGreaterThan(framedBytes);
+      expect(budget.memory("receive-pack-request")).toBe(0);
+    } finally {
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
 
     const malformed: ReceivePackRequest = baseRequest([command()], {
       advertised: new Set(["report-status", "push-options"]),
@@ -381,11 +395,11 @@ describe("receive-pack request validation", () => {
     const rejected = [
       baseRequest([command()], {
         advertised: new Set(["report-status", "push-options"]),
-        pushOptions: [...exact, "excess"],
+        pushOptions: Array.from({ length: MAX_PUSH_OPTIONS + 1 }, () => "excess"),
       }),
       baseRequest([command()], {
         advertised: new Set(["report-status", "push-options"]),
-        pushOptions: ["é".repeat(MAX_PUSH_OPTION_BYTES / 2 + 1)],
+        pushOptions: ["é".repeat(MAX_PKT_PAYLOAD_BYTES / 2 + 1)],
       }),
       baseRequest([command()], {
         advertised: new Set(["report-status", "push-options"]),
@@ -460,24 +474,42 @@ describe("receive-pack replay and certainty", () => {
     const bodies: Uint8Array[] = [];
     let opens = 0;
     const update = command();
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const budget = new TransportOperationBudget(reservation);
     const http: GitHttpClient = async (request) => {
       bodies.push(await collectBody(request.body));
       return bodies.length === 1
         ? response(utf8.encode("auth"), 401, "text/plain")
         : response(report([update]));
     };
-    await receivePack(
-      baseRequest([update], {
-        pack: () => {
-          opens++;
-          return once(utf8.encode("PACKbody"));
-        },
-      }),
-      { http, onAuth: () => ({ username: "token" }) },
-    );
-    expect(opens).toBe(2);
-    expect(bodies).toHaveLength(2);
-    expect(bodies[1]).toEqual(bodies[0]);
+    try {
+      await receivePack(
+        baseRequest([update], {
+          pack: () => {
+            opens++;
+            return once(utf8.encode("PACKbody"));
+          },
+        }),
+        { http, onAuth: () => ({ username: "token" }), operationBudget: budget },
+      );
+      expect(opens).toBe(2);
+      expect(bodies).toHaveLength(2);
+      expect(bodies[1]).toEqual(bodies[0]);
+      expect(budget.memory("receive-pack-request")).toBe(0);
+      expect(budget.memory("receive-pack-status-reader")).toBe(0);
+      expect(budget.memory("receive-pack-sideband-reader")).toBe(0);
+      expect(budget.memory("receive-pack-status-frame")).toBe(0);
+      expect(budget.memory("receive-pack-status-parse")).toBe(0);
+      expect(budget.memory("receive-pack-result")).toBe(340);
+      expect(budget.retainedBytes).toBe(340);
+      budget.clearAllMemory();
+      expect(budget.retainedBytes).toBe(0);
+      expect(coordinator.totalBytes).toBe(0);
+    } finally {
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
   });
 
   it("does not retry POST transport failure and preserves it as uncertain cause", async () => {
@@ -538,14 +570,24 @@ describe("receive-pack replay and certainty", () => {
     expect(attempts).toBe(2);
 
     const callbackFailure = new Error("credential store failed");
-    await expect(
-      receivePack(baseRequest([command()]), {
-        http: async () => response(new Uint8Array(0), 401, "text/plain"),
-        onAuth: () => {
-          throw callbackFailure;
-        },
-      }),
-    ).rejects.toMatchObject({ code: "EAUTH", cause: callbackFailure });
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const budget = new TransportOperationBudget(reservation);
+    try {
+      await expect(
+        receivePack(baseRequest([command()]), {
+          http: async () => response(new Uint8Array(0), 401, "text/plain"),
+          onAuth: () => {
+            throw callbackFailure;
+          },
+          operationBudget: budget,
+        }),
+      ).rejects.toMatchObject({ code: "EAUTH", cause: callbackFailure });
+      expect(budget.retainedBytes).toBe(0);
+    } finally {
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
 
     const readFailure = new Error("401 body read failed");
     await expect(
@@ -619,12 +661,24 @@ describe("receive-pack replay and certainty", () => {
       },
     ];
     for (const entry of cases) {
-      await expect(
-        receivePack(entry.request ?? baseRequest([command()]), { http: entry.http }),
-      ).rejects.toMatchObject({
-        code: "EPUSHUNCERTAIN",
-        ...(entry.cause === undefined ? {} : { cause: entry.cause }),
-      });
+      const coordinator = new MemoryCoordinator();
+      const reservation = coordinator.reserve();
+      const budget = new TransportOperationBudget(reservation);
+      try {
+        await expect(
+          receivePack(entry.request ?? baseRequest([command()]), {
+            http: entry.http,
+            operationBudget: budget,
+          }),
+        ).rejects.toMatchObject({
+          code: "EPUSHUNCERTAIN",
+          ...(entry.cause === undefined ? {} : { cause: entry.cause }),
+        });
+        expect(budget.retainedBytes).toBe(0);
+      } finally {
+        reservation.dispose();
+      }
+      coordinator.assertIdle();
     }
   });
 
@@ -703,15 +757,24 @@ describe("receive-pack status validation and bounds", () => {
         [second.ref, { ok: false, error: "hook rejected" }],
       ]),
     });
-    await expect(
-      receivePack(
-        baseRequest(commands, {
-          advertised: new Set(["report-status", "atomic"]),
-          atomic: true,
-        }),
-        { http: async () => response(body) },
-      ),
-    ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN", cause: { code: "ECORRUPT" } });
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const budget = new TransportOperationBudget(reservation);
+    try {
+      await expect(
+        receivePack(
+          baseRequest(commands, {
+            advertised: new Set(["report-status", "atomic"]),
+            atomic: true,
+          }),
+          { http: async () => response(body), operationBudget: budget },
+        ),
+      ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN", cause: { code: "ECORRUPT" } });
+      expect(budget.retainedBytes).toBe(0);
+    } finally {
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
   });
 
   it("returns complete atomic all-ng and complete unpack rejection", async () => {
@@ -758,13 +821,25 @@ describe("receive-pack status validation and bounds", () => {
       concat([report(commands), pkt("ok refs/heads/trailing\n")]),
     ];
     for (const body of bodies) {
-      await expect(
-        receivePack(baseRequest(commands), { http: async () => response(body) }),
-      ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN" });
+      const coordinator = new MemoryCoordinator();
+      const reservation = coordinator.reserve();
+      const budget = new TransportOperationBudget(reservation);
+      try {
+        await expect(
+          receivePack(baseRequest(commands), {
+            http: async () => response(body),
+            operationBudget: budget,
+          }),
+        ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN" });
+        expect(budget.retainedBytes).toBe(0);
+      } finally {
+        reservation.dispose();
+      }
+      coordinator.assertIdle();
     }
   });
 
-  it("enforces lowered status packet, input and result bounds with E2BIG as cause", async () => {
+  it("preserves caller-lowered status packet, input and result bounds", async () => {
     const body = report([first]);
     await expect(
       receivePack(baseRequest([first]), {
@@ -809,18 +884,28 @@ describe("receive-pack status validation and bounds", () => {
     ).rejects.toMatchObject({ code: "EPUSHUNCERTAIN", cause: { code: "E2BIG" } });
   });
 
-  it("enforces the hard retained-result limit after POST", async () => {
-    const many = Array.from({ length: 130 }, (_, index) => command(index));
-    const reason = "x".repeat(65_000);
+  it("streams beyond the former input cap and retains the result under the shared owner", async () => {
+    const many = Array.from({ length: 300 }, (_, index) => command(index));
+    const reason = "x".repeat(56_000);
     const statuses = new Map(many.map((item) => [item.ref, reason]));
-    await expect(
-      receivePack(baseRequest(many), {
-        http: async () => response(report(many, statuses)),
-      }),
-    ).rejects.toMatchObject({
-      code: "EPUSHUNCERTAIN",
-      cause: { code: "E2BIG", message: /retained-state/ },
-    });
+    const body = report(many, statuses);
+    expect(body.length).toBeGreaterThan(16 * 1024 * 1024);
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const budget = new TransportOperationBudget(reservation);
+    try {
+      await expect(
+        receivePack(baseRequest(many), {
+          http: async () => response(body),
+          operationBudget: budget,
+        }),
+      ).resolves.toMatchObject({ unpack: "ok" });
+      expect(budget.memory("receive-pack-result")).toBeGreaterThan(8 * 1024 * 1024);
+      expect(coordinator.highWaterBytes).toBeLessThanOrEqual(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
   });
 
   it("charges retained statuses to the caller-owned operation budget", async () => {
@@ -833,11 +918,67 @@ describe("receive-pack status validation and bounds", () => {
         operationBudget: budget,
       });
       expect(budget.memory("receive-pack-request")).toBe(0);
-      expect(budget.memory("receive-pack-result")).toBe(426);
+      expect(budget.memory("receive-pack-result")).toBe(340);
     } finally {
       reservation.dispose();
     }
     coordinator.assertIdle();
+  });
+
+  it("does not charge a caller-owned command ref as a new result string", async () => {
+    const long = { ...first, ref: `refs/heads/${"r".repeat(32 * 1024)}` };
+    const coordinator = new MemoryCoordinator();
+    const reservation = coordinator.reserve();
+    const budget = new TransportOperationBudget(reservation);
+    try {
+      const result = await receivePack(baseRequest([long]), {
+        http: async () => response(report([long])),
+        operationBudget: budget,
+      });
+      expect(result.refs.get(long.ref)).toEqual({ ok: true });
+      expect(budget.memory("receive-pack-result")).toBe(340);
+    } finally {
+      reservation.dispose();
+    }
+    coordinator.assertIdle();
+  });
+
+  it("admits the exact shared aggregate and rejects its first memory excess", async () => {
+    const calibrated = new MemoryCoordinator();
+    const calibrationReservation = calibrated.reserve();
+    const calibrationBudget = new TransportOperationBudget(calibrationReservation);
+    await receivePack(baseRequest([first]), {
+      http: async () => response(report([first])),
+      operationBudget: calibrationBudget,
+    });
+    const required = calibrated.highWaterBytes;
+    calibrationReservation.dispose();
+    calibrated.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      const reservation = coordinator.reserve();
+      const budget = new TransportOperationBudget(reservation);
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - required + excess);
+      try {
+        const operation = receivePack(baseRequest([first]), {
+          http: async () => response(report([first])),
+          operationBudget: budget,
+        });
+        if (excess === 0) {
+          await expect(operation).resolves.toMatchObject({ unpack: "ok" });
+          expect(coordinator.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+        } else {
+          await expect(operation).rejects.toMatchObject({ code: "EPUSHUNCERTAIN" });
+          expect(budget.retainedBytes).toBe(0);
+        }
+      } finally {
+        reservation.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
   });
 
   it("shares the aggregate operation reservation and fails before POST", async () => {
