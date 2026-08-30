@@ -205,7 +205,6 @@ const CHECKOUT_RESULT_ARRAY_SLOT_BYTES = 8;
 const CHECKOUT_RESULT_ROW_BYTES = 128;
 const CHECKOUT_ROUTING_MAP_BYTES = 128;
 const CHECKOUT_ROUTING_MAP_ENTRY_BYTES = 72;
-export const MAX_CHECKOUT_LIST_RETAINED_BYTES = 6 * 1024 * 1024;
 export const MAX_CONFIG_SECTION_MOVE_ROWS = 1_024;
 export const MAX_CONFIG_SECTION_MOVE_TEXT_BYTES = 1024 * 1024;
 export const CONFIG_SECTION_MOVE_UPDATE_SQL = `UPDATE git_config
@@ -4611,7 +4610,6 @@ export class SqliteGitDatabase {
       const rows: CheckoutRow[] = [];
       let primaryCount = 0;
       let previousRoot: string | null = null;
-      let policyRetainedBytes = 0;
       let collectionBytes = CHECKOUT_RESULT_ARRAY_BYTES;
       for (const raw of this.#db.iterate(
         `SELECT id AS checkout_id, repo_id, root, typeof(root) AS root_type,
@@ -4630,13 +4628,6 @@ export class SqliteGitDatabase {
           throw new CorruptError("checkout roots are not in strict byte order");
         }
         previousRoot = row.root;
-        policyRetainedBytes +=
-          CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES +
-          utf8ByteLength(row.root) +
-          refTextBytes(row.head, "stored HEAD target", "stored");
-        if (policyRetainedBytes > MAX_CHECKOUT_LIST_RETAINED_BYTES) {
-          throw new GitError("E2BIG", "checkout listing exceeds its 6 MiB retained bound");
-        }
         collectionBytes += checkoutResultRowRetainedBytes(row);
         collectionMemory.set("other", collectionBytes);
         rows.push(this.#rememberCheckout(row));

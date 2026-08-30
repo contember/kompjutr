@@ -8,7 +8,6 @@ import {
   type CheckoutRow,
   type CheckoutStore,
   listCheckoutsOwned,
-  MAX_CHECKOUT_LIST_RETAINED_BYTES,
   SqliteGitDatabase,
 } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -575,8 +574,7 @@ describe("checkout lifecycle storage", () => {
     expect(db.scalar<number>("SELECT count(*) FROM git_index_state")).toBe(before.indexStates);
   });
 
-  it("retains the exact 6 MiB maximum in one ordered frozen listing", () => {
-    expect(MAX_CHECKOUT_LIST_RETAINED_BYTES).toBe(6 * 1024 * 1024);
+  it("lists the former 6 MiB threshold fixture in one dynamically owned collection", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     db.run("INSERT INTO git_repositories (id) VALUES (1)");
@@ -605,6 +603,8 @@ describe("checkout lifecycle storage", () => {
     expect(checkouts.every(Object.isFrozen)).toBe(true);
     expect(utf8.encode(checkouts[0]?.root ?? "").byteLength).toBe(4_096);
     expect(utf8.encode(checkouts[0]?.head ?? "").byteLength).toBe(1_024);
+    expect(database.openShared(1).memory.highWaterBytes).toBeGreaterThan(6 * 1024 * 1024);
+    database.openShared(1).memory.assertIdle();
     expect(db.storage.statementCount).toBeLessThan(1_000);
   });
 
