@@ -681,12 +681,22 @@ describe("blob id batches", () => {
     );
     const longId = new Uint8Array(MAX_CACHED_CONTENT_ID_BYTES + 1).fill(7);
     store.upsertBlobIds([{ contentId: longId, oid: "1".repeat(40) }]);
+    expect(store.db.scalar<number>("SELECT count(*) FROM git_blob_ids")).toBe(0);
     expect(store.lookupBlobIds([longId])).toEqual(new Map());
     expect(store.blobIdMismatches([{ contentId: longId, oid: "1".repeat(40) }])).toEqual(
       new Map([[0, null]]),
     );
 
     store.upsertBlobIds([{ contentId, oid: "1".repeat(40) }]);
+    store.db.run(
+      "INSERT INTO git_blob_ids (repo_id, content_id, oid, generation) VALUES (?, ?, ?, ?)",
+      1,
+      blob(longId),
+      "1".repeat(40),
+      1,
+    );
+    expect(store.db.scalar<number>("SELECT count(*) FROM git_blob_ids")).toBe(2);
+    expect(store.lookupBlobIds([longId])).toEqual(new Map());
     store.db.run("PRAGMA ignore_check_constraints = ON");
     store.db.run("UPDATE git_blob_ids SET oid = 'broken' WHERE repo_id = ?", 1);
     store.db.run("PRAGMA ignore_check_constraints = OFF");

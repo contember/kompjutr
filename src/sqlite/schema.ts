@@ -2,11 +2,7 @@
 // `repo_id`; worktree-private rows use `checkout_id`.
 
 import { CorruptError } from "../core/errors.js";
-import {
-  BLOB_ID_GENERATION_EXHAUSTED,
-  MAX_BLOB_ID_CACHE_ROWS,
-  MAX_CACHED_CONTENT_ID_BYTES,
-} from "./blob-id-cache.js";
+import { BLOB_ID_GENERATION_EXHAUSTED, MAX_BLOB_ID_CACHE_ROWS } from "./blob-id-cache.js";
 import type { SqlDatabase } from "./db.js";
 import { OPERATION_STATE_TABLE } from "./operation-schema.js";
 import { REFLOG_SCHEMA_STATEMENTS } from "./reflog-schema.js";
@@ -375,9 +371,7 @@ const STATEMENTS = [
   // one, and a missing row means "read the file", never "the file differs".
   `CREATE TABLE IF NOT EXISTS git_blob_ids (
      repo_id INTEGER NOT NULL CHECK (typeof(repo_id) = 'integer' AND repo_id >= 1),
-     content_id BLOB NOT NULL CHECK (
-       typeof(content_id) = 'blob' AND length(content_id) <= ${MAX_CACHED_CONTENT_ID_BYTES}
-     ),
+     content_id BLOB NOT NULL CHECK (typeof(content_id) = 'blob'),
      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
      generation INTEGER NOT NULL CHECK (typeof(generation) = 'integer' AND generation >= 1),
      PRIMARY KEY (repo_id, content_id),
