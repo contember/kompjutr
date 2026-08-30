@@ -1,7 +1,6 @@
 export const MAX_REFLOG_TIMEZONE_MINUTES = 24 * 60;
 export const MAX_REFLOG_ORDINAL = Number.MAX_SAFE_INTEGER;
 export const MAX_REFLOG_STATE_ROWS = 100_000;
-export const MAX_REFLOG_STATE_BYTES = 48 * 1024 * 1024;
 
 const VALID_OID_SQL = "length(CAST(%s AS BLOB)) = 40 AND %s NOT GLOB '*[^0-9a-f]*'";
 

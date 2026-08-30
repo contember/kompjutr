@@ -465,6 +465,26 @@ describe("public reflog listing", () => {
     }
   });
 
+  it("mutates refs with dynamically owned ref state above the former 48 MiB cap", () => {
+    const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
+    workspace.repo.store.db.run(
+      `WITH RECURSIVE sequence(id) AS (
+         VALUES (1) UNION ALL SELECT id + 1 FROM sequence WHERE id < 20000
+       )
+       INSERT INTO git_refs (repo_id, name, target)
+       SELECT ?, 'refs/tags/' || printf('%05d', id) || printf('%0*d', 1010, 0), ?
+         FROM sequence`,
+      workspace.repo.store.repoId,
+      FIRST,
+    );
+
+    workspace.repo.store.setRef("refs/tags/new", SECOND);
+
+    expect(workspace.repo.store.getRef("refs/tags/new")).toBe(SECOND);
+    expect(workspace.repo.store.memory.highWaterBytes).toBeGreaterThan(48 * 1024 * 1024);
+    workspace.repo.store.memory.assertIdle();
+  });
+
   it("bounds pages and keeps an exclusive ordinal cursor stable across append and reopen", async () => {
     const workspace = makeRepo("/", { now: () => NOW_MILLISECONDS });
     const ref = "refs/heads/history";

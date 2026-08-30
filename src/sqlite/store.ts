@@ -94,7 +94,6 @@ export { PACK_BLOB_CALLER_HEADROOM_BYTES } from "./packs.js";
 import { BLOB_ID_GENERATION_EXHAUSTED, MAX_CACHED_CONTENT_ID_BYTES } from "./blob-id-cache.js";
 import {
   MAX_REFLOG_ORDINAL,
-  MAX_REFLOG_STATE_BYTES,
   MAX_REFLOG_STATE_ROWS,
   MAX_REFLOG_TIMEZONE_MINUTES,
 } from "./reflog-schema.js";
@@ -9065,15 +9064,13 @@ export class CheckoutStore implements IndexStore {
 
       const before = new Map<string, string>();
       let rows = 0;
-      let retainedBytes = REF_ROW_RETAINED_BYTES + oldHead.length * 2;
       for (const { name, target } of this.#iterateStoredRefs(
         normalized.budget.memoryReservation(),
         "ref state query",
       )) {
         rows++;
-        retainedBytes += REF_ROW_RETAINED_BYTES + name.length * 2 + target.length * 2;
-        if (rows > MAX_REFLOG_STATE_ROWS || retainedBytes > MAX_REFLOG_STATE_BYTES) {
-          throw new GitError("E2BIG", "repository ref state exceeds its retained bound");
+        if (rows > MAX_REFLOG_STATE_ROWS) {
+          throw new GitError("E2BIG", "repository ref state exceeds its structural row bound");
         }
         normalized.budget.charge(
           REF_ROW_RETAINED_BYTES + retainedStringBytes(name) + retainedStringBytes(target),
