@@ -424,7 +424,13 @@ caught before implementation.
    deletes store statement constants only after WU2 consumers are gone.
 3. WU4 removes disjoint standalone gates. WU5 normalizes tests/docs and proves
    the statement model is absent.
-4. WU6 applies only reviewed byte-limit decisions.
+4. WU6 applies only reviewed byte-limit decisions. After WU6a/WU6b, a
+   review-approved WU6c-pre prerequisite lands the internal owner-aware tree,
+   graph, hash/checkout-guard and journal seams before WU6c consumes them. It
+   promotes only the required WU6d/WU6g seam and call-site work: stable keys
+   remain assigned to their original stage until every default consumer is
+   converted. `CHECKOUT_GUARD_BYTES` is a promoted hidden WU6c alias;
+   `CHECKOUT_GUARD_BATCH` remains a non-refusing flush size.
 5. WU7 establishes the store module seam. WU8–WU10 extract table families
    sequentially because each edits the coordinating checkout facade.
 6. Integrated T3 review and fixes settle before benchmark/parity/full closure
@@ -446,6 +452,13 @@ shape exceptions, store import topology and proportional per-WU review.
   declaration rows plus hidden byte sites including real structural failures,
   stops extraction for separate fixes,
   and names parity/conformance plus three-run benchmark thresholds.
+- **Sequencing-delta reviewer:** Ohm (`fix_computer_worktree_scan_t3`)
+- **Sequencing-delta verdict:** approved after corrections
+- **Sequencing-delta findings:** WU6c could not remove its integration aliases
+  while tree-build and graph defaults still enforced the same ceilings. The
+  approved WU6c-pre stage promotes only internal owner-aware seams and exact
+  WU6c call sites. `commits.ts:MAX_LOG_STATE_BYTES` remains open for WU6g until
+  `Repository.walk()` and all default consumers are converted.
 
 ## Run log
 
@@ -559,6 +572,12 @@ shape exceptions, store import topology and proportional per-WU review.
   worktree's `ENOENT`. A separate test-only integration repair now supplies all
   chunks, proves exactly 65 reads and verifies the staged row plus cleanup. The
   focused witness passes in 1.95 s; runtime code is unchanged.
+- 2026-08-30 — Two read-only WU6c design lanes found a real dependency cycle:
+  integration/history first-excess witnesses still reached tree-build and
+  commit-graph ceilings assigned to later WU6 stages. Ohm approved a minimal
+  topological correction after two review rounds. WU6c-pre now lands internal
+  owner-aware tree, graph, hash/checkout-guard and journal seams; later WUs skip
+  only landed seam/call-site work, never an incomplete stable key.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.
