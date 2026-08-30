@@ -81,6 +81,11 @@ shared object, pack, ref, config, shallow, fetch, maintenance, and cache
 namespace. Their working trees, indexes, tracker state, operation journals, and
 raw `HEAD` remain independent.
 
+`src/sqlite/store.ts` is the compatibility facade for this model. Internal
+contracts, database routing, shared-repository state, and checkout-bound state
+live under `src/sqlite/store/`; production consumers continue to import only the
+facade so internal table-family boundaries do not become package contracts.
+
 The native `readTree()` and `writeTree()` methods target the selected checkout
 index. `withScratchIndex({ name }, callback)` instead creates one named index
 inside a synchronous outer transaction and passes a revoked-on-return handle

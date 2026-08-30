@@ -8,7 +8,8 @@ through `SharedRepoStore`; the two direct `git_refs` existence checks in
 ```
 db.ts             Database — the DurableObjectStorageLike adapter, cursor refinement
 schema.ts         every CREATE TABLE, the version, and the shared row limits
-store.ts          repository registry: objects, refs, config, index, reflog
+store.ts          compatibility facade; consumers import only this public seam
+store/            contracts, database routing, shared repository, checkout implementation
 packs.ts          pack-native object storage (derived from dgit — keep the header)
 tree-index.ts     parsed tree edges · tree-walk.ts walks them · commits.ts caches commits
 index-tracker.ts  index dirty state · sparse-workspace.ts · pack-ingest-index.ts
