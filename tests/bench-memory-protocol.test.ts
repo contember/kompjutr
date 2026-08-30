@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   type MemoryRunIdentity,
+  memoryScenarioSpec,
   parseMemoryRun,
   parseMemoryRunOutput,
   parseRuntimeEvidence,
@@ -99,6 +100,28 @@ function parsedCalibration() {
 }
 
 describe("memory benchmark protocol", () => {
+  it("registers every accepted cgroup row above its former limit", () => {
+    const required = [
+      "core.integration.guard-hash",
+      "core.rebase.baseline-hash",
+      "core.staging.add-hash",
+      "sqlite.maintenance.reachability",
+      "sqlite.pack.fallback-audit",
+      "sqlite.pack.authenticate",
+      "sqlite.graph.retained",
+      "sqlite.object.singleton",
+      "sqlite.config.move",
+      "sqlite.checkout.list",
+    ];
+    for (const name of required) {
+      const spec = memoryScenarioSpec(name);
+      expect(spec.scenario).toBe(name);
+      expect(spec.workloadBytes).toBeGreaterThan(spec.formerLimitBytes);
+      expect(spec.coordinator).toBe("required");
+    }
+    expect(() => memoryScenarioSpec("missing-row")).toThrow(/unknown memory scenario/);
+  });
+
   it("accepts exact evidence and treats a SQL target miss as data", () => {
     expect(parseMemoryRun(JSON.stringify(validRow()), IDENTITY).statementTarget).toBe("pass");
     const miss = validRow();
