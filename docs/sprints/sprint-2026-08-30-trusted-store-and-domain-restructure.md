@@ -315,3 +315,17 @@ spec and this plan are authoritative; tests are the only gate.
 <!-- Append as you work: discoveries, deviations, blockers. Graduate each entry:
      changed the *why* → ../decisions/NNNN ; new future work → ../backlog/NN ;
      transient → leave it (dies with the sprint on archive). -->
+
+- 2026-08-31 — Execution is orchestrated through parallel subagents in waves;
+  two sequencing deviations from the plan: (1) WU9 runs parallel to WU10 (their
+  post-WU8 territories are disjoint: `store/pack/**` + `ops/{sparse-workspace,staging}`
+  vs `store/*.ts`); (2) the file-ceiling witness lands after both, not inside
+  WU9, because it can only be green once WU10 has split `checkout.ts`.
+- 2026-08-31 — WU1 verified at `11f7b92`: typecheck, check, public-exports
+  (15/15), and `npm test` (167/167) green; no repair needed.
+- 2026-08-31 — WU2 landed: repo-scoped owned dispatch now binds once in the
+  `SharedRepoStore` constructor and installs only from the non-removable
+  primary checkout; regression test added. WU3 landed: `src/core/rows.ts`
+  (Decoder/RowShape/OptionsSchema kit) + consolidated `src/core/paths.ts`;
+  `staging.ts` and `maintenance/state.ts` converted as the representative
+  slice (zero `Reflect.get` option loops remain in staging).
