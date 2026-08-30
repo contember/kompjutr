@@ -601,6 +601,20 @@ shape exceptions, store import topology and proportional per-WU review.
   Typecheck, Biome, diff-check, public exports, package smoke and the 165/165
   routine smoke gate passed. The smoke gate took 13.18 s under a two-vCPU lease;
   the full suite remains deferred to sprint closure.
+- 2026-08-30 — WU6d removed the reviewed read, tree, path, sparse and staging
+  component ceilings and cumulative hash/work admissions. Tree parsing,
+  indexing, traversal, checkout roots, filesystem paths, sparse hydration,
+  status, add, rm and ls-files now charge simultaneously live values to one
+  caller-owned reservation; valid oversized singleton bindings reach SQLite,
+  while derived caches become unavailable only on real headroom or engine
+  failure. Add now remains atomic across bounded index flushes. Independent
+  review-to-clean closed allocation-order, ownership-transfer, double-charge,
+  payload-preflight, iterator-cleanup and rollback gaps across every WU6d lane.
+  No projected statement-count runtime barrier was added; the existing ones
+  remain assigned to backlog 60. Focused former-bound and exact/+1 witnesses,
+  typecheck, Biome, diff-check, build, public exports and package smoke passed.
+  The 166/166 routine smoke gate passed in 14.05 s under a two-vCPU lease; the
+  full suite remains deferred to sprint closure.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

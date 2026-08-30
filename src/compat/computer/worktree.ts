@@ -37,7 +37,6 @@ import type {
 } from "../../fs/types.js";
 import type { SqlDatabase } from "../../sqlite/db.js";
 
-const MAX_PATH_CODE_UNITS = 4096;
 const MAX_HANDLE_COUNT = 5_000;
 
 const EMPTY = Buffer.alloc(0);
@@ -58,7 +57,7 @@ function isMissing(error: unknown): boolean {
 }
 
 function assertRealPath(path: string): asserts path is RealPath {
-  if (!path.startsWith("/") || normalize(path) !== path || path.length > MAX_PATH_CODE_UNITS) {
+  if (!path.startsWith("/") || normalize(path) !== path) {
     throw new Error(`Computer returned an invalid canonical path: '${path}'`);
   }
 }
@@ -72,7 +71,6 @@ function validateHandleInputs(handles: readonly RegularFileHandle[]): void {
     if (handle === undefined) continue;
     if (
       typeof handle.path !== "string" ||
-      handle.path.length > MAX_PATH_CODE_UNITS ||
       !handle.path.startsWith("/") ||
       normalize(handle.path) !== handle.path
     ) {

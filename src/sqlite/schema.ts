@@ -29,7 +29,6 @@ export const MAX_ROUTING_CHECKOUTS = 8_192;
 export const MAX_ROUTING_CHECKOUTS_RETAINED_BYTES = 16 * 1024 * 1024;
 /** Root-only consumers retain less than the complete validated routing rows. */
 export const MAX_ROUTING_ROOTS_UTF8_BYTES = 6 * 1024 * 1024;
-export const MAX_CHECKOUT_ROOT_BYTES = 4_096;
 export const MAX_INDEX_PATH_BYTES = 8 * 1_024;
 export const MAX_SCRATCH_INDEXES_PER_REPOSITORY = 16;
 export const MAX_SCRATCH_INDEX_NAME_BYTES = 255;
@@ -145,7 +144,6 @@ const STATEMENTS = [
      ),
      root TEXT NOT NULL UNIQUE CHECK (
        typeof(root) = 'text'
-       AND length(CAST(root AS BLOB)) BETWEEN 1 AND ${MAX_CHECKOUT_ROOT_BYTES}
        AND substr(root, 1, 1) = '/'
        AND (root = '/' OR substr(root, -1) != '/')
        AND instr(root, char(0)) = 0
@@ -640,7 +638,7 @@ const STATEMENTS = [
        typeof(mode) = 'text' AND mode IN ('40000','040000','100644','100755','120000','160000')
      ),
      name_bytes BLOB NOT NULL CHECK (
-       typeof(name_bytes) = 'blob' AND length(name_bytes) BETWEEN 1 AND 2200
+       typeof(name_bytes) = 'blob' AND length(name_bytes) >= 1
      ),
      oid TEXT NOT NULL CHECK (typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40),
      raw_entry BLOB NOT NULL CHECK (typeof(raw_entry) = 'blob'),
@@ -655,7 +653,7 @@ const STATEMENTS = [
 
   `CREATE INDEX IF NOT EXISTS git_tree_entries_by_name_bytes
      ON git_tree_entries (source_key, name_bytes)
-     WHERE typeof(name_bytes) = 'blob' AND length(name_bytes) <= 2200`,
+     WHERE typeof(name_bytes) = 'blob'`,
 
   `CREATE VIEW IF NOT EXISTS git_tree_entries_wide AS
      SELECT s.repo_id, s.tree_oid, s.storage, s.source_id,
@@ -809,7 +807,6 @@ const STATEMENTS = [
      cursor_text TEXT CHECK (
        cursor_text IS NULL OR (
          typeof(cursor_text) = 'text'
-         AND length(CAST(cursor_text AS BLOB)) BETWEEN 0 AND ${MAX_CHECKOUT_ROOT_BYTES}
          AND instr(cursor_text, char(0)) = 0
        )
      ),

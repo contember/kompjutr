@@ -8,7 +8,12 @@ import {
   type TreeEntry,
   TreeParser,
 } from "../src/core/objects.js";
-import { readBlob, type SqlDatabase } from "../src/sqlite/db.js";
+import {
+  MAX_OPERATION_MEMORY_BYTES,
+  MemoryCoordinator,
+  type MemoryReservation,
+} from "../src/memory.js";
+import { Database, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
 import { PackTreeIndex } from "../src/sqlite/pack-ingest-index.js";
 import {
   createTreeIndexSink,
@@ -19,7 +24,11 @@ import {
   type TreeSource,
 } from "../src/sqlite/schema.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
-import { indexSeededTreeSource } from "../src/sqlite/tree-index.js";
+import {
+  indexSeededTreeSource,
+  indexSeededTreeSources,
+  type TreeSourceInput,
+} from "../src/sqlite/tree-index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const OID = "11".repeat(20);
@@ -170,7 +179,7 @@ describe("incremental tree parser", () => {
     expect(bytewise.at(-1)?.observedSize).toBe(data.length);
   });
 
-  it("fails closed for every partial field and while an overlong field grows", () => {
+  it("fails closed for partial fields and accepts the former name first excess", () => {
     const partialOid = concat([utf8.encode("100644 file\0"), new Uint8Array(19)]);
     for (const partial of [utf8.encode("100644"), utf8.encode("100644 file"), partialOid]) {
       const parser = new TreeParser();
@@ -180,10 +189,11 @@ describe("incremental tree parser", () => {
 
     const mode = new TreeParser();
     expect(() => consume(mode, utf8.encode("1006444"))).toThrow("tree mode is too long");
-    const name = new TreeParser();
-    expect(() => consume(name, utf8.encode(`100644 ${"a".repeat(2_201)}`))).toThrow(
-      "tree entry name is too long",
-    );
+
+    const formerExcess = "a".repeat(2_201);
+    expect(parseTree(rawEntry("100644", formerExcess))).toEqual([
+      { mode: "100644", name: formerExcess, oid: OID },
+    ]);
   });
 
   it("rejects invalid UTF-8 names in scalar and incremental parsing", () => {
@@ -338,6 +348,220 @@ describe("incremental tree index sink", () => {
     expect(db.sharedEntryPayload).toBe(true);
     expect(db.writes.at(-1)).toBe("marker");
     expect(inner.storage.statementCount).toBeLessThan(1_000);
+  });
+
+  it("indexes an oversized singleton outside the 704 KiB batching arena", () => {
+    const name = "x".repeat(704 * 1024 + 1);
+    const data = rawEntry("100644", name);
+    const db = new TestDatabase();
+    initializeTreeSchema(db);
+
+    db.transactionSync(() => indexTreeSource(db, source(data.length), [data]));
+
+    expect(
+      db.one<{ complete: number; entry_count: number; name_length: number }>(
+        `SELECT source.complete, source.entry_count, length(entry.name_bytes) AS name_length
+           FROM git_tree_sources source
+           JOIN git_tree_entries entry ON entry.source_key = source.source_key
+          WHERE source.repo_id = 1 AND source.tree_oid = ? AND entry.ordinal = 0`,
+        TREE_OID,
+      ),
+    ).toEqual({ complete: 1, entry_count: 1, name_length: name.length });
+
+    const database = new SqliteGitDatabase(new TestDatabase());
+    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
+    const oid = store.write("tree", data);
+    expect([...store.walkTree(oid)]).toEqual([{ path: name, mode: "100644", oid: OID }]);
+    store.shared.memory.assertIdle();
+  });
+
+  it("composes oversized parser, arena, and direct binding ownership exactly", () => {
+    const data = rawEntry("100644", "x".repeat(704 * 1024 + 1));
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    const measuredDb = new TestDatabase();
+    initializeTreeSchema(measuredDb);
+    measuredDb.transactionSync(() =>
+      indexTreeSource(measuredDb, source(data.length), [data], measuredOwner),
+    );
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      const db = new TestDatabase();
+      initializeTreeSchema(db);
+      try {
+        const index = () =>
+          db.transactionSync(() => indexTreeSource(db, source(data.length), [data], owner));
+        if (excess === 0) expect(index).not.toThrow();
+        else expect(index).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
+  });
+
+  it("owns direct pack tree streams by their actual current chunk", () => {
+    const data = rawEntry("100644", "x".repeat(32 * 1024));
+    const run = (coordinator: MemoryCoordinator) => {
+      const owner = coordinator.reserve();
+      const db = new TestDatabase();
+      initializeTreeSchema(db);
+      const index = new PackTreeIndex(db, owner);
+      index.addStream(1, TREE_OID, 1, data.length, () => [data]);
+      return { db, owner };
+    };
+
+    const measured = new MemoryCoordinator();
+    const baseline = run(measured);
+    const operationBytes = baseline.owner.highWaterBytes;
+    expect(operationBytes).toBeLessThan(2 * ONE_MIB);
+    expect(baseline.owner.currentBytes).toBe(0);
+    baseline.owner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      const db = new TestDatabase();
+      initializeTreeSchema(db);
+      const index = new PackTreeIndex(db, owner);
+      try {
+        const add = () => index.addStream(1, TREE_OID, 1, data.length, () => [data]);
+        if (excess === 0) expect(add).not.toThrow();
+        else expect(add).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
+          excess === 0 ? 1 : 0,
+        );
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
+  });
+
+  it("pre-admits multi-source pack seed serialization before its SQL write", () => {
+    const count = 2_048;
+    const empty = new Uint8Array(0);
+    const stage = (db: TestDatabase, owner: MemoryReservation) => {
+      const index = new PackTreeIndex(db, owner);
+      for (let at = 0; at < count; at++) {
+        index.addBuffered(1, (at + 1).toString(16).padStart(40, "0"), 1, 0, empty);
+      }
+      return index;
+    };
+
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    const measuredDb = new TestDatabase();
+    initializeTreeSchema(measuredDb);
+    const measuredIndex = stage(measuredDb, measuredOwner);
+    const retainedBytes = measuredOwner.currentBytes;
+    measuredIndex.flush();
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(retainedBytes);
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const owner = coordinator.reserve();
+      const db = new TestDatabase();
+      initializeTreeSchema(db);
+      const index = stage(db, owner);
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      db.storage.histogram = new Map();
+      try {
+        const flush = () => index.flush();
+        if (excess === 0) expect(flush).not.toThrow();
+        else expect(flush).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(
+          excess === 0 ? count : 0,
+        );
+        if (excess === 1) {
+          expect(
+            [...db.storage.histogram.keys()].some((query) =>
+              query.startsWith("INSERT OR IGNORE INTO git_tree_sources"),
+            ),
+          ).toBe(false);
+        }
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
+  });
+
+  it("streams seeded marker RETURNING rows through the production adapter", () => {
+    const count = 32;
+    const sources: TreeSourceInput[] = Array.from({ length: count }, (_, at) => ({
+      repoId: 1,
+      treeOid: (at + 1).toString(16).padStart(40, "0"),
+      storage: "loose",
+      sourceId: 0,
+      objectSize: 0,
+      chunks: [],
+    }));
+    const open = (): Database => {
+      const db = new Database(new TestDatabase().storage);
+      initializeTreeSchema(db);
+      db.run(
+        `INSERT INTO git_tree_sources
+           (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
+         SELECT 1, value, 'loose', 0, 0, ?, NULL, NULL FROM json_each(?)`,
+        0,
+        JSON.stringify(sources.map((entry) => entry.treeOid)),
+      );
+      return db;
+    };
+
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    const measuredDb = open();
+    measuredDb.transactionSync(() => indexSeededTreeSources(measuredDb, sources, measuredOwner));
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      const db = open();
+      try {
+        const index = () => db.transactionSync(() => indexSeededTreeSources(db, sources, owner));
+        if (excess === 0) expect(index).not.toThrow();
+        else expect(index).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources WHERE complete = 1")).toBe(
+          excess === 0 ? count : 0,
+        );
+        expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_entries")).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
   });
 
   it("keeps marker formulas and legacy adapters byte-exact", () => {

@@ -4,8 +4,10 @@ import { openRepository } from "../src/core/context.js";
 import { CorruptError, GitError } from "../src/core/errors.js";
 import { commit } from "../src/core/ops/commit.js";
 import { eagerStatus, type StatusOptions, status, statusStream } from "../src/core/ops/status.js";
+import { FullStatusTrackerSeed, sparseStatus } from "../src/core/ops/status-sparse.js";
 import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
 import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   advanceIndexTrackerBaseline,
@@ -14,6 +16,7 @@ import {
   resealIndexTracker,
   WORKTREE_DIRTY,
 } from "../src/sqlite/index-tracker.js";
+import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../src/sqlite/maintenance/control.js";
 import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSparseWorkspaceSource,
@@ -966,7 +969,7 @@ describe("sparse eager status", () => {
     });
   });
 
-  it("returns normal status and skips reseal above the retained-memory cap", () => {
+  it("returns normal status and reseals past the former retained-memory cap", () => {
     const workspace = makeRepo("/");
     const suffix = "x".repeat(2_000);
     workspace.repo.checkout.indexReplace(
@@ -979,10 +982,11 @@ describe("sparse eager status", () => {
     expect(
       eagerStatus(workspace.repo, workspace.worktree, { untrackedFiles: "all" }, recorded.context),
     ).toHaveLength(4_000);
-    expect(recorded.reseals).toEqual([]);
+    expect(recorded.reseals).toHaveLength(1);
+    expect(recorded.reseals[0]?.entries).toHaveLength(4_000);
   });
 
-  it("skips reseal for a worktree leaf the tracker cannot represent", () => {
+  it("reseals a worktree leaf past the former tracker path ceiling", () => {
     const workspace = makeRepo("/");
     const path = "x".repeat(2_201);
     writeWorkFile(workspace, `/${path}`, "large path\n");
@@ -991,7 +995,41 @@ describe("sparse eager status", () => {
     expect(
       eagerStatus(workspace.repo, workspace.worktree, { untrackedFiles: "all" }, recorded.context),
     ).toEqual([expect.objectContaining({ path })]);
-    expect(recorded.reseals).toEqual([]);
+    expect(recorded.reseals).toEqual([
+      expect.objectContaining({ entries: [{ path, flags: WORKTREE_DIRTY }] }),
+    ]);
+  });
+
+  it("reseals at exact shared headroom and cleans up first excess", () => {
+    const path = "x".repeat(2_201);
+    const measuredCoordinator = new MemoryCoordinator();
+    const measuredOwner = measuredCoordinator.reserve();
+    const measured = new FullStatusTrackerSeed(measuredOwner);
+    measured.observeUntracked(path);
+    measured.finish();
+    expect(measured.resealable).toBe(true);
+    const operationBytes = measuredOwner.highWaterBytes;
+    measured.dispose();
+    measuredOwner.dispose();
+    measuredCoordinator.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      const seed = new FullStatusTrackerSeed(owner);
+      try {
+        seed.observeUntracked(path);
+        seed.finish();
+        expect(seed.resealable).toBe(excess === 0);
+      } finally {
+        seed.dispose();
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
   });
 
   it("uses the tree diff when HEAD changes after the tracker baseline", () => {
@@ -1053,6 +1091,143 @@ describe("sparse eager status", () => {
       eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, context),
     ).toEqual([]);
     expect(workspace.storage.statementCount).toBeLessThan(1_000);
+  });
+
+  it("holds sparse hydration and exact hashes at shared headroom and cleans up first excess", () => {
+    const makeFixture = () => {
+      const workspace = makeRepo("/");
+      writeWorkFile(workspace, "/a.txt", "before\n");
+      commitFiles(workspace, ["a.txt"]);
+      sealIndexTracker(workspace);
+      workspace.tick(60_000);
+      writeWorkFile(workspace, "/a.txt", "after\n");
+      const source = requireSparseWorkspace(workspace);
+      const state = source.readState(workspace.repo.checkout.checkoutId);
+      if (!state.available) throw new Error("missing sparse fixture baseline");
+      let reseals = 0;
+      const context: Pick<GitContext, "sparseWorkspace" | "indexTracker"> = {
+        sparseWorkspace: source,
+        indexTracker: {
+          reseal() {
+            reseals++;
+            return true;
+          },
+        },
+      };
+      return { workspace, state, context, reseals: () => reseals };
+    };
+
+    const measured = makeFixture();
+    const measuredOwner = measured.workspace.repo.store.reserveMemory();
+    const measuredWorktree = new NoScanWorktree(measured.workspace.worktree);
+    expect(
+      sparseStatus(
+        measured.workspace.repo,
+        measuredWorktree,
+        {},
+        measured.context,
+        measured.state.baselineTreeOid,
+        measuredOwner,
+      ),
+    ).toEqual([expect.objectContaining({ path: "a.txt", worktree: "M" })]);
+    expect(measuredWorktree.bulkReadPaths).toEqual(["/a.txt"]);
+    expect(measured.reseals()).toBe(1);
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
+
+    for (const excess of [0, 1]) {
+      const fixture = makeFixture();
+      const blocker = fixture.workspace.repo.store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = fixture.workspace.repo.store.reserveMemory();
+      const worktree = new NoScanWorktree(fixture.workspace.worktree);
+      try {
+        const result = sparseStatus(
+          fixture.workspace.repo,
+          worktree,
+          {},
+          fixture.context,
+          fixture.state.baselineTreeOid,
+          owner,
+        );
+        expect(result).toEqual(
+          excess === 0 ? [expect.objectContaining({ path: "a.txt", worktree: "M" })] : null,
+        );
+        expect(worktree.bulkReadPaths).toEqual(["/a.txt"]);
+        expect(fixture.reseals()).toBe(excess === 0 ? 1 : 0);
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+    }
+  });
+
+  it("propagates E2BIG from sparse tracker publication", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "before\n");
+    commitFiles(workspace, ["a.txt"]);
+    sealIndexTracker(workspace);
+    workspace.tick(60_000);
+    writeWorkFile(workspace, "/a.txt", "after\n");
+    const context: Pick<GitContext, "sparseWorkspace" | "indexTracker"> = {
+      sparseWorkspace: requireSparseWorkspace(workspace),
+      indexTracker: {
+        reseal() {
+          throw new GitError("E2BIG", "injected sparse tracker publication failure");
+        },
+      },
+    };
+
+    expect(() =>
+      eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, context),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "E2BIG",
+        message: "injected sparse tracker publication failure",
+      }),
+    );
+  });
+
+  it("propagates native structural failure from sparse tracker publication", () => {
+    const workspace = makeRepo("/");
+    writeWorkFile(workspace, "/a.txt", "before\n");
+    commitFiles(workspace, ["a.txt"]);
+    sealIndexTracker(workspace);
+    workspace.tick(60_000);
+    writeWorkFile(workspace, "/a.txt", "after\n");
+    workspace.database.db.run(
+      "UPDATE git_maintenance_control SET root_epoch = ? WHERE repo_id = ?",
+      Number.MAX_SAFE_INTEGER,
+      workspace.repo.store.repoId,
+    );
+    const context: Pick<GitContext, "sparseWorkspace" | "indexTracker"> = {
+      sparseWorkspace: requireSparseWorkspace(workspace),
+      indexTracker: {
+        reseal(checkoutId, baselineTreeOid, entries, owningReservation) {
+          return resealIndexTracker(
+            workspace.database.db,
+            checkoutId,
+            baselineTreeOid,
+            entries,
+            owningReservation,
+          );
+        },
+      },
+    };
+
+    expect(() =>
+      eagerStatus(workspace.repo, new NoScanWorktree(workspace.worktree), {}, context),
+    ).toThrowError(
+      expect.objectContaining({ code: "E2BIG", message: MAINTENANCE_ROOT_EPOCH_EXHAUSTED }),
+    );
+    expect(
+      readIndexTrackerState(workspace.database.db, workspace.repo.checkout.checkoutId),
+    ).toEqual({ available: true, baselineTreeOid: workspace.repo.headTree() });
+    expect([
+      ...requireSparseWorkspace(workspace).dirtyPaths(workspace.repo.checkout.checkoutId),
+    ]).toEqual([{ path: "a.txt", flags: WORKTREE_DIRTY }]);
   });
 
   it("propagates sparse hydration corruption without resealing", () => {

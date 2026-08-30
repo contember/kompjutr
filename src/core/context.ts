@@ -62,6 +62,7 @@ export interface IndexTrackerWriter {
     checkoutId: number,
     baselineTreeOid: string | null,
     entries: Iterable<IndexTrackerSeedEntry>,
+    owningReservation?: MemoryReservation,
   ): boolean;
   /** Move a sealed baseline without clearing its dirty journal. */
   advanceBaseline?(checkoutId: number, baselineTreeOid: string | null): boolean;

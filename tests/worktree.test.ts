@@ -10,11 +10,12 @@ import {
   hashWorktreePaths,
   hashWorktreePathsOwned,
   MAX_COMPILED_PATHS,
-  MAX_COMPILED_PATHSPEC_BYTES,
+  releaseCompiledPathspecs,
   WORKTREE_SCAN_PAGE,
   type WorktreePath,
   walkWorktree,
   walkWorktreeEntriesStream,
+  walkWorktreeEntriesStreamOwned,
   walkWorktreeStream,
 } from "../src/core/ops/worktree-io.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -561,24 +562,85 @@ describe("walkWorktreeStream", () => {
 
     for (const fixture of cases) {
       expect(matchesPaths(fixture.path, fixture.paths)).toBe(fixture.expected);
-      expect(compilePathspecs(fixture.paths).matches(fixture.path)).toBe(fixture.expected);
+      const compiled = compilePathspecs(fixture.paths);
+      try {
+        expect(compiled.matches(fixture.path)).toBe(fixture.expected);
+      } finally {
+        releaseCompiledPathspecs(compiled);
+      }
     }
-    expect(compilePathspecs(["dir///"]).matchesEntry("dir")).toBe(true);
-    expect(compilePathspecs(["/"]).matchesEntry("anything")).toBe(true);
+    const directory = compilePathspecs(["dir///"]);
+    const root = compilePathspecs(["/"]);
+    try {
+      expect(directory.matchesEntry("dir")).toBe(true);
+      expect(root.matchesEntry("anything")).toBe(true);
+    } finally {
+      releaseCompiledPathspecs(root);
+      releaseCompiledPathspecs(directory);
+    }
   });
 
-  it("bounds compiled pathspec count and request bytes before sorting", () => {
-    expect(() =>
-      compilePathspecs(Array.from({ length: MAX_COMPILED_PATHS }, () => "x")),
-    ).not.toThrow();
+  it("bounds compiled pathspec count but accepts values above the former byte ceiling", () => {
+    const exact = compilePathspecs(Array.from({ length: MAX_COMPILED_PATHS }, () => "x"));
+    releaseCompiledPathspecs(exact);
     expect(() =>
       compilePathspecs(Array.from({ length: MAX_COMPILED_PATHS + 1 }, () => "x")),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
 
-    expect(() => compilePathspecs(["x".repeat(MAX_COMPILED_PATHSPEC_BYTES - 4)])).not.toThrow();
-    expect(() => compilePathspecs(["x".repeat(MAX_COMPILED_PATHSPEC_BYTES - 3)])).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    const long = "x".repeat(1024 * 1024 - 3);
+    const compiled = compilePathspecs([long]);
+    try {
+      expect(compiled.matches(long)).toBe(true);
+      expect(compiled.matchesEntry(long)).toBe(true);
+    } finally {
+      releaseCompiledPathspecs(compiled);
+    }
+  });
+
+  it("owns compiled pathspec collections through an owned traversal", () => {
+    const workspace = makeRepo("/");
+    const directory = "x".repeat(1024 * 1024 - 16);
+    workspace.worktree.makeDirectories([`/${directory}`]);
+    workspace.worktree.writeFile(`/${directory}/kept`, new Uint8Array([1]));
+    const paths = [`${directory}/missing`];
+
+    const measured = workspace.repo.store.reserveMemory();
+    expect([
+      ...walkWorktreeEntriesStreamOwned(workspace.worktree, "/", measured, { paths }),
+    ]).toEqual([]);
+    const traversalBytes = measured.highWaterBytes;
+    expect(measured.currentBytes).toBe(0);
+    measured.dispose();
+    workspace.repo.store.memory.assertIdle();
+
+    const exactBlocker = workspace.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - traversalBytes);
+    const exact = workspace.repo.store.reserveMemory();
+    try {
+      expect([
+        ...walkWorktreeEntriesStreamOwned(workspace.worktree, "/", exact, { paths }),
+      ]).toEqual([]);
+      expect(exact.currentBytes).toBe(0);
+      expect(exact.highWaterBytes + exactBlocker.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exact.dispose();
+      exactBlocker.dispose();
+    }
+    workspace.repo.store.memory.assertIdle();
+
+    const overBlocker = workspace.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - traversalBytes + 1);
+    const over = workspace.repo.store.reserveMemory();
+    try {
+      expect(() => [
+        ...walkWorktreeEntriesStreamOwned(workspace.worktree, "/", over, { paths }),
+      ]).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(over.currentBytes).toBe(0);
+    } finally {
+      over.dispose();
+      overBlocker.dispose();
+    }
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("prunes later pages after observing only the current scan page", () => {
@@ -741,7 +803,8 @@ describe("batched worktree hashing", () => {
       expect(() =>
         nativeRealpathOwned(realpathWorkspace.worktree, deep, overRealpath),
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(realpathWorkspace.storage.statementCount).toBe(0);
+      // The metadata preflight must refuse before the payload query.
+      expect(realpathWorkspace.storage.statementCount).toBe(1);
     } finally {
       overRealpath.dispose();
       overRealpathBlocker.dispose();
@@ -764,7 +827,8 @@ describe("batched worktree hashing", () => {
       expect(() =>
         nativeRealpathOwned(realpathWorkspace.worktree, "/owned-link", overExpansion),
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(realpathWorkspace.storage.statementCount).toBe(1);
+      // Resolve the link, then refuse after the expanded-path metadata preflight.
+      expect(realpathWorkspace.storage.statementCount).toBe(3);
     } finally {
       overExpansion.dispose();
       overExpansionBlocker.dispose();

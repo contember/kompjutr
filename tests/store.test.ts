@@ -6,6 +6,7 @@ import { concat, utf8 } from "../src/core/bytes.js";
 import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
 import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { retainedStringBytes } from "../src/core/retained.js";
 import { deflate } from "../src/core/zlib.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { MAX_CACHED_CONTENT_ID_BYTES } from "../src/sqlite/blob-id-cache.js";
@@ -22,7 +23,9 @@ import {
   ancestors,
   blobIdMismatchRetainedBytes,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
+  configGetOwned,
   contentIdKey,
+  createRefMutationMemoryOwner,
   MAX_BLOB_ID_MISMATCH_RETAINED_BYTES,
   MAX_CONFIG_SECTION_MOVE_ROWS,
   MAX_CONFIG_SECTION_MOVE_TEXT_BYTES,
@@ -3073,6 +3076,60 @@ describe("refs, config and index", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
     expect(over.db.storage.statementCount).toBeLessThan(1_000);
+  });
+
+  it("retains an owned config value and refuses one byte before reading its payload", () => {
+    const path = "user.name";
+    const value = "v".repeat(8_192);
+    const valueBytes = utf8.encode(value).byteLength;
+    const retainedValueBytes = 256 + 8 + retainedStringBytes(value);
+    const operationBytes = retainedValueBytes + 512 + 2 * valueBytes;
+    const setup = open();
+    setup.store.configSet(path, value);
+
+    const exactDb = new TestDatabase(setup.db.storage);
+    const exactDatabase = new SqliteGitDatabase(exactDb);
+    const exactCheckout = exactDatabase.checkoutAt("/repo");
+    if (exactCheckout === null) throw new Error("owned config checkout is missing");
+    const exactStore = exactDatabase.openCheckout(exactCheckout);
+    const exactBlocker = exactStore.shared.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactOwner = createRefMutationMemoryOwner(exactStore.shared);
+    exactDb.storage.histogram = new Map();
+    exactDb.storage.resetCounters();
+    try {
+      expect(configGetOwned(exactStore.shared, path, exactOwner)).toBe(value);
+      expect(exactOwner.memoryReservation().currentBytes).toBe(retainedValueBytes);
+      expect(exactOwner.owns(value)).toBe(true);
+      expect(exactStore.shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exactDb.storage.statementCount).toBe(2);
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    exactStore.shared.memory.assertIdle();
+
+    const overDb = new TestDatabase(setup.db.storage);
+    const overDatabase = new SqliteGitDatabase(overDb);
+    const overCheckout = overDatabase.checkoutAt("/repo");
+    if (overCheckout === null) throw new Error("owned config checkout is missing");
+    const overStore = overDatabase.openCheckout(overCheckout);
+    const overBlocker = overStore.shared.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const overOwner = createRefMutationMemoryOwner(overStore.shared);
+    overDb.storage.histogram = new Map();
+    overDb.storage.resetCounters();
+    try {
+      expect(() => configGetOwned(overStore.shared, path, overOwner)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(overOwner.memoryReservation().currentBytes).toBe(256);
+      expect(overDb.storage.statementCount).toBe(1);
+    } finally {
+      overOwner.dispose();
+      overBlocker.dispose();
+    }
+    overStore.shared.memory.assertIdle();
   });
 
   it("detects a multi-valued config key after inspecting only two metadata rows", () => {

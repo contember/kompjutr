@@ -68,7 +68,7 @@ const CHECKOUT_WINDOW_ROWS = 1_000;
 const CHECKOUT_REMOVAL_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_PRUNE_BYTES = 16 * 1024 * 1024;
 const CHECKOUT_PRUNE_PATHS = 50_000;
-const CHECKOUT_REMOVE_BINDING_BYTES = 1_000_000;
+const CHECKOUT_REMOVE_FLUSH_BYTES = 1_000_000;
 const CHECKOUT_PATH_FIXED_BYTES = 96;
 const CHECKOUT_UNMERGED_PATHS = 10_000;
 const CHECKOUT_UNMERGED_BYTES = 4 * 1024 * 1024;
@@ -340,7 +340,7 @@ function discardUnmergedPaths(
       physical.push(row.left);
     }
   }
-  for (const batch of planWorktreeRemovalBatches(repo, physical, "checkout conflict removal")) {
+  for (const batch of planWorktreeRemovalBatches(repo, physical)) {
     worktree.removeFiles(batch.map((path) => joinPath(repo.root, path)));
   }
   index.indexApply((sink) => {
@@ -460,7 +460,7 @@ function restoreStructuralConflicts(
   }
 
   const paths = [...removals].sort(comparePaths);
-  for (const batch of planWorktreeRemovalBatches(repo, paths, "checkout structural removal")) {
+  for (const batch of planWorktreeRemovalBatches(repo, paths)) {
     worktree.removeFiles(
       batch.map((path) => joinPath(repo.root, path)),
       { recursive: true },
@@ -588,7 +588,7 @@ function flushRemovals(
 ): void {
   if (removed.length === 0) return;
   const physical = removed.filter((path) => !preserved.has(path));
-  for (const batch of planWorktreeRemovalBatches(repo, physical, "checkout tracked removal")) {
+  for (const batch of planWorktreeRemovalBatches(repo, physical)) {
     worktree.removeFiles(batch.map((path) => joinPath(repo.root, path)));
   }
   for (let offset = 0; offset < removed.length; offset += CHECKOUT_WINDOW_ROWS) {
@@ -714,7 +714,7 @@ function planEmptyDirectories(
   }
   roots.sort(comparePaths);
   return {
-    batches: planWorktreeRemovalBatches(repo, roots, "checkout directory pruning"),
+    batches: planWorktreeRemovalBatches(repo, roots),
   };
 }
 
@@ -732,12 +732,8 @@ function pruneEmptyDirectories(
   }
 }
 
-/** Keep every JSON binding below the platform ceiling before the first delete. */
-function planWorktreeRemovalBatches(
-  repo: Repository,
-  paths: readonly string[],
-  label: string,
-): string[][] {
+/** Split ordinary removals at the flush target; larger singletons still reach the worktree. */
+function planWorktreeRemovalBatches(repo: Repository, paths: readonly string[]): string[][] {
   const batches: string[][] = [];
   let batch: string[] = [];
   let bytes = 2;
@@ -751,11 +747,8 @@ function planWorktreeRemovalBatches(
   for (const path of paths) {
     const absolute = joinPath(repo.root, path);
     const itemBytes = utf8.encode(JSON.stringify(absolute)).byteLength;
-    if (itemBytes + 2 > CHECKOUT_REMOVE_BINDING_BYTES) {
-      throw new GitError("E2BIG", `${label} path exceeds ${CHECKOUT_REMOVE_BINDING_BYTES} bytes`);
-    }
     const separator = batch.length === 0 ? 0 : 1;
-    if (batch.length > 0 && bytes + separator + itemBytes > CHECKOUT_REMOVE_BINDING_BYTES) flush();
+    if (batch.length > 0 && bytes + separator + itemBytes > CHECKOUT_REMOVE_FLUSH_BYTES) flush();
     batch.push(path);
     bytes += (batch.length === 1 ? 0 : 1) + itemBytes;
   }

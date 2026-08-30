@@ -1,13 +1,12 @@
 // Bounded exact-identity rename pairing shared by status and diff.
 
-import { isOid, utf8 } from "../bytes.js";
+import { isOid } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
 import { comparePaths } from "../streams.js";
 
 export const MAX_EXACT_RENAME_CANDIDATES = 10_000;
 export const MAX_EXACT_RENAME_RETAINED_BYTES = 16 * 1024 * 1024;
-const MAX_RENAME_PATH_BYTES = 2_200;
 const RENAME_CANDIDATE_FIXED_BYTES = 256;
 const RENAME_CONFIG_BYTES = 16;
 const TRUE_CONFIG_VALUES = new Set(["1", "true", "yes", "on"]);
@@ -157,8 +156,7 @@ export function classifyExactRenames(
 
 /** Retained charge reserves the candidate plus its future basename index. */
 export function exactRenameCandidateRetainedBytes(candidate: ExactRenameCandidate): number {
-  validateCandidate(candidate);
-  const pathBytes = utf8.encode(candidate.path).length;
+  const pathBytes = validateCandidate(candidate);
   return RENAME_CANDIDATE_FIXED_BYTES + pathBytes * 2;
 }
 
@@ -197,28 +195,50 @@ function pairBucket(bucket: RenameBucket, output: ExactRename[]): void {
   }
 }
 
-function validateCandidate(candidate: ExactRenameCandidate): void {
-  if (
-    typeof candidate.path !== "string" ||
-    candidate.path.length === 0 ||
-    candidate.path.startsWith("/") ||
-    candidate.path.endsWith("/") ||
-    candidate.path.includes("\0") ||
-    candidate.path
-      .split("/")
-      .some((segment) => segment === "" || segment === "." || segment === "..")
-  ) {
+function validateCandidate(candidate: ExactRenameCandidate): number {
+  if (typeof candidate.path !== "string") {
     throw new CorruptError("rename candidate path is invalid");
   }
-  const pathBytes = utf8.encode(candidate.path).length;
-  if (pathBytes > MAX_RENAME_PATH_BYTES) {
-    throw new GitError(
-      "E2BIG",
-      `rename candidate path exceeds ${MAX_RENAME_PATH_BYTES} UTF-8 bytes`,
-    );
-  }
+  const pathBytes = validatePathAndCountUtf8(candidate.path);
   modeClass(candidate.mode);
   if (!isOid(candidate.oid)) throw new CorruptError("rename candidate object id is invalid");
+  return pathBytes;
+}
+
+function validatePathAndCountUtf8(path: string): number {
+  let bytes = 0;
+  let segmentStart = 0;
+  for (let index = 0; index <= path.length; index++) {
+    if (index === path.length || path.charCodeAt(index) === 0x2f) {
+      const length = index - segmentStart;
+      if (
+        length === 0 ||
+        (length === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
+        (length === 2 &&
+          path.charCodeAt(segmentStart) === 0x2e &&
+          path.charCodeAt(segmentStart + 1) === 0x2e)
+      ) {
+        throw new CorruptError("rename candidate path is invalid");
+      }
+      if (index < path.length) bytes++;
+      segmentStart = index + 1;
+      continue;
+    }
+    const unit = path.charCodeAt(index);
+    if (unit === 0) throw new CorruptError("rename candidate path is invalid");
+    if (unit < 0x80) bytes++;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = path.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 3;
+      }
+    } else bytes += 3;
+  }
+  return bytes;
 }
 
 function modeClass(mode: string): "regular" | "symlink" {

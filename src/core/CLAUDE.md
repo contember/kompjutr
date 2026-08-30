@@ -56,7 +56,9 @@ memory, format, platform, corruption, or structural limits.
 - **A new commit must produce a valid cache projection atomically with object
   visibility.** Reject malformed, oversized, or unsafe-numeric commits instead of
   storing an object the cache cannot represent.
-- Git paths cap at 2,200 UTF-8 bytes; tree traversal retains at most 16 MiB. Both fail closed.
+- Give Git paths and traversals no component byte ceiling. Validate grammar,
+  charge simultaneously live values to the shared operation owner, and surface
+  only real memory, format, platform, corruption, or structural failures.
 
 ## diff/ is not MIT
 

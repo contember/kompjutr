@@ -16,6 +16,7 @@ import {
   createTreeIndexSink,
   indexTreeSource,
   indexTreeSources,
+  type TreeSource,
   type TreeSourceInput,
 } from "./tree-index.js";
 
@@ -24,6 +25,8 @@ const PACK_TREE_BATCH_SOURCES = 2048;
 const PACK_TREE_SOURCE_BYTES = 256;
 export const PACK_TREE_CHUNK_BYTES = 64;
 const PACK_TREE_CHUNK_ARRAY_BYTES = 64;
+const PACK_TREE_DIRECT_FIXED_BYTES =
+  PACK_TREE_SOURCE_BYTES + PACK_TREE_CHUNK_ARRAY_BYTES + PACK_TREE_CHUNK_BYTES;
 const PACK_COMMIT_BATCH_SOURCES = 2048;
 const PACK_COMMIT_PARSE_BYTES = 1024;
 export const PACK_COMMIT_PAYLOAD_BYTES = 256;
@@ -419,10 +422,13 @@ export class PackTreeIndex {
       this.flush();
     }
     if (retained > PACK_TREE_BATCH_BYTES) {
-      this.#direct(() =>
-        indexTreeSource(this.db, this.#source(repoId, treeOid, sourceId, objectSize, [data]), [
-          data,
-        ]),
+      this.#direct(PACK_TREE_DIRECT_FIXED_BYTES, () =>
+        indexTreeSource(
+          this.db,
+          this.#directSource(repoId, treeOid, sourceId, objectSize),
+          [data],
+          this.reservation,
+        ),
       );
       return;
     }
@@ -440,9 +446,14 @@ export class PackTreeIndex {
     chunks: () => Iterable<Uint8Array>,
   ): void {
     this.flush();
-    this.#direct(() => {
-      const source = this.#source(repoId, treeOid, sourceId, objectSize, []);
-      indexTreeSource(this.db, source, chunks());
+    this.#direct(PACK_TREE_DIRECT_FIXED_BYTES, () => {
+      const source = this.#directSource(repoId, treeOid, sourceId, objectSize);
+      indexTreeSource(
+        this.db,
+        source,
+        this.#ownDirectChunks(chunks(), PACK_TREE_DIRECT_FIXED_BYTES),
+        this.reservation,
+      );
     });
   }
 
@@ -457,11 +468,15 @@ export class PackTreeIndex {
     const retained = this.#sourceBytes(target.length, chunkCount);
     if (retained > PACK_TREE_BATCH_BYTES) {
       this.flush();
-      this.#direct(() => {
-        const source = this.#source(repoId, treeOid, sourceId, objectSize, []);
-        const sink = createTreeIndexSink(this.db, source);
-        for (const chunk of target.chunks()) sink.push(chunk);
-        sink.finish();
+      this.#direct(PACK_TREE_DIRECT_FIXED_BYTES, () => {
+        const source = this.#directSource(repoId, treeOid, sourceId, objectSize);
+        const sink = createTreeIndexSink(this.db, source, this.reservation);
+        try {
+          for (const chunk of target.chunks()) sink.push(chunk);
+          sink.finish();
+        } finally {
+          sink.dispose();
+        }
       });
       return;
     }
@@ -489,7 +504,7 @@ export class PackTreeIndex {
   flush(): void {
     if (this.#sources.length === 0) return;
     try {
-      this.db.transactionSync(() => indexTreeSources(this.db, this.#sources));
+      this.db.transactionSync(() => indexTreeSources(this.db, this.#sources, this.reservation));
     } finally {
       this.#sources.length = 0;
       this.#payloadBytes = 0;
@@ -520,9 +535,28 @@ export class PackTreeIndex {
     return { repoId, treeOid, storage: "pack", sourceId, objectSize, chunks };
   }
 
-  #direct(write: () => void): void {
-    this.reservation.set("tree", PACK_TREE_BATCH_BYTES);
+  #directSource(repoId: number, treeOid: string, sourceId: number, objectSize: number): TreeSource {
+    return { repoId, treeOid, storage: "pack", sourceId, objectSize };
+  }
+
+  *#ownDirectChunks(chunks: Iterable<Uint8Array>, retainedBytes: number): Generator<Uint8Array> {
+    for (const chunk of chunks) {
+      const currentBytes = retainedBytes + chunk.length;
+      if (!Number.isSafeInteger(currentBytes)) {
+        throw new GitError("E2BIG", "packed tree stream ownership is too large");
+      }
+      this.reservation.set("tree", currentBytes);
+      try {
+        yield chunk;
+      } finally {
+        this.reservation.set("tree", retainedBytes);
+      }
+    }
+  }
+
+  #direct(retainedBytes: number, write: () => void): void {
     try {
+      this.reservation.set("tree", retainedBytes);
       this.db.transactionSync(write);
     } finally {
       this.reservation.clear("tree");

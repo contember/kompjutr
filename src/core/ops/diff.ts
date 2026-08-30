@@ -48,7 +48,6 @@ const DEFAULT_ABBREV = 7;
 const DIFF_WINDOW_ROWS = 1000;
 const DIFF_REPOSITORY_BYTES = 8 * 1024 * 1024;
 const DIFF_WORKTREE_BYTES = 8 * 1024 * 1024;
-const DIFF_PATH_BYTES = 2_200;
 const DIFF_SUMMARY_ENTRY_FIXED_BYTES = 128;
 const DIFF_SUMMARY_MAX_ROWS = 50_000;
 const MIB = 1024 * 1024;
@@ -287,7 +286,7 @@ function appendCombinedDiff(
   ) {
     return;
   }
-  preflightCombinedDiff(firstBytes, secondBytes, afterBytes, out.outputCeiling());
+  preflightCombinedDiff(firstBytes, secondBytes, afterBytes, out.outputCeiling(), change.path);
   appendCombinedHunks(
     out,
     utf8Decoder.decode(firstBytes),
@@ -317,6 +316,7 @@ function preflightCombinedDiff(
   second: Uint8Array,
   result: Uint8Array,
   outputCeiling: number,
+  path: string,
 ): void {
   const firstInfo = combinedInputInfo(first);
   const secondInfo = combinedInputInfo(second);
@@ -349,6 +349,7 @@ function preflightCombinedDiff(
       lines * DIFF_COMBINED_ROW_BYTES,
       resultInfo.lines * 2,
       outputCeiling * 2,
+      retainedStringBytes(path),
       DIFF_COMBINED_FIXED_BYTES,
     ],
     "retained memory",
@@ -648,7 +649,6 @@ export function diffHeaderPath(
 }
 
 function validateDiffPath(path: string): void {
-  let bytes = 0;
   for (let index = 0; index < path.length; index++) {
     const code = path.charCodeAt(index);
     if (code === 0) throw new GitError("EINVAL", "diff path must not contain NUL");
@@ -658,14 +658,8 @@ function validateDiffPath(path: string): void {
         throw new GitError("EINVAL", "diff path must be well-formed UTF-16");
       }
       index++;
-      bytes += 4;
     } else if (code >= 0xdc00 && code <= 0xdfff) {
       throw new GitError("EINVAL", "diff path must be well-formed UTF-16");
-    } else {
-      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3;
-    }
-    if (bytes > DIFF_PATH_BYTES) {
-      throw new GitError("E2BIG", `diff path exceeds ${DIFF_PATH_BYTES} UTF-8 bytes`);
     }
   }
 }

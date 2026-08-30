@@ -16,7 +16,7 @@ import { realpath } from "../../src/fs/store/resolve.js";
 import {
   DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES,
-  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES,
   DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS,
   DISCOVERY_EXCLUDE_ROOTS_MAX,
   DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES,
@@ -770,7 +770,7 @@ describe("discoverFiles", () => {
       const ranges = issued.bindings[index];
       if (typeof ranges !== "string") throw new Error("exclusion ranges were not JSON text");
       expect(new TextEncoder().encode(ranges).byteLength).toBeLessThanOrEqual(
-        DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+        DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES,
       );
       sourceRows += db.scalar<number>("SELECT count(*) FROM json_each(?)", ranges) ?? 0;
       if (index > 0) expect(ranges).toBe("[]");
@@ -780,12 +780,12 @@ describe("discoverFiles", () => {
     expect(recorder.maxResultBytes).toBe(0);
   });
 
-  it("rolls the first JSON value over without exceeding one SQL binding", () => {
-    const path = `/repo/${"x".repeat(4_090)}`;
+  it("pages JSON roots beyond the former 4096-unit boundary", () => {
+    const path = `/repo/${"x".repeat(4_091)}`;
     const item = JSON.stringify(path);
     const itemBytes = new TextEncoder().encode(item).byteLength;
     const exactItems = Math.floor(
-      (DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES - 1) / (itemBytes + 1),
+      (DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES - 1) / (itemBytes + 1),
     );
     const segments = discoveryExcludeRootsJsonSegments(
       Array.from({ length: exactItems + 1 }, () => path),
@@ -793,14 +793,34 @@ describe("discoverFiles", () => {
 
     expect(segments).toHaveLength(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS);
     expect(new TextEncoder().encode(segments[0] ?? "").byteLength).toBeLessThanOrEqual(
-      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES,
     );
     expect(new TextEncoder().encode(segments[1] ?? "").byteLength).toBeLessThanOrEqual(
-      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES,
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES,
     );
     expect(segments[0]).not.toBe("[]");
     expect(segments[1]).not.toBe("[]");
     expect(segments.slice(2).every((segment) => segment === "[]")).toBe(true);
+  });
+
+  it("passes a singleton above the JSON flush target through to SQLite", () => {
+    const db = open();
+    writeFiles(db, [{ path: "/repo/file.txt", bytes: new Uint8Array(0) }]);
+    const root = realpath(db, "/repo");
+    const longRoot = `/repo/${"x".repeat(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES)}`;
+    const recorder = new RecordingDatabase(db);
+
+    expect(discoverFiles(recorder, root, "*", { excludeRoots: [longRoot] }).handles).toHaveLength(
+      1,
+    );
+    const issued = recorder.queries[0];
+    if (issued === undefined) throw new Error("discovery statement was not recorded");
+    const firstBinding = issued.bindings[0];
+    if (typeof firstBinding !== "string") throw new Error("excluded roots were not JSON text");
+    expect(new TextEncoder().encode(firstBinding).byteLength).toBeGreaterThan(
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES,
+    );
+    expect(JSON.parse(firstBinding)).toEqual([longRoot]);
   });
 
   it("derives exact exclusion cardinality and memory bounds from global routing", () => {
@@ -832,10 +852,10 @@ describe("discoverFiles", () => {
         DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS -
         1,
     );
-    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES).toBe(1_500_000);
-    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS).toBe(26);
-    expect(DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS).toBe(32);
-    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES).toBeLessThan(2_000_000);
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES).toBe(1_500_000);
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS).toBe(52);
+    expect(DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS).toBe(58);
+    expect(DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES).toBeLessThan(2_000_000);
     expect(DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS).toBeLessThan(100);
     expect(DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES).toBeLessThan(100 * 1024 * 1024);
 

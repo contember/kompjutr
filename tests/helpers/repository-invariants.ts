@@ -15,7 +15,6 @@ import { readMaintenanceRunView } from "../../src/sqlite/maintenance/state.js";
 import { requireRawRefTarget, requireRefName } from "../../src/sqlite/ref-validation.js";
 import { createSqliteSparseWorkspaceSource } from "../../src/sqlite/sparse-workspace.js";
 import { SqliteGitDatabase, type StoreOptions } from "../../src/sqlite/store.js";
-import { TREE_WALK_PATH_BYTES } from "../../src/sqlite/tree-walk.js";
 import { TestDatabase } from "./db.js";
 import type { TestWorkspace } from "./workspace.js";
 
@@ -74,8 +73,8 @@ function requireIndexPath(value: unknown): string {
     } else {
       bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
     }
-    if (bytes > TREE_WALK_PATH_BYTES) {
-      throw new CorruptError("interleaving invariant index path exceeds its byte bound");
+    if (!Number.isSafeInteger(bytes)) {
+      throw new CorruptError("interleaving invariant index path size overflows");
     }
   }
   for (const segment of value.split("/")) {
@@ -182,8 +181,7 @@ function assertIndexReadable(repo: Repository): void {
   let rows = 0;
   const objects: string[] = [];
   for (const row of repo.store.db.iterate(
-    `SELECT CASE WHEN typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ?
-                 THEN path END AS path,
+    `SELECT CASE WHEN typeof(path) = 'text' THEN path END AS path,
             CASE WHEN typeof(stage) = 'integer' THEN stage END AS stage,
             CASE WHEN typeof(mode) = 'integer' THEN mode END AS mode,
             CASE WHEN typeof(oid) = 'text' AND length(CAST(oid AS BLOB)) = 40
@@ -197,7 +195,6 @@ function assertIndexReadable(repo: Repository): void {
             CASE WHEN rev IS NULL THEN NULL
                  WHEN typeof(rev) = 'integer' THEN rev ELSE -1 END AS rev
        FROM git_index WHERE checkout_id = ? ORDER BY path, stage`,
-    TREE_WALK_PATH_BYTES,
     repo.checkout.checkoutId,
   )) {
     rows++;
@@ -254,5 +251,10 @@ export function assertRepositoryReadable(repo: Repository): void {
       // Iteration validates every retained dirty row.
     }
   }
-  readMaintenanceRunView(repo.store.db, repo.store.repoId);
+  const maintenanceMemory = repo.store.reserveMemory();
+  try {
+    readMaintenanceRunView(repo.store.db, repo.store.repoId, maintenanceMemory);
+  } finally {
+    maintenanceMemory.dispose();
+  }
 }

@@ -25,7 +25,6 @@ export const DEFAULT_READ_BUDGET = 1_500_000;
 
 /** Bounds both the JSON binding and each path-lookup result set. */
 const LOOKUP_BATCH_BYTES = 1_500_000;
-const MAX_PATH_CODE_UNITS = 4096;
 
 interface NodeRow {
   path: string;
@@ -254,7 +253,6 @@ function validateHandleInputs(handles: readonly RegularFileHandle[]): void {
     if (handle === undefined) continue;
     if (
       typeof handle.path !== "string" ||
-      handle.path.length > MAX_PATH_CODE_UNITS ||
       !handle.path.startsWith("/") ||
       normalize(handle.path) !== handle.path
     ) {

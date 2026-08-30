@@ -2,12 +2,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { checkoutTree } from "../src/core/ops/checkout.js";
-import { compileReadPathspec, lsFilesResultRetainedBytes } from "../src/core/ops/pathspec.js";
+import {
+  type CompiledReadPathspec,
+  compileReadPathspec,
+  type LsFilesOptions,
+} from "../src/core/ops/pathspec.js";
 import { lsFilesAtRef } from "../src/core/ops/reads.js";
 import {
   lsFiles,
   lsFilesWithWorktree,
-  MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES,
   MAX_LS_FILES_EXCLUDE_ROOTS,
 } from "../src/core/ops/staging.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -21,6 +24,11 @@ import type {
   ScanEntry,
   ScanOptions,
 } from "../src/fs/types.js";
+import {
+  MAX_OPERATION_MEMORY_BYTES,
+  MemoryCoordinator,
+  type MemoryReservation,
+} from "../src/memory.js";
 import type { IndexEntry } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
@@ -29,6 +37,18 @@ import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspac
 import { CountingWorktree } from "./helpers/worktree.js";
 
 const fixtures: GitFixture[] = [];
+
+function withCompiledPathspec<T>(
+  options: LsFilesOptions,
+  use: (pathspec: CompiledReadPathspec) => T,
+): T {
+  const pathspec = compileReadPathspec(options);
+  try {
+    return use(pathspec);
+  } finally {
+    pathspec.release();
+  }
+}
 
 afterEach(() => {
   while (fixtures.length > 0) fixtures.pop()?.dispose();
@@ -288,7 +308,9 @@ describe("ls-files pathspec", () => {
       );
     }
 
-    expect(compileReadPathspec({ paths: [] }).collect(["a"])).toEqual(["a"]);
+    expect(withCompiledPathspec({ paths: [] }, (pathspec) => pathspec.collect(["a"]))).toEqual([
+      "a",
+    ]);
     expect(() => compileReadPathspec({ paths: [""] })).toThrowError(
       expect.objectContaining({ code: "EINVAL" }),
     );
@@ -296,20 +318,27 @@ describe("ls-files pathspec", () => {
 
   it("fails closed immediately above every injected structural limit", () => {
     expect(() =>
-      compileReadPathspec({ paths: ["?"], limits: { maxPatternBytes: 1, maxInputBytes: 1 } }),
-    ).not.toThrow();
-    expect(() =>
-      compileReadPathspec({ paths: ["?"], limits: { maxPatternBytes: 0 } }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(() => compileReadPathspec({ paths: ["?"], limits: { maxInputBytes: 0 } })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
-    expect(() =>
-      compileReadPathspec({ paths: ["?"], limits: { maxWildcardTokens: 1 } }),
+      withCompiledPathspec({ paths: ["?"], limits: { maxWildcardTokens: 1 } }, () => {}),
     ).not.toThrow();
     expect(() =>
       compileReadPathspec({ paths: ["?"], limits: { maxWildcardTokens: 0 } }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+
+    expect(
+      withCompiledPathspec({ paths: ["x".repeat(2_201)] }, (pathspec) =>
+        pathspec.collect(["x".repeat(2_201)]),
+      ),
+    ).toEqual(["x".repeat(2_201)]);
+
+    const cumulative = Array.from(
+      { length: 40 },
+      (_, index) => `${index.toString().padStart(2, "0")}-${"y".repeat(1_700)}`,
+    );
+    expect(
+      withCompiledPathspec({ paths: cumulative }, (pathspec) =>
+        pathspec.collect([cumulative[39] ?? ""]),
+      ),
+    ).toEqual([cumulative[39]]);
   });
 
   it("fails rather than truncating matcher or retained results", () => {
@@ -326,20 +355,89 @@ describe("ls-files pathspec", () => {
       lsFiles(workspace.repo, { paths: ["?"], limits: { maxMatcherWork: 1 } }),
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
 
-    const oneResult = lsFilesResultRetainedBytes("a");
-    expect(
-      lsFiles(workspace.repo, {
-        paths: ["a"],
-        limits: { maxRetainedBytes: oneResult },
-      }),
-    ).toEqual(["a"]);
-    expect(() =>
-      lsFiles(workspace.repo, {
-        paths: ["a"],
-        limits: { maxRetainedBytes: oneResult - 1 },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    const measuredPathspec = compileReadPathspec({ paths: ["a"] }, measuredOwner);
+    try {
+      expect(measuredPathspec.collect(["a"])).toEqual(["a"]);
+    } finally {
+      measuredPathspec.release();
+    }
+    const operationBytes = measured.highWaterBytes;
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      try {
+        const collect = (): string[] => {
+          const pathspec = compileReadPathspec({ paths: ["a"] }, owner);
+          try {
+            return pathspec.collect(["a"]);
+          } finally {
+            pathspec.release();
+          }
+        };
+        if (excess === 0) expect(collect()).toEqual(["a"]);
+        else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
   });
+
+  it.each([
+    ["segmented", { paths: ["dir/./leaf"] }, ["dir/leaf"], ["dir/leaf"]],
+    ["glob", { paths: ["src/*?.ts"] }, ["src/a.ts", "src/no.js"], ["src/a.ts"]],
+    [
+      "coalescing",
+      { paths: ["dir", "dir/file", "other/file"] },
+      ["dir/file", "other/file"],
+      ["dir/file", "other/file"],
+    ],
+    ["unmatched", { paths: ["*.ts"] }, ["a.js", "b.js"], []],
+  ])(
+    "pre-admits %s compilation and collection at the aggregate boundary",
+    (_, options, rows, expected) => {
+      const execute = (owner: MemoryReservation): string[] => {
+        const pathspec = compileReadPathspec(options, owner);
+        try {
+          return pathspec.collect(rows);
+        } finally {
+          pathspec.release();
+        }
+      };
+
+      const measured = new MemoryCoordinator();
+      const measuredOwner = measured.reserve();
+      expect(execute(measuredOwner)).toEqual(expected);
+      const operationBytes = measuredOwner.highWaterBytes;
+      measuredOwner.dispose();
+      measured.assertIdle();
+
+      for (const excess of [0, 1]) {
+        const coordinator = new MemoryCoordinator();
+        const blocker = coordinator.reserve();
+        blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+        const owner = coordinator.reserve();
+        try {
+          const collect = () => execute(owner);
+          if (excess === 0) expect(collect()).toEqual(expected);
+          else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+          expect(owner.currentBytes).toBe(0);
+        } finally {
+          owner.dispose();
+          blocker.dispose();
+        }
+        coordinator.assertIdle();
+      }
+    },
+  );
 });
 
 describe("ls-files selection", () => {
@@ -554,7 +652,19 @@ describe("ls-files selection", () => {
     expect(measured.discoveryStatements).toBe(1);
     expect(measured.discoverySourceRows).toBe(1);
     expect(MAX_LS_FILES_EXCLUDE_ROOTS).toBe(8_192);
-    expect(MAX_LS_FILES_EXCLUDE_ROOT_UTF8_BYTES).toBe(6 * 1024 * 1024);
+  });
+
+  it("accepts an exclude root beyond the former checkout-root byte ceiling", () => {
+    const workspace = makeRepo("/");
+    const root = `/nested-${"x".repeat(5_000)}`;
+
+    expect(
+      lsFilesWithWorktree(workspace.repo, workspace.worktree, {
+        others: true,
+        excludeRoots: [root],
+      }),
+    ).toEqual([]);
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("accepts the global routing ceiling and applies the limit after coalescing", () => {
@@ -621,14 +731,18 @@ describe("ls-files selection", () => {
       "cached-last",
     ];
     expect(cached).toHaveLength(257);
-    expect(compileReadPathspec({ paths: cached }).scanPrefixes).toHaveLength(513);
+    expect(
+      withCompiledPathspec({ paths: cached }, (pathspec) => pathspec.scanPrefixes?.length),
+    ).toBe(513);
     expect(lsFiles(workspace.repo, { paths: cached })).toEqual([]);
 
     const exact = [
       ...Array.from({ length: 64 }, (_, index) => `p${index.toString().padStart(2, "0")}\\x`),
       "first-excess",
     ];
-    expect(compileReadPathspec({ paths: exact }).scanPrefixes).toHaveLength(129);
+    expect(
+      withCompiledPathspec({ paths: exact }, (pathspec) => pathspec.scanPrefixes?.length),
+    ).toBe(129);
     expect(
       lsFilesWithWorktree(workspace.repo, workspace.worktree, { others: true, paths: exact }),
     ).toEqual([]);
@@ -645,10 +759,13 @@ describe("ls-files selection", () => {
       yield "z-selected";
     }
     const pathspec = compileReadPathspec({ paths: ["*selected"] });
-
-    expect(pathspec.scanPrefixes).toBeNull();
-    expect(pathspec.collect(rows())).toEqual(["z-selected"]);
-    expect(traversed).toBe(100_001);
+    try {
+      expect(pathspec.scanPrefixes).toBeNull();
+      expect(pathspec.collect(rows())).toEqual(["z-selected"]);
+      expect(traversed).toBe(100_001);
+    } finally {
+      pathspec.release();
+    }
   });
 
   it("streams the 100,001st cached index row through leading-wildcard public paths", () => {

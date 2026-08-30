@@ -202,31 +202,47 @@ export function eagerStatus(
     return status(repo, worktree, options);
   }
 
-  const state = source.readState(repo.checkout.checkoutId);
-  if (!state.available) {
-    const baselineTreeOid = repo.headTree();
-    const seed = new FullStatusTrackerSeed();
-    const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
-    const rows = sortStatusDetails([
-      ...applyStatusRenames(
-        statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
-        prepass.renames,
-      ),
-    ]);
-    if (seed.resealable) {
-      tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries());
+  const reservation = repo.store.reserveMemory();
+  try {
+    const state = source.readState(repo.checkout.checkoutId);
+    if (!state.available) {
+      const baselineTreeOid = repo.headTree();
+      const seed = new FullStatusTrackerSeed(reservation);
+      try {
+        const prepass = fullStatusPrepass(repo, baselineTreeOid, options);
+        const rows = sortStatusDetails([
+          ...applyStatusRenames(
+            statusStreamInternal(repo, worktree, options, baselineTreeOid, prepass, seed),
+            prepass.renames,
+          ),
+        ]);
+        if (seed.resealable) {
+          tracker.reseal(repo.checkout.checkoutId, baselineTreeOid, seed.entries(), reservation);
+        }
+        return rows;
+      } finally {
+        seed.dispose();
+      }
     }
-    return rows;
-  }
 
-  const sparse = sparseStatus(repo, worktree, options, context, state.baselineTreeOid);
-  if (sparse === null) return status(repo, worktree, options);
-  if (sparse.length === 0) {
-    renameDetectionEnabled(repo, "status", options.renames);
-    return sparse;
+    const sparse = sparseStatus(
+      repo,
+      worktree,
+      options,
+      context,
+      state.baselineTreeOid,
+      reservation,
+    );
+    if (sparse === null) return status(repo, worktree, options);
+    if (sparse.length === 0) {
+      renameDetectionEnabled(repo, "status", options.renames);
+      return sparse;
+    }
+    const renames = classifyStatusRenames(repo, repo.headTree(), options);
+    return sortStatusDetails([...applyStatusRenames(sparse, renames)]);
+  } finally {
+    reservation.dispose();
   }
-  const renames = classifyStatusRenames(repo, repo.headTree(), options);
-  return sortStatusDetails([...applyStatusRenames(sparse, renames)]);
 }
 
 /**

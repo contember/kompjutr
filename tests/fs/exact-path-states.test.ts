@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { createExactPathStateSource } from "../../src/fs/exact-path-states.js";
+import {
+  createExactPathStateSource,
+  exactPathStatesOwned,
+} from "../../src/fs/exact-path-states.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../../src/memory.js";
 import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
@@ -130,7 +134,67 @@ describe("exact path states", () => {
     }
   });
 
-  it("rejects inputs outside the checkout-root bounds before querying", () => {
+  it("sends a singleton above the JSON page target to SQLite", () => {
+    const db = new TestDatabase();
+    createFilesystem(db);
+    const recording = new RecordingDatabase(db);
+    const path = `/${"x".repeat(1_500_000)}`;
+
+    expect(createExactPathStateSource(recording).states([path])).toEqual(["missing"]);
+    expect(recording.statements).toHaveLength(1);
+    const binding = recording.statements[0]?.bindings[0];
+    expect(typeof binding).toBe("string");
+    if (typeof binding === "string") {
+      expect(new TextEncoder().encode(binding).byteLength).toBeGreaterThan(1_500_000);
+    }
+  });
+
+  it("owns exact-path pages at the exact aggregate and cleans up first excess", () => {
+    const db = new TestDatabase();
+    createFilesystem(db);
+    const recording = new RecordingDatabase(db);
+    const coordinator = new MemoryCoordinator();
+    const source = createExactPathStateSource(recording);
+    const paths = [`/${"x".repeat(4_096)}`];
+
+    const measured = coordinator.reserve();
+    expect(exactPathStatesOwned(source, paths, measured)).toEqual(["missing"]);
+    const operationBytes = measured.highWaterBytes;
+    expect(measured.currentBytes).toBe(0);
+    measured.dispose();
+    coordinator.assertIdle();
+
+    const exactBlocker = coordinator.reserve();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exact = coordinator.reserve();
+    try {
+      expect(exactPathStatesOwned(source, paths, exact)).toEqual(["missing"]);
+      expect(exact.currentBytes).toBe(0);
+      expect(exact.highWaterBytes + exactBlocker.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exact.dispose();
+      exactBlocker.dispose();
+    }
+    coordinator.assertIdle();
+
+    recording.statements.length = 0;
+    const overBlocker = coordinator.reserve();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const over = coordinator.reserve();
+    try {
+      expect(() => exactPathStatesOwned(source, paths, over)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(over.currentBytes).toBe(0);
+      expect(recording.statements).toHaveLength(0);
+    } finally {
+      over.dispose();
+      overBlocker.dispose();
+    }
+    coordinator.assertIdle();
+  });
+
+  it("accepts a path above the former byte ceiling and still rejects invalid inputs", () => {
     const db = new TestDatabase();
     createFilesystem(db);
     const recording = new RecordingDatabase(db);
@@ -139,13 +203,12 @@ describe("exact path states", () => {
     expect(() => source.states(Array.from({ length: 1_025 }, () => "/missing"))).toThrowError(
       expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(() => source.states([`/${"x".repeat(4_096)}`])).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    expect(source.states([`/${"x".repeat(4_096)}`])).toEqual(["missing"]);
+    expect(recording.statements).toHaveLength(1);
     for (const path of ["relative", "/not/../canonical", "/trailing/", "/nul\0path"]) {
       expect(() => source.states([path])).toThrowError(expect.objectContaining({ code: "EINVAL" }));
     }
-    expect(recording.statements).toHaveLength(0);
+    expect(recording.statements).toHaveLength(1);
   });
 
   it("fails closed when SQLite returns a malformed state row", () => {
@@ -185,6 +248,28 @@ describe("exact path states", () => {
       expect(() => createExactPathStateSource(db).states(["/invalid"])).toThrowError(
         expect.objectContaining({ code: "EIO" }),
       );
+    } finally {
+      db.run("PRAGMA ignore_check_constraints = OFF");
+    }
+  });
+
+  it("sanitizes an oversized corrupt node type and releases its owner", () => {
+    const db = new TestDatabase();
+    const fs = createFilesystem(db);
+    const coordinator = new MemoryCoordinator();
+    fs.writeFile("/invalid-large", new Uint8Array());
+    db.run("PRAGMA ignore_check_constraints = ON");
+    try {
+      db.run(
+        "UPDATE fs_nodes SET type = ? WHERE inode = (SELECT inode FROM fs_paths WHERE path = ?)",
+        "x".repeat(1_500_001),
+        "/invalid-large",
+      );
+
+      expect(() =>
+        createExactPathStateSource(db, coordinator).states(["/invalid-large"]),
+      ).toThrowError(expect.objectContaining({ code: "EIO" }));
+      coordinator.assertIdle();
     } finally {
       db.run("PRAGMA ignore_check_constraints = OFF");
     }

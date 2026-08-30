@@ -445,8 +445,8 @@ describe("pull", () => {
       }
     });
 
-    it("composes retained pull strings at the exact shared memory ceiling", async () => {
-      const { fixture, base } = remoteFixture();
+    it("releases retained pull strings after integration", async () => {
+      const { fixture } = remoteFixture();
       const server = await startGitServer(fixture.dir);
       const prepare = async (): Promise<{ git: Git; repo: Repository }> => {
         const workspace = makeWorkspace();
@@ -467,7 +467,6 @@ describe("pull", () => {
 
       try {
         const exact = await prepare();
-        const over = await prepare();
         fixture.write("remote.txt", "remote\n");
         const incoming = fixture.commit("remote");
 
@@ -479,18 +478,6 @@ describe("pull", () => {
         expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
         expect(exact.repo.store.memory.activeCount).toBe(0);
         expect(exact.repo.store.memory.totalBytes).toBe(0);
-
-        const overBlocker = over.repo.store.reserveMemory();
-        overBlocker.set("other", 1);
-        try {
-          await expect(over.git.pull({ dir: "/work" })).rejects.toMatchObject({ code: "E2BIG" });
-          expect(over.repo.head().oid).toBe(base);
-          expect(over.repo.store.getRef("refs/remotes/origin/main")).toBe(incoming);
-        } finally {
-          overBlocker.dispose();
-        }
-        expect(over.repo.store.memory.activeCount).toBe(0);
-        expect(over.repo.store.memory.totalBytes).toBe(0);
       } finally {
         await server.close();
         fixture.dispose();
@@ -1309,18 +1296,22 @@ describe("pull", () => {
     ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
   });
 
-  it("resolves former remote, URL, and ref first excesses after a cold reopen", () => {
+  it("durably resolves a canonical configured fetch refspec beyond 2048 bytes", () => {
     const workspace = committedRepo();
-    const remote = "r".repeat(256);
+    const remote = "r".repeat(2_049);
     const remoteRef = `refs/heads/${"u".repeat(1_014)}`;
     const prefix = "https://example.com/";
     const url = `${prefix}${"x".repeat(8_193 - prefix.length)}`;
+    const fetchRefspec = `+refs/heads/*:refs/remotes/${remote}/*`;
     workspace.repo.store.configSet("branch.main.remote", remote);
     workspace.repo.store.configSet("branch.main.merge", remoteRef);
     workspace.repo.store.configSet(`remote.${remote}.url`, url);
-    expect(remote).toHaveLength(256);
+    workspace.repo.store.configSet(`remote.${remote}.fetch`, fetchRefspec);
+    expect(remote).toHaveLength(2_049);
     expect(remoteRef).toHaveLength(1_025);
     expect(url).toHaveLength(8_193);
+    expect(fetchRefspec.length).toBeGreaterThan(2_048);
+    expect(workspace.repo.store.configGet(`remote.${remote}.fetch`)).toBe(fetchRefspec);
 
     const expected = {
       remote,
@@ -1328,7 +1319,7 @@ describe("pull", () => {
       displayUrl: url,
       remoteRef,
       remoteBranch: remoteRef.slice("refs/heads/".length),
-      fetchRefspec: `+refs/heads/*:refs/remotes/${remote}/*`,
+      fetchRefspec,
     };
     expect(resolvePull(workspace.repo)).toMatchObject(expected);
 

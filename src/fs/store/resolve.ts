@@ -13,9 +13,6 @@ import type { RealPath } from "../types.js";
 /** POSIX's own guidance; dofs counts follows the same way. */
 const MAX_FOLLOWS = 40;
 
-/** Bounds the quadratic prefix set below to comfortably less than 100 MB. */
-export const MAX_PATH_CODE_UNITS = 4096;
-
 /** Keeps every `json_each` binding below the platform BLOB/TEXT ceiling. */
 const PATH_BATCH_BYTES = 1_500_000;
 
@@ -29,8 +26,6 @@ const SET_ENTRY_BYTES = 48;
 const MAP_FIXED_BYTES = 128;
 const MAP_ENTRY_BYTES = 48;
 const NODE_ROW_BYTES = 128;
-// SQLite substr() counts code points; each returned point may occupy two UTF-16 units.
-const MAX_STORED_LINK_TARGET_UNITS = (MAX_PATH_CODE_UNITS + 1) * 2;
 const RESOLVE_FIXED_BYTES = 512;
 
 interface NodeRow {
@@ -92,15 +87,14 @@ function plannedPathsAllocationBytes(
   pending: readonly string[],
 ): number {
   let currentUnits = pathLength(resolved);
+  let maximumUnits = currentUnits;
   let stringBytes = retainedStringUnits(currentUnits);
   let retainedPaths = 1;
   for (const component of pending) {
     if (component === "" || component === ".") continue;
     if (component !== "..") {
-      currentUnits = Math.min(
-        MAX_PATH_CODE_UNITS,
-        currentUnits + (currentUnits === 1 ? 0 : 1) + component.length,
-      );
+      currentUnits += (currentUnits === 1 ? 0 : 1) + component.length;
+      maximumUnits = Math.max(maximumUnits, currentUnits);
     }
     stringBytes += retainedStringUnits(currentUnits);
     retainedPaths++;
@@ -111,7 +105,7 @@ function plannedPathsAllocationBytes(
     SET_FIXED_BYTES +
     retainedPaths * SET_ENTRY_BYTES +
     stringBytes +
-    2 * retainedStringUnits(MAX_PATH_CODE_UNITS)
+    2 * retainedStringUnits(maximumUnits)
   );
 }
 
@@ -197,8 +191,7 @@ function nodesAllocationBytes(paths: readonly string[]): number {
       MAP_ENTRY_BYTES +
       NODE_ROW_BYTES +
       retainedStringUnits(path.length) +
-      retainedStringUnits("symlink".length) +
-      retainedStringUnits(MAX_STORED_LINK_TARGET_UNITS);
+      retainedStringUnits("symlink".length);
   }
   flush();
   return retainedRows + maximumBatchBytes + BYTE_ARRAY_FIXED_BYTES + maximumItemBytes;
@@ -219,12 +212,47 @@ function symlinkTransitionBytes(target: string, suffixCount: number): number {
  * indexed statement regardless of depth; a symlink expansion starts a new
  * batch because only then is the next set of real prefixes known.
  */
-function nodesOn(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow> {
+interface NodeMetadataRow {
+  row_count: unknown;
+  target_bytes: unknown;
+}
+
+function nodesOn(
+  db: SqlDatabase,
+  paths: readonly string[],
+  reservation?: MemoryReservation,
+  admittedBytes = 0,
+): Map<string, NodeRow> {
   const out = new Map<string, NodeRow>();
+  let targetBytes = 0;
   let items: string[] = [];
   let bytes = 2;
   const flush = (): void => {
     if (items.length === 0) return;
+    const binding = `[${items.join(",")}]`;
+    if (reservation !== undefined) {
+      const metadata = db.one<NodeMetadataRow>(
+        `SELECT count(*) AS row_count,
+                coalesce(sum(length(CAST(n.link_target AS BLOB))), 0) AS target_bytes
+           FROM fs_paths p
+           JOIN fs_nodes n ON n.inode = p.inode
+          WHERE p.path IN (SELECT value FROM json_each(?))`,
+        binding,
+      );
+      if (
+        metadata === undefined ||
+        typeof metadata.row_count !== "number" ||
+        !Number.isSafeInteger(metadata.row_count) ||
+        metadata.row_count < 0 ||
+        typeof metadata.target_bytes !== "number" ||
+        !Number.isSafeInteger(metadata.target_bytes) ||
+        metadata.target_bytes < 0
+      ) {
+        throw new Error("path resolution metadata is invalid");
+      }
+      targetBytes += metadata.row_count * STRING_FIXED_BYTES + metadata.target_bytes * 2;
+      reservation.set("other", admittedBytes + targetBytes);
+    }
     for (const row of db.all<NodeRow>(
       `SELECT p.path AS path,
               CASE
@@ -233,14 +261,18 @@ function nodesOn(db: SqlDatabase, paths: readonly string[]): Map<string, NodeRow
                 WHEN typeof(n.type) = 'text' AND n.type = 'symlink' THEN 'symlink'
                 ELSE ''
               END AS type,
-              substr(n.link_target, 1, 4097) AS link_target
+              n.link_target AS link_target
          FROM fs_paths p
          JOIN fs_nodes n ON n.inode = p.inode
         WHERE p.path IN (SELECT value FROM json_each(?))`,
-      `[${items.join(",")}]`,
+      binding,
     )) {
-      if (row.type !== "dir" && row.type !== "file" && row.type !== "symlink") {
-        throw new Error("fs_nodes.type is not a known entry type");
+      if (
+        typeof row.path !== "string" ||
+        (row.type !== "dir" && row.type !== "file" && row.type !== "symlink") ||
+        (row.link_target !== null && typeof row.link_target !== "string")
+      ) {
+        throw new Error("path resolution row is invalid");
       }
       out.set(row.path, row);
     }
@@ -310,31 +342,6 @@ function enoent(path: string): Error {
   });
 }
 
-function enametoolong(path: string): Error {
-  return Object.assign(new Error("ENAMETOOLONG: path exceeds 4096 UTF-16 code units"), {
-    code: "ENAMETOOLONG",
-    path,
-  });
-}
-
-function requireAcceptedLength(path: string, sourcePath: string): void {
-  if (path.length > MAX_PATH_CODE_UNITS) throw enametoolong(sourcePath);
-}
-
-function requireAcceptedComponents(
-  resolved: readonly string[],
-  pending: readonly string[],
-  sourcePath: string,
-): void {
-  const componentLength = [...resolved, ...pending].reduce(
-    (total, component) => total + component.length,
-    0,
-  );
-  const componentCount = resolved.length + pending.length;
-  const pathLength = 1 + componentLength + Math.max(0, componentCount - 1);
-  if (pathLength > MAX_PATH_CODE_UNITS) throw enametoolong(sourcePath);
-}
-
 function requireDirectory(row: NodeRow | undefined, sourcePath: string): void {
   if (row !== undefined && row.type !== "dir") throw enotdir(sourcePath);
 }
@@ -350,7 +357,6 @@ function resolve(
   initialNodes?: ReadonlyMap<string, NodeRow>,
   reservation?: MemoryReservation,
 ): RealPath {
-  requireAcceptedLength(path, path);
   const stateMemory = reservation?.scope() ?? null;
   stateMemory?.set(
     "other",
@@ -377,12 +383,12 @@ function resolve(
           RESOLVE_FIXED_BYTES + componentStateMaximumBytes(resolved, pending),
         );
         iterationMemory?.set("other", plannedPathsAllocationBytes(resolved, pending));
+        const pathsBytes = plannedPathsAllocationBytes(resolved, pending);
         const paths = plannedPaths(resolved, pending);
-        iterationMemory?.set(
-          "other",
-          plannedPathsAllocationBytes(resolved, pending) + nodesAllocationBytes(paths),
-        );
-        const nodes = initialNodes ?? nodesOn(db, paths);
+        const nodesBytes = nodesAllocationBytes(paths);
+        iterationMemory?.set("other", pathsBytes + nodesBytes);
+        const nodes =
+          initialNodes ?? nodesOn(db, paths, iterationMemory ?? undefined, pathsBytes + nodesBytes);
         initialNodes = undefined;
         let expanded = false;
 
@@ -412,7 +418,6 @@ function resolve(
 
           resolved.pop();
           const target = node.link_target ?? "";
-          requireAcceptedLength(target, path);
           const transitionMemory = reservation?.scope() ?? null;
           try {
             transitionMemory?.set(
@@ -425,7 +430,6 @@ function resolve(
               "other",
               RESOLVE_FIXED_BYTES + componentStateMaximumBytes(resolved, pending),
             );
-            requireAcceptedComponents(resolved, pending, path);
           } finally {
             transitionMemory?.dispose();
           }
@@ -467,7 +471,6 @@ function resolveMany(db: SqlDatabase, paths: readonly string[], followFinal: boo
   };
 
   for (const path of paths) {
-    requireAcceptedLength(path, path);
     const candidates = plannedPaths([], componentsOf(path));
     let addedBytes = 0;
     for (const candidate of candidates) {

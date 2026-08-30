@@ -1,5 +1,5 @@
 import { isOid } from "../core/bytes.js";
-import { CorruptError, GitError } from "../core/errors.js";
+import { CorruptError, GitError, hasErrorCode } from "../core/errors.js";
 import type {
   CommitTreeSnapshotDirectory,
   CommitTreeSnapshotRequest,
@@ -21,16 +21,14 @@ import type {
   SparseWorktreeLeaf,
 } from "../core/sparse-workspace.js";
 import { comparePaths } from "../core/streams.js";
+import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../memory.js";
 import { readBlob, type SqlDatabase } from "./db.js";
 import { iterateIndexTrackerDirty, readIndexTrackerState } from "./index-tracker.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "./schema.js";
 import type { IndexEntry } from "./store.js";
 
 const MAX_PATHS = 1_000;
-const MAX_PATH_BYTES = 2_200;
-const MAX_ROOT_BYTES = 4_096;
 const MAX_ROOT_SEGMENTS = 128;
-const MAX_REQUEST_JSON_BYTES = 1024 * 1024;
 const MAX_DEPTH = 64;
 const MAX_EDGE_STEPS = 32_768;
 const MAX_INDEX_ANCESTORS = 32_768;
@@ -41,9 +39,6 @@ const MAX_SELECTED_ROWS = 32_768;
 const MAX_SELECTED_EXACT_ANCESTORS = 32_768;
 const MAX_SNAPSHOT_DIRECTORIES = 1_000;
 const MAX_SOURCE_ENTRIES = 8_192;
-const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
-const MAX_WORKTREE_RETAINED_BYTES = 4 * 1024 * 1024;
-export const MAX_SPARSE_WORKSPACE_RETAINED_BYTES = 8 * 1024 * 1024;
 const ROW_RETAINED_BYTES = 1_024;
 const INDEX_ENTRY_RETAINED_BYTES = 320;
 const INDEX_ANCESTOR_RETAINED_BYTES = 192;
@@ -110,12 +105,25 @@ interface ValidatedTreeSource {
 interface SourceBudget {
   entries: number;
   bytes: number;
+  limit: number;
 }
 
 interface SnapshotRetainedBudget {
   limit: number;
   used: number;
   peak: number;
+  reservation: MemoryReservation | null;
+}
+
+function admitReservation(reservation: MemoryReservation | null, bytes: number): boolean {
+  if (reservation === null) return true;
+  try {
+    reservation.set("other", bytes);
+    return true;
+  } catch (error) {
+    if (hasErrorCode(error, "E2BIG")) return false;
+    throw error;
+  }
 }
 
 function reserveSnapshot(budget: SnapshotRetainedBudget, bytes: number): boolean {
@@ -124,6 +132,10 @@ function reserveSnapshot(budget: SnapshotRetainedBudget, bytes: number): boolean
   }
   budget.used += bytes;
   budget.peak = Math.max(budget.peak, budget.used);
+  if (!admitReservation(budget.reservation, budget.used)) {
+    budget.used -= bytes;
+    return false;
+  }
   return true;
 }
 
@@ -132,6 +144,9 @@ function releaseSnapshot(budget: SnapshotRetainedBudget, bytes: number): void {
     throw new CorruptError("commit tree snapshot retained accounting is invalid");
   }
   budget.used -= bytes;
+  if (!admitReservation(budget.reservation, budget.used)) {
+    throw new CorruptError("commit tree snapshot retained release failed");
+  }
 }
 
 function inputError(message: string): GitError {
@@ -179,27 +194,29 @@ function validateRoot(root: string): void {
     } else if (unit < 0x80) bytes++;
     else if (unit < 0x800) bytes += 2;
     else bytes += 3;
-    if (bytes > MAX_ROOT_BYTES) {
-      throw tooLarge(`sparse workspace root exceeds ${MAX_ROOT_BYTES} bytes`);
-    }
+    if (!Number.isSafeInteger(bytes)) throw tooLarge("sparse workspace root size overflows");
   }
 }
 
-function parseRelativePath(path: string): { bytes: number; segments: string[] } {
+function relativePathShape(path: string): { bytes: number; segments: number } {
   if (path === "" || path.startsWith("/") || path.endsWith("/")) {
     throw inputError("sparse workspace path is invalid");
   }
-  const segments: string[] = [];
+  let segments = 0;
   let bytes = 0;
   let start = 0;
   for (let index = 0; index <= path.length; index++) {
     const unit = path.charCodeAt(index);
     if (index === path.length || unit === 0x2f) {
-      const part = path.slice(start, index);
-      if (part === "" || part === "." || part === "..") {
+      const length = index - start;
+      if (
+        length === 0 ||
+        (length === 1 && path.charCodeAt(start) === 0x2e) ||
+        (length === 2 && path.charCodeAt(start) === 0x2e && path.charCodeAt(start + 1) === 0x2e)
+      ) {
         throw inputError("sparse workspace path is invalid");
       }
-      segments.push(part);
+      segments++;
       start = index + 1;
       if (index !== path.length) bytes++;
     } else if (unit === 0) {
@@ -215,27 +232,36 @@ function parseRelativePath(path: string): { bytes: number; segments: string[] } 
     } else if (unit < 0x80) bytes++;
     else if (unit < 0x800) bytes += 2;
     else bytes += 3;
-    if (bytes > MAX_PATH_BYTES) {
-      throw tooLarge(`sparse workspace path exceeds ${MAX_PATH_BYTES} bytes`);
-    }
+    if (!Number.isSafeInteger(bytes)) throw tooLarge("sparse workspace path size overflows");
   }
   return { bytes, segments };
 }
 
-function requestRetainedLimit(value: number | undefined): number {
-  if (value === undefined) return MAX_SPARSE_WORKSPACE_RETAINED_BYTES;
+function parseRelativePath(path: string): { bytes: number; segments: string[] } {
+  const shape = relativePathShape(path);
+  return { bytes: shape.bytes, segments: path.split("/") };
+}
+
+function requestRetainedLimit(
+  value: number | undefined,
+  reservation: MemoryReservation | null = null,
+): number {
+  const available =
+    reservation === null
+      ? MAX_OPERATION_MEMORY_BYTES
+      : reservation.currentBytes + reservation.remainingBytes;
+  if (value === undefined) return available;
   if (!Number.isSafeInteger(value) || value < 0) {
     throw inputError("sparse workspace retained limit is invalid");
   }
-  if (value > MAX_SPARSE_WORKSPACE_RETAINED_BYTES) {
-    throw tooLarge(
-      `sparse workspace retained limit exceeds ${MAX_SPARSE_WORKSPACE_RETAINED_BYTES} bytes`,
-    );
-  }
-  return value;
+  return Math.min(value, available);
 }
 
-function validateRequest(request: SparseWorkspaceRequest, retainedLimit: number): ValidatedRequest {
+function validateRequest(
+  request: SparseWorkspaceRequest,
+  retainedLimit: number,
+  reservation: MemoryReservation | null,
+): ValidatedRequest {
   if (!Number.isSafeInteger(request.repoId) || request.repoId <= 0) {
     throw inputError("sparse workspace repository id is invalid");
   }
@@ -253,32 +279,29 @@ function validateRequest(request: SparseWorkspaceRequest, retainedLimit: number)
     throw tooLarge(`sparse workspace request exceeds ${MAX_PATHS} paths`);
   }
 
-  const segments: string[][] = [];
   let retainedBytes = 0;
   let jsonBytes = 2;
   let jsonChars = 2;
   let previous: string | null = null;
   for (const path of request.paths) {
-    const parsed = parseRelativePath(path);
+    const parsed = relativePathShape(path);
     if (previous !== null && comparePaths(previous, path) >= 0) {
       throw inputError("sparse workspace paths are not in strict Git order");
     }
-    if (parsed.segments.length > MAX_DEPTH) {
+    if (parsed.segments > MAX_DEPTH) {
       return { json: "", segments: [], retainedBytes: -1 };
     }
-    const pathJson = JSON.stringify(path);
-    const encodedPathJson = encoder.encode(pathJson).length;
-    jsonBytes += encodedPathJson + (previous === null ? 0 : 1);
-    jsonChars += pathJson.length + (previous === null ? 0 : 1);
-    if (jsonBytes > MAX_REQUEST_JSON_BYTES) {
-      throw tooLarge(`sparse workspace request exceeds ${MAX_REQUEST_JSON_BYTES} JSON bytes`);
+    const quoted = jsonQuotedSize(path);
+    jsonBytes += quoted.bytes + (previous === null ? 0 : 1);
+    jsonChars += quoted.chars + (previous === null ? 0 : 1);
+    if (!Number.isSafeInteger(jsonBytes) || !Number.isSafeInteger(jsonChars)) {
+      throw tooLarge("sparse workspace request JSON size overflows");
     }
-    segments.push(parsed.segments);
     retainedBytes +=
       ROW_RETAINED_BYTES +
       path.length * 4 +
       parsed.bytes +
-      parsed.segments.length * SEGMENT_RETAINED_BYTES;
+      parsed.segments * SEGMENT_RETAINED_BYTES;
     if (retainedBytes > retainedLimit) {
       return { json: "", segments: [], retainedBytes: -1 };
     }
@@ -287,12 +310,22 @@ function validateRequest(request: SparseWorkspaceRequest, retainedLimit: number)
   if (retainedBytes > retainedLimit - jsonChars * 2) {
     return { json: "", segments: [], retainedBytes: -1 };
   }
+  retainedBytes += jsonChars * 2;
+  if (!admitReservation(reservation, retainedBytes)) {
+    return { json: "", segments: [], retainedBytes: -1 };
+  }
+  const segments = request.paths.map((path) => path.split("/"));
   const json = JSON.stringify(request.paths);
-  retainedBytes += json.length * 2;
+  if (json.length !== jsonChars) {
+    throw new CorruptError("sparse workspace request JSON size changed during construction");
+  }
   return { json, segments, retainedBytes };
 }
 
-function validateIndexAncestorRequest(input: unknown): {
+function validateIndexAncestorRequest(
+  input: unknown,
+  reservation: MemoryReservation | null,
+): {
   request: SparseIndexAncestorRequest;
   pathBytes: number[];
   json: string;
@@ -335,7 +368,7 @@ function validateIndexAncestorRequest(input: unknown): {
     ancestors,
     ...(maxRetainedBytes === undefined ? {} : { maxRetainedBytes }),
   };
-  const retainedLimit = requestRetainedLimit(request.maxRetainedBytes);
+  const retainedLimit = requestRetainedLimit(request.maxRetainedBytes, reservation);
 
   const parts: string[] = [];
   const pathBytes: number[] = [];
@@ -356,8 +389,8 @@ function validateIndexAncestorRequest(input: unknown): {
     const nextJsonBytes = jsonBytes + encoder.encode(part).length + separatorBytes;
     const nextJsonChars = jsonChars + part.length + separatorBytes;
     const nextRetainedBytes = retainedBytes + INDEX_ANCESTOR_RETAINED_BYTES + path.length * 4;
-    if (nextJsonBytes > MAX_REQUEST_JSON_BYTES) {
-      throw tooLarge(`sparse index ancestor request exceeds ${MAX_REQUEST_JSON_BYTES} JSON bytes`);
+    if (!Number.isSafeInteger(nextJsonBytes) || !Number.isSafeInteger(nextJsonChars)) {
+      throw tooLarge("sparse index ancestor request JSON size overflows");
     }
     if (nextRetainedBytes > retainedLimit - nextJsonChars * 2) {
       throw tooLarge(`sparse index ancestor retained state exceeds ${retainedLimit} bytes`);
@@ -369,11 +402,15 @@ function validateIndexAncestorRequest(input: unknown): {
     retainedBytes = nextRetainedBytes;
     previous = path;
   }
+  const totalRetainedBytes = retainedBytes + jsonChars * 2;
+  if (!admitReservation(reservation, totalRetainedBytes)) {
+    throw tooLarge("sparse index ancestor retained state exceeds operation memory");
+  }
   return {
     request,
     pathBytes,
     json: `[${parts.join(",")}]`,
-    retainedBytes: retainedBytes + jsonChars * 2,
+    retainedBytes: totalRetainedBytes,
   };
 }
 
@@ -418,7 +455,6 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
        AND storage IN ('loose','pack')
        AND typeof(source_id) = 'integer' AND source_id >= 0
        AND typeof(object_size) = 'integer' AND object_size >= 0
-         AND object_size <= ${MAX_SOURCE_BYTES}
        AND typeof(entry_count) = 'integer' AND entry_count >= 0
          AND entry_count <= ${MAX_SOURCE_ENTRIES}
        AND typeof(base_cost) = 'integer'
@@ -469,7 +505,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                OR typeof(entry.mode) <> 'text'
                OR entry.mode NOT IN ('40000','040000','100644','100755','120000','160000')
                OR typeof(entry.name_bytes) <> 'blob'
-               OR length(entry.name_bytes) = 0 OR length(entry.name_bytes) > ${MAX_PATH_BYTES}
+               OR length(entry.name_bytes) = 0
                OR instr(entry.name_bytes, X'00') != 0
                OR instr(CAST(entry.name_bytes AS TEXT), '/') != 0
                OR CAST(CAST(entry.name_bytes AS TEXT) AS BLOB) != entry.name_bytes
@@ -478,7 +514,6 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                   WHERE duplicate.source_key = entry.source_key
                     AND duplicate.name_bytes = entry.name_bytes
                     AND typeof(duplicate.name_bytes) = 'blob'
-                    AND length(duplicate.name_bytes) <= ${MAX_PATH_BYTES}
                     AND duplicate.ordinal < entry.ordinal
                )
                OR typeof(entry.oid) <> 'text' OR length(entry.oid) != 40
@@ -558,14 +593,13 @@ SELECT selected.ordinal, selected.side, selected.final, selected.validated,
   LEFT JOIN git_tree_entries edge
     ON edge.source_key = selected.source_key
    AND edge.name_bytes = CAST(selected.segment AS BLOB)
-   AND typeof(edge.name_bytes) = 'blob' AND length(edge.name_bytes) <= ${MAX_PATH_BYTES}
+   AND typeof(edge.name_bytes) = 'blob'
    AND edge.ordinal = (
      SELECT min(candidate.ordinal)
        FROM git_tree_entries candidate
       WHERE candidate.source_key = selected.source_key
         AND candidate.name_bytes = CAST(selected.segment AS BLOB)
         AND typeof(candidate.name_bytes) = 'blob'
-        AND length(candidate.name_bytes) <= ${MAX_PATH_BYTES}
    )
  ORDER BY selected.ordinal, selected.side`;
 
@@ -630,7 +664,7 @@ function validateSourceRow(
   ) {
     throw new CorruptError("sparse tree source metadata is inconsistent");
   }
-  if (entryCount > MAX_SOURCE_ENTRIES || objectSize > MAX_SOURCE_BYTES) return "unavailable";
+  if (entryCount > MAX_SOURCE_ENTRIES || objectSize > budget.limit) return "unavailable";
   const boundedCount = numberField(row.bounded_count);
   const rawBytes = numberField(row.raw_bytes);
   const preflightValidationBytes = numberField(row.preflight_validation_bytes);
@@ -640,7 +674,7 @@ function validateSourceRow(
   if (boundedCount !== entryCount || rawBytes !== objectSize) {
     throw new CorruptError("sparse tree source entries disagree with its marker");
   }
-  if (row.admitted !== 1 || preflightValidationBytes > MAX_SOURCE_BYTES - budget.bytes) {
+  if (row.admitted !== 1 || preflightValidationBytes > budget.limit - budget.bytes) {
     return "unavailable";
   }
   const actualCount = numberField(row.actual_count);
@@ -661,11 +695,11 @@ function validateSourceRow(
   ) {
     throw new CorruptError("sparse tree source entries are inconsistent");
   }
-  if (validationBytes > MAX_SOURCE_BYTES) return "unavailable";
+  if (validationBytes > budget.limit) return "unavailable";
   if (cached === undefined) {
     if (
       budget.entries > MAX_SOURCE_ENTRIES - entryCount ||
-      budget.bytes > MAX_SOURCE_BYTES - validationBytes
+      budget.bytes > budget.limit - validationBytes
     ) {
       return "unavailable";
     }
@@ -686,6 +720,7 @@ function treeDepth(
   retainedBytes: number,
   retainedLimit: number,
   retainSource?: (treeOid: string) => boolean,
+  reservation: MemoryReservation | null = null,
 ): { available: boolean; resolutions: Map<string, TreeResolution> } {
   const parts: string[] = [];
   let jsonBytes = 2;
@@ -703,11 +738,16 @@ function treeDepth(
     jsonBytes += encoder.encode(part).length + (parts.length === 1 ? 0 : 1);
     jsonChars += part.length + (parts.length === 1 ? 0 : 1);
     if (
-      jsonBytes > MAX_REQUEST_JSON_BYTES ||
+      !Number.isSafeInteger(jsonBytes) ||
+      !Number.isSafeInteger(jsonChars) ||
       retainedBytes + jsonChars * 4 + parts.length * 8 > retainedLimit
     ) {
       return { available: false, resolutions: new Map() };
     }
+  }
+  const queryRetainedBytes = retainedBytes + jsonChars * 4 + parts.length * 8;
+  if (!admitReservation(reservation, queryRetainedBytes)) {
+    return { available: false, resolutions: new Map() };
   }
   const json = `[${parts.join(",")}]`;
   const resolutions = new Map<string, TreeResolution>();
@@ -717,8 +757,8 @@ function treeDepth(
     json,
     repoId,
     MAX_SOURCE_ENTRIES - budget.entries,
-    MAX_SOURCE_BYTES - budget.bytes,
-    MAX_SOURCE_BYTES - budget.bytes,
+    budget.limit - budget.bytes,
+    budget.limit - budget.bytes,
   )) {
     rows++;
     if (rows > cursors.length) throw new CorruptError("sparse tree lookup returned duplicate rows");
@@ -770,6 +810,7 @@ function resolveTrees(
   segments: string[][],
   retainedRequestBytes: number,
   retainedLimit: number,
+  reservation: MemoryReservation | null,
 ): {
   available: boolean;
   baseline: Array<SparseTreeLeaf | null>;
@@ -778,7 +819,11 @@ function resolveTrees(
   const baseline: Array<SparseTreeLeaf | null> = request.paths.map(() => null);
   const current: Array<SparseTreeLeaf | null> = request.paths.map(() => null);
   const sources = new Map<string, ValidatedTreeSource>();
-  const budget: SourceBudget = { entries: 0, bytes: 0 };
+  const budget: SourceBudget = {
+    entries: 0,
+    bytes: 0,
+    limit: Math.max(0, retainedLimit - retainedRequestBytes),
+  };
   const sharedTrees =
     request.baselineTreeOid !== null && request.baselineTreeOid === request.currentTreeOid;
   let cursors: TreeCursor[] = [];
@@ -831,6 +876,9 @@ function resolveTrees(
     if (retainedBeforeQuery > retainedLimit) {
       return { available: false, baseline, current };
     }
+    if (!admitReservation(reservation, retainedBeforeQuery)) {
+      return { available: false, baseline, current };
+    }
     const resolved = treeDepth(
       db,
       request.repoId,
@@ -839,6 +887,8 @@ function resolveTrees(
       budget,
       retainedBeforeQuery,
       retainedLimit,
+      undefined,
+      reservation,
     );
     if (!resolved.available) return { available: false, baseline, current };
     const next: TreeCursor[] = [];
@@ -868,13 +918,15 @@ function resolveTrees(
           ancestry: [...cursor.ancestry, resolution.treeOid],
         });
         nextBytes += CURSOR_RETAINED_BYTES + (cursor.ancestry.length + 1) * OID_RETAINED_BYTES;
-        if (
+        const nextRetainedBytes =
           retainedRequestBytes +
-            cursorBytes +
-            cursors.length * RESOLUTION_RETAINED_BYTES +
-            nextBytes +
-            sources.size * SOURCE_RETAINED_BYTES >
-          retainedLimit
+          cursorBytes +
+          cursors.length * RESOLUTION_RETAINED_BYTES +
+          nextBytes +
+          sources.size * SOURCE_RETAINED_BYTES;
+        if (
+          nextRetainedBytes > retainedLimit ||
+          !admitReservation(reservation, nextRetainedBytes)
         ) {
           return { available: false, baseline, current };
         }
@@ -913,7 +965,6 @@ function validatedSparseIndexEntry(row: Record<string, unknown>): IndexEntry {
     typeof path !== "string" ||
     pathBytes === null ||
     pathBytes < 0 ||
-    pathBytes > MAX_PATH_BYTES ||
     !validStoredIndexPath(path, pathBytes) ||
     row.stage_type !== "integer" ||
     stage === null ||
@@ -981,6 +1032,8 @@ function readIndex(
   pathsJson: string,
   count: number,
   retainedLimit: number,
+  retainedBase: number,
+  reservation: MemoryReservation | null,
 ): { available: boolean; rows: IndexEntry[][]; retainedBytes: number } {
   const result: IndexEntry[][] = Array.from({ length: count }, () => []);
   let available = true;
@@ -1002,7 +1055,12 @@ function readIndex(
       available = false;
       continue;
     }
-    retainedBytes += INDEX_ENTRY_RETAINED_BYTES;
+    const nextRetainedBytes = retainedBytes + INDEX_ENTRY_RETAINED_BYTES;
+    if (!admitReservation(reservation, retainedBase + nextRetainedBytes)) {
+      available = false;
+      continue;
+    }
+    retainedBytes = nextRetainedBytes;
     entries.push(entry);
   }
   return { available, rows: result, retainedBytes };
@@ -1150,9 +1208,13 @@ SELECT wanted.ordinal, wanted.path AS wanted_path,
 function indexAncestorFacts(
   db: SqlDatabase,
   request: SparseIndexAncestorRequest,
+  reservation: MemoryReservation | null = null,
 ): SparseIndexAncestorResult {
-  const validated = validateIndexAncestorRequest(request);
-  if (validated.request.ancestors.length === 0) return { facts: [], retainedBytes: 0 };
+  const validated = validateIndexAncestorRequest(request, reservation);
+  if (validated.request.ancestors.length === 0) {
+    reservation?.clear("other");
+    return { facts: [], retainedBytes: 0 };
+  }
 
   const facts: SparseIndexAncestorResult["facts"] = validated.request.ancestors.map((path) => ({
     path,
@@ -1192,7 +1254,6 @@ function indexAncestorFacts(
       row.wanted_path !== expected ||
       wantedPathBytes === null ||
       wantedPathBytes < 0 ||
-      wantedPathBytes > MAX_PATH_BYTES ||
       expectedPathBytes !== wantedPathBytes
     ) {
       throw new CorruptError("sparse index ancestor lookup returned a malformed row");
@@ -1313,6 +1374,8 @@ function readWorktree(
   pathsJson: string,
   count: number,
   retainedLimit: number,
+  retainedBase: number,
+  reservation: MemoryReservation | null,
 ): { available: boolean; rows: Array<SparseWorktreeLeaf | null>; retainedBytes: number } {
   const result: Array<SparseWorktreeLeaf | null> = Array.from({ length: count }, () => null);
   let returned = 0;
@@ -1378,26 +1441,16 @@ function readWorktree(
     }
     if (type === "dir") continue;
     if (
-      (row.link_target_type === "text" &&
-        targetBytes !== null &&
-        targetBytes > MAX_WORKTREE_RETAINED_BYTES) ||
-      (row.content_id_type === "blob" &&
-        contentBytes !== null &&
-        contentBytes > MAX_WORKTREE_RETAINED_BYTES)
-    ) {
-      return { available: false, rows: result, retainedBytes };
-    }
-    if (
       (type === "file" && row.link_target !== null) ||
       (type === "symlink" && typeof row.link_target !== "string")
     ) {
       throw new CorruptError("sparse worktree lookup returned malformed payload metadata");
     }
     const nextRetainedBytes = retainedBytes + (targetBytes ?? 0) * 2 + (contentBytes ?? 0);
-    if (
-      nextRetainedBytes !== cumulativeRetainedBytes ||
-      nextRetainedBytes > MAX_WORKTREE_RETAINED_BYTES
-    ) {
+    if (nextRetainedBytes !== cumulativeRetainedBytes) {
+      return { available: false, rows: result, retainedBytes };
+    }
+    if (!admitReservation(reservation, retainedBase + nextRetainedBytes)) {
       return { available: false, rows: result, retainedBytes };
     }
     retainedBytes = nextRetainedBytes;
@@ -1418,9 +1471,13 @@ function readWorktree(
   return { available: true, rows: result, retainedBytes };
 }
 
-function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorkspaceResult {
-  const retainedLimit = requestRetainedLimit(request.maxRetainedBytes);
-  const validated = validateRequest(request, retainedLimit);
+function hydrate(
+  db: SqlDatabase,
+  request: SparseWorkspaceRequest,
+  reservation: MemoryReservation | null = null,
+): SparseWorkspaceResult {
+  const retainedLimit = requestRetainedLimit(request.maxRetainedBytes, reservation);
+  const validated = validateRequest(request, retainedLimit, reservation);
   if (validated.retainedBytes < 0 || validated.retainedBytes > retainedLimit) {
     return { available: false };
   }
@@ -1459,7 +1516,10 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
   if (checkout.matches !== 1) throw inputError("sparse workspace root does not match checkout");
   if (checkout.root_valid !== 1)
     throw new CorruptError("sparse workspace checkout root is malformed");
-  if (request.paths.length === 0) return { available: true, rows: [], retainedBytes: 0 };
+  if (request.paths.length === 0) {
+    reservation?.clear("other");
+    return { available: true, rows: [], retainedBytes: 0 };
+  }
 
   const trees = resolveTrees(
     db,
@@ -1467,6 +1527,7 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
     validated.segments,
     validated.retainedBytes,
     retainedLimit,
+    reservation,
   );
   if (!trees.available) return { available: false };
   const index = readIndex(
@@ -1475,12 +1536,11 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
     validated.json,
     request.paths.length,
     retainedLimit - validated.retainedBytes,
+    validated.retainedBytes,
+    reservation,
   );
   if (!index.available) return { available: false };
-  const worktreeRetainedLimit = Math.min(
-    MAX_WORKTREE_RETAINED_BYTES,
-    retainedLimit - validated.retainedBytes - index.retainedBytes,
-  );
+  const worktreeRetainedLimit = retainedLimit - validated.retainedBytes - index.retainedBytes;
   if (worktreeRetainedLimit < 0) return { available: false };
   const worktree = readWorktree(
     db,
@@ -1488,6 +1548,8 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
     validated.json,
     request.paths.length,
     worktreeRetainedLimit,
+    validated.retainedBytes + index.retainedBytes,
+    reservation,
   );
   if (!worktree.available) return { available: false };
   if (validated.retainedBytes + index.retainedBytes > retainedLimit - worktree.retainedBytes) {
@@ -1495,6 +1557,8 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
   }
 
   const rows: SparseWorkspaceRow[] = [];
+  const retainedBytes = validated.retainedBytes + index.retainedBytes + worktree.retainedBytes;
+  if (!admitReservation(reservation, retainedBytes)) return { available: false };
   for (let ordinal = 0; ordinal < request.paths.length; ordinal++) {
     const path = request.paths[ordinal];
     const indexEntries = index.rows[ordinal];
@@ -1512,7 +1576,7 @@ function hydrate(db: SqlDatabase, request: SparseWorkspaceRequest): SparseWorksp
   return {
     available: true,
     rows,
-    retainedBytes: validated.retainedBytes + index.retainedBytes + worktree.retainedBytes,
+    retainedBytes,
   };
 }
 
@@ -1650,11 +1714,7 @@ function selectedExactAncestorUpperBound(
     bound.count * (SELECTED_EXACT_SET_ENTRY_BYTES + SELECTED_EXACT_ARRAY_SLOT_BYTES) +
     bound.chars * 2 +
     bound.jsonChars * 2;
-  if (
-    bound.jsonBytes > MAX_REQUEST_JSON_BYTES ||
-    !Number.isSafeInteger(retainedBytes) ||
-    retainedBytes > retainedHeadroom
-  ) {
+  if (!Number.isSafeInteger(retainedBytes) || retainedBytes > retainedHeadroom) {
     return null;
   }
   return bound;
@@ -1699,9 +1759,24 @@ function jsonQuotedSize(value: string): { chars: number; bytes: number } {
 
 function selectedExactAncestors(
   validated: ValidatedSelectedPathRequest,
+  reservation: MemoryReservation | null,
 ): SelectedExactAncestors | null {
   const retainedHeadroom = validated.retainedLimit - validated.retainedBytes;
-  if (selectedExactAncestorUpperBound(validated.request, retainedHeadroom) === null) return null;
+  const bound = selectedExactAncestorUpperBound(validated.request, retainedHeadroom);
+  if (
+    bound === null ||
+    !admitReservation(
+      reservation,
+      validated.retainedBytes +
+        SELECTED_EXACT_SET_RETAINED_BYTES +
+        SELECTED_EXACT_ARRAY_RETAINED_BYTES +
+        bound.count * (SELECTED_EXACT_SET_ENTRY_BYTES + SELECTED_EXACT_ARRAY_SLOT_BYTES) +
+        bound.chars * 2 +
+        bound.jsonChars * 2,
+    )
+  ) {
+    return null;
+  }
 
   const unique = new Set<string>();
   const root = validated.request.root;
@@ -1735,7 +1810,6 @@ function selectedExactAncestors(
     jsonChars * 2;
   if (
     !Number.isSafeInteger(jsonBytes) ||
-    jsonBytes > MAX_REQUEST_JSON_BYTES ||
     !Number.isSafeInteger(retainedBytes) ||
     retainedBytes > retainedHeadroom
   ) {
@@ -1744,7 +1818,10 @@ function selectedExactAncestors(
   return { json: JSON.stringify(ancestors), retainedBytes };
 }
 
-function validateSelectedPathRequest(input: unknown): ValidatedSelectedPathRequest | null {
+function validateSelectedPathRequest(
+  input: unknown,
+  reservation: MemoryReservation | null = null,
+): ValidatedSelectedPathRequest | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw inputError("selected path request is invalid");
   }
@@ -1771,7 +1848,7 @@ function validateSelectedPathRequest(input: unknown): ValidatedSelectedPathReque
   ) {
     throw inputError("selected path retained limit is invalid");
   }
-  const retainedLimit = requestRetainedLimit(maxRetainedBytes);
+  const retainedLimit = requestRetainedLimit(maxRetainedBytes, reservation);
   const specs: SelectedPathSpec[] = [];
   const parts: string[] = [];
   let retainedBytes = 0;
@@ -1800,8 +1877,8 @@ function validateSelectedPathRequest(input: unknown): ValidatedSelectedPathReque
     jsonBytes += encoder.encode(part).length + separator;
     jsonChars += part.length + separator;
     retainedBytes += ROW_RETAINED_BYTES + path.length * 4 + parsed.bytes;
-    if (jsonBytes > MAX_REQUEST_JSON_BYTES) {
-      throw tooLarge(`selected path request exceeds ${MAX_REQUEST_JSON_BYTES} JSON bytes`);
+    if (!Number.isSafeInteger(jsonBytes) || !Number.isSafeInteger(jsonChars)) {
+      throw tooLarge("selected path request JSON size overflows");
     }
     if (retainedBytes > retainedLimit - jsonChars * 2) return null;
     parts.push(part);
@@ -1815,10 +1892,12 @@ function validateSelectedPathRequest(input: unknown): ValidatedSelectedPathReque
     specs,
     ...(maxRetainedBytes === undefined ? {} : { maxRetainedBytes }),
   };
+  const totalRetainedBytes = retainedBytes + jsonChars * 2;
+  if (!admitReservation(reservation, totalRetainedBytes)) return null;
   return {
     request,
     json: `[${parts.join(",")}]`,
-    retainedBytes: retainedBytes + jsonChars * 2,
+    retainedBytes: totalRetainedBytes,
     retainedLimit,
   };
 }
@@ -2150,8 +2229,7 @@ function validateSelectedCheckout(
     row.root_type !== "text" ||
     row.root !== request.root ||
     rootBytes === null ||
-    rootBytes < 1 ||
-    rootBytes > MAX_ROOT_BYTES
+    rootBytes < 1
   ) {
     throw new CorruptError("selected path checkout row is malformed or mismatched");
   }
@@ -2166,6 +2244,8 @@ function readSelectedIndex(
   retainedHeadroom: number,
   exact: boolean,
   retainEntry?: () => boolean,
+  retainedBase = 0,
+  reservation: MemoryReservation | null = null,
 ): { available: boolean; rows: IndexEntry[]; retainedBytes: number } {
   const rows: IndexEntry[] = [];
   let metadata = false;
@@ -2209,14 +2289,22 @@ function readSelectedIndex(
       available = false;
       continue;
     }
-    retainedBytes += SELECTED_INDEX_RETAINED_BYTES;
+    const nextRetainedBytes = retainedBytes + SELECTED_INDEX_RETAINED_BYTES;
+    if (!admitReservation(reservation, retainedBase + nextRetainedBytes)) {
+      available = false;
+      continue;
+    }
+    retainedBytes = nextRetainedBytes;
     rows.push(entry);
   }
   if (!metadata) throw new CorruptError("selected index lookup lost metadata");
   return { available, rows, retainedBytes };
 }
 
-function snapshotSelectedRequestBytes(dirty: readonly SparseWorkspaceDirty[]): number | null {
+function snapshotSelectedRequestBytes(
+  dirty: readonly SparseWorkspaceDirty[],
+  retainedLimit: number,
+): number | null {
   let retainedBytes = SNAPSHOT_REQUEST_RETAINED_BYTES + SNAPSHOT_ARRAY_RETAINED_BYTES * 2;
   let jsonChars = 2;
   for (let index = 0; index < dirty.length; index++) {
@@ -2227,10 +2315,10 @@ function snapshotSelectedRequestBytes(dirty: readonly SparseWorkspaceDirty[]): n
     const separator = index === 0 ? 0 : 1;
     const records =
       ROW_RETAINED_BYTES * 2 + SNAPSHOT_ARRAY_SLOT_BYTES * 2 + path.length * 4 + parsed.bytes;
-    if (records > MAX_SPARSE_WORKSPACE_RETAINED_BYTES - retainedBytes) return null;
+    if (records > retainedLimit - retainedBytes) return null;
     retainedBytes += records;
     jsonChars += part.length + separator;
-    if (jsonChars * 2 > MAX_SPARSE_WORKSPACE_RETAINED_BYTES - retainedBytes) return null;
+    if (jsonChars * 2 > retainedLimit - retainedBytes) return null;
   }
   return retainedBytes + jsonChars * 2;
 }
@@ -2240,6 +2328,8 @@ function readSelectedWorktree(
   validated: ValidatedSelectedPathRequest,
   retainedHeadroom: number,
   exactAncestors?: SelectedExactAncestors,
+  retainedBase = 0,
+  reservation: MemoryReservation | null = null,
 ): { available: boolean; rows: SelectedWorktreeFact[]; retainedBytes: number } {
   const rows: SelectedWorktreeFact[] = [];
   let metadata = false;
@@ -2315,7 +2405,6 @@ function readSelectedWorktree(
       typeof row.path !== "string" ||
       pathBytes === null ||
       pathBytes < 1 ||
-      pathBytes > MAX_ROOT_BYTES + MAX_PATH_BYTES + 1 ||
       encoder.encode(row.path).length !== pathBytes ||
       typeof row.relative !== "string" ||
       !validStoredIndexPath(row.relative, encoder.encode(row.relative).length) ||
@@ -2396,11 +2485,16 @@ function readSelectedWorktree(
     ) {
       throw new CorruptError("selected worktree lookup returned malformed payload");
     }
+    const nextRetainedBytes = retainedBytes + SELECTED_WORKTREE_RETAINED_BYTES + payloadBytes;
+    if (!admitReservation(reservation, retainedBase + nextRetainedBytes)) {
+      available = false;
+      continue;
+    }
     const contentId = row.content_id === null ? null : readBlob(row.content_id);
     if (contentId !== null && contentId.length !== contentBytes) {
       throw new CorruptError("selected worktree lookup returned malformed content id");
     }
-    retainedBytes += SELECTED_WORKTREE_RETAINED_BYTES + payloadBytes;
+    retainedBytes = nextRetainedBytes;
     rows.push({
       path: row.relative,
       stat: {
@@ -2420,14 +2514,19 @@ function readSelectedWorktree(
   return { available, rows, retainedBytes };
 }
 
-function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPathResult {
-  const validated = validateSelectedPathRequest(request);
+function selectPaths(
+  db: SqlDatabase,
+  request: SelectedPathRequest,
+  reservation: MemoryReservation | null = null,
+): SelectedPathResult {
+  const validated = validateSelectedPathRequest(request, reservation);
   if (validated === null) return { available: false };
   if (validated.request.specs.length === 0) {
+    reservation?.clear("other");
     return { available: true, index: [], worktree: [], retainedBytes: 0 };
   }
   const exactAncestors = validated.request.specs.every((spec) => !spec.recursive)
-    ? selectedExactAncestors(validated)
+    ? selectedExactAncestors(validated, reservation)
     : null;
   const exactRetainedBytes = exactAncestors?.retainedBytes ?? 0;
   const index = readSelectedIndex(
@@ -2435,6 +2534,9 @@ function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPat
     validated,
     validated.retainedLimit - validated.retainedBytes - exactRetainedBytes,
     exactAncestors !== null,
+    undefined,
+    validated.retainedBytes + exactRetainedBytes,
+    reservation,
   );
   const headroom =
     validated.retainedLimit - validated.retainedBytes - exactRetainedBytes - index.retainedBytes;
@@ -2443,13 +2545,17 @@ function selectPaths(db: SqlDatabase, request: SelectedPathRequest): SelectedPat
     validated,
     Math.max(0, headroom),
     exactAncestors ?? undefined,
+    validated.retainedBytes + exactRetainedBytes + index.retainedBytes,
+    reservation,
   );
   if (!index.available || !worktree.available || headroom < 0) return { available: false };
+  const retainedBytes = validated.retainedBytes + index.retainedBytes + worktree.retainedBytes;
+  if (!admitReservation(reservation, retainedBytes)) return { available: false };
   return {
     available: true,
     index: index.rows,
     worktree: worktree.rows,
-    retainedBytes: validated.retainedBytes + index.retainedBytes + worktree.retainedBytes,
+    retainedBytes,
   };
 }
 
@@ -2459,7 +2565,10 @@ interface ValidatedSnapshotRequest {
   retainedBytes: number;
 }
 
-function validateSnapshotRequest(input: unknown): ValidatedSnapshotRequest | null {
+function validateSnapshotRequest(
+  input: unknown,
+  reservation: MemoryReservation | null = null,
+): ValidatedSnapshotRequest | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw inputError("commit tree snapshot request is invalid");
   }
@@ -2488,10 +2597,10 @@ function validateSnapshotRequest(input: unknown): ValidatedSnapshotRequest | nul
   ) {
     throw inputError("commit tree snapshot retained limit is invalid");
   }
-  const retainedLimit = requestRetainedLimit(maxRetainedBytes);
+  const retainedLimit = requestRetainedLimit(maxRetainedBytes, reservation);
   const retainedBytes =
     SNAPSHOT_REQUEST_RETAINED_BYTES + root.length * 4 + (baselineTreeOid === null ? 0 : 160);
-  if (retainedBytes > retainedLimit) return null;
+  if (retainedBytes > retainedLimit || !admitReservation(reservation, retainedBytes)) return null;
   return {
     request: {
       repoId,
@@ -2563,8 +2672,7 @@ function readSnapshotDirty(
         row.root_type !== "text" ||
         row.root !== validated.request.root ||
         rootBytes === null ||
-        rootBytes < 1 ||
-        rootBytes > MAX_ROOT_BYTES
+        rootBytes < 1
       ) {
         throw new CorruptError("commit tree snapshot checkout is malformed");
       }
@@ -2600,7 +2708,6 @@ function readSnapshotDirty(
       typeof row.path !== "string" ||
       pathBytes === null ||
       pathBytes < 1 ||
-      pathBytes > MAX_PATH_BYTES ||
       !validStoredIndexPath(row.path, pathBytes) ||
       row.flags_type !== "integer" ||
       flags === null ||
@@ -2688,10 +2795,7 @@ function reserveSnapshotTreeDepth(
   let jsonChars = 2;
   for (const cursor of cursors) {
     const partChars = SNAPSHOT_TREE_PART_JSON_CHARS + cursor.segment.length * 6;
-    if (
-      !Number.isSafeInteger(partChars) ||
-      partChars > MAX_REQUEST_JSON_BYTES - jsonChars - (jsonChars === 2 ? 0 : 1)
-    ) {
+    if (!Number.isSafeInteger(partChars)) {
       return null;
     }
     jsonChars += partChars + (jsonChars === 2 ? 0 : 1);
@@ -2737,6 +2841,7 @@ function snapshotTreeDepth(
     retained.used - reservation.requestBytes,
     retained.limit,
     retainSource,
+    retained.reservation,
   );
   releaseSnapshot(retained, reservation.requestBytes);
   return { ...result, resolutionBytes: reservation.resolutionBytes };
@@ -2782,7 +2887,11 @@ function resolveSnapshotDirectoryOids(
   }
   if (sourcePresent === 0) return { available: false, oids, sources };
   oids[0] = request.baselineTreeOid;
-  const budget: SourceBudget = { entries: 0, bytes: 0 };
+  const budget: SourceBudget = {
+    entries: 0,
+    bytes: 0,
+    limit: Math.max(0, retained.limit - retained.used),
+  };
   const rootCursorBytes =
     SNAPSHOT_ARRAY_RETAINED_BYTES + SNAPSHOT_ARRAY_SLOT_BYTES + snapshotCursorRetainedBytes(1, 1);
   if (!reserveSnapshot(retained, rootCursorBytes)) {
@@ -3047,7 +3156,7 @@ function readSnapshotDirectories(
     const separator = parts.length === 0 ? 0 : 1;
     requestJsonChars += part.length + separator;
     requestJsonBytes += encoder.encode(part).length + separator;
-    if (requestJsonBytes > MAX_REQUEST_JSON_BYTES) {
+    if (!Number.isSafeInteger(requestJsonBytes)) {
       return { available: false, directories: [] };
     }
     parts.push(part);
@@ -3058,9 +3167,6 @@ function readSnapshotDirectories(
     return { available: false, directories: [] };
   }
   const json = `[${parts.join(",")}]`;
-  if (encoder.encode(json).length > MAX_REQUEST_JSON_BYTES) {
-    return { available: false, directories: [] };
-  }
   if (
     !reserveSnapshot(
       retained,
@@ -3138,16 +3244,18 @@ function readSnapshotDirectories(
   return { available: true, directories };
 }
 
-function snapshotCommitTree(
+function snapshotCommitTreeNative(
   db: SqlDatabase,
   request: CommitTreeSnapshotRequest,
+  reservation: MemoryReservation | null = null,
 ): CommitTreeSnapshotResult {
-  const validated = validateSnapshotRequest(request);
+  const validated = validateSnapshotRequest(request, reservation);
   if (validated === null) return { available: false };
   const retained: SnapshotRetainedBudget = {
     limit: validated.retainedLimit,
     used: validated.retainedBytes,
     peak: validated.retainedBytes,
+    reservation,
   };
   const dirty = readSnapshotDirty(db, validated, retained);
   if (!dirty.available) return { available: false };
@@ -3167,7 +3275,7 @@ function snapshotCommitTree(
     };
   }
   if (dirty.dirty.length > MAX_PATHS) return { available: false };
-  const selectedRequestBytes = snapshotSelectedRequestBytes(dirty.dirty);
+  const selectedRequestBytes = snapshotSelectedRequestBytes(dirty.dirty, retained.limit);
   if (selectedRequestBytes === null || !reserveSnapshot(retained, selectedRequestBytes)) {
     return { available: false };
   }
@@ -3209,19 +3317,221 @@ function snapshotCommitTree(
   };
 }
 
+interface NativeSparseWorkspaceOperations {
+  dirtyPaths(checkoutId: number, reservation: MemoryReservation): Iterable<SparseWorkspaceDirty>;
+  hydrate(request: SparseWorkspaceRequest, reservation: MemoryReservation): SparseWorkspaceResult;
+  indexAncestorFacts(
+    request: SparseIndexAncestorRequest,
+    reservation: MemoryReservation,
+  ): SparseIndexAncestorResult;
+}
+
+interface NativeSelectedPathOperations {
+  select(request: SelectedPathRequest, reservation: MemoryReservation): SelectedPathResult;
+}
+
+interface NativeCommitTreeOperations {
+  snapshot(
+    request: CommitTreeSnapshotRequest,
+    reservation: MemoryReservation,
+  ): CommitTreeSnapshotResult;
+}
+
+const nativeSparseWorkspaceOperations = new WeakMap<
+  SparseWorkspaceSource,
+  NativeSparseWorkspaceOperations
+>();
+const nativeSelectedPathOperations = new WeakMap<
+  SelectedPathSource,
+  NativeSelectedPathOperations
+>();
+const nativeCommitTreeOperations = new WeakMap<
+  CommitTreeSnapshotSource,
+  NativeCommitTreeOperations
+>();
+
+function retainedResult(
+  reservation: MemoryReservation,
+  retainedBytes: number,
+  label: string,
+): void {
+  if (!Number.isSafeInteger(retainedBytes) || retainedBytes < 0) {
+    throw new CorruptError(`${label} returned invalid retained bytes`);
+  }
+  reservation.set("other", retainedBytes);
+}
+
+/** Use the native owner seam without widening the public sparse source interface. */
+export function sparseDirtyPathsOwned(
+  source: SparseWorkspaceSource,
+  checkoutId: number,
+  owningReservation: MemoryReservation,
+): Iterable<SparseWorkspaceDirty> {
+  return (
+    nativeSparseWorkspaceOperations.get(source)?.dirtyPaths(checkoutId, owningReservation) ??
+    source.dirtyPaths(checkoutId)
+  );
+}
+
+/** Use the native owner seam without widening the public sparse source interface. */
+export function hydrateSparseWorkspaceOwned(
+  source: SparseWorkspaceSource,
+  request: SparseWorkspaceRequest,
+  owningReservation: MemoryReservation,
+): SparseWorkspaceResult {
+  const reservation = owningReservation.scope();
+  try {
+    const native = nativeSparseWorkspaceOperations.get(source);
+    const fallbackLimit =
+      native === undefined
+        ? requestRetainedLimit(request.maxRetainedBytes, reservation)
+        : undefined;
+    const result =
+      native === undefined
+        ? source.hydrate({ ...request, maxRetainedBytes: fallbackLimit })
+        : native.hydrate(request, reservation);
+    if (!result.available) {
+      reservation.dispose();
+      return result;
+    }
+    if (fallbackLimit !== undefined && result.retainedBytes > fallbackLimit) {
+      throw new CorruptError("sparse workspace source exceeded its retained limit");
+    }
+    retainedResult(reservation, result.retainedBytes, "sparse workspace source");
+    return result;
+  } catch (error) {
+    reservation.dispose();
+    if (hasErrorCode(error, "E2BIG")) return { available: false };
+    throw error;
+  }
+}
+
+/** Use the native owner seam without widening the public sparse source interface. */
+export function sparseIndexAncestorFactsOwned(
+  source: SparseWorkspaceSource,
+  request: SparseIndexAncestorRequest,
+  owningReservation: MemoryReservation,
+): SparseIndexAncestorResult {
+  const reservation = owningReservation.scope();
+  try {
+    const native = nativeSparseWorkspaceOperations.get(source);
+    const fallbackLimit =
+      native === undefined
+        ? requestRetainedLimit(request.maxRetainedBytes, reservation)
+        : undefined;
+    const result =
+      native === undefined
+        ? source.indexAncestorFacts?.({
+            ...request,
+            maxRetainedBytes: fallbackLimit,
+          })
+        : native.indexAncestorFacts(request, reservation);
+    if (result === undefined) {
+      throw new GitError("EUNSUPPORTED", "sparse index ancestor source is unavailable");
+    }
+    if (fallbackLimit !== undefined && result.retainedBytes > fallbackLimit) {
+      throw new CorruptError("sparse index ancestor source exceeded its retained limit");
+    }
+    retainedResult(reservation, result.retainedBytes, "sparse index ancestor source");
+    return result;
+  } catch (error) {
+    reservation.dispose();
+    throw error;
+  }
+}
+
+/** Use the native owner seam without widening the public selected-path source interface. */
+export function selectSparsePathsOwned(
+  source: SelectedPathSource,
+  request: SelectedPathRequest,
+  owningReservation: MemoryReservation,
+): SelectedPathResult {
+  const reservation = owningReservation.scope();
+  try {
+    const native = nativeSelectedPathOperations.get(source);
+    const fallbackLimit =
+      native === undefined
+        ? requestRetainedLimit(request.maxRetainedBytes, reservation)
+        : undefined;
+    const result =
+      native === undefined
+        ? source.select({ ...request, maxRetainedBytes: fallbackLimit })
+        : native.select(request, reservation);
+    if (!result.available) {
+      reservation.dispose();
+      return result;
+    }
+    if (fallbackLimit !== undefined && result.retainedBytes > fallbackLimit) {
+      throw new CorruptError("selected path source exceeded its retained limit");
+    }
+    retainedResult(reservation, result.retainedBytes, "selected path source");
+    return result;
+  } catch (error) {
+    reservation.dispose();
+    if (hasErrorCode(error, "E2BIG")) return { available: false };
+    throw error;
+  }
+}
+
+/** Use the native owner seam without widening the public commit-tree source interface. */
+export function snapshotCommitTreeOwned(
+  source: CommitTreeSnapshotSource,
+  request: CommitTreeSnapshotRequest,
+  owningReservation: MemoryReservation,
+): CommitTreeSnapshotResult {
+  const reservation = owningReservation.scope();
+  try {
+    const native = nativeCommitTreeOperations.get(source);
+    const result =
+      native === undefined
+        ? source.snapshot({
+            ...request,
+            maxRetainedBytes: requestRetainedLimit(request.maxRetainedBytes, reservation),
+          })
+        : native.snapshot(request, reservation);
+    if (!result.available) {
+      reservation.dispose();
+      return result;
+    }
+    retainedResult(reservation, result.retainedBytes, "commit tree snapshot source");
+    return result;
+  } catch (error) {
+    reservation.dispose();
+    if (hasErrorCode(error, "E2BIG")) return { available: false };
+    throw error;
+  }
+}
+
 export function createSqliteSparseWorkspaceSource(db: SqlDatabase): SparseWorkspaceSource {
-  return {
+  const source: SparseWorkspaceSource = {
     readState: (checkoutId) => readIndexTrackerState(db, checkoutId),
     dirtyPaths: (checkoutId) => iterateIndexTrackerDirty(db, checkoutId),
     hydrate: (request) => hydrate(db, request),
     indexAncestorFacts: (request) => indexAncestorFacts(db, request),
   };
+  nativeSparseWorkspaceOperations.set(source, {
+    dirtyPaths: (checkoutId, reservation) =>
+      iterateIndexTrackerDirty(db, checkoutId, undefined, reservation),
+    hydrate: (request, reservation) => hydrate(db, request, reservation),
+    indexAncestorFacts: (request, reservation) => indexAncestorFacts(db, request, reservation),
+  });
+  return source;
 }
 
 export function createSqliteSelectedPathSource(db: SqlDatabase): SelectedPathSource {
-  return { select: (request) => selectPaths(db, request) };
+  const source: SelectedPathSource = { select: (request) => selectPaths(db, request) };
+  nativeSelectedPathOperations.set(source, {
+    select: (request, reservation) => selectPaths(db, request, reservation),
+  });
+  return source;
 }
 
 export function createSqliteCommitTreeSnapshotSource(db: SqlDatabase): CommitTreeSnapshotSource {
-  return { snapshot: (request) => snapshotCommitTree(db, request) };
+  const source: CommitTreeSnapshotSource = {
+    snapshot: (request) => snapshotCommitTreeNative(db, request),
+  };
+  nativeCommitTreeOperations.set(source, {
+    snapshot: (request, reservation) => snapshotCommitTreeNative(db, request, reservation),
+  });
+  return source;
 }

@@ -9,7 +9,7 @@ import { subtreeSuccessor } from "../../fs/path.js";
 import { nativeRealpathOwned, nativeScanOwned } from "../../fs/store/owned-read.js";
 import { scanPageRetainedBytes } from "../../fs/store/scan.js";
 import type { RealPath, ScanEntry, ScanOptions } from "../../fs/types.js";
-import type { MemoryReservation } from "../../memory.js";
+import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import { type IndexEntry, indexScanOwned, writeObjectsOwned } from "../../sqlite/store.js";
 import { toHex, utf8 } from "../bytes.js";
 import { GitError } from "../errors.js";
@@ -47,13 +47,15 @@ const HASH_BYTE_ARRAY_BYTES = 64;
 const HASH_STATE_BYTES = 256;
 const HASH_OID_BYTES = retainedStringBytes("0".repeat(40));
 const WORKTREE_DECODED_ROW_BYTES = 256;
+const PATHSPEC_MATCHER_BYTES = 256;
+const PATHSPEC_ARRAY_BYTES = 64;
+const PATHSPEC_ARRAY_SLOT_BYTES = 8;
 
 function retainedStringUnits(units: number): number {
   return 48 + units * 2;
 }
 
 export const MAX_COMPILED_PATHS = 32_768;
-export const MAX_COMPILED_PATHSPEC_BYTES = 1024 * 1024;
 
 export interface WalkOptions {
   /**
@@ -90,13 +92,15 @@ export interface CompiledPathspecMatcher {
 }
 
 class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
+  readonly #reservation: MemoryReservation;
   readonly #checkoutAll: boolean;
   readonly #walkAll: boolean;
   readonly #exact: string[];
   readonly #checkoutPrefixes: string[];
   readonly #walkPrefixes: string[];
 
-  constructor(paths: readonly string[] | undefined) {
+  constructor(paths: readonly string[] | undefined, reservation: MemoryReservation) {
+    this.#reservation = reservation;
     this.#checkoutAll =
       paths === undefined || paths.length === 0 || paths.includes("") || paths.includes(".");
     this.#walkAll =
@@ -130,25 +134,100 @@ class ByteOrderedPathspecMatcher implements CompiledPathspecMatcher {
 
   includesDirectory(path: string): boolean {
     if (this.#walkAll || this.matchesEntry(path)) return true;
-    const prefix = `${path}/`;
-    const at = lowerBound(this.#walkPrefixes, prefix);
-    return this.#walkPrefixes[at]?.startsWith(prefix) === true;
+    const transient = this.#reservation.scope();
+    transient.set("other", retainedStringUnits(path.length + 1));
+    try {
+      const prefix = `${path}/`;
+      const at = lowerBound(this.#walkPrefixes, prefix);
+      return this.#walkPrefixes[at]?.startsWith(prefix) === true;
+    } finally {
+      transient.dispose();
+    }
   }
 
   #hasPrefix(prefixes: readonly string[], path: string): boolean {
-    let slash = path.indexOf("/");
-    while (slash >= 0) {
-      if (containsByteOrdered(prefixes, path.slice(0, slash))) return true;
-      slash = path.indexOf("/", slash + 1);
+    const transient = this.#reservation.scope();
+    transient.set("other", retainedStringUnits(path.length));
+    try {
+      let slash = path.indexOf("/");
+      while (slash >= 0) {
+        if (containsByteOrdered(prefixes, path.slice(0, slash))) return true;
+        slash = path.indexOf("/", slash + 1);
+      }
+      return false;
+    } finally {
+      transient.dispose();
     }
-    return false;
+  }
+
+  retainedBytes(): number {
+    let bytes =
+      PATHSPEC_MATCHER_BYTES +
+      3 * PATHSPEC_ARRAY_BYTES +
+      (this.#exact.length + this.#checkoutPrefixes.length + this.#walkPrefixes.length) *
+        PATHSPEC_ARRAY_SLOT_BYTES;
+    for (const path of this.#exact) bytes += retainedStringBytes(path);
+    for (const path of this.#checkoutPrefixes) bytes += retainedStringBytes(path);
+    return bytes;
   }
 }
 
+const COMPILED_PATHSPEC_RELEASES = new WeakMap<CompiledPathspecMatcher, () => void>();
+
 /** Compile once when one pathspec list is reused across joins or walks. */
 export function compilePathspecs(paths: readonly string[] | undefined): CompiledPathspecMatcher {
+  const coordinator = new MemoryCoordinator();
+  const reservation = coordinator.reserve();
+  try {
+    const matcher = compilePathspecsOwned(paths, reservation);
+    COMPILED_PATHSPEC_RELEASES.set(matcher, () => {
+      reservation.dispose();
+      coordinator.assertIdle();
+    });
+    return matcher;
+  } catch (error) {
+    reservation.dispose();
+    coordinator.assertIdle();
+    throw error;
+  }
+}
+
+/** Release a standalone compiled matcher after its final consumer. */
+export function releaseCompiledPathspecs(matcher: CompiledPathspecMatcher | undefined): void {
+  if (matcher === undefined) return;
+  const release = COMPILED_PATHSPEC_RELEASES.get(matcher);
+  if (release === undefined) return;
+  COMPILED_PATHSPEC_RELEASES.delete(matcher);
+  release();
+}
+
+/** Compile a matcher whose lifetime is owned by an existing operation reservation. */
+export function compilePathspecsOwned(
+  paths: readonly string[] | undefined,
+  reservation: MemoryReservation,
+): ByteOrderedPathspecMatcher {
   validateCompiledPathspecs(paths);
-  return new ByteOrderedPathspecMatcher(paths);
+  reservation.set("other", compiledPathspecConstructionBytes(paths));
+  try {
+    const matcher = new ByteOrderedPathspecMatcher(paths, reservation);
+    reservation.set("other", matcher.retainedBytes());
+    return matcher;
+  } catch (error) {
+    reservation.clear("other");
+    throw error;
+  }
+}
+
+function compiledPathspecConstructionBytes(paths: readonly string[] | undefined): number {
+  const values = paths ?? [];
+  let strings = 0;
+  for (const path of values) strings += 2 * retainedStringUnits(path.length);
+  return (
+    PATHSPEC_MATCHER_BYTES +
+    4 * PATHSPEC_ARRAY_BYTES +
+    values.length * 4 * PATHSPEC_ARRAY_SLOT_BYTES +
+    strings
+  );
 }
 
 function validateCompiledPathspecs(paths: readonly string[] | undefined): void {
@@ -156,69 +235,10 @@ function validateCompiledPathspecs(paths: readonly string[] | undefined): void {
   if (paths.length > MAX_COMPILED_PATHS) {
     throw new GitError("E2BIG", `compiled pathspec exceeds ${MAX_COMPILED_PATHS} paths`);
   }
-  let inputBytes = 0;
-  let requestBytes = 2;
   for (let index = 0; index < paths.length; index++) {
     const path = paths[index];
     if (path === undefined) throw new GitError("EINVAL", "compiled pathspec is not dense");
-    const sizes = pathspecBytes(path);
-    const separator = index === 0 ? 0 : 1;
-    if (
-      sizes.input > MAX_COMPILED_PATHSPEC_BYTES - inputBytes ||
-      sizes.request + separator > MAX_COMPILED_PATHSPEC_BYTES - requestBytes
-    ) {
-      throw new GitError("E2BIG", `compiled pathspec exceeds ${MAX_COMPILED_PATHSPEC_BYTES} bytes`);
-    }
-    inputBytes += sizes.input;
-    requestBytes += sizes.request + separator;
   }
-}
-
-function pathspecBytes(value: string): { input: number; request: number } {
-  let input = 0;
-  let request = 2;
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (
-      unit === 0x22 ||
-      unit === 0x5c ||
-      unit === 0x08 ||
-      unit === 0x09 ||
-      unit === 0x0a ||
-      unit === 0x0c ||
-      unit === 0x0d
-    ) {
-      input++;
-      request += 2;
-    } else if (unit < 0x20) {
-      input++;
-      request += 6;
-    } else if (unit < 0x80) {
-      input++;
-      request++;
-    } else if (unit < 0x800) {
-      input += 2;
-      request += 2;
-    } else if (unit >= 0xd800 && unit <= 0xdbff) {
-      const low = value.charCodeAt(index + 1);
-      if (low >= 0xdc00 && low <= 0xdfff) {
-        input += 4;
-        request += 4;
-        index++;
-      } else {
-        input += 3;
-        request += 6;
-      }
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      input += 3;
-      request += 6;
-    } else {
-      input += 3;
-      request += 3;
-    }
-    if (input > MAX_COMPILED_PATHSPEC_BYTES || request > MAX_COMPILED_PATHSPEC_BYTES) break;
-  }
-  return { input, request };
 }
 
 function uniqueByteOrdered(values: readonly string[]): string[] {
@@ -334,7 +354,6 @@ function* walkWorktreeEntriesStreamCore(
   const lexicalRoot =
     memory?.construct(root.length, () => root.replace(/\/+$/, "") || "/") ??
     (root.replace(/\/+$/, "") || "/");
-  const pathspec = options.pathspec ?? compilePathspecs(options.paths);
   const baseRead = readWorktreeRealpath(worktree, lexicalRoot, memory);
   const base = baseRead.path;
   const excluded = new Set<string>();
@@ -344,8 +363,20 @@ function* walkWorktreeEntriesStreamCore(
   const pruned: Array<{ directory: string; lower: string; upper: string; bytes: number }> = [];
   let pageMemory: MemoryReservation | null = null;
   let cursorMemory: MemoryReservation | null = null;
+  let pathspecMemory: MemoryReservation | null = null;
+  let releaseLocalPathspec = false;
+  let pathspec = options.pathspec;
 
   try {
+    if (pathspec === undefined) {
+      if (memory === undefined) {
+        pathspec = compilePathspecs(options.paths);
+        releaseLocalPathspec = true;
+      } else {
+        pathspecMemory = memory.scope();
+        pathspec = compilePathspecsOwned(options.paths, pathspecMemory);
+      }
+    }
     for (const path of options.excludeRoots ?? []) {
       const slotBytes = HASH_COLLECTION_ENTRY_BYTES;
       memory?.add(slotBytes);
@@ -485,6 +516,8 @@ function* walkWorktreeEntriesStreamCore(
     pageMemory?.dispose();
     for (const range of pruned) memory?.release(range.bytes);
     releaseWorktreeRealpath(baseRead, memory);
+    pathspecMemory?.dispose();
+    if (releaseLocalPathspec) releaseCompiledPathspecs(pathspec);
   }
 }
 
@@ -1162,21 +1195,16 @@ export function* dirtyPathStreamOwned(
     if (retained < HASH_OWNER_BYTES) throw new Error("dirty-path memory accounting is corrupt");
     reservation.set("other", retained);
   };
-  const pathspec = compilePathspecs(paths);
-  const excluded: string[] = [];
-  for (const path of excludeRoots) {
-    const current = reservation.scope();
-    current.set("other", retainedStringUnits(path.length));
-    try {
-      const relative = relativeTo(repo.root, path);
-      if (relative === null || relative === "") continue;
-      const bytes = HASH_COLLECTION_ENTRY_BYTES + retainedStringBytes(relative);
-      add(bytes);
-      excluded.push(relative);
-    } finally {
-      current.dispose();
-    }
+  const pathspecMemory = reservation.scope();
+  let pathspec: CompiledPathspecMatcher;
+  try {
+    pathspec = compilePathspecsOwned(paths, pathspecMemory);
+  } catch (error) {
+    pathspecMemory.dispose();
+    reservation.clear("other");
+    throw error;
   }
+  const excluded: string[] = [];
   let root: RealPath | null = null;
   let rootRead: WorktreeRealpathRead | null = null;
   let scanned: Generator<WorktreePath> | null = null;
@@ -1270,6 +1298,19 @@ export function* dirtyPathStreamOwned(
   };
 
   try {
+    for (const path of excludeRoots) {
+      const current = reservation.scope();
+      current.set("other", retainedStringUnits(path.length));
+      try {
+        const relative = relativeTo(repo.root, path);
+        if (relative === null || relative === "") continue;
+        const bytes = HASH_COLLECTION_ENTRY_BYTES + retainedStringBytes(relative);
+        add(bytes);
+        excluded.push(relative);
+      } finally {
+        current.dispose();
+      }
+    }
     for (const entry of indexScanOwned(repo.checkout, indexMemory)) {
       if (limits !== undefined) {
         if (limits.indexRows >= limits.maxIndexRows) {
@@ -1332,6 +1373,7 @@ export function* dirtyPathStreamOwned(
     if (rootRead !== null) releaseWorktreeRealpath(rootRead, scanMemory);
     worktreeMemory.dispose();
     indexMemory.dispose();
+    pathspecMemory.dispose();
   }
 }
 

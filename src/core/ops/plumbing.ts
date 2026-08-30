@@ -39,7 +39,6 @@ import {
 } from "./tree-build.js";
 
 const READ_TREE_MAX_ROWS_PER_STREAM = 50_000;
-const READ_TREE_MAX_WRITE_BYTES = 64 * 1024 * 1024;
 const WRITE_TREE_INDEX_PAGE = 2_048;
 export const MAX_COMMIT_TREE_PARENTS = 2;
 export const MAX_COMMIT_TREE_REVISION_TRAVERSALS = 8;
@@ -118,7 +117,6 @@ export function readTree(
             restoreStructure: true,
             maxWorktreeRowsPerPass: READ_TREE_MAX_ROWS_PER_STREAM,
             maxSourceRowsPerPass: READ_TREE_MAX_ROWS_PER_STREAM,
-            maxWriteBytes: READ_TREE_MAX_WRITE_BYTES,
           },
           index,
         );

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 import {
   classifyExactRenames,
@@ -121,6 +121,17 @@ describe("bounded exact rename classification", () => {
     ]);
   });
 
+  it("classifies a rename path above the former component ceiling", () => {
+    const basename = "x".repeat(2_201 - "old/".length);
+    const source = candidate(`old/${basename}`);
+    const destination = candidate(`new/${basename}`);
+
+    expect(classifyExactRenames([source], [destination])).toMatchObject({
+      kind: "classified",
+      renames: [{ source, destination, similarity: 100 }],
+    });
+  });
+
   it("cannot form a rename after either filtered endpoint is removed", () => {
     expect(classifyExactRenames([candidate("old/a")], []).renames).toEqual([]);
     expect(classifyExactRenames([], [candidate("new/a")]).renames).toEqual([]);
@@ -148,6 +159,25 @@ describe("bounded exact rename classification", () => {
         maxRetainedBytes: retainedBytes - 1,
       }),
     ).toMatchObject({ kind: "fallback", renames: [], candidateCount: 2 });
+  });
+
+  it("scans path grammar and UTF-8 length before the aggregate byte boundary", () => {
+    const source = candidate(`old/${"é".repeat(128 * 1024)}`);
+    const destination = candidate(`new/${"😀".repeat(64 * 1024)}`);
+    const encode = vi.spyOn(TextEncoder.prototype, "encode");
+    try {
+      const retainedBytes =
+        exactRenameCandidateRetainedBytes(source) + exactRenameCandidateRetainedBytes(destination);
+      expect(
+        classifyExactRenames([source], [destination], { maxRetainedBytes: retainedBytes }),
+      ).toMatchObject({ kind: "classified", candidateCount: 2, retainedBytes });
+      expect(
+        classifyExactRenames([source], [destination], { maxRetainedBytes: retainedBytes - 1 }),
+      ).toMatchObject({ kind: "fallback", candidateCount: 2 });
+      expect(encode).not.toHaveBeenCalled();
+    } finally {
+      encode.mockRestore();
+    }
   });
 
   it("rejects corrupt identities and attempts to raise hard limits", () => {

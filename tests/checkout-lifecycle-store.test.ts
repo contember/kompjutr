@@ -1,11 +1,13 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
+import { retainedStringBytes } from "../src/core/retained.js";
 import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   type CheckoutRow,
   type CheckoutStore,
+  listCheckoutsOwned,
   MAX_CHECKOUT_LIST_RETAINED_BYTES,
   SqliteGitDatabase,
 } from "../src/sqlite/store.js";
@@ -49,6 +51,73 @@ class CheckoutCursorDatabase implements SqlDatabase {
   }
 }
 
+class CheckoutAdmissionDatabase implements SqlDatabase {
+  statementCalls = 0;
+
+  constructor(readonly inner: TestDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.statementCalls++;
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    this.statementCalls++;
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    this.statementCalls++;
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    this.statementCalls++;
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    this.statementCalls++;
+    return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+function checkoutInputRetainedBytes(value: string): number {
+  const relativePrefix = value.startsWith("/") ? 0 : 1;
+  const sourceUnits = value.length + relativePrefix;
+  let parts = 1 + relativePrefix;
+  for (let index = 0; index < value.length; index++) {
+    if (value.charCodeAt(index) === 0x2f) parts++;
+  }
+  const sourceBytes = utf8.encode(value).byteLength + relativePrefix;
+  const stringUnits = (units: number): number => 48 + 2 * units;
+  return (
+    1_024 +
+    stringUnits(value.length) +
+    (relativePrefix === 0 ? 0 : stringUnits(sourceUnits)) +
+    128 +
+    parts * 64 +
+    2 * sourceUnits +
+    2 * stringUnits(sourceUnits + 1) +
+    2 * (256 + sourceBytes)
+  );
+}
+
+function checkoutSqlRetainedBytes(input: string, normalized: string): number {
+  return (
+    512 +
+    48 +
+    2 * input.length +
+    48 +
+    2 * normalized.length +
+    2 * (256 + utf8.encode(normalized).byteLength)
+  );
+}
+
 function repository() {
   const db = new TestDatabase();
   const database = new SqliteGitDatabase(db);
@@ -88,6 +157,200 @@ function checkoutStorageRow(db: TestDatabase, checkoutId: number): Record<string
 }
 
 describe("checkout lifecycle storage", () => {
+  it("round-trips the former checkout-root first excess across a cold reopen", () => {
+    const db = new TestDatabase();
+    const database = new SqliteGitDatabase(db);
+    const root = `/${"r".repeat(4_096)}`;
+    const checkout = database.createRepository(root, "ref: refs/heads/main");
+    expect(utf8.encode(root)).toHaveLength(4_097);
+    expect(database.checkoutAt(root)).toEqual(expect.objectContaining({ root }));
+
+    const reopenedDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
+    const reopened = reopenedDatabase.checkoutAt(root);
+    expect(reopened).toEqual(expect.objectContaining({ id: checkout.id, root }));
+    expect(reopenedDatabase.listRoutingRoots()).toContain(root);
+  });
+
+  it("admits checkout-root normalization and bindings before the first SQL call", () => {
+    const setupDb = new TestDatabase();
+    const setup = new SqliteGitDatabase(setupDb);
+    const checkout = setup.createRepository("/repo", "ref: refs/heads/main");
+    const input = `${"segment/../".repeat(512)}repo`;
+    const rootBytes = utf8.encode(checkout.root).byteLength;
+    const headBytes = utf8.encode(checkout.head).byteLength;
+    const rowBytes = 352 + 3 * (rootBytes + headBytes);
+    const operationBytes = Math.max(
+      checkoutInputRetainedBytes(input),
+      checkoutSqlRetainedBytes(input, "/repo") + rowBytes,
+    );
+
+    const exactObserved = new CheckoutAdmissionDatabase(new TestDatabase(setupDb.storage));
+    const exactDatabase = new SqliteGitDatabase(exactObserved);
+    const exactShared = exactDatabase.openShared(checkout.repoId);
+    const exactBlocker = exactShared.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    exactObserved.statementCalls = 0;
+    try {
+      expect(exactDatabase.checkoutAt(input)).toEqual(expect.objectContaining({ root: "/repo" }));
+      expect(exactObserved.statementCalls).toBeGreaterThan(0);
+      expect(exactShared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    exactShared.memory.assertIdle();
+
+    const overObserved = new CheckoutAdmissionDatabase(new TestDatabase(setupDb.storage));
+    const overDatabase = new SqliteGitDatabase(overObserved);
+    const overShared = overDatabase.openShared(checkout.repoId);
+    const overBlocker = overShared.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - checkoutInputRetainedBytes(input) + 1);
+    overObserved.statementCalls = 0;
+    try {
+      expect(() => overDatabase.checkoutAt(input)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(overObserved.statementCalls).toBe(0);
+      expect(overDatabase.checkoutAt("/repo")).toEqual(
+        expect.objectContaining({ id: checkout.id }),
+      );
+    } finally {
+      overBlocker.dispose();
+    }
+    overShared.memory.assertIdle();
+  });
+
+  it("rejects invalid checkout roots before accounting or SQL", () => {
+    const setupDb = new TestDatabase();
+    const setup = new SqliteGitDatabase(setupDb);
+    const checkout = setup.createRepository("/repo", "ref: refs/heads/main");
+    const observed = new CheckoutAdmissionDatabase(new TestDatabase(setupDb.storage));
+    const database = new SqliteGitDatabase(observed);
+    const shared = database.openShared(checkout.repoId);
+    const inputs: readonly unknown[] = [null, 42, "/bad\0root"];
+
+    for (const input of inputs) {
+      observed.statementCalls = 0;
+      expect(() => Reflect.apply(database.checkoutAt, database, [input])).toThrowError(
+        expect.objectContaining({ code: "EINVAL" }),
+      );
+      expect(observed.statementCalls).toBe(0);
+      shared.memory.assertIdle();
+    }
+  });
+
+  it("owns checkout and routing collections while the current row remains live", () => {
+    const setupDb = new TestDatabase();
+    const setup = new SqliteGitDatabase(setupDb);
+    const primary = setup.createRepository("/repo", "ref: refs/heads/main");
+    const second = setup.createCheckout(primary.repoId, "/repo/a", OID);
+    const third = setup.createCheckout(primary.repoId, "/repo/b-long", OTHER_OID);
+    const checkouts = [primary, second, third];
+    const maximumRootBytes = Math.max(
+      ...checkouts.map((checkout) => utf8.encode(checkout.root).byteLength),
+    );
+    const maximumHeadBytes = Math.max(
+      ...checkouts.map((checkout) => utf8.encode(checkout.head).byteLength),
+    );
+    const rowBytes = 352 + 3 * (maximumRootBytes + maximumHeadBytes);
+    const checkoutRowsBytes = checkouts.reduce(
+      (bytes, checkout) =>
+        bytes + 8 + 128 + retainedStringBytes(checkout.root) + retainedStringBytes(checkout.head),
+      0,
+    );
+    const rootRowsBytes = checkouts.reduce(
+      (bytes, checkout) => bytes + 8 + retainedStringBytes(checkout.root),
+      0,
+    );
+    const calls: readonly {
+      name: string;
+      collectionBytes: number;
+      read(database: SqliteGitDatabase): readonly unknown[];
+    }[] = [
+      {
+        name: "repository checkout list",
+        collectionBytes: 128 + checkoutRowsBytes,
+        read: (database) => database.listCheckouts(primary.repoId),
+      },
+      {
+        name: "routing checkout list",
+        collectionBytes: 128 + 2 * 128 + 2 * 72 + checkoutRowsBytes,
+        read: (database) => database.listRoutingCheckouts(),
+      },
+      {
+        name: "routing root list",
+        collectionBytes: 128 + 2 * 128 + 2 * 72 + rootRowsBytes,
+        read: (database) => database.listRoutingRoots(),
+      },
+    ];
+
+    for (const call of calls) {
+      const database = new SqliteGitDatabase(new TestDatabase(setupDb.storage));
+      const shared = database.openShared(primary.repoId);
+      const operationBytes = rowBytes + call.collectionBytes;
+      const exactBlocker = shared.reserveMemory();
+      exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+      try {
+        expect(call.read(database), call.name).toHaveLength(3);
+        expect(shared.memory.highWaterBytes, call.name).toBe(MAX_OPERATION_MEMORY_BYTES);
+      } finally {
+        exactBlocker.dispose();
+      }
+      shared.memory.assertIdle();
+
+      const overBlocker = shared.reserveMemory();
+      overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+      try {
+        expect(() => call.read(database), call.name).toThrowError(
+          expect.objectContaining({ code: "E2BIG" }),
+        );
+      } finally {
+        overBlocker.dispose();
+      }
+      shared.memory.assertIdle();
+    }
+  });
+
+  it("retains an owned checkout list until its caller releases the repository owner", () => {
+    const setupDb = new TestDatabase();
+    const setup = new SqliteGitDatabase(setupDb);
+    const primary = setup.createRepository("/repo", "ref: refs/heads/main");
+    const linked = setup.createCheckout(primary.repoId, "/linked", OID);
+    const expectedBytes =
+      128 +
+      2 * (8 + 128) +
+      retainedStringBytes(primary.root) +
+      retainedStringBytes(primary.head) +
+      retainedStringBytes(linked.root) +
+      retainedStringBytes(linked.head);
+
+    const database = new SqliteGitDatabase(new TestDatabase(setupDb.storage));
+    const shared = database.openShared(primary.repoId);
+    const owner = shared.reserveMemory();
+    try {
+      const rows = listCheckoutsOwned(database, primary.repoId, owner);
+      expect(rows).toHaveLength(2);
+      expect(owner.currentBytes).toBe(expectedBytes);
+      const blocker = shared.reserveMemory();
+      try {
+        blocker.set("other", MAX_OPERATION_MEMORY_BYTES - expectedBytes);
+        expect(() => blocker.set("other", blocker.currentBytes + 1)).toThrowError(
+          expect.objectContaining({ code: "E2BIG" }),
+        );
+      } finally {
+        blocker.dispose();
+      }
+      expect(rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: primary.id }),
+          expect.objectContaining({ id: linked.id }),
+        ]),
+      );
+    } finally {
+      owner.dispose();
+    }
+    shared.memory.assertIdle();
+  });
+
   it("round-trips the former symbolic HEAD first excess across a cold reopen", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
@@ -104,19 +367,21 @@ describe("checkout lifecycle storage", () => {
 
   it("owns one long cold HEAD row at the exact boundary and releases a rejected read", () => {
     const head = `ref: refs/heads/${"h".repeat(1_500_001)}`;
+    const root = "/long-head";
     const db = new TestDatabase();
     const setup = new SqliteGitDatabase(db);
-    const checkout = setup.createRepository("/long-head", head);
-    const currentRowBytes = 304 + 3 * utf8.encode(head).byteLength;
-    expect(currentRowBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+    const checkout = setup.createRepository(root, head);
+    const currentRowBytes = 352 + 3 * (utf8.encode(root).byteLength + utf8.encode(head).byteLength);
+    const operationBytes = checkoutSqlRetainedBytes(root, root) + currentRowBytes;
+    expect(operationBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
 
     const exactDatabase = new SqliteGitDatabase(new TestDatabase(db.storage));
     const exactShared = exactDatabase.openShared(checkout.repoId);
     const exactBlocker = exactShared.reserveMemory();
-    const externalBytes = MAX_OPERATION_MEMORY_BYTES - currentRowBytes;
+    const externalBytes = MAX_OPERATION_MEMORY_BYTES - operationBytes;
     exactBlocker.set("other", externalBytes);
     try {
-      const reopened = exactDatabase.checkoutAt("/long-head");
+      const reopened = exactDatabase.checkoutAt(root);
       expect(reopened).toEqual(expect.objectContaining({ head }));
       expect(exactShared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
       expect(exactBlocker.currentBytes).toBe(externalBytes);
@@ -130,7 +395,7 @@ describe("checkout lifecycle storage", () => {
     const overBlocker = overShared.reserveMemory();
     overBlocker.set("other", externalBytes + 1);
     try {
-      expect(() => overDatabase.checkoutAt("/long-head")).toThrowError(
+      expect(() => overDatabase.checkoutAt(root)).toThrowError(
         expect.objectContaining({ code: "E2BIG" }),
       );
       expect(checkoutStorageRow(new TestDatabase(db.storage), checkout.id)).toEqual(before);
@@ -138,7 +403,7 @@ describe("checkout lifecycle storage", () => {
     } finally {
       overBlocker.dispose();
     }
-    expect(overDatabase.checkoutAt("/long-head")).toEqual(expect.objectContaining({ head }));
+    expect(overDatabase.checkoutAt(root)).toEqual(expect.objectContaining({ head }));
     const probe = overShared.reserveMemory();
     try {
       probe.set("other", MAX_OPERATION_MEMORY_BYTES);

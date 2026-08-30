@@ -1,6 +1,6 @@
 import { CorruptError, GitError } from "../../core/errors.js";
+import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../db.js";
-import { MAX_CHECKOUT_ROOT_BYTES } from "../schema.js";
 import { type MaintenanceRootSource, validateMaintenanceRootCursor } from "./roots.js";
 
 export type MaintenancePhase =
@@ -110,23 +110,57 @@ function rootSourceField(value: unknown): MaintenanceRootSource {
   return value;
 }
 
-function cursorTextField(row: Record<string, unknown>): string | null {
-  if (row.cursor_text_type === "null") {
+function cursorMemoryBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 256) / 3) {
+    throw new CorruptError("maintenance text cursor byte metadata is invalid");
+  }
+  return 256 + 3 * bytes;
+}
+
+function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) index++;
+      bytes += low >= 0xdc00 && low <= 0xdfff ? 4 : 3;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      bytes += 3;
+    } else {
+      bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    }
+  }
+  return bytes;
+}
+
+function cursorMetadata(row: Record<string, unknown>): number | null {
+  if (row.cursor_text_type === null || row.cursor_text_type === "null") {
+    if (row.cursor_text_bytes !== null) {
+      throw new CorruptError("absent maintenance text cursor returned byte metadata");
+    }
+    return null;
+  }
+  if (row.cursor_text_type !== "text") {
+    throw new CorruptError("maintenance text cursor storage type is invalid");
+  }
+  return safeInteger(row.cursor_text_bytes, "maintenance text cursor bytes", 0);
+}
+
+function cursorTextField(
+  row: Record<string, unknown>,
+  admittedCursorBytes: number | null,
+): string | null {
+  if (admittedCursorBytes === null) {
     if (row.cursor_text !== null || row.cursor_text_bytes !== null) {
       throw new CorruptError("absent maintenance text cursor returned metadata");
     }
     return null;
   }
-  const bytes = safeInteger(
-    row.cursor_text_bytes,
-    "maintenance text cursor bytes",
-    0,
-    MAX_CHECKOUT_ROOT_BYTES,
-  );
   if (
     row.cursor_text_type !== "text" ||
     typeof row.cursor_text !== "string" ||
-    new TextEncoder().encode(row.cursor_text).length !== bytes
+    utf8ByteLength(row.cursor_text) !== admittedCursorBytes
   ) {
     throw new CorruptError("maintenance text cursor is invalid");
   }
@@ -139,7 +173,11 @@ function validateRepositoryId(repoId: number): void {
   }
 }
 
-function requireRunView(row: Record<string, unknown>, repoId: number): MaintenanceRunView | null {
+function requireRunView(
+  row: Record<string, unknown>,
+  repoId: number,
+  admittedCursorBytes: number | null,
+): MaintenanceRunView | null {
   if (row.repository_id !== repoId) {
     throw new CorruptError("maintenance state crossed repositories");
   }
@@ -178,7 +216,10 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
     "maintenance checkout cursor",
     1,
   );
-  const cursorText = cursorTextField(row);
+  if (cursorMetadata(row) !== admittedCursorBytes) {
+    throw new CorruptError("maintenance text cursor changed after metadata preflight");
+  }
+  const cursorText = cursorTextField(row, admittedCursorBytes);
   const cursorOrdinal = nullableInteger(row.cursor_ordinal, "maintenance ordinal cursor");
   const nextEligibleMs = nullableInteger(row.next_eligible_ms, "maintenance next eligible time");
   if (phase !== "sweep-packs" && phase !== "finish" && nextEligibleMs !== null) {
@@ -219,8 +260,32 @@ function requireRunView(row: Record<string, unknown>, repoId: number): Maintenan
 }
 
 /** Read and fully validate the active run together with its allocation control. */
-export function readMaintenanceRunView(db: SqlDatabase, repoId: number): MaintenanceRunView | null {
+export function readMaintenanceRunView(
+  db: SqlDatabase,
+  repoId: number,
+  reservation: MemoryReservation,
+): MaintenanceRunView | null {
   validateRepositoryId(repoId);
+  const metadata = db.one<Record<string, unknown>>(
+    `SELECT repository.id AS repository_id,
+            CASE WHEN run.repo_id IS NOT NULL THEN typeof(run.cursor_text) END
+              AS cursor_text_type,
+            CASE WHEN run.repo_id IS NOT NULL
+              THEN length(CAST(run.cursor_text AS BLOB)) END AS cursor_text_bytes
+       FROM git_repositories repository
+       LEFT JOIN git_maintenance_runs run ON run.repo_id = repository.id
+      WHERE repository.id = ?`,
+    repoId,
+  );
+  if (metadata === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
+  if (metadata.repository_id !== repoId) {
+    throw new CorruptError("maintenance state metadata crossed repositories");
+  }
+  const admittedCursorBytes = cursorMetadata(metadata);
+  reservation.set(
+    "other",
+    admittedCursorBytes === null ? 0 : cursorMemoryBytes(admittedCursorBytes),
+  );
   const row = db.one<Record<string, unknown>>(
     `SELECT repository.id AS repository_id,
             control.repo_id AS control_repo_id, control.root_epoch, control.next_run_id,
@@ -230,10 +295,7 @@ export function readMaintenanceRunView(db: SqlDatabase, repoId: number): Mainten
               AS cursor_text_type,
             CASE WHEN run.repo_id IS NOT NULL
               THEN length(CAST(run.cursor_text AS BLOB)) END AS cursor_text_bytes,
-            CASE WHEN run.cursor_text IS NULL OR (
-              typeof(run.cursor_text) = 'text'
-              AND length(CAST(run.cursor_text AS BLOB)) <= ?
-            ) THEN run.cursor_text END AS cursor_text,
+            run.cursor_text,
             run.cursor_ordinal, run.reachable_objects, run.queued_objects,
             run.repacked_objects, run.reclaimed_objects, run.reclaimed_packs,
             run.reclaimed_bytes, run.next_eligible_ms, run.restarted
@@ -241,11 +303,12 @@ export function readMaintenanceRunView(db: SqlDatabase, repoId: number): Mainten
        LEFT JOIN git_maintenance_control control ON control.repo_id = repository.id
        LEFT JOIN git_maintenance_runs run ON run.repo_id = control.repo_id
       WHERE repository.id = ?`,
-    MAX_CHECKOUT_ROOT_BYTES,
     repoId,
   );
-  if (row === undefined) throw new GitError("ENOTFOUND", "repository does not exist");
-  return requireRunView(row, repoId);
+  if (row === undefined) {
+    throw new CorruptError("maintenance state changed after metadata preflight");
+  }
+  return requireRunView(row, repoId, admittedCursorBytes);
 }
 
 function clearRunOwnedReachability(db: SqlDatabase, repoId: number, runId: number): void {
@@ -270,13 +333,14 @@ export function resetMaintenanceRunForRootChange(
   db: SqlDatabase,
   repoId: number,
   expectedRunId: number,
+  reservation: MemoryReservation,
 ): MaintenanceRunView {
   validateRepositoryId(repoId);
   if (!Number.isSafeInteger(expectedRunId) || expectedRunId < 1) {
     throw new GitError("EINVAL", "maintenance run id must be a safe positive integer");
   }
   return db.transactionSync(() => {
-    const before = readMaintenanceRunView(db, repoId);
+    const before = readMaintenanceRunView(db, repoId, reservation.scope());
     if (before === null || before.runId !== expectedRunId) {
       throw new CorruptError("maintenance restart lost its active run");
     }
@@ -318,7 +382,7 @@ export function resetMaintenanceRunForRootChange(
     ) {
       throw new CorruptError("maintenance restart was not published atomically");
     }
-    const after = readMaintenanceRunView(db, repoId);
+    const after = readMaintenanceRunView(db, repoId, reservation.scope());
     if (after === null || after.runId !== expectedRunId) {
       throw new CorruptError("maintenance restart did not retain its run id");
     }
@@ -332,6 +396,7 @@ export function rolloverFinishedMaintenanceRun(
   repoId: number,
   expectedRunId: number,
   nowMs: number,
+  reservation: MemoryReservation,
 ): MaintenanceRunView {
   validateRepositoryId(repoId);
   if (!Number.isSafeInteger(expectedRunId) || expectedRunId < 1) {
@@ -341,7 +406,7 @@ export function rolloverFinishedMaintenanceRun(
     throw new GitError("EINVAL", "maintenance clock must return non-negative integer milliseconds");
   }
   return db.transactionSync(() => {
-    const before = readMaintenanceRunView(db, repoId);
+    const before = readMaintenanceRunView(db, repoId, reservation.scope());
     if (before === null || before.runId !== expectedRunId || before.phase !== "finish") {
       throw new CorruptError("maintenance rollover lost its finished run");
     }
@@ -437,7 +502,7 @@ export function rolloverFinishedMaintenanceRun(
     ) {
       throw new CorruptError("maintenance rollover did not publish a zeroed run");
     }
-    const after = readMaintenanceRunView(db, repoId);
+    const after = readMaintenanceRunView(db, repoId, reservation.scope());
     if (after === null || after.runId !== runId) {
       throw new CorruptError("maintenance rollover did not publish its new run");
     }

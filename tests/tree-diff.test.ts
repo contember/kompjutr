@@ -14,6 +14,7 @@ import {
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { joinSorted } from "../src/core/streams.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -604,7 +605,7 @@ describe("tree diff", () => {
     expect(db.storage.statementCount).toBe(1);
   }, 30_000);
 
-  it("accepts exactly 2,200 path bytes and rejects 2,201", () => {
+  it("accepts the former 2,201-byte excess and composes its traversal owner", () => {
     const make = (leafName: string) => {
       const { db, store } = open();
       let root = store.write(
@@ -628,11 +629,41 @@ describe("tree diff", () => {
       },
     ]);
     expect(accepted.db.storage.statementCount).toBeLessThan(1_000);
-    const rejected = make("leaff");
-    expect(() => [...rejected.store.walkTreeDiff(null, rejected.root)]).toThrow(
-      /path exceeds 2200 bytes/,
+    const formerExcess = make("leaff");
+    const expected = [
+      {
+        path: `${"d/".repeat(1_098)}leaff`,
+        beforeMode: null,
+        beforeOid: null,
+        afterMode: MODE_FILE,
+        afterOid: oid(1),
+      },
+    ];
+    expect([...formerExcess.store.walkTreeDiff(null, formerExcess.root)]).toEqual(expected);
+    expect(formerExcess.db.storage.statementCount).toBeLessThan(1_000);
+
+    const measured = formerExcess.store.reserveMemory();
+    expect([...formerExcess.store.walkTreeDiff(null, formerExcess.root, measured)]).toEqual(
+      expected,
     );
-    expect(rejected.db.storage.statementCount).toBeLessThan(1_000);
+    const operationBytes = measured.highWaterBytes;
+    expect(measured.currentBytes).toBe(0);
+    measured.dispose();
+
+    for (const excess of [0, 1]) {
+      const blocker = formerExcess.store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = formerExcess.store.reserveMemory();
+      try {
+        const walk = () => [...formerExcess.store.walkTreeDiff(null, formerExcess.root, owner)];
+        if (excess === 0) expect(walk()).toEqual(expected);
+        else expect(walk).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+    }
   }, 30_000);
 
   it("reads only complete packed tree sources", async () => {

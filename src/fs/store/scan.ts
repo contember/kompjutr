@@ -35,17 +35,16 @@ export const GLOB_PATTERN_MAX_BYTES = 50;
 export const DISCOVERY_PAGE_MAX = 1_000;
 export const DISCOVERY_EXCLUDE_ROOTS_MAX = MAX_ROUTING_CHECKOUTS;
 export const DISCOVERY_EXCLUDE_ROOT_INPUTS_MAX = MAX_ROUTING_CHECKOUTS + 1;
-const DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX = 4_096;
-const DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES = DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX * 6 + 2;
 /** Every input byte can expand to a six-byte JSON escape, plus quotes and separators. */
 const DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES =
   MAX_ROUTING_ROOTS_UTF8_BYTES * 6 + DISCOVERY_EXCLUDE_ROOTS_MAX * 3 + 2;
-export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES = 1_500_000;
-/** A completed segment can leave less than one maximum-sized item of slack. */
-export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS = Math.ceil(
-  DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES /
-    (DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES - DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES - 1),
-);
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES = 1_500_000;
+/** Next-fit uses at most two segments per target-sized portion, including large singletons. */
+export const DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS =
+  Math.ceil(
+    (2 * DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES) /
+      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES,
+  ) + 1;
 /** Splitting replaces each inter-item comma with two array brackets. */
 export const DISCOVERY_EXCLUDE_ROOTS_JSON_MAX_BYTES =
   DISCOVERY_EXCLUDE_ROOTS_SINGLE_JSON_MAX_BYTES + DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS - 1;
@@ -64,7 +63,7 @@ export const DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES =
   DISCOVERY_EXCLUDE_ARRAY_FIXED_BYTES +
   DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS * DISCOVERY_EXCLUDE_ARRAY_SLOT_BYTES +
   DISCOVERY_EXCLUDE_STRING_FIXED_BYTES +
-  2 * DISCOVERY_EXCLUDE_ITEM_JSON_MAX_BYTES;
+  4 * DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES;
 
 const PERMISSION_BITS = 0o7777;
 const OWNED_SCAN_METADATA_BYTES = 512;
@@ -85,7 +84,7 @@ if (DISCOVERY_EXCLUDE_ROOTS_RETAINED_MAX_BYTES >= 100 * 1024 * 1024) {
   throw new Error("discovery excluded-root retained bound exceeds 100 MiB");
 }
 if (
-  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES >= 2_000_000 ||
+  DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES >= 2_000_000 ||
   DISCOVERY_EXCLUDE_ROOTS_SQL_BINDINGS >= 100
 ) {
   throw new Error("discovery excluded-root SQL bindings exceed the platform limit");
@@ -107,6 +106,43 @@ function boundedUtf8Bytes(value: string, limit: number): number {
       }
     } else bytes += 3;
     if (bytes > limit) return limit + 1;
+  }
+  return bytes;
+}
+
+function jsonStringUtf8Bytes(value: string): number {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (
+      code === 0x22 ||
+      code === 0x5c ||
+      code === 0x08 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0c ||
+      code === 0x0d
+    ) {
+      bytes += 2;
+    } else if (code < 0x20) {
+      bytes += 6;
+    } else if (code < 0x80) {
+      bytes++;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 6;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      bytes += 6;
+    } else {
+      bytes += 3;
+    }
   }
   return bytes;
 }
@@ -320,7 +356,6 @@ export function validateDiscoveryExcludeRoots(root: RealPath, input: unknown): s
     if (
       typeof path !== "string" ||
       !path.startsWith("/") ||
-      path.length > DISCOVERY_EXCLUDE_ROOT_CODE_UNITS_MAX ||
       path.includes("\0") ||
       normalize(path) !== path ||
       (path !== root && !path.startsWith(prefix))
@@ -363,16 +398,26 @@ export function discoveryExcludeRootsJsonSegments(
   let segment = "[";
   let segmentBytes = 1;
   for (const path of excludeRoots) {
+    const itemBytes = jsonStringUtf8Bytes(path);
+    if (itemBytes + 2 > DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES) {
+      if (segmentBytes > 1) segments.push(`${segment}]`);
+      const singleton = JSON.stringify([path]);
+      if (singleton === undefined) throw new Error("discoverFiles: excluded root is not JSON text");
+      segments.push(singleton);
+      if (segments.length > DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS) {
+        throw new Error("discoverFiles: excluded-root segmentation invariant failed");
+      }
+      segment = "[";
+      segmentBytes = 1;
+      continue;
+    }
     const item = JSON.stringify(path);
     if (item === undefined) throw new Error("discoverFiles: excluded root is not JSON text");
-    const itemBytes = boundedUtf8Bytes(item, DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES);
-    if (itemBytes + 2 > DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES) {
-      throw new Error("discoverFiles: one excluded root exceeds the JSON segment bound");
-    }
     const delimiter = segmentBytes === 1 ? "" : ",";
     if (
+      segmentBytes > 1 &&
       segmentBytes + delimiter.length + itemBytes + 1 >
-      DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_MAX_BYTES
+        DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENT_TARGET_BYTES
     ) {
       segments.push(`${segment}]`);
       if (segments.length >= DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS) {
@@ -387,7 +432,10 @@ export function discoveryExcludeRootsJsonSegments(
     segment += `${delimiter}${item}`;
     segmentBytes += delimiter.length + itemBytes;
   }
-  segments.push(`${segment}]`);
+  if (segmentBytes > 1 || segments.length === 0) segments.push(`${segment}]`);
+  if (segments.length > DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS) {
+    throw new Error("discoverFiles: excluded-root segmentation invariant failed");
+  }
   while (segments.length < DISCOVERY_EXCLUDE_ROOTS_JSON_SEGMENTS) segments.push("[]");
   return segments;
 }

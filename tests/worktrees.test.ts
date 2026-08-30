@@ -70,6 +70,24 @@ function seedMain(workspace: TestRepository): WrittenCommit {
   return commit;
 }
 
+function insertMissingCheckoutWitnesses(workspace: TestRepository, count = 64): void {
+  const roots = Array.from({ length: count }, (_, index) => {
+    const prefix = `/missing-${index.toString().padStart(4, "0")}-`;
+    return `${prefix}${"x".repeat(4_096 - prefix.length)}`;
+  });
+  workspace.database.db.run(
+    `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+     SELECT CAST(key AS INTEGER) + 2, ?, value, ?, 0 FROM json_each(?)`,
+    workspace.repo.store.repoId,
+    "1".repeat(40),
+    JSON.stringify(roots),
+  );
+  workspace.database.db.run(
+    "UPDATE git_identity_control SET last_checkout_id = ? WHERE singleton = 1",
+    count + 1,
+  );
+}
+
 function bindGit(workspace: TestWorkspace, database = workspace.database): Git {
   const exactRootStates = workspace.context.exactRootStates;
   if (exactRootStates === undefined)
@@ -364,20 +382,58 @@ describe("worktree add", () => {
     }
   });
 
-  it("bounds roots before normalization", () => {
+  it("adds and removes a canonical root beyond the former 4096-unit boundary", () => {
     const workspace = makeRepo("/");
     const commit = seedMain(workspace);
     const oversized = `/${"x".repeat(4_096)}`;
 
-    expect(() =>
-      worktreeAdd(workspace.context, workspace.repo, {
-        root: oversized,
-        target: { kind: "detached", startPoint: commit.oid },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(() =>
-      worktreeRemove(workspace.context, workspace.repo, { root: oversized, force: true }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const added = worktreeAdd(workspace.context, workspace.repo, {
+      root: oversized,
+      target: { kind: "detached", startPoint: commit.oid },
+    });
+    expect(added.root).toBe(oversized);
+    expect(workspace.database.checkoutAt(oversized)?.root).toBe(oversized);
+
+    worktreeRemove(workspace.context, workspace.repo, { root: oversized, force: true });
+    expect(workspace.database.checkoutAt(oversized)).toBeNull();
+    expect(workspace.worktree.stat(oversized)).toBeNull();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("owns root normalization at the exact aggregate and cleans up first excess", () => {
+    const root = `/${"x".repeat(1024 * 1024)}`;
+    const run = (workspace: TestRepository): void => {
+      worktreeRemove(workspace.context, workspace.repo, { root, force: true });
+    };
+
+    const measured = makeRepo("/");
+    expect(() => run(measured)).toThrowError(
+      expect.objectContaining({ code: "EWORKTREENOTFOUND" }),
+    );
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(root.length * 2);
+    measured.repo.store.memory.assertIdle();
+
+    const exact = makeRepo("/");
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(() => run(exact)).toThrowError(expect.objectContaining({ code: "EWORKTREENOTFOUND" }));
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    exact.repo.store.memory.assertIdle();
+
+    const over = makeRepo("/");
+    const overBlocker = over.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => run(over)).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    } finally {
+      overBlocker.dispose();
+    }
+    over.repo.store.memory.assertIdle();
   });
 });
 
@@ -418,6 +474,92 @@ describe("worktree list and checkout sharing", () => {
     expect(listed.every(Object.isFrozen)).toBe(true);
     const cold = bindGit(workspace, new SqliteGitDatabase(workspace.database.db));
     await expect(cold.worktreeList({ dir: "/a" })).resolves.toEqual(listed);
+  });
+
+  it("owns native root-state reads and keeps custom-provider fallback cleanup", () => {
+    const workspace = makeRepo("/");
+    seedMain(workspace);
+    const native = workspace.context.exactRootStates;
+    if (native === undefined) throw new Error("test workspace has no exact root state source");
+    const originalStates = native.states;
+    let fallbackCalls = 0;
+    native.states = () => {
+      fallbackCalls++;
+      throw new Error("native fallback must not run");
+    };
+    try {
+      expect(worktreeList(workspace.context, workspace.repo)).toEqual([
+        expect.objectContaining({ root: "/", state: "present" }),
+      ]);
+      expect(fallbackCalls).toBe(0);
+      workspace.repo.store.memory.assertIdle();
+    } finally {
+      native.states = originalStates;
+    }
+
+    const custom = {
+      states: (roots: readonly string[]): Array<"present" | "missing"> => {
+        expect(workspace.repo.store.memory.activeCount).toBe(1);
+        expect(workspace.repo.store.memory.totalBytes).toBeGreaterThan(0);
+        return roots.map(() => "present");
+      },
+    };
+    expect(worktreeList({ ...workspace.context, exactRootStates: custom }, workspace.repo)).toEqual(
+      [expect.objectContaining({ root: "/", state: "present" })],
+    );
+    workspace.repo.store.memory.assertIdle();
+
+    const failure = new Error("custom root-state failure");
+    expect(() =>
+      worktreeList(
+        {
+          ...workspace.context,
+          exactRootStates: {
+            states: () => {
+              throw failure;
+            },
+          },
+        },
+        workspace.repo,
+      ),
+    ).toThrow(failure);
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("owns checkout and state snapshots at the exact list aggregate and first excess", () => {
+    const prepare = (): TestRepository => {
+      const workspace = makeRepo("/");
+      insertMissingCheckoutWitnesses(workspace);
+      return workspace;
+    };
+
+    const measured = prepare();
+    expect(worktreeList(measured.context, measured.repo)).toHaveLength(65);
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    measured.repo.store.memory.assertIdle();
+
+    const exact = prepare();
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(worktreeList(exact.context, exact.repo)).toHaveLength(65);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    exact.repo.store.memory.assertIdle();
+
+    const over = prepare();
+    const overBlocker = over.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => worktreeList(over.context, over.repo)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+    } finally {
+      overBlocker.dispose();
+    }
+    over.repo.store.memory.assertIdle();
   });
 
   it("shares objects and refs while keeping worktree and index state isolated", async () => {
@@ -590,6 +732,45 @@ describe("worktree prune", () => {
     await expect(git.worktreePrune()).resolves.toEqual([
       expect.objectContaining({ root: "/parent/nested", state: "missing" }),
     ]);
+  });
+
+  it("owns the exact prune aggregate and rejects first excess before removal", () => {
+    const prepare = (): TestRepository => {
+      const workspace = makeRepo("/");
+      insertMissingCheckoutWitnesses(workspace);
+      return workspace;
+    };
+
+    const measured = prepare();
+    expect(worktreePrune(measured.context, measured.repo)).toHaveLength(64);
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(measured.database.listCheckouts(measured.repo.store.repoId)).toHaveLength(1);
+    measured.repo.store.memory.assertIdle();
+
+    const exact = prepare();
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(worktreePrune(exact.context, exact.repo)).toHaveLength(64);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    expect(exact.database.listCheckouts(exact.repo.store.repoId)).toHaveLength(1);
+    exact.repo.store.memory.assertIdle();
+
+    const over = prepare();
+    const overBlocker = over.repo.store.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() => worktreePrune(over.context, over.repo)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+    } finally {
+      overBlocker.dispose();
+    }
+    expect(over.database.listCheckouts(over.repo.store.repoId)).toHaveLength(65);
+    over.repo.store.memory.assertIdle();
   });
 
   it("lists and prunes the 1,024-checkout ceiling within the statement target", () => {

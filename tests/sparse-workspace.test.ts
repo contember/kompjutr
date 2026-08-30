@@ -5,6 +5,7 @@ import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import { add } from "../src/core/ops/staging.js";
 import { comparePaths } from "../src/core/streams.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   INDEX_DIRTY,
@@ -19,8 +20,11 @@ import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-  MAX_SPARSE_WORKSPACE_RETAINED_BYTES,
+  hydrateSparseWorkspaceOwned,
   SPARSE_TREE_DEPTH_SQL,
+  selectSparsePathsOwned,
+  snapshotCommitTreeOwned,
+  sparseIndexAncestorFactsOwned,
 } from "../src/sqlite/sparse-workspace.js";
 import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
 
@@ -324,7 +328,6 @@ function installPackCopy(
 describe("SQLite sparse workspace source", () => {
   it("keeps packed blob reads and caller-held state below 100 MiB", () => {
     expect(PACK_BLOB_CALLER_HEADROOM_BYTES).toBe(8 * 1024 * 1024);
-    expect(MAX_SPARSE_WORKSPACE_RETAINED_BYTES).toBe(PACK_BLOB_CALLER_HEADROOM_BYTES);
     expect(PACK_BLOB_MEMORY_MODEL_BYTES).toBeLessThan(100 * 1024 * 1024);
   });
 
@@ -579,7 +582,7 @@ describe("SQLite sparse workspace source", () => {
     if (!result.available) return;
     expect(result.index).toHaveLength(1_000);
     expect(result.worktree).toHaveLength(1_000);
-    expect(result.retainedBytes).toBeLessThanOrEqual(MAX_SPARSE_WORKSPACE_RETAINED_BYTES);
+    expect(result.retainedBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
     expect(workspace.storage.statementCount).toBe(2);
     expect(workspace.storage.rowCount).toBe(2_002);
     expect([...histogram.keys()].some((query) => query.startsWith("WITH wanted(path)"))).toBe(true);
@@ -1483,13 +1486,13 @@ describe("SQLite sparse workspace source", () => {
         baselineTreeOid: null,
         currentTreeOid: null,
         paths: [],
-        maxRetainedBytes: MAX_SPARSE_WORKSPACE_RETAINED_BYTES + 1,
+        maxRetainedBytes: MAX_OPERATION_MEMORY_BYTES + 1,
       });
     } catch (error) {
       failure = error;
     }
-    expect(failure).toMatchObject({ code: "E2BIG" });
-    expect(workspace.storage.statementCount).toBe(0);
+    expect(failure).toBeUndefined();
+    expect(workspace.storage.statementCount).toBe(1);
 
     expect(
       source.hydrate({
@@ -1499,10 +1502,122 @@ describe("SQLite sparse workspace source", () => {
         baselineTreeOid: null,
         currentTreeOid: null,
         paths: [],
-        maxRetainedBytes: MAX_SPARSE_WORKSPACE_RETAINED_BYTES,
+        maxRetainedBytes: MAX_OPERATION_MEMORY_BYTES,
       }),
     ).toEqual({ available: true, rows: [], retainedBytes: 0 });
-    expect(workspace.storage.statementCount).toBe(1);
+    expect(workspace.storage.statementCount).toBe(2);
+  });
+
+  it("owns native sparse results at the exact aggregate boundary and cleans up excess", () => {
+    const workspace = committedWorkspace();
+    const source = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const request = {
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      baselineTreeOid: workspace.repo.headTree(),
+      currentTreeOid: null,
+      paths: ["a.txt"],
+    };
+
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    const measuredResult = hydrateSparseWorkspaceOwned(source, request, measuredOwner);
+    expect(measuredResult.available).toBe(true);
+    if (!measuredResult.available) throw new Error("owned sparse hydration was unavailable");
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(measuredResult.retainedBytes);
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      try {
+        const result = hydrateSparseWorkspaceOwned(source, request, owner);
+        if (excess === 0) {
+          expect(result).toEqual(measuredResult);
+          expect(owner.currentBytes).toBe(measuredResult.retainedBytes);
+        } else {
+          expect(result).toEqual({ available: false });
+          expect(owner.currentBytes).toBe(0);
+        }
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
+  });
+
+  it("routes every native sparse facade through an owner and preserves custom fallback", () => {
+    const workspace = committedWorkspace();
+    const selected = createSqliteSelectedPathSource(workspace.database.db);
+    const selectedRequest = {
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      specs: [{ path: "a.txt", recursive: false }],
+    };
+    const selectedCoordinator = new MemoryCoordinator();
+    const selectedOwner = selectedCoordinator.reserve();
+    const selectedResult = selectSparsePathsOwned(selected, selectedRequest, selectedOwner);
+    expect(selectedResult.available).toBe(true);
+    if (!selectedResult.available) throw new Error("owned selected paths were unavailable");
+    expect(selectedOwner.currentBytes).toBe(selectedResult.retainedBytes);
+    selectedOwner.dispose();
+    selectedCoordinator.assertIdle();
+
+    const fallbackCoordinator = new MemoryCoordinator();
+    const fallbackOwner = fallbackCoordinator.reserve();
+    const fallback = selectSparsePathsOwned(
+      { select: (request) => selected.select(request) },
+      selectedRequest,
+      fallbackOwner,
+    );
+    expect(fallback).toEqual(selectedResult);
+    if (fallback.available) expect(fallbackOwner.currentBytes).toBe(fallback.retainedBytes);
+    fallbackOwner.dispose();
+    fallbackCoordinator.assertIdle();
+
+    const sparse = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const ancestorCoordinator = new MemoryCoordinator();
+    const ancestorOwner = ancestorCoordinator.reserve();
+    const ancestors = sparseIndexAncestorFactsOwned(
+      sparse,
+      { checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["a.txt"] },
+      ancestorOwner,
+    );
+    expect(ancestors.facts).toEqual([{ path: "a.txt", exact: true, descendant: false }]);
+    expect(ancestorOwner.currentBytes).toBe(ancestors.retainedBytes);
+    ancestorOwner.dispose();
+    ancestorCoordinator.assertIdle();
+
+    const baseline = workspace.repo.headTree();
+    expect(
+      resealIndexTracker(workspace.database.db, workspace.repo.checkout.checkoutId, baseline, []),
+    ).toBe(true);
+    const snapshot = createSqliteCommitTreeSnapshotSource(workspace.database.db);
+    const snapshotCoordinator = new MemoryCoordinator();
+    const snapshotOwner = snapshotCoordinator.reserve();
+    const snapshotResult = snapshotCommitTreeOwned(
+      snapshot,
+      {
+        repoId: workspace.repo.store.repoId,
+        checkoutId: workspace.repo.checkout.checkoutId,
+        root: "/",
+        baselineTreeOid: baseline,
+      },
+      snapshotOwner,
+    );
+    expect(snapshotResult.available).toBe(true);
+    if (snapshotResult.available) {
+      expect(snapshotOwner.currentBytes).toBe(snapshotResult.retainedBytes);
+    }
+    snapshotOwner.dispose();
+    snapshotCoordinator.assertIdle();
   });
 
   it("hydrates exact tree, index, and worktree leaves in path order", () => {
@@ -1900,7 +2015,7 @@ describe("SQLite sparse workspace source", () => {
     expect(() => source.hydrate(request)).toThrowError(/malformed row/);
   });
 
-  it("rejects dangling filesystem metadata and falls back before large payload egress", () => {
+  it("rejects malformed filesystem metadata and owns a former large payload excess", () => {
     const dangling = committedWorkspace();
     const danglingInode = dangling.database.db.scalar<number>(
       "SELECT inode FROM fs_paths WHERE path = '/a.txt'",
@@ -1921,16 +2036,29 @@ describe("SQLite sparse workspace source", () => {
     large.database.db.run(
       "UPDATE fs_nodes SET content_id = zeroblob(4194305) WHERE inode = (SELECT inode FROM fs_paths WHERE path = '/a.txt')",
     );
-    expect(
-      createSqliteSparseWorkspaceSource(large.database.db).hydrate({
-        repoId: large.repo.store.repoId,
-        checkoutId: large.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: null,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toEqual({ available: false });
+    const coordinator = new MemoryCoordinator();
+    const owner = coordinator.reserve();
+    try {
+      const result = hydrateSparseWorkspaceOwned(
+        createSqliteSparseWorkspaceSource(large.database.db),
+        {
+          repoId: large.repo.store.repoId,
+          checkoutId: large.repo.checkout.checkoutId,
+          root: "/",
+          baselineTreeOid: null,
+          currentTreeOid: null,
+          paths: ["a.txt"],
+        },
+        owner,
+      );
+      expect(result.available).toBe(true);
+      if (!result.available) throw new Error("large owned worktree payload was unavailable");
+      expect(result.rows[0]?.worktree?.contentId).toHaveLength(4_194_305);
+      expect(owner.currentBytes).toBe(result.retainedBytes);
+    } finally {
+      owner.dispose();
+    }
+    coordinator.assertIdle();
 
     const symlink = committedWorkspace();
     symlink.database.db.run(
@@ -1998,7 +2126,7 @@ describe("SQLite sparse workspace source", () => {
     expect(workspace.storage.statementCount).toBe(0);
   });
 
-  it("bounds escaped JSON and absolute roots before whole-request allocation", () => {
+  it("sends former 1 MiB JSON and accepts a former root first excess", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     const tree = workspace.repo.headTree();
@@ -2007,40 +2135,34 @@ describe("SQLite sparse workspace source", () => {
       (_, index) => `p${index.toString().padStart(4, "0")}${"\u0001".repeat(175)}`,
     );
     workspace.storage.resetCounters();
-    let jsonFailure: unknown;
-    try {
-      source.hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: tree,
-        currentTreeOid: null,
-        paths: escaped,
-      });
-    } catch (error) {
-      jsonFailure = error;
-    }
-    expect(jsonFailure).toMatchObject({ code: "E2BIG" });
-    expect(workspace.storage.statementCount).toBe(0);
+    const jsonResult = source.hydrate({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      baselineTreeOid: tree,
+      currentTreeOid: null,
+      paths: escaped,
+    });
+    expect(JSON.stringify(escaped).length).toBeGreaterThan(1024 * 1024);
+    expect(jsonResult.available).toBe(true);
+    expect(workspace.storage.statementCount).toBeGreaterThan(0);
 
-    let rootFailure: unknown;
-    try {
-      source.hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: `/${"a".repeat(4_096)}`,
-        baselineTreeOid: tree,
+    const longRoot = `/${"a".repeat(4_096)}`;
+    const rooted = makeRepo(longRoot);
+    rooted.worktree.mkdir(longRoot, { recursive: true });
+    expect(
+      createSqliteSparseWorkspaceSource(rooted.database.db).hydrate({
+        repoId: rooted.repo.store.repoId,
+        checkoutId: rooted.repo.checkout.checkoutId,
+        root: longRoot,
+        baselineTreeOid: null,
         currentTreeOid: null,
-        paths: ["a.txt"],
-      });
-    } catch (error) {
-      rootFailure = error;
-    }
-    expect(rootFailure).toMatchObject({ code: "E2BIG" });
-    expect(workspace.storage.statementCount).toBe(0);
+        paths: [],
+      }),
+    ).toEqual({ available: true, rows: [], retainedBytes: 0 });
   });
 
-  it("accepts a 2200-byte path and rejects the next byte before SQL", () => {
+  it("accepts the former 2,201-byte path excess", () => {
     const workspace = committedWorkspace();
     const source = createSqliteSparseWorkspaceSource(workspace.database.db);
     expect(
@@ -2053,23 +2175,15 @@ describe("SQLite sparse workspace source", () => {
         paths: ["a".repeat(2_200)],
       }).available,
     ).toBe(true);
-    workspace.storage.resetCounters();
-
-    let failure: unknown;
-    try {
-      source.hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: null,
-        currentTreeOid: null,
-        paths: ["a".repeat(2_201)],
-      });
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toMatchObject({ code: "E2BIG" });
-    expect(workspace.storage.statementCount).toBe(0);
+    const formerExcess = source.hydrate({
+      repoId: workspace.repo.store.repoId,
+      checkoutId: workspace.repo.checkout.checkoutId,
+      root: "/",
+      baselineTreeOid: null,
+      currentTreeOid: null,
+      paths: ["a".repeat(2_201)],
+    });
+    expect(formerExcess.available).toBe(true);
   });
 
   it("hydrates exactly 1000 paths with constant statement count", () => {
@@ -2094,7 +2208,7 @@ describe("SQLite sparse workspace source", () => {
     expect(result.available).toBe(true);
     if (result.available) {
       expect(result.rows).toHaveLength(1_000);
-      expect(result.retainedBytes).toBeLessThanOrEqual(MAX_SPARSE_WORKSPACE_RETAINED_BYTES);
+      expect(result.retainedBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
     }
     expect(workspace.storage.statementCount).toBe(4);
     expect(workspace.storage.rowCount).toBe(2_001);
@@ -2147,6 +2261,42 @@ describe("SQLite sparse workspace source", () => {
     expect(() =>
       source.hydrate({ ...request, checkoutId: workspace.repo.checkout.checkoutId }),
     ).toThrowError(expect.objectContaining({ code: "EINVAL" }));
+  });
+
+  it("hydrates an owned native tree beyond the former 8 MiB source ceiling", () => {
+    const workspace = makeRepo("/");
+    const entries = Array.from({ length: 4_096 }, (_, index) => ({
+      mode: MODE_FILE,
+      name: `p${index.toString().padStart(4, "0")}${"x".repeat(2_044)}`,
+      oid: "1".repeat(40),
+    }));
+    const serialized = serializeTree(entries);
+    expect(serialized.byteLength).toBeGreaterThan(8 * 1024 * 1024);
+    const tree = workspace.repo.store.write("tree", serialized);
+    const source = createSqliteSparseWorkspaceSource(workspace.database.db);
+    const coordinator = new MemoryCoordinator();
+    const owner = coordinator.reserve();
+    try {
+      const result = hydrateSparseWorkspaceOwned(
+        source,
+        {
+          repoId: workspace.repo.store.repoId,
+          checkoutId: workspace.repo.checkout.checkoutId,
+          root: "/",
+          baselineTreeOid: tree,
+          currentTreeOid: null,
+          paths: [entries[0]?.name ?? ""],
+        },
+        owner,
+      );
+      expect(result.available).toBe(true);
+      if (!result.available) throw new Error("large owned sparse tree was unavailable");
+      expect(result.rows).toHaveLength(1);
+      expect(owner.currentBytes).toBe(result.retainedBytes);
+    } finally {
+      owner.dispose();
+    }
+    coordinator.assertIdle();
   });
 
   it("falls back when distinct touched sources exceed the cumulative row cap by one", () => {

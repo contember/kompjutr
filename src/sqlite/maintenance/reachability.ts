@@ -2,6 +2,7 @@ import { isOid, toHex } from "../../core/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../../core/errors.js";
 import type { ObjectType } from "../../core/objects.js";
 import { InflateStream } from "../../core/zlib.js";
+import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../db.js";
 import { MAX_DELTA_DEPTH } from "../packs.js";
 import type { ObjectReadInfo, SharedRepoStore } from "../store.js";
@@ -10,8 +11,11 @@ import { TREE_QUEUE_ROW_FIXED_BYTES } from "../tree-index.js";
 const EDGE_PAGE = 256;
 const HEADER_LINE_PREFIX_BYTES = 128;
 const MAX_HEADER_OBJECT_BYTES = 48 * 1024 * 1024;
-const MAX_TREE_NAME_BYTES = 2_200;
-const MAX_TREE_RAW_ENTRY_BYTES = 2_264;
+const TREE_EDGE_METADATA_ROW_BYTES = 256;
+const TREE_EDGE_RESULT_BYTES = 256;
+const TREE_EDGE_EXPECTED_JSON_BYTES = 256;
+const REACHABILITY_PUBLICATION_ROW_BYTES = 1024;
+const REACHABILITY_OPERATION_BYTES = 1024;
 
 export type MaintenanceReachabilityStatus = "progress" | "complete" | "root-changed";
 
@@ -79,6 +83,16 @@ interface ExistingMark {
 interface PublicationResult {
   discoveredObjects: number;
   discoveredLogicalObjects: number;
+}
+
+interface TreeEdgeMetadata {
+  sourceKey: number;
+  ordinal: number;
+  mode: string;
+  nameLength: number;
+  oid: string;
+  rawLength: number;
+  cumulativeBase: number;
 }
 
 function safeInteger(
@@ -844,12 +858,12 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
-function validateTreeEntry(
+function validateTreeEntryMetadata(
   row: Record<string, unknown>,
   sourceKey: number,
   ordinal: number,
   previousBase: number,
-): { edge: ReachabilityEdge; cumulativeBase: number } {
+): TreeEdgeMetadata {
   if (row.source_key !== sourceKey) throw new CorruptError("tree edge crossed source boundaries");
   if (row.ordinal !== ordinal) throw new CorruptError("tree edge ordinals are not contiguous");
   const mode = row.mode;
@@ -863,16 +877,33 @@ function validateTreeEntry(
   ) {
     throw new CorruptError("tree edge mode is invalid");
   }
-  if (
-    row.name_type !== "blob" ||
-    safeInteger(row.name_length, "tree edge name length", 0) < 1 ||
-    safeInteger(row.name_length, "tree edge name length", 0) > MAX_TREE_NAME_BYTES ||
-    row.name_bytes === null
-  ) {
-    throw new CorruptError("tree edge name exceeds its materialization bound");
+  if (row.name_type !== "blob") {
+    throw new CorruptError("tree edge name is invalid");
+  }
+  const nameLength = safeInteger(row.name_length, "tree edge name length", 1);
+  const oid = oidField(row.oid, "tree edge OID");
+  if (row.raw_type !== "blob") {
+    throw new CorruptError("tree raw edge is invalid");
+  }
+  const rawLength = safeInteger(row.raw_length, "tree raw edge length", 0);
+  const cumulativeBase = safeInteger(row.cumulative_base, "tree cumulative edge cost", 0);
+  const expectedBase =
+    previousBase + TREE_QUEUE_ROW_FIXED_BYTES + nameLength + mode.length + oid.length;
+  if (!Number.isSafeInteger(expectedBase) || cumulativeBase !== expectedBase) {
+    throw new CorruptError("tree cumulative edge cost is inconsistent");
+  }
+  return { sourceKey, ordinal, mode, nameLength, oid, rawLength, cumulativeBase };
+}
+
+function validateTreeEntryPayload(
+  row: Record<string, unknown>,
+  metadata: TreeEdgeMetadata,
+): ReachabilityEdge {
+  if (row.source_key !== metadata.sourceKey || row.ordinal !== metadata.ordinal) {
+    throw new CorruptError("tree edge payload changed its metadata order");
   }
   const name = bytesField(row.name_bytes, "tree edge name");
-  if (name.length !== row.name_length || name.includes(0) || name.includes(0x2f)) {
+  if (name.length !== metadata.nameLength || name.includes(0) || name.includes(0x2f)) {
     throw new CorruptError("tree edge name is invalid");
   }
   try {
@@ -880,19 +911,11 @@ function validateTreeEntry(
   } catch (error) {
     throw new CorruptError("tree edge name is not valid UTF-8", { cause: error });
   }
-  const oid = oidField(row.oid, "tree edge OID");
-  if (
-    row.raw_type !== "blob" ||
-    safeInteger(row.raw_length, "tree raw edge length", 0) > MAX_TREE_RAW_ENTRY_BYTES ||
-    row.raw_entry === null
-  ) {
-    throw new CorruptError("tree raw edge exceeds its materialization bound");
-  }
   const raw = bytesField(row.raw_entry, "tree raw edge");
-  if (raw.length !== row.raw_length) {
-    throw new CorruptError("tree raw edge length changed after its SQL guard");
+  if (raw.length !== metadata.rawLength) {
+    throw new CorruptError("tree raw edge length changed after its metadata read");
   }
-  const modeBytes = new TextEncoder().encode(mode);
+  const modeBytes = new TextEncoder().encode(metadata.mode);
   const expectedLength = modeBytes.length + name.length + 22;
   const nameAt = modeBytes.length + 1;
   const oidAt = nameAt + name.length + 1;
@@ -902,24 +925,20 @@ function validateTreeEntry(
     raw[modeBytes.length] !== 0x20 ||
     !equalBytes(raw.subarray(nameAt, oidAt - 1), name) ||
     raw[oidAt - 1] !== 0 ||
-    toHex(raw.subarray(oidAt)) !== oid
+    toHex(raw.subarray(oidAt)) !== metadata.oid
   ) {
     throw new CorruptError("tree raw edge disagrees with its indexed fields");
   }
-  const cumulativeBase = safeInteger(row.cumulative_base, "tree cumulative edge cost", 0);
-  const expectedBase =
-    previousBase + TREE_QUEUE_ROW_FIXED_BYTES + name.length + mode.length + oid.length;
-  if (!Number.isSafeInteger(expectedBase) || cumulativeBase !== expectedBase) {
-    throw new CorruptError("tree cumulative edge cost is inconsistent");
-  }
   return {
-    edge: {
-      oid,
-      type: mode === "40000" || mode === "040000" ? "tree" : mode === "160000" ? "commit" : "blob",
-      optionalMissing: mode === "160000",
-      physicalOnly: false,
-    },
-    cumulativeBase,
+    oid: metadata.oid,
+    type:
+      metadata.mode === "40000" || metadata.mode === "040000"
+        ? "tree"
+        : metadata.mode === "160000"
+          ? "commit"
+          : "blob",
+    optionalMissing: metadata.mode === "160000",
+    physicalOnly: false,
   };
 }
 
@@ -928,6 +947,7 @@ function treeExpansion(
   store: SharedRepoStore,
   object: QueueObject,
   info: ObjectReadInfo,
+  reservation: MemoryReservation,
 ): ObjectExpansion {
   let source: Record<string, unknown> | null = null;
   let sourceRows = 0;
@@ -995,41 +1015,98 @@ function treeExpansion(
     previousBase = safeInteger(previous.cumulative_base, "preceding tree cumulative cost", 0);
   }
 
-  const edges: ReachabilityEdge[] = [];
-  let rows = 0;
+  const page = reservation.scope();
+  page.set("metadata", (EDGE_PAGE + 1) * TREE_EDGE_METADATA_ROW_BYTES);
+  const metadata: TreeEdgeMetadata[] = [];
+  let largestPayload = 0;
+  let largestDecode = 0;
   for (const row of db.iterate(
-    `SELECT /* maintenance-tree-edges */ source_key, ordinal, mode,
+    `SELECT /* maintenance-tree-edge-metadata */ source_key, ordinal,
+            CASE WHEN typeof(mode) = 'text' AND length(CAST(mode AS BLOB)) <= 6
+                 THEN mode ELSE NULL END AS mode,
             typeof(name_bytes) AS name_type, length(name_bytes) AS name_length,
-            CASE WHEN typeof(name_bytes) = 'blob'
-                       AND length(name_bytes) BETWEEN 1 AND ${MAX_TREE_NAME_BYTES}
-                 THEN name_bytes ELSE NULL END AS name_bytes,
-            oid,
+            CASE WHEN typeof(oid) = 'text' AND length(oid) <= 40
+                 THEN oid ELSE NULL END AS oid,
             typeof(raw_entry) AS raw_type, length(raw_entry) AS raw_length,
-            CASE WHEN typeof(raw_entry) = 'blob'
-                       AND length(raw_entry) BETWEEN 0 AND ${MAX_TREE_RAW_ENTRY_BYTES}
-                 THEN raw_entry ELSE NULL END AS raw_entry,
             cumulative_base
        FROM git_tree_entries WHERE source_key = ? AND ordinal >= ?
       ORDER BY ordinal LIMIT ${EDGE_PAGE + 1}`,
     sourceKey,
     object.edgeCursor,
   )) {
-    const checked = validateTreeEntry(row, sourceKey, object.edgeCursor + rows, previousBase);
+    const checked = validateTreeEntryMetadata(
+      row,
+      sourceKey,
+      object.edgeCursor + metadata.length,
+      previousBase,
+    );
     previousBase = checked.cumulativeBase;
-    rows++;
-    if (object.edgeCursor + rows > entryCount) {
+    metadata.push(checked);
+    if (object.edgeCursor + metadata.length > entryCount) {
       throw new CorruptError("tree source has rows beyond its completion marker");
     }
-    if (edges.length < EDGE_PAGE) edges.push(checked.edge);
+    const payload = checked.nameLength + checked.rawLength;
+    if (!Number.isSafeInteger(payload)) {
+      throw new GitError("E2BIG", "tree edge payload memory accounting overflows");
+    }
+    largestPayload = Math.max(largestPayload, payload);
+    largestDecode = Math.max(largestDecode, checked.nameLength * 2);
   }
   const remaining = entryCount - object.edgeCursor;
-  if (rows !== Math.min(remaining, EDGE_PAGE + 1)) {
+  if (metadata.length !== Math.min(remaining, EDGE_PAGE + 1)) {
     throw new CorruptError("tree source rows are incomplete");
   }
   const nextCursor = object.edgeCursor + Math.min(remaining, EDGE_PAGE);
   const semanticComplete = nextCursor === entryCount;
   if (semanticComplete && previousBase !== baseCost) {
     throw new CorruptError("tree source completion cost is inconsistent");
+  }
+  const edgeCount = Math.min(metadata.length, EDGE_PAGE);
+  const retainedMetadata = metadata.length * TREE_EDGE_METADATA_ROW_BYTES;
+  const resultBytes = edgeCount * TREE_EDGE_RESULT_BYTES;
+  const liveBytes =
+    resultBytes + metadata.length * TREE_EDGE_EXPECTED_JSON_BYTES + largestPayload + largestDecode;
+  if (!Number.isSafeInteger(liveBytes)) {
+    throw new GitError("E2BIG", "tree edge page memory accounting overflows");
+  }
+  page.set("metadata", retainedMetadata);
+  page.set("other", liveBytes);
+  const expectedPayloads = JSON.stringify(
+    metadata.map((entry) => ({ q: entry.ordinal, n: entry.nameLength, r: entry.rawLength })),
+  );
+  const edges: ReachabilityEdge[] = [];
+  let payloadOrdinal = 0;
+  for (const row of db.iterate(
+    `WITH expected AS (
+       SELECT CAST(json_extract(value, '$.q') AS INTEGER) AS ordinal,
+              CAST(json_extract(value, '$.n') AS INTEGER) AS name_length,
+              CAST(json_extract(value, '$.r') AS INTEGER) AS raw_length
+         FROM json_each(?)
+     )
+     SELECT /* maintenance-tree-edge-payloads */ entry.source_key, entry.ordinal,
+            CASE WHEN typeof(entry.name_bytes) = 'blob'
+                       AND length(entry.name_bytes) = expected.name_length
+                 THEN entry.name_bytes ELSE NULL END AS name_bytes,
+            CASE WHEN typeof(entry.raw_entry) = 'blob'
+                       AND length(entry.raw_entry) = expected.raw_length
+                 THEN entry.raw_entry ELSE NULL END AS raw_entry
+       FROM expected
+       JOIN git_tree_entries entry
+         ON entry.source_key = ? AND entry.ordinal = expected.ordinal
+      ORDER BY entry.ordinal`,
+    expectedPayloads,
+    sourceKey,
+  )) {
+    const expected = metadata[payloadOrdinal];
+    if (expected === undefined) {
+      throw new CorruptError("tree edge payloads exceed their metadata page");
+    }
+    const edge = validateTreeEntryPayload(row, expected);
+    if (edges.length < EDGE_PAGE) edges.push(edge);
+    payloadOrdinal++;
+  }
+  if (payloadOrdinal !== metadata.length) {
+    throw new CorruptError("tree edge payload page is incomplete");
   }
   let complete = semanticComplete;
   if (semanticComplete) {
@@ -1257,7 +1334,13 @@ function publishExpansion(
   run: RunState,
   object: QueueObject,
   expansion: ObjectExpansion,
+  reservation: MemoryReservation,
 ): PublicationResult {
+  const publication = reservation.scope();
+  publication.set(
+    "other",
+    REACHABILITY_OPERATION_BYTES + expansion.edges.length * REACHABILITY_PUBLICATION_ROW_BYTES,
+  );
   const edges = normalizeAndValidateEdges(store, expansion.edges);
   const marks = existingMarks(db, store.repoId, run.runId, edges);
   let discoveredObjects = 0;
@@ -1417,65 +1500,71 @@ export function advanceMaintenanceReachability(
   if (!Number.isSafeInteger(store.repoId) || store.repoId < 1) {
     throw new GitError("EINVAL", "repository id must be a safe positive integer");
   }
-  return store.db.transactionSync(() => {
-    let run = readRun(store.db, store.repoId);
-    if (run.observedRootEpoch !== run.rootEpoch) {
-      return {
-        runId: run.runId,
-        status: "root-changed",
-        processedOid: null,
-        discoveredObjects: 0,
-        discoveredLogicalObjects: 0,
-      };
-    }
-    if (run.phase === "classify-loose") {
-      auditCompletedMark(store.db, store.repoId, run);
-      return {
-        runId: run.runId,
-        status: "complete",
-        processedOid: null,
-        discoveredObjects: 0,
-        discoveredLogicalObjects: 0,
-      };
-    }
-    if (run.phase !== "mark") {
-      throw new GitError("EINVAL", `maintenance reachability cannot advance phase ${run.phase}`);
-    }
-    run = initializeAndValidateCounters(store.db, store.repoId, run);
-    const object = readNextObject(store.db, store.repoId, run.runId);
-    if (object === null) {
-      finishMark(store.db, store.repoId, run);
-      return {
-        runId: run.runId,
-        status: "complete",
-        processedOid: null,
-        discoveredObjects: 0,
-        discoveredLogicalObjects: 0,
-      };
-    }
-    if (run.queuedObjects === 0) {
-      throw new CorruptError("maintenance queued count omitted an unexpanded mark");
-    }
-    let expansion: ObjectExpansion;
-    if (object.physicalOnly) {
-      expansion = physicalExpansion(store, object);
-    } else {
-      const info = requireObjectInfo(store, object.oid);
-      if (object.shallowBoundary && info.type !== "commit") {
-        throw new CorruptError("maintenance shallow boundary is not a commit");
+  const reservation = store.reserveMemory();
+  try {
+    reservation.set("other", REACHABILITY_OPERATION_BYTES);
+    return store.db.transactionSync(() => {
+      let run = readRun(store.db, store.repoId);
+      if (run.observedRootEpoch !== run.rootEpoch) {
+        return {
+          runId: run.runId,
+          status: "root-changed",
+          processedOid: null,
+          discoveredObjects: 0,
+          discoveredLogicalObjects: 0,
+        };
       }
-      expansion =
-        info.type === "tree"
-          ? treeExpansion(store.db, store, object, info)
-          : headerExpansion(store, object, info);
-    }
-    const published = publishExpansion(store.db, store, run, object, expansion);
-    return {
-      runId: run.runId,
-      status: "progress",
-      processedOid: object.oid,
-      discoveredObjects: published.discoveredObjects,
-      discoveredLogicalObjects: published.discoveredLogicalObjects,
-    };
-  });
+      if (run.phase === "classify-loose") {
+        auditCompletedMark(store.db, store.repoId, run);
+        return {
+          runId: run.runId,
+          status: "complete",
+          processedOid: null,
+          discoveredObjects: 0,
+          discoveredLogicalObjects: 0,
+        };
+      }
+      if (run.phase !== "mark") {
+        throw new GitError("EINVAL", `maintenance reachability cannot advance phase ${run.phase}`);
+      }
+      run = initializeAndValidateCounters(store.db, store.repoId, run);
+      const object = readNextObject(store.db, store.repoId, run.runId);
+      if (object === null) {
+        finishMark(store.db, store.repoId, run);
+        return {
+          runId: run.runId,
+          status: "complete",
+          processedOid: null,
+          discoveredObjects: 0,
+          discoveredLogicalObjects: 0,
+        };
+      }
+      if (run.queuedObjects === 0) {
+        throw new CorruptError("maintenance queued count omitted an unexpanded mark");
+      }
+      let expansion: ObjectExpansion;
+      if (object.physicalOnly) {
+        expansion = physicalExpansion(store, object);
+      } else {
+        const info = requireObjectInfo(store, object.oid);
+        if (object.shallowBoundary && info.type !== "commit") {
+          throw new CorruptError("maintenance shallow boundary is not a commit");
+        }
+        expansion =
+          info.type === "tree"
+            ? treeExpansion(store.db, store, object, info, reservation)
+            : headerExpansion(store, object, info);
+      }
+      const published = publishExpansion(store.db, store, run, object, expansion, reservation);
+      return {
+        runId: run.runId,
+        status: "progress",
+        processedOid: object.oid,
+        discoveredObjects: published.discoveredObjects,
+        discoveredLogicalObjects: published.discoveredLogicalObjects,
+      };
+    });
+  } finally {
+    reservation.dispose();
+  }
 }

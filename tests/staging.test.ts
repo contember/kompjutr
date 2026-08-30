@@ -1121,6 +1121,67 @@ describe("add", () => {
       }),
     ]);
   });
+
+  it("rolls back first-window index and object writes when the second read window fails", () => {
+    class SecondWindowFailureWorktree extends CountingWorktree {
+      calls = 0;
+
+      override readFiles(paths: readonly string[], options?: { budget?: number }) {
+        this.calls++;
+        if (this.calls === 2) throw new GitError("E2BIG", "injected second-window read failure");
+        return super.readFiles(paths, options);
+      }
+    }
+
+    const workspace = makeRepo("/");
+    const bytes = utf8.encode("x\n");
+    workspace.worktree.writeFiles(
+      Array.from({ length: 1_001 }, (_, index) => ({
+        path: `/f${index.toString().padStart(4, "0")}.txt`,
+        bytes,
+      })),
+    );
+    const worktree = new SecondWindowFailureWorktree(workspace.worktree);
+    const beforeObjects = workspace.repo.store.objectCount();
+
+    expect(() => add(workspace.repo, worktree, { paths: [], all: true, force: true })).toThrow(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+
+    expect(worktree.calls).toBe(2);
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("does not charge an AddIndexPath alias as a second retained path", () => {
+    const workspace = makeRepo("/");
+    const oid = workspace.repo.store.write("blob", utf8.encode("indexed\n"));
+    const suffix = "x".repeat(8_000);
+    const paths = Array.from(
+      { length: 700 },
+      (_, index) => `${index.toString().padStart(3, "0")}-${suffix}`,
+    );
+    for (const path of paths) {
+      workspace.repo.checkout.indexPut({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+    const beforeObjects = workspace.repo.store.objectCount();
+
+    expect(() => add(workspace.repo, workspace.worktree, { paths: [], all: true })).not.toThrow();
+
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(workspace.repo.store.objectCount()).toBe(beforeObjects);
+    for (const path of paths) expect(workspace.worktree.stat(`/${path}`)).toBeNull();
+    workspace.repo.store.memory.assertIdle();
+  });
 });
 
 describe("rm", () => {
@@ -1163,6 +1224,32 @@ describe("rm", () => {
     expect(worktree.rangeReads).toBe(65);
     expect(workspace.repo.checkout.indexGet("large.bin")).toBeNull();
     expect(workspace.worktree.stat("/large.bin")?.size).toBe(bytes.length);
+  });
+
+  it("hashes aggregate bytes beyond the former add and rm work ceilings", () => {
+    const workspace = makeRepo("/");
+    const exact = new Uint8Array(32 * 1024 * 1024);
+    const plusOne = new Uint8Array(32 * 1024 * 1024 + 1);
+    exact[0] = 1;
+    plusOne[plusOne.length - 1] = 2;
+    workspace.worktree.writeFiles([
+      { path: "/a.bin", bytes: exact },
+      { path: "/b.bin", bytes: plusOne },
+    ]);
+
+    add(workspace.repo, workspace.worktree, { paths: [], all: true, force: true });
+    for (const path of ["a.bin", "b.bin"]) {
+      const entry = workspace.repo.checkout.indexGet(path);
+      if (entry === null) throw new Error(`missing ${path} index entry`);
+      workspace.repo.checkout.indexPut({ ...entry, size: null, mtime: null, ino: null, rev: null });
+    }
+
+    rm(workspace.repo, workspace.worktree, { paths: ["."], cached: true, recursive: true });
+
+    expect(workspace.repo.checkout.indexEntries()).toEqual([]);
+    expect(workspace.worktree.stat("/a.bin")?.size).toBe(exact.length);
+    expect(workspace.worktree.stat("/b.bin")?.size).toBe(plusOne.length);
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("continues worktree safety hashing through the former 17th batch", () => {
@@ -1472,6 +1559,21 @@ describe("rm", () => {
 
     expect(lsFiles(workspace.repo)).toEqual(["file.txt"]);
     expect(utf8Decoder.decode(workspace.worktree.readFile("/file.txt"))).toBe("content\n");
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("passes an oversized singleton removal through to the filesystem", () => {
+    const root = `/root-${"x".repeat(1_000_000)}`;
+    const workspace = makeRepo(root);
+    const path = "file.txt";
+    writeWorkFile(workspace, `${root}/${path}`, "content\n");
+    add(workspace.repo, workspace.worktree, { paths: [path], force: true });
+
+    rm(workspace.repo, workspace.worktree, { paths: [path], force: true });
+
+    expect(workspace.repo.checkout.indexGet(path)).toBeNull();
+    expect(workspace.worktree.stat(`${root}/${path}`)).toBeNull();
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("reports a pathspec that is not in the index", () => {
@@ -1482,7 +1584,7 @@ describe("rm", () => {
     );
   });
 
-  it("bounds pathspec count, UTF-8 length, and retained state before mutation", () => {
+  it("bounds pathspec count and retained state without a component byte ceiling", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/file.txt", "content\n");
     add(workspace.repo, workspace.worktree, { paths: ["file.txt"] });
@@ -1499,13 +1601,21 @@ describe("rm", () => {
     ).toThrow(expect.objectContaining({ code: "E2BIG" }));
     assertUnchanged();
 
-    expect(() =>
-      rm(workspace.repo, workspace.worktree, {
-        paths: ["x".repeat(2_201)],
-        force: true,
-      }),
-    ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+    const longPath = `long-${"x".repeat(2_201)}`;
+    writeWorkFile(workspace, `/${longPath}`, "long\n");
+    const sourceStatements: number[] = [];
+    add(
+      workspace.repo,
+      workspace.worktree,
+      { paths: [longPath] },
+      nativeAddContext(workspace, sourceStatements),
+    );
+    expect(sourceStatements).toEqual([2]);
+    expect(workspace.repo.checkout.indexGet(longPath)).not.toBeNull();
+    rm(workspace.repo, workspace.worktree, { paths: [longPath], cached: true, force: true });
+    expect(workspace.repo.checkout.indexGet(longPath)).toBeNull();
     assertUnchanged();
+    workspace.repo.store.memory.assertIdle();
 
     const suffix = "y".repeat(2_080);
     expect(() =>

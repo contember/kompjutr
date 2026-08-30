@@ -1,11 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
 import { hashObject, serializeCommit, serializeTree } from "../src/core/objects.js";
 import type { MergeStateMetadata, MergeTouchedPath } from "../src/core/ops/merge-state.js";
 import { mergeOperationState } from "../src/core/ops/operation-state.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
-import { Database } from "../src/sqlite/db.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { Database, type SqlDatabase } from "../src/sqlite/db.js";
 import {
   advanceIndexTrackerBaseline,
   initializeIndexTracker,
@@ -16,7 +17,11 @@ import {
   MAINTENANCE_ROOT_EPOCH_EXHAUSTED,
   readMaintenanceRootEpoch,
 } from "../src/sqlite/maintenance/control.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import {
+  type MaintenanceRootSource,
+  validatedOperationJournalRoots,
+} from "../src/sqlite/maintenance/roots.js";
+import { advanceMaintenanceRootSnapshotOwned, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const NOW = 1_800_000_000_123;
@@ -27,6 +32,99 @@ const PERSON = {
   timezoneOffset: 0,
 };
 const EMPTY_TREE_BYTES = serializeTree([]);
+
+class MaintenanceCursorDatabase implements SqlDatabase {
+  cursorPayloadReads = 0;
+  refPayloadReads = 0;
+  headPayloadReads = 0;
+  reflogPayloadReads = 0;
+  indexPayloadReads = 0;
+  indexBaselinePayloadReads = 0;
+  shallowPayloadReads = 0;
+  operationCheckoutReads = 0;
+
+  constructor(readonly inner: TestDatabase) {}
+
+  run(query: string, ...bindings: unknown[]): void {
+    this.inner.run(query, ...bindings);
+  }
+
+  all<Row extends object>(query: string, ...bindings: unknown[]): Row[] {
+    return this.inner.all<Row>(query, ...bindings);
+  }
+
+  one<Row extends object>(query: string, ...bindings: unknown[]): Row | undefined {
+    if (
+      query.includes("SELECT repo_id, run_id, observed_root_epoch") &&
+      query.includes("cursor_checkout_id, cursor_text")
+    ) {
+      this.cursorPayloadReads++;
+    }
+    return this.inner.one<Row>(query, ...bindings);
+  }
+
+  scalar<T>(query: string, ...bindings: unknown[]): T | undefined {
+    return this.inner.scalar<T>(query, ...bindings);
+  }
+
+  iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    if (query.includes("typeof(name) AS name_type")) this.refPayloadReads++;
+    if (query.includes("typeof(head) AS head_type")) this.headPayloadReads++;
+    if (query.includes("typeof(ref_key) AS ref_key_type")) this.reflogPayloadReads++;
+    if (query.includes("typeof(entry.path) AS path_type")) this.indexPayloadReads++;
+    if (query.includes("typeof(state.baseline_tree_oid) AS baseline_tree_oid_type")) {
+      this.indexBaselinePayloadReads++;
+    }
+    if (query.includes("typeof(oid) AS oid_type") && query.includes("FROM git_shallow")) {
+      this.shallowPayloadReads++;
+    }
+    if (query.includes("SELECT id AS checkout_id, repo_id FROM git_checkouts")) {
+      this.operationCheckoutReads++;
+    }
+    return this.inner.iterate(query, ...bindings);
+  }
+
+  transactionSync<T>(closure: () => T): T {
+    return this.inner.transactionSync(closure);
+  }
+}
+
+function installRootRun(db: TestDatabase, repoId: number, source: MaintenanceRootSource): void {
+  const rootEpoch = db.scalar<number>(
+    "SELECT root_epoch FROM git_maintenance_control WHERE repo_id = ?",
+    repoId,
+  );
+  if (rootEpoch === undefined) {
+    db.run(
+      `INSERT INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+       VALUES (?, 0, 2)`,
+      repoId,
+    );
+  } else {
+    db.run("UPDATE git_maintenance_control SET next_run_id = 2 WHERE repo_id = ?", repoId);
+  }
+  db.run(
+    `INSERT INTO git_maintenance_runs
+       (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source)
+     VALUES (?, 1, ?, 'roots', ?, ?)`,
+    repoId,
+    rootEpoch ?? 0,
+    NOW,
+    source,
+  );
+}
+
+function rootPayloadReads(
+  database: MaintenanceCursorDatabase,
+  source: Exclude<MaintenanceRootSource, "operations" | "done">,
+): number {
+  if (source === "refs") return database.refPayloadReads;
+  if (source === "heads") return database.headPayloadReads;
+  if (source === "reflogs") return database.reflogPayloadReads;
+  if (source === "index") return database.indexPayloadReads;
+  if (source === "index-baseline") return database.indexBaselinePayloadReads;
+  return database.shallowPayloadReads;
+}
 
 function commitBytes(message: string, parent: string[] = []): Uint8Array {
   return serializeCommit({
@@ -77,6 +175,268 @@ function hasRootSource(db: TestDatabase, repoId: number, oid: string, source: nu
 }
 
 describe("maintenance roots", () => {
+  it("keeps reservation ownership out of the public database method", () => {
+    const { database } = open();
+
+    expectTypeOf(database.advanceMaintenanceRootSnapshot)
+      .parameter(1)
+      .toEqualTypeOf<{ nowMs: number; pageRows?: number }>();
+  });
+
+  it("admits a cold text cursor from metadata before materializing its payload", () => {
+    const inner = new TestDatabase();
+    const observed = new MaintenanceCursorDatabase(inner);
+    const database = new SqliteGitDatabase(observed, { now: () => NOW });
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const cursor = `refs/heads/${"c".repeat(4_086)}`;
+    expect(utf8.encode(cursor)).toHaveLength(4_097);
+    inner.run(
+      `INSERT INTO git_maintenance_control (repo_id, root_epoch, next_run_id)
+       VALUES (?, 0, 2)`,
+      checkout.repoId,
+    );
+    inner.run(
+      `INSERT INTO git_maintenance_runs
+         (repo_id, run_id, observed_root_epoch, phase, started_ms, root_source, cursor_text)
+       VALUES (?, 1, 0, 'roots', ?, 'refs', ?)`,
+      checkout.repoId,
+      NOW,
+      cursor,
+    );
+    const shared = database.openShared(checkout.repoId);
+    const cursorBytes = utf8.encode(cursor).byteLength;
+    const cursorMemoryBytes = 256 + 3 * cursorBytes;
+    const emptyPageMemoryBytes = 2_048 + 2 * (256 + cursorBytes);
+    const exactExternalBytes =
+      MAX_OPERATION_MEMORY_BYTES - cursorMemoryBytes - emptyPageMemoryBytes - 4_096;
+
+    const exactBlocker = shared.reserveMemory();
+    exactBlocker.set("other", exactExternalBytes);
+    const exactOwner = shared.reserveMemory();
+    observed.cursorPayloadReads = 0;
+    try {
+      expect(
+        advanceMaintenanceRootSnapshotOwned(
+          database,
+          checkout.repoId,
+          { nowMs: NOW, pageRows: 1 },
+          exactOwner,
+        ),
+      ).toMatchObject({ rootSource: "heads", complete: false });
+      expect(observed.cursorPayloadReads).toBe(1);
+      expect(exactOwner.highWaterBytes + exactBlocker.currentBytes).toBe(
+        MAX_OPERATION_MEMORY_BYTES,
+      );
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    inner.run(
+      `UPDATE git_maintenance_runs
+          SET root_source = 'refs', cursor_text = ?
+        WHERE repo_id = ?`,
+      cursor,
+      checkout.repoId,
+    );
+    const restored = inner.one(
+      "SELECT * FROM git_maintenance_runs WHERE repo_id = ?",
+      checkout.repoId,
+    );
+
+    const overBlocker = shared.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - cursorMemoryBytes + 1);
+    const overOwner = shared.reserveMemory();
+    observed.cursorPayloadReads = 0;
+    try {
+      expect(() =>
+        advanceMaintenanceRootSnapshotOwned(
+          database,
+          checkout.repoId,
+          { nowMs: NOW, pageRows: 1 },
+          overOwner,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(observed.cursorPayloadReads).toBe(0);
+      expect(
+        inner.one("SELECT * FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId),
+      ).toEqual(restored);
+    } finally {
+      overOwner.dispose();
+      overBlocker.dispose();
+    }
+    shared.memory.assertIdle();
+  });
+
+  it("admits stored root pages before reading their payloads", () => {
+    const sources: readonly (
+      | "refs"
+      | "heads"
+      | "reflogs"
+      | "index"
+      | "index-baseline"
+      | "shallow"
+    )[] = ["refs", "heads", "reflogs", "index", "index-baseline", "shallow"];
+    for (const source of sources) {
+      const inner = new TestDatabase();
+      const observed = new MaintenanceCursorDatabase(inner);
+      const database = new SqliteGitDatabase(observed, { now: () => NOW });
+      const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+      const store = database.openCheckout(checkout);
+      let textBytes: number;
+      if (source === "refs") {
+        store.setRef("refs/heads/topic", "ref: refs/heads/missing");
+        textBytes =
+          utf8.encode("refs/heads/topic").byteLength +
+          utf8.encode("ref: refs/heads/missing").byteLength;
+      } else if (source === "heads") {
+        textBytes = utf8.encode(checkout.head).byteLength;
+      } else if (source === "reflogs") {
+        inner.run(
+          `INSERT INTO git_reflog_entries
+             (repo_id, ref_name, ordinal, old_raw, new_raw, old_oid, new_oid,
+              actor_name, actor_email, timestamp, timezone, reason)
+           VALUES (?, 'refs/heads/topic', 1, NULL, 'ref: refs/heads/missing', NULL, NULL,
+                   NULL, NULL, ?, 0, 'maintenance boundary')`,
+          checkout.repoId,
+          Math.floor(NOW / 1_000),
+        );
+        textBytes =
+          utf8.encode("refs/heads/topic").byteLength +
+          utf8.encode("ref: refs/heads/missing").byteLength;
+      } else if (source === "index") {
+        const path = "index.txt";
+        store.indexPut({
+          path,
+          stage: 0,
+          mode: 0o160000,
+          oid: "f".repeat(40),
+          size: null,
+          mtime: null,
+          ino: null,
+        });
+        textBytes = utf8.encode(path).byteLength + 40;
+      } else if (source === "index-baseline") {
+        const tree = store.write("tree", EMPTY_TREE_BYTES);
+        inner.run(
+          `UPDATE git_index_state SET baseline_tree_oid = ?, format = 1, complete = 1
+            WHERE checkout_id = ?`,
+          tree,
+          checkout.id,
+        );
+        textBytes = 40;
+      } else {
+        const commit = store.write("commit", commitBytes("shallow boundary"));
+        store.setShallow([commit]);
+        textBytes = 40;
+      }
+      installRootRun(inner, checkout.repoId, source);
+      observed.refPayloadReads = 0;
+      observed.headPayloadReads = 0;
+      observed.reflogPayloadReads = 0;
+      observed.indexPayloadReads = 0;
+      observed.indexBaselinePayloadReads = 0;
+      observed.shallowPayloadReads = 0;
+      const shared = database.openShared(checkout.repoId);
+      const pageBytes = 2_048 + 1_024 + 3 * textBytes + (source === "index" ? 512 : 0);
+      const futureBytes = source === "reflogs" ? 7_168 : 5_888;
+      const externalBytes = MAX_OPERATION_MEMORY_BYTES - pageBytes - futureBytes;
+
+      const exactBlocker = shared.reserveMemory();
+      exactBlocker.set("other", externalBytes);
+      const exactOwner = shared.reserveMemory();
+      try {
+        expect(
+          advanceMaintenanceRootSnapshotOwned(
+            database,
+            checkout.repoId,
+            { nowMs: NOW, pageRows: 1 },
+            exactOwner,
+          ),
+        ).toMatchObject({ complete: false });
+        expect(rootPayloadReads(observed, source)).toBe(1);
+        expect(exactOwner.highWaterBytes + exactBlocker.currentBytes).toBe(
+          MAX_OPERATION_MEMORY_BYTES,
+        );
+      } finally {
+        exactOwner.dispose();
+        exactBlocker.dispose();
+      }
+
+      inner.run(
+        `UPDATE git_maintenance_runs
+            SET root_source = ?, cursor_checkout_id = NULL,
+                cursor_text = NULL, cursor_ordinal = NULL
+          WHERE repo_id = ?`,
+        source,
+        checkout.repoId,
+      );
+      const restored = inner.one(
+        "SELECT * FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      );
+      observed.refPayloadReads = 0;
+      observed.headPayloadReads = 0;
+      observed.reflogPayloadReads = 0;
+      observed.indexPayloadReads = 0;
+      observed.indexBaselinePayloadReads = 0;
+      observed.shallowPayloadReads = 0;
+      const overBlocker = shared.reserveMemory();
+      overBlocker.set("other", externalBytes + 1);
+      const overOwner = shared.reserveMemory();
+      try {
+        expect(() =>
+          advanceMaintenanceRootSnapshotOwned(
+            database,
+            checkout.repoId,
+            { nowMs: NOW, pageRows: 1 },
+            overOwner,
+          ),
+        ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(rootPayloadReads(observed, source)).toBe(0);
+        expect(
+          inner.one("SELECT * FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId),
+        ).toEqual(restored);
+      } finally {
+        overOwner.dispose();
+        overBlocker.dispose();
+      }
+      shared.memory.assertIdle();
+    }
+  });
+
+  it("resumes index discovery from a path beyond the former local cursor ceiling", () => {
+    const { db, database, checkout, store } = open();
+    const oid = store.write("blob", utf8.encode("long index root\n"));
+    const firstPath = "a".repeat(4_097);
+    const secondPath = "b".repeat(4_097);
+    for (const path of [firstPath, secondPath]) {
+      store.indexPut({
+        path,
+        stage: 0,
+        mode: 0o100644,
+        oid,
+        size: null,
+        mtime: null,
+        ino: null,
+      });
+    }
+    installRootRun(db, checkout.repoId, "index");
+
+    expect(
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toMatchObject({ rootSource: "index", complete: false });
+    expect(
+      db.scalar<string>(
+        "SELECT cursor_text FROM git_maintenance_runs WHERE repo_id = ?",
+        checkout.repoId,
+      ),
+    ).toBe(firstPath);
+    expect(
+      database.advanceMaintenanceRootSnapshot(checkout.repoId, { nowMs: NOW, pageRows: 1 }),
+    ).toMatchObject({ rootSource: "index-baseline", complete: false });
+    expect(hasRootSource(db, checkout.repoId, oid, 8)).toBe(true);
+  });
+
   it("snapshots every authoritative root across cold bounded resumes", () => {
     const { db, database, checkout, store } = open();
     const tree = store.write("tree", EMPTY_TREE_BYTES);
@@ -494,6 +854,87 @@ describe("maintenance roots", () => {
         "SELECT root_source, cursor_checkout_id FROM git_maintenance_runs",
       ),
     ).toEqual({ root_source: "operations", cursor_checkout_id: null });
+  });
+
+  it("admits operation source and derived roots before their construction", () => {
+    const inner = new TestDatabase();
+    const observed = new MaintenanceCursorDatabase(inner);
+    const database = new SqliteGitDatabase(observed, { now: () => NOW });
+    const checkout = database.createRepository("/repo", "ref: refs/heads/main");
+    const store = database.openCheckout(checkout);
+    store.write("tree", EMPTY_TREE_BYTES);
+    const original = store.write("commit", commitBytes("operation original"));
+    const incoming = store.write("commit", commitBytes("operation incoming", [original]));
+    store.writeMergeState(
+      {
+        ...mergeMetadata(original, incoming),
+        phase: "ready",
+        mode: "no-commit",
+      },
+      [],
+    );
+    const journal = store.requireOperationState("merge");
+    const derivedBytes = 512 + 3 * 192;
+    const shared = database.openShared(checkout.repoId);
+
+    const exactBlocker = shared.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - derivedBytes);
+    const exactOwner = shared.reserveMemory();
+    try {
+      expect(validatedOperationJournalRoots(journal, exactOwner)).toEqual([
+        { oid: original, expectedType: "commit" },
+        { oid: original, expectedType: "commit" },
+        { oid: incoming, expectedType: "commit" },
+      ]);
+      expect(exactOwner.currentBytes).toBe(derivedBytes);
+      expect(shared.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactOwner.dispose();
+      exactBlocker.dispose();
+    }
+    shared.memory.assertIdle();
+
+    const overBlocker = shared.reserveMemory();
+    overBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - derivedBytes + 1);
+    const overOwner = shared.reserveMemory();
+    try {
+      expect(() => validatedOperationJournalRoots(journal, overOwner)).toThrowError(
+        expect.objectContaining({ code: "E2BIG" }),
+      );
+      expect(overOwner.currentBytes).toBe(0);
+    } finally {
+      overOwner.dispose();
+      overBlocker.dispose();
+    }
+    shared.memory.assertIdle();
+
+    installRootRun(inner, checkout.repoId, "operations");
+    const restored = inner.one(
+      "SELECT * FROM git_maintenance_runs WHERE repo_id = ?",
+      checkout.repoId,
+    );
+    const pageBlocker = shared.reserveMemory();
+    pageBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - 512 + 1);
+    const pageOwner = shared.reserveMemory();
+    observed.operationCheckoutReads = 0;
+    try {
+      expect(() =>
+        advanceMaintenanceRootSnapshotOwned(
+          database,
+          checkout.repoId,
+          { nowMs: NOW, pageRows: 1 },
+          pageOwner,
+        ),
+      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      expect(observed.operationCheckoutReads).toBe(0);
+      expect(
+        inner.one("SELECT * FROM git_maintenance_runs WHERE repo_id = ?", checkout.repoId),
+      ).toEqual(restored);
+    } finally {
+      pageOwner.dispose();
+      pageBlocker.dispose();
+    }
+    shared.memory.assertIdle();
   });
 
   it.each([

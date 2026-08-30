@@ -4,7 +4,6 @@ import { performance } from "node:perf_hooks";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
-import { GitError } from "../src/core/errors.js";
 import {
   type Commit,
   hashObject,
@@ -18,18 +17,19 @@ import {
 } from "../src/core/objects.js";
 import {
   catFile,
+  collectDirectTreeEntries,
   collectRecursiveTreeEntries,
   log,
   lsFilesAtRef,
   lsTree,
   MAX_LS_TREE_ENTRIES,
-  MAX_LS_TREE_RETAINED_BYTES,
   show,
 } from "../src/core/ops/reads.js";
 import { treeStream } from "../src/core/ops/tree-stream.js";
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import { commitCacheBytes } from "../src/sqlite/commits.js";
 import { iterateSqlCursor, type SqlDatabase } from "../src/sqlite/db.js";
 import { SqliteGitDatabase, WALK_TREE_SQL } from "../src/sqlite/store.js";
@@ -39,6 +39,32 @@ import { importFixture } from "./helpers/import.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 const timingGate = process.env.KOMPJUTR_TIMING_GATE === "1";
+
+class TraversalPayloadProbeDatabase extends TestDatabase {
+  traversalPayloadRows = 0;
+  traversalClosures = 0;
+
+  resetTraversalProbe(): void {
+    this.traversalPayloadRows = 0;
+    this.traversalClosures = 0;
+  }
+
+  override iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
+    const rows = super.iterate(query, ...bindings);
+    if (query !== WALK_TREE_SQL) return rows;
+    const probe = this;
+    return (function* (): Generator<Record<string, unknown>> {
+      try {
+        for (const row of rows) {
+          if (row.path !== null || row.raw_path !== null) probe.traversalPayloadRows++;
+          yield row;
+        }
+      } finally {
+        probe.traversalClosures++;
+      }
+    })();
+  }
+}
 
 let fixture: GitFixture;
 let fixtureDb: TestDatabase;
@@ -292,11 +318,32 @@ describe("rev-parse", () => {
     expect(() => repo.revParse("HEAD~33")).toThrow(expect.objectContaining({ code: "E2BIG" }));
   });
 
-  it("bounds the whole expression before parsing", () => {
-    expect(repo.revParse(`HEAD${" ".repeat(1_020)}`)).toBe(repo.revParse("HEAD"));
-    expect(() => repo.revParse(`HEAD${" ".repeat(1_021)}`)).toThrow(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+  it("accepts the former expression first excess and composes its actual owner", () => {
+    const expression = `HEAD${" ".repeat(1_021)}`;
+    expect(repo.revParse(expression)).toBe(repo.revParse("HEAD"));
+
+    const database = new SqliteGitDatabase(fixtureDb);
+    const checkout = database.findCheckout("/repo");
+    if (checkout === null) throw new Error("revision fixture checkout disappeared");
+    const measuredRepo = new Repository(database.openCheckout(checkout));
+    const headOid = measuredRepo.revParse("HEAD");
+    expect(measuredRepo.revParse(expression)).toBe(headOid);
+    const operationBytes = measuredRepo.store.memory.highWaterBytes;
+    expect(measuredRepo.store.memory.totalBytes).toBe(0);
+
+    for (const excess of [0, 1]) {
+      const blocker = measuredRepo.store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      try {
+        const resolve = () => measuredRepo.revParse(expression);
+        if (excess === 0) expect(resolve()).toBe(headOid);
+        else expect(resolve).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      } finally {
+        blocker.dispose();
+      }
+      expect(measuredRepo.store.memory.activeCount).toBe(0);
+      expect(measuredRepo.store.memory.totalBytes).toBe(0);
+    }
   });
 
   it("bounds composed traversals and parses suffix decimals without numeric overflow", () => {
@@ -533,7 +580,7 @@ describe("ls-tree and cat-file", () => {
     }
   });
 
-  it("accepts exact recursive result limits and rejects the first excess", () => {
+  it("keeps the recursive structural limit and composes result memory exactly", () => {
     const entry = { mode: MODE_FILE, name: "leaf", oid: "1".repeat(40) };
     const rows = function* (count: number, path: string) {
       for (let index = 0; index < count; index++) yield { path, entry };
@@ -546,20 +593,104 @@ describe("ls-tree and cat-file", () => {
       expect.objectContaining({ code: "E2BIG" }),
     );
 
-    const byteBoundaryRows = 8_192;
-    const boundaryPath = "x".repeat(
-      (MAX_LS_TREE_RETAINED_BYTES - byteBoundaryRows * 256) / (byteBoundaryRows * 2),
-    );
-    expect(collectRecursiveTreeEntries(rows(byteBoundaryRows, boundaryPath))).toHaveLength(
-      byteBoundaryRows,
-    );
-    const excess = function* () {
-      yield* rows(byteBoundaryRows, boundaryPath);
-      yield { path: "x", entry };
-    };
-    expect(() => collectRecursiveTreeEntries(excess())).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    expect(collectRecursiveTreeEntries(rows(8_192, "x".repeat(900)))).toHaveLength(8_192);
+
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    expect(collectRecursiveTreeEntries(rows(2, "path"), measuredOwner)).toHaveLength(2);
+    const operationBytes = measured.highWaterBytes;
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      try {
+        const collect = () => collectRecursiveTreeEntries(rows(2, "path"), owner);
+        if (excess === 0) expect(collect()).toHaveLength(2);
+        else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
+  });
+
+  it("pre-admits nonrecursive projection arrays at the aggregate boundary", () => {
+    const entries = [
+      { mode: MODE_FILE, name: "a.txt", oid: "1".repeat(40) },
+      { mode: MODE_FILE, name: "long-name.txt", oid: "2".repeat(40) },
+    ];
+    const expected = collectDirectTreeEntries(entries, "dir/");
+
+    const measured = new MemoryCoordinator();
+    const measuredOwner = measured.reserve();
+    expect(collectDirectTreeEntries(entries, "dir/", measuredOwner)).toEqual(expected);
+    const operationBytes = measuredOwner.highWaterBytes;
+    measuredOwner.dispose();
+    measured.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      try {
+        const collect = () => collectDirectTreeEntries(entries, "dir/", owner);
+        if (excess === 0) expect(collect()).toEqual(expected);
+        else expect(collect).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
+  });
+
+  it("pre-admits the authenticated nonrecursive source before materializing it", () => {
+    const db = new TestDatabase();
+    const store = openScale(db);
+    const tree = serializeTree([
+      { mode: MODE_FILE, name: "a.txt", oid: numberedOid(1) },
+      { mode: MODE_FILE, name: "long-name.txt", oid: numberedOid(2) },
+    ]);
+    const treeOid = store.write("tree", tree);
+    const local = new Repository(store);
+    const expected = [
+      { mode: "100644", path: "a.txt", oid: numberedOid(1), type: "blob" },
+      { mode: "100644", path: "long-name.txt", oid: numberedOid(2), type: "blob" },
+    ];
+
+    expect(lsTree(local, treeOid)).toEqual(expected);
+    const operationBytes = local.store.memory.highWaterBytes;
+    local.store.memory.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const blocker = local.store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const histogram = new Map<string, number>();
+      db.storage.histogram = histogram;
+      db.storage.resetCounters();
+      try {
+        const read = () => lsTree(local, treeOid);
+        const materializedSource = (): boolean =>
+          [...histogram.keys()].some((query) => query.includes("SELECT w.oid, c.seq, c.data"));
+        if (excess === 0) {
+          expect(read()).toEqual(expected);
+          expect(materializedSource()).toBe(true);
+        } else {
+          expect(read).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+          expect(materializedSource()).toBe(false);
+        }
+      } finally {
+        blocker.dispose();
+      }
+      local.store.memory.assertIdle();
+    }
   });
 
   it("lists every path in a tree", () => {
@@ -1019,26 +1150,76 @@ describe("batched tree reads", () => {
     }
   }, 30_000);
 
-  it("fails a 2,201-byte path with E2BIG before traversing deeper", () => {
-    const { db, store, root } = deepTree(5_000, "leaff");
+  it("authenticates the former 2,201-byte excess and cleans up exact row ownership", () => {
+    const { db, store, root, leafOid } = deepTree(1_099, "lea");
     db.storage.resetCounters();
     const started = performance.now();
-    let error: unknown;
-    try {
-      for (const _entry of store.walkTree(root)) {
-        // The single leaf is past the path cap.
-      }
-    } catch (caught) {
-      error = caught;
-    }
+    const entries = [...store.walkTree(root)];
     const elapsed = performance.now() - started;
 
-    expect(error).toBeInstanceOf(GitError);
-    if (!(error instanceof GitError)) throw new Error("expected GitError");
-    expect(error.code).toBe("E2BIG");
+    expect(entries).toEqual([{ path: `${"d/".repeat(1_099)}lea`, mode: MODE_FILE, oid: leafOid }]);
     expect(db.storage.statementCount).toBeLessThan(1_000);
     if (timingGate) expect(elapsed).toBeLessThan(100);
+
+    const measured = store.reserveMemory();
+    expect([...store.walkTree(root, measured)]).toEqual(entries);
+    const operationBytes = measured.highWaterBytes;
+    expect(measured.currentBytes).toBe(0);
+    measured.dispose();
+
+    for (const excess of [0, 1]) {
+      const blocker = store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = store.reserveMemory();
+      try {
+        const walk = () => [...store.walkTree(root, owner)];
+        if (excess === 0) expect(walk()).toEqual(entries);
+        else expect(walk).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+    }
   }, 30_000);
+
+  it("pre-admits the full shallow ASCII path peak before SQL payload projection", () => {
+    const db = new TraversalPayloadProbeDatabase();
+    const store = openScale(db);
+    const name = "x".repeat(512 * 1024);
+    const leafOid = numberedOid(1);
+    const root = store.write("tree", serializeTree([{ mode: MODE_FILE, name, oid: leafOid }]));
+    const expected = [{ path: name, mode: MODE_FILE, oid: leafOid }];
+
+    const measured = store.reserveMemory();
+    expect([...store.walkTree(root, measured)]).toEqual(expected);
+    const operationBytes = measured.highWaterBytes;
+    expect(measured.currentBytes).toBe(0);
+    measured.dispose();
+
+    for (const excess of [0, 1]) {
+      const blocker = store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = store.reserveMemory();
+      db.resetTraversalProbe();
+      try {
+        const walk = () => [...store.walkTree(root, owner)];
+        if (excess === 0) {
+          expect(walk()).toEqual(expected);
+          expect(db.traversalPayloadRows).toBe(1);
+        } else {
+          expect(walk).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+          expect(db.traversalPayloadRows).toBe(0);
+        }
+        expect(db.traversalClosures).toBe(1);
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      store.shared.memory.assertIdle();
+    }
+  });
 
   const longQueue = (count: number) => {
     const db = new TestDatabase();
@@ -1295,8 +1476,8 @@ describe("batched tree reads", () => {
         `EXPLAIN QUERY PLAN ${WALK_TREE_SQL}`,
         1,
         "0".repeat(40),
-        2_200,
         8 * 1024 * 1024,
+        MAX_OPERATION_MEMORY_BYTES,
         16 * 1024 * 1024,
         192,
       )

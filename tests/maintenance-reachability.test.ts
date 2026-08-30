@@ -12,6 +12,7 @@ import {
 } from "../src/core/objects.js";
 import { encodeDeltaHeader } from "../src/core/pack/delta.js";
 import { PackWriter } from "../src/core/pack/writer.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { advanceMaintenanceReachability } from "../src/sqlite/maintenance/reachability.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
@@ -33,7 +34,8 @@ function open(db = new TestDatabase()) {
 }
 
 class GuardedTreeEdgeDatabase implements SqlDatabase {
-  sawGuardedProjection = false;
+  sawMetadataFirst = false;
+  sawPayloadProjection = false;
 
   constructor(
     readonly inner: TestDatabase,
@@ -58,22 +60,28 @@ class GuardedTreeEdgeDatabase implements SqlDatabase {
   }
 
   *iterate(query: string, ...bindings: unknown[]): Iterable<Record<string, unknown>> {
-    const treeEdges = query.includes("maintenance-tree-edges");
-    if (treeEdges) {
-      this.sawGuardedProjection =
-        query.includes("CASE WHEN typeof(name_bytes) = 'blob'") &&
-        query.includes("CASE WHEN typeof(raw_entry) = 'blob'");
-      if (!this.sawGuardedProjection) {
-        throw new Error("tree edge query did not guard BLOBs before projection");
-      }
+    const metadata = query.includes("maintenance-tree-edge-metadata");
+    const payload = query.includes("maintenance-tree-edge-payloads");
+    if (metadata) {
+      this.sawMetadataFirst =
+        !query.includes("THEN name_bytes") && !query.includes("THEN raw_entry");
+      if (!this.sawMetadataFirst) throw new Error("tree edge metadata query projected a BLOB");
+    }
+    if (payload) {
+      this.sawPayloadProjection =
+        query.includes("CASE WHEN typeof(entry.name_bytes) = 'blob'") &&
+        query.includes("CASE WHEN typeof(entry.raw_entry) = 'blob'") &&
+        query.includes("length(entry.name_bytes) = expected.name_length") &&
+        query.includes("length(entry.raw_entry) = expected.raw_length");
+      if (!this.sawPayloadProjection) throw new Error("tree edge payload query was not guarded");
     }
     for (const row of this.inner.iterate(query, ...bindings)) {
-      if (!treeEdges || row.ordinal !== this.ordinal) {
+      if (!metadata || row.ordinal !== this.ordinal) {
         yield row;
       } else if (this.field === "name") {
-        yield { ...row, name_type: "blob", name_length: 101 * 1024 * 1024, name_bytes: null };
+        yield { ...row, name_type: "blob", name_length: 101 * 1024 * 1024 };
       } else {
-        yield { ...row, raw_type: "blob", raw_length: 101 * 1024 * 1024, raw_entry: null };
+        yield { ...row, raw_type: "blob", raw_length: 101 * 1024 * 1024 };
       }
     }
   }
@@ -335,7 +343,7 @@ describe("maintenance reachability", () => {
     ).toEqual({ expanded: 1, edge_cursor: 300 });
   });
 
-  it("guards oversized current and lookahead tree BLOBs before materialization", () => {
+  it("rejects unowned current and lookahead tree BLOBs from metadata only", () => {
     for (const fixture of [openGuardedTree(0, "name"), openGuardedTree(256, "raw")]) {
       const blob = fixture.store.write("blob", utf8.encode("shared\n"));
       const entries: { mode: string; name: string; oid: string }[] = [];
@@ -349,10 +357,9 @@ describe("maintenance reachability", () => {
       const tree = fixture.store.write("tree", serializeTree(entries));
       seedMark(fixture.db, fixture.checkout.repoId, [{ oid: tree }]);
 
-      expect(() => advanceMaintenanceReachability(fixture.store.shared)).toThrowError(
-        expect.objectContaining({ code: "ECORRUPT" }),
-      );
-      expect(fixture.guarded.sawGuardedProjection).toBe(true);
+      expect(() => advanceMaintenanceReachability(fixture.store.shared)).toThrow();
+      expect(fixture.guarded.sawMetadataFirst).toBe(true);
+      expect(fixture.guarded.sawPayloadProjection).toBe(false);
       expect(
         fixture.db.scalar<number>(
           "SELECT expanded FROM git_maintenance_objects WHERE repo_id = ? AND oid = ?",
@@ -360,6 +367,55 @@ describe("maintenance reachability", () => {
           tree,
         ),
       ).toBe(0);
+    }
+  });
+
+  it("accepts the former tree-name excess and pre-admits its payload exactly", () => {
+    const fixture = () => {
+      const { db, checkout, store } = open();
+      const target = store.write("blob", utf8.encode("owned\n"));
+      const tree = store.write(
+        "tree",
+        serializeTree([{ mode: MODE_FILE, name: "n".repeat(2_201), oid: target }]),
+      );
+      seedMark(db, checkout.repoId, [{ oid: tree }]);
+      const reopened = new SqliteGitDatabase(db, { objectCacheBytes: 16 * 1024 * 1024 });
+      return { db, shared: reopened.openCheckout(checkout.id).shared, tree };
+    };
+
+    const measured = fixture();
+    measured.db.storage.histogram = new Map();
+    expect(advanceMaintenanceReachability(measured.shared)).toMatchObject({
+      processedOid: measured.tree,
+      discoveredObjects: 1,
+    });
+    const operationBytes = measured.shared.memory.highWaterBytes;
+    measured.shared.memory.assertIdle();
+    expect(
+      [...measured.db.storage.histogram.keys()].some((query) => query.includes("WITH expected AS")),
+    ).toBe(true);
+
+    for (const excess of [0, 1]) {
+      const current = fixture();
+      const blocker = current.shared.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      current.db.storage.histogram = new Map();
+      try {
+        const advance = () => advanceMaintenanceReachability(current.shared);
+        if (excess === 0) {
+          expect(advance()).toMatchObject({ processedOid: current.tree, discoveredObjects: 1 });
+        } else {
+          expect(advance).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+          expect(
+            [...current.db.storage.histogram.keys()].some((query) =>
+              query.includes("WITH expected AS"),
+            ),
+          ).toBe(false);
+        }
+      } finally {
+        blocker.dispose();
+      }
+      current.shared.memory.assertIdle();
     }
   });
 

@@ -15,7 +15,6 @@ import { fetchInto, type RemoteAuthOptions } from "./network.js";
 import type { FetchResult } from "./refspec.js";
 
 const HEADS = "refs/heads/";
-const MAX_PULL_FETCH_REFSPEC_BYTES = 2_048;
 const FALSE_CONFIG_VALUES = new Set(["", "0", "false", "no", "off"]);
 const TRUE_CONFIG_VALUES = new Set(["1", "true", "yes", "on"]);
 
@@ -218,7 +217,7 @@ function pullFetchShape(
     "remote..fetch".length + remote.length,
     () => `remote.${remote}.fetch`,
   );
-  const configuredFetch = configured(repo, fetchPath, MAX_PULL_FETCH_REFSPEC_BYTES, owner);
+  const configuredFetch = configured(repo, fetchPath, undefined, owner);
   if (configuredFetch !== undefined && configuredFetch !== canonical) {
     throw new UnsupportedOperationError("custom pull fetch refspec");
   }

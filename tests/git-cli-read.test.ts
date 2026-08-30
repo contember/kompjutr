@@ -290,12 +290,10 @@ describe("git diff header path quoting", () => {
     expect(diffHeaderPath("plain name.txt", "a/", { quotePaths: true })).toBe("a/plain name.txt");
   });
 
-  it("accepts exactly 2,200 UTF-8 bytes and rejects malformed or excess paths", () => {
+  it("quotes paths beyond the former 2,200-byte boundary and rejects malformed paths", () => {
     const exact = "é".repeat(1_100);
     expect(diffHeaderPath(exact, "a/", { quotePaths: true })).toHaveLength(8_804);
-    expect(() => diffHeaderPath(`${exact}x`, "a/", { quotePaths: true })).toThrowError(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    expect(diffHeaderPath(`${exact}x`, "a/", { quotePaths: true })).toHaveLength(8_805);
     for (const path of ["nul\0path", "high\ud800path", "low\udc00path"]) {
       expect(() => diffHeaderPath(path, "a/", { quotePaths: true })).toThrowError(
         expect.objectContaining({ code: "EINVAL" }),

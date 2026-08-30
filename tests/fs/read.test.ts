@@ -513,7 +513,6 @@ describe("readFileHandles", () => {
   it.each([
     ["relative", "repo/.gitignore"],
     ["non-canonical", "/repo/../repo/.gitignore"],
-    ["overlong", `/${"x".repeat(4_096)}`],
   ])("rejects a %s caller handle path before issuing SQL", (_name, path) => {
     const { fixture, handle } = discovered();
     Object.defineProperty(handle, "path", { value: path });
@@ -521,6 +520,20 @@ describe("readFileHandles", () => {
 
     expect(() => readFileHandles(fixture.db, [handle])).toThrow(/invalid canonical path/);
     expect(fixture.db.statementCount).toBe(0);
+  });
+
+  it("revalidates and reads a handle beyond the former 4096-unit boundary", () => {
+    const fixture = new Fixture();
+    const path = `/repo/${"x".repeat(4_096)}`;
+    const bytes = pseudoRandom(32, 17);
+    fixture.transaction(() => fixture.file(path, bytes));
+    const root = realpath(fixture.db, "/repo");
+    const { handles } = discoverFiles(fixture.db, root, "*");
+    const handle = handles[0];
+    if (handle === undefined) throw new Error("long-path handle was not discovered");
+
+    expect(handle.path).toBe(path);
+    expect(readFileHandles(fixture.db, [handle]).files.get(handle.path)).toEqual(bytes);
   });
 
   it("returns at most one global byte budget and preserves the retry boundary", () => {

@@ -7,9 +7,9 @@
 // bottom-up pass, so the only thing held live is the directory stack of
 // the path currently being visited.
 
-import type { MemoryReservation } from "../../memory.js";
+import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import { type IndexEntry, type ObjectBatch, writeObjectsOwned } from "../../sqlite/store.js";
-import { CorruptError, GitError } from "../errors.js";
+import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import {
   compareTreeEntries,
   hashObject,
@@ -22,7 +22,6 @@ import { retainedStringBytes } from "../retained.js";
 import type { CommitTreeSnapshotResult } from "../sparse-workspace.js";
 import { comparePaths } from "../streams.js";
 
-export const MAX_TREE_BUILD_PATH_BYTES = 2_200;
 /** Maximum entries retained in one materialized tree object. */
 export const MAX_TREE_BUILD_LEAF_ENTRIES = 10_000;
 export const MAX_TREE_BUILD_OBJECTS = 4_096;
@@ -30,8 +29,6 @@ export const MAX_TREE_BUILD_OBJECTS = 4_096;
 const INDEX_DIRTY = 1;
 const MAX_SPARSE_TREE_PATHS = 1_000;
 const MAX_SPARSE_TREE_INDEX_ROWS = MAX_SPARSE_TREE_PATHS * 4;
-const MAX_SPARSE_TREE_RETAINED_BYTES = 8 * 1024 * 1024;
-const MAX_SPARSE_TREE_PLAN_BYTES = 16 * 1024 * 1024;
 
 export interface TreeBuildPreflightLimits {
   maxEntriesPerTree: number;
@@ -85,6 +82,53 @@ const SERIALIZED_OBJECT_FIXED_BYTES = 64;
 const BUILD_RESULT_BYTES = 96;
 const OID_RETAINED_BYTES = 48 + 40 * 2;
 const MODE_RETAINED_BYTES = 48 + 6 * 2;
+const SPARSE_PLAN_FIXED_BYTES = 512;
+const SPARSE_COLLECTION_BYTES = 64;
+const SPARSE_MAP_ENTRY_BYTES = 96;
+const SPARSE_SET_ENTRY_BYTES = 64;
+const SPARSE_RESULT_BYTES = 96;
+const SPARSE_OBJECT_BYTES = 96;
+
+const SPARSE_PLAN_UNAVAILABLE = new Error("sparse tree plan exceeds operation memory");
+
+interface SparsePlanMemory {
+  readonly bytes: number;
+  add(bytes: number): void;
+  set(bytes: number): void;
+}
+
+function sparsePlanMemory(
+  reservation: MemoryReservation | null,
+  initialBytes: number,
+): SparsePlanMemory {
+  let bytes = initialBytes;
+  const set = (next: number): void => {
+    if (!Number.isSafeInteger(next) || next < 0) {
+      throw new GitError("E2BIG", "sparse tree plan memory accounting overflows");
+    }
+    if (reservation !== null) {
+      try {
+        reservation.set("tree", next);
+      } catch (error) {
+        if (typeof error === "object" && error !== null && Reflect.get(error, "code") === "E2BIG") {
+          throw SPARSE_PLAN_UNAVAILABLE;
+        }
+        throw error;
+      }
+    }
+    bytes = next;
+  };
+  set(initialBytes);
+  return {
+    get bytes() {
+      return bytes;
+    },
+    add(additional) {
+      set(checkedBytes(bytes, additional, "memory"));
+    },
+    set,
+  };
+}
 
 function checkedBytes(total: number, bytes: number, label: string): number {
   if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > Number.MAX_SAFE_INTEGER - total) {
@@ -182,13 +226,6 @@ function utf8Length(value: string, label: string): number {
   return bytes;
 }
 
-function checkedAdd(total: number, bytes: number, limit: number, label: string): number {
-  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > limit - total) {
-    throw new GitError("E2BIG", `tree build exceeds ${limit} ${label}`);
-  }
-  return total + bytes;
-}
-
 function serializedEntryBytes(modeBytes: number, nameBytes: number): number {
   // `<mode> <name>\0<20-byte oid>`.
   return modeBytes + nameBytes + 22;
@@ -212,10 +249,8 @@ function requireIndexFact(value: number | null | undefined, label: string): void
 }
 
 function validateSnapshotIndexEntry(entry: IndexEntry): void {
-  validatePath(entry.path);
-  if (utf8Length(entry.path, "commit tree snapshot index path") > MAX_TREE_BUILD_PATH_BYTES) {
-    throw new GitError("E2BIG", "commit tree snapshot index path exceeds its capacity");
-  }
+  validatePathShape(entry.path);
+  utf8Length(entry.path, "commit tree snapshot index path");
   if (!Number.isSafeInteger(entry.stage) || entry.stage < 0 || entry.stage > 3) {
     throw new CorruptError("commit tree snapshot index stage is invalid");
   }
@@ -251,7 +286,7 @@ function treeBytes(entries: readonly TreeEntry[]): number {
       modeBytes,
       utf8Length(entry.name, "commit tree snapshot entry name"),
     );
-    bytes = checkedAdd(bytes, entryBytes, MAX_SPARSE_TREE_PLAN_BYTES, "sparse tree bytes");
+    bytes = checkedBytes(bytes, entryBytes, "sparse tree bytes");
   }
   return bytes;
 }
@@ -275,9 +310,10 @@ function pathDepth(path: string): number {
   return depth;
 }
 
-function expectedDirectoryPaths(paths: readonly string[]): string[] {
+function expectedDirectoryPaths(paths: readonly { path: string }[]): string[] {
   const expected = new Set<string>([""]);
-  for (const path of paths) {
+  for (const row of paths) {
+    const path = row.path;
     let slash = path.indexOf("/");
     while (slash >= 0) {
       expected.add(path.slice(0, slash));
@@ -299,6 +335,7 @@ function unchangedSparseTreePlan(baselineTreeOid: string | null): SparseTreeBuil
 function validateSnapshotDirectories(
   snapshot: CommitTreeSnapshot,
   expectedPaths: readonly string[],
+  reservation: MemoryReservation,
 ): Map<string, CommitTreeSnapshot["directories"][number]> {
   if (snapshot.directories.length !== expectedPaths.length) {
     throw new CorruptError("commit tree snapshot directory set is incomplete");
@@ -316,12 +353,9 @@ function validateSnapshotDirectories(
     ) {
       throw new CorruptError("commit tree snapshot directories are not in strict Git order");
     }
-    if (directory.path !== "") validatePath(directory.path);
-    if (
-      directory.path !== "" &&
-      utf8Length(directory.path, "commit tree snapshot directory path") > MAX_TREE_BUILD_PATH_BYTES
-    ) {
-      throw new GitError("E2BIG", "commit tree snapshot directory path exceeds its capacity");
+    if (directory.path !== "") validatePathShape(directory.path);
+    if (directory.path !== "") {
+      utf8Length(directory.path, "commit tree snapshot directory path");
     }
     if (directory.oid !== null && !validOid(directory.oid)) {
       throw new CorruptError("commit tree snapshot directory oid is invalid");
@@ -332,41 +366,51 @@ function validateSnapshotDirectories(
     if (directory.oid === null && directory.entries.length !== 0) {
       throw new CorruptError("commit tree snapshot missing directory has entries");
     }
-    let previous: TreeEntry | null = null;
-    const names = new Set<string>();
-    for (const entry of directory.entries) {
-      if (typeof entry !== "object" || entry === null) {
-        throw new CorruptError("commit tree snapshot entry is invalid");
+    const validationReservation = reservation.scope();
+    try {
+      const validationMemory = sparsePlanMemory(
+        validationReservation,
+        SPARSE_COLLECTION_BYTES +
+          directory.entries.length * (SPARSE_SET_ENTRY_BYTES + TREE_ENTRY_FIXED_BYTES),
+      );
+      let previous: TreeEntry | null = null;
+      const names = new Set<string>();
+      for (const entry of directory.entries) {
+        if (typeof entry !== "object" || entry === null) {
+          throw new CorruptError("commit tree snapshot entry is invalid");
+        }
+        validateTreeMode(entry.mode);
+        if (
+          typeof entry.name !== "string" ||
+          entry.name === "" ||
+          entry.name.includes("/") ||
+          entry.name.includes("\0")
+        ) {
+          throw new CorruptError("commit tree snapshot entry name is invalid");
+        }
+        utf8Length(entry.name, "commit tree snapshot entry name");
+        if (typeof entry.oid !== "string" || !validOid(entry.oid)) {
+          throw new CorruptError("commit tree snapshot entry oid is invalid");
+        }
+        if (
+          names.has(entry.name) ||
+          (previous !== null && compareTreeEntries(previous, entry) >= 0)
+        ) {
+          throw new CorruptError("commit tree snapshot entries are not in strict Git order");
+        }
+        names.add(entry.name);
+        previous = entry;
       }
-      validateTreeMode(entry.mode);
-      if (
-        typeof entry.name !== "string" ||
-        entry.name === "" ||
-        entry.name.includes("/") ||
-        entry.name.includes("\0")
-      ) {
-        throw new CorruptError("commit tree snapshot entry name is invalid");
+      if (directory.oid !== null) {
+        const bytes = treeBytes(directory.entries);
+        validationMemory.add(serializationWorkingBytes(directory.entries, bytes) + 512);
+        const data = serializeTree(directory.entries);
+        if (hashObject("tree", data) !== directory.oid) {
+          throw new CorruptError("commit tree snapshot directory differs from its oid");
+        }
       }
-      if (utf8Length(entry.name, "commit tree snapshot entry name") > MAX_TREE_BUILD_PATH_BYTES) {
-        throw new GitError("E2BIG", "commit tree snapshot entry name exceeds its capacity");
-      }
-      if (typeof entry.oid !== "string" || !validOid(entry.oid)) {
-        throw new CorruptError("commit tree snapshot entry oid is invalid");
-      }
-      if (
-        names.has(entry.name) ||
-        (previous !== null && compareTreeEntries(previous, entry) >= 0)
-      ) {
-        throw new CorruptError("commit tree snapshot entries are not in strict Git order");
-      }
-      names.add(entry.name);
-      previous = entry;
-    }
-    if (directory.oid !== null) {
-      treeBytes(directory.entries);
-      if (hashObject("tree", serializeTree(directory.entries)) !== directory.oid) {
-        throw new CorruptError("commit tree snapshot directory differs from its oid");
-      }
+    } finally {
+      validationReservation.dispose();
     }
     directories.set(directory.path, directory);
   }
@@ -376,6 +420,7 @@ function validateSnapshotDirectories(
 function requireSnapshotAncestry(
   directories: ReadonlyMap<string, CommitTreeSnapshot["directories"][number]>,
   baselineTreeOid: string | null,
+  reservation: MemoryReservation,
 ): void {
   const root = directories.get("");
   if (root === undefined || root.oid !== baselineTreeOid) {
@@ -383,16 +428,22 @@ function requireSnapshotAncestry(
   }
   for (const [path, directory] of directories) {
     if (path === "") continue;
-    const parent = directories.get(parentPath(path));
-    if (parent === undefined) {
-      throw new CorruptError("commit tree snapshot directory lost its parent");
-    }
-    const expected = parent.entries.find(
-      (entry) =>
-        entry.name === basename(path) && (entry.mode === "40000" || entry.mode === "040000"),
-    );
-    if (directory.oid !== (expected?.oid ?? null)) {
-      throw new CorruptError("commit tree snapshot directory ancestry is inconsistent");
+    const pathReservation = reservation.scope();
+    try {
+      pathReservation.set("tree", 2 * retainedStringBytes(path));
+      const parent = directories.get(parentPath(path));
+      if (parent === undefined) {
+        throw new CorruptError("commit tree snapshot directory lost its parent");
+      }
+      const name = basename(path);
+      const expected = parent.entries.find(
+        (entry) => entry.name === name && (entry.mode === "40000" || entry.mode === "040000"),
+      );
+      if (directory.oid !== (expected?.oid ?? null)) {
+        throw new CorruptError("commit tree snapshot directory ancestry is inconsistent");
+      }
+    } finally {
+      pathReservation.dispose();
     }
   }
 }
@@ -404,6 +455,36 @@ function requireSnapshotAncestry(
 export function planSparseTreeBuild(
   snapshot: CommitTreeSnapshot,
   baselineTreeOid: string | null,
+  owningReservation?: MemoryReservation,
+): SparseTreeBuildPlan {
+  const localReservation =
+    owningReservation === undefined ? new MemoryCoordinator().reserve() : null;
+  const reservation =
+    owningReservation === undefined ? localReservation : owningReservation.scope();
+  if (reservation === null) throw new Error("sparse tree plan lost its local memory owner");
+  try {
+    const plan = planSparseTreeBuildOwned(
+      snapshot,
+      baselineTreeOid,
+      reservation,
+      owningReservation === undefined,
+    );
+    if (!plan.available || localReservation !== null) reservation.dispose();
+    return plan;
+  } catch (error) {
+    reservation.dispose();
+    if (error === SPARSE_PLAN_UNAVAILABLE || hasErrorCode(error, "E2BIG")) {
+      return { available: false };
+    }
+    throw error;
+  }
+}
+
+function planSparseTreeBuildOwned(
+  snapshot: CommitTreeSnapshot,
+  baselineTreeOid: string | null,
+  reservation: MemoryReservation,
+  retainSnapshot: boolean,
 ): SparseTreeBuildPlan {
   if (snapshot.baselineTreeOid !== baselineTreeOid) {
     throw new CorruptError("commit tree snapshot baseline differs from HEAD");
@@ -418,21 +499,24 @@ export function planSparseTreeBuild(
   ) {
     throw new CorruptError("commit tree snapshot row collections are invalid");
   }
-  let capacityExceeded = snapshot.retainedBytes > MAX_SPARSE_TREE_RETAINED_BYTES;
+  const memory = sparsePlanMemory(
+    reservation,
+    checkedBytes(retainSnapshot ? snapshot.retainedBytes : 0, SPARSE_PLAN_FIXED_BYTES, "memory"),
+  );
+  let capacityExceeded = false;
   if (snapshot.dirty.length > MAX_SPARSE_TREE_PATHS) capacityExceeded = true;
   if (snapshot.index.length > MAX_SPARSE_TREE_INDEX_ROWS) capacityExceeded = true;
   if (snapshot.directories.length > MAX_SPARSE_TREE_PATHS) capacityExceeded = true;
 
+  memory.add(SPARSE_COLLECTION_BYTES);
   const dirtyByPath = new Map<string, number>();
   let previousDirty: string | null = null;
   for (const entry of snapshot.dirty) {
     if (typeof entry !== "object" || entry === null) {
       throw new CorruptError("commit tree snapshot dirty row is invalid");
     }
-    validatePath(entry.path);
-    if (utf8Length(entry.path, "commit tree snapshot dirty path") > MAX_TREE_BUILD_PATH_BYTES) {
-      throw new GitError("E2BIG", "commit tree snapshot dirty path exceeds its capacity");
-    }
+    validatePathShape(entry.path);
+    utf8Length(entry.path, "commit tree snapshot dirty path");
     if (
       !Number.isSafeInteger(entry.flags) ||
       entry.flags < 1 ||
@@ -441,10 +525,12 @@ export function planSparseTreeBuild(
     ) {
       throw new CorruptError("commit tree snapshot dirty rows are malformed or unordered");
     }
+    memory.add(SPARSE_MAP_ENTRY_BYTES);
     dirtyByPath.set(entry.path, entry.flags);
     previousDirty = entry.path;
   }
 
+  memory.add(SPARSE_COLLECTION_BYTES);
   const indexByPath = new Map<string, IndexEntry[]>();
   let previousIndex: IndexEntry | null = null;
   for (const entry of snapshot.index) {
@@ -461,8 +547,13 @@ export function planSparseTreeBuild(
       throw new CorruptError("commit tree snapshot index rows are incomplete or unordered");
     }
     const group = indexByPath.get(entry.path);
-    if (group === undefined) indexByPath.set(entry.path, [entry]);
-    else group.push(entry);
+    if (group === undefined) {
+      memory.add(SPARSE_MAP_ENTRY_BYTES + ARRAY_FIXED_BYTES + ARRAY_SLOT_BYTES);
+      indexByPath.set(entry.path, [entry]);
+    } else {
+      memory.add(ARRAY_SLOT_BYTES);
+      group.push(entry);
+    }
     previousIndex = entry;
   }
 
@@ -471,28 +562,77 @@ export function planSparseTreeBuild(
       throw new CorruptError("clean commit tree snapshot retained selected rows");
     }
     if (capacityExceeded) return { available: false };
-    return unchangedSparseTreePlan(baselineTreeOid);
+    const plan = unchangedSparseTreePlan(baselineTreeOid);
+    memory.set(sparsePlanRetainedBytes(plan));
+    return plan;
   }
 
-  const expectedPaths = expectedDirectoryPaths(snapshot.dirty.map((entry) => entry.path));
-  const directories = validateSnapshotDirectories(snapshot, expectedPaths);
-  requireSnapshotAncestry(directories, baselineTreeOid);
+  let expectedPeak = 2 * SPARSE_COLLECTION_BYTES + SPARSE_SET_ENTRY_BYTES + ARRAY_SLOT_BYTES;
+  for (const entry of snapshot.dirty) {
+    expectedPeak = checkedBytes(
+      expectedPeak,
+      pathSegmentCount(entry.path) *
+        (SPARSE_SET_ENTRY_BYTES + ARRAY_SLOT_BYTES + retainedStringBytes(entry.path)),
+      "memory",
+    );
+  }
+  const expectedReservation = reservation.scope();
+  let directories: Map<string, CommitTreeSnapshot["directories"][number]>;
+  try {
+    expectedReservation.set("tree", expectedPeak);
+    const expectedPaths = expectedDirectoryPaths(snapshot.dirty);
+    let expectedRetainedBytes = ARRAY_FIXED_BYTES + expectedPaths.length * ARRAY_SLOT_BYTES;
+    for (const path of expectedPaths) {
+      expectedRetainedBytes = checkedBytes(
+        expectedRetainedBytes,
+        retainedStringBytes(path),
+        "memory",
+      );
+    }
+    expectedReservation.set("tree", expectedRetainedBytes);
+    memory.add(SPARSE_COLLECTION_BYTES + snapshot.directories.length * SPARSE_MAP_ENTRY_BYTES);
+    directories = validateSnapshotDirectories(snapshot, expectedPaths, reservation);
+  } finally {
+    expectedReservation.dispose();
+  }
+  requireSnapshotAncestry(directories, baselineTreeOid, reservation);
   if (capacityExceeded) return { available: false };
 
-  const dirtyIndexPaths = snapshot.dirty
-    .filter((entry) => (entry.flags & INDEX_DIRTY) !== 0)
-    .map((entry) => entry.path);
+  memory.add(ARRAY_FIXED_BYTES + snapshot.dirty.length * ARRAY_SLOT_BYTES);
+  const dirtyIndexPaths: string[] = [];
+  for (const entry of snapshot.dirty) {
+    if ((entry.flags & INDEX_DIRTY) !== 0) dirtyIndexPaths.push(entry.path);
+  }
   if (dirtyIndexPaths.length === 0) {
-    return unchangedSparseTreePlan(baselineTreeOid);
+    const plan = unchangedSparseTreePlan(baselineTreeOid);
+    memory.set(sparsePlanRetainedBytes(plan));
+    return plan;
   }
 
+  let routingPeak = 2 * SPARSE_COLLECTION_BYTES + SPARSE_SET_ENTRY_BYTES;
+  for (const path of dirtyIndexPaths) {
+    routingPeak = checkedBytes(
+      routingPeak,
+      retainedStringBytes(path) +
+        SPARSE_MAP_ENTRY_BYTES +
+        ARRAY_FIXED_BYTES +
+        ARRAY_SLOT_BYTES +
+        pathSegmentCount(path) * (SPARSE_SET_ENTRY_BYTES + retainedStringBytes(path)),
+      "memory",
+    );
+  }
+  const routingReservation = reservation.scope();
+  const routingMemory = sparsePlanMemory(routingReservation, routingPeak);
   const dirtyByParent = new Map<string, string[]>();
   const affectedDirectories = new Set<string>([""]);
   for (const path of dirtyIndexPaths) {
     const parent = parentPath(path);
     const siblings = dirtyByParent.get(parent);
-    if (siblings === undefined) dirtyByParent.set(parent, [path]);
-    else siblings.push(path);
+    if (siblings === undefined) {
+      dirtyByParent.set(parent, [path]);
+    } else {
+      siblings.push(path);
+    }
     let ancestor = parent;
     for (;;) {
       affectedDirectories.add(ancestor);
@@ -501,81 +641,164 @@ export function planSparseTreeBuild(
     }
   }
 
+  let routingRetainedBytes = 2 * SPARSE_COLLECTION_BYTES;
+  for (const [parent, siblings] of dirtyByParent) {
+    routingRetainedBytes = checkedBytes(
+      routingRetainedBytes,
+      SPARSE_MAP_ENTRY_BYTES +
+        retainedStringBytes(parent) +
+        ARRAY_FIXED_BYTES +
+        siblings.length * ARRAY_SLOT_BYTES,
+      "memory",
+    );
+  }
+  for (const ancestor of affectedDirectories) {
+    routingRetainedBytes = checkedBytes(
+      routingRetainedBytes,
+      SPARSE_SET_ENTRY_BYTES + retainedStringBytes(ancestor),
+      "memory",
+    );
+  }
+  routingMemory.set(
+    checkedBytes(
+      routingRetainedBytes,
+      ARRAY_FIXED_BYTES + affectedDirectories.size * 2 * ARRAY_SLOT_BYTES,
+      "memory",
+    ),
+  );
   const order = [...affectedDirectories].sort((left, right) => {
     const depth = pathDepth(right) - pathDepth(left);
     return depth === 0 ? comparePaths(left, right) : depth;
   });
+  routingRetainedBytes = checkedBytes(
+    routingRetainedBytes,
+    ARRAY_FIXED_BYTES + order.length * ARRAY_SLOT_BYTES,
+    "memory",
+  );
+  routingMemory.set(routingRetainedBytes);
+  memory.add(3 * SPARSE_COLLECTION_BYTES);
   const results = new Map<string, string | null>();
   const childrenByParent = new Map<string, Array<{ path: string; oid: string | null }>>();
   const objects: PlannedTreeObject[] = [];
-  let plannedBytes = 0;
 
   const recordResult = (path: string, oid: string | null): void => {
+    memory.add(SPARSE_MAP_ENTRY_BYTES + (oid === null ? 0 : retainedStringBytes(oid)));
     results.set(path, oid);
     if (path === "") return;
+    memory.add(retainedStringBytes(path));
     const parent = parentPath(path);
     const children = childrenByParent.get(parent);
+    memory.add(SPARSE_RESULT_BYTES + ARRAY_SLOT_BYTES);
     const result = { path, oid };
-    if (children === undefined) childrenByParent.set(parent, [result]);
-    else children.push(result);
+    if (children === undefined) {
+      memory.add(SPARSE_MAP_ENTRY_BYTES + ARRAY_FIXED_BYTES + retainedStringBytes(parent));
+      childrenByParent.set(parent, [result]);
+    } else children.push(result);
   };
 
   for (const path of order) {
-    const baseline = directories.get(path);
-    if (baseline === undefined) {
-      throw new CorruptError("commit tree snapshot omitted an affected directory");
-    }
-    const entries = new Map<string, TreeEntry>();
-    for (const entry of baseline.entries) entries.set(entry.name, entry);
-
-    for (const dirtyPath of dirtyByParent.get(path) ?? []) {
-      const name = basename(dirtyPath);
-      entries.delete(name);
-      const stageZero = indexByPath.get(dirtyPath)?.find((entry) => entry.stage === 0);
-      if (stageZero !== undefined) {
-        entries.set(name, { mode: stageZero.mode.toString(8), name, oid: stageZero.oid });
+    const iterationReservation = reservation.scope();
+    let retainIteration = false;
+    try {
+      const iterationMemory = sparsePlanMemory(iterationReservation, SPARSE_COLLECTION_BYTES);
+      const baseline = directories.get(path);
+      if (baseline === undefined) {
+        throw new CorruptError("commit tree snapshot omitted an affected directory");
       }
-    }
+      iterationMemory.add(baseline.entries.length * SPARSE_MAP_ENTRY_BYTES);
+      const entries = new Map<string, TreeEntry>();
+      for (const entry of baseline.entries) entries.set(entry.name, entry);
 
-    for (const child of childrenByParent.get(path) ?? []) {
-      const childPath = child.path;
-      const childOid = child.oid;
-      const name = basename(childPath);
-      const exactStageZero = indexByPath.get(childPath)?.find((entry) => entry.stage === 0);
-      if (exactStageZero !== undefined) {
-        if (childOid !== null) {
-          throw new CorruptError("commit tree snapshot index contains a file above another file");
+      for (const dirtyPath of dirtyByParent.get(path) ?? []) {
+        iterationMemory.add(retainedStringBytes(dirtyPath));
+        const name = basename(dirtyPath);
+        entries.delete(name);
+        const stageZero = indexByPath.get(dirtyPath)?.find((entry) => entry.stage === 0);
+        if (stageZero !== undefined) {
+          iterationMemory.add(
+            SPARSE_MAP_ENTRY_BYTES + TREE_ENTRY_FIXED_BYTES + retainedStringBytes(name),
+          );
+          entries.set(name, { mode: stageZero.mode.toString(8), name, oid: stageZero.oid });
         }
+      }
+
+      for (const child of childrenByParent.get(path) ?? []) {
+        const childPath = child.path;
+        const childOid = child.oid;
+        iterationMemory.add(retainedStringBytes(childPath));
+        const name = basename(childPath);
+        const exactStageZero = indexByPath.get(childPath)?.find((entry) => entry.stage === 0);
+        if (exactStageZero !== undefined) {
+          if (childOid !== null) {
+            throw new CorruptError("commit tree snapshot index contains a file above another file");
+          }
+          continue;
+        }
+        if (childOid === null) entries.delete(name);
+        else {
+          iterationMemory.add(
+            SPARSE_MAP_ENTRY_BYTES + TREE_ENTRY_FIXED_BYTES + retainedStringBytes(name),
+          );
+          entries.set(name, { mode: MODE_TREE, name, oid: childOid });
+        }
+      }
+
+      if (path !== "" && entries.size === 0) {
+        recordResult(path, null);
         continue;
       }
-      if (childOid === null) entries.delete(name);
-      else entries.set(name, { mode: MODE_TREE, name, oid: childOid });
-    }
-
-    if (path !== "" && entries.size === 0) {
-      recordResult(path, null);
-      continue;
-    }
-    const treeEntries = [...entries.values()];
-    const bytes = treeBytes(treeEntries);
-    if (bytes > MAX_SPARSE_TREE_PLAN_BYTES - plannedBytes) return { available: false };
-    const data = serializeTree(treeEntries);
-    if (data.length !== bytes) {
-      throw new CorruptError("commit tree snapshot serialized size is inconsistent");
-    }
-    const oid = hashObject("tree", data);
-    recordResult(path, oid);
-    if (oid !== baseline.oid) {
-      plannedBytes += bytes;
-      objects.push({ oid, data });
+      iterationMemory.add(ARRAY_FIXED_BYTES + entries.size * ARRAY_SLOT_BYTES);
+      const treeEntries = [...entries.values()];
+      iterationMemory.add(entries.size * 64);
+      const bytes = treeBytes(treeEntries);
+      iterationMemory.add(serializationWorkingBytes(treeEntries, bytes) + 512);
+      const data = serializeTree(treeEntries);
+      if (data.length !== bytes) {
+        throw new CorruptError("commit tree snapshot serialized size is inconsistent");
+      }
+      const oid = hashObject("tree", data);
+      recordResult(path, oid);
+      if (oid !== baseline.oid) {
+        iterationMemory.set(
+          SPARSE_OBJECT_BYTES +
+            ARRAY_SLOT_BYTES +
+            retainedStringBytes(oid) +
+            SERIALIZED_OBJECT_FIXED_BYTES +
+            data.byteLength,
+        );
+        objects.push({ oid, data });
+        retainIteration = true;
+      }
+    } finally {
+      if (!retainIteration) iterationReservation.dispose();
     }
   }
+  routingReservation.dispose();
 
   const tree = results.get("");
   if (tree === undefined || tree === null) {
     throw new CorruptError("commit tree snapshot lost its root result");
   }
-  return { available: true, tree, objects };
+  const plan = { available: true, tree, objects } satisfies SparseTreeBuildPlan;
+  memory.set(SPARSE_RESULT_BYTES + retainedStringBytes(plan.tree) + ARRAY_FIXED_BYTES);
+  return plan;
+}
+
+function sparsePlanRetainedBytes(plan: SparseTreeBuildPlan): number {
+  if (!plan.available) return 0;
+  let bytes = SPARSE_RESULT_BYTES + retainedStringBytes(plan.tree) + ARRAY_FIXED_BYTES;
+  for (const object of plan.objects) {
+    bytes = checkedBytes(
+      bytes,
+      SPARSE_OBJECT_BYTES +
+        ARRAY_SLOT_BYTES +
+        retainedStringBytes(object.oid) +
+        SERIALIZED_OBJECT_FIXED_BYTES +
+        object.data.byteLength,
+      "memory",
+    );
+  }
+  return bytes;
 }
 
 /** Materialize a fully preflighted sparse plan in bottom-up order. */
@@ -589,16 +812,33 @@ export function writeSparseTreePlanInBatch(batch: ObjectBatch, plan: SparseTreeB
   return plan.tree;
 }
 
-function validatePath(path: string): string[] {
+function validatePathShape(path: string): void {
   if (typeof path !== "string" || path.length === 0 || path.startsWith("/") || path.endsWith("/")) {
     throw new CorruptError("tree-build index path is invalid");
   }
-  const segments = path.split("/");
-  for (const segment of segments) {
-    if (segment === "" || segment === "." || segment === ".." || segment.includes("\0")) {
+  let start = 0;
+  for (let index = 0; index <= path.length; index++) {
+    if (index < path.length && path.charCodeAt(index) !== 0x2f) {
+      if (path.charCodeAt(index) === 0) {
+        throw new CorruptError("tree-build index path is invalid");
+      }
+      continue;
+    }
+    const length = index - start;
+    if (
+      length === 0 ||
+      (length === 1 && path.charCodeAt(start) === 0x2e) ||
+      (length === 2 && path.charCodeAt(start) === 0x2e && path.charCodeAt(start + 1) === 0x2e)
+    ) {
       throw new CorruptError("tree-build index path is invalid");
     }
+    start = index + 1;
   }
+}
+
+function validatePath(path: string): string[] {
+  validatePathShape(path);
+  const segments = path.split("/");
   return segments;
 }
 
@@ -674,12 +914,6 @@ export function preflightTreeBuild(
     previousEntryStage = entry.stage;
     if (entry.stage !== 0) continue;
     const pathLength = utf8Length(entry.path, "tree-build index path");
-    if (pathLength > MAX_TREE_BUILD_PATH_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `tree-build index path exceeds ${MAX_TREE_BUILD_PATH_BYTES} UTF-8 bytes`,
-      );
-    }
     totalPathBytes = checkedBytes(totalPathBytes, pathLength, "full-path diagnostic");
     if (previousPath !== null) {
       if (comparePaths(previousPath, entry.path) >= 0) {

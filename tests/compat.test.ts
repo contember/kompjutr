@@ -15,6 +15,22 @@ function tableNames(storage: SqliteTestStorage): string[] {
 }
 
 describe("Computer client operation interlocks", () => {
+  it("revalidates a canonical handle beyond the former 4096-unit boundary", async () => {
+    const storage = new SqliteTestStorage();
+    const workspace = new Workspace({ storage });
+    const path = `/${"x".repeat(4_096)}`;
+    await workspace.fs.writeFile(path, "long path\n");
+    const worktree = new ComputerWorktree(workspace.provider());
+
+    const page = worktree.discoverFiles(worktree.realpath("/"), "*", { limit: 1 });
+    const handle = page.handles[0];
+    if (handle === undefined) throw new Error("long-path handle was not discovered");
+    expect(handle.path).toBe(path);
+    const bytes = worktree.readFileHandles([handle]).files.get(handle.path);
+    if (bytes === undefined) throw new Error("long-path handle was not read");
+    expect(new TextDecoder().decode(bytes)).toBe("long path\n");
+  });
+
   it("keeps the Computer Git context lazy until the first operation", async () => {
     const storage = new SqliteTestStorage();
     const workspace = new Workspace({

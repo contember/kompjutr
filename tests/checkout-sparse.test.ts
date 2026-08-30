@@ -21,6 +21,7 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../src/fs/types.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import {
   createSqliteSelectedPathSource,
@@ -348,7 +349,7 @@ function checkoutState(workspace: TestRepository) {
 }
 
 describe("sparse checkout", () => {
-  it("rejects one byte below the exact plan budget before mutation", () => {
+  it("falls back on shared headroom before plan mutation", () => {
     const workspace = makeRepo("/");
     writeWorkFile(workspace, "/a", "a\n");
     stageWorktreePaths(workspace, ["a"]);
@@ -360,19 +361,21 @@ describe("sparse checkout", () => {
       after: undefined,
       worktreeType: "file",
     };
-    const exactPlanBytes = 384 + 96 + 2;
+    const constrained = workspace.repo.store.reserveMemory();
+    const blocker = workspace.repo.store.reserveMemory();
+    blocker.set("other", MAX_OPERATION_MEMORY_BYTES - 1);
 
     workspace.storage.resetCounters();
-    expect(
-      checkoutSparseChanges(workspace.repo, workspace.worktree, [change], exactPlanBytes - 1),
-    ).toBe(false);
+    expect(checkoutSparseChanges(workspace.repo, workspace.worktree, [change], constrained)).toBe(
+      false,
+    );
     expect(workspace.storage.statementCount).toBe(0);
     expect(workspace.worktree.stat("/a")?.type).toBe("file");
     expect(workspace.repo.checkout.indexGet("a")).not.toBeNull();
+    blocker.dispose();
+    constrained.dispose();
 
-    expect(
-      checkoutSparseChanges(workspace.repo, workspace.worktree, [change], exactPlanBytes),
-    ).toBe(true);
+    expect(checkoutSparseChanges(workspace.repo, workspace.worktree, [change])).toBe(true);
     expect(workspace.worktree.stat("/a")).toBeNull();
     expect(workspace.repo.checkout.indexGet("a")).toBeNull();
   });
@@ -537,7 +540,7 @@ describe("sparse checkout", () => {
     expect(capacity.workspace.repo.head().oid).toBe(capacity.target);
   });
 
-  it("accepts the selected mapping retained boundary and hydrates at first excess", () => {
+  it("does not impose a selected-mapping retained sublimit", () => {
     const run = (excess: number): SelectedCheckoutCalls => {
       const fixture = makeChangedFiles(2, 1);
       const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
@@ -563,7 +566,31 @@ describe("sparse checkout", () => {
     };
 
     expect(run(0).hydrates).toBe(0);
-    expect(run(1).hydrates).toBe(1);
+    expect(run(1).hydrates).toBe(0);
+  });
+
+  it("uses a selected path past the former component ceiling", () => {
+    const workspace = makeRepo("/");
+    configureFixtureIdentity(workspace);
+    const path = "x".repeat(2_201);
+    writeWorkFile(workspace, `/${path}`, "before\n");
+    stageWorktreePaths(workspace, [path]);
+    const base = commit(workspace.context, workspace.repo, { message: "base" }).oid;
+    writeWorkFile(workspace, `/${path}`, "after\n");
+    stageWorktreePaths(workspace, [path]);
+    const target = commit(workspace.context, workspace.repo, { message: "target" }).oid;
+    checkout(workspace.context, workspace.repo, workspace.worktree, { ref: base, force: true });
+    sealIndexTracker(workspace);
+    const calls: SelectedCheckoutCalls = { requests: [], statements: [], hydrates: 0 };
+
+    checkout(selectedCheckoutContext(workspace, calls), workspace.repo, workspace.worktree, {
+      ref: target,
+      force: true,
+    });
+
+    expectFile(workspace, `/${path}`, "after\n");
+    expect(calls.requests).toHaveLength(1);
+    expect(calls.hydrates).toBe(0);
   });
 
   it("rejects malformed, duplicate, unordered, and extraneous selected facts before mutation", () => {

@@ -434,10 +434,17 @@ export function checkout(
         return;
       }
       const tracker = context.indexTracker;
-      if (tracker !== undefined && trySparseCleanCheckout(context, repo, worktree, tree)) {
-        moveHead(context, repo, options.ref, commit);
-        tracker.reseal(repo.checkout.checkoutId, tree, []);
-        return;
+      if (tracker !== undefined) {
+        const sparseReservation = repo.store.reserveMemory();
+        try {
+          if (trySparseCleanCheckout(context, repo, worktree, tree, sparseReservation)) {
+            moveHead(context, repo, options.ref, commit);
+            tracker.reseal(repo.checkout.checkoutId, tree, [], sparseReservation);
+            return;
+          }
+        } finally {
+          sparseReservation.dispose();
+        }
       }
       checkoutLegacy(context, repo, worktree, options, tree, commit);
     });

@@ -3,16 +3,15 @@ import { CorruptError, GitError } from "../../core/errors.js";
 import type { ObjectType } from "../../core/objects.js";
 import type { OperationJournal } from "../../core/ops/operation-state.js";
 import { comparePaths } from "../../core/streams.js";
+import type { MemoryReservation } from "../../memory.js";
 import type { SqlDatabase } from "../db.js";
 import { requireRawRefTarget, requireRefName } from "../ref-validation.js";
-import { MAX_CHECKOUT_ROOT_BYTES } from "../schema.js";
 import { ensureMaintenanceControl } from "./control.js";
 
 const RETAINED_REFLOG_SECONDS = 90 * 24 * 60 * 60;
 const RETAINED_REFLOG_ROWS = 1_024;
 const DEFAULT_PAGE_ROWS = 128;
 const MAX_PAGE_ROWS = 128;
-const MAX_INDEX_PATH_BYTES = 2_200;
 export const MAINTENANCE_ROOT_EPOCH_DRIFTED = "maintenance roots changed after root discovery";
 
 const ROOT_REFS = 1;
@@ -38,12 +37,16 @@ export interface MaintenanceRootInput {
   expectedType: ObjectType;
 }
 
-export type ValidatedOperationRootReader = (checkoutId: number) => readonly MaintenanceRootInput[];
+export type ValidatedOperationRootReader = (
+  checkoutId: number,
+  reservation: MemoryReservation,
+) => readonly MaintenanceRootInput[];
 
 export interface AdvanceMaintenanceRootSnapshotOptions {
   repoId: number;
   nowMs: number;
   pageRows?: number;
+  reservation: MemoryReservation;
   readOperationRoots: ValidatedOperationRootReader;
 }
 
@@ -132,15 +135,53 @@ function requireNullableInteger(value: unknown, label: string): number | null {
   return value === null ? null : requireSafeInteger(value, label, 0);
 }
 
-function requireNullableText(value: unknown, label: string): string | null {
-  if (value === null) return null;
-  if (typeof value !== "string" || utf8Bytes(value, MAX_CHECKOUT_ROOT_BYTES) < 0) {
+function cursorMemoryBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 256) / 3) {
+    throw new CorruptError("maintenance text cursor byte metadata is invalid");
+  }
+  return 256 + 3 * bytes;
+}
+
+function publishedCursorMemoryBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > (Number.MAX_SAFE_INTEGER - 512) / 5) {
+    throw new CorruptError("maintenance text cursor byte metadata is invalid");
+  }
+  return 512 + 5 * bytes;
+}
+
+function requireCursorMetadata(row: Record<string, unknown>): number | null {
+  if (row.cursor_text_type === "null") {
+    if (row.cursor_text_bytes !== null) {
+      throw new CorruptError("absent maintenance text cursor returned byte metadata");
+    }
+    return null;
+  }
+  if (row.cursor_text_type !== "text") {
+    throw new CorruptError("maintenance text cursor storage type is invalid");
+  }
+  return requireSafeInteger(row.cursor_text_bytes, "maintenance text cursor bytes", 0);
+}
+
+function requireNullableText(
+  value: unknown,
+  label: string,
+  admittedBytes: number | null,
+): string | null {
+  if (admittedBytes === null) {
+    if (value !== null) throw new CorruptError(`${label} appeared after metadata preflight`);
+    return null;
+  }
+  if (typeof value !== "string" || utf8Bytes(value, Number.MAX_SAFE_INTEGER) !== admittedBytes) {
     throw new CorruptError(`${label} is invalid`);
   }
   return value;
 }
 
-function requireRun(row: Record<string, unknown>, repoId: number): RunState {
+function requireRun(
+  row: Record<string, unknown>,
+  repoId: number,
+  admittedCursorBytes: number | null,
+): RunState {
   if (row.repo_id !== repoId) throw new CorruptError("maintenance run crossed repositories");
   const phase = row.phase;
   if (
@@ -170,7 +211,11 @@ function requireRun(row: Record<string, unknown>, repoId: number): RunState {
     startedMs: requireSafeInteger(row.started_ms, "maintenance start time", 0),
     rootSource: requireSource(row.root_source),
     cursorCheckoutId: requireNullableInteger(row.cursor_checkout_id, "maintenance checkout cursor"),
-    cursorText: requireNullableText(row.cursor_text, "maintenance text cursor"),
+    cursorText: requireNullableText(
+      row.cursor_text,
+      "maintenance text cursor",
+      admittedCursorBytes,
+    ),
     cursorOrdinal: requireNullableInteger(row.cursor_ordinal, "maintenance ordinal cursor"),
     restarted: row.restarted === 1,
   };
@@ -253,14 +298,31 @@ export function validateMaintenanceRootCursor(run: MaintenanceRootCursorState): 
   }
 }
 
-function readRun(db: SqlDatabase, repoId: number): RunState | null {
-  const row = db.one<Record<string, unknown>>(
-    `SELECT repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-            cursor_checkout_id, cursor_text, cursor_ordinal, restarted
+function readRun(db: SqlDatabase, repoId: number, reservation: MemoryReservation): RunState | null {
+  const metadata = db.one<Record<string, unknown>>(
+    `SELECT typeof(cursor_text) AS cursor_text_type,
+            length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes
        FROM git_maintenance_runs WHERE repo_id = ?`,
     repoId,
   );
-  return row === undefined ? null : requireRun(row, repoId);
+  if (metadata === undefined) {
+    reservation.clear("other");
+    return null;
+  }
+  const cursorBytes = requireCursorMetadata(metadata);
+  reservation.set("other", cursorBytes === null ? 0 : cursorMemoryBytes(cursorBytes));
+  const row = db.one<Record<string, unknown>>(
+    `SELECT repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
+            cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
+            length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes, cursor_ordinal, restarted
+       FROM git_maintenance_runs WHERE repo_id = ?`,
+    repoId,
+  );
+  if (row === undefined) throw new CorruptError("maintenance run changed after metadata preflight");
+  if (requireCursorMetadata(row) !== cursorBytes) {
+    throw new CorruptError("maintenance text cursor changed after metadata preflight");
+  }
+  return requireRun(row, repoId, cursorBytes);
 }
 
 function createRun(
@@ -268,6 +330,7 @@ function createRun(
   repoId: number,
   rootEpoch: number,
   startedMs: number,
+  reservation: MemoryReservation,
 ): RunState {
   const allocated = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_control
@@ -294,14 +357,19 @@ function createRun(
     rootEpoch,
     startedMs,
   );
-  const run = readRun(db, repoId);
+  const run = readRun(db, repoId, reservation);
   if (run === null || run.runId !== runId) {
     throw new CorruptError("new maintenance run was not published");
   }
   return run;
 }
 
-function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState {
+function restartRun(
+  db: SqlDatabase,
+  run: RunState,
+  rootEpoch: number,
+  reservation: MemoryReservation,
+): RunState {
   db.run(
     "DELETE FROM git_maintenance_objects WHERE repo_id = ? AND run_id = ?",
     run.repoId,
@@ -319,16 +387,22 @@ function restartRun(db: SqlDatabase, run: RunState, rootEpoch: number): RunState
             reachable_objects = 0, queued_objects = 0, restarted = 1
       WHERE repo_id = ? AND run_id = ?
       RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-                cursor_checkout_id, cursor_text, cursor_ordinal, restarted`,
+                cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
+                length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes,
+                cursor_ordinal, restarted`,
     rootEpoch,
     run.repoId,
     run.runId,
   );
   if (row === undefined) throw new CorruptError("maintenance root restart lost its run");
-  return requireRun(row, run.repoId);
+  const cursorBytes = requireCursorMetadata(row);
+  if (cursorBytes !== null) throw new CorruptError("maintenance root restart retained its cursor");
+  const restarted = requireRun(row, run.repoId, cursorBytes);
+  reservation.clear("other");
+  return restarted;
 }
 
-function utf8Bytes(value: string, maximum: number): number {
+function utf8Bytes(value: string, maximum = Number.MAX_SAFE_INTEGER): number {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const unit = value.charCodeAt(index);
@@ -369,18 +443,123 @@ function requireReflogEndpoint(rawValue: unknown, oidValue: unknown): string | n
 }
 
 function validIndexPath(path: string): boolean {
-  if (
-    path === "" ||
-    path.startsWith("/") ||
-    path.endsWith("/") ||
-    utf8Bytes(path, MAX_INDEX_PATH_BYTES) < 0
-  ) {
+  if (path === "" || path.startsWith("/") || path.endsWith("/") || utf8Bytes(path) < 0) {
     return false;
   }
-  for (const part of path.split("/")) {
-    if (part === "" || part === "." || part === "..") return false;
+  let segmentStart = 0;
+  for (let index = 0; index <= path.length; index++) {
+    if (index !== path.length && path.charCodeAt(index) !== 0x2f) continue;
+    const segmentLength = index - segmentStart;
+    if (
+      segmentLength === 0 ||
+      (segmentLength === 1 && path.charCodeAt(segmentStart) === 0x2e) ||
+      (segmentLength === 2 &&
+        path.charCodeAt(segmentStart) === 0x2e &&
+        path.charCodeAt(segmentStart + 1) === 0x2e)
+    ) {
+      return false;
+    }
+    segmentStart = index + 1;
   }
   return true;
+}
+
+interface RootPageMetadata {
+  rows: number;
+  textBytes: number;
+}
+
+function requireRootPageMetadata(
+  row: Record<string, unknown> | undefined,
+  label: string,
+  maximumRows: number,
+): RootPageMetadata {
+  if (row === undefined) throw new CorruptError(`${label} metadata row is missing`);
+  const rows = requireSafeInteger(row.row_count, `${label} row count`, 0, maximumRows);
+  if (row.invalid_types !== 0) throw new CorruptError(`${label} text metadata is invalid`);
+  const textBytes = requireSafeInteger(row.text_bytes, `${label} text bytes`, 0);
+  return { rows, textBytes };
+}
+
+function admitRootPage(
+  reservation: MemoryReservation,
+  metadata: RootPageMetadata,
+  bindingBytes = 0,
+): void {
+  if (metadata.textBytes > (Number.MAX_SAFE_INTEGER - 2_048) / 3) {
+    throw new GitError("E2BIG", "maintenance root page memory accounting overflow");
+  }
+  const textMemory = 3 * metadata.textBytes;
+  if (
+    !Number.isSafeInteger(bindingBytes) ||
+    bindingBytes < 0 ||
+    bindingBytes > Number.MAX_SAFE_INTEGER - 2_048 - textMemory ||
+    metadata.rows > (Number.MAX_SAFE_INTEGER - 2_048 - textMemory - bindingBytes) / 1_024
+  ) {
+    throw new GitError("E2BIG", "maintenance root page memory accounting overflow");
+  }
+  reservation.set("other", 2_048 + bindingBytes + metadata.rows * 1_024 + textMemory);
+}
+
+function admitFutureRootPage(reservation: MemoryReservation, maximumCandidates: number): void {
+  if (
+    !Number.isSafeInteger(maximumCandidates) ||
+    maximumCandidates < 0 ||
+    maximumCandidates > (Number.MAX_SAFE_INTEGER - 4_608) / 1_280
+  ) {
+    throw new GitError("E2BIG", "maintenance root page memory accounting overflow");
+  }
+  reservation.set(
+    "other",
+    4_096 +
+      maximumCandidates * 1_024 +
+      (maximumCandidates === 0 ? 0 : 512 + maximumCandidates * 256),
+  );
+}
+
+function textBindingMemoryBytes(value: string | null, copies: number): number {
+  if (value === null) return 0;
+  const bytes = utf8Bytes(value);
+  if (
+    bytes < 0 ||
+    !Number.isSafeInteger(copies) ||
+    copies < 1 ||
+    bytes > (Number.MAX_SAFE_INTEGER - 256 * copies) / copies
+  ) {
+    throw new GitError("E2BIG", "maintenance root binding memory accounting overflow");
+  }
+  return copies * (256 + bytes);
+}
+
+function requirePageText(
+  row: Record<string, unknown>,
+  valueField: string,
+  typeField: string,
+  bytesField: string,
+  label: string,
+): { value: string; bytes: number } {
+  const bytes = requireSafeInteger(row[bytesField], `${label} bytes`, 0);
+  const value = row[valueField];
+  if (row[typeField] !== "text" || typeof value !== "string" || utf8Bytes(value) !== bytes) {
+    throw new CorruptError(`${label} changed after metadata preflight`);
+  }
+  return { value, bytes };
+}
+
+function requireNullablePageText(
+  row: Record<string, unknown>,
+  valueField: string,
+  typeField: string,
+  bytesField: string,
+  label: string,
+): { value: string | null; bytes: number } {
+  if (row[typeField] === "null") {
+    if (row[valueField] !== null || row[bytesField] !== null) {
+      throw new CorruptError(`${label} changed after metadata preflight`);
+    }
+    return { value: null, bytes: 0 };
+  }
+  return requirePageText(row, valueField, typeField, bytesField, label);
 }
 
 function rootsFromRefs(
@@ -388,13 +567,45 @@ function rootsFromRefs(
   repoId: number,
   cursor: string | null,
   pageRows: number,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
+  const bindingBytes = textBindingMemoryBytes(cursor, 2);
+  reservation.set("other", bindingBytes);
+  const metadata = requireRootPageMetadata(
+    db.one<Record<string, unknown>>(
+      `SELECT count(*) AS row_count,
+              coalesce(sum(CASE WHEN typeof(name) = 'text' AND typeof(target) = 'text'
+                THEN 0 ELSE 1 END), 0) AS invalid_types,
+              coalesce(sum(length(CAST(name AS BLOB)) +
+                           length(CAST(target AS BLOB))), 0) AS text_bytes
+         FROM (
+           SELECT name, target FROM git_refs
+            WHERE repo_id = ? AND (? IS NULL OR name > ? COLLATE BINARY)
+            ORDER BY name COLLATE BINARY LIMIT ?
+         )`,
+      repoId,
+      cursor,
+      cursor,
+      pageRows + 1,
+    ),
+    "maintenance ref root page",
+    pageRows + 1,
+  );
+  admitRootPage(reservation, metadata, bindingBytes);
+  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
+  let payloadRows = 0;
+  let textBytes = 0;
   let last = cursor;
   let hasMore = false;
   for (const row of db.iterate(
-    `SELECT repo_id, name, target FROM git_refs
+    `SELECT repo_id, name, typeof(name) AS name_type,
+            length(CAST(name AS BLOB)) AS name_bytes,
+            target, typeof(target) AS target_type,
+            length(CAST(target AS BLOB)) AS target_bytes
+       FROM git_refs
       WHERE repo_id = ? AND (? IS NULL OR name > ? COLLATE BINARY)
       ORDER BY name COLLATE BINARY LIMIT ?`,
     repoId,
@@ -402,19 +613,32 @@ function rootsFromRefs(
     cursor,
     pageRows + 1,
   )) {
+    payloadRows++;
+    const storedName = requirePageText(row, "name", "name_type", "name_bytes", "stored ref name");
+    const storedTarget = requirePageText(
+      row,
+      "target",
+      "target_type",
+      "target_bytes",
+      "stored ref target",
+    );
+    textBytes += storedName.bytes + storedTarget.bytes;
+    if (row.repo_id !== repoId) throw new CorruptError("ref root crossed repositories");
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    if (row.repo_id !== repoId) throw new CorruptError("ref root crossed repositories");
-    const name = requireRefName(row.name, "stored ref name", "stored");
+    const name = requireRefName(storedName.value, "stored ref name", "stored");
     if (last !== null && comparePaths(last, name) >= 0) {
       throw new CorruptError("ref roots are not in strict byte order");
     }
-    const target = requireRawRefTarget(row.target, `stored target of ${name}`, "stored");
+    const target = requireRawRefTarget(storedTarget.value, `stored target of ${name}`, "stored");
     if (isOid(target)) candidates.push({ oid: target, expectedType: null, optionalMissing: false });
     last = name;
     rows++;
+  }
+  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
+    throw new CorruptError("maintenance ref root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -430,29 +654,67 @@ function rootsFromHeads(
   repoId: number,
   cursor: number | null,
   pageRows: number,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
+  const after = cursor ?? 0;
+  const metadata = requireRootPageMetadata(
+    db.one<Record<string, unknown>>(
+      `SELECT count(*) AS row_count,
+              coalesce(sum(CASE WHEN typeof(head) = 'text' THEN 0 ELSE 1 END), 0)
+                AS invalid_types,
+              coalesce(sum(length(CAST(head AS BLOB))), 0) AS text_bytes
+         FROM (
+           SELECT head FROM git_checkouts
+            WHERE repo_id = ? AND id > ? ORDER BY id LIMIT ?
+         )`,
+      repoId,
+      after,
+      pageRows + 1,
+    ),
+    "maintenance HEAD root page",
+    pageRows + 1,
+  );
+  admitRootPage(reservation, metadata);
+  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let last = cursor ?? 0;
+  let payloadRows = 0;
+  let textBytes = 0;
+  let last = after;
   let hasMore = false;
   for (const row of db.iterate(
-    `SELECT id AS checkout_id, repo_id, head FROM git_checkouts
+    `SELECT id AS checkout_id, repo_id, head, typeof(head) AS head_type,
+            length(CAST(head AS BLOB)) AS head_bytes
+       FROM git_checkouts
       WHERE repo_id = ? AND id > ? ORDER BY id LIMIT ?`,
     repoId,
     last,
     pageRows + 1,
   )) {
+    payloadRows++;
+    const storedHead = requirePageText(
+      row,
+      "head",
+      "head_type",
+      "head_bytes",
+      "stored checkout HEAD",
+    );
+    textBytes += storedHead.bytes;
+    if (row.repo_id !== repoId) throw new CorruptError("checkout HEAD crossed repositories");
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    if (row.repo_id !== repoId) throw new CorruptError("checkout HEAD crossed repositories");
     const checkoutId = requireSafeInteger(row.checkout_id, "checkout HEAD id", 1);
     if (checkoutId <= last) throw new CorruptError("checkout HEAD roots are unordered");
-    const head = requireRawRefTarget(row.head, "stored HEAD target", "stored");
+    const head = requireRawRefTarget(storedHead.value, "stored HEAD target", "stored");
     if (isOid(head)) candidates.push({ oid: head, expectedType: null, optionalMissing: false });
     last = checkoutId;
     rows++;
+  }
+  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
+    throw new CorruptError("maintenance HEAD root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -469,17 +731,76 @@ function rootsFromReflogs(
   startedMs: number,
   cursor: number | null,
   pageRows: number,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
   const cutoff = Math.max(0, Math.floor(startedMs / 1_000) - RETAINED_REFLOG_SECONDS);
+  const after = cursor ?? 0;
+  const metadata = requireRootPageMetadata(
+    db.one<Record<string, unknown>>(
+      `SELECT count(*) AS row_count,
+              coalesce(sum(CASE
+                WHEN typeof(ref_key) = 'text'
+                 AND typeof(old_raw) IN ('null', 'text')
+                 AND typeof(new_raw) IN ('null', 'text')
+                 AND typeof(old_oid) IN ('null', 'text')
+                 AND typeof(new_oid) IN ('null', 'text')
+                THEN 0 ELSE 1 END), 0) AS invalid_types,
+              coalesce(sum(length(CAST(ref_key AS BLOB)) +
+                           coalesce(length(CAST(old_raw AS BLOB)), 0) +
+                           coalesce(length(CAST(new_raw AS BLOB)), 0) +
+                           coalesce(length(CAST(old_oid AS BLOB)), 0) +
+                           coalesce(length(CAST(new_oid AS BLOB)), 0)), 0) AS text_bytes
+         FROM (
+           SELECT source_kind, ref_key, checkout_id, ordinal, old_raw, new_raw,
+                  old_oid, new_oid, timestamp
+             FROM (
+               SELECT 0 AS source_kind, entry.ref_name AS ref_key, NULL AS checkout_id,
+                      entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+                      entry.timestamp
+                 FROM git_reflog_entries entry
+                WHERE entry.repo_id = ? AND entry.timestamp >= ?
+               UNION ALL
+               SELECT 1 AS source_kind, 'HEAD' AS ref_key, entry.checkout_id,
+                      entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
+                      entry.timestamp
+                 FROM git_checkout_reflog_entries entry
+                WHERE entry.repo_id = ? AND entry.timestamp >= ?
+             ) retained
+            WHERE ordinal > ? ORDER BY ordinal LIMIT ?
+         )`,
+      repoId,
+      cutoff,
+      repoId,
+      cutoff,
+      after,
+      pageRows + 1,
+    ),
+    "maintenance reflog root page",
+    pageRows + 1,
+  );
+  admitRootPage(reservation, metadata);
+  admitFutureRootPage(futureReservation, metadata.rows * 2);
   const candidates: RootCandidate[] = [];
   const directThresholds = new Map<string, number>();
   const checkoutThresholds = new Map<number, number>();
   let rows = 0;
-  let last = cursor ?? 0;
+  let payloadRows = 0;
+  let textBytes = 0;
+  let last = after;
   let hasMore = false;
   for (const row of db.iterate(
-    `SELECT source_kind, ref_key, checkout_id, ordinal, old_raw, new_raw,
-            old_oid, new_oid, timestamp
+    `SELECT source_kind, ref_key, typeof(ref_key) AS ref_key_type,
+            length(CAST(ref_key AS BLOB)) AS ref_key_bytes,
+            checkout_id, ordinal,
+            old_raw, typeof(old_raw) AS old_raw_type,
+            length(CAST(old_raw AS BLOB)) AS old_raw_bytes,
+            new_raw, typeof(new_raw) AS new_raw_type,
+            length(CAST(new_raw AS BLOB)) AS new_raw_bytes,
+            old_oid, typeof(old_oid) AS old_oid_type,
+            length(CAST(old_oid AS BLOB)) AS old_oid_bytes,
+            new_oid, typeof(new_oid) AS new_oid_type,
+            length(CAST(new_oid AS BLOB)) AS new_oid_bytes, timestamp
        FROM (
          SELECT 0 AS source_kind, entry.ref_name AS ref_key, NULL AS checkout_id,
                 entry.ordinal, entry.old_raw, entry.new_raw, entry.old_oid, entry.new_oid,
@@ -501,12 +822,49 @@ function rootsFromReflogs(
     last,
     pageRows + 1,
   )) {
+    payloadRows++;
+    const refKey = requirePageText(
+      row,
+      "ref_key",
+      "ref_key_type",
+      "ref_key_bytes",
+      "stored reflog ref key",
+    );
+    const oldRaw = requireNullablePageText(
+      row,
+      "old_raw",
+      "old_raw_type",
+      "old_raw_bytes",
+      "stored reflog old target",
+    );
+    const newRaw = requireNullablePageText(
+      row,
+      "new_raw",
+      "new_raw_type",
+      "new_raw_bytes",
+      "stored reflog new target",
+    );
+    const oldOid = requireNullablePageText(
+      row,
+      "old_oid",
+      "old_oid_type",
+      "old_oid_bytes",
+      "stored reflog old OID",
+    );
+    const newOid = requireNullablePageText(
+      row,
+      "new_oid",
+      "new_oid_type",
+      "new_oid_bytes",
+      "stored reflog new OID",
+    );
+    textBytes += refKey.bytes + oldRaw.bytes + newRaw.bytes + oldOid.bytes + newOid.bytes;
     const ordinal = requireSafeInteger(row.ordinal, "retained reflog ordinal", 1);
     if (ordinal <= last) throw new CorruptError("retained reflog roots are unordered");
     requireSafeInteger(row.timestamp, "retained reflog timestamp", cutoff);
     let threshold: number;
     if (row.source_kind === 0) {
-      const refName = requireRefName(row.ref_key, "stored reflog ref name", "stored");
+      const refName = requireRefName(refKey.value, "stored reflog ref name", "stored");
       if (row.checkout_id !== null) {
         throw new CorruptError("direct reflog root retained a checkout id");
       }
@@ -529,7 +887,7 @@ function rootsFromReflogs(
         directThresholds.set(refName, threshold);
       }
     } else if (row.source_kind === 1) {
-      if (row.ref_key !== "HEAD") throw new CorruptError("checkout reflog root is not HEAD");
+      if (refKey.value !== "HEAD") throw new CorruptError("checkout reflog root is not HEAD");
       const checkoutId = requireSafeInteger(row.checkout_id, "checkout reflog root id", 1);
       const cached = checkoutThresholds.get(checkoutId);
       if (cached !== undefined) {
@@ -551,22 +909,25 @@ function rootsFromReflogs(
     } else {
       throw new CorruptError("retained reflog root source is invalid");
     }
-    const oldOid = requireReflogEndpoint(row.old_raw, row.old_oid);
-    const newOid = requireReflogEndpoint(row.new_raw, row.new_oid);
+    const oldRoot = requireReflogEndpoint(oldRaw.value, oldOid.value);
+    const newRoot = requireReflogEndpoint(newRaw.value, newOid.value);
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
     if (ordinal >= threshold) {
-      if (oldOid !== null) {
-        candidates.push({ oid: oldOid, expectedType: null, optionalMissing: false });
+      if (oldRoot !== null) {
+        candidates.push({ oid: oldRoot, expectedType: null, optionalMissing: false });
       }
-      if (newOid !== null) {
-        candidates.push({ oid: newOid, expectedType: null, optionalMissing: false });
+      if (newRoot !== null) {
+        candidates.push({ oid: newRoot, expectedType: null, optionalMissing: false });
       }
     }
     last = ordinal;
     rows++;
+  }
+  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
+    throw new CorruptError("maintenance reflog root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -584,16 +945,58 @@ function rootsFromIndex(
   cursorText: string | null,
   cursorOrdinal: number | null,
   pageRows: number,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
-  const candidates: RootCandidate[] = [];
-  let rows = 0;
   let checkoutId = cursorCheckoutId ?? 0;
   let path = cursorText ?? "";
   let stage = cursorOrdinal ?? -1;
+  const bindingBytes = textBindingMemoryBytes(path, 2);
+  reservation.set("other", bindingBytes);
+  const metadata = requireRootPageMetadata(
+    db.one<Record<string, unknown>>(
+      `SELECT count(*) AS row_count,
+              coalesce(sum(CASE WHEN typeof(path) = 'text' AND typeof(oid) = 'text'
+                THEN 0 ELSE 1 END), 0) AS invalid_types,
+              coalesce(sum(length(CAST(path AS BLOB)) +
+                           length(CAST(oid AS BLOB))), 0) AS text_bytes
+         FROM (
+           SELECT entry.path, entry.oid
+             FROM git_index entry
+             JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
+            WHERE checkout.repo_id = ? AND (
+              checkout.id > ? OR (
+                checkout.id = ? AND (
+                  entry.path > ? COLLATE BINARY OR (entry.path = ? AND entry.stage > ?)
+                )
+              )
+            )
+            ORDER BY checkout.id, entry.path COLLATE BINARY, entry.stage LIMIT ?
+         )`,
+      repoId,
+      checkoutId,
+      checkoutId,
+      path,
+      path,
+      stage,
+      pageRows + 1,
+    ),
+    "maintenance index root page",
+    pageRows + 1,
+  );
+  admitRootPage(reservation, metadata, bindingBytes);
+  admitFutureRootPage(futureReservation, metadata.rows);
+  const candidates: RootCandidate[] = [];
+  let rows = 0;
+  let payloadRows = 0;
+  let textBytes = 0;
   let hasMore = false;
   for (const row of db.iterate(
-    `SELECT checkout.id AS checkout_id, checkout.repo_id, entry.path, entry.stage,
-            entry.mode, entry.oid
+    `SELECT checkout.id AS checkout_id, checkout.repo_id, entry.path,
+            typeof(entry.path) AS path_type,
+            length(CAST(entry.path AS BLOB)) AS path_bytes,
+            entry.stage, entry.mode, entry.oid, typeof(entry.oid) AS oid_type,
+            length(CAST(entry.oid AS BLOB)) AS oid_bytes
        FROM git_index entry
        JOIN git_checkouts checkout ON checkout.id = entry.checkout_id
       WHERE checkout.repo_id = ? AND (
@@ -612,20 +1015,31 @@ function rootsFromIndex(
     stage,
     pageRows + 1,
   )) {
+    payloadRows++;
+    const storedPath = requirePageText(
+      row,
+      "path",
+      "path_type",
+      "path_bytes",
+      "stored index root path",
+    );
+    const storedOid = requirePageText(row, "oid", "oid_type", "oid_bytes", "stored index root OID");
+    textBytes += storedPath.bytes + storedOid.bytes;
+    if (row.repo_id !== repoId) throw new CorruptError("index root crossed repositories");
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
-    if (row.repo_id !== repoId) throw new CorruptError("index root crossed repositories");
     const nextCheckoutId = requireSafeInteger(row.checkout_id, "index root checkout id", 1);
-    if (typeof row.path !== "string" || !validIndexPath(row.path)) {
+    if (!validIndexPath(storedPath.value)) {
       throw new CorruptError("index root path is invalid");
     }
     const nextStage = requireSafeInteger(row.stage, "index root stage", 0, 3);
     if (
       nextCheckoutId < checkoutId ||
       (nextCheckoutId === checkoutId &&
-        (comparePaths(row.path, path) < 0 || (row.path === path && nextStage <= stage)))
+        (comparePaths(storedPath.value, path) < 0 ||
+          (storedPath.value === path && nextStage <= stage)))
     ) {
       throw new CorruptError("index roots are not in strict key order");
     }
@@ -637,7 +1051,7 @@ function rootsFromIndex(
     ) {
       throw new CorruptError("index root mode is invalid");
     }
-    const oid = requireNullableOid(row.oid, "index root OID");
+    const oid = requireNullableOid(storedOid.value, "index root OID");
     if (oid === null) throw new CorruptError("index root OID is absent");
     const gitlink = row.mode === 0o160000;
     candidates.push({
@@ -646,9 +1060,12 @@ function rootsFromIndex(
       optionalMissing: gitlink,
     });
     checkoutId = nextCheckoutId;
-    path = row.path;
+    path = storedPath.value;
     stage = nextStage;
     rows++;
+  }
+  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
+    throw new CorruptError("maintenance index root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -664,13 +1081,43 @@ function rootsFromIndexBaselines(
   repoId: number,
   cursor: number | null,
   pageRows: number,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
+  const after = cursor ?? 0;
+  const metadata = requireRootPageMetadata(
+    db.one<Record<string, unknown>>(
+      `SELECT count(*) AS row_count,
+              coalesce(sum(CASE WHEN typeof(baseline_tree_oid) IN ('null', 'text')
+                THEN 0 ELSE 1 END), 0) AS invalid_types,
+              coalesce(sum(coalesce(length(CAST(baseline_tree_oid AS BLOB)), 0)), 0)
+                AS text_bytes
+         FROM (
+           SELECT state.baseline_tree_oid
+             FROM git_index_state state
+             JOIN git_checkouts checkout ON checkout.id = state.checkout_id
+            WHERE checkout.repo_id = ? AND checkout.id > ? AND state.complete = 1
+            ORDER BY checkout.id LIMIT ?
+         )`,
+      repoId,
+      after,
+      pageRows + 1,
+    ),
+    "maintenance index baseline root page",
+    pageRows + 1,
+  );
+  admitRootPage(reservation, metadata);
+  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
-  let last = cursor ?? 0;
+  let payloadRows = 0;
+  let textBytes = 0;
+  let last = after;
   let hasMore = false;
   for (const row of db.iterate(
     `SELECT checkout.id AS checkout_id, checkout.repo_id, state.baseline_tree_oid,
+            typeof(state.baseline_tree_oid) AS baseline_tree_oid_type,
+            length(CAST(state.baseline_tree_oid AS BLOB)) AS baseline_tree_oid_bytes,
             state.format, state.complete
        FROM git_index_state state
        JOIN git_checkouts checkout ON checkout.id = state.checkout_id
@@ -680,6 +1127,15 @@ function rootsFromIndexBaselines(
     last,
     pageRows + 1,
   )) {
+    payloadRows++;
+    const baseline = requireNullablePageText(
+      row,
+      "baseline_tree_oid",
+      "baseline_tree_oid_type",
+      "baseline_tree_oid_bytes",
+      "stored index baseline tree OID",
+    );
+    textBytes += baseline.bytes;
     if (rows === pageRows) {
       hasMore = true;
       break;
@@ -690,13 +1146,16 @@ function rootsFromIndexBaselines(
     if (row.format !== 1 || row.complete !== 1) {
       throw new CorruptError("complete index baseline state is invalid");
     }
-    if (row.baseline_tree_oid !== null) {
-      const oid = requireNullableOid(row.baseline_tree_oid, "index baseline tree OID");
+    if (baseline.value !== null) {
+      const oid = requireNullableOid(baseline.value, "index baseline tree OID");
       if (oid === null) throw new CorruptError("index baseline tree OID is absent");
       candidates.push({ oid, expectedType: "tree", optionalMissing: false });
     }
     last = checkoutId;
     rows++;
+  }
+  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
+    throw new CorruptError("maintenance index baseline root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -712,13 +1171,42 @@ function rootsFromShallow(
   repoId: number,
   cursor: string | null,
   pageRows: number,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
+  const bindingBytes = textBindingMemoryBytes(cursor, 2);
+  reservation.set("other", bindingBytes);
+  const metadata = requireRootPageMetadata(
+    db.one<Record<string, unknown>>(
+      `SELECT count(*) AS row_count,
+              coalesce(sum(CASE WHEN typeof(oid) = 'text' THEN 0 ELSE 1 END), 0)
+                AS invalid_types,
+              coalesce(sum(length(CAST(oid AS BLOB))), 0) AS text_bytes
+         FROM (
+           SELECT oid FROM git_shallow
+            WHERE repo_id = ? AND (? IS NULL OR oid > ? COLLATE BINARY)
+            ORDER BY oid COLLATE BINARY LIMIT ?
+         )`,
+      repoId,
+      cursor,
+      cursor,
+      pageRows + 1,
+    ),
+    "maintenance shallow root page",
+    pageRows + 1,
+  );
+  admitRootPage(reservation, metadata, bindingBytes);
+  admitFutureRootPage(futureReservation, metadata.rows);
   const candidates: RootCandidate[] = [];
   let rows = 0;
+  let payloadRows = 0;
+  let textBytes = 0;
   let last = cursor;
   let hasMore = false;
   for (const row of db.iterate(
-    `SELECT repo_id, oid FROM git_shallow
+    `SELECT repo_id, oid, typeof(oid) AS oid_type,
+            length(CAST(oid AS BLOB)) AS oid_bytes
+       FROM git_shallow
       WHERE repo_id = ? AND (? IS NULL OR oid > ? COLLATE BINARY)
       ORDER BY oid COLLATE BINARY LIMIT ?`,
     repoId,
@@ -726,12 +1214,21 @@ function rootsFromShallow(
     cursor,
     pageRows + 1,
   )) {
+    payloadRows++;
+    const storedOid = requirePageText(
+      row,
+      "oid",
+      "oid_type",
+      "oid_bytes",
+      "stored shallow root OID",
+    );
+    textBytes += storedOid.bytes;
     if (rows === pageRows) {
       hasMore = true;
       break;
     }
     if (row.repo_id !== repoId) throw new CorruptError("shallow root crossed repositories");
-    const oid = requireNullableOid(row.oid, "shallow root OID");
+    const oid = requireNullableOid(storedOid.value, "shallow root OID");
     if (oid === null) throw new CorruptError("shallow root OID is absent");
     if (last !== null && comparePaths(last, oid) >= 0) {
       throw new CorruptError("shallow roots are unordered");
@@ -739,6 +1236,9 @@ function rootsFromShallow(
     candidates.push({ oid, expectedType: "commit", optionalMissing: false });
     last = oid;
     rows++;
+  }
+  if (payloadRows !== metadata.rows || textBytes !== metadata.textBytes) {
+    throw new CorruptError("maintenance shallow root page changed after metadata preflight");
   }
   return {
     candidates,
@@ -756,7 +1256,10 @@ function rootsFromOperations(
   cursorOrdinal: number | null,
   pageRows: number,
   readOperationRoots: ValidatedOperationRootReader,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
+  reservation.set("other", 512);
   const candidates: RootCandidate[] = [];
   const after = cursorCheckoutId ?? 0;
   let checkoutId: number | null = null;
@@ -780,6 +1283,7 @@ function rootsFromOperations(
     if (cursorOrdinal !== null) {
       throw new CorruptError("operation root cursor checkout is missing");
     }
+    admitFutureRootPage(futureReservation, 0);
     return {
       candidates,
       cursorCheckoutId: null,
@@ -788,12 +1292,16 @@ function rootsFromOperations(
       hasMore: false,
     };
   }
-  const roots = readOperationRoots(checkoutId);
+  const derivedMemory = reservation.scope();
+  const roots = readOperationRoots(checkoutId, derivedMemory);
   const offset = cursorOrdinal ?? 0;
   if (offset > roots.length) {
     throw new CorruptError("operation root cursor exceeds its validated journal");
   }
   const end = Math.min(roots.length, offset + pageRows);
+  const candidateCount = end - offset;
+  reservation.set("other", 512 + candidateCount * 1_024);
+  admitFutureRootPage(futureReservation, candidateCount);
   for (let ordinal = offset; ordinal < end; ordinal++) {
     const root = roots[ordinal];
     if (root === undefined || !isOid(root.oid)) {
@@ -838,7 +1346,16 @@ function rootsFromOperations(
   };
 }
 
-function validateObjectRoots(db: SqlDatabase, repoId: number, roots: RootCandidate[]): string[] {
+function validateObjectRoots(
+  db: SqlDatabase,
+  repoId: number,
+  roots: RootCandidate[],
+  reservation: MemoryReservation,
+): string[] {
+  if (roots.length > (Number.MAX_SAFE_INTEGER - 4_096) / 1_024) {
+    throw new GitError("E2BIG", "maintenance root validation memory accounting overflow");
+  }
+  reservation.set("other", 4_096 + roots.length * 1_024);
   const unique = new Map<
     string,
     { oid: string; expectedType: ObjectType | null; optionalMissing: boolean }
@@ -936,31 +1453,41 @@ function insertRoots(
   sourceMask: number,
   roots: string[],
   shallow: boolean,
+  reservation: MemoryReservation,
 ): void {
   if (roots.length === 0) return;
-  const payload = JSON.stringify(roots);
-  db.run(
-    `INSERT INTO git_maintenance_objects
+  if (roots.length > (Number.MAX_SAFE_INTEGER - 512) / 256) {
+    throw new GitError("E2BIG", "maintenance root publication memory accounting overflow");
+  }
+  const publicationMemory = reservation.scope();
+  publicationMemory.set("other", 512 + roots.length * 256);
+  try {
+    const payload = JSON.stringify(roots);
+    db.run(
+      `INSERT INTO git_maintenance_objects
        (repo_id, run_id, oid, source_mask, expanded, shallow_boundary, physical_only, edge_cursor)
      SELECT ?, ?, value, ?, 0, ?, 0, 0 FROM json_each(?)
      WHERE true
      ON CONFLICT(repo_id, run_id, oid) DO UPDATE SET
        source_mask = source_mask | excluded.source_mask,
        shallow_boundary = max(shallow_boundary, excluded.shallow_boundary)`,
-    repoId,
-    runId,
-    sourceMask,
-    shallow ? 1 : 0,
-    payload,
-  );
-  if (shallow) {
-    db.run(
-      `INSERT OR IGNORE INTO git_maintenance_shallow (repo_id, run_id, oid)
-       SELECT ?, ?, value FROM json_each(?)`,
       repoId,
       runId,
+      sourceMask,
+      shallow ? 1 : 0,
       payload,
     );
+    if (shallow) {
+      db.run(
+        `INSERT OR IGNORE INTO git_maintenance_shallow (repo_id, run_id, oid)
+       SELECT ?, ?, value FROM json_each(?)`,
+        repoId,
+        runId,
+        payload,
+      );
+    }
+  } finally {
+    publicationMemory.dispose();
   }
 }
 
@@ -988,13 +1515,32 @@ function pageForSource(
   run: RunState,
   pageRows: number,
   readOperationRoots: ValidatedOperationRootReader,
+  reservation: MemoryReservation,
+  futureReservation: MemoryReservation,
 ): RootPage {
-  if (run.rootSource === "refs") return rootsFromRefs(db, repoId, run.cursorText, pageRows);
+  if (run.rootSource === "refs") {
+    return rootsFromRefs(db, repoId, run.cursorText, pageRows, reservation, futureReservation);
+  }
   if (run.rootSource === "heads") {
-    return rootsFromHeads(db, repoId, run.cursorCheckoutId, pageRows);
+    return rootsFromHeads(
+      db,
+      repoId,
+      run.cursorCheckoutId,
+      pageRows,
+      reservation,
+      futureReservation,
+    );
   }
   if (run.rootSource === "reflogs") {
-    return rootsFromReflogs(db, repoId, run.startedMs, run.cursorOrdinal, pageRows);
+    return rootsFromReflogs(
+      db,
+      repoId,
+      run.startedMs,
+      run.cursorOrdinal,
+      pageRows,
+      reservation,
+      futureReservation,
+    );
   }
   if (run.rootSource === "index") {
     return rootsFromIndex(
@@ -1004,13 +1550,22 @@ function pageForSource(
       run.cursorText,
       run.cursorOrdinal,
       pageRows,
+      reservation,
+      futureReservation,
     );
   }
   if (run.rootSource === "index-baseline") {
-    return rootsFromIndexBaselines(db, repoId, run.cursorCheckoutId, pageRows);
+    return rootsFromIndexBaselines(
+      db,
+      repoId,
+      run.cursorCheckoutId,
+      pageRows,
+      reservation,
+      futureReservation,
+    );
   }
   if (run.rootSource === "shallow") {
-    return rootsFromShallow(db, repoId, run.cursorText, pageRows);
+    return rootsFromShallow(db, repoId, run.cursorText, pageRows, reservation, futureReservation);
   }
   if (run.rootSource === "operations") {
     return rootsFromOperations(
@@ -1020,6 +1575,8 @@ function pageForSource(
       run.cursorOrdinal,
       pageRows,
       readOperationRoots,
+      reservation,
+      futureReservation,
     );
   }
   return {
@@ -1037,6 +1594,7 @@ function publishPage(
   run: RunState,
   rootEpoch: number,
   page: RootPage,
+  reservation: MemoryReservation,
 ): RunState {
   const source = page.hasMore ? run.rootSource : nextSource(run.rootSource);
   if (source === "done") {
@@ -1052,21 +1610,36 @@ function publishPage(
               cursor_text = NULL, cursor_ordinal = NULL, queued_objects = ?
         WHERE repo_id = ? AND run_id = ? AND observed_root_epoch = ? AND phase = 'roots'
         RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-                  cursor_checkout_id, cursor_text, cursor_ordinal, restarted`,
+                  cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
+                  length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes,
+                  cursor_ordinal, restarted`,
       queuedObjects,
       repoId,
       run.runId,
       rootEpoch,
     );
     if (row === undefined) throw new CorruptError("maintenance root completion lost its epoch");
-    return requireRun(row, repoId);
+    const cursorBytes = requireCursorMetadata(row);
+    if (cursorBytes !== null)
+      throw new CorruptError("completed maintenance roots retained a cursor");
+    return requireRun(row, repoId, cursorBytes);
   }
+  const nextCursor = page.hasMore ? page.cursorText : null;
+  const nextCursorBytes =
+    nextCursor === null ? null : utf8Bytes(nextCursor, Number.MAX_SAFE_INTEGER);
+  if (nextCursorBytes === -1) throw new CorruptError("maintenance text cursor is invalid");
+  reservation.set(
+    "other",
+    nextCursorBytes === null ? 0 : publishedCursorMemoryBytes(nextCursorBytes),
+  );
   const row = db.one<Record<string, unknown>>(
     `UPDATE git_maintenance_runs
         SET root_source = ?, cursor_checkout_id = ?, cursor_text = ?, cursor_ordinal = ?
       WHERE repo_id = ? AND run_id = ? AND observed_root_epoch = ? AND phase = 'roots'
       RETURNING repo_id, run_id, observed_root_epoch, phase, started_ms, root_source,
-                cursor_checkout_id, cursor_text, cursor_ordinal, restarted`,
+                cursor_checkout_id, cursor_text, typeof(cursor_text) AS cursor_text_type,
+                length(CAST(cursor_text AS BLOB)) AS cursor_text_bytes,
+                cursor_ordinal, restarted`,
     source,
     page.hasMore ? page.cursorCheckoutId : null,
     page.hasMore ? page.cursorText : null,
@@ -1076,7 +1649,11 @@ function publishPage(
     rootEpoch,
   );
   if (row === undefined) throw new CorruptError("maintenance root cursor lost its epoch");
-  return requireRun(row, repoId);
+  const returnedCursorBytes = requireCursorMetadata(row);
+  if (returnedCursorBytes !== nextCursorBytes) {
+    throw new CorruptError("maintenance root cursor changed while it was published");
+  }
+  return requireRun(row, repoId, returnedCursorBytes);
 }
 
 /** Advance one durable, bounded root-discovery page. */
@@ -1096,15 +1673,15 @@ export function advanceMaintenanceRootSnapshot(
   }
   return db.transactionSync(() => {
     const control = ensureMaintenanceControl(db, options.repoId);
-    let run = readRun(db, options.repoId);
+    let run = readRun(db, options.repoId, options.reservation);
     if (run === null) {
-      run = createRun(db, options.repoId, control.rootEpoch, options.nowMs);
+      run = createRun(db, options.repoId, control.rootEpoch, options.nowMs, options.reservation);
     }
     if (run.observedRootEpoch !== control.rootEpoch) {
       if (run.phase !== "roots" && run.phase !== "mark") {
         throw new GitError("ESTALE", MAINTENANCE_ROOT_EPOCH_DRIFTED);
       }
-      run = restartRun(db, run, control.rootEpoch);
+      run = restartRun(db, run, control.rootEpoch, options.reservation);
     }
     if (run.phase !== "roots") {
       return {
@@ -1114,17 +1691,48 @@ export function advanceMaintenanceRootSnapshot(
         restarted: run.restarted,
       };
     }
-    const page = pageForSource(db, options.repoId, run, pageRows, options.readOperationRoots);
-    const roots = validateObjectRoots(db, options.repoId, page.candidates);
-    insertRoots(
-      db,
-      options.repoId,
-      run.runId,
-      sourceMask(run.rootSource),
-      roots,
-      run.rootSource === "shallow",
-    );
-    run = publishPage(db, options.repoId, run, control.rootEpoch, page);
+    const pageMemory = options.reservation.scope();
+    const validationMemory = options.reservation.scope();
+    try {
+      const page = pageForSource(
+        db,
+        options.repoId,
+        run,
+        pageRows,
+        options.readOperationRoots,
+        pageMemory,
+        validationMemory,
+      );
+      const roots = validateObjectRoots(db, options.repoId, page.candidates, validationMemory);
+      insertRoots(
+        db,
+        options.repoId,
+        run.runId,
+        sourceMask(run.rootSource),
+        roots,
+        run.rootSource === "shallow",
+        validationMemory,
+      );
+      const nextRunMemory = options.reservation.scope();
+      try {
+        const nextRun = publishPage(
+          db,
+          options.repoId,
+          run,
+          control.rootEpoch,
+          page,
+          nextRunMemory,
+        );
+        options.reservation.clear("other");
+        run = nextRun;
+      } catch (error) {
+        nextRunMemory.dispose();
+        throw error;
+      }
+    } finally {
+      validationMemory.dispose();
+      pageMemory.dispose();
+    }
     return {
       runId: run.runId,
       rootSource: run.rootSource,
@@ -1137,7 +1745,24 @@ export function advanceMaintenanceRootSnapshot(
 /** Extract roots only from a journal already accepted by CheckoutStore validation. */
 export function validatedOperationJournalRoots(
   journal: OperationJournal,
+  reservation: MemoryReservation,
 ): readonly MaintenanceRootInput[] {
+  let rootCount = 1;
+  if (journal.state.kind === "merge") rootCount += 2;
+  else if (journal.state.kind === "rebase") rootCount += 3;
+  for (const step of journal.steps) {
+    rootCount++;
+    if (step.selectedParentOid !== null) rootCount++;
+    if (step.resultOid !== null) rootCount++;
+  }
+  for (const entry of journal.touched) {
+    if (entry.index !== null) rootCount++;
+    if (entry.worktree.kind === "file" || entry.worktree.kind === "symlink") rootCount++;
+  }
+  if (rootCount > (Number.MAX_SAFE_INTEGER - 512) / 192) {
+    throw new GitError("E2BIG", "maintenance operation root memory accounting overflow");
+  }
+  reservation.set("other", 512 + rootCount * 192);
   const roots: MaintenanceRootInput[] = [
     { oid: journal.state.originalHeadOid, expectedType: "commit" },
   ];

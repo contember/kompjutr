@@ -1,6 +1,8 @@
 import { isOid } from "../core/bytes.js";
-import { CorruptError, GitError } from "../core/errors.js";
+import { CorruptError, GitError, hasErrorCode } from "../core/errors.js";
+import { retainedStringBytes } from "../core/retained.js";
 import { comparePaths } from "../core/streams.js";
+import { MemoryCoordinator, type MemoryReservation } from "../memory.js";
 import type { SqlDatabase } from "./db.js";
 import {
   bumpMaintenanceRootEpoch,
@@ -23,7 +25,18 @@ const TRACKER_FORMAT = 1;
 const DEFAULT_PAGE_ROWS = 1_000;
 const MAX_PAGE_ROWS = 1_000;
 const MAX_PAGE_BYTES = 1024 * 1024;
-const MAX_PATH_BYTES = 2_200;
+const PAGE_FIXED_BYTES = 512;
+const PAGE_ROW_BYTES = 192;
+const PAGE_ARRAY_SLOT_BYTES = 8;
+const PAGE_JSON_ROW_BYTES = 48;
+const STRING_FIXED_BYTES = retainedStringBytes("");
+
+function retainedPathUpperBound(utf8Bytes: number): number {
+  if (utf8Bytes > Math.floor((Number.MAX_SAFE_INTEGER - STRING_FIXED_BYTES) / 2)) {
+    throw new GitError("E2BIG", "index tracker path memory accounting overflow");
+  }
+  return STRING_FIXED_BYTES + utf8Bytes * 2;
+}
 
 function invalidPathSql(path: string): string {
   return `typeof(${path}) <> 'text'
@@ -38,8 +51,7 @@ function invalidPathSql(path: string): string {
     OR instr(${path}, '/./') > 0
     OR instr(${path}, '/../') > 0
     OR substr(${path}, -2) = '/.'
-    OR substr(${path}, -3) = '/..'
-    OR length(CAST(${path} AS BLOB)) > ${MAX_PATH_BYTES}`;
+    OR substr(${path}, -3) = '/..'`;
 }
 
 function ownerRows(paths: string): string {
@@ -262,9 +274,17 @@ function validateCheckoutId(checkoutId: number): void {
   }
 }
 
-function validRelativePath(path: string): boolean {
+function isMaintenanceEpochExhaustion(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    Reflect.get(error, "message") === MAINTENANCE_ROOT_EPOCH_EXHAUSTED
+  );
+}
+
+function relativePathBytes(path: string): number | null {
   if (path === "" || path.startsWith("/") || path.endsWith("/") || path.includes("\0")) {
-    return false;
+    return null;
   }
   let bytes = 0;
   let segmentStart = 0;
@@ -279,20 +299,19 @@ function validRelativePath(path: string): boolean {
           path.charCodeAt(segmentStart) === 0x2e &&
           path.charCodeAt(segmentStart + 1) === 0x2e)
       ) {
-        return false;
+        return null;
       }
       segmentStart = at + 1;
       bytes++;
     } else if (unit >= 0xd800 && unit <= 0xdbff) {
       const next = path.charCodeAt(++at);
-      if (next < 0xdc00 || next > 0xdfff) return false;
+      if (next < 0xdc00 || next > 0xdfff) return null;
       bytes += 4;
     } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      return false;
+      return null;
     } else if (unit < 0x80) bytes++;
     else if (unit < 0x800) bytes += 2;
     else bytes += 3;
-    if (bytes > MAX_PATH_BYTES) return false;
   }
   const segmentLength = path.length - segmentStart;
   if (
@@ -301,19 +320,47 @@ function validRelativePath(path: string): boolean {
       path.charCodeAt(segmentStart) === 0x2e &&
       path.charCodeAt(segmentStart + 1) === 0x2e)
   ) {
-    return false;
+    return null;
   }
-  return true;
+  return bytes;
+}
+
+function textBytes(value: string): number | null {
+  let bytes = 0;
+  for (let at = 0; at < value.length; at++) {
+    const unit = value.charCodeAt(at);
+    if (unit < 0x80) bytes++;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(++at);
+      if (next < 0xdc00 || next > 0xdfff) return null;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return null;
+    else bytes += 3;
+  }
+  return bytes;
 }
 
 function validRoot(root: string): boolean {
   if (!root.startsWith("/") || root.includes("\0")) return false;
   if (root === "/") return true;
   if (root.endsWith("/")) return false;
-  for (const part of root.slice(1).split("/")) {
-    if (part === "" || part === "." || part === "..") return false;
-  }
-  for (let at = 0; at < root.length; at++) {
+  let segmentStart = 1;
+  for (let at = 1; at <= root.length; at++) {
+    if (at === root.length || root.charCodeAt(at) === 0x2f) {
+      const length = at - segmentStart;
+      if (
+        length === 0 ||
+        (length === 1 && root.charCodeAt(segmentStart) === 0x2e) ||
+        (length === 2 &&
+          root.charCodeAt(segmentStart) === 0x2e &&
+          root.charCodeAt(segmentStart + 1) === 0x2e)
+      ) {
+        return false;
+      }
+      segmentStart = at + 1;
+      continue;
+    }
     const unit = root.charCodeAt(at);
     if (unit >= 0xd800 && unit <= 0xdbff) {
       const next = root.charCodeAt(++at);
@@ -326,7 +373,7 @@ function validRoot(root: string): boolean {
 }
 
 function validateDirty(entry: IndexTrackerDirty): void {
-  if (typeof entry.path !== "string" || !validRelativePath(entry.path)) {
+  if (typeof entry.path !== "string" || relativePathBytes(entry.path) === null) {
     throw new CorruptError("index tracker has an invalid path");
   }
   if (!Number.isInteger(entry.flags) || entry.flags < INDEX_DIRTY || entry.flags > 3) {
@@ -334,34 +381,70 @@ function validateDirty(entry: IndexTrackerDirty): void {
   }
 }
 
-function encodedEntryBytes(entry: IndexTrackerDirty): number {
-  let bytes = 5 + String(entry.flags).length;
-  for (let at = 0; at < entry.path.length; at++) {
-    const unit = entry.path.charCodeAt(at);
-    if (unit === 0x22 || unit === 0x5c) bytes += 2;
-    else if (unit < 0x20) bytes += 6;
-    else if (unit < 0x80) bytes++;
-    else if (unit < 0x800) bytes += 2;
-    else if (unit >= 0xd800 && unit <= 0xdbff) {
-      at++;
-      bytes += 4;
-    } else bytes += 3;
-    if (bytes + 2 > MAX_PAGE_BYTES) throw new CorruptError("index tracker entry is too large");
-  }
-  return bytes;
+interface EncodedEntrySize {
+  bindingBytes: number;
+  stringUnits: number;
 }
 
-function insertPage(db: SqlDatabase, checkoutId: number, page: IndexTrackerDirty[]): void {
-  const json = JSON.stringify(page.map((entry) => [entry.path, entry.flags]));
-  db.run(
-    `INSERT INTO git_index_dirty (checkout_id, path, flags)
-     SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]')
-       FROM json_each(?)
-      WHERE true
-     ON CONFLICT (checkout_id, path) DO UPDATE SET flags = flags | excluded.flags`,
-    checkoutId,
-    json,
+function encodedEntrySize(entry: IndexTrackerDirty): EncodedEntrySize {
+  let bindingBytes = 5 + String(entry.flags).length;
+  let stringUnits = 5 + String(entry.flags).length;
+  for (let at = 0; at < entry.path.length; at++) {
+    const unit = entry.path.charCodeAt(at);
+    if (unit === 0x22 || unit === 0x5c) {
+      bindingBytes += 2;
+      stringUnits += 2;
+    } else if (unit < 0x20) {
+      bindingBytes += 6;
+      stringUnits += 6;
+    } else if (unit < 0x80) {
+      bindingBytes++;
+      stringUnits++;
+    } else if (unit < 0x800) {
+      bindingBytes += 2;
+      stringUnits++;
+    } else if (unit >= 0xd800 && unit <= 0xdbff) {
+      at++;
+      bindingBytes += 4;
+      stringUnits += 2;
+    } else {
+      bindingBytes += 3;
+      stringUnits++;
+    }
+    if (!Number.isSafeInteger(bindingBytes) || !Number.isSafeInteger(stringUnits)) {
+      throw new GitError("E2BIG", "index tracker entry memory accounting overflow");
+    }
+  }
+  return { bindingBytes, stringUnits };
+}
+
+function insertPage(
+  db: SqlDatabase,
+  checkoutId: number,
+  page: IndexTrackerDirty[],
+  bindingBytes: number,
+  stringUnits: number,
+  reservation: MemoryReservation,
+): void {
+  const jsonMemory = reservation.scope();
+  jsonMemory.set(
+    "other",
+    PAGE_FIXED_BYTES + page.length * PAGE_JSON_ROW_BYTES + stringUnits * 2 + bindingBytes,
   );
+  const json = JSON.stringify(page.map((entry) => [entry.path, entry.flags]));
+  try {
+    db.run(
+      `INSERT INTO git_index_dirty (checkout_id, path, flags)
+       SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]')
+         FROM json_each(?)
+        WHERE true
+       ON CONFLICT (checkout_id, path) DO UPDATE SET flags = flags | excluded.flags`,
+      checkoutId,
+      json,
+    );
+  } finally {
+    jsonMemory.dispose();
+  }
 }
 
 export function initializeIndexTracker(db: SqlDatabase): void {
@@ -453,53 +536,106 @@ function* dirtyRows(
   db: SqlDatabase,
   checkoutId: number,
   pageRows: number,
+  owningReservation?: MemoryReservation,
 ): Generator<IndexTrackerDirty> {
-  let after: string | null = null;
-  for (;;) {
-    let rows = 0;
-    let hasMore = false;
-    for (const row of db.iterate(
-      `SELECT CASE
-                WHEN typeof(path) = 'text' AND length(CAST(path AS BLOB)) <= ${MAX_PATH_BYTES}
-                THEN path
-              END AS guarded_path,
-              typeof(path) AS path_type,
-              length(CAST(path AS BLOB)) AS path_bytes,
-              CASE WHEN typeof(flags) = 'integer' AND flags IN (1, 2, 3)
-                   THEN flags END AS guarded_flags
-         FROM git_index_dirty
-        WHERE checkout_id = ? AND (? IS NULL OR path > ? COLLATE BINARY)
-        ORDER BY path COLLATE BINARY LIMIT ?`,
-      checkoutId,
-      after,
-      after,
-      pageRows + 1,
-    )) {
-      const path = row.guarded_path;
-      const flags = row.guarded_flags;
-      if (
-        row.path_type !== "text" ||
-        typeof row.path_bytes !== "number" ||
-        row.path_bytes > MAX_PATH_BYTES ||
-        typeof path !== "string" ||
-        typeof flags !== "number"
-      ) {
-        throw new CorruptError("index tracker has a malformed dirty row");
+  const reservation = owningReservation?.scope() ?? new MemoryCoordinator().reserve();
+  try {
+    let after: string | null = null;
+    for (;;) {
+      const pageMemory = reservation.scope();
+      try {
+        const expectedBytes: number[] = [];
+        let pageRetained = PAGE_FIXED_BYTES + (after === null ? 0 : 2 * retainedStringBytes(after));
+        pageMemory.set("other", pageRetained);
+        for (const row of db.iterate(
+          `SELECT typeof(path) AS path_type,
+                  length(CAST(path AS BLOB)) AS path_bytes,
+                  CASE WHEN typeof(flags) = 'integer' AND flags IN (1, 2, 3)
+                       THEN 1 ELSE 0 END AS flags_valid
+             FROM git_index_dirty
+            WHERE checkout_id = ? AND (? IS NULL OR path > ? COLLATE BINARY)
+            ORDER BY path COLLATE BINARY LIMIT ?`,
+          checkoutId,
+          after,
+          after,
+          pageRows + 1,
+        )) {
+          const pathBytes = row.path_bytes;
+          if (
+            row.path_type !== "text" ||
+            typeof pathBytes !== "number" ||
+            !Number.isSafeInteger(pathBytes) ||
+            pathBytes < 0 ||
+            row.flags_valid !== 1
+          ) {
+            throw new CorruptError("index tracker has a malformed dirty row");
+          }
+          const additional =
+            PAGE_ROW_BYTES + PAGE_ARRAY_SLOT_BYTES + retainedPathUpperBound(pathBytes);
+          if (
+            !Number.isSafeInteger(additional) ||
+            pageRetained > Number.MAX_SAFE_INTEGER - additional
+          ) {
+            throw new GitError("E2BIG", "index tracker dirty page memory accounting overflow");
+          }
+          pageRetained += additional;
+          pageMemory.set("other", pageRetained);
+          expectedBytes.push(pathBytes);
+        }
+        if (expectedBytes.length === 0) return;
+
+        let ordinal = 0;
+        let hasMore = false;
+        for (const row of db.iterate(
+          `SELECT path, flags
+             FROM git_index_dirty
+            WHERE checkout_id = ? AND (? IS NULL OR path > ? COLLATE BINARY)
+            ORDER BY path COLLATE BINARY LIMIT ?`,
+          checkoutId,
+          after,
+          after,
+          pageRows + 1,
+        )) {
+          const expected = expectedBytes[ordinal];
+          const path = row.path;
+          const flags = row.flags;
+          if (expected === undefined || typeof path !== "string" || typeof flags !== "number") {
+            throw new CorruptError("index tracker has a malformed dirty row");
+          }
+          const actualBytes = relativePathBytes(path);
+          if (actualBytes === null) throw new CorruptError("index tracker has an invalid path");
+          if (actualBytes !== expected) {
+            throw new CorruptError("index tracker has a malformed dirty row");
+          }
+          const entry: IndexTrackerDirty = { path, flags };
+          validateDirty(entry);
+          if (after !== null && comparePaths(entry.path, after) <= 0) {
+            throw new CorruptError("index tracker dirty rows are unordered");
+          }
+          if (ordinal === pageRows) {
+            hasMore = true;
+            break;
+          }
+          reservation.set("metadata", retainedStringBytes(entry.path));
+          after = entry.path;
+          ordinal++;
+          yield entry;
+        }
+        if (ordinal !== Math.min(expectedBytes.length, pageRows)) {
+          throw new CorruptError("index tracker dirty page lost rows");
+        }
+        if (!hasMore) {
+          if (expectedBytes.length > pageRows) {
+            throw new CorruptError("index tracker dirty page lost its continuation row");
+          }
+          return;
+        }
+      } finally {
+        pageMemory.dispose();
       }
-      const entry: IndexTrackerDirty = { path, flags };
-      validateDirty(entry);
-      if (after !== null && comparePaths(entry.path, after) <= 0) {
-        throw new CorruptError("index tracker dirty rows are unordered");
-      }
-      if (rows === pageRows) {
-        hasMore = true;
-        break;
-      }
-      after = entry.path;
-      rows++;
-      yield entry;
     }
-    if (!hasMore) return;
+  } finally {
+    reservation.dispose();
   }
 }
 
@@ -507,12 +643,13 @@ export function iterateIndexTrackerDirty(
   db: SqlDatabase,
   checkoutId: number,
   pageRows: number = DEFAULT_PAGE_ROWS,
+  owningReservation?: MemoryReservation,
 ): Iterable<IndexTrackerDirty> {
   validateCheckoutId(checkoutId);
   if (!Number.isSafeInteger(pageRows) || pageRows <= 0 || pageRows > MAX_PAGE_ROWS) {
     throw new CorruptError("invalid index tracker page size");
   }
-  return dirtyRows(db, checkoutId, pageRows);
+  return dirtyRows(db, checkoutId, pageRows, owningReservation);
 }
 
 export function invalidateIndexTracker(db: SqlDatabase, checkoutId: number): void {
@@ -588,80 +725,150 @@ export function resealIndexTracker(
   checkoutId: number,
   baselineTreeOid: string | null,
   entries: Iterable<IndexTrackerDirty>,
+  owningReservation?: MemoryReservation,
 ): boolean {
   validateCheckoutId(checkoutId);
   if (baselineTreeOid !== null && !isOid(baselineTreeOid)) {
     throw new CorruptError("invalid index tracker baseline tree");
   }
-  return db.transactionSync(() => {
-    const checkout = db.one<Record<string, unknown>>(
-      `SELECT checkout.root, checkout.repo_id, state.complete AS previous_complete
-         FROM git_checkouts checkout
-         LEFT JOIN git_index_state state ON state.checkout_id = checkout.id
-        WHERE checkout.id = ?`,
-      checkoutId,
-    );
-    if (checkout === undefined) return false;
-    db.run(
-      `INSERT INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
-       VALUES (?, NULL, ?, 0)
-       ON CONFLICT (checkout_id) DO UPDATE SET complete = 0`,
-      checkoutId,
-      TRACKER_FORMAT,
-    );
-    if (
-      typeof checkout.repo_id !== "number" ||
-      !Number.isSafeInteger(checkout.repo_id) ||
-      checkout.repo_id < 1 ||
-      typeof checkout.root !== "string" ||
-      !validRoot(checkout.root) ||
-      (checkout.previous_complete !== null &&
-        checkout.previous_complete !== 0 &&
-        checkout.previous_complete !== 1)
-    ) {
-      throw new CorruptError("index tracker checkout row is malformed");
-    }
-    const root = db.one<Record<string, unknown>>(
-      `SELECT nodes.type AS type
-         FROM fs_paths paths JOIN fs_nodes nodes ON nodes.inode = paths.inode
-        WHERE paths.path = ?`,
-      checkout.root,
-    );
-    if (root === undefined || root.type !== "dir") {
-      if (checkout.previous_complete === 1) {
-        bumpMaintenanceRootEpoch(db, checkout.repo_id);
-      }
+  const reservation = owningReservation?.scope() ?? new MemoryCoordinator().reserve();
+  try {
+    try {
+      return db.transactionSync(() => {
+        const metadata = db.one<Record<string, unknown>>(
+          `SELECT typeof(checkout.root) AS root_type,
+                length(CAST(checkout.root AS BLOB)) AS root_bytes,
+                checkout.repo_id,
+                state.complete AS previous_complete
+           FROM git_checkouts checkout
+           LEFT JOIN git_index_state state ON state.checkout_id = checkout.id
+          WHERE checkout.id = ?`,
+          checkoutId,
+        );
+        if (metadata === undefined) return false;
+        if (
+          metadata.root_type !== "text" ||
+          typeof metadata.root_bytes !== "number" ||
+          !Number.isSafeInteger(metadata.root_bytes) ||
+          metadata.root_bytes < 1 ||
+          typeof metadata.repo_id !== "number" ||
+          !Number.isSafeInteger(metadata.repo_id) ||
+          metadata.repo_id < 1 ||
+          (metadata.previous_complete !== null &&
+            metadata.previous_complete !== 0 &&
+            metadata.previous_complete !== 1)
+        ) {
+          throw new CorruptError("index tracker checkout row is malformed");
+        }
+        reservation.set("metadata", PAGE_FIXED_BYTES + retainedPathUpperBound(metadata.root_bytes));
+        const checkout = db.one<Record<string, unknown>>(
+          "SELECT root FROM git_checkouts WHERE id = ?",
+          checkoutId,
+        );
+        if (
+          checkout === undefined ||
+          typeof checkout.root !== "string" ||
+          textBytes(checkout.root) !== metadata.root_bytes ||
+          !validRoot(checkout.root)
+        ) {
+          throw new CorruptError("index tracker checkout row is malformed");
+        }
+        db.run(
+          `INSERT INTO git_index_state (checkout_id, baseline_tree_oid, format, complete)
+         VALUES (?, NULL, ?, 0)
+         ON CONFLICT (checkout_id) DO UPDATE SET complete = 0`,
+          checkoutId,
+          TRACKER_FORMAT,
+        );
+        const rootBinding = reservation.scope();
+        rootBinding.set("other", 2 * retainedStringBytes(checkout.root));
+        const root = db.one<Record<string, unknown>>(
+          `SELECT nodes.type AS type
+           FROM fs_paths paths JOIN fs_nodes nodes ON nodes.inode = paths.inode
+          WHERE paths.path = ?`,
+          checkout.root,
+        );
+        rootBinding.dispose();
+        if (root === undefined || root.type !== "dir") {
+          if (metadata.previous_complete === 1) {
+            bumpMaintenanceRootEpoch(db, metadata.repo_id);
+          }
+          return false;
+        }
+
+        db.run("DELETE FROM git_index_dirty WHERE checkout_id = ?", checkoutId);
+        let page: IndexTrackerDirty[] = [];
+        let pageBindingBytes = 2;
+        let pageStringUnits = 2;
+        let pageRetainedBytes = PAGE_FIXED_BYTES;
+        let pageMemory = reservation.scope();
+        const flush = (): void => {
+          if (page.length === 0) return;
+          insertPage(db, checkoutId, page, pageBindingBytes, pageStringUnits, reservation);
+          pageMemory.dispose();
+          page = [];
+          pageBindingBytes = 2;
+          pageStringUnits = 2;
+          pageRetainedBytes = PAGE_FIXED_BYTES;
+          pageMemory = reservation.scope();
+        };
+        try {
+          try {
+            for (const entry of entries) {
+              validateDirty(entry);
+              const encoded = encodedEntrySize(entry);
+              const separator = page.length === 0 ? 0 : 1;
+              if (
+                page.length === MAX_PAGE_ROWS ||
+                (page.length !== 0 &&
+                  pageBindingBytes + encoded.bindingBytes + separator > MAX_PAGE_BYTES)
+              ) {
+                flush();
+              }
+              const retained =
+                PAGE_ROW_BYTES + PAGE_ARRAY_SLOT_BYTES + retainedStringBytes(entry.path);
+              if (pageRetainedBytes > Number.MAX_SAFE_INTEGER - retained) {
+                throw new GitError("E2BIG", "index tracker reseal memory accounting overflow");
+              }
+              pageRetainedBytes += retained;
+              pageMemory.set("other", pageRetainedBytes);
+              page.push({ path: entry.path, flags: entry.flags });
+              pageBindingBytes += encoded.bindingBytes + (page.length === 1 ? 0 : 1);
+              pageStringUnits += encoded.stringUnits + (page.length === 1 ? 0 : 1);
+              if (
+                !Number.isSafeInteger(pageBindingBytes) ||
+                !Number.isSafeInteger(pageStringUnits)
+              ) {
+                throw new GitError("E2BIG", "index tracker reseal memory accounting overflow");
+              }
+              if (page.length === 1 && pageBindingBytes > MAX_PAGE_BYTES) flush();
+            }
+            flush();
+          } catch (error) {
+            if (!hasErrorCode(error, "E2BIG")) throw error;
+            if (metadata.previous_complete === 1) bumpMaintenanceRootEpoch(db, metadata.repo_id);
+            return false;
+          }
+        } finally {
+          pageMemory.dispose();
+        }
+        db.run(
+          `UPDATE git_index_state
+            SET baseline_tree_oid = ?, format = ?, complete = 1
+          WHERE checkout_id = ?`,
+          baselineTreeOid,
+          TRACKER_FORMAT,
+          checkoutId,
+        );
+        bumpMaintenanceRootEpoch(db, metadata.repo_id);
+        return true;
+      });
+    } catch (error) {
+      if (!hasErrorCode(error, "E2BIG") || isMaintenanceEpochExhaustion(error)) throw error;
+      invalidateIndexTracker(db, checkoutId);
       return false;
     }
-
-    db.run("DELETE FROM git_index_dirty WHERE checkout_id = ?", checkoutId);
-    let page: IndexTrackerDirty[] = [];
-    let pageBytes = 2;
-    for (const entry of entries) {
-      validateDirty(entry);
-      const bytes = encodedEntryBytes(entry);
-      if (bytes + 2 > MAX_PAGE_BYTES) throw new CorruptError("index tracker entry is too large");
-      if (
-        page.length === MAX_PAGE_ROWS ||
-        pageBytes + bytes + (page.length === 0 ? 0 : 1) > MAX_PAGE_BYTES
-      ) {
-        insertPage(db, checkoutId, page);
-        page = [];
-        pageBytes = 2;
-      }
-      page.push({ path: entry.path, flags: entry.flags });
-      pageBytes += bytes + (page.length === 1 ? 0 : 1);
-    }
-    if (page.length !== 0) insertPage(db, checkoutId, page);
-    db.run(
-      `UPDATE git_index_state
-          SET baseline_tree_oid = ?, format = ?, complete = 1
-        WHERE checkout_id = ?`,
-      baselineTreeOid,
-      TRACKER_FORMAT,
-      checkoutId,
-    );
-    bumpMaintenanceRootEpoch(db, checkout.repo_id);
-    return true;
-  });
+  } finally {
+    reservation.dispose();
+  }
 }

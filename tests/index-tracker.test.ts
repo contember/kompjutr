@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { initializeFsSchema } from "../src/fs/schema.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../src/memory.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
@@ -204,23 +205,68 @@ describe("index tracker", () => {
     expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
   });
 
-  it("enforces the exact UTF-8 path bound without returning oversized text", () => {
+  it("accepts paths beyond the former component and page targets", () => {
     const db = setup();
     addRepository(db, 1, "/repo");
-    const exact = "é".repeat(1_100);
-    const oversized = `${exact}a`;
+    const formerExact = "é".repeat(1_100);
+    const formerExcess = `${formerExact}a`;
+    const pageExcess = `large/${"x".repeat(1024 * 1024)}`;
 
-    expect(resealIndexTracker(db, 1, TREE, [{ path: exact, flags: INDEX_DIRTY }])).toBe(true);
-    expect(dirty(db, 1)).toEqual([{ path: exact, flags: INDEX_DIRTY }]);
-    expect(() =>
-      resealIndexTracker(db, 1, OTHER_TREE, [{ path: oversized, flags: INDEX_DIRTY }]),
-    ).toThrowError(/invalid path/);
+    expect(
+      resealIndexTracker(db, 1, TREE, [
+        { path: formerExact, flags: INDEX_DIRTY },
+        { path: formerExcess, flags: WORKTREE_DIRTY },
+        { path: pageExcess, flags: INDEX_DIRTY | WORKTREE_DIRTY },
+      ]),
+    ).toBe(true);
     expect(readIndexTrackerState(db, 1)).toEqual({ available: true, baselineTreeOid: TREE });
-    expect(dirty(db, 1)).toEqual([{ path: exact, flags: INDEX_DIRTY }]);
+    expect(dirty(db, 1)).toEqual([
+      { path: pageExcess, flags: INDEX_DIRTY | WORKTREE_DIRTY },
+      { path: formerExact, flags: INDEX_DIRTY },
+      { path: formerExcess, flags: WORKTREE_DIRTY },
+    ]);
 
     seal(db, 1);
-    db.run("INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, ?, 1)", oversized);
+    db.run("PRAGMA ignore_check_constraints = ON");
+    db.run(
+      "INSERT INTO git_index_dirty (checkout_id, path, flags) VALUES (1, ?, 1)",
+      new Uint8Array([1]),
+    );
+    db.run("PRAGMA ignore_check_constraints = OFF");
     expect(() => dirty(db, 1)).toThrowError(/malformed dirty row/);
+  });
+
+  it("reseals at exact shared headroom and invalidates on first excess", () => {
+    const entry = { path: "x".repeat(2_201), flags: INDEX_DIRTY };
+    const measuredDb = setup();
+    addRepository(measuredDb, 1, "/repo");
+    const measuredCoordinator = new MemoryCoordinator();
+    const measuredOwner = measuredCoordinator.reserve();
+    expect(resealIndexTracker(measuredDb, 1, TREE, [entry], measuredOwner)).toBe(true);
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(measuredOwner.currentBytes).toBe(0);
+    measuredOwner.dispose();
+    measuredCoordinator.assertIdle();
+
+    for (const excess of [0, 1]) {
+      const db = setup();
+      addRepository(db, 1, "/repo");
+      const coordinator = new MemoryCoordinator();
+      const blocker = coordinator.reserve();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + excess);
+      const owner = coordinator.reserve();
+      try {
+        expect(resealIndexTracker(db, 1, TREE, [entry], owner)).toBe(excess === 0);
+        expect(readIndexTrackerState(db, 1)).toEqual(
+          excess === 0 ? { available: true, baselineTreeOid: TREE } : { available: false },
+        );
+        expect(owner.currentBytes).toBe(0);
+      } finally {
+        owner.dispose();
+        blocker.dispose();
+      }
+      coordinator.assertIdle();
+    }
   });
 
   it("streams and reseals past the former dirty-row and page ceilings", () => {
@@ -374,8 +420,10 @@ describe("index tracker", () => {
       "a".repeat(2_201),
       TREE,
     );
-    expect(readIndexTrackerState(db, 1)).toEqual({ available: false });
-    expect(dirty(db, 1)).toEqual([]);
+    expect(readIndexTrackerState(db, 1)).toEqual({ available: true, baselineTreeOid: TREE });
+    expect(dirty(db, 1)).toEqual([
+      { path: "a".repeat(2_201), flags: INDEX_DIRTY | WORKTREE_DIRTY },
+    ]);
     db.run("PRAGMA ignore_check_constraints = OFF");
   });
 

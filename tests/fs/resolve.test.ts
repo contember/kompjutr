@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
-
 import { initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
-import { realpath, realpathNoFollow, realpaths } from "../../src/fs/store/resolve.js";
+import {
+  realpath,
+  realpathNoFollow,
+  realpathOwned,
+  realpaths,
+} from "../../src/fs/store/resolve.js";
 import type { EntryType } from "../../src/fs/types.js";
-import type { SqlDatabase } from "../../src/sqlite/db.js";
+import { MAX_OPERATION_MEMORY_BYTES, MemoryCoordinator } from "../../src/memory.js";
+import { Database, type DurableObjectStorageLike, type SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
 interface Spec {
@@ -177,36 +182,47 @@ describe("ordered path resolution", () => {
     expect(() => realpath(db, "/loop-0")).toThrowError(expect.objectContaining({ code: "ELOOP" }));
   });
 
-  it("accepts 4096 UTF-16 code units and rejects the next one", () => {
-    const db = setup([]);
-    const boundary = `/${"😀".repeat(2047)}x`;
-    expect(boundary.length).toBe(4096);
-    expect(realpath(db, boundary)).toBe(boundary);
+  it("resolves paths and symlink targets beyond the former 4096-unit boundary", () => {
+    const target = `/${"😀".repeat(2_048)}x`;
+    const db = setup([{ path: target }, { path: "/link", type: "symlink", target }]);
 
-    db.storage.resetCounters();
-    expect(() => realpath(db, `${boundary}y`)).toThrowError(
-      expect.objectContaining({ code: "ENAMETOOLONG" }),
-    );
-    expect(db.storage.statementCount).toBe(0);
+    expect(target.length).toBe(4_098);
+    expect(realpath(db, target)).toBe(target);
+    expect(realpath(db, "/link")).toBe(target);
   });
 
-  it("rejects a symlink expansion that crosses the accepted-path bound", () => {
-    const db = setup([{ path: "/link", type: "symlink", target: "a".repeat(4090) }]);
-    db.storage.resetCounters();
-    expect(() => realpath(db, "/link/child")).toThrowError(
-      expect.objectContaining({ code: "ENAMETOOLONG" }),
+  it("rejects aggregate owned memory before materializing a long symlink target", () => {
+    const db = setup([{ path: "/link", type: "symlink", target: `/${"x".repeat(600_000)}` }]);
+    const recording = new RecordingDatabase(db);
+    const coordinator = new MemoryCoordinator();
+    const occupied = coordinator.reserve();
+    const owner = coordinator.reserve();
+    occupied.set("other", MAX_OPERATION_MEMORY_BYTES - 1_000_000);
+
+    expect(() => realpathOwned(recording, "/link", owner)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
     );
-    expect(db.storage.statementCount).toBe(1);
+    expect(recording.queries).toHaveLength(1);
+    expect(recording.queries[0]?.query).toContain("sum(length(CAST(n.link_target AS BLOB)))");
+    expect(owner.currentBytes).toBe(0);
+
+    owner.dispose();
+    occupied.dispose();
+    coordinator.assertIdle();
   });
 
-  it("bounds an oversized symlink target before returning it from SQLite", () => {
-    const db = setup([{ path: "/link", type: "symlink", target: "x".repeat(10_000) }]);
-    db.storage.resetCounters();
-    expect(() => realpath(db, "/link")).toThrowError(
-      expect.objectContaining({ code: "ENAMETOOLONG" }),
+  it("normalizes an engine-reported long-value failure", () => {
+    const storage: DurableObjectStorageLike = {
+      sql: {
+        exec() {
+          throw Object.assign(new Error("value too large"), { code: "SQLITE_TOOBIG" });
+        },
+      },
+    };
+
+    expect(() => realpath(new Database(storage), `/${"x".repeat(4_096)}`)).toThrowError(
+      expect.objectContaining({ code: "E2BIG", message: "SQLite rejected a value as too large" }),
     );
-    expect(db.storage.statementCount).toBe(1);
-    expect(db.storage.rowCount).toBe(2);
   });
 });
 
@@ -235,7 +251,8 @@ describe("resolution query shape", () => {
     if (issued === undefined) throw new Error("resolver issued no statement");
     expect(issued.bindings).toHaveLength(1);
     expect(issued.query).toContain("json_each(?)");
-    expect(issued.query).toContain("substr(n.link_target, 1, 4097)");
+    expect(issued.query).toContain("n.link_target AS link_target");
+    expect(issued.query).not.toContain("substr(n.link_target");
 
     const plan = db
       .all<{ detail: string }>(`EXPLAIN QUERY PLAN ${issued.query}`, ...issued.bindings)

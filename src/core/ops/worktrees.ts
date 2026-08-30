@@ -1,7 +1,10 @@
+import { exactPathStatesOwned } from "../../fs/exact-path-states.js";
+import type { MemoryReservation } from "../../memory.js";
 import {
   type CheckoutRow,
   type CheckoutStore,
   createRefMutationMemoryOwner,
+  listCheckoutsOwned,
   mutateRefsOwned,
   type RefMutationMemoryOwner,
 } from "../../sqlite/store.js";
@@ -10,6 +13,7 @@ import { CorruptError, GitError, RefNotFoundError, UnsupportedOperationError } f
 import { normalizePath } from "../paths.js";
 import { checkRefText, hasCanonicalRefSyntax } from "../ref-name.js";
 import { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { checkoutTree } from "./checkout.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import { statusStream } from "./status.js";
@@ -47,6 +51,40 @@ interface AddPlan {
 interface WorktreeSnapshot {
   rows: readonly CheckoutRow[];
   states: readonly ExactRootState[];
+}
+
+const SNAPSHOT_FIXED_BYTES = 256;
+const SNAPSHOT_ARRAY_BYTES = 64;
+const SNAPSHOT_ARRAY_SLOT_BYTES = 8;
+const SNAPSHOT_CHECKOUT_ROW_BYTES = 1_024;
+const SNAPSHOT_INFO_BYTES = 256;
+const SNAPSHOT_MAP_BYTES = 128;
+const SNAPSHOT_MAP_ENTRY_BYTES = 64;
+const NORMALIZE_ARRAY_BYTES = 64;
+const NORMALIZE_ARRAY_SLOT_BYTES = 8;
+const NORMALIZE_STRING_SLOT_BYTES = 8;
+
+function retainedStringUnits(units: number): number {
+  return 48 + units * 2;
+}
+
+function normalizeConstructionBytes(path: string): number {
+  const absoluteUnits = path.length + (path.startsWith("/") ? 0 : 1);
+  let splitItems = 1;
+  for (let index = 0; index < path.length; index++) {
+    if (path.charCodeAt(index) === 0x2f) splitItems++;
+  }
+  return (
+    retainedStringBytes(path) +
+    (path.startsWith("/") ? 0 : retainedStringUnits(absoluteUnits)) +
+    2 * NORMALIZE_ARRAY_BYTES +
+    splitItems * 2 * NORMALIZE_ARRAY_SLOT_BYTES +
+    splitItems * 48 +
+    absoluteUnits * 2 +
+    retainedStringUnits(absoluteUnits) +
+    retainedStringUnits(absoluteUnits + 1) +
+    NORMALIZE_STRING_SLOT_BYTES
+  );
 }
 
 function worktreeError(code: string, message: string): GitError {
@@ -176,20 +214,35 @@ function info(row: CheckoutRow, state: ExactRootState): WorktreeInfo {
   });
 }
 
-function snapshot(context: GitContext, repo: Repository): WorktreeSnapshot {
+function snapshot(
+  context: GitContext,
+  repo: Repository,
+  reservation: MemoryReservation,
+): WorktreeSnapshot {
   const source = context.exactRootStates;
   if (source === undefined) throw new UnsupportedOperationError("worktree listing");
-  const rows = context.database.listCheckouts(repo.store.repoId);
-  const states = source.states(rows.map((row) => row.root));
-  if (states.length !== rows.length) {
-    throw new CorruptError("worktree state source returned an invalid result length");
-  }
-  for (const state of states) {
-    if (state !== "present" && state !== "missing") {
-      throw new CorruptError("worktree state source returned an invalid state");
+  reservation.set("other", SNAPSHOT_FIXED_BYTES);
+  const rows = listCheckoutsOwned(context.database, repo.store.repoId, reservation);
+  const rootsMemory = reservation.scope();
+  const statesMemory = reservation.scope();
+  rootsMemory.set("other", SNAPSHOT_ARRAY_BYTES + rows.length * SNAPSHOT_ARRAY_SLOT_BYTES);
+  statesMemory.set("other", SNAPSHOT_ARRAY_BYTES + rows.length * SNAPSHOT_ARRAY_SLOT_BYTES);
+  const roots = rows.map((row) => row.root);
+  try {
+    const ownedStates = exactPathStatesOwned(source, roots, reservation);
+    const states = ownedStates ?? source.states(roots);
+    if (states.length !== rows.length) {
+      throw new CorruptError("worktree state source returned an invalid result length");
     }
+    for (const state of states) {
+      if (state !== "present" && state !== "missing") {
+        throw new CorruptError("worktree state source returned an invalid state");
+      }
+    }
+    return { rows, states };
+  } finally {
+    rootsMemory.dispose();
   }
-  return { rows, states };
 }
 
 export function worktreeAdd(
@@ -200,12 +253,9 @@ export function worktreeAdd(
   if (typeof options.root !== "string" || options.root === "") {
     throw worktreeError("EINVAL", "worktree root is required");
   }
-  if (options.root.length > 4_096) {
-    throw worktreeError("E2BIG", "worktree root exceeds 4096 UTF-16 code units");
-  }
   const owner = new WorktreePlanOwner(repo);
   try {
-    const root = normalizePath(options.root);
+    const root = owner.normalize(options.root);
     const plan = addPlan(repo, options.target, owner);
     const row = context.database.createCheckout(
       repo.store.repoId,
@@ -221,6 +271,7 @@ export function worktreeAdd(
 
 class WorktreePlanOwner {
   readonly mutationOwner: RefMutationMemoryOwner;
+  #normalizationMemory: MemoryReservation | null = null;
 
   constructor(repo: Repository) {
     this.mutationOwner = createRefMutationMemoryOwner(repo.store);
@@ -230,23 +281,51 @@ class WorktreePlanOwner {
     return this.mutationOwner.construct(units, construct);
   }
 
+  normalize(path: string): string {
+    if (this.#normalizationMemory !== null) {
+      throw new Error("worktree root normalization is already owned");
+    }
+    const memory = this.mutationOwner.memoryReservation().scope();
+    memory.set("other", normalizeConstructionBytes(path));
+    try {
+      const normalized = normalizePath(path);
+      memory.set("other", retainedStringBytes(normalized));
+      this.#normalizationMemory = memory;
+      return normalized;
+    } catch (error) {
+      memory.dispose();
+      throw error;
+    }
+  }
+
   dispose(): void {
+    this.#normalizationMemory?.dispose();
+    this.#normalizationMemory = null;
     this.mutationOwner.dispose();
   }
 }
 
 export function worktreeList(context: GitContext, repo: Repository): readonly WorktreeInfo[] {
-  const current = snapshot(context, repo);
-  const result: WorktreeInfo[] = [];
-  for (let index = 0; index < current.rows.length; index++) {
-    const row = current.rows[index];
-    const state = current.states[index];
-    if (row === undefined || state === undefined) {
-      throw new CorruptError("worktree state source returned an incomplete result");
+  const reservation = repo.store.reserveMemory();
+  try {
+    const current = snapshot(context, repo, reservation);
+    let retainedBytes = SNAPSHOT_FIXED_BYTES + SNAPSHOT_ARRAY_BYTES;
+    reservation.set("other", retainedBytes);
+    const result: WorktreeInfo[] = [];
+    for (let index = 0; index < current.rows.length; index++) {
+      const row = current.rows[index];
+      const state = current.states[index];
+      if (row === undefined || state === undefined) {
+        throw new CorruptError("worktree state source returned an incomplete result");
+      }
+      retainedBytes += SNAPSHOT_ARRAY_SLOT_BYTES + SNAPSHOT_INFO_BYTES;
+      reservation.set("other", retainedBytes);
+      result.push(info(row, state));
     }
-    result.push(info(row, state));
+    return Object.freeze(result);
+  } finally {
+    reservation.dispose();
   }
-  return Object.freeze(result);
 }
 
 export function worktreeRemove(
@@ -257,53 +336,74 @@ export function worktreeRemove(
   if (typeof options.root !== "string" || options.root === "") {
     throw worktreeError("EINVAL", "worktree root is required");
   }
-  if (options.root.length > 4_096) {
-    throw worktreeError("E2BIG", "worktree root exceeds 4096 UTF-16 code units");
-  }
-  const root = normalizePath(options.root);
-  const row = context.database.checkoutAt(root);
-  if (row === null || row.repoId !== repo.store.repoId) {
-    throw worktreeError("EWORKTREENOTFOUND", `worktree is not registered: ${root}`);
-  }
-  if (row.isPrimary) {
-    throw worktreeError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
-  }
-  const target = new Repository(context.database.openCheckout(row));
-  context.database.removeCheckout(row.id, () => {
-    if (options.force !== true) {
-      const stream = statusStream(target, context.worktree, { untrackedFiles: "normal" });
-      const first = stream.next();
-      stream.return(undefined);
-      if (!first.done) {
-        throw worktreeError("EWORKTREEDIRTY", `worktree contains changes: ${root}`);
-      }
+  const owner = new WorktreePlanOwner(repo);
+  try {
+    const root = owner.normalize(options.root);
+    const row = context.database.checkoutAt(root);
+    if (row === null || row.repoId !== repo.store.repoId) {
+      throw worktreeError("EWORKTREENOTFOUND", `worktree is not registered: ${root}`);
     }
-    context.worktree.removeFiles([root], { recursive: true });
-    return undefined;
-  });
+    if (row.isPrimary) {
+      throw worktreeError("EPRIMARYWORKTREE", "the primary checkout cannot be removed");
+    }
+    const target = new Repository(context.database.openCheckout(row));
+    context.database.removeCheckout(row.id, () => {
+      if (options.force !== true) {
+        const stream = statusStream(target, context.worktree, { untrackedFiles: "normal" });
+        const first = stream.next();
+        stream.return(undefined);
+        if (!first.done) {
+          throw worktreeError("EWORKTREEDIRTY", `worktree contains changes: ${root}`);
+        }
+      }
+      context.worktree.removeFiles([root], { recursive: true });
+      return undefined;
+    });
+  } finally {
+    owner.dispose();
+  }
 }
 
 export function worktreePrune(context: GitContext, repo: Repository): readonly WorktreeInfo[] {
-  const current = snapshot(context, repo);
-  const checkoutIds: number[] = [];
-  const selected = new Map<number, WorktreeInfo>();
-  for (let index = 0; index < current.rows.length; index++) {
-    const row = current.rows[index];
-    const state = current.states[index];
-    if (row === undefined || state === undefined) {
-      throw new CorruptError("worktree state source returned an incomplete result");
+  const reservation = repo.store.reserveMemory();
+  try {
+    const current = snapshot(context, repo, reservation);
+    let retainedBytes = SNAPSHOT_FIXED_BYTES + 3 * SNAPSHOT_ARRAY_BYTES + SNAPSHOT_MAP_BYTES;
+    reservation.set("other", retainedBytes);
+    const checkoutIds: number[] = [];
+    const selected = new Map<number, WorktreeInfo>();
+    let removedRowsBytes = 0;
+    for (let index = 0; index < current.rows.length; index++) {
+      const row = current.rows[index];
+      const state = current.states[index];
+      if (row === undefined || state === undefined) {
+        throw new CorruptError("worktree state source returned an incomplete result");
+      }
+      if (state === "missing" && !row.isPrimary) {
+        retainedBytes += SNAPSHOT_ARRAY_SLOT_BYTES + SNAPSHOT_MAP_ENTRY_BYTES + SNAPSHOT_INFO_BYTES;
+        removedRowsBytes +=
+          SNAPSHOT_CHECKOUT_ROW_BYTES +
+          retainedStringBytes(row.root) +
+          retainedStringBytes(row.head) +
+          2 * SNAPSHOT_ARRAY_SLOT_BYTES;
+        reservation.set("other", retainedBytes);
+        checkoutIds.push(row.id);
+        selected.set(row.id, info(row, state));
+      }
     }
-    if (state === "missing" && !row.isPrimary) {
-      checkoutIds.push(row.id);
-      selected.set(row.id, info(row, state));
+    retainedBytes += removedRowsBytes;
+    reservation.set("other", retainedBytes);
+    const removed = context.database.removeCheckouts(repo.store.repoId, checkoutIds);
+    const result: WorktreeInfo[] = [];
+    for (const row of removed) {
+      const item = selected.get(row.id);
+      if (item === undefined) {
+        throw new CorruptError("worktree prune removed an unexpected checkout");
+      }
+      result.push(item);
     }
+    return Object.freeze(result);
+  } finally {
+    reservation.dispose();
   }
-  const removed = context.database.removeCheckouts(repo.store.repoId, checkoutIds);
-  const result: WorktreeInfo[] = [];
-  for (const row of removed) {
-    const item = selected.get(row.id);
-    if (item === undefined) throw new CorruptError("worktree prune removed an unexpected checkout");
-    result.push(item);
-  }
-  return Object.freeze(result);
 }

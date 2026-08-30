@@ -622,7 +622,7 @@ describe("git schema", () => {
     );
   });
 
-  it("enforces immutable bounded checkout identity and validates one primary", () => {
+  it("enforces immutable canonical checkout identity and validates one primary", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     db.run("INSERT INTO git_repositories (id) VALUES (41), (42), (43)");
@@ -633,14 +633,16 @@ describe("git schema", () => {
       exactRoot,
     );
     expect(db.scalar<number>("SELECT length(CAST(root AS BLOB)) FROM git_checkouts")).toBe(4_096);
-    expect(() =>
-      db.run(
-        `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
-         VALUES (102, 42, ?, ?, 1)`,
-        `/${"b".repeat(4_096)}`,
-        "1".repeat(40),
-      ),
-    ).toThrow(/CHECK/);
+    const formerFirstExcess = `/${"b".repeat(4_096)}`;
+    db.run(
+      `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
+       VALUES (102, 42, ?, ?, 1)`,
+      formerFirstExcess,
+      "1".repeat(40),
+    );
+    expect(
+      db.scalar<number>("SELECT length(CAST(root AS BLOB)) FROM git_checkouts WHERE id = 102"),
+    ).toBe(4_097);
     expect(() =>
       db.run(
         `INSERT INTO git_checkouts (id, repo_id, root, head, is_primary)
