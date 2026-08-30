@@ -556,8 +556,9 @@ shape exceptions, store import topology and proportional per-WU review.
 - 2026-08-30 — The WU6b leader gate exposed one stale WU4 witness in
   `tests/plumbing-write.test.ts`: it still expects the removed 65th hash range-
   read refusal, while the source now correctly proceeds to the synthetic
-  worktree's `ENOENT`. The isolated failure predates the WU6b diff and will land
-  as a separate sprint-integration test repair before closure.
+  worktree's `ENOENT`. A separate test-only integration repair now supplies all
+  chunks, proves exactly 65 reads and verifies the staged row plus cleanup. The
+  focused witness passes in 1.95 s; runtime code is unchanged.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

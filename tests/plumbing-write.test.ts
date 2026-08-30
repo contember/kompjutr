@@ -1186,24 +1186,32 @@ describe("tree and index write plumbing", () => {
     ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
     expect(byteError).toContain(`${64 * 1024 * 1024} bytes`);
 
-    let rangeError = "";
-    expect(() =>
-      workspace.repo.store.withScratchIndex("range-limit", (scratch) => {
-        try {
-          add(
-            workspace.repo,
-            syntheticWorktree(workspace.worktree, 1, null, 64 * 64 * 1024 + 1),
-            { paths: [], all: true, force: true },
-            undefined,
-            scratch,
-          );
-        } catch (error) {
-          if (!(error instanceof GitError)) throw error;
-          rangeError = error.message;
-        }
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-    expect(rangeError).toContain("64 range reads");
+    const rangeSize = 64 * 64 * 1024 + 1;
+    const rangeOid = workspace.repo.store.write("blob", new Uint8Array(rangeSize));
+    let rangeReads = 0;
+    const rangeSource = syntheticWorktree(workspace.worktree, 1, null, rangeSize);
+    const rangeWorktree: Worktree = {
+      ...rangeSource,
+      readRange(path, offset, length) {
+        expect(path).toBe("/f00000.txt");
+        expect(offset).toBe(rangeReads * 64 * 1024);
+        rangeReads++;
+        return new Uint8Array(length);
+      },
+    };
+    workspace.repo.store.withScratchIndex("former-range-limit", (scratch) => {
+      add(workspace.repo, rangeWorktree, { paths: [], all: true, force: true }, undefined, scratch);
+      const staged = [...scratch.indexScan()];
+      expect(staged).toHaveLength(1);
+      expect(staged[0]).toMatchObject({
+        path: "f00000.txt",
+        mode: 0o100644,
+        oid: rangeOid,
+        size: rangeSize,
+      });
+    });
+    expect(rangeReads).toBe(65);
+    expect(workspace.repo.store.typeAndSize(rangeOid)).toEqual({ type: "blob", size: rangeSize });
 
     expect(controlState(workspace)).toEqual(beforeControl);
     expect(workspace.database.db.scalar<number>("SELECT count(*) FROM git_scratch_indexes")).toBe(
