@@ -1,7 +1,7 @@
 // Pure content resolution for a bounded three-tree integration plan.
 
-import { MAX_OPERATION_MEMORY_BYTES, type MemoryReservation } from "../../memory.js";
-import { MAX_BLOB_BATCH_BYTES, PACK_BLOB_CALLER_HEADROOM_BYTES } from "../../sqlite/store.js";
+import type { MemoryReservation } from "../../memory.js";
+import { MAX_BLOB_BATCH_BYTES } from "../../sqlite/store.js";
 import {
   DEFAULT_TEXT_MERGE_LIMITS,
   estimateTextMergeMemory,
@@ -11,6 +11,7 @@ import {
 import { CorruptError, GitError } from "../errors.js";
 import { hashObject, MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 import {
   type ConflictStructuralEntry,
@@ -25,11 +26,8 @@ import { treeStream } from "./tree-stream.js";
 
 export const MAX_INTEGRATION_SOURCE_ROWS = 200_000;
 export const MAX_INTEGRATION_PLAN_ENTRIES = 1_000;
-export const MAX_INTEGRATION_STRUCTURE_BYTES = 4 * 1024 * 1024;
-export const MAX_INTEGRATION_PLAN_BYTES = 32 * 1024 * 1024;
 
 const FIXED_CALLER_BYTES = 16 * 1024;
-const STRUCTURAL_ENTRY_BYTES = 768;
 const INTEGRATION_ENTRY_BYTES = 512;
 const ID_VECTOR_ENTRY_BYTES = 192;
 const BLOB_MAP_ENTRY_BYTES = 128;
@@ -68,6 +66,14 @@ export interface IntegrationPlan {
   /** Conservative bytes the caller must reserve while retaining this plan. */
   retainedBytes: number;
   memoryHighWaterBytes: number;
+  /** Present on plans produced by the native planner. */
+  readonly reservation?: MemoryReservation;
+  release?(): void;
+}
+
+export interface OwnedIntegrationPlan extends IntegrationPlan {
+  readonly reservation: MemoryReservation;
+  release(): void;
 }
 
 export interface IntegrationLimits {
@@ -83,6 +89,8 @@ export interface IntegrationInput {
   incomingTreeOid: string | null;
   text?: TextMergeOptions;
   limits?: IntegrationLimits;
+  /** Existing operation owner whose child retains the returned plan. */
+  reservation?: MemoryReservation;
   /** Caller-owned bytes that remain live for the full planning call. */
   callerRetainedBytes?: number;
 }
@@ -128,8 +136,9 @@ class RelocationAllocator {
 
   constructor(
     requests: readonly RelocationRequest[],
-    private readonly maxRetainedBytes: number,
+    private readonly reservation: MemoryReservation,
   ) {
+    this.reservation.set("other", this.#retainedBytes);
     for (const request of requests) this.#add(request.desired);
   }
 
@@ -167,14 +176,12 @@ class RelocationAllocator {
       throw new GitError("E2BIG", "virtual relocation path is below an occupied file");
     }
     if (!namespace.occupied.has(-1)) {
-      validateRelocationPath(desired);
       this.observe(desired);
       return desired;
     }
     for (let ordinal = 0; ordinal < MAX_INTEGRATION_PLAN_ENTRIES - 1; ordinal++) {
       if (namespace.occupied.has(ordinal)) continue;
       const allocated = `${desired}_${ordinal}`;
-      validateRelocationPath(allocated);
       this.observe(allocated);
       return allocated;
     }
@@ -211,13 +218,8 @@ class RelocationAllocator {
   }
 
   #retain(bytes: number): void {
-    if (bytes > this.maxRetainedBytes - this.#retainedBytes) {
-      throw new GitError(
-        "E2BIG",
-        `virtual relocation state exceeds ${this.maxRetainedBytes} retained bytes`,
-      );
-    }
     this.#retainedBytes += bytes;
+    this.reservation.set("other", this.#retainedBytes);
   }
 }
 
@@ -236,12 +238,9 @@ function collisionOrdinal(suffix: string): number | null {
 }
 
 function validateVirtualLabel(label: string, role: string): void {
-  if (label.length > 256) throw new GitError("E2BIG", `virtual ${role} label exceeds 256 bytes`);
-  const bytes = new TextEncoder().encode(label).length;
   if (label.length === 0 || label.includes("/") || label.includes("\0")) {
     throw new GitError("EINVAL", `virtual ${role} label is not a safe path segment`);
   }
-  if (bytes > 256) throw new GitError("E2BIG", `virtual ${role} label exceeds 256 bytes`);
 }
 
 function virtualMarkerSize(depth: number | undefined): number {
@@ -254,12 +253,6 @@ function virtualMarkerSize(depth: number | undefined): number {
     throw new GitError("E2BIG", "virtual integration depth exceeds the marker-size limit");
   }
   return markerSize;
-}
-
-function validateRelocationPath(path: string): void {
-  if (new TextEncoder().encode(path).length > 2_200) {
-    throw new GitError("E2BIG", "virtual relocation path exceeds 2200 bytes");
-  }
 }
 
 function relocationKey(path: string, side: "current" | "incoming"): string {
@@ -278,11 +271,16 @@ function isDescendant(path: string, parent: string): boolean {
   return path.length > parent.length && path.startsWith(parent) && path[parent.length] === "/";
 }
 
-function relocationRequests(
+function visitRelocationRequests(
   entries: readonly StructuralIntegrationEntry[],
   labels: { current: string; incoming: string },
-): RelocationRequest[] {
-  const requests: RelocationRequest[] = [];
+  visit: (
+    path: string,
+    side: "current" | "incoming",
+    label: string,
+    identity: IntegrationIdentity,
+  ) => void,
+): void {
   for (let index = 0; index < entries.length; index++) {
     const entry = entries[index];
     if (entry?.kind !== "conflict") continue;
@@ -292,23 +290,9 @@ function relocationRequests(
       const next = entries[index + 1];
       if (next === undefined || !isDescendant(next.path, entry.path)) continue;
       if (current !== null && incoming === null) {
-        validateRelocationPath(`${entry.path}~${labels.current}`);
-        requests.push({
-          key: relocationKey(entry.path, "current"),
-          path: entry.path,
-          desired: `${entry.path}~${labels.current}`,
-          side: "current",
-          identity: current,
-        });
+        visit(entry.path, "current", labels.current, current);
       } else if (incoming !== null && current === null) {
-        validateRelocationPath(`${entry.path}~${labels.incoming}`);
-        requests.push({
-          key: relocationKey(entry.path, "incoming"),
-          path: entry.path,
-          desired: `${entry.path}~${labels.incoming}`,
-          side: "incoming",
-          identity: incoming,
-        });
+        visit(entry.path, "incoming", labels.incoming, incoming);
       }
       continue;
     }
@@ -330,15 +314,24 @@ function relocationRequests(
     const side = modeRank(current.mode) < modeRank(incoming.mode) ? "current" : "incoming";
     const identity = side === "current" ? current : incoming;
     const label = side === "current" ? labels.current : labels.incoming;
-    validateRelocationPath(`${entry.path}~${label}`);
+    visit(entry.path, side, label, identity);
+  }
+}
+
+function relocationRequests(
+  entries: readonly StructuralIntegrationEntry[],
+  labels: { current: string; incoming: string },
+): RelocationRequest[] {
+  const requests: RelocationRequest[] = [];
+  visitRelocationRequests(entries, labels, (path, side, label, identity) => {
     requests.push({
-      key: relocationKey(entry.path, side),
-      path: entry.path,
-      desired: `${entry.path}~${label}`,
+      key: relocationKey(path, side),
+      path,
+      desired: `${path}~${label}`,
       side,
       identity,
     });
-  }
+  });
   return requests;
 }
 
@@ -347,29 +340,35 @@ function allocateRelocations(
   input: VirtualAncestorIntegrationInput,
   requests: readonly RelocationRequest[],
   limits: ResolvedIntegrationLimits,
+  reservation: MemoryReservation,
 ): { names: Map<string, string>; retainedBytes: number } {
   if (requests.length === 0) return { names: new Map(), retainedBytes: 0 };
-  const allocator = new RelocationAllocator(requests, limits.maxStructureBytes);
-  let rows = 0;
-  for (const treeOid of [input.currentTreeOid, input.incomingTreeOid]) {
-    for (const entry of treeStream(repo, treeOid)) {
-      if (rows >= limits.maxSourceRows * 2) {
-        throw new GitError("E2BIG", "virtual relocation scan exceeds its source row limit");
+  const memory = reservation.scope();
+  try {
+    const allocator = new RelocationAllocator(requests, memory);
+    let rows = 0;
+    for (const treeOid of [input.currentTreeOid, input.incomingTreeOid]) {
+      for (const entry of treeStream(repo, treeOid)) {
+        if (rows >= limits.maxSourceRows * 2) {
+          throw new GitError("E2BIG", "virtual relocation scan exceeds its source row limit");
+        }
+        rows++;
+        allocator.observe(entry.path);
       }
-      rows++;
-      allocator.observe(entry.path);
     }
+    const names = new Map<string, string>();
+    for (const request of requests) names.set(request.key, allocator.allocate(request.desired));
+    return { names, retainedBytes: allocator.retainedBytes };
+  } finally {
+    memory.dispose();
   }
-  const names = new Map<string, string>();
-  for (const request of requests) names.set(request.key, allocator.allocate(request.desired));
-  return { names, retainedBytes: allocator.retainedBytes };
 }
 
 interface ResolvedIntegrationLimits {
   maxSourceRows: number;
   maxEntries: number;
-  maxStructureBytes: number;
-  maxPlanBytes: number;
+  maxStructureBytes: number | undefined;
+  maxPlanBytes: number | undefined;
 }
 
 function boundedLimit(value: number | undefined, ceiling: number, label: string): number {
@@ -384,13 +383,16 @@ function resolveLimits(limits: IntegrationLimits | undefined): ResolvedIntegrati
   return {
     maxSourceRows: boundedLimit(limits?.maxSourceRows, MAX_INTEGRATION_SOURCE_ROWS, "source row"),
     maxEntries: boundedLimit(limits?.maxEntries, MAX_INTEGRATION_PLAN_ENTRIES, "entry"),
-    maxStructureBytes: boundedLimit(
-      limits?.maxStructureBytes,
-      MAX_INTEGRATION_STRUCTURE_BYTES,
-      "structure byte",
-    ),
-    maxPlanBytes: boundedLimit(limits?.maxPlanBytes, MAX_INTEGRATION_PLAN_BYTES, "plan byte"),
+    maxStructureBytes: optionalLimit(limits?.maxStructureBytes, "structure byte"),
+    maxPlanBytes: optionalLimit(limits?.maxPlanBytes, "plan byte"),
   };
+}
+
+function optionalLimit(value: number | undefined, label: string): number | undefined {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+    throw new RangeError(`invalid integration ${label} limit`);
+  }
+  return value;
 }
 
 function checkedAdd(left: number, right: number, label: string): number {
@@ -405,11 +407,11 @@ function checkedAdd(left: number, right: number, label: string): number {
 }
 
 function pathBytes(path: string): number {
-  return checkedAdd(64, path.length * 2, "path");
+  return pathUnitsBytes(path.length);
 }
 
-function structuralEntryBytes(entry: StructuralIntegrationEntry): number {
-  return checkedAdd(STRUCTURAL_ENTRY_BYTES, pathBytes(entry.path), "structure");
+function pathUnitsBytes(units: number): number {
+  return checkedAdd(64, units * 2, "path");
 }
 
 function integrationEntryBytes(entry: IntegrationEntry): number {
@@ -426,11 +428,12 @@ function integrationEntryOverhead(path: string): number {
 }
 
 function remainingContentCapacity(
-  maxPlanBytes: number,
+  maxPlanBytes: number | undefined,
   passthroughBytes: number,
   resolvedBytes: number,
   path: string,
 ): number {
+  if (maxPlanBytes === undefined) return DEFAULT_TEXT_MERGE_LIMITS.maxOutputBytes;
   const retained = checkedAdd(passthroughBytes, resolvedBytes, "plan");
   const overhead = integrationEntryOverhead(path);
   if (retained > maxPlanBytes || overhead > maxPlanBytes - retained) {
@@ -510,15 +513,6 @@ function callerRetainedBytes(
   return bytes;
 }
 
-function requireCallerHeadroom(bytes: number): void {
-  if (bytes > PACK_BLOB_CALLER_HEADROOM_BYTES) {
-    throw new GitError(
-      "E2BIG",
-      `integration caller state exceeds the ${PACK_BLOB_CALLER_HEADROOM_BYTES}-byte packed-read headroom`,
-    );
-  }
-}
-
 function validateBlobBatch(
   requested: readonly string[],
   blobs: ReadonlyMap<string, Uint8Array>,
@@ -594,6 +588,61 @@ function virtualAddAddCandidate(entry: ConflictStructuralEntry): ContentCandidat
     stages: entry.stages,
     forceAddAddConflict: current.mode !== incoming.mode,
   };
+}
+
+function planningCollectionsAdmissionBytes(
+  entries: readonly StructuralIntegrationEntry[],
+  virtualLabels: { current: string; incoming: string } | null,
+): number {
+  let candidateCount = 0;
+  for (const entry of entries) {
+    if (entry.kind === "content") {
+      candidateCount++;
+      continue;
+    }
+    if (virtualLabels !== null && entry.kind === "conflict") {
+      const current = entry.stages.current;
+      const incoming = entry.stages.incoming;
+      if (
+        entry.conflict === "add/add" &&
+        current !== null &&
+        incoming !== null &&
+        isRegularMode(current.mode) &&
+        isRegularMode(incoming.mode)
+      ) {
+        candidateCount++;
+      }
+    }
+  }
+  let bytes = checkedAdd(
+    FIXED_CALLER_BYTES,
+    (entries.length + candidateCount * 10) * ID_VECTOR_ENTRY_BYTES,
+    "planning collections",
+  );
+  if (virtualLabels === null) return bytes;
+  visitRelocationRequests(entries, virtualLabels, (path, side, label) => {
+    const keyBytes = pathUnitsBytes(path.length + 1 + side.length);
+    const desiredBytes = pathUnitsBytes(path.length + 1 + label.length);
+    bytes = checkedAdd(
+      bytes,
+      checkedAdd(
+        INTEGRATION_ENTRY_BYTES,
+        checkedAdd(keyBytes, desiredBytes, "virtual relocation"),
+        "virtual relocation",
+      ),
+      "planning collections",
+    );
+    bytes = checkedAdd(
+      bytes,
+      checkedAdd(
+        ID_VECTOR_ENTRY_BYTES,
+        checkedAdd(desiredBytes, 8, "virtual relocation suffix"),
+        "virtual relocation map",
+      ),
+      "planning collections",
+    );
+  });
+  return bytes;
 }
 
 function cleanIdentity(
@@ -676,7 +725,8 @@ function resolveContentCandidate(
   }
   const boundedText = boundTextOutput(text, maxContentBytes);
   const memory = estimateTextMergeMemory(base, current, incoming, boundedText);
-  reservation.set("other", checkedAdd(retainedBytes, memory.peakBytes, "memory"));
+  const transientBytes = memory.peakBytes - memory.inputBytes;
+  reservation.set("other", checkedAdd(retainedBytes, transientBytes, "memory"));
   const merged = mergeText(base, current, incoming, boundedText);
   const stages = entry.stages;
   if (merged.kind === "binary") {
@@ -741,58 +791,68 @@ function resolveContentCandidate(
 }
 
 /** Build a deterministic integration delta without mutating repository state. */
-export function planIntegration(repo: Repository, input: IntegrationInput): IntegrationPlan {
-  return planIntegrationInternal(repo, input, null);
+export function planIntegration(repo: Repository, input: IntegrationInput): OwnedIntegrationPlan {
+  return planIntegrationInternal(repo, input, null, undefined);
 }
 
 /** Collapse conflicts the way Git builds a temporary recursive merge-base tree. */
 export function planVirtualAncestorIntegration(
   repo: Repository,
   input: VirtualAncestorIntegrationInput,
-): IntegrationPlan {
-  validateVirtualLabel(input.labels.current, "current");
-  validateVirtualLabel(input.labels.incoming, "incoming");
-  const markerSize = virtualMarkerSize(input.depth);
-  if (input.text?.markerSize !== undefined && input.text.markerSize !== markerSize) {
-    throw new GitError("EINVAL", "virtual integration marker size does not match its depth");
-  }
-  return planIntegrationInternal(
-    repo,
-    {
-      ...input,
-      text: {
-        ...input.text,
-        labels: {
-          ...input.text?.labels,
-          current: input.labels.current,
-          incoming: input.labels.incoming,
-        },
-        markerSize,
-      },
-    },
-    input.labels,
-  );
+): OwnedIntegrationPlan {
+  return planIntegrationInternal(repo, input, input.labels, input.depth);
 }
 
 function planIntegrationInternal(
   repo: Repository,
   input: IntegrationInput,
   virtualLabels: { current: string; incoming: string } | null,
-): IntegrationPlan {
-  const reservation = repo.store.reserveMemory();
+  virtualDepth: number | undefined,
+): OwnedIntegrationPlan {
+  if (input.reservation !== undefined && !repo.store.ownsMemoryReservation(input.reservation)) {
+    throw new GitError("EINVAL", "integration reservation belongs to another repository");
+  }
+  const reservation = input.reservation?.scope() ?? repo.store.reserveMemory();
+  let succeeded = false;
   try {
-    const externalBytes =
-      input.callerRetainedBytes === undefined
-        ? 0
-        : boundedLimit(
-            input.callerRetainedBytes,
-            MAX_OPERATION_MEMORY_BYTES,
-            "caller retained byte",
-          );
-    const exclusiveBytes = MAX_OPERATION_MEMORY_BYTES - externalBytes;
-    // Exclude yielded pack ingest before opening any tree cursor or retaining plan state.
-    reservation.set("other", exclusiveBytes);
+    const callerBytes = optionalLimit(input.callerRetainedBytes, "caller retained byte") ?? 0;
+    if (callerBytes > 0) {
+      const callerMemory = reservation.scope();
+      callerMemory.set("other", callerBytes);
+    }
     const limits = resolveLimits(input.limits);
+    const labelMemory = reservation.scope();
+    let text = input.text ?? {};
+    if (virtualLabels !== null) {
+      validateVirtualLabel(virtualLabels.current, "current");
+      validateVirtualLabel(virtualLabels.incoming, "incoming");
+      labelMemory.set(
+        "other",
+        checkedAdd(
+          256,
+          checkedAdd(
+            retainedStringBytes(virtualLabels.current),
+            retainedStringBytes(virtualLabels.incoming),
+            "virtual labels",
+          ),
+          "virtual labels",
+        ),
+      );
+      const markerSize = virtualMarkerSize(virtualDepth);
+      if (input.text?.markerSize !== undefined && input.text.markerSize !== markerSize) {
+        throw new GitError("EINVAL", "virtual integration marker size does not match its depth");
+      }
+      text = {
+        ...input.text,
+        labels: {
+          ...input.text?.labels,
+          current: virtualLabels.current,
+          incoming: virtualLabels.incoming,
+        },
+        markerSize,
+      };
+    }
+    const structureMemory = reservation.scope();
     const structure = classifyIntegrationStructure(repo, {
       baseTreeOid: input.baseTreeOid,
       currentTreeOid: input.currentTreeOid,
@@ -800,9 +860,14 @@ function planIntegrationInternal(
       limits: {
         maxRows: limits.maxSourceRows,
         maxEntries: limits.maxEntries,
-        maxRetainedBytes: limits.maxStructureBytes,
+        ...(limits.maxStructureBytes === undefined
+          ? {}
+          : { maxRetainedBytes: limits.maxStructureBytes }),
       },
+      reservation: structureMemory,
     });
+    const stateMemory = reservation.scope();
+    stateMemory.set("other", planningCollectionsAdmissionBytes(structure.entries, virtualLabels));
     const candidates: ContentCandidate[] = [];
     for (const entry of structure.entries) {
       if (entry.kind === "content") {
@@ -820,21 +885,23 @@ function planIntegrationInternal(
     const relocations =
       virtualLabels === null
         ? { names: new Map<string, string>(), retainedBytes: 0 }
-        : allocateRelocations(repo, { ...input, labels: virtualLabels }, relocationList, limits);
+        : allocateRelocations(
+            repo,
+            { ...input, labels: virtualLabels },
+            relocationList,
+            limits,
+            reservation,
+          );
     const relocationByKey = new Map(relocationList.map((request) => [request.key, request]));
     const requestedOids = stableIdentityVector(candidates);
     const remainingUses = identityUseCounts(candidates);
     let staticBytes = FIXED_CALLER_BYTES;
-    for (const entry of structure.entries) {
-      staticBytes = checkedAdd(staticBytes, structuralEntryBytes(entry), "structure");
-    }
     staticBytes = checkedAdd(
       staticBytes,
       (structure.entries.length + candidates.length + requestedOids.length * 3) *
         ID_VECTOR_ENTRY_BYTES,
       "identity vectors",
     );
-    staticBytes = checkedAdd(staticBytes, relocations.retainedBytes, "virtual relocations");
     for (const request of relocationList) {
       const allocated = relocations.names.get(request.key);
       if (allocated === undefined) throw new CorruptError("virtual relocation path is missing");
@@ -872,7 +939,7 @@ function planIntegrationInternal(
     if (staticEntries.length + candidates.length > limits.maxEntries) {
       throw new GitError("E2BIG", `integration plan exceeds ${limits.maxEntries} entries`);
     }
-    if (passthroughBytes > limits.maxPlanBytes) {
+    if (limits.maxPlanBytes !== undefined && passthroughBytes > limits.maxPlanBytes) {
       throw new GitError("E2BIG", `integration plan exceeds ${limits.maxPlanBytes} retained bytes`);
     }
     staticBytes = checkedAdd(staticBytes, passthroughBytes, "static plan");
@@ -881,12 +948,11 @@ function planIntegrationInternal(
       staticEntries.length * ID_VECTOR_ENTRY_BYTES,
       "static plan vector",
     );
-    requireCallerHeadroom(checkedAdd(externalBytes, staticBytes, "caller state"));
 
     let resolvedBytes = 0;
     let remaining = requestedOids;
     let nextCandidate = 0;
-    reservation.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
+    stateMemory.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
     while (nextCandidate < candidates.length) {
       const candidate = candidates[nextCandidate]!;
       const ready = candidateOids(candidate).every((oid) => loaded.has(oid));
@@ -895,48 +961,50 @@ function planIntegrationInternal(
           throw new CorruptError("integration blob batches ended before all candidates resolved");
         }
         const beforeRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        requireCallerHeadroom(checkedAdd(externalBytes, beforeRead, "caller state"));
         const mapHeadroom = Math.min(remaining.length, 4096) * BLOB_MAP_ENTRY_BYTES;
-        const available =
-          PACK_BLOB_CALLER_HEADROOM_BYTES - externalBytes - beforeRead - mapHeadroom;
-        if (available <= 0) {
-          throw new GitError("E2BIG", "integration has no caller headroom for another blob batch");
-        }
-        const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, available);
-        reservation.set("other", exclusiveBytes);
+        const available = reservation.remainingBytes - mapHeadroom;
+        const budgetBytes = Math.min(MAX_BLOB_BATCH_BYTES, Math.max(1, available));
+        stateMemory.set(
+          "other",
+          checkedAdd(beforeRead, budgetBytes + mapHeadroom, "blob read admission"),
+        );
         const batch = repo.readBlobs(remaining, { budgetBytes });
         validateBlobBatch(remaining, batch.blobs, batch.remaining, batch.bytes);
         for (const [oid, data] of batch.blobs) loaded.set(oid, data);
         remaining = batch.remaining;
         const afterRead = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
-        requireCallerHeadroom(checkedAdd(externalBytes, afterRead, "caller state"));
-        reservation.set("other", afterRead);
+        stateMemory.set("other", afterRead);
         continue;
       }
 
-      const retained = callerRetainedBytes(staticBytes, resolvedBytes, loaded);
       const maxContentBytes = remainingContentCapacity(
         limits.maxPlanBytes,
         passthroughBytes,
         resolvedBytes,
         candidate.path,
       );
-      const result = resolveContentCandidate(
-        candidate,
-        loaded,
-        input.text ?? {},
-        reservation,
-        retained,
-        maxContentBytes,
-        virtualLabels !== null,
-      );
+      const mergeMemory = reservation.scope();
+      let result: IntegrationEntry;
+      try {
+        result = resolveContentCandidate(
+          candidate,
+          loaded,
+          text,
+          mergeMemory,
+          0,
+          maxContentBytes,
+          virtualLabels !== null,
+        );
+      } finally {
+        mergeMemory.dispose();
+      }
       const entryBytes = integrationEntryBytes(result);
       const nextPlanBytes = checkedAdd(
         checkedAdd(passthroughBytes, resolvedBytes, "plan"),
         entryBytes,
         "plan",
       );
-      if (nextPlanBytes > limits.maxPlanBytes) {
+      if (limits.maxPlanBytes !== undefined && nextPlanBytes > limits.maxPlanBytes) {
         throw new GitError(
           "E2BIG",
           `integration plan exceeds ${limits.maxPlanBytes} retained bytes`,
@@ -957,29 +1025,38 @@ function planIntegrationInternal(
         }
       }
       nextCandidate++;
-      reservation.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
+      stateMemory.set("other", callerRetainedBytes(staticBytes, resolvedBytes, loaded));
     }
 
     if (remaining.length !== 0 || loaded.size !== 0 || remainingUses.size !== 0) {
       throw new CorruptError("integration content phase retained unconsumed blob objects");
     }
     const finalArrayBytes = (staticEntries.length + resolved.size) * ID_VECTOR_ENTRY_BYTES;
-    const finalPeak = checkedAdd(
-      callerRetainedBytes(staticBytes, resolvedBytes, loaded),
-      finalArrayBytes,
-      "final plan",
-    );
-    reservation.set("other", finalPeak);
+    const finalArrayMemory = reservation.scope();
+    finalArrayMemory.set("other", finalArrayBytes);
     const entries = [...staticEntries, ...resolved.values()].sort((left, right) =>
       comparePaths(left.path, right.path),
     );
-    return {
+    const finalRetainedBytes = entries.reduce(
+      (bytes, entry) => checkedAdd(bytes, integrationEntryBytes(entry), "final plan"),
+      checkedAdd(FIXED_CALLER_BYTES, finalArrayBytes, "final plan"),
+    );
+    finalArrayMemory.dispose();
+    stateMemory.dispose();
+    structureMemory.dispose();
+    labelMemory.dispose();
+    reservation.set("other", finalRetainedBytes);
+    const plan: OwnedIntegrationPlan = {
       entries,
       sourceRows: structure.sourceRows,
-      retainedBytes: finalPeak,
+      retainedBytes: finalRetainedBytes,
       memoryHighWaterBytes: reservation.highWaterBytes,
+      reservation,
+      release: () => reservation.dispose(),
     };
+    succeeded = true;
+    return plan;
   } finally {
-    reservation.dispose();
+    if (!succeeded) reservation.dispose();
   }
 }

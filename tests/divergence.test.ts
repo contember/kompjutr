@@ -2,13 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import { utf8 } from "../src/core/bytes.js";
 import { serializeCommit, serializeTree } from "../src/core/objects.js";
-import {
-  divergence,
-  MAX_MERGE_BASE_COMMITS,
-  MAX_MERGE_BASE_RETAINED_BYTES,
-} from "../src/core/ops/merge-base.js";
+import { divergence, MAX_MERGE_BASE_COMMITS } from "../src/core/ops/merge-base.js";
 import { Repository } from "../src/core/repository.js";
-import { MAX_LOG_COMMITS, MAX_LOG_STATE_BYTES } from "../src/sqlite/commits.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
+import { MAX_LOG_COMMITS } from "../src/sqlite/commits.js";
 import type { SqlDatabase } from "../src/sqlite/db.js";
 import { type CheckoutRow, type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
@@ -321,11 +318,9 @@ describe("bounded divergence", () => {
     }
   });
 
-  it("retains the fixed 50k/32 MiB graph ceilings and survives a cold reopen", () => {
+  it("admits the former 32 MiB first excess through the shared owner and survives a cold reopen", () => {
     expect(MAX_MERGE_BASE_COMMITS).toBe(MAX_LOG_COMMITS);
     expect(MAX_MERGE_BASE_COMMITS).toBe(50_000);
-    expect(MAX_MERGE_BASE_RETAINED_BYTES).toBe(MAX_LOG_STATE_BYTES);
-    expect(MAX_MERGE_BASE_RETAINED_BYTES).toBe(32 * 1024 * 1024);
 
     const active = harness();
     const person = {
@@ -349,9 +344,12 @@ describe("bounded divergence", () => {
       );
       if (root === "") root = tip;
     }
-    expect(() => divergence(active.repo, { current: tip, upstream: root })).toThrow(
-      expect.objectContaining({ code: "E2BIG" }),
-    );
+    expect(divergence(active.repo, { current: tip, upstream: root })).toEqual({
+      relationship: "ahead",
+      ahead: 19,
+      behind: 0,
+    });
+    active.repo.store.memory.assertIdle();
 
     const split = divergentFixture();
     try {
@@ -366,6 +364,49 @@ describe("bounded divergence", () => {
         relationship: "diverged",
         ...gitCounts(split.fixture, split.current, split.upstream),
       });
+    } finally {
+      split.fixture.dispose();
+    }
+  });
+
+  it("shares exact aggregate graph capacity and releases success and failure ownership", () => {
+    const split = divergentFixture();
+    try {
+      const attempt = (capacity: number): boolean => {
+        const active = harness();
+        importReachable(active.store, split.fixture, [split.current, split.upstream]);
+        const blocker = active.repo.store.reserveMemory();
+        blocker.set("other", MAX_OPERATION_MEMORY_BYTES - capacity);
+        try {
+          const result = divergence(active.repo, {
+            current: split.current,
+            upstream: split.upstream,
+          });
+          expect(result).toEqual({
+            relationship: "diverged",
+            ...gitCounts(split.fixture, split.current, split.upstream),
+          });
+          expect(active.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+          return true;
+        } catch (error) {
+          expect(error).toEqual(expect.objectContaining({ code: "E2BIG" }));
+          return false;
+        } finally {
+          blocker.dispose();
+          active.repo.store.memory.assertIdle();
+        }
+      };
+
+      let insufficient = 0;
+      let sufficient = MAX_OPERATION_MEMORY_BYTES;
+      while (sufficient - insufficient > 1) {
+        const candidate = insufficient + Math.floor((sufficient - insufficient) / 2);
+        if (attempt(candidate)) sufficient = candidate;
+        else insufficient = candidate;
+      }
+      expect(sufficient).toBeGreaterThan(1);
+      expect(attempt(sufficient)).toBe(true);
+      expect(attempt(sufficient - 1)).toBe(false);
     } finally {
       split.fixture.dispose();
     }

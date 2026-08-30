@@ -1,6 +1,7 @@
 // Pure structural planning for a three-way integration. Blob content is left
 // to the bounded content phase; this layer only compares tree identities.
 
+import { MemoryCoordinator, type MemoryReservation } from "../../memory.js";
 import { isOid } from "../bytes.js";
 import { CorruptError, GitError } from "../errors.js";
 import { MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
@@ -10,7 +11,6 @@ import { type TargetEntry, treeStream } from "./tree-stream.js";
 
 export const MAX_INTEGRATION_STRUCTURE_ROWS = 200_000;
 export const MAX_INTEGRATION_STRUCTURE_ENTRIES = 65_536;
-export const MAX_INTEGRATION_STRUCTURE_BYTES = 16 * 1024 * 1024;
 
 const PLAN_ENTRY_BYTES = 192;
 const IDENTITY_BYTES = 128;
@@ -81,12 +81,14 @@ export interface IntegrationStructureInput {
   currentTreeOid: string | null;
   incomingTreeOid: string | null;
   limits?: IntegrationStructureLimits;
+  /** Dedicated owner for structural entries retained by the caller. */
+  reservation?: MemoryReservation;
 }
 
 interface ResolvedLimits {
   maxRows: number;
   maxEntries: number;
-  maxRetainedBytes: number;
+  maxRetainedBytes: number | undefined;
 }
 
 interface ClassifiedRow {
@@ -106,7 +108,10 @@ class PlanBudget {
   #planBytes = 0;
   #prefixBytes = 0;
 
-  constructor(private readonly limits: ResolvedLimits) {}
+  constructor(
+    private readonly limits: ResolvedLimits,
+    private readonly reservation: MemoryReservation,
+  ) {}
 
   add(entry: StructuralIntegrationEntry): void {
     if (this.#entries >= this.limits.maxEntries) {
@@ -116,7 +121,10 @@ class PlanBudget {
       );
     }
     const bytes = retainedEntryBytes(entry);
-    if (bytes > this.limits.maxRetainedBytes - this.#planBytes - this.#prefixBytes) {
+    if (
+      this.limits.maxRetainedBytes !== undefined &&
+      bytes > this.limits.maxRetainedBytes - this.#planBytes - this.#prefixBytes
+    ) {
       throw new GitError(
         "E2BIG",
         `integration structure exceeds ${this.limits.maxRetainedBytes} retained bytes`,
@@ -124,14 +132,16 @@ class PlanBudget {
     }
     this.#entries++;
     this.#planBytes += bytes;
+    this.#sync();
   }
 
   replace(before: StructuralIntegrationEntry, after: StructuralIntegrationEntry): void {
     const beforeBytes = retainedEntryBytes(before);
     const afterBytes = retainedEntryBytes(after);
     if (
+      this.limits.maxRetainedBytes !== undefined &&
       afterBytes >
-      this.limits.maxRetainedBytes - (this.#planBytes - beforeBytes) - this.#prefixBytes
+        this.limits.maxRetainedBytes - (this.#planBytes - beforeBytes) - this.#prefixBytes
     ) {
       throw new GitError(
         "E2BIG",
@@ -139,20 +149,42 @@ class PlanBudget {
       );
     }
     this.#planBytes += afterBytes - beforeBytes;
+    this.#sync();
   }
 
   addPrefix(bytes: number): void {
-    if (bytes > this.limits.maxRetainedBytes - this.#planBytes - this.#prefixBytes) {
+    if (
+      this.limits.maxRetainedBytes !== undefined &&
+      bytes > this.limits.maxRetainedBytes - this.#planBytes - this.#prefixBytes
+    ) {
       throw new GitError(
         "E2BIG",
         `integration structure exceeds ${this.limits.maxRetainedBytes} retained bytes`,
       );
     }
     this.#prefixBytes += bytes;
+    this.#sync();
   }
 
   removePrefix(bytes: number): void {
     this.#prefixBytes -= bytes;
+    this.#sync();
+  }
+
+  finish(): void {
+    this.#prefixBytes = 0;
+    this.#sync();
+  }
+
+  clear(): void {
+    this.#entries = 0;
+    this.#planBytes = 0;
+    this.#prefixBytes = 0;
+    this.reservation.clear("other");
+  }
+
+  #sync(): void {
+    this.reservation.set("other", this.#planBytes + this.#prefixBytes);
   }
 }
 
@@ -195,15 +227,18 @@ function boundedLimit(value: number | undefined, ceiling: number, label: string)
   return value;
 }
 
+function optionalByteLimit(value: number | undefined): number | undefined {
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+    throw new RangeError("invalid integration structure retained-byte limit");
+  }
+  return value;
+}
+
 function resolveLimits(limits: IntegrationStructureLimits | undefined): ResolvedLimits {
   return {
     maxRows: boundedLimit(limits?.maxRows, MAX_INTEGRATION_STRUCTURE_ROWS, "row"),
     maxEntries: boundedLimit(limits?.maxEntries, MAX_INTEGRATION_STRUCTURE_ENTRIES, "entry"),
-    maxRetainedBytes: boundedLimit(
-      limits?.maxRetainedBytes,
-      MAX_INTEGRATION_STRUCTURE_BYTES,
-      "retained-byte",
-    ),
+    maxRetainedBytes: optionalByteLimit(limits?.maxRetainedBytes),
   };
 }
 
@@ -379,68 +414,84 @@ export function classifyStructuralStreams(
   currentEntries: Iterable<TargetEntry>,
   incomingEntries: Iterable<TargetEntry>,
   limits?: IntegrationStructureLimits,
+  reservation?: MemoryReservation,
 ): StructuralIntegrationPlan {
   const resolved = resolveLimits(limits);
-  const budget = new PlanBudget(resolved);
+  const local = reservation === undefined ? new MemoryCoordinator().reserve() : null;
+  const owner = reservation ?? local;
+  if (owner === null) throw new Error("integration structure memory owner is missing");
+  const budget = new PlanBudget(resolved, owner);
   const entries: StructuralIntegrationEntry[] = [];
   const prefixes: PrefixCandidate[] = [];
   let sourceRows = 0;
 
-  for (const row of joinSorted3(
-    validated(baseEntries, "base"),
-    validated(currentEntries, "current"),
-    validated(incomingEntries, "incoming"),
-    { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
-  )) {
-    if (sourceRows >= resolved.maxRows) {
-      throw new GitError("E2BIG", `integration structure exceeds ${resolved.maxRows} source rows`);
-    }
-    sourceRows++;
-    while (prefixes.length > 0) {
-      const candidate = prefixes[prefixes.length - 1];
-      if (candidate !== undefined && isDescendant(row.path, candidate.path)) break;
-      const expired = prefixes.pop();
-      if (expired !== undefined) budget.removePrefix(expired.retainedBytes);
-    }
-
-    const classified = classifyRow(row.path, row.a, row.b, row.c);
-    let entryIndex: number | null = null;
-
-    if (classified.occupiesPath && prefixes.length > 0) {
-      for (const prefix of prefixes) {
-        const replacement = fileDirectoryEntry(prefix.path, prefix.stages);
-        if (prefix.entryIndex === null) {
-          budget.add(replacement);
-          prefix.entryIndex = entries.length;
-          entries.push(replacement);
-        } else {
-          replaceEntry(entries, prefix.entryIndex, replacement, budget);
-        }
+  try {
+    for (const row of joinSorted3(
+      validated(baseEntries, "base"),
+      validated(currentEntries, "current"),
+      validated(incomingEntries, "incoming"),
+      { a: (entry) => entry.path, b: (entry) => entry.path, c: (entry) => entry.path },
+    )) {
+      if (sourceRows >= resolved.maxRows) {
+        throw new GitError(
+          "E2BIG",
+          `integration structure exceeds ${resolved.maxRows} source rows`,
+        );
       }
-      const replacement = fileDirectoryEntry(row.path, stages(row.a, row.b, row.c));
-      budget.add(replacement);
-      entryIndex = entries.length;
-      entries.push(replacement);
-    } else if (classified.entry !== null) {
-      budget.add(classified.entry);
-      entryIndex = entries.length;
-      entries.push(classified.entry);
+      sourceRows++;
+      while (prefixes.length > 0) {
+        const candidate = prefixes[prefixes.length - 1];
+        if (candidate !== undefined && isDescendant(row.path, candidate.path)) break;
+        const expired = prefixes.pop();
+        if (expired !== undefined) budget.removePrefix(expired.retainedBytes);
+      }
+
+      const classified = classifyRow(row.path, row.a, row.b, row.c);
+      let entryIndex: number | null = null;
+
+      if (classified.occupiesPath && prefixes.length > 0) {
+        for (const prefix of prefixes) {
+          const replacement = fileDirectoryEntry(prefix.path, prefix.stages);
+          if (prefix.entryIndex === null) {
+            budget.add(replacement);
+            prefix.entryIndex = entries.length;
+            entries.push(replacement);
+          } else {
+            replaceEntry(entries, prefix.entryIndex, replacement, budget);
+          }
+        }
+        const replacement = fileDirectoryEntry(row.path, stages(row.a, row.b, row.c));
+        budget.add(replacement);
+        entryIndex = entries.length;
+        entries.push(replacement);
+      } else if (classified.entry !== null) {
+        budget.add(classified.entry);
+        entryIndex = entries.length;
+        entries.push(classified.entry);
+      }
+
+      const canPrefixAnotherSide =
+        row.a === undefined || row.b === undefined || row.c === undefined;
+      if (classified.occupiesPath && canPrefixAnotherSide) {
+        const retainedBytes = retainedPrefixBytes(row.path, row.a, row.b, row.c);
+        budget.addPrefix(retainedBytes);
+        prefixes.push({
+          path: row.path,
+          stages: stages(row.a, row.b, row.c),
+          entryIndex,
+          retainedBytes,
+        });
+      }
     }
 
-    const canPrefixAnotherSide = row.a === undefined || row.b === undefined || row.c === undefined;
-    if (classified.occupiesPath && canPrefixAnotherSide) {
-      const retainedBytes = retainedPrefixBytes(row.path, row.a, row.b, row.c);
-      budget.addPrefix(retainedBytes);
-      prefixes.push({
-        path: row.path,
-        stages: stages(row.a, row.b, row.c),
-        entryIndex,
-        retainedBytes,
-      });
-    }
+    budget.finish();
+    return { entries, sourceRows };
+  } catch (error) {
+    budget.clear();
+    throw error;
+  } finally {
+    local?.dispose();
   }
-
-  return { entries, sourceRows };
 }
 
 /** Build a mutation-free structural delta from three authoritative tree cursors. */
@@ -449,6 +500,9 @@ export function classifyIntegrationStructure(
   input: IntegrationStructureInput,
 ): StructuralIntegrationPlan {
   resolveLimits(input.limits);
+  if (input.reservation !== undefined && !repo.store.ownsMemoryReservation(input.reservation)) {
+    throw new GitError("EINVAL", "integration structure reservation belongs to another repository");
+  }
   if (
     input.currentTreeOid === input.incomingTreeOid ||
     input.baseTreeOid === input.incomingTreeOid
@@ -469,6 +523,7 @@ export function classifyIntegrationStructure(
         stream.return(undefined);
       }
     }
+    input.reservation?.clear("other");
     return { entries: [], sourceRows: 0 };
   }
   return classifyStructuralStreams(
@@ -476,5 +531,6 @@ export function classifyIntegrationStructure(
     treeStream(repo, input.currentTreeOid),
     treeStream(repo, input.incomingTreeOid),
     input.limits,
+    input.reservation,
   );
 }

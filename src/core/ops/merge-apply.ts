@@ -1,17 +1,26 @@
 // Atomic low-level application and restoration of one projected merge plan.
 
-import type { WriteEntry } from "../../fs/types.js";
+import { nativeRealpathOwned, nativeScanOwned } from "../../fs/store/owned-read.js";
+import { scanPageRetainedBytes } from "../../fs/store/scan.js";
+import type { RealPath, ScanEntry, WriteEntry } from "../../fs/types.js";
+import type { MemoryReservation } from "../../memory.js";
 import {
   type IndexEntry,
   type IndexSink,
   type IndexStore,
+  indexScanOwned,
   MAX_BLOB_BATCH_BYTES,
+  readOperationStateOwned,
+  replaceOperationJournalOwned,
+  writeObjectsOwned,
+  writeOperationJournalOwned,
 } from "../../sqlite/store.js";
-import { fromHex, isOid, utf8, utf8Decoder } from "../bytes.js";
+import { fromHex, isOid, utf8Decoder } from "../bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../errors.js";
 import { hashObject, MODE_COMMIT, MODE_EXECUTABLE, MODE_FILE, MODE_SYMLINK } from "../objects.js";
 import { joinPath, relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { comparePaths } from "../streams.js";
 import { fileModeFor, type Worktree, type WorktreeStat } from "../worktree.js";
 import type { ProjectedMergeEntry } from "./merge-projection.js";
@@ -33,11 +42,22 @@ import {
   type OperationStepMetadata,
   operationJournalIntegrityOid,
   operationJournalRetainedBytes,
+  operationKindMismatch,
+  operationNotActive,
+  operationStepsForState,
   type RebaseStateMetadata,
+  validateOperationStepMetadata,
 } from "./operation-state.js";
+import { type HashedPath, hashExactWorktreePathsOwned } from "./worktree-io.js";
 
 const APPLY_SCAN_PAGE = 1_000;
-export const MAX_MERGE_APPLY_CONTENT_BYTES = 32 * 1024 * 1024;
+const COLLECTION_BASE_BYTES = 128;
+const COLLECTION_ENTRY_BYTES = 96;
+const OBJECT_BYTES = 192;
+const ARRAY_SLOT_BYTES = 8;
+const OBJECT_INFO_PAGE = 4_096;
+const OPERATION_STATE_FIXED_BYTES = 2 * 1024;
+const TOUCHED_DRAFT_FIXED_BYTES = 1024;
 
 export type MergeApplyMetadata = Omit<MergeStateMetadata, "phase">;
 export type MergeApplyOutcome = "clean" | "conflicted" | "ready";
@@ -50,6 +70,8 @@ export interface MergeApplyResult {
 export interface OperationApplyOptions {
   suspendedState: OperationStateMetadata | null;
 }
+
+type ApplyMemoryOwner = MemoryReservation | undefined;
 
 interface ActiveRebaseApply {
   expectedIntegrityOid: string;
@@ -73,12 +95,138 @@ interface SnapshotDraft {
   stat: WorktreeStat | null;
 }
 
+interface TouchedSpecs {
+  entries: TouchedSpec[];
+  dispose(): void;
+}
+
 interface WorktreeSnapshotScan {
   entries: Map<string, WorktreeStat>;
+  dispose(): void;
 }
 
 interface IndexSnapshots {
   entries: Map<string, MergeIndexSnapshot>;
+  dispose(): void;
+}
+
+interface SnapshotObjects {
+  entries: Map<string, HashedPath>;
+  dispose(): void;
+}
+
+interface ContentObjects {
+  entries: Map<string, string>;
+  dispose(): void;
+}
+
+interface BlobMetadata {
+  sizes: ReadonlyMap<string, number>;
+  dispose(): void;
+}
+
+interface AdmittedBlobBatch {
+  end: number;
+  blobs: ReadonlyMap<string, Uint8Array>;
+  dispose(): void;
+}
+
+interface OwnedPaths {
+  entries: string[];
+  dispose(): void;
+}
+
+function checkedMemoryBytes(current: number, added: number, label: string): number {
+  if (
+    !Number.isSafeInteger(current) ||
+    current < 0 ||
+    !Number.isSafeInteger(added) ||
+    added < 0 ||
+    added > Number.MAX_SAFE_INTEGER - current
+  ) {
+    throw new GitError("E2BIG", `${label} memory accounting overflow`);
+  }
+  return current + added;
+}
+
+function retainedArrayBytes(length: number): number {
+  if (!Number.isSafeInteger(length) || length < 0) {
+    throw new GitError("E2BIG", "merge apply array memory accounting overflow");
+  }
+  return checkedMemoryBytes(COLLECTION_BASE_BYTES, length * ARRAY_SLOT_BYTES, "merge apply array");
+}
+
+function retainedIdentityBytes(identity: { mode: string; oid: string }): number {
+  return checkedMemoryBytes(
+    OBJECT_BYTES,
+    retainedStringBytes(identity.mode) + retainedStringBytes(identity.oid),
+    "projected merge identity",
+  );
+}
+
+function projectedEntriesRetainedBytes(entries: readonly ProjectedMergeEntry[]): number {
+  let bytes = retainedArrayBytes(entries.length);
+  for (const entry of entries) {
+    bytes = checkedMemoryBytes(
+      bytes,
+      OBJECT_BYTES + retainedStringBytes(entry.path) + retainedStringBytes(entry.logicalPath),
+      "projected merge entries",
+    );
+    if (entry.stageZero !== null) {
+      bytes = checkedMemoryBytes(
+        bytes,
+        retainedIdentityBytes(entry.stageZero),
+        "projected merge entries",
+      );
+    }
+    if (entry.stages !== null) {
+      bytes = checkedMemoryBytes(bytes, OBJECT_BYTES, "projected merge entries");
+      for (const identity of [entry.stages.base, entry.stages.current, entry.stages.incoming]) {
+        if (identity !== null) {
+          bytes = checkedMemoryBytes(
+            bytes,
+            retainedIdentityBytes(identity),
+            "projected merge entries",
+          );
+        }
+      }
+    }
+    if (entry.worktree !== null) {
+      bytes = checkedMemoryBytes(
+        bytes,
+        retainedIdentityBytes(entry.worktree),
+        "projected merge entries",
+      );
+    }
+    if (entry.content !== null) {
+      bytes = checkedMemoryBytes(
+        bytes,
+        OBJECT_BYTES + entry.content.byteLength,
+        "projected merge entries",
+      );
+    }
+  }
+  return bytes;
+}
+
+function withApplyMemory<T>(
+  repo: Repository,
+  owner: ApplyMemoryOwner,
+  localCallerRetainedBytes: number,
+  body: (reservation: MemoryReservation) => T,
+  retainsResult: (result: T) => boolean,
+): T {
+  const reservation =
+    owner === undefined ? repo.store.reserveMemory() : repo.store.scopeMemoryReservation(owner);
+  let keep = false;
+  try {
+    if (owner === undefined) reservation.set("other", localCallerRetainedBytes);
+    const result = body(reservation);
+    keep = owner !== undefined && retainsResult(result);
+    return result;
+  } finally {
+    if (!keep) reservation.dispose();
+  }
 }
 
 function validMode(mode: string): boolean {
@@ -99,7 +247,6 @@ export function validateProjectedIndexEntries(entries: readonly ProjectedMergeEn
     throw new GitError("E2BIG", `merge apply exceeds ${MAX_MERGE_TOUCHED_PATHS} projected paths`);
   }
   let previous: string | null = null;
-  let contentBytes = 0;
   for (const entry of entries) {
     validateMergePath(entry.path, "projected path");
     validateMergePath(entry.logicalPath, "projected logical path");
@@ -160,18 +307,11 @@ export function validateProjectedIndexEntries(entries: readonly ProjectedMergeEn
     ) {
       throw new CorruptError(`merged content identity does not match ${entry.path}`);
     }
-    contentBytes += entry.content?.length ?? 0;
-    if (!Number.isSafeInteger(contentBytes) || contentBytes > MAX_MERGE_APPLY_CONTENT_BYTES) {
-      throw new GitError(
-        "E2BIG",
-        `merge apply content exceeds ${MAX_MERGE_APPLY_CONTENT_BYTES} bytes`,
-      );
-    }
     previous = entry.path;
   }
 }
 
-function boundedUtf8Length(value: string, limit: number, label: string): number {
+function canonicalUtf8Length(value: string, label: string): number {
   let bytes = 0;
   for (let index = 0; index < value.length; index++) {
     const unit = value.charCodeAt(index);
@@ -185,46 +325,153 @@ function boundedUtf8Length(value: string, limit: number, label: string): number 
     } else {
       bytes += unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
     }
-    if (bytes > limit) throw new GitError("E2BIG", `${label} exceeds ${limit} bytes`);
+    if (!Number.isSafeInteger(bytes)) {
+      throw new GitError("E2BIG", `${label} memory accounting overflow`);
+    }
   }
   return bytes;
 }
 
-function touchedSpecs(entries: readonly ProjectedMergeEntry[]): TouchedSpec[] {
+function operationIdentityRetainedBytes(identity: { name: string; email: string } | null): number {
+  if (identity === null) return 0;
+  return checkedMemoryBytes(
+    canonicalUtf8Length(identity.name, "operation identity name"),
+    canonicalUtf8Length(identity.email, "operation identity email"),
+    "operation identity",
+  );
+}
+
+function operationHeaderDraftRetainedBytes(state: OperationStateMetadata): number {
+  let bytes = OPERATION_STATE_FIXED_BYTES;
+  for (const value of [
+    state.originalHeadRef,
+    state.currentLabel,
+    state.incomingLabel,
+    state.message,
+  ]) {
+    bytes = checkedMemoryBytes(
+      bytes,
+      canonicalUtf8Length(value, "operation journal text"),
+      "operation journal header",
+    );
+  }
+  bytes = checkedMemoryBytes(bytes, 40, "operation journal header");
+  bytes = checkedMemoryBytes(
+    bytes,
+    operationIdentityRetainedBytes(state.author),
+    "operation journal header",
+  );
+  bytes = checkedMemoryBytes(
+    bytes,
+    operationIdentityRetainedBytes(state.committer),
+    "operation journal header",
+  );
+  if (state.kind === "merge") {
+    return checkedMemoryBytes(bytes, 80 + state.mergeOrigin.length, "operation journal header");
+  }
+  return state.kind === "rebase"
+    ? checkedMemoryBytes(bytes, 120, "operation journal header")
+    : bytes;
+}
+
+function operationJournalDraftRetainedBytes(
+  state: OperationStateMetadata,
+  drafts: readonly SnapshotDraft[],
+  steps: readonly OperationStepMetadata[] | undefined,
+): number {
+  let bytes = operationHeaderDraftRetainedBytes(state);
+  const sequence = steps ?? (state.kind === "rebase" ? [] : operationStepsForState(state));
+  for (const step of sequence) {
+    bytes = checkedMemoryBytes(
+      bytes,
+      validateOperationStepMetadata(step),
+      "operation journal steps",
+    );
+  }
+  for (const draft of drafts) {
+    let touchedBytes = TOUCHED_DRAFT_FIXED_BYTES;
+    touchedBytes = checkedMemoryBytes(
+      touchedBytes,
+      canonicalUtf8Length(draft.spec.path, "operation touched path") * 2,
+      "operation touched draft",
+    );
+    touchedBytes = checkedMemoryBytes(
+      touchedBytes,
+      canonicalUtf8Length(draft.spec.logicalPath, "operation logical path") * 2,
+      "operation touched draft",
+    );
+    if (draft.index !== null) {
+      touchedBytes = checkedMemoryBytes(touchedBytes, 256, "operation touched draft");
+    }
+    if (draft.stat !== null) {
+      touchedBytes = checkedMemoryBytes(
+        touchedBytes,
+        draft.stat.type === "dir" ? 128 : 256,
+        "operation touched draft",
+      );
+    }
+    bytes = checkedMemoryBytes(bytes, touchedBytes, "operation journal touched drafts");
+  }
+  return bytes;
+}
+
+function touchedSpecs(
+  entries: readonly ProjectedMergeEntry[],
+  reservation: MemoryReservation,
+): TouchedSpecs {
+  const memory = reservation.scope();
+  let retainedBytes = COLLECTION_BASE_BYTES;
+  memory.set("other", retainedBytes);
   const byPath = new Map<string, TouchedSpec>();
-  const retain = (spec: TouchedSpec): void => {
-    if (byPath.has(spec.path)) return;
+  const retain = (
+    path: string,
+    logicalPath: string,
+    purpose: MergeTouchedPath["purpose"],
+    ownedStringBytes: number,
+  ): void => {
+    if (byPath.has(path)) return;
     if (byPath.size >= MAX_MERGE_TOUCHED_PATHS) {
       throw new GitError("E2BIG", `merge journal exceeds ${MAX_MERGE_TOUCHED_PATHS} touched paths`);
     }
+    retainedBytes = checkedMemoryBytes(
+      retainedBytes,
+      COLLECTION_ENTRY_BYTES + OBJECT_BYTES + ownedStringBytes,
+      "merge touched paths",
+    );
+    memory.set("other", retainedBytes);
+    const spec: TouchedSpec = { path, logicalPath, purpose };
     byPath.set(spec.path, spec);
   };
   const retainAncestor = (path: string): void => {
     let slash = path.lastIndexOf("/");
     while (slash > 0) {
-      const ancestor = path.slice(0, slash);
-      retain({ path: ancestor, logicalPath: ancestor, purpose: "primary" });
-      slash = ancestor.lastIndexOf("/");
+      const sliceMemory = reservation.scope();
+      sliceMemory.set("other", 48 + slash * 2);
+      try {
+        const ancestor = path.slice(0, slash);
+        retain(ancestor, ancestor, "primary", retainedStringBytes(ancestor));
+        slash = ancestor.lastIndexOf("/");
+      } finally {
+        sliceMemory.dispose();
+      }
     }
   };
   for (const entry of entries) {
-    retain({
-      path: entry.path,
-      logicalPath: entry.logicalPath,
-      purpose: entry.purpose,
-    });
+    retain(entry.path, entry.logicalPath, entry.purpose, 0);
     if (entry.purpose !== "primary" && !byPath.has(entry.logicalPath)) {
-      retain({
-        path: entry.logicalPath,
-        logicalPath: entry.logicalPath,
-        purpose: "primary",
-      });
+      retain(entry.logicalPath, entry.logicalPath, "primary", 0);
     }
     retainAncestor(entry.path);
     retainAncestor(entry.logicalPath);
   }
+  retainedBytes = checkedMemoryBytes(
+    retainedBytes,
+    retainedArrayBytes(byPath.size),
+    "merge touched paths",
+  );
+  memory.set("other", retainedBytes);
   const specs = [...byPath.values()].sort((left, right) => comparePaths(left.path, right.path));
-  return specs;
+  return { entries: specs, dispose: () => memory.dispose() };
 }
 
 function lowerBound(paths: readonly string[], wanted: string): number {
@@ -256,15 +503,37 @@ function destructiveOwner(path: string, roots: readonly string[]): string | null
   return previous !== undefined && path.startsWith(`${previous}/`) ? previous : null;
 }
 
-function minimalRoots(paths: readonly string[]): string[] {
-  const roots: string[] = [];
-  for (const path of paths) {
-    const previous = roots[roots.length - 1];
-    if (previous === undefined || (path !== previous && !path.startsWith(`${previous}/`))) {
-      roots.push(path);
-    }
-  }
-  return roots;
+function pathDescendsFrom(path: string, root: string): boolean {
+  return path.length > root.length && path.startsWith(root) && path.charCodeAt(root.length) === 47;
+}
+
+function worktreeRealpathOwned(
+  worktree: Worktree,
+  path: string,
+  reservation: MemoryReservation,
+): RealPath {
+  const native = nativeRealpathOwned(worktree, path, reservation);
+  if (native !== null) return native;
+  const resolved = worktree.realpath(path);
+  reservation.set("other", retainedStringBytes(resolved));
+  return resolved;
+}
+
+function worktreeScanPageOwned(
+  worktree: Worktree,
+  root: RealPath,
+  after: string | undefined,
+  reservation: MemoryReservation,
+): ScanEntry[] {
+  const native = nativeScanOwned(worktree, root, { after, limit: APPLY_SCAN_PAGE }, reservation);
+  if (native !== null) return native;
+  const page = worktree.scan(root, { after, limit: APPLY_SCAN_PAGE });
+  reservation.set("other", scanPageRetainedBytes(page));
+  return page;
+}
+
+function retainedScanEntryBytes(entry: ScanEntry): number {
+  return scanPageRetainedBytes([entry]) - scanPageRetainedBytes([]);
 }
 
 function worktreeSnapshotScan(
@@ -273,26 +542,94 @@ function worktreeSnapshotScan(
   specs: readonly TouchedSpec[],
   destructiveRoots: readonly string[],
   ownedPaths: readonly string[],
+  reservation: MemoryReservation,
 ): WorktreeSnapshotScan {
-  const root = worktree.realpath(repo.root);
-  const absoluteToRelative = new Map(specs.map((spec) => [joinPath(root, spec.path), spec.path]));
-  const absoluteDestructive = minimalRoots(destructiveRoots)
-    .map((path) => joinPath(root, path))
-    .sort(comparePaths);
-  const exactOwned = new Set(ownedPaths);
+  const memory = reservation.scope();
+  const rootMemory = memory.scope();
+  const root = worktreeRealpathOwned(worktree, repo.root, rootMemory);
+  let destructiveCount = 0;
+  let previousDestructive: string | null = null;
+  let structureBytes = COLLECTION_BASE_BYTES * 2;
+  for (const spec of specs) {
+    structureBytes = checkedMemoryBytes(
+      structureBytes,
+      COLLECTION_ENTRY_BYTES + retainedJoinedPathBytes(root, spec.path),
+      "merge worktree scan",
+    );
+  }
+  for (const path of destructiveRoots) {
+    if (previousDestructive !== null && pathDescendsFrom(path, previousDestructive)) continue;
+    previousDestructive = path;
+    destructiveCount++;
+    structureBytes = checkedMemoryBytes(
+      structureBytes,
+      ARRAY_SLOT_BYTES + retainedJoinedPathBytes(root, path),
+      "merge worktree scan",
+    );
+  }
+  structureBytes = checkedMemoryBytes(
+    structureBytes,
+    COLLECTION_BASE_BYTES + ownedPaths.length * COLLECTION_ENTRY_BYTES,
+    "merge worktree scan",
+  );
+  memory.set("other", structureBytes);
+  const absoluteToRelative = new Map<string, string>();
+  const absoluteDestructive: string[] = [];
+  const exactOwned = new Set<string>();
+  let lastAbsolute: string | null = null;
+  for (const spec of specs) {
+    const absolute = joinPath(root, spec.path);
+    absoluteToRelative.set(absolute, spec.path);
+    lastAbsolute = absolute;
+  }
+  previousDestructive = null;
+  for (const path of destructiveRoots) {
+    if (previousDestructive !== null && pathDescendsFrom(path, previousDestructive)) continue;
+    previousDestructive = path;
+    absoluteDestructive.push(joinPath(root, path));
+  }
+  absoluteDestructive.sort(comparePaths);
+  if (absoluteDestructive.length !== destructiveCount) {
+    throw new CorruptError("merge destructive root accounting differs from its selection");
+  }
+  for (const path of ownedPaths) exactOwned.add(path);
+  let foundBytes = COLLECTION_BASE_BYTES;
+  const foundMemory = reservation.scope();
+  foundMemory.set("other", foundBytes);
   const found = new Map<string, WorktreeStat>();
-  const last = specs[specs.length - 1];
-  if (last === undefined) return { entries: found };
-  const lastAbsolute = joinPath(root, last.path);
+  if (lastAbsolute === null) {
+    rootMemory.dispose();
+    memory.dispose();
+    return { entries: found, dispose: () => foundMemory.dispose() };
+  }
+  const cursorMemory = memory.scope();
   let after: string | undefined;
   while (true) {
-    const page = worktree.scan(root, { after, limit: APPLY_SCAN_PAGE });
-    if (page.length === 0) break;
+    const pageMemory = memory.scope();
+    const page = worktreeScanPageOwned(worktree, root, after, pageMemory);
+    if (page.length === 0) {
+      pageMemory.dispose();
+      break;
+    }
+    let transferredBytes = 0;
     for (const entry of page) {
       const relative = relativeTo(root, entry.path);
       if (relative === null) throw new CorruptError("worktree scan escaped the repository root");
       const exact = absoluteToRelative.get(entry.path);
-      if (exact !== undefined) found.set(exact, entry);
+      if (exact !== undefined && !found.has(exact)) {
+        foundBytes = checkedMemoryBytes(
+          foundBytes,
+          COLLECTION_ENTRY_BYTES,
+          "merge worktree snapshots",
+        );
+        foundMemory.set("other", foundBytes);
+        transferredBytes = checkedMemoryBytes(
+          transferredBytes,
+          retainedScanEntryBytes(entry),
+          "merge worktree snapshots",
+        );
+        found.set(exact, entry);
+      }
       const owner = destructiveOwner(entry.path, absoluteDestructive);
       if (
         owner !== null &&
@@ -307,32 +644,57 @@ function worktreeSnapshotScan(
       if (comparePaths(entry.path, lastAbsolute) > 0 && owner === null) break;
     }
     const tail = page[page.length - 1];
-    if (tail === undefined || page.length < APPLY_SCAN_PAGE) break;
-    if (after !== undefined && comparePaths(tail.path, after) <= 0) {
+    const finished = tail === undefined || page.length < APPLY_SCAN_PAGE;
+    if (tail !== undefined && after !== undefined && comparePaths(tail.path, after) <= 0) {
       throw new CorruptError("merge worktree scan cursor made no progress");
     }
-    if (
+    const beyondOwned =
+      tail !== undefined &&
       comparePaths(tail.path, lastAbsolute) > 0 &&
-      destructiveOwner(tail.path, absoluteDestructive) === null
-    ) {
-      break;
+      destructiveOwner(tail.path, absoluteDestructive) === null;
+    if (!finished && !beyondOwned && tail !== undefined) {
+      cursorMemory.set("other", retainedStringBytes(tail.path));
+      after = tail.path;
     }
-    after = tail.path;
+    pageMemory.dispose();
+    foundBytes = checkedMemoryBytes(foundBytes, transferredBytes, "merge worktree snapshots");
+    foundMemory.set("other", foundBytes);
+    if (finished || beyondOwned) break;
   }
-  return { entries: found };
+  rootMemory.dispose();
+  memory.dispose();
+  return { entries: found, dispose: () => foundMemory.dispose() };
 }
 
-function indexSnapshots(repo: Repository, specs: readonly TouchedSpec[]): IndexSnapshots {
-  const wanted = new Set(specs.map((spec) => spec.path));
+function indexSnapshots(
+  repo: Repository,
+  specs: readonly TouchedSpec[],
+  reservation: MemoryReservation,
+): IndexSnapshots {
+  const memory = reservation.scope();
+  let retainedBytes =
+    COLLECTION_BASE_BYTES + COLLECTION_BASE_BYTES + specs.length * COLLECTION_ENTRY_BYTES;
+  memory.set("other", retainedBytes);
+  const wanted = new Set<string>();
   const found = new Map<string, MergeIndexSnapshot>();
+  for (const spec of specs) wanted.add(spec.path);
   const last = specs[specs.length - 1];
-  if (last === undefined) return { entries: found };
-  for (const entry of repo.checkout.indexScan()) {
+  if (last === undefined) return { entries: found, dispose: () => memory.dispose() };
+  for (const entry of indexScanOwned(repo.checkout, memory)) {
     if (comparePaths(entry.path, last.path) > 0) break;
     if (!wanted.has(entry.path)) continue;
     if (entry.stage !== 0) {
       throw new GitError("EUNMERGED", "cannot apply a merge over unmerged index entries");
     }
+    retainedBytes = checkedMemoryBytes(
+      retainedBytes,
+      COLLECTION_ENTRY_BYTES +
+        OBJECT_BYTES +
+        retainedStringBytes(entry.path) +
+        retainedStringBytes(entry.oid),
+      "merge index snapshots",
+    );
+    memory.set("other", retainedBytes);
     found.set(entry.path, {
       stage: 0,
       mode: entry.mode,
@@ -343,75 +705,47 @@ function indexSnapshots(repo: Repository, specs: readonly TouchedSpec[]): IndexS
       rev: entry.rev ?? null,
     });
   }
-  return { entries: found };
+  return { entries: found, dispose: () => memory.dispose() };
 }
 
 function snapshotWorktreeObjects(
   repo: Repository,
   worktree: Worktree,
-  root: string,
   drafts: readonly SnapshotDraft[],
-): Map<string, string> {
-  const oids = new Map<string, string>();
-  const files: string[] = [];
-  const snapshotLimit = 4 * MAX_BLOB_BATCH_BYTES;
-  let snapshotBytes = 0;
+  reservation: MemoryReservation,
+): SnapshotObjects {
+  const snapshotMemory = reservation.scope();
+  const pathsMemory = reservation.scope();
+  let retainedBytes = retainedArrayBytes(drafts.length);
+  pathsMemory.set("other", retainedBytes);
+  const paths: { path: string; stat: WorktreeStat }[] = [];
   for (const draft of drafts) {
     const stat = draft.stat;
-    if (stat?.type === "file") {
-      if (stat.size > MAX_BLOB_BATCH_BYTES) {
-        throw new GitError(
-          "E2BIG",
-          `merge snapshot file ${draft.spec.path} exceeds ${MAX_BLOB_BATCH_BYTES} bytes`,
-        );
-      }
-      snapshotBytes += stat.size;
-    } else if (stat?.type === "symlink") {
+    if (stat?.type === "symlink") {
       if (stat.target === null) {
         throw new CorruptError(`worktree symlink ${draft.spec.path} has no target`);
       }
-      snapshotBytes += boundedUtf8Length(
-        stat.target,
-        MAX_BLOB_BATCH_BYTES,
-        `merge snapshot symlink ${draft.spec.path}`,
-      );
+      canonicalUtf8Length(stat.target, `merge snapshot symlink ${draft.spec.path}`);
     }
-    if (!Number.isSafeInteger(snapshotBytes) || snapshotBytes > snapshotLimit) {
-      throw new GitError("E2BIG", `merge worktree snapshot exceeds ${snapshotLimit} bytes`);
+    if (stat?.type === "file" || stat?.type === "symlink") {
+      retainedBytes = checkedMemoryBytes(retainedBytes, OBJECT_BYTES, "merge snapshot inputs");
+      pathsMemory.set("other", retainedBytes);
+      paths.push({ path: draft.spec.path, stat });
     }
   }
-  repo.store.writeObjects((batch) => {
-    for (const draft of drafts) {
-      if (draft.stat?.type === "symlink") {
-        if (draft.stat.target === null) throw new CorruptError("validated symlink lost its target");
-        oids.set(draft.spec.path, batch.write("blob", utf8.encode(draft.stat.target)));
-      } else if (draft.stat?.type === "file") {
-        files.push(joinPath(root, draft.spec.path));
-      }
-    }
-    let remaining = files;
-    while (remaining.length > 0) {
-      const read = worktree.readFiles(remaining, { budget: MAX_BLOB_BATCH_BYTES });
-      for (const [absolute, bytes] of read.files) {
-        const relative = relativeTo(root, absolute);
-        if (relative === null) throw new CorruptError("merge snapshot read escaped repository");
-        oids.set(relative, batch.write("blob", bytes));
-      }
-      if (read.remaining.length >= remaining.length) {
-        throw new CorruptError("merge snapshot file batch made no progress");
-      }
-      remaining = read.remaining;
-    }
+  const hashed = hashExactWorktreePathsOwned(repo, worktree, paths, snapshotMemory, {
+    write: true,
   });
+  pathsMemory.dispose();
   for (const draft of drafts) {
     if (
       (draft.stat?.type === "file" || draft.stat?.type === "symlink") &&
-      !oids.has(draft.spec.path)
+      !hashed.has(draft.spec.path)
     ) {
       throw new CorruptError(`merge snapshot lost worktree path ${draft.spec.path}`);
     }
   }
-  return oids;
+  return { entries: hashed, dispose: () => snapshotMemory.dispose() };
 }
 
 function worktreeSnapshot(draft: SnapshotDraft, oid: string | undefined): MergeWorktreeSnapshot {
@@ -424,42 +758,292 @@ function worktreeSnapshot(draft: SnapshotDraft, oid: string | undefined): MergeW
 
 function touchedFromDrafts(
   drafts: readonly SnapshotDraft[],
-  oids: ReadonlyMap<string, string> | null,
+  snapshots: ReadonlyMap<string, HashedPath> | null,
 ): MergeTouchedPath[] {
   return drafts.map((draft) => ({
     path: draft.spec.path,
     logicalPath: draft.spec.logicalPath,
     purpose: draft.spec.purpose,
     index: draft.index,
-    worktree: worktreeSnapshot(draft, oids === null ? "0".repeat(40) : oids.get(draft.spec.path)),
+    worktree: worktreeSnapshot(
+      draft,
+      snapshots === null ? "0".repeat(40) : snapshots.get(draft.spec.path)?.oid,
+    ),
   }));
 }
 
-function validateSourceBlobs(repo: Repository, entries: readonly ProjectedMergeEntry[]): void {
+function collectBlobMetadata<T>(
+  repo: Repository,
+  entries: readonly T[],
+  oidOf: (entry: T) => string | null,
+  label: "merge output" | "merge abort",
+  reservation: MemoryReservation,
+): BlobMetadata {
+  const retainedMemory = reservation.scope();
+  const buildMemory = reservation.scope();
+  let buildBytes = COLLECTION_BASE_BYTES * 2;
+  buildMemory.set("other", buildBytes);
   const seen = new Set<string>();
   const oids: string[] = [];
-  for (const entry of entries) {
-    const identity = entry.content === null ? entry.worktree : null;
-    if (identity === null || seen.has(identity.oid)) continue;
-    seen.add(identity.oid);
-    oids.push(identity.oid);
-  }
-  if (oids.length === 0) return;
-  const sizeByOid = new Map<string, number>();
-  for (const object of repo.store.objectInfo(oids)) {
-    if (object.type !== "blob") {
-      throw new CorruptError(`merge output object ${object.oid} is not a blob`);
+  try {
+    for (const entry of entries) {
+      const oid = oidOf(entry);
+      if (oid === null || seen.has(oid)) continue;
+      buildBytes = checkedMemoryBytes(
+        buildBytes,
+        COLLECTION_ENTRY_BYTES + ARRAY_SLOT_BYTES,
+        `${label} metadata inputs`,
+      );
+      buildMemory.set("other", buildBytes);
+      seen.add(oid);
+      oids.push(oid);
     }
-    if (object.size > MAX_BLOB_BATCH_BYTES) {
-      throw new GitError("E2BIG", `merge blob object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
+
+    let retainedBytes = COLLECTION_BASE_BYTES;
+    retainedMemory.set("other", retainedBytes);
+    const sizes = new Map<string, number>();
+    for (let offset = 0; offset < oids.length; offset += OBJECT_INFO_PAGE) {
+      const length = Math.min(OBJECT_INFO_PAGE, oids.length - offset);
+      const pageMemory = reservation.scope();
+      let pageBytes = retainedArrayBytes(length);
+      for (let ordinal = 0; ordinal < length; ordinal++) {
+        const oid = oids[offset + ordinal];
+        if (oid === undefined) throw new CorruptError(`${label} metadata input is incomplete`);
+        pageBytes = checkedMemoryBytes(
+          pageBytes,
+          OBJECT_BYTES + retainedStringBytes(oid),
+          `${label} metadata page`,
+        );
+      }
+      pageMemory.set("other", pageBytes);
+      try {
+        const page = oids.slice(offset, offset + length);
+        for (const object of repo.store.objectInfo(page)) {
+          if (object.type !== "blob") {
+            throw new CorruptError(`${label} object ${object.oid} is not a blob`);
+          }
+          if (object.size > MAX_BLOB_BATCH_BYTES) {
+            throw new GitError("E2BIG", `merge blob object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
+          }
+          retainedBytes = checkedMemoryBytes(
+            retainedBytes,
+            COLLECTION_ENTRY_BYTES + retainedStringBytes(object.oid),
+            `${label} metadata`,
+          );
+          retainedMemory.set("other", retainedBytes);
+          sizes.set(object.oid, object.size);
+        }
+      } finally {
+        pageMemory.dispose();
+      }
     }
-    sizeByOid.set(object.oid, object.size);
+    for (const oid of oids) {
+      if (!sizes.has(oid)) throw new CorruptError(`${label} lost object ${oid}`);
+    }
+    return { sizes, dispose: () => retainedMemory.dispose() };
+  } catch (error) {
+    retainedMemory.dispose();
+    throw error;
+  } finally {
+    buildMemory.dispose();
   }
-  for (const entry of entries) {
-    const identity = entry.content === null ? entry.worktree : null;
-    if (identity === null) continue;
-    const size = sizeByOid.get(identity.oid);
-    if (size === undefined) throw new CorruptError(`merge output lost object ${identity.oid}`);
+}
+
+function validateSourceBlobs(
+  repo: Repository,
+  entries: readonly ProjectedMergeEntry[],
+  reservation: MemoryReservation,
+): BlobMetadata {
+  return collectBlobMetadata(
+    repo,
+    entries,
+    (entry) => (entry.content === null ? (entry.worktree?.oid ?? null) : null),
+    "merge output",
+    reservation,
+  );
+}
+
+function retainedJoinedPathBytes(root: string, path: string): number {
+  return 48 + (root.length + path.length + 1) * 2;
+}
+
+function blobBatchRetainedBytes<T>(
+  repo: Repository,
+  entries: readonly T[],
+  start: number,
+  end: number,
+  oidCount: number,
+  resultCount: number,
+  remainingCount: number,
+  payloadBytes: number,
+  pathOf: (entry: T) => string,
+  symlinkOf: (entry: T) => boolean,
+  sizeOf: (entry: T) => number,
+  label: string,
+): number {
+  let bytes = COLLECTION_BASE_BYTES * 4;
+  bytes = checkedMemoryBytes(bytes, retainedArrayBytes(oidCount), label);
+  bytes = checkedMemoryBytes(bytes, retainedArrayBytes(end - start), label);
+  bytes = checkedMemoryBytes(bytes, retainedArrayBytes(remainingCount), label);
+  bytes = checkedMemoryBytes(
+    bytes,
+    (oidCount * 2 + resultCount * 2) * COLLECTION_ENTRY_BYTES,
+    label,
+  );
+  bytes = checkedMemoryBytes(bytes, payloadBytes, label);
+  for (let index = start; index < end; index++) {
+    const entry = entries[index];
+    if (entry === undefined) throw new CorruptError(`${label} selection is incomplete`);
+    let writeBytes = OBJECT_BYTES + 20 + retainedJoinedPathBytes(repo.root, pathOf(entry));
+    if (symlinkOf(entry)) {
+      writeBytes = checkedMemoryBytes(writeBytes, 48 + sizeOf(entry) * 2, label);
+    }
+    bytes = checkedMemoryBytes(bytes, writeBytes, label);
+  }
+  return bytes;
+}
+
+function readAdmittedBlobBatch<T>(
+  repo: Repository,
+  entries: readonly T[],
+  start: number,
+  metadata: BlobMetadata,
+  reservation: MemoryReservation,
+  pathOf: (entry: T) => string,
+  oidOf: (entry: T) => string,
+  symlinkOf: (entry: T) => boolean,
+  label: string,
+): AdmittedBlobBatch {
+  const memory = reservation.scope();
+  let end = start;
+  let payloadBytes = 0;
+  memory.set(
+    "other",
+    blobBatchRetainedBytes(
+      repo,
+      entries,
+      start,
+      start,
+      0,
+      0,
+      0,
+      0,
+      pathOf,
+      symlinkOf,
+      () => 0,
+      label,
+    ),
+  );
+  const selected = new Set<string>();
+  try {
+    while (end < entries.length) {
+      const entry = entries[end];
+      if (entry === undefined) throw new CorruptError(`${label} selection is incomplete`);
+      const oid = oidOf(entry);
+      const size = metadata.sizes.get(oid);
+      if (size === undefined) throw new CorruptError(`${label} lost object ${oid}`);
+      const nextPayload = selected.has(oid)
+        ? payloadBytes
+        : checkedMemoryBytes(payloadBytes, size, label);
+      if (nextPayload > MAX_BLOB_BATCH_BYTES && end > start) break;
+      const nextOids = selected.has(oid) ? selected.size : selected.size + 1;
+      if (nextOids > OBJECT_INFO_PAGE && end > start) break;
+      const nextBytes = blobBatchRetainedBytes(
+        repo,
+        entries,
+        start,
+        end + 1,
+        nextOids,
+        nextOids,
+        0,
+        nextPayload,
+        pathOf,
+        symlinkOf,
+        (candidate) => {
+          const candidateSize = metadata.sizes.get(oidOf(candidate));
+          if (candidateSize === undefined) {
+            throw new CorruptError(`${label} lost object ${oidOf(candidate)}`);
+          }
+          return candidateSize;
+        },
+        label,
+      );
+      const availableBytes = checkedMemoryBytes(
+        memory.currentBytes,
+        reservation.remainingBytes,
+        label,
+      );
+      if (nextBytes > availableBytes) {
+        if (end === start) memory.set("other", nextBytes);
+        break;
+      }
+      memory.set("other", nextBytes);
+      selected.add(oid);
+      payloadBytes = nextPayload;
+      end++;
+    }
+    if (end === start) throw new CorruptError(`${label} made no progress`);
+    const oids = [...selected];
+    const read = repo.readBlobs(oids, { budgetBytes: Math.max(1, payloadBytes) });
+    let actualPayloadBytes = 0;
+    let returnedOids = 0;
+    for (let index = 0; index < oids.length; index++) {
+      const oid = oids[index];
+      if (oid === undefined) throw new CorruptError(`${label} admitted object list is incomplete`);
+      const bytes = read.blobs.get(oid);
+      if (bytes === undefined) break;
+      const expectedSize = metadata.sizes.get(oid);
+      if (expectedSize === undefined || bytes.byteLength !== expectedSize) {
+        throw new CorruptError(`${label} object ${oid} differs from its admitted metadata`);
+      }
+      actualPayloadBytes = checkedMemoryBytes(actualPayloadBytes, bytes.byteLength, label);
+      returnedOids++;
+    }
+    memory.set(
+      "other",
+      blobBatchRetainedBytes(
+        repo,
+        entries,
+        start,
+        end,
+        oids.length,
+        read.blobs.size,
+        read.remaining.length,
+        actualPayloadBytes,
+        pathOf,
+        symlinkOf,
+        (entry) => {
+          const size = metadata.sizes.get(oidOf(entry));
+          if (size === undefined) throw new CorruptError(`${label} lost object ${oidOf(entry)}`);
+          return size;
+        },
+        label,
+      ),
+    );
+    if (
+      returnedOids === 0 ||
+      read.blobs.size !== returnedOids ||
+      read.remaining.length !== oids.length - returnedOids ||
+      read.bytes !== actualPayloadBytes
+    ) {
+      throw new CorruptError(`${label} did not match its admitted payload`);
+    }
+    for (let index = returnedOids; index < oids.length; index++) {
+      if (read.remaining[index - returnedOids] !== oids[index]) {
+        throw new CorruptError(`${label} deferred a non-prefix object`);
+      }
+    }
+    let actualEnd = start;
+    while (actualEnd < end) {
+      const entry = entries[actualEnd];
+      if (entry === undefined || !read.blobs.has(oidOf(entry))) break;
+      actualEnd++;
+    }
+    if (actualEnd === start) throw new CorruptError(`${label} made no progress`);
+    return { end: actualEnd, blobs: read.blobs, dispose: () => memory.dispose() };
+  } catch (error) {
+    memory.dispose();
+    throw error;
   }
 }
 
@@ -481,19 +1065,29 @@ function metadataForOutcome(
 function contentObjects(
   repo: Repository,
   entries: readonly ProjectedMergeEntry[],
-): Map<string, string> {
+  reservation: MemoryReservation,
+): ContentObjects {
+  const memory = reservation.scope();
+  let retainedBytes = COLLECTION_BASE_BYTES;
+  memory.set("other", retainedBytes);
   const oids = new Map<string, string>();
-  repo.store.writeObjects((batch) => {
+  writeObjectsOwned(repo.store, reservation, (batch) => {
     for (const entry of entries) {
       if (entry.content === null) continue;
       const oid = batch.write("blob", entry.content);
       if (entry.stageZero !== null && oid !== entry.stageZero.oid) {
         throw new CorruptError(`merged content identity does not match ${entry.path}`);
       }
+      retainedBytes = checkedMemoryBytes(
+        retainedBytes,
+        COLLECTION_ENTRY_BYTES + retainedStringBytes(oid),
+        "merge content objects",
+      );
+      memory.set("other", retainedBytes);
       oids.set(entry.path, oid);
     }
   });
-  return oids;
+  return { entries: oids, dispose: () => memory.dispose() };
 }
 
 function materialiseWrites(
@@ -501,7 +1095,12 @@ function materialiseWrites(
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   contentOids: ReadonlyMap<string, string>,
+  metadata: BlobMetadata,
+  reservation: MemoryReservation,
 ): void {
+  const pendingMemory = reservation.scope();
+  let pendingBytes = retainedArrayBytes(entries.length) * 2;
+  pendingMemory.set("other", pendingBytes);
   const inline: WriteEntry[] = [];
   const pending: ProjectedMergeEntry[] = [];
   for (const entry of entries) {
@@ -509,6 +1108,12 @@ function materialiseWrites(
     if (entry.content !== null) {
       const oid = contentOids.get(entry.path);
       if (oid === undefined) throw new CorruptError(`merge output lacks content ${entry.path}`);
+      pendingBytes = checkedMemoryBytes(
+        pendingBytes,
+        OBJECT_BYTES + retainedJoinedPathBytes(repo.root, entry.path) + 20,
+        "merge inline writes",
+      );
+      pendingMemory.set("other", pendingBytes);
       inline.push({
         path: joinPath(repo.root, entry.path),
         bytes: entry.content,
@@ -519,24 +1124,31 @@ function materialiseWrites(
       pending.push(entry);
     }
   }
-  if (inline.length > 0) worktree.writeFiles(inline);
+  if (inline.length > 0) {
+    worktree.writeFiles(inline);
+  }
 
-  let remaining = pending;
-  while (remaining.length > 0) {
-    const read = repo.readBlobs(
-      remaining.map((entry) => entry.worktree?.oid ?? ""),
-      { budgetBytes: MAX_BLOB_BATCH_BYTES },
+  let offset = 0;
+  while (offset < pending.length) {
+    const batch = readAdmittedBlobBatch(
+      repo,
+      pending,
+      offset,
+      metadata,
+      reservation,
+      (entry) => entry.path,
+      (entry) => entry.worktree?.oid ?? "",
+      (entry) => entry.worktree?.mode === MODE_SYMLINK,
+      "merge output batch",
     );
     const writes: WriteEntry[] = [];
-    const deferred: ProjectedMergeEntry[] = [];
-    for (const entry of remaining) {
+    for (let index = offset; index < batch.end; index++) {
+      const entry = pending[index];
+      if (entry === undefined) throw new CorruptError("merge output batch selection is incomplete");
       const identity = entry.worktree;
       if (identity === null) continue;
-      const bytes = read.blobs.get(identity.oid);
-      if (bytes === undefined) {
-        deferred.push(entry);
-        continue;
-      }
+      const bytes = batch.blobs.get(identity.oid);
+      if (bytes === undefined) throw new CorruptError(`merge output lost object ${identity.oid}`);
       const path = joinPath(repo.root, entry.path);
       const contentId = fromHex(identity.oid);
       writes.push(
@@ -545,12 +1157,14 @@ function materialiseWrites(
           : { path, bytes, mode: fileModeFor(identity.mode), contentId },
       );
     }
-    if (writes.length > 0) worktree.writeFiles(writes);
-    if (deferred.length >= remaining.length) {
-      throw new CorruptError("merge output blob batch made no progress");
+    try {
+      if (writes.length > 0) worktree.writeFiles(writes);
+      offset = batch.end;
+    } finally {
+      batch.dispose();
     }
-    remaining = deferred;
   }
+  pendingMemory.dispose();
 }
 
 function putIdentity(
@@ -576,30 +1190,45 @@ function applyIndex(
   index: IndexStore,
   entries: readonly ProjectedMergeEntry[],
   specs: readonly TouchedSpec[],
+  reservation: MemoryReservation,
 ): void {
-  const projected = new Set(entries.map((entry) => entry.path));
-  index.indexApply((sink) => {
-    for (const spec of specs) {
-      if (!projected.has(spec.path)) sink.remove(spec.path);
-    }
-    for (const entry of entries) {
-      sink.remove(entry.path);
-      if (entry.stageZero !== null) {
-        putIdentity(sink, entry.path, 0, entry.stageZero.mode, entry.stageZero.oid);
+  const memory = reservation.scope();
+  memory.set(
+    "other",
+    checkedMemoryBytes(
+      COLLECTION_BASE_BYTES,
+      entries.length * COLLECTION_ENTRY_BYTES,
+      "merge projected index paths",
+    ),
+  );
+  const projected = new Set<string>();
+  for (const entry of entries) projected.add(entry.path);
+  try {
+    index.indexApply((sink) => {
+      for (const spec of specs) {
+        if (!projected.has(spec.path)) sink.remove(spec.path);
       }
-      if (entry.stages !== null) {
-        if (entry.stages.base !== null) {
-          putIdentity(sink, entry.path, 1, entry.stages.base.mode, entry.stages.base.oid);
+      for (const entry of entries) {
+        sink.remove(entry.path);
+        if (entry.stageZero !== null) {
+          putIdentity(sink, entry.path, 0, entry.stageZero.mode, entry.stageZero.oid);
         }
-        if (entry.stages.current !== null) {
-          putIdentity(sink, entry.path, 2, entry.stages.current.mode, entry.stages.current.oid);
-        }
-        if (entry.stages.incoming !== null) {
-          putIdentity(sink, entry.path, 3, entry.stages.incoming.mode, entry.stages.incoming.oid);
+        if (entry.stages !== null) {
+          if (entry.stages.base !== null) {
+            putIdentity(sink, entry.path, 1, entry.stages.base.mode, entry.stages.base.oid);
+          }
+          if (entry.stages.current !== null) {
+            putIdentity(sink, entry.path, 2, entry.stages.current.mode, entry.stages.current.oid);
+          }
+          if (entry.stages.incoming !== null) {
+            putIdentity(sink, entry.path, 3, entry.stages.incoming.mode, entry.stages.incoming.oid);
+          }
         }
       }
-    }
-  });
+    });
+  } finally {
+    memory.dispose();
+  }
 }
 
 /** Write a validated clean projection to one caller-selected index. */
@@ -607,46 +1236,99 @@ export function applyProjectedIndex(
   repo: Repository,
   index: IndexStore,
   entries: readonly ProjectedMergeEntry[],
+  owner?: MemoryReservation,
 ): void {
-  validateProjectedIndexEntries(entries);
-  if (entries.some((entry) => entry.stages !== null)) {
-    throw new GitError("EUNMERGED", "cannot apply a conflicted projection to an index");
-  }
-  const specs = touchedSpecs(entries);
-  repo.store.runScratchAwareOperation(() =>
-    repo.store.db.transactionSync(() => {
-      contentObjects(repo, entries);
-      applyIndex(index, entries, specs);
-    }),
+  withApplyMemory(
+    repo,
+    owner,
+    owner === undefined ? projectedEntriesRetainedBytes(entries) : 0,
+    (reservation) => {
+      validateProjectedIndexEntries(entries);
+      if (entries.some((entry) => entry.stages !== null)) {
+        throw new GitError("EUNMERGED", "cannot apply a conflicted projection to an index");
+      }
+      const specs = touchedSpecs(entries, reservation);
+      try {
+        repo.store.runScratchAwareOperation(() =>
+          repo.store.db.transactionSync(() => {
+            const content = contentObjects(repo, entries, reservation);
+            try {
+              applyIndex(index, entries, specs.entries, reservation);
+            } finally {
+              content.dispose();
+            }
+          }),
+        );
+      } finally {
+        specs.dispose();
+      }
+    },
+    () => false,
   );
 }
 
-function applyDestructiveRoots(entries: readonly ProjectedMergeEntry[]): string[] {
-  return entries
-    .filter((entry) => entry.worktree === null || entry.worktree.mode !== MODE_COMMIT)
-    .map((entry) => entry.path)
-    .sort(comparePaths);
+function applyDestructiveRoots(
+  entries: readonly ProjectedMergeEntry[],
+  reservation: MemoryReservation,
+): OwnedPaths {
+  const memory = reservation.scope();
+  memory.set("other", retainedArrayBytes(entries.length));
+  const roots: string[] = [];
+  for (const entry of entries) {
+    if (entry.worktree === null || entry.worktree.mode !== MODE_COMMIT) roots.push(entry.path);
+  }
+  roots.sort(comparePaths);
+  return { entries: roots, dispose: () => memory.dispose() };
 }
 
 function structuralRemovals(
   entries: readonly ProjectedMergeEntry[],
   snapshots: ReadonlyMap<string, WorktreeStat>,
-): string[] {
+  reservation: MemoryReservation,
+): OwnedPaths {
+  const memory = reservation.scope();
+  let retainedBytes = COLLECTION_BASE_BYTES;
+  memory.set("other", retainedBytes);
   const removals = new Set<string>();
+  const add = (path: string, ownedStringBytes: number): void => {
+    if (removals.has(path)) return;
+    retainedBytes = checkedMemoryBytes(
+      retainedBytes,
+      COLLECTION_ENTRY_BYTES + ownedStringBytes,
+      "merge structural removals",
+    );
+    memory.set("other", retainedBytes);
+    removals.add(path);
+  };
   for (const entry of entries) {
     if (entry.worktree === null || snapshots.get(entry.path)?.type === "dir") {
-      removals.add(entry.path);
+      add(entry.path, 0);
     }
     if (entry.worktree === null) continue;
     let slash = entry.path.lastIndexOf("/");
     while (slash > 0) {
-      const ancestor = entry.path.slice(0, slash);
-      const stat = snapshots.get(ancestor);
-      if (stat !== undefined && stat.type !== "dir") removals.add(ancestor);
-      slash = ancestor.lastIndexOf("/");
+      const sliceMemory = reservation.scope();
+      sliceMemory.set("other", 48 + slash * 2);
+      try {
+        const ancestor = entry.path.slice(0, slash);
+        const stat = snapshots.get(ancestor);
+        if (stat !== undefined && stat.type !== "dir") {
+          add(ancestor, retainedStringBytes(ancestor));
+        }
+        slash = ancestor.lastIndexOf("/");
+      } finally {
+        sliceMemory.dispose();
+      }
     }
   }
-  return [...removals].sort(comparePaths);
+  retainedBytes = checkedMemoryBytes(
+    retainedBytes,
+    retainedArrayBytes(removals.size),
+    "merge structural removals",
+  );
+  memory.set("other", retainedBytes);
+  const paths = [...removals].sort(comparePaths);
+  return { entries: paths, dispose: () => memory.dispose() };
 }
 
 /** Apply inside the caller's transaction so journal and mutations commit together. */
@@ -656,6 +1338,7 @@ function applyProjectedOperationInternal(
   entries: readonly ProjectedMergeEntry[],
   options: OperationApplyOptions,
   activeRebase: ActiveRebaseApply | null,
+  reservation: MemoryReservation,
 ): OperationApplyResult {
   validateProjectedIndexEntries(entries);
   if (activeRebase === null) {
@@ -664,83 +1347,155 @@ function applyProjectedOperationInternal(
     if (options.suspendedState !== null) {
       throw new CorruptError("rebase apply supplied two journal transitions");
     }
-    const current = repo.checkout.requireOperationState("rebase");
-    if (current.integrityOid !== activeRebase.expectedIntegrityOid) {
-      throw new GitError("EOPMISMATCH", "rebase operation changed before apply");
-    }
-    if (
-      current.steps.length !== activeRebase.steps.length ||
-      current.steps.some((step, ordinal) => {
-        const supplied = activeRebase.steps[ordinal];
-        return (
-          supplied === undefined ||
-          step.sourceOid !== supplied.sourceOid ||
-          step.selectedParentOid !== supplied.selectedParentOid ||
-          step.mainline !== supplied.mainline ||
-          step.outcome !== supplied.outcome ||
-          step.resultOid !== supplied.resultOid
-        );
-      })
-    ) {
-      throw new GitError("EOPMISMATCH", "rebase apply queue differs from its active journal");
+    const activeMemory = reservation.scope();
+    try {
+      const current = readOperationStateOwned(repo.checkout, activeMemory);
+      if (current === null) throw operationNotActive("rebase");
+      if (current.kind !== "rebase") throw operationKindMismatch("rebase", current.kind);
+      if (current.integrityOid !== activeRebase.expectedIntegrityOid) {
+        throw new GitError("EOPMISMATCH", "rebase operation changed before apply");
+      }
+      if (
+        current.steps.length !== activeRebase.steps.length ||
+        current.steps.some((step, ordinal) => {
+          const supplied = activeRebase.steps[ordinal];
+          return (
+            supplied === undefined ||
+            step.sourceOid !== supplied.sourceOid ||
+            step.selectedParentOid !== supplied.selectedParentOid ||
+            step.mainline !== supplied.mainline ||
+            step.outcome !== supplied.outcome ||
+            step.resultOid !== supplied.resultOid
+          );
+        })
+      ) {
+        throw new GitError("EOPMISMATCH", "rebase apply queue differs from its active journal");
+      }
+    } finally {
+      activeMemory.dispose();
     }
   }
   const suspendedState = activeRebase?.conflictState ?? options.suspendedState;
   const suspendedSteps = activeRebase?.steps;
 
-  const specs = touchedSpecs(entries);
+  const retainedSpecs = touchedSpecs(entries, reservation);
+  const specs = retainedSpecs.entries;
+  const setupMemory = reservation.scope();
+  setupMemory.set("other", retainedArrayBytes(specs.length));
   const owned = specs.map((spec) => spec.path);
-  const destructive = applyDestructiveRoots(entries);
-  const worktreeRows = worktreeSnapshotScan(repo, worktree, specs, destructive, owned);
+  const destructive = applyDestructiveRoots(entries, reservation);
+  const worktreeRows = worktreeSnapshotScan(
+    repo,
+    worktree,
+    specs,
+    destructive.entries,
+    owned,
+    reservation,
+  );
+  destructive.dispose();
+  setupMemory.dispose();
+  const draftsMemory = reservation.scope();
   let drafts: SnapshotDraft[] = [];
-  let previewTouched: MergeTouchedPath[] = [];
+  let index: IndexSnapshots | null = null;
   if (suspendedState !== null) {
-    const index = indexSnapshots(repo, specs);
+    const snapshots = indexSnapshots(repo, specs, reservation);
+    index = snapshots;
+    draftsMemory.set(
+      "other",
+      checkedMemoryBytes(
+        retainedArrayBytes(specs.length),
+        specs.length * OBJECT_BYTES,
+        "merge snapshot drafts",
+      ),
+    );
     drafts = specs.map((spec) => ({
       spec,
-      index: index.entries.get(spec.path) ?? null,
+      index: snapshots.entries.get(spec.path) ?? null,
       stat: worktreeRows.entries.get(spec.path) ?? null,
     }));
-    previewTouched = touchedFromDrafts(drafts, null);
   }
 
-  validateSourceBlobs(repo, entries);
-  const removals = structuralRemovals(entries, worktreeRows.entries);
-  if (suspendedState !== null) {
-    operationJournalRetainedBytes(suspendedState, previewTouched, suspendedSteps);
-  }
+  const sourceBlobs = validateSourceBlobs(repo, entries, reservation);
+  const removals = structuralRemovals(entries, worktreeRows.entries, reservation);
 
   let touched: readonly MergeTouchedPath[] | null = null;
+  let journalMemory: MemoryReservation | null = null;
   if (suspendedState !== null) {
-    const root = worktree.realpath(repo.root);
-    const snapshotOids = snapshotWorktreeObjects(repo, worktree, root, drafts);
-    touched = touchedFromDrafts(drafts, snapshotOids);
-    operationJournalRetainedBytes(suspendedState, touched, suspendedSteps);
+    journalMemory = reservation.scope();
+    journalMemory.set(
+      "other",
+      operationJournalDraftRetainedBytes(suspendedState, drafts, suspendedSteps),
+    );
+    const snapshots = snapshotWorktreeObjects(repo, worktree, drafts, reservation);
+    touched = touchedFromDrafts(drafts, snapshots.entries);
+    journalMemory.set(
+      "other",
+      operationJournalRetainedBytes(suspendedState, touched, suspendedSteps),
+    );
+    snapshots.dispose();
+    index?.dispose();
+    index = null;
+    worktreeRows.dispose();
+    draftsMemory.dispose();
   }
 
-  const contentOids = contentObjects(repo, entries);
-  if (removals.length > 0) {
-    worktree.removeFiles(
-      removals.map((path) => joinPath(repo.root, path)),
-      {
-        recursive: true,
-      },
-    );
+  if (suspendedState === null) {
+    worktreeRows.dispose();
+    draftsMemory.dispose();
   }
-  materialiseWrites(repo, worktree, entries, contentOids);
-  applyIndex(repo.checkout, entries, specs);
-  if (touched !== null) {
-    if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
-    if (activeRebase === null) {
-      repo.checkout.writeOperationState(suspendedState, touched);
-    } else {
-      repo.checkout.replaceOperationJournal(
-        activeRebase.expectedIntegrityOid,
-        suspendedState,
-        activeRebase.steps,
-        touched,
-      );
+
+  const content = contentObjects(repo, entries, reservation);
+  try {
+    if (removals.entries.length > 0) {
+      const removalMemory = reservation.scope();
+      let removalBytes = retainedArrayBytes(removals.entries.length);
+      for (const path of removals.entries) {
+        removalBytes = checkedMemoryBytes(
+          removalBytes,
+          retainedJoinedPathBytes(repo.root, path),
+          "merge removal paths",
+        );
+      }
+      removalMemory.set("other", removalBytes);
+      try {
+        const absolute = removals.entries.map((path) => joinPath(repo.root, path));
+        worktree.removeFiles(absolute, { recursive: true });
+      } finally {
+        removalMemory.dispose();
+      }
     }
+    materialiseWrites(repo, worktree, entries, content.entries, sourceBlobs, reservation);
+    applyIndex(repo.checkout, entries, specs, reservation);
+    if (touched !== null) {
+      if (suspendedState === null) throw new CorruptError("operation snapshot lost its state");
+      if (journalMemory === null) throw new CorruptError("operation snapshot lost its owner");
+      if (activeRebase === null) {
+        if (suspendedState.kind === "rebase") {
+          throw new CorruptError("rebase apply omitted its active journal");
+        }
+        writeOperationJournalOwned(
+          repo.checkout,
+          suspendedState,
+          operationStepsForState(suspendedState),
+          touched,
+          journalMemory,
+        );
+      } else {
+        replaceOperationJournalOwned(
+          repo.checkout,
+          activeRebase.expectedIntegrityOid,
+          suspendedState,
+          activeRebase.steps,
+          touched,
+          journalMemory,
+        );
+      }
+    }
+  } finally {
+    content.dispose();
+    sourceBlobs.dispose();
+    removals.dispose();
+    retainedSpecs.dispose();
   }
   return { touched };
 }
@@ -751,8 +1506,16 @@ export function applyProjectedOperation(
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   options: OperationApplyOptions,
+  owner?: MemoryReservation,
 ): OperationApplyResult {
-  return applyProjectedOperationInternal(repo, worktree, entries, options, null);
+  return withApplyMemory(
+    repo,
+    owner,
+    owner === undefined ? projectedEntriesRetainedBytes(entries) : 0,
+    (reservation) =>
+      applyProjectedOperationInternal(repo, worktree, entries, options, null, reservation),
+    (result) => result.touched !== null,
+  );
 }
 
 export interface ProjectedRebaseTransitionOptions<T> extends ActiveRebaseApply {
@@ -769,26 +1532,35 @@ export function applyProjectedRebaseTransition<T>(
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   options: ProjectedRebaseTransitionOptions<T>,
+  owner?: MemoryReservation,
 ): ProjectedRebaseTransitionResult<T> {
-  return repo.store.db.transactionSync(() => {
-    const applied = applyProjectedOperationInternal(
-      repo,
-      worktree,
-      entries,
-      { suspendedState: null },
-      options,
-    );
-    if (options.conflictState !== null) {
-      if (applied.touched === null) {
-        throw new CorruptError("conflicted rebase apply omitted its ownership snapshot");
-      }
-      return { outcome: "conflicted" };
-    }
-    if (applied.touched !== null) {
-      throw new CorruptError("clean rebase apply unexpectedly retained ownership snapshots");
-    }
-    return { outcome: "clean", value: options.onClean(applied) };
-  });
+  return withApplyMemory(
+    repo,
+    owner,
+    owner === undefined ? projectedEntriesRetainedBytes(entries) : 0,
+    (reservation) =>
+      repo.store.db.transactionSync(() => {
+        const applied = applyProjectedOperationInternal(
+          repo,
+          worktree,
+          entries,
+          { suspendedState: null },
+          options,
+          reservation,
+        );
+        if (options.conflictState !== null) {
+          if (applied.touched === null) {
+            throw new CorruptError("conflicted rebase apply omitted its ownership snapshot");
+          }
+          return { outcome: "conflicted" };
+        }
+        if (applied.touched !== null) {
+          throw new CorruptError("clean rebase apply unexpectedly retained ownership snapshots");
+        }
+        return { outcome: "clean", value: options.onClean(applied) };
+      }),
+    () => false,
+  );
 }
 
 export function applyProjectedMerge(
@@ -796,24 +1568,38 @@ export function applyProjectedMerge(
   worktree: Worktree,
   entries: readonly ProjectedMergeEntry[],
   metadata: MergeApplyMetadata,
+  owner?: MemoryReservation,
 ): MergeApplyResult {
-  const outcome = outcomeOf(entries, metadata.mode);
-  if (outcome === "clean") {
-    validateMergeStateMetadata({ ...metadata, phase: "conflicted" });
-  }
-  const state = outcome === "clean" ? null : metadataForOutcome(metadata, outcome);
-  const applied = applyProjectedOperation(repo, worktree, entries, {
-    suspendedState: state === null ? null : mergeOperationState(state),
-  });
-  const journal =
-    state === null || applied.touched === null
-      ? null
-      : {
-          state,
-          touched: applied.touched,
-          retainedBytes: mergeJournalRetainedBytes(state, applied.touched),
-        };
-  return { outcome, journal };
+  return withApplyMemory(
+    repo,
+    owner,
+    owner === undefined ? projectedEntriesRetainedBytes(entries) : 0,
+    (reservation) => {
+      const outcome = outcomeOf(entries, metadata.mode);
+      if (outcome === "clean") {
+        validateMergeStateMetadata({ ...metadata, phase: "conflicted" });
+      }
+      const state = outcome === "clean" ? null : metadataForOutcome(metadata, outcome);
+      const applied = applyProjectedOperationInternal(
+        repo,
+        worktree,
+        entries,
+        { suspendedState: state === null ? null : mergeOperationState(state) },
+        null,
+        reservation,
+      );
+      const journal =
+        state === null || applied.touched === null
+          ? null
+          : {
+              state,
+              touched: applied.touched,
+              retainedBytes: mergeJournalRetainedBytes(state, applied.touched),
+            };
+      return { outcome, journal };
+    },
+    (result) => result.journal !== null,
+  );
 }
 
 function validateJournal(journal: MergeJournal): void {
@@ -870,11 +1656,18 @@ function validateJournalObjects(repo: Repository, journal: MergeJournal): void {
   }
 }
 
-function abortDestructiveRoots(touched: readonly MergeTouchedPath[]): string[] {
-  return touched
-    .filter((entry) => entry.worktree.kind !== "directory")
-    .map((entry) => entry.path)
-    .sort(comparePaths);
+function abortDestructiveRoots(
+  touched: readonly MergeTouchedPath[],
+  reservation: MemoryReservation,
+): OwnedPaths {
+  const memory = reservation.scope();
+  memory.set("other", retainedArrayBytes(touched.length));
+  const roots: string[] = [];
+  for (const entry of touched) {
+    if (entry.worktree.kind !== "directory") roots.push(entry.path);
+  }
+  roots.sort(comparePaths);
+  return { entries: roots, dispose: () => memory.dispose() };
 }
 
 function restoreIndex(repo: Repository, touched: readonly MergeTouchedPath[]): void {
@@ -894,53 +1687,91 @@ function restoreWorktree(
   worktree: Worktree,
   touched: readonly MergeTouchedPath[],
   current: ReadonlyMap<string, WorktreeStat>,
+  metadata: BlobMetadata,
+  reservation: MemoryReservation,
 ): void {
+  const retainedMemory = reservation.scope();
+  let retainedBytes = checkedMemoryBytes(
+    retainedArrayBytes(touched.length) * 3,
+    COLLECTION_BASE_BYTES,
+    "merge restore collections",
+  );
+  retainedMemory.set("other", retainedBytes);
   const removals = new Set<string>();
   const directories: WriteEntry[] = [];
   const pending: MergeTouchedPath[] = [];
+  const addRemoval = (path: string): void => {
+    if (removals.has(path)) return;
+    retainedBytes = checkedMemoryBytes(
+      retainedBytes,
+      COLLECTION_ENTRY_BYTES,
+      "merge restore removals",
+    );
+    retainedMemory.set("other", retainedBytes);
+    removals.add(path);
+  };
   for (const entry of touched) {
     if (entry.worktree.kind === "absent") {
-      removals.add(entry.path);
+      addRemoval(entry.path);
     } else if (entry.worktree.kind === "directory") {
       const found = current.get(entry.path);
-      if (found !== undefined && found.type !== "dir") removals.add(entry.path);
+      if (found !== undefined && found.type !== "dir") addRemoval(entry.path);
+      retainedBytes = checkedMemoryBytes(
+        retainedBytes,
+        OBJECT_BYTES + retainedJoinedPathBytes(repo.root, entry.path),
+        "merge restore directories",
+      );
+      retainedMemory.set("other", retainedBytes);
       directories.push({
         path: joinPath(repo.root, entry.path),
         mode: entry.worktree.mode & 0o7777,
       });
     } else {
-      if (current.get(entry.path)?.type === "dir") removals.add(entry.path);
+      if (current.get(entry.path)?.type === "dir") addRemoval(entry.path);
       pending.push(entry);
     }
   }
   if (removals.size > 0) {
-    worktree.removeFiles(
-      [...removals].sort(comparePaths).map((path) => joinPath(repo.root, path)),
-      { recursive: true },
-    );
+    let removeBytes = retainedArrayBytes(removals.size) * 2;
+    for (const path of removals) {
+      removeBytes = checkedMemoryBytes(
+        removeBytes,
+        retainedJoinedPathBytes(repo.root, path),
+        "merge restore removal paths",
+      );
+    }
+    retainedBytes = checkedMemoryBytes(retainedBytes, removeBytes, "merge restore removal paths");
+    retainedMemory.set("other", retainedBytes);
+    const ordered = [...removals].sort(comparePaths);
+    const absolute = ordered.map((path) => joinPath(repo.root, path));
+    worktree.removeFiles(absolute, { recursive: true });
   }
   if (directories.length > 0) worktree.writeFiles(directories);
 
-  let remaining = pending;
-  while (remaining.length > 0) {
-    const read = repo.readBlobs(
-      remaining.flatMap((entry) =>
+  let offset = 0;
+  while (offset < pending.length) {
+    const batch = readAdmittedBlobBatch(
+      repo,
+      pending,
+      offset,
+      metadata,
+      reservation,
+      (entry) => entry.path,
+      (entry) =>
         entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
-          ? [entry.worktree.oid]
-          : [],
-      ),
-      { budgetBytes: MAX_BLOB_BATCH_BYTES },
+          ? entry.worktree.oid
+          : "",
+      (entry) => entry.worktree.kind === "symlink",
+      "merge restore batch",
     );
     const writes: WriteEntry[] = [];
-    const deferred: MergeTouchedPath[] = [];
-    for (const entry of remaining) {
+    for (let index = offset; index < batch.end; index++) {
+      const entry = pending[index];
+      if (entry === undefined) throw new CorruptError("merge restore selection is incomplete");
       const snapshot = entry.worktree;
       if (snapshot.kind !== "file" && snapshot.kind !== "symlink") continue;
-      const bytes = read.blobs.get(snapshot.oid);
-      if (bytes === undefined) {
-        deferred.push(entry);
-        continue;
-      }
+      const bytes = batch.blobs.get(snapshot.oid);
+      if (bytes === undefined) throw new CorruptError(`merge abort lost object ${snapshot.oid}`);
       const path = joinPath(repo.root, entry.path);
       writes.push(
         snapshot.kind === "symlink"
@@ -953,38 +1784,31 @@ function restoreWorktree(
             },
       );
     }
-    if (writes.length > 0) worktree.writeFiles(writes);
-    if (deferred.length >= remaining.length) {
-      throw new CorruptError("merge abort blob batch made no progress");
+    try {
+      if (writes.length > 0) worktree.writeFiles(writes);
+      offset = batch.end;
+    } finally {
+      batch.dispose();
     }
-    remaining = deferred;
   }
+  retainedMemory.dispose();
 }
 
-function validateRestoreBlobs(repo: Repository, touched: readonly MergeTouchedPath[]): void {
-  const oids: string[] = [];
-  const seen = new Set<string>();
-  for (const entry of touched) {
-    const snapshot = entry.worktree;
-    if (snapshot.kind !== "file" && snapshot.kind !== "symlink") continue;
-    if (!seen.has(snapshot.oid)) {
-      seen.add(snapshot.oid);
-      oids.push(snapshot.oid);
-    }
-  }
-  const found = new Set<string>();
-  for (const object of repo.store.objectInfo(oids)) {
-    if (object.type !== "blob") {
-      throw new CorruptError(`merge abort object ${object.oid} is not a blob`);
-    }
-    if (object.size > MAX_BLOB_BATCH_BYTES) {
-      throw new GitError("E2BIG", `merge blob object exceeds ${MAX_BLOB_BATCH_BYTES} bytes`);
-    }
-    found.add(object.oid);
-  }
-  for (const oid of oids) {
-    if (!found.has(oid)) throw new CorruptError(`merge abort lost object ${oid}`);
-  }
+function validateRestoreBlobs(
+  repo: Repository,
+  touched: readonly MergeTouchedPath[],
+  reservation: MemoryReservation,
+): BlobMetadata {
+  return collectBlobMetadata(
+    repo,
+    touched,
+    (entry) =>
+      entry.worktree.kind === "file" || entry.worktree.kind === "symlink"
+        ? entry.worktree.oid
+        : null,
+    "merge abort",
+    reservation,
+  );
 }
 
 /** Restore only journal-owned paths; the caller supplies the atomic transaction. */
@@ -992,27 +1816,67 @@ export function abortProjectedMerge(
   repo: Repository,
   worktree: Worktree,
   journal: MergeJournal,
+  owner?: MemoryReservation,
 ): void {
-  validateJournal(journal);
-  validateJournalObjects(repo, journal);
-  const specs = journal.touched.map((entry) => ({
-    path: entry.path,
-    logicalPath: entry.logicalPath,
-    purpose: entry.purpose,
-  }));
-  const owned = journal.touched
-    .filter((entry) => entry.worktree.kind === "absent")
-    .map((entry) => entry.path);
-  const current = worktreeSnapshotScan(
+  withApplyMemory(
     repo,
-    worktree,
-    specs,
-    abortDestructiveRoots(journal.touched),
-    owned,
+    owner,
+    0,
+    (reservation) => {
+      validateJournal(journal);
+      validateJournalObjects(repo, journal);
+      const setupMemory = reservation.scope();
+      setupMemory.set(
+        "other",
+        checkedMemoryBytes(
+          retainedArrayBytes(journal.touched.length) * 2,
+          journal.touched.length * OBJECT_BYTES,
+          "merge abort setup",
+        ),
+      );
+      const specs: TouchedSpec[] = [];
+      const owned: string[] = [];
+      for (const entry of journal.touched) {
+        specs.push({
+          path: entry.path,
+          logicalPath: entry.logicalPath,
+          purpose: entry.purpose,
+        });
+        if (entry.worktree.kind === "absent") owned.push(entry.path);
+      }
+      const destructive = abortDestructiveRoots(journal.touched, reservation);
+      const current = worktreeSnapshotScan(
+        repo,
+        worktree,
+        specs,
+        destructive.entries,
+        owned,
+        reservation,
+      );
+      destructive.dispose();
+      setupMemory.dispose();
+      try {
+        const restoreBlobs = validateRestoreBlobs(repo, journal.touched, reservation);
+        try {
+          restoreWorktree(
+            repo,
+            worktree,
+            journal.touched,
+            current.entries,
+            restoreBlobs,
+            reservation,
+          );
+        } finally {
+          restoreBlobs.dispose();
+        }
+        restoreIndex(repo, journal.touched);
+        repo.checkout.clearMergeState();
+      } finally {
+        current.dispose();
+      }
+    },
+    () => false,
   );
-  restoreWorktree(repo, worktree, journal.touched, current.entries);
-  restoreIndex(repo, journal.touched);
-  repo.checkout.clearMergeState();
 }
 
 /** Restore one authenticated operation snapshot; the caller owns state clearing. */
@@ -1020,44 +1884,83 @@ export function restoreProjectedOperation(
   repo: Repository,
   worktree: Worktree,
   journal: OperationJournal,
+  owner?: MemoryReservation,
 ): void {
-  const retainedBytes = operationJournalRetainedBytes(
-    journal.state,
-    journal.touched,
-    journal.steps,
-  );
-  if (retainedBytes !== journal.retainedBytes) {
-    throw new CorruptError("operation journal retained-byte count is stale");
-  }
-  if (
-    operationJournalIntegrityOid(journal.state, journal.touched, journal.steps) !==
-    journal.integrityOid
-  ) {
-    throw new CorruptError("operation journal integrity identity is stale");
-  }
-  let previous: string | null = null;
-  for (const entry of journal.touched) {
-    if (previous !== null && comparePaths(previous, entry.path) >= 0) {
-      throw new CorruptError("operation journal paths are not in strict Git path order");
-    }
-    previous = entry.path;
-  }
-  const specs = journal.touched.map((entry) => ({
-    path: entry.path,
-    logicalPath: entry.logicalPath,
-    purpose: entry.purpose,
-  }));
-  const owned = journal.touched
-    .filter((entry) => entry.worktree.kind === "absent")
-    .map((entry) => entry.path);
-  const current = worktreeSnapshotScan(
+  withApplyMemory(
     repo,
-    worktree,
-    specs,
-    abortDestructiveRoots(journal.touched),
-    owned,
+    owner,
+    0,
+    (reservation) => {
+      const retainedBytes = operationJournalRetainedBytes(
+        journal.state,
+        journal.touched,
+        journal.steps,
+      );
+      if (retainedBytes !== journal.retainedBytes) {
+        throw new CorruptError("operation journal retained-byte count is stale");
+      }
+      if (
+        operationJournalIntegrityOid(journal.state, journal.touched, journal.steps) !==
+        journal.integrityOid
+      ) {
+        throw new CorruptError("operation journal integrity identity is stale");
+      }
+      let previous: string | null = null;
+      for (const entry of journal.touched) {
+        if (previous !== null && comparePaths(previous, entry.path) >= 0) {
+          throw new CorruptError("operation journal paths are not in strict Git path order");
+        }
+        previous = entry.path;
+      }
+      const setupMemory = reservation.scope();
+      setupMemory.set(
+        "other",
+        checkedMemoryBytes(
+          retainedArrayBytes(journal.touched.length) * 2,
+          journal.touched.length * OBJECT_BYTES,
+          "operation restore setup",
+        ),
+      );
+      const specs: TouchedSpec[] = [];
+      const owned: string[] = [];
+      for (const entry of journal.touched) {
+        specs.push({
+          path: entry.path,
+          logicalPath: entry.logicalPath,
+          purpose: entry.purpose,
+        });
+        if (entry.worktree.kind === "absent") owned.push(entry.path);
+      }
+      const destructive = abortDestructiveRoots(journal.touched, reservation);
+      const current = worktreeSnapshotScan(
+        repo,
+        worktree,
+        specs,
+        destructive.entries,
+        owned,
+        reservation,
+      );
+      destructive.dispose();
+      setupMemory.dispose();
+      try {
+        const restoreBlobs = validateRestoreBlobs(repo, journal.touched, reservation);
+        try {
+          restoreWorktree(
+            repo,
+            worktree,
+            journal.touched,
+            current.entries,
+            restoreBlobs,
+            reservation,
+          );
+        } finally {
+          restoreBlobs.dispose();
+        }
+        restoreIndex(repo, journal.touched);
+      } finally {
+        current.dispose();
+      }
+    },
+    () => false,
   );
-  validateRestoreBlobs(repo, journal.touched);
-  restoreWorktree(repo, worktree, journal.touched, current.entries);
-  restoreIndex(repo, journal.touched);
 }

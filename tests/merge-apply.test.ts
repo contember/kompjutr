@@ -10,7 +10,9 @@ import {
 import type { ProjectedMergeEntry } from "../src/core/ops/merge-projection.js";
 import type { MergeJournal, MergeTouchedPath } from "../src/core/ops/merge-state.js";
 import type { Repository } from "../src/core/repository.js";
+import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry } from "../src/fs/types.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
 
 function commit(repo: Repository, digit: string): string {
@@ -68,6 +70,45 @@ function textAt(workspace: TestRepository, path: string): string | null {
   return stat === null ? null : utf8Decoder.decode(workspace.worktree.readFile(`/${path}`));
 }
 
+function readyApplyFixture(): {
+  workspace: TestRepository;
+  entries: readonly ProjectedMergeEntry[];
+  applyMetadata: MergeApplyMetadata;
+} {
+  const workspace = makeRepo();
+  seedFile(workspace, "owned.txt", "old\n");
+  const next = blob(workspace.repo, "next\n");
+  return {
+    workspace,
+    entries: [
+      {
+        path: "owned.txt",
+        logicalPath: "owned.txt",
+        purpose: "primary",
+        stageZero: next,
+        stages: null,
+        worktree: next,
+        content: null,
+      },
+    ],
+    applyMetadata: metadata(workspace.repo, "no-commit"),
+  };
+}
+
+function readyAbortFixture(): ReturnType<typeof readyApplyFixture> & { journal: MergeJournal } {
+  const fixture = readyApplyFixture();
+  const result = fixture.workspace.repo.store.db.transactionSync(() =>
+    applyProjectedMerge(
+      fixture.workspace.repo,
+      fixture.workspace.worktree,
+      fixture.entries,
+      fixture.applyMetadata,
+    ),
+  );
+  if (result.journal === null) throw new Error("ready merge omitted its journal");
+  return { ...fixture, journal: result.journal };
+}
+
 describe("projected merge apply", () => {
   it("does not retain rollback blobs for a clean commit-mode outcome", () => {
     const workspace = makeRepo();
@@ -120,6 +161,251 @@ describe("projected merge apply", () => {
     expect(textAt(workspace, "small.txt")).toBe("next\n");
   });
 
+  it("applies content one byte past the former standalone ceiling", () => {
+    const workspace = makeRepo();
+    const entries: ProjectedMergeEntry[] = [];
+    let remaining = 32 * 1024 * 1024 + 1;
+    for (let ordinal = 0; remaining > 0; ordinal++) {
+      const content = new Uint8Array(Math.min(1024 * 1024, remaining));
+      content[0] = ordinal;
+      const oid = hashObject("blob", content);
+      const identity = { mode: "100644", oid };
+      const path = `large-${ordinal.toString().padStart(2, "0")}.bin`;
+      entries.push({
+        path,
+        logicalPath: path,
+        purpose: "primary",
+        stageZero: identity,
+        stages: null,
+        worktree: identity,
+        content,
+      });
+      remaining -= content.byteLength;
+    }
+
+    const result = workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
+    );
+
+    expect(result).toEqual({ outcome: "clean", journal: null });
+    expect(entries).toHaveLength(33);
+    expect(workspace.worktree.stat("/large-00.bin")?.size).toBe(1024 * 1024);
+    expect(workspace.worktree.stat("/large-32.bin")?.size).toBe(1);
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("charges caller-owned retained results and releases exact and failed aggregates", () => {
+    const measured = readyApplyFixture();
+    const measuredOwner = measured.workspace.repo.store.reserveMemory();
+    const measuredResult = measured.workspace.repo.store.db.transactionSync(() =>
+      applyProjectedMerge(
+        measured.workspace.repo,
+        measured.workspace.worktree,
+        measured.entries,
+        measured.applyMetadata,
+        measuredOwner,
+      ),
+    );
+    expect(measuredResult.outcome).toBe("ready");
+    expect(measuredResult.journal).not.toBeNull();
+    const operationBytes = measuredOwner.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(measuredOwner.currentBytes);
+    expect(measuredOwner.currentBytes).toBeGreaterThan(0);
+    measuredOwner.dispose();
+    measured.workspace.repo.store.memory.assertIdle();
+
+    const exact = readyApplyFixture();
+    const exactOwner = exact.workspace.repo.store.reserveMemory();
+    exactOwner.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    const exactReadBlobs = exact.workspace.repo.readBlobs.bind(exact.workspace.repo);
+    const exactReadFiles = exact.workspace.worktree.readFiles.bind(exact.workspace.worktree);
+    const exactIndexApply = exact.workspace.repo.checkout.indexApply.bind(
+      exact.workspace.repo.checkout,
+    );
+    let exactPayloadReads = 0;
+    let exactSnapshotReads = 0;
+    let exactIndexApplies = 0;
+    exact.workspace.repo.readBlobs = (oids, options) => {
+      exactPayloadReads++;
+      return exactReadBlobs(oids, options);
+    };
+    exact.workspace.worktree.readFiles = (paths, options) => {
+      exactSnapshotReads++;
+      return exactReadFiles(paths, options);
+    };
+    exact.workspace.repo.checkout.indexApply = (body, options) => {
+      exactIndexApplies++;
+      return exactIndexApply(body, options);
+    };
+    try {
+      const result = exact.workspace.repo.store.db.transactionSync(() =>
+        applyProjectedMerge(
+          exact.workspace.repo,
+          exact.workspace.worktree,
+          exact.entries,
+          exact.applyMetadata,
+          exactOwner,
+        ),
+      );
+      expect(result.outcome).toBe("ready");
+      expect(exactOwner.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+      expect(exactPayloadReads).toBeGreaterThan(0);
+      expect(exactSnapshotReads).toBeGreaterThan(0);
+      expect(exactIndexApplies).toBeGreaterThan(0);
+    } finally {
+      exactOwner.dispose();
+    }
+    exact.workspace.repo.store.memory.assertIdle();
+
+    const excess = readyApplyFixture();
+    const excessOwner = excess.workspace.repo.store.reserveMemory();
+    excessOwner.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    const excessReadBlobs = excess.workspace.repo.readBlobs.bind(excess.workspace.repo);
+    const excessReadFiles = excess.workspace.worktree.readFiles.bind(excess.workspace.worktree);
+    const excessIndexApply = excess.workspace.repo.checkout.indexApply.bind(
+      excess.workspace.repo.checkout,
+    );
+    let excessPayloadReads = 0;
+    let excessSnapshotReads = 0;
+    let excessIndexApplies = 0;
+    excess.workspace.repo.readBlobs = (oids, options) => {
+      excessPayloadReads++;
+      return excessReadBlobs(oids, options);
+    };
+    excess.workspace.worktree.readFiles = (paths, options) => {
+      excessSnapshotReads++;
+      return excessReadFiles(paths, options);
+    };
+    excess.workspace.repo.checkout.indexApply = (body, options) => {
+      excessIndexApplies++;
+      return excessIndexApply(body, options);
+    };
+    try {
+      expect(() =>
+        excess.workspace.repo.store.db.transactionSync(() =>
+          applyProjectedMerge(
+            excess.workspace.repo,
+            excess.workspace.worktree,
+            excess.entries,
+            excess.applyMetadata,
+            excessOwner,
+          ),
+        ),
+      ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+      expect(excessPayloadReads).toBe(0);
+      expect(excessSnapshotReads).toBe(0);
+      expect(excessIndexApplies).toBe(0);
+      expect(excess.workspace.repo.checkout.readMergeState()).toBeNull();
+      expect(textAt(excess.workspace, "owned.txt")).toBe("old\n");
+    } finally {
+      excessOwner.dispose();
+    }
+    excess.workspace.repo.store.memory.assertIdle();
+  });
+
+  it("admits restore payloads before reading and rolls back exact aggregate excess", () => {
+    const measured = readyAbortFixture();
+    const measuredOwner = measured.workspace.repo.store.reserveMemory();
+    measuredOwner.set("other", measured.journal.retainedBytes);
+    measured.workspace.repo.store.db.transactionSync(() =>
+      abortProjectedMerge(
+        measured.workspace.repo,
+        measured.workspace.worktree,
+        measured.journal,
+        measuredOwner,
+      ),
+    );
+    const transientBytes = measuredOwner.highWaterBytes - measuredOwner.currentBytes;
+    expect(transientBytes).toBeGreaterThan(0);
+    measuredOwner.dispose();
+    measured.workspace.repo.store.memory.assertIdle();
+
+    const exact = readyAbortFixture();
+    const exactOwner = exact.workspace.repo.store.reserveMemory();
+    exactOwner.set("other", MAX_OPERATION_MEMORY_BYTES - transientBytes);
+    const exactReadBlobs = exact.workspace.repo.readBlobs.bind(exact.workspace.repo);
+    const exactWriteFiles = exact.workspace.worktree.writeFiles.bind(exact.workspace.worktree);
+    const exactIndexApply = exact.workspace.repo.checkout.indexApply.bind(
+      exact.workspace.repo.checkout,
+    );
+    let exactPayloadReads = 0;
+    let exactRestoreWrites = 0;
+    let exactIndexRestores = 0;
+    exact.workspace.repo.readBlobs = (oids, options) => {
+      exactPayloadReads++;
+      return exactReadBlobs(oids, options);
+    };
+    exact.workspace.worktree.writeFiles = (entries, options) => {
+      exactRestoreWrites++;
+      return exactWriteFiles(entries, options);
+    };
+    exact.workspace.repo.checkout.indexApply = (body, options) => {
+      exactIndexRestores++;
+      return exactIndexApply(body, options);
+    };
+    try {
+      exact.workspace.repo.store.db.transactionSync(() =>
+        abortProjectedMerge(
+          exact.workspace.repo,
+          exact.workspace.worktree,
+          exact.journal,
+          exactOwner,
+        ),
+      );
+      expect(exactPayloadReads).toBeGreaterThan(0);
+      expect(exactRestoreWrites).toBeGreaterThan(0);
+      expect(exactIndexRestores).toBeGreaterThan(0);
+      expect(exactOwner.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactOwner.dispose();
+    }
+    exact.workspace.repo.store.memory.assertIdle();
+
+    const excess = readyAbortFixture();
+    const excessOwner = excess.workspace.repo.store.reserveMemory();
+    excessOwner.set("other", MAX_OPERATION_MEMORY_BYTES - transientBytes + 1);
+    const excessReadBlobs = excess.workspace.repo.readBlobs.bind(excess.workspace.repo);
+    const excessWriteFiles = excess.workspace.worktree.writeFiles.bind(excess.workspace.worktree);
+    const excessIndexApply = excess.workspace.repo.checkout.indexApply.bind(
+      excess.workspace.repo.checkout,
+    );
+    let excessPayloadReads = 0;
+    let excessRestoreWrites = 0;
+    let excessIndexRestores = 0;
+    excess.workspace.repo.readBlobs = (oids, options) => {
+      excessPayloadReads++;
+      return excessReadBlobs(oids, options);
+    };
+    excess.workspace.worktree.writeFiles = (entries, options) => {
+      excessRestoreWrites++;
+      return excessWriteFiles(entries, options);
+    };
+    excess.workspace.repo.checkout.indexApply = (body, options) => {
+      excessIndexRestores++;
+      return excessIndexApply(body, options);
+    };
+    try {
+      expect(() =>
+        excess.workspace.repo.store.db.transactionSync(() =>
+          abortProjectedMerge(
+            excess.workspace.repo,
+            excess.workspace.worktree,
+            excess.journal,
+            excessOwner,
+          ),
+        ),
+      ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+      expect(excessPayloadReads).toBe(0);
+      expect(excessRestoreWrites).toBe(0);
+      expect(excessIndexRestores).toBe(0);
+      expect(textAt(excess.workspace, "owned.txt")).toBe("next\n");
+      expect(excess.workspace.repo.checkout.readMergeState()).not.toBeNull();
+    } finally {
+      excessOwner.dispose();
+    }
+    excess.workspace.repo.store.memory.assertIdle();
+  });
+
   it("applies the operation that the former exhausted prior budget rejected", () => {
     const workspace = makeRepo();
     workspace.worktree.writeFiles([{ path: "/guarded.txt", bytes: utf8.encode("old\n") }]);
@@ -163,7 +449,7 @@ describe("projected merge apply", () => {
       },
     ];
     let scanCalls = 0;
-    workspace.worktree.scan = (_root, options): ScanEntry[] => {
+    const scan = (_root: string, options: { limit: number }): ScanEntry[] => {
       scanCalls++;
       if (scanCalls > 50) return [];
       const first = (scanCalls - 1) * options.limit;
@@ -180,9 +466,10 @@ describe("projected merge apply", () => {
         contentId: null,
       }));
     };
+    const fallbackWorktree: Worktree = { ...workspace.worktree, scan };
 
     const result = workspace.repo.store.db.transactionSync(() =>
-      applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
+      applyProjectedMerge(workspace.repo, fallbackWorktree, entries, metadata(workspace.repo)),
     );
 
     expect(scanCalls).toBe(51);
@@ -219,11 +506,14 @@ describe("projected merge apply", () => {
         contentId: null,
       }),
     );
-    workspace.worktree.scan = () => page;
+    const fallbackWorktree: Worktree = {
+      ...workspace.worktree,
+      scan: () => page,
+    };
 
     expect(() =>
       workspace.repo.store.db.transactionSync(() =>
-        applyProjectedMerge(workspace.repo, workspace.worktree, entries, metadata(workspace.repo)),
+        applyProjectedMerge(workspace.repo, fallbackWorktree, entries, metadata(workspace.repo)),
       ),
     ).toThrow(expect.objectContaining({ code: "ECORRUPT" }));
     expect(workspace.repo.checkout.readMergeState()).toBeNull();

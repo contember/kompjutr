@@ -1,11 +1,17 @@
 // Restart-safe execution of one authenticated linear rebase sequence.
 
-import type { IndexEntry } from "../../sqlite/store.js";
-import { utf8 } from "../bytes.js";
+import type { MemoryReservation } from "../../memory.js";
+import {
+  type IndexEntry,
+  readOperationStateOwned,
+  replaceOperationJournalOwned,
+  writeOperationJournalOwned,
+} from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { CorruptError, GitError } from "../errors.js";
 import { relativeTo } from "../paths.js";
 import type { Repository } from "../repository.js";
+import { retainedStringBytes } from "../retained.js";
 import { comparePaths, joinSorted } from "../streams.js";
 import type { Worktree } from "../worktree.js";
 import { checkoutTree, checkoutTreeExcluding } from "./checkout.js";
@@ -21,6 +27,7 @@ import {
   requireCleanIntegrationWorktree,
   requireSafeIntegrationWorktree,
   reserveIntegrationPlan,
+  retainedTouchedPathSet,
 } from "./integration-worktree.js";
 import type { RebaseResult } from "./kinds.js";
 import { applyProjectedRebaseTransition } from "./merge-apply.js";
@@ -30,12 +37,13 @@ import type {
   RebaseJournal,
   RebaseStateMetadata,
 } from "./operation-state.js";
-import { planRebase } from "./rebase-plan.js";
+import { operationKindMismatch, operationNotActive } from "./operation-state.js";
+import { planRebase, type RebasePlan } from "./rebase-plan.js";
 import { operationRefLogMetadata, persistedRefLogMetadata } from "./ref-log.js";
 import {
   type CheckoutBlockerLimits,
-  checkoutBlockersAgainst,
-  hardResetBlockersAgainst,
+  checkoutBlockersAgainstOwned,
+  hardResetBlockersAgainstOwned,
 } from "./refs.js";
 import {
   planRetainedFixedReplayStep,
@@ -46,10 +54,14 @@ import {
 import { treeStream } from "./tree-stream.js";
 
 const REBASE_BASELINE_MAX_ENTRIES = 4_096;
-const REBASE_BASELINE_MAX_BYTES = 32 * 1024 * 1024;
-const REBASE_INTEGRATION_PLAN_BYTES = 20 * 1024 * 1024;
+const REBASE_BASELINE_FIXED_BYTES = 512;
+const REBASE_BASELINE_OID_BYTES = 256;
+const REBASE_BASELINE_INFO_BYTES = 384;
 const REBASE_EXCLUDE_ROOTS = 64;
-const REBASE_EXCLUDE_BYTES = 1024 * 1024;
+const REBASE_JOURNAL_CONSTRUCTION_BYTES = 2_048;
+const REBASE_STEP_VECTOR_BYTES = 16;
+const REBASE_REPLAY_OID_VECTOR_BYTES = 128;
+const REBASE_REPLAY_OID_SLOT_BYTES = 8;
 
 export interface RebaseStartOptions {
   upstream: string;
@@ -62,6 +74,29 @@ export interface RebaseContinueOptions {
   env?: Record<string, string>;
 }
 
+export function preflightRebaseReplayObjects(
+  repo: Repository,
+  plan: RebasePlan,
+  reservation: MemoryReservation,
+): void {
+  if (plan.relation !== "replay") return;
+  const replayOidMemory = reservation.scope();
+  try {
+    replayOidMemory.set(
+      "other",
+      REBASE_REPLAY_OID_VECTOR_BYTES + (1 + plan.steps.length * 2) * REBASE_REPLAY_OID_SLOT_BYTES,
+    );
+    const replayOids = [plan.upstreamOid];
+    for (const step of plan.steps) {
+      replayOids.push(step.sourceOid);
+      if (step.selectedParentOid !== null) replayOids.push(step.selectedParentOid);
+    }
+    preflightReplayCommitObjects(repo, replayOids, reservation);
+  } finally {
+    replayOidMemory.dispose();
+  }
+}
+
 export type RebaseLifecycleResult = RebaseResult;
 
 interface RebaseExclusions {
@@ -71,23 +106,38 @@ interface RebaseExclusions {
 
 const NO_REBASE_EXCLUSIONS: RebaseExclusions = { absolute: [], relative: [] };
 
-function rebaseExclusions(repo: Repository, roots: readonly string[]): RebaseExclusions {
+function requireRebaseJournal(repo: Repository, reservation: MemoryReservation): RebaseJournal {
+  const journal = readOperationStateOwned(repo.checkout, reservation);
+  if (journal === null) throw operationNotActive("rebase");
+  if (journal.kind !== "rebase") throw operationKindMismatch("rebase", journal.kind);
+  return journal;
+}
+
+function rebaseExclusions(
+  repo: Repository,
+  roots: readonly string[],
+  reservation: MemoryReservation,
+): RebaseExclusions {
   if (roots.length > REBASE_EXCLUDE_ROOTS) {
     throw new GitError("E2BIG", `rebase exclusions exceed ${REBASE_EXCLUDE_ROOTS} roots`);
   }
   const absolute: string[] = [];
   const relative: string[] = [];
-  let retainedBytes = 0;
+  let retainedBytes = 256 + roots.length * 32;
+  for (const root of roots) retainedBytes += retainedStringBytes(root);
+  reservation.set("other", retainedBytes);
   for (const root of roots) {
+    reservation.set("other", retainedBytes + retainedStringBytes(root));
     const path = relativeTo(repo.root, root);
     if (path === null || path === "") {
       throw new GitError("EINVAL", `rebase exclusion ${root} is not nested under ${repo.root}`);
     }
-    retainedBytes += utf8.encode(root).byteLength + utf8.encode(path).byteLength;
-    if (!Number.isSafeInteger(retainedBytes) || retainedBytes > REBASE_EXCLUDE_BYTES) {
-      throw new GitError("E2BIG", `rebase exclusions exceed ${REBASE_EXCLUDE_BYTES} bytes`);
+    if (relative.includes(path)) {
+      reservation.set("other", retainedBytes);
+      continue;
     }
-    if (relative.includes(path)) continue;
+    retainedBytes += retainedStringBytes(path);
+    reservation.set("other", retainedBytes);
     absolute.push(root);
     relative.push(path);
   }
@@ -109,8 +159,8 @@ function requirePathsOutsideExclusions(
   }
 }
 
-function requireRebaseIndex(repo: Repository) {
-  const stats = requireBoundedIntegrationIndex(repo);
+function requireRebaseIndex(repo: Repository, reservation?: MemoryReservation) {
+  const stats = requireBoundedIntegrationIndex(repo, reservation);
   if (stats.leafEntries > REBASE_BASELINE_MAX_ENTRIES) {
     throw new GitError("E2BIG", `rebase index exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`);
   }
@@ -120,8 +170,9 @@ function requireRebaseIndex(repo: Repository) {
 function requireRebaseTree(
   repo: Repository,
   entries: Parameters<typeof requireBoundedIntegrationTree>[1],
+  reservation?: MemoryReservation,
 ) {
-  const stats = requireBoundedIntegrationTree(repo, entries);
+  const stats = requireBoundedIntegrationTree(repo, entries, reservation);
   if (stats.leafEntries > REBASE_BASELINE_MAX_ENTRIES) {
     throw new GitError("E2BIG", `rebase result exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`);
   }
@@ -172,13 +223,14 @@ function requireCurrentBaseline(
   worktree: Worktree,
   state: RebaseStateMetadata,
   exclusions: RebaseExclusions,
+  reservation?: MemoryReservation,
 ): string {
   const tree = repo.readCommit(state.currentParentOid).tree;
-  requireRebaseIndex(repo);
+  requireRebaseIndex(repo, reservation);
   if (!integrationIndexMatchesTree(repo, tree)) {
     throw new GitError("ECHECKOUTFAIL", "rebase index differs from its current replay parent");
   }
-  requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
+  requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute, reservation);
   return tree;
 }
 
@@ -187,27 +239,34 @@ function materializeTree(
   worktree: Worktree,
   baselineTree: string,
   target: BaselineTransition,
+  reservation: MemoryReservation,
 ): void {
-  const blockers = checkoutBlockersAgainst(
-    repo,
-    worktree,
-    baselineTree,
-    target.treeOid,
-    undefined,
-    true,
-    checkoutGuardLimits(),
-  );
-  if (blockers.tracked.length > 0) {
-    throw new GitError(
-      "ECHECKOUTFAIL",
-      `local changes to ${blockers.tracked.join(", ")} would be overwritten by rebase`,
+  const guardMemory = reservation.scope();
+  try {
+    const blockers = checkoutBlockersAgainstOwned(
+      repo,
+      worktree,
+      baselineTree,
+      target.treeOid,
+      undefined,
+      true,
+      guardMemory,
+      checkoutGuardLimits(),
     );
-  }
-  if (blockers.untracked.length > 0) {
-    throw new GitError(
-      "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
-    );
+    if (blockers.tracked.length > 0) {
+      throw new GitError(
+        "ECHECKOUTFAIL",
+        `local changes to ${blockers.tracked.join(", ")} would be overwritten by rebase`,
+      );
+    }
+    if (blockers.untracked.length > 0) {
+      throw new GitError(
+        "ECHECKOUTFAIL",
+        `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
+      );
+    }
+  } finally {
+    guardMemory.dispose();
   }
   checkoutTree(repo, worktree, target.treeOid, {
     preserveMatchingIndex: true,
@@ -222,9 +281,7 @@ interface BaselineTransition {
 function checkoutGuardLimits(): CheckoutBlockerLimits {
   return {
     maxRows: 50_000,
-    maxHashBytes: REBASE_BASELINE_MAX_BYTES,
     rows: 0,
-    hashBytes: 0,
     maxHashCandidates: REBASE_BASELINE_MAX_ENTRIES,
     hashCandidates: 0,
   };
@@ -236,20 +293,27 @@ function hardMaterializeTree(
   baselineTree: string,
   target: BaselineTransition,
   exclusions: RebaseExclusions,
+  reservation: MemoryReservation,
 ): void {
-  const blockers = hardResetBlockersAgainst(
-    repo,
-    worktree,
-    baselineTree,
-    target.treeOid,
-    checkoutGuardLimits(),
-    exclusions.absolute,
-  );
-  if (blockers.untracked.length > 0) {
-    throw new GitError(
-      "ECHECKOUTFAIL",
-      `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
+  const guardMemory = reservation.scope();
+  try {
+    const blockers = hardResetBlockersAgainstOwned(
+      repo,
+      worktree,
+      baselineTree,
+      target.treeOid,
+      guardMemory,
+      checkoutGuardLimits(),
+      exclusions.absolute,
     );
+    if (blockers.untracked.length > 0) {
+      throw new GitError(
+        "ECHECKOUTFAIL",
+        `untracked working tree files would be overwritten by rebase: ${blockers.untracked.join(", ")}`,
+      );
+    }
+  } finally {
+    guardMemory.dispose();
   }
   checkoutTreeExcluding(repo, worktree, target.treeOid, exclusions.absolute, {
     preserveMatchingIndex: false,
@@ -259,7 +323,15 @@ function hardMaterializeTree(
   });
 }
 
-function preflightBaselineTransition(repo: Repository, treeOid: string): BaselineTransition {
+function preflightBaselineTransition(
+  repo: Repository,
+  treeOid: string,
+  owningReservation?: MemoryReservation,
+): BaselineTransition {
+  const reservation = owningReservation?.scope() ?? repo.store.reserveMemory();
+  const stateMemory = reservation.scope();
+  let retainedBytes = REBASE_BASELINE_FIXED_BYTES;
+  stateMemory.set("other", retainedBytes);
   const oids: string[] = [];
   const entries = function* (): Generator<IndexEntry> {
     for (const entry of treeStream(repo, treeOid)) {
@@ -272,6 +344,8 @@ function preflightBaselineTransition(repo: Repository, treeOid: string): Baselin
           `rebase baseline exceeds ${REBASE_BASELINE_MAX_ENTRIES} entries`,
         );
       }
+      retainedBytes += REBASE_BASELINE_OID_BYTES;
+      stateMemory.set("other", retainedBytes);
       oids.push(entry.oid);
       yield {
         path: entry.path,
@@ -285,28 +359,45 @@ function preflightBaselineTransition(repo: Repository, treeOid: string): Baselin
       };
     }
   };
-  requireRebaseTree(repo, entries());
-  const unique = new Set(oids);
-  const sizes = new Map<string, number>();
-  for (const object of repo.store.objectInfo([...unique])) {
-    if (object.type !== "blob") {
-      throw new CorruptError(`rebase baseline object ${object.oid} is not a blob`);
+  try {
+    requireRebaseTree(repo, entries(), reservation);
+    const uniqueMemory = reservation.scope();
+    uniqueMemory.set("other", oids.length * REBASE_BASELINE_OID_BYTES);
+    let unique: string[];
+    try {
+      unique = [...new Set(oids)];
+      retainedBytes =
+        REBASE_BASELINE_FIXED_BYTES + oids.length * 8 + unique.length * REBASE_BASELINE_OID_BYTES;
+      stateMemory.set("other", retainedBytes);
+      oids.length = 0;
+    } finally {
+      uniqueMemory.dispose();
     }
-    sizes.set(object.oid, object.size);
-  }
-  let blobBytes = 0;
-  for (const oid of oids) {
-    const size = sizes.get(oid);
-    if (size === undefined) throw new CorruptError(`rebase baseline lost blob ${oid}`);
-    if (size > REBASE_BASELINE_MAX_BYTES - blobBytes) {
-      throw new GitError(
-        "E2BIG",
-        `rebase baseline exceeds ${REBASE_BASELINE_MAX_BYTES} blob bytes`,
-      );
+    const infoMemory = reservation.scope();
+    infoMemory.set("other", unique.length * REBASE_BASELINE_INFO_BYTES);
+    try {
+      const info = repo.store.objectInfo(unique);
+      if (info.length !== unique.length) {
+        throw new CorruptError("rebase baseline object metadata is incomplete");
+      }
+      for (let ordinal = 0; ordinal < info.length; ordinal++) {
+        const object = info[ordinal];
+        const oid = unique[ordinal];
+        if (object === undefined || oid === undefined || object.oid !== oid) {
+          throw new CorruptError("rebase baseline object metadata is out of order");
+        }
+        if (object.type !== "blob") {
+          throw new CorruptError(`rebase baseline object ${object.oid} is not a blob`);
+        }
+      }
+    } finally {
+      infoMemory.dispose();
     }
-    blobBytes += size;
+    return { treeOid };
+  } finally {
+    stateMemory.dispose();
+    reservation.dispose();
   }
-  return { treeOid };
 }
 
 function initialState(
@@ -360,39 +451,59 @@ function advance(
   journal: RebaseJournal,
   outcome: "applied" | "skipped",
   resultOid: string | null,
+  reservation: MemoryReservation,
   committer?: GitIdentity,
 ): void {
-  const steps = nextSteps(journal, outcome, resultOid);
-  repo.checkout.replaceOperationJournal(
-    journal.integrityOid,
-    {
+  const constructionMemory = reservation.scope();
+  constructionMemory.set(
+    "other",
+    REBASE_JOURNAL_CONSTRUCTION_BYTES + journal.steps.length * REBASE_STEP_VECTOR_BYTES,
+  );
+  try {
+    const steps = nextSteps(journal, outcome, resultOid);
+    const state: RebaseStateMetadata = {
       ...journal.state,
       phase: "running",
       currentStep: journal.state.currentStep + 1,
       currentParentOid: resultOid ?? journal.state.currentParentOid,
       committer: committer ?? journal.state.committer,
-    },
-    steps,
-    [],
-  );
+    };
+    const writeMemory = reservation.scope();
+    try {
+      replaceOperationJournalOwned(
+        repo.checkout,
+        journal.integrityOid,
+        state,
+        steps,
+        [],
+        writeMemory,
+      );
+    } finally {
+      writeMemory.dispose();
+    }
+  } finally {
+    constructionMemory.dispose();
+  }
 }
 
 function planCurrentStep(
   repo: Repository,
   journal: RebaseJournal,
-  callerRetainedBytes = 0,
+  reservation: MemoryReservation,
 ): RetainedReplayPlan {
   const step = journal.steps[journal.state.currentStep];
   if (step === undefined || step.outcome !== "pending") {
     throw new CorruptError("rebase current step is not pending");
   }
-  const retained = planRetainedFixedReplayStep(repo, {
-    sourceOid: step.sourceOid,
-    selectedParentOid: step.selectedParentOid,
-    currentOid: journal.state.currentParentOid,
-    callerRetainedBytes,
-    limits: { maxPlanBytes: REBASE_INTEGRATION_PLAN_BYTES },
-  });
+  const retained = planRetainedFixedReplayStep(
+    repo,
+    {
+      sourceOid: step.sourceOid,
+      selectedParentOid: step.selectedParentOid,
+      currentOid: journal.state.currentParentOid,
+    },
+    reservation,
+  );
   const plan = retained.plan;
   if (
     !sameQueueStep(step, {
@@ -436,22 +547,27 @@ function applyOneStep(
   exclusions: RebaseExclusions,
 ): "advanced" | "conflicted" {
   return repo.store.db.transactionSync(() => {
-    const journal = repo.checkout.requireOperationState("rebase");
-    if (journal.integrityOid !== expectedIntegrityOid) {
-      throw new GitError("EOPMISMATCH", "rebase operation changed before replay");
-    }
-    requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "running") return "conflicted";
-    const currentTree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
     const journalReservation = repo.store.reserveMemory();
-    journalReservation.set("other", journal.retainedBytes);
     try {
-      const retainedPlan = planCurrentStep(repo, journal, journal.retainedBytes);
+      const journal = requireRebaseJournal(repo, journalReservation);
+      if (journal.integrityOid !== expectedIntegrityOid) {
+        throw new GitError("EOPMISMATCH", "rebase operation changed before replay");
+      }
+      requireOriginalHead(repo, journal.state);
+      if (journal.state.phase !== "running") return "conflicted";
+      const currentTree = requireCurrentBaseline(
+        repo,
+        worktree,
+        journal.state,
+        exclusions,
+        journalReservation,
+      );
+      const retainedPlan = planCurrentStep(repo, journal, journalReservation);
       try {
         const plan = retainedPlan.plan;
         const planReservation = reserveIntegrationPlan(repo, plan.integration);
         try {
-          requireRebaseIndex(repo);
+          requireRebaseIndex(repo, planReservation);
           if (sourceIsEmpty(plan)) {
             const identities = stepIdentities(context, repo, plan, options);
             const result = writeUnpublishedCommit(repo, {
@@ -459,11 +575,11 @@ function applyOneStep(
               parent: [journal.state.currentParentOid],
               identities,
             });
-            advance(repo, journal, "applied", result.oid, identities.committer);
+            advance(repo, journal, "applied", result.oid, journalReservation, identities.committer);
             return "advanced";
           }
           if (plan.integration.entries.length === 0) {
-            advance(repo, journal, "skipped", null);
+            advance(repo, journal, "skipped", null, journalReservation);
             return "advanced";
           }
           const projected = projectIntegrationWithCollisions(
@@ -474,8 +590,9 @@ function applyOneStep(
             plan.integration,
             plan.labels.current,
             plan.labels.incoming,
-            new Set(),
+            undefined,
             "rebase",
+            planReservation,
           );
           for (const entry of projected) {
             requirePathsOutsideExclusions([entry.path, entry.logicalPath], exclusions);
@@ -484,33 +601,49 @@ function applyOneStep(
             repo,
             worktree,
             plan.incomingTreeOid,
-            plan.integration.entries.map((entry) => entry.path),
+            plan.integration.entries,
             "rebase",
             currentTree,
+            planReservation,
           );
-          requireRebaseTree(repo, (reservation) =>
-            prospectiveIntegrationIndexEntries(repo, projected, reservation),
+          requireRebaseTree(
+            repo,
+            (owner) => prospectiveIntegrationIndexEntries(repo, projected, owner),
+            planReservation,
           );
           const conflicted = plan.integration.entries.some((entry) => entry.kind === "conflict");
-          const transition = applyProjectedRebaseTransition<"advanced">(repo, worktree, projected, {
-            expectedIntegrityOid: journal.integrityOid,
-            conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
-            steps: journal.steps,
-            onClean: () => {
-              if (integrationIndexMatchesTree(repo, currentTree)) {
-                advance(repo, journal, "skipped", null);
+          const transition = applyProjectedRebaseTransition<"advanced">(
+            repo,
+            worktree,
+            projected,
+            {
+              expectedIntegrityOid: journal.integrityOid,
+              conflictState: conflicted ? { ...journal.state, phase: "conflicted" } : null,
+              steps: journal.steps,
+              onClean: () => {
+                if (integrationIndexMatchesTree(repo, currentTree)) {
+                  advance(repo, journal, "skipped", null, journalReservation);
+                  return "advanced";
+                }
+                const identities = stepIdentities(context, repo, plan, options);
+                const result = writeUnpublishedCommit(repo, {
+                  message: plan.sourceCommit.message,
+                  parent: [journal.state.currentParentOid],
+                  identities,
+                });
+                advance(
+                  repo,
+                  journal,
+                  "applied",
+                  result.oid,
+                  journalReservation,
+                  identities.committer,
+                );
                 return "advanced";
-              }
-              const identities = stepIdentities(context, repo, plan, options);
-              const result = writeUnpublishedCommit(repo, {
-                message: plan.sourceCommit.message,
-                parent: [journal.state.currentParentOid],
-                identities,
-              });
-              advance(repo, journal, "applied", result.oid, identities.committer);
-              return "advanced";
+              },
             },
-          });
+            planReservation,
+          );
           return transition.outcome === "conflicted" ? "conflicted" : transition.value;
         } finally {
           planReservation.dispose();
@@ -528,53 +661,53 @@ function requireConflictOwnership(
   repo: Repository,
   worktree: Worktree,
   journal: RebaseJournal,
+  journalReservation: MemoryReservation,
 ): void {
   requireConflictSnapshots(repo, journal);
-  const journalReservation = repo.store.reserveMemory();
-  journalReservation.set("other", journal.retainedBytes);
+  const retainedPlan = planCurrentStep(repo, journal, journalReservation);
   try {
-    const retainedPlan = planCurrentStep(repo, journal, journal.retainedBytes);
+    const plan = retainedPlan.plan;
+    const reservation = reserveIntegrationPlan(repo, plan.integration);
+    const omittedMemory = reservation.scope();
+    const shapeMemory = reservation.scope();
     try {
-      const plan = retainedPlan.plan;
-      const reservation = reserveIntegrationPlan(repo, plan.integration);
-      try {
-        const omitted = new Set(journal.touched.map((entry) => entry.path));
-        const projected = projectIntegrationWithCollisions(
-          repo,
-          worktree,
-          plan.baseTreeOid,
-          plan.incomingTreeOid,
-          plan.integration,
-          plan.labels.current,
-          plan.labels.incoming,
-          omitted,
-          "rebase",
-        );
-        const expected = projectedTouchedShape(projected);
-        if (expected.length !== journal.touched.length) {
-          throw new CorruptError("rebase conflict ownership is incomplete");
+      const omitted = retainedTouchedPathSet(journal.touched, omittedMemory);
+      const projected = projectIntegrationWithCollisions(
+        repo,
+        worktree,
+        plan.baseTreeOid,
+        plan.incomingTreeOid,
+        plan.integration,
+        plan.labels.current,
+        plan.labels.incoming,
+        omitted,
+        "rebase",
+        reservation,
+      );
+      const expected = projectedTouchedShape(projected, shapeMemory);
+      if (expected.length !== journal.touched.length) {
+        throw new CorruptError("rebase conflict ownership is incomplete");
+      }
+      for (let ordinal = 0; ordinal < expected.length; ordinal++) {
+        const left = expected[ordinal];
+        const right = journal.touched[ordinal];
+        if (
+          left === undefined ||
+          right === undefined ||
+          left.path !== right.path ||
+          left.logicalPath !== right.logicalPath ||
+          left.purpose !== right.purpose
+        ) {
+          throw new CorruptError("rebase conflict ownership differs from its replay plan");
         }
-        for (let ordinal = 0; ordinal < expected.length; ordinal++) {
-          const left = expected[ordinal];
-          const right = journal.touched[ordinal];
-          if (
-            left === undefined ||
-            right === undefined ||
-            left.path !== right.path ||
-            left.logicalPath !== right.logicalPath ||
-            left.purpose !== right.purpose
-          ) {
-            throw new CorruptError("rebase conflict ownership differs from its replay plan");
-          }
-        }
-      } finally {
-        reservation.dispose();
       }
     } finally {
-      retainedPlan.release();
+      shapeMemory.dispose();
+      omittedMemory.dispose();
+      reservation.dispose();
     }
   } finally {
-    journalReservation.dispose();
+    retainedPlan.release();
   }
 }
 
@@ -623,39 +756,44 @@ function publishCompleted(
   exclusions: RebaseExclusions,
 ): RebaseLifecycleResult {
   return repo.store.db.transactionSync(() => {
-    const journal = repo.checkout.requireOperationState("rebase");
-    requireOriginalHead(repo, journal.state);
-    if (journal.state.phase !== "running" || journal.state.currentStep !== journal.steps.length) {
-      throw new CorruptError("rebase publication started before replay completion");
-    }
-    const tree = requireCurrentBaseline(repo, worktree, journal.state, exclusions);
-    if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
-      throw new CorruptError("completed rebase baseline changed before publication");
-    }
-    repo.mutateRefs(
-      {
-        expected: {
-          name: journal.state.originalHeadRef,
-          target: journal.state.originalHeadOid,
-        },
-        puts: [
-          {
+    const reservation = repo.store.reserveMemory();
+    try {
+      const journal = requireRebaseJournal(repo, reservation);
+      requireOriginalHead(repo, journal.state);
+      if (journal.state.phase !== "running" || journal.state.currentStep !== journal.steps.length) {
+        throw new CorruptError("rebase publication started before replay completion");
+      }
+      const tree = requireCurrentBaseline(repo, worktree, journal.state, exclusions, reservation);
+      if (repo.readCommit(journal.state.currentParentOid).tree !== tree) {
+        throw new CorruptError("completed rebase baseline changed before publication");
+      }
+      repo.mutateRefs(
+        {
+          expected: {
             name: journal.state.originalHeadRef,
-            target: journal.state.currentParentOid,
+            target: journal.state.originalHeadOid,
           },
-        ],
-      },
-      persistedRefLogMetadata(context, journal.state.committer, "rebase: replay"),
-    );
-    // False leaves the old baseline mismatched, so later sparse reads fall back safely.
-    context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, tree);
-    repo.checkout.clearOperationState();
-    return {
-      outcome: "completed",
-      oid: journal.state.currentParentOid,
-      ...completedCounts(journal.steps),
-      fastForward: false,
-    };
+          puts: [
+            {
+              name: journal.state.originalHeadRef,
+              target: journal.state.currentParentOid,
+            },
+          ],
+        },
+        persistedRefLogMetadata(context, journal.state.committer, "rebase: replay"),
+      );
+      // False leaves the old baseline mismatched, so later sparse reads fall back safely.
+      context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, tree);
+      repo.checkout.clearOperationState();
+      return {
+        outcome: "completed",
+        oid: journal.state.currentParentOid,
+        ...completedCounts(journal.steps),
+        fastForward: false,
+      };
+    } finally {
+      reservation.dispose();
+    }
   });
 }
 
@@ -668,16 +806,23 @@ interface RebaseDriveState {
   skipped: number;
 }
 
-function readRebaseDriveState(repo: Repository): RebaseDriveState {
-  const journal = repo.checkout.requireOperationState("rebase");
-  requireOriginalHead(repo, journal.state);
-  return {
-    integrityOid: journal.integrityOid,
-    phase: journal.state.phase,
-    currentStep: journal.state.currentStep,
-    stepCount: journal.steps.length,
-    ...completedCounts(journal.steps),
-  };
+function readRebaseDriveState(repo: Repository, reservation: MemoryReservation): RebaseDriveState {
+  const journalMemory = reservation.scope();
+  try {
+    const journal = requireRebaseJournal(repo, journalMemory);
+    requireOriginalHead(repo, journal.state);
+    const stateMemory = reservation.scope();
+    stateMemory.set("other", 256 + retainedStringBytes(journal.integrityOid));
+    return {
+      integrityOid: journal.integrityOid,
+      phase: journal.state.phase,
+      currentStep: journal.state.currentStep,
+      stepCount: journal.steps.length,
+      ...completedCounts(journal.steps),
+    };
+  } finally {
+    journalMemory.dispose();
+  }
 }
 
 function driveRebase(
@@ -688,14 +833,19 @@ function driveRebase(
   exclusions: RebaseExclusions,
 ): RebaseLifecycleResult {
   for (;;) {
-    const state = readRebaseDriveState(repo);
-    if (state.phase === "conflicted") {
-      return { outcome: "conflicted", replayed: state.replayed, skipped: state.skipped };
+    const reservation = repo.store.reserveMemory();
+    try {
+      const state = readRebaseDriveState(repo, reservation);
+      if (state.phase === "conflicted") {
+        return { outcome: "conflicted", replayed: state.replayed, skipped: state.skipped };
+      }
+      if (state.currentStep === state.stepCount) {
+        return publishCompleted(context, repo, worktree, exclusions);
+      }
+      applyOneStep(context, repo, worktree, state.integrityOid, options, exclusions);
+    } finally {
+      reservation.dispose();
     }
-    if (state.currentStep === state.stepCount) {
-      return publishCompleted(context, repo, worktree, exclusions);
-    }
-    applyOneStep(context, repo, worktree, state.integrityOid, options, exclusions);
   }
 }
 
@@ -712,23 +862,23 @@ export function startRebase(
     requireRebaseIndex(repo);
     requireCleanIntegrationIndex(repo, originalTree, "rebase");
     requireCleanIntegrationWorktree(repo, worktree, "rebase");
-    const plan = planRebase(repo, { upstream: options.upstream, currentOid: head.oid });
-    if (plan.relation === "up-to-date") {
-      return { relation: plan.relation, oid: head.oid };
-    }
     const planReservation = repo.store.reserveMemory();
-    planReservation.set("other", plan.retainedBytes);
     try {
-      const replayOids = [plan.upstreamOid];
-      for (const step of plan.steps) {
-        replayOids.push(step.sourceOid);
-        if (step.selectedParentOid !== null) replayOids.push(step.selectedParentOid);
+      const plan = planRebase(
+        repo,
+        { upstream: options.upstream, currentOid: head.oid },
+        planReservation,
+      );
+      if (plan.relation === "up-to-date") {
+        return { relation: plan.relation, oid: head.oid };
       }
-      if (plan.relation === "replay") preflightReplayCommitObjects(repo, replayOids);
+      preflightRebaseReplayObjects(repo, plan, planReservation);
       const upstreamTree = repo.readCommit(plan.upstreamOid).tree;
-      const baseline = preflightBaselineTransition(repo, upstreamTree);
-      if (plan.relation === "replay") preflightBaselineTransition(repo, originalTree);
-      materializeTree(repo, worktree, originalTree, baseline);
+      const baseline = preflightBaselineTransition(repo, upstreamTree, planReservation);
+      if (plan.relation === "replay") {
+        preflightBaselineTransition(repo, originalTree, planReservation);
+      }
+      materializeTree(repo, worktree, originalTree, baseline, planReservation);
       const observed = repo.head();
       if (observed.ref !== head.ref || observed.oid !== head.oid) {
         throw new GitError("ESTALEHEAD", "HEAD changed while rebase was being prepared");
@@ -752,11 +902,19 @@ export function startRebase(
         identity: options.committer,
         env: options.env,
       }).actor;
-      repo.checkout.writeOperationJournal(
-        initialState(head, plan.upstreamOid, plan.baseOid, actor),
-        plan.steps,
-        [],
-      );
+      const constructionMemory = planReservation.scope();
+      constructionMemory.set("other", REBASE_JOURNAL_CONSTRUCTION_BYTES);
+      try {
+        const state = initialState(head, plan.upstreamOid, plan.baseOid, actor);
+        const writeMemory = planReservation.scope();
+        try {
+          writeOperationJournalOwned(repo.checkout, state, plan.steps, [], writeMemory);
+        } finally {
+          writeMemory.dispose();
+        }
+      } finally {
+        constructionMemory.dispose();
+      }
       return { relation: plan.relation, oid: plan.upstreamOid };
     } finally {
       planReservation.dispose();
@@ -781,16 +939,24 @@ function prepareContinuation(
   repo: Repository,
   worktree: Worktree,
   exclusions: RebaseExclusions,
+  reservation: MemoryReservation,
 ): PreparedContinuation {
-  const journal = repo.checkout.requireOperationState("rebase");
-  requireOriginalHead(repo, journal.state);
-  requireResumedTopology(repo, journal);
-  if (journal.state.phase === "running") {
-    requireCurrentBaseline(repo, worktree, journal.state, exclusions);
-    return { phase: "running" };
+  const journalMemory = reservation.scope();
+  try {
+    const journal = requireRebaseJournal(repo, journalMemory);
+    requireOriginalHead(repo, journal.state);
+    requireResumedTopology(repo, journal);
+    if (journal.state.phase === "running") {
+      requireCurrentBaseline(repo, worktree, journal.state, exclusions, journalMemory);
+      return { phase: "running" };
+    }
+    requireConflictOwnership(repo, worktree, journal, journalMemory);
+    const preparedMemory = reservation.scope();
+    preparedMemory.set("other", 256 + retainedStringBytes(journal.integrityOid));
+    return { phase: "conflicted", integrityOid: journal.integrityOid };
+  } finally {
+    journalMemory.dispose();
   }
-  requireConflictOwnership(repo, worktree, journal);
-  return { phase: "conflicted", integrityOid: journal.integrityOid };
 }
 
 export function continueRebase(
@@ -809,13 +975,18 @@ export function continueRebaseExcluding(
   excludeRoots: readonly string[],
   options: RebaseContinueOptions = {},
 ): RebaseLifecycleResult {
-  return continueRebaseInternal(
-    context,
-    repo,
-    worktree,
-    options,
-    rebaseExclusions(repo, excludeRoots),
-  );
+  const reservation = repo.store.reserveMemory();
+  try {
+    return continueRebaseInternal(
+      context,
+      repo,
+      worktree,
+      options,
+      rebaseExclusions(repo, excludeRoots, reservation),
+    );
+  } finally {
+    reservation.dispose();
+  }
 }
 
 function continueRebaseInternal(
@@ -825,56 +996,83 @@ function continueRebaseInternal(
   options: RebaseContinueOptions,
   exclusions: RebaseExclusions,
 ): RebaseLifecycleResult {
-  const prepared = prepareContinuation(repo, worktree, exclusions);
-  if (prepared.phase === "running") {
-    return driveRebase(context, repo, worktree, options, exclusions);
-  }
-  repo.store.db.transactionSync(() => {
-    const current = repo.checkout.requireOperationState("rebase");
-    if (current.integrityOid !== prepared.integrityOid) {
-      throw new GitError("EOPMISMATCH", "rebase conflict changed before continuation");
+  const operationReservation = repo.store.reserveMemory();
+  try {
+    const prepared = prepareContinuation(repo, worktree, exclusions, operationReservation);
+    if (prepared.phase === "running") {
+      return driveRebase(context, repo, worktree, options, exclusions);
     }
-    requireOriginalHead(repo, current.state);
-    if (repo.checkout.hasConflicts()) {
-      throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
-    }
-    requireRebaseIndex(repo);
-    requireCleanIntegrationWorktree(repo, worktree, "rebase", exclusions.absolute);
-    const journalReservation = repo.store.reserveMemory();
-    journalReservation.set("other", current.retainedBytes);
-    try {
-      const retainedPlan = planCurrentStep(repo, current, current.retainedBytes);
+    repo.store.db.transactionSync(() => {
+      const journalReservation = operationReservation.scope();
       try {
-        const plan = retainedPlan.plan;
-        const planReservation = reserveIntegrationPlan(repo, plan.integration);
+        const current = requireRebaseJournal(repo, journalReservation);
+        if (current.integrityOid !== prepared.integrityOid) {
+          throw new GitError("EOPMISMATCH", "rebase conflict changed before continuation");
+        }
+        requireOriginalHead(repo, current.state);
+        if (repo.checkout.hasConflicts()) {
+          throw new GitError("EUNMERGED", "cannot continue rebase: the index has unmerged paths");
+        }
+        requireRebaseIndex(repo, journalReservation);
+        requireCleanIntegrationWorktree(
+          repo,
+          worktree,
+          "rebase",
+          exclusions.absolute,
+          journalReservation,
+        );
+        const retainedPlan = planCurrentStep(repo, current, journalReservation);
         try {
-          const currentTree = repo.readCommit(current.state.currentParentOid).tree;
-          const resultEmpty = integrationIndexMatchesTree(repo, currentTree);
-          const baseline = resultEmpty ? preflightBaselineTransition(repo, currentTree) : null;
-          if (resultEmpty) {
-            if (baseline === null) throw new CorruptError("result-empty rebase lost its baseline");
-            hardMaterializeTree(repo, worktree, currentTree, baseline, exclusions);
-            advance(repo, current, "skipped", null);
-          } else {
-            const identities = stepIdentities(context, repo, plan, options);
-            const result = writeUnpublishedCommit(repo, {
-              message: plan.sourceCommit.message,
-              parent: [current.state.currentParentOid],
-              identities,
-            });
-            advance(repo, current, "applied", result.oid, identities.committer);
+          const plan = retainedPlan.plan;
+          const planReservation = reserveIntegrationPlan(repo, plan.integration);
+          try {
+            const currentTree = repo.readCommit(current.state.currentParentOid).tree;
+            const resultEmpty = integrationIndexMatchesTree(repo, currentTree);
+            const baseline = resultEmpty
+              ? preflightBaselineTransition(repo, currentTree, planReservation)
+              : null;
+            if (resultEmpty) {
+              if (baseline === null)
+                throw new CorruptError("result-empty rebase lost its baseline");
+              hardMaterializeTree(
+                repo,
+                worktree,
+                currentTree,
+                baseline,
+                exclusions,
+                planReservation,
+              );
+              advance(repo, current, "skipped", null, journalReservation);
+            } else {
+              const identities = stepIdentities(context, repo, plan, options);
+              const result = writeUnpublishedCommit(repo, {
+                message: plan.sourceCommit.message,
+                parent: [current.state.currentParentOid],
+                identities,
+              });
+              advance(
+                repo,
+                current,
+                "applied",
+                result.oid,
+                journalReservation,
+                identities.committer,
+              );
+            }
+          } finally {
+            planReservation.dispose();
           }
         } finally {
-          planReservation.dispose();
+          retainedPlan.release();
         }
       } finally {
-        retainedPlan.release();
+        journalReservation.dispose();
       }
-    } finally {
-      journalReservation.dispose();
-    }
-  });
-  return driveRebase(context, repo, worktree, options, exclusions);
+    });
+    return driveRebase(context, repo, worktree, options, exclusions);
+  } finally {
+    operationReservation.dispose();
+  }
 }
 
 interface PreparedSkip {
@@ -883,20 +1081,34 @@ interface PreparedSkip {
   baseline: BaselineTransition;
 }
 
-function prepareSkip(repo: Repository, worktree: Worktree): PreparedSkip {
-  const journal = repo.checkout.requireOperationState("rebase");
-  requireOriginalHead(repo, journal.state);
-  requireResumedTopology(repo, journal);
-  if (journal.state.phase !== "conflicted") {
-    throw new GitError("EOPMISMATCH", "rebase skip requires a conflicted step");
+function prepareSkip(
+  repo: Repository,
+  worktree: Worktree,
+  reservation: MemoryReservation,
+): PreparedSkip {
+  const journalMemory = reservation.scope();
+  try {
+    const journal = requireRebaseJournal(repo, journalMemory);
+    requireOriginalHead(repo, journal.state);
+    requireResumedTopology(repo, journal);
+    if (journal.state.phase !== "conflicted") {
+      throw new GitError("EOPMISMATCH", "rebase skip requires a conflicted step");
+    }
+    requireConflictOwnership(repo, worktree, journal, journalMemory);
+    const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
+    const preparedMemory = reservation.scope();
+    preparedMemory.set(
+      "other",
+      256 + retainedStringBytes(journal.integrityOid) + retainedStringBytes(currentTree),
+    );
+    return {
+      integrityOid: journal.integrityOid,
+      currentTree,
+      baseline: preflightBaselineTransition(repo, currentTree, journalMemory),
+    };
+  } finally {
+    journalMemory.dispose();
   }
-  requireConflictOwnership(repo, worktree, journal);
-  const currentTree = repo.readCommit(journal.state.currentParentOid).tree;
-  return {
-    integrityOid: journal.integrityOid,
-    currentTree,
-    baseline: preflightBaselineTransition(repo, currentTree),
-  };
 }
 
 export function skipRebase(
@@ -905,23 +1117,34 @@ export function skipRebase(
   worktree: Worktree,
   options: RebaseContinueOptions = {},
 ): RebaseLifecycleResult {
-  const prepared = prepareSkip(repo, worktree);
-  repo.store.db.transactionSync(() => {
-    const current = repo.checkout.requireOperationState("rebase");
-    if (current.integrityOid !== prepared.integrityOid) {
-      throw new GitError("EOPMISMATCH", "rebase conflict changed before skip");
-    }
-    requireOriginalHead(repo, current.state);
-    hardMaterializeTree(
-      repo,
-      worktree,
-      prepared.currentTree,
-      prepared.baseline,
-      NO_REBASE_EXCLUSIONS,
-    );
-    advance(repo, current, "skipped", null);
-  });
-  return driveRebase(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+  const operationReservation = repo.store.reserveMemory();
+  try {
+    const prepared = prepareSkip(repo, worktree, operationReservation);
+    repo.store.db.transactionSync(() => {
+      const reservation = operationReservation.scope();
+      try {
+        const current = requireRebaseJournal(repo, reservation);
+        if (current.integrityOid !== prepared.integrityOid) {
+          throw new GitError("EOPMISMATCH", "rebase conflict changed before skip");
+        }
+        requireOriginalHead(repo, current.state);
+        hardMaterializeTree(
+          repo,
+          worktree,
+          prepared.currentTree,
+          prepared.baseline,
+          NO_REBASE_EXCLUSIONS,
+          reservation,
+        );
+        advance(repo, current, "skipped", null, reservation);
+      } finally {
+        reservation.dispose();
+      }
+    });
+    return driveRebase(context, repo, worktree, options, NO_REBASE_EXCLUSIONS);
+  } finally {
+    operationReservation.dispose();
+  }
 }
 
 interface PreparedAbort {
@@ -930,17 +1153,37 @@ interface PreparedAbort {
   baseline: BaselineTransition;
 }
 
-function prepareAbort(repo: Repository, worktree: Worktree): PreparedAbort {
-  const journal = repo.checkout.requireOperationState("rebase");
-  requireOriginalHead(repo, journal.state);
-  requireResumedTopology(repo, journal);
-  if (journal.state.phase === "conflicted") requireConflictOwnership(repo, worktree, journal);
-  const originalTree = repo.readCommit(journal.state.originalHeadOid).tree;
-  return {
-    integrityOid: journal.integrityOid,
-    baselineTree: repo.readCommit(journal.state.currentParentOid).tree,
-    baseline: preflightBaselineTransition(repo, originalTree),
-  };
+function prepareAbort(
+  repo: Repository,
+  worktree: Worktree,
+  reservation: MemoryReservation,
+): PreparedAbort {
+  const journalMemory = reservation.scope();
+  try {
+    const journal = requireRebaseJournal(repo, journalMemory);
+    requireOriginalHead(repo, journal.state);
+    requireResumedTopology(repo, journal);
+    if (journal.state.phase === "conflicted") {
+      requireConflictOwnership(repo, worktree, journal, journalMemory);
+    }
+    const originalTree = repo.readCommit(journal.state.originalHeadOid).tree;
+    const baselineTree = repo.readCommit(journal.state.currentParentOid).tree;
+    const preparedMemory = reservation.scope();
+    preparedMemory.set(
+      "other",
+      256 +
+        retainedStringBytes(journal.integrityOid) +
+        retainedStringBytes(baselineTree) +
+        retainedStringBytes(originalTree),
+    );
+    return {
+      integrityOid: journal.integrityOid,
+      baselineTree,
+      baseline: preflightBaselineTransition(repo, originalTree, journalMemory),
+    };
+  } finally {
+    journalMemory.dispose();
+  }
 }
 
 export function abortRebase(repo: Repository, worktree: Worktree): void {
@@ -952,7 +1195,12 @@ export function abortRebaseExcluding(
   worktree: Worktree,
   excludeRoots: readonly string[],
 ): void {
-  abortRebaseInternal(repo, worktree, rebaseExclusions(repo, excludeRoots));
+  const reservation = repo.store.reserveMemory();
+  try {
+    abortRebaseInternal(repo, worktree, rebaseExclusions(repo, excludeRoots, reservation));
+  } finally {
+    reservation.dispose();
+  }
 }
 
 function abortRebaseInternal(
@@ -960,14 +1208,31 @@ function abortRebaseInternal(
   worktree: Worktree,
   exclusions: RebaseExclusions,
 ): void {
-  const prepared = prepareAbort(repo, worktree);
-  repo.store.db.transactionSync(() => {
-    const current = repo.checkout.requireOperationState("rebase");
-    if (current.integrityOid !== prepared.integrityOid) {
-      throw new GitError("EOPMISMATCH", "rebase operation changed before abort");
-    }
-    requireOriginalHead(repo, current.state);
-    hardMaterializeTree(repo, worktree, prepared.baselineTree, prepared.baseline, exclusions);
-    repo.checkout.clearOperationState();
-  });
+  const operationReservation = repo.store.reserveMemory();
+  try {
+    const prepared = prepareAbort(repo, worktree, operationReservation);
+    repo.store.db.transactionSync(() => {
+      const reservation = operationReservation.scope();
+      try {
+        const current = requireRebaseJournal(repo, reservation);
+        if (current.integrityOid !== prepared.integrityOid) {
+          throw new GitError("EOPMISMATCH", "rebase operation changed before abort");
+        }
+        requireOriginalHead(repo, current.state);
+        hardMaterializeTree(
+          repo,
+          worktree,
+          prepared.baselineTree,
+          prepared.baseline,
+          exclusions,
+          reservation,
+        );
+        repo.checkout.clearOperationState();
+      } finally {
+        reservation.dispose();
+      }
+    });
+  } finally {
+    operationReservation.dispose();
+  }
 }

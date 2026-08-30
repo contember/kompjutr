@@ -1,6 +1,12 @@
 // Two-head merge orchestration over bounded graph, integration, and apply seams.
 
-import { type IndexEntry, type ObjectBatch, writeObjectsOwned } from "../../sqlite/store.js";
+import type { MemoryReservation } from "../../memory.js";
+import {
+  type IndexEntry,
+  type ObjectBatch,
+  readOperationStateOwned,
+  writeObjectsOwned,
+} from "../../sqlite/store.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
 import { hashObject, serializeCommit } from "../objects.js";
@@ -23,6 +29,7 @@ import {
   requireSafeIntegrationWorktree,
   reserveIntegrationExecution,
   reserveIntegrationPlan,
+  retainedTouchedPathSet,
 } from "./integration-worktree.js";
 import type { MergeResult } from "./kinds.js";
 import { abortProjectedMerge, applyProjectedMerge } from "./merge-apply.js";
@@ -35,6 +42,11 @@ import {
   type MergeTouchedPath,
   validateMergeStateMetadata,
 } from "./merge-state.js";
+import {
+  mergeJournalFromOperation,
+  operationKindMismatch,
+  operationNotActive,
+} from "./operation-state.js";
 import { operationRefLogMetadata, type RefLogReason } from "./ref-log.js";
 import { buildTreeInBatch } from "./tree-build.js";
 import { treeStream } from "./tree-stream.js";
@@ -42,6 +54,9 @@ import { treeStream } from "./tree-stream.js";
 const HEADS = "refs/heads/";
 const MAX_MERGE_REVISION_CODE_UNITS = 1_024;
 const MAX_VIRTUAL_COMMITS = 1;
+const MERGE_COLLECTION_BASE_BYTES = 128;
+const MERGE_ARRAY_SLOT_BYTES = 8;
+const MERGE_OBJECT_BYTES = 192;
 const VIRTUAL_IDENTITY = {
   name: "git merge-recursive",
   email: "merge-recursive@localhost",
@@ -211,11 +226,13 @@ function requireBoundedVirtualTree(
   repo: Repository,
   currentOid: string,
   plan: IntegrationPlan,
+  reservation: ReturnType<Repository["store"]["reserveMemory"]>,
 ): void {
   const currentTree = commitTree(repo, currentOid);
   requireBoundedIntegrationTree(
     repo,
     virtualTreeEntries(repo, batchForIdentity(), currentTree, plan),
+    reservation,
   );
 }
 
@@ -267,7 +284,7 @@ function synthesizeVirtualPair(
   });
   const reservation = reserveIntegrationPlan(repo, plan);
   try {
-    requireBoundedVirtualTree(repo, currentOid, plan);
+    requireBoundedVirtualTree(repo, currentOid, plan, reservation);
     return materializeVirtualCommit(repo, currentOid, incomingOid, plan, reservation);
   } finally {
     reservation.dispose();
@@ -348,6 +365,7 @@ function requireJournalOwnership(
   repo: Repository,
   worktree: Worktree,
   journal: MergeJournal,
+  owner: MemoryReservation,
 ): void {
   const state = journal.state;
   requireOriginalSnapshots(repo, journal);
@@ -376,10 +394,13 @@ function requireJournalOwnership(
         incoming: state.incomingLabel,
       },
     },
+    reservation: owner,
   });
   const reservation = reserveIntegrationPlan(repo, plan);
+  const omittedMemory = reservation.scope();
+  const shapeMemory = reservation.scope();
   try {
-    const omitted = new Set(journal.touched.map((entry) => entry.path));
+    const omitted = retainedTouchedPathSet(journal.touched, omittedMemory);
     const projected = projectIntegrationWithCollisions(
       repo,
       worktree,
@@ -389,8 +410,10 @@ function requireJournalOwnership(
       state.currentLabel,
       state.incomingLabel,
       omitted,
+      "merge",
+      reservation,
     );
-    const expected = projectedTouchedShape(projected);
+    const expected = projectedTouchedShape(projected, shapeMemory);
     if (expected.length !== journal.touched.length) {
       throw new GitError("ECORRUPT", "merge journal path ownership is incomplete");
     }
@@ -408,8 +431,17 @@ function requireJournalOwnership(
       }
     }
   } finally {
+    shapeMemory.dispose();
+    omittedMemory.dispose();
     reservation.dispose();
   }
+}
+
+function requireMergeJournalOwned(repo: Repository, reservation: MemoryReservation): MergeJournal {
+  const journal = readOperationStateOwned(repo.checkout, reservation);
+  if (journal === null) throw operationNotActive("merge");
+  if (journal.kind !== "merge") throw operationKindMismatch("merge", journal.kind);
+  return mergeJournalFromOperation(journal);
 }
 
 function savedIdentity(identity: GitIdentity | undefined): GitIdentity | null {
@@ -423,6 +455,7 @@ function metadata(
   nextLabel: string,
   options: MergeOptions,
   mergeOrigin: MergeOrigin,
+  message: string,
 ): Omit<MergeStateMetadata, "phase"> {
   return {
     originalHeadRef: head.ref,
@@ -433,24 +466,92 @@ function metadata(
     mergeOrigin,
     currentLabel,
     incomingLabel: nextLabel,
-    message: options.message ?? defaultMessage(nextLabel),
+    message,
     author: savedIdentity(options.author),
     committer: savedIdentity(options.committer),
   };
 }
 
-function conflictedPaths(entries: readonly ProjectedMergeEntry[]): string[] {
-  return entries.flatMap((entry) => (entry.stages === null ? [] : [entry.path]));
+function checkedMergeBytes(current: number, added: number): number {
+  if (
+    !Number.isSafeInteger(current) ||
+    current < 0 ||
+    !Number.isSafeInteger(added) ||
+    added < 0 ||
+    added > Number.MAX_SAFE_INTEGER - current
+  ) {
+    throw new GitError("E2BIG", "merge message memory accounting overflow");
+  }
+  return current + added;
 }
 
-function compatibilityConflict(paths: readonly string[]): GitError {
-  return new GitError(
-    "EMERGEFAIL",
-    `git merge failed: Automatic merge failed with one or more merge conflicts in the following files: ${paths.join(", ")}. Fix conflicts then commit the result.`,
+function mergeArrayBytes(length: number): number {
+  return checkedMergeBytes(MERGE_COLLECTION_BASE_BYTES, length * MERGE_ARRAY_SLOT_BYTES);
+}
+
+function mergeStringUnits(units: number): number {
+  return checkedMergeBytes(48, units * 2);
+}
+
+function conflictedPaths(
+  entries: readonly ProjectedMergeEntry[],
+  reservation: MemoryReservation,
+): string[] {
+  const memory = reservation.scope();
+  memory.set("other", mergeArrayBytes(entries.length));
+  const paths: string[] = [];
+  for (const entry of entries) {
+    if (entry.stages !== null) paths.push(entry.path);
+  }
+  return paths;
+}
+
+function compatibilityConflict(paths: readonly string[], reservation: MemoryReservation): GitError {
+  const joinedUnits = paths.reduce(
+    (units, path, index) => units + path.length + (index === 0 ? 0 : 2),
+    0,
   );
+  const prefix =
+    "git merge failed: Automatic merge failed with one or more merge conflicts in the following files: ";
+  const suffix = ". Fix conflicts then commit the result.";
+  const memory = reservation.scope();
+  memory.set(
+    "other",
+    checkedMergeBytes(
+      MERGE_OBJECT_BYTES + mergeStringUnits(joinedUnits),
+      mergeStringUnits(prefix.length + joinedUnits + suffix.length),
+    ),
+  );
+  return new GitError("EMERGEFAIL", `${prefix}${paths.join(", ")}${suffix}`);
 }
 
-function messageWithConflicts(message: string, paths: readonly string[]): string {
+function messageWithConflicts(
+  supplied: string | undefined,
+  nextLabel: string,
+  paths: readonly string[],
+  reservation: MemoryReservation,
+): string {
+  const defaultUnits = "Merge branch ''".length + nextLabel.length;
+  const messageUnits = supplied?.length ?? defaultUnits;
+  const bodyUnits = messageUnits + (supplied?.endsWith("\n") === true ? 0 : 1);
+  const conflictsUnits = paths.reduce((units, path) => units + path.length + 3, 0);
+  const finalUnits =
+    paths.length === 0 ? messageUnits : bodyUnits + "\n# Conflicts:\n".length + conflictsUnits;
+  let retainedBytes = MERGE_OBJECT_BYTES + mergeStringUnits(finalUnits);
+  if (supplied === undefined) {
+    retainedBytes = checkedMergeBytes(retainedBytes, mergeStringUnits(messageUnits));
+  }
+  if (paths.length > 0) {
+    retainedBytes = checkedMergeBytes(retainedBytes, mergeArrayBytes(paths.length));
+    retainedBytes = checkedMergeBytes(retainedBytes, mergeStringUnits(bodyUnits));
+    retainedBytes = checkedMergeBytes(retainedBytes, mergeStringUnits(conflictsUnits));
+    for (const path of paths) {
+      retainedBytes = checkedMergeBytes(retainedBytes, mergeStringUnits(path.length + 3));
+    }
+  }
+  const memory = reservation.scope();
+  memory.set("other", retainedBytes);
+  const message = supplied ?? defaultMessage(nextLabel);
   if (paths.length === 0) return message;
   const body = message.endsWith("\n") ? message : `${message}\n`;
   return `${body}\n# Conflicts:\n${paths.map((path) => `#\t${path}\n`).join("")}`;
@@ -561,21 +662,28 @@ function mergeInTransaction(
       plan,
       currentLabel,
       nextLabel,
+      undefined,
+      "merge",
+      reservation,
     );
     requireSafeIntegrationWorktree(
       repo,
       worktree,
       nextTree,
-      plan.entries.map((entry) => entry.path),
+      plan.entries,
       "merge",
+      undefined,
+      reservation,
     );
-    const conflicts = conflictedPaths(projected);
+    const conflicts = conflictedPaths(projected, reservation);
     if (conflicts.length > 0 && behavior.persistConflicts === false) {
-      throw compatibilityConflict(conflicts);
+      throw compatibilityConflict(conflicts, reservation);
     }
     if (!isFastForward) {
-      requireBoundedIntegrationTree(repo, (reservation) =>
-        prospectiveIntegrationIndexEntries(repo, projected, reservation),
+      requireBoundedIntegrationTree(
+        repo,
+        (owner) => prospectiveIntegrationIndexEntries(repo, projected, owner),
+        reservation,
       );
     }
 
@@ -583,6 +691,12 @@ function mergeInTransaction(
     if (current.ref !== head.ref || current.oid !== head.oid) {
       throw new GitError("ESTALEHEAD", "HEAD changed while the merge was being prepared");
     }
+    const retainedMessage = messageWithConflicts(
+      options.message,
+      nextLabel,
+      conflicts,
+      reservation,
+    );
     const mergeMetadata = metadata(
       head,
       incomingOid,
@@ -590,9 +704,9 @@ function mergeInTransaction(
       nextLabel,
       isFastForward ? { ...options, commit: true } : options,
       behavior.origin ?? "merge",
+      retainedMessage,
     );
-    mergeMetadata.message = messageWithConflicts(mergeMetadata.message, conflicts);
-    const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata);
+    const applied = applyProjectedMerge(repo, worktree, projected, mergeMetadata, reservation);
     if (isFastForward) {
       repo.mutateRefs(
         {
@@ -613,7 +727,7 @@ function mergeInTransaction(
       context.indexTracker?.advanceBaseline?.(repo.checkout.checkoutId, nextTree);
       return { oid: incomingOid, fastForward: true };
     }
-    requireBoundedIntegrationIndex(repo);
+    requireBoundedIntegrationIndex(repo, reservation);
     if (applied.outcome === "conflicted") {
       return { conflicted: true, pendingCommit: true };
     }
@@ -656,15 +770,15 @@ export function mergeContinue(
   options: MergeContinueOptions = {},
 ): MergeResult {
   return repo.store.db.transactionSync(() => {
-    const journal = repo.checkout.requireMergeState();
-    const head = requireOriginalHead(repo, journal.state);
-    requireJournalOwnership(repo, context.worktree, journal);
-    if (repo.checkout.hasConflicts()) {
-      throw new GitError("EUNMERGED", "cannot continue: the index has unmerged paths");
-    }
-    requireBoundedIntegrationIndex(repo);
     const reservation = reserveIntegrationExecution(repo);
     try {
+      const journal = requireMergeJournalOwned(repo, reservation);
+      const head = requireOriginalHead(repo, journal.state);
+      requireJournalOwnership(repo, context.worktree, journal, reservation);
+      if (repo.checkout.hasConflicts()) {
+        throw new GitError("EUNMERGED", "cannot continue: the index has unmerged paths");
+      }
+      requireBoundedIntegrationIndex(repo, reservation);
       const identities = resolveIdentity(context, repo, {
         author: options.author ?? journal.state.author ?? undefined,
         committer: options.committer ?? journal.state.committer ?? undefined,
@@ -694,12 +808,12 @@ export function mergeContinue(
 /** Restore only paths owned by the active merge and clear its durable state. */
 export function mergeAbort(repo: Repository, worktree: Worktree): void {
   repo.store.db.transactionSync(() => {
-    const journal = repo.checkout.requireMergeState();
-    requireOriginalHead(repo, journal.state);
-    requireJournalOwnership(repo, worktree, journal);
     const reservation = reserveIntegrationExecution(repo);
     try {
-      abortProjectedMerge(repo, worktree, journal);
+      const journal = requireMergeJournalOwned(repo, reservation);
+      requireOriginalHead(repo, journal.state);
+      requireJournalOwnership(repo, worktree, journal, reservation);
+      abortProjectedMerge(repo, worktree, journal, reservation);
     } finally {
       reservation.dispose();
     }

@@ -4,9 +4,17 @@ import { utf8, utf8Decoder } from "../src/core/bytes.js";
 import { hasErrorCode } from "../src/core/errors.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { integrationIndexMatchesTree } from "../src/core/ops/integration-worktree.js";
-import { rebase, rebaseAbort, rebaseContinue, rebaseSkip } from "../src/core/ops/rebase.js";
+import {
+  rebase,
+  rebaseAbort,
+  rebaseContinue,
+  rebaseContinueExcluding,
+  rebaseSkip,
+} from "../src/core/ops/rebase.js";
+import { checkoutBlockersAgainstOwned } from "../src/core/ops/refs.js";
 import { add, rm } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -304,6 +312,68 @@ describe("rebase lifecycle", () => {
     expect(completed.outcome).toBe("completed");
     expect(textAt(workspace, "shared.txt")).toBe("resolved\n");
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
+  });
+
+  it("retains exclusions beyond the former one-megabyte component refusal", async () => {
+    const source = fixture();
+    const { upstream } = divergent(source, true);
+    const workspace = await imported(source);
+    expect(
+      rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }).outcome,
+    ).toBe("conflicted");
+    const roots = Array.from(
+      { length: 64 },
+      (_, ordinal) => `/foreign-${ordinal}-${"x".repeat(17_000)}`,
+    );
+
+    expectCode(
+      () => rebaseContinueExcluding(workspace.context, workspace.repo, workspace.worktree, roots),
+      "EUNMERGED",
+    );
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("retains checkout guard results beside active rebase ownership at exact capacity", async () => {
+    const source = fixture();
+    source.write("base.txt", "base\n");
+    const base = source.commit("base");
+    source.git("checkout", "-q", "-b", "upstream", base);
+    source.write("blocked.txt", "upstream\n");
+    const upstream = source.commit("upstream");
+    source.git("checkout", "-q", "-b", "current", base);
+    const workspace = await imported(source);
+    writeWorkFile(workspace, "/blocked.txt", "untracked\n");
+    const baselineTree = workspace.repo.readCommit(base).tree;
+    const targetTree = workspace.repo.readCommit(upstream).tree;
+    const owner = workspace.repo.store.reserveMemory();
+    owner.set("other", 4_096);
+    const guardMemory = owner.scope();
+    const blockers = checkoutBlockersAgainstOwned(
+      workspace.repo,
+      workspace.worktree,
+      baselineTree,
+      targetTree,
+      undefined,
+      true,
+      guardMemory,
+      { maxRows: 50_000, rows: 0, maxHashCandidates: 4_096, hashCandidates: 0 },
+    );
+    expect(blockers).toEqual({ tracked: [], untracked: ["blocked.txt"] });
+    const retainedBytes = owner.currentBytes;
+    expect(retainedBytes).toBeGreaterThan(4_096);
+
+    const exact = workspace.repo.store.reserveMemory();
+    exact.set("other", MAX_OPERATION_MEMORY_BYTES - retainedBytes);
+    exact.dispose();
+    const excess = workspace.repo.store.reserveMemory();
+    expect(() => excess.set("other", MAX_OPERATION_MEMORY_BYTES - retainedBytes + 1)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    excess.dispose();
+    guardMemory.dispose();
+    expect(owner.currentBytes).toBe(4_096);
+    owner.dispose();
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("keeps a cold distinct-type rebase journal until structural abort blockers clear", async () => {
@@ -642,38 +712,21 @@ describe("rebase lifecycle", () => {
     const upstreamTree = absent.repo.readCommit(upstream).tree;
     const upstreamFile = absent.repo.readTree(upstreamTree).find((entry) => entry.name === "x");
     if (upstreamFile === undefined) throw new Error("upstream file is missing");
-    const originalReplace = absent.repo.checkout.replaceOperationJournal.bind(absent.repo.checkout);
-    let sawAbsent = false;
-    absent.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
-      const relocation = touched.find((entry) => entry.path === "x~HEAD");
-      if (state.phase !== "conflicted" || relocation === undefined) {
-        originalReplace(integrity, state, steps, touched);
-        return;
-      }
-      sawAbsent = relocation.index === null && relocation.worktree.kind === "absent";
-      originalReplace(
-        integrity,
-        state,
-        steps,
-        touched.map((entry) =>
-          entry.path === "x~HEAD"
-            ? {
-                ...entry,
-                worktree: {
-                  kind: "file",
-                  mode: Number.parseInt(upstreamFile.mode, 8),
-                  oid: upstreamFile.oid,
-                  revision: 0,
-                },
-              }
-            : entry,
-        ),
-      );
-    };
     expect(rebase(absent.context, absent.repo, absent.worktree, { upstream }).outcome).toBe(
       "conflicted",
     );
-    expect(sawAbsent).toBe(true);
+    const relocation = absent.repo.checkout
+      .requireOperationState("rebase")
+      .touched.find((entry) => entry.path === "x~HEAD");
+    expect(relocation).toMatchObject({ index: null, worktree: { kind: "absent" } });
+    absent.repo.store.db.run(
+      `UPDATE git_operation_touched
+       SET worktree_kind = 'file', worktree_mode = ?, worktree_oid = ?, worktree_revision = 0
+       WHERE checkout_id = ? AND path = 'x~HEAD'`,
+      Number.parseInt(upstreamFile.mode, 8),
+      upstreamFile.oid,
+      absent.repo.checkout.checkoutId,
+    );
     expectCode(() => rebaseSkip(absent.context, absent.repo, absent.worktree), "ECORRUPT");
 
     const directory = await imported(source);

@@ -588,6 +588,19 @@ shape exceptions, store import topology and proportional per-WU review.
   The 111-test filesystem/worktree slice, typecheck, Biome, build, public-export
   snapshot, and 157/157 routine smoke gate passed; the smoke gate took 12.55 s
   under a two-vCPU lease.
+- 2026-08-30 — WU6c removed the reviewed integration, merge, replay and rebase
+  byte ceilings and cumulative work counters. Planning, graph traversal,
+  collision projection, worktree guards, payload batches, journal recovery,
+  replay messages and lifecycle state now share one operation reservation.
+  Returned plans retain their owner until release; streamed reads admit the
+  current metadata-derived batch before payload materialization. Exact/+1
+  witnesses prove refusal before payload, snapshot, SQL, object-info, state and
+  message construction while rollback and cold-reopen state remain intact.
+  Five independent Ohm review passes closed allocation-order, ownership-transfer,
+  double-charge and iterator-cleanup findings; the final verdict was CLEAN.
+  Typecheck, Biome, diff-check, public exports, package smoke and the 165/165
+  routine smoke gate passed. The smoke gate took 13.18 s under a two-vCPU lease;
+  the full suite remains deferred to sprint closure.
 
 The committed before baseline below preserves the medians required by the final
 gate; wall values are external local durations under the one shared lease.

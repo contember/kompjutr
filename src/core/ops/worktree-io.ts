@@ -1111,8 +1111,6 @@ export interface DirtyPathLimits {
   worktreeRows: number;
   maxHashCandidates: number;
   hashCandidates: number;
-  maxHashBytes: number;
-  hashBytes: number;
 }
 
 export function dirtyPaths(
@@ -1242,7 +1240,6 @@ export function* dirtyPathStreamOwned(
             );
           }
           limits.hashCandidates += needsHash.length;
-          for (const candidate of needsHash) limits.hashBytes += candidate.stat.size;
         }
 
         const hashes = hashWorktreePathsAtRoot(

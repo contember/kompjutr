@@ -7,6 +7,7 @@ import { cherryPick } from "../src/core/ops/cherry-pick.js";
 import { revert, revertAbort, revertContinue, revertSkip } from "../src/core/ops/revert.js";
 import { add, rm } from "../src/core/ops/staging.js";
 import { Repository } from "../src/core/repository.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -135,6 +136,179 @@ describe("revert lifecycle", () => {
     expect(head).toMatchObject({ oldOid: current, newOid: result.oid, reason: "revert" });
     if (named === undefined || head === undefined) throw new Error("revert reflog is missing");
     expect(head.ordinal).toBe(named.ordinal + 1);
+  });
+
+  it("admits the default message before deriving it at the exact shared-memory boundary", async () => {
+    const source = fixture();
+    source.write("tracked.txt", "base\n");
+    source.commit("base");
+    source.write(".git/message", `${"s".repeat(100_000)}\nbody\n`);
+    source.git("commit", "-q", "--allow-empty", "--cleanup=verbatim", "-F", ".git/message");
+    const reverted = source.git("rev-parse", "HEAD");
+    source.write("later.txt", "later\n");
+    source.commit("later");
+
+    const measuredWorkspace = await imported(source);
+    const measured = reopen(measuredWorkspace);
+    expect(
+      revert(measured.context, measured.repo, measuredWorkspace.worktree, { source: reverted }),
+    ).toEqual({ outcome: "empty", reason: "source" });
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(0);
+
+    const exactWorkspace = await imported(source);
+    const exact = reopen(exactWorkspace);
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(
+        revert(exact.context, exact.repo, exactWorkspace.worktree, { source: reverted }),
+      ).toEqual({ outcome: "empty", reason: "source" });
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    exact.repo.store.memory.assertIdle();
+
+    const excessWorkspace = await imported(source);
+    const excess = reopen(excessWorkspace);
+    const beforeHead = excess.repo.head();
+    const excessWriteFiles = excessWorkspace.worktree.writeFiles.bind(excessWorkspace.worktree);
+    const excessIndexApply = excess.repo.checkout.indexApply.bind(excess.repo.checkout);
+    let worktreeWrites = 0;
+    let indexApplies = 0;
+    excessWorkspace.worktree.writeFiles = (entries, options) => {
+      worktreeWrites++;
+      return excessWriteFiles(entries, options);
+    };
+    excess.repo.checkout.indexApply = (body, options) => {
+      indexApplies++;
+      return excessIndexApply(body, options);
+    };
+    const excessBlocker = excess.repo.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() =>
+        revert(excess.context, excess.repo, excessWorkspace.worktree, { source: reverted }),
+      ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+      expect(worktreeWrites).toBe(0);
+      expect(indexApplies).toBe(0);
+      expect(excess.repo.head()).toEqual(beforeHead);
+      expect(excess.repo.checkout.readOperationState()).toBeNull();
+      expect(excess.repo.store.reflog("refs/heads/main")).toEqual([]);
+      expect(excess.repo.checkout.reflog("HEAD")).toEqual([]);
+    } finally {
+      excessBlocker.dispose();
+    }
+    excess.repo.store.memory.assertIdle();
+  });
+
+  it("releases default-message subject intermediates before applying at the exact aggregate", async () => {
+    const source = fixture();
+    source.write("tracked.txt", "base\n");
+    source.commit("base");
+    source.write("tracked.txt", "changed\n");
+    source.write(".git/message", `${"s".repeat(10_000)}\nbody\n`);
+    source.git("add", "tracked.txt");
+    source.git("commit", "-q", "--cleanup=verbatim", "-F", ".git/message");
+    const reverted = source.git("rev-parse", "HEAD");
+    source.write("later.txt", "later\n");
+    source.commit("later");
+
+    const measuredWorkspace = await imported(source);
+    const measured = reopen(measuredWorkspace);
+    expect(
+      revert(measured.context, measured.repo, measuredWorkspace.worktree, { source: reverted }),
+    ).toEqual(expect.objectContaining({ outcome: "committed" }));
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+    expect(operationBytes).toBeGreaterThan(0);
+
+    const exactWorkspace = await imported(source);
+    const exact = reopen(exactWorkspace);
+    const exactWriteFiles = exactWorkspace.worktree.writeFiles.bind(exactWorkspace.worktree);
+    const exactIndexApply = exact.repo.checkout.indexApply.bind(exact.repo.checkout);
+    let worktreeWrites = 0;
+    let indexApplies = 0;
+    exactWorkspace.worktree.writeFiles = (entries, options) => {
+      worktreeWrites++;
+      return exactWriteFiles(entries, options);
+    };
+    exact.repo.checkout.indexApply = (body, options) => {
+      indexApplies++;
+      return exactIndexApply(body, options);
+    };
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(
+        revert(exact.context, exact.repo, exactWorkspace.worktree, { source: reverted }),
+      ).toEqual(expect.objectContaining({ outcome: "committed" }));
+      expect(worktreeWrites).toBeGreaterThan(0);
+      expect(indexApplies).toBeGreaterThan(0);
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    exact.repo.store.memory.assertIdle();
+  });
+
+  it("charges a supplied message before the empty replay branch", async () => {
+    const source = fixture();
+    source.write("tracked.txt", "base\n");
+    source.commit("base");
+    source.git("commit", "-q", "--allow-empty", "-m", "empty");
+    const reverted = source.git("rev-parse", "HEAD");
+    source.write("later.txt", "later\n");
+    source.commit("later");
+    const message = "m".repeat(100_000);
+
+    const measuredWorkspace = await imported(source);
+    const measured = reopen(measuredWorkspace);
+    expect(
+      revert(measured.context, measured.repo, measuredWorkspace.worktree, {
+        source: reverted,
+        message,
+      }),
+    ).toEqual({ outcome: "empty", reason: "source" });
+    const operationBytes = measured.repo.store.memory.highWaterBytes;
+
+    const exactWorkspace = await imported(source);
+    const exact = reopen(exactWorkspace);
+    const exactBlocker = exact.repo.store.reserveMemory();
+    exactBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes);
+    try {
+      expect(
+        revert(exact.context, exact.repo, exactWorkspace.worktree, {
+          source: reverted,
+          message,
+        }),
+      ).toEqual({ outcome: "empty", reason: "source" });
+      expect(exact.repo.store.memory.highWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    } finally {
+      exactBlocker.dispose();
+    }
+    exact.repo.store.memory.assertIdle();
+
+    const excessWorkspace = await imported(source);
+    const excess = reopen(excessWorkspace);
+    const beforeHead = excess.repo.head();
+    const excessBlocker = excess.repo.store.reserveMemory();
+    excessBlocker.set("other", MAX_OPERATION_MEMORY_BYTES - operationBytes + 1);
+    try {
+      expect(() =>
+        revert(excess.context, excess.repo, excessWorkspace.worktree, {
+          source: reverted,
+          message,
+        }),
+      ).toThrow(expect.objectContaining({ code: "E2BIG" }));
+      expect(excess.repo.head()).toEqual(beforeHead);
+      expect(excess.repo.checkout.readOperationState()).toBeNull();
+      expect(excess.repo.store.reflog("refs/heads/main")).toEqual([]);
+      expect(excess.repo.checkout.reflog("HEAD")).toEqual([]);
+    } finally {
+      excessBlocker.dispose();
+    }
+    excess.repo.store.memory.assertIdle();
   });
 
   it("rolls back a clean revert when publication fails after the ref mutation", async () => {

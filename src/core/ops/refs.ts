@@ -599,9 +599,7 @@ export interface CheckoutBlockers {
 
 export interface CheckoutBlockerLimits {
   maxRows: number;
-  maxHashBytes: number;
   rows: number;
-  hashBytes: number;
   maxHashCandidates: number;
   hashCandidates: number;
 }
@@ -1124,7 +1122,6 @@ function flushGuardCandidates(
         }
         limits.hashCandidates += needsHash.length;
       }
-      for (const candidate of needsHash) limits.hashBytes += candidate.worktree.stat.size;
     }
     const hashReservation = reservation.scope();
     try {

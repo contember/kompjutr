@@ -1,5 +1,6 @@
 // One-commit revert over the shared replay lifecycle.
 
+import type { MemoryReservation } from "../../memory.js";
 import type { GitContext, GitIdentity } from "../context.js";
 import { GitError } from "../errors.js";
 import type { Repository } from "../repository.js";
@@ -39,16 +40,64 @@ function sourceSubject(message: string): string {
   return (newline < 0 ? message.slice(start) : message.slice(start, newline)).replace(/\r$/, "");
 }
 
-function defaultMessage(plan: ReplayPlan): string {
-  const subject = sourceSubject(plan.sourceCommit.message);
-  if (plan.sourceCommit.parent.length > 1) {
-    const selectedParent = plan.selectedParentOid;
-    if (selectedParent === null) {
-      throw new GitError("ECORRUPT", "revert merge plan has no selected parent");
-    }
-    return `Revert "${subject}"\n\nThis reverts commit ${plan.sourceOid}, reversing\nchanges made to ${selectedParent}.\n`;
+function checkedMessageUnits(current: number, added: number): number {
+  if (
+    !Number.isSafeInteger(current) ||
+    current < 0 ||
+    !Number.isSafeInteger(added) ||
+    added < 0 ||
+    added > Number.MAX_SAFE_INTEGER - current
+  ) {
+    throw new GitError("E2BIG", "revert message memory accounting overflow");
   }
-  return `Revert "${subject}"\n\nThis reverts commit ${plan.sourceOid}.\n`;
+  return current + added;
+}
+
+function retainedMessageUnits(units: number): number {
+  return checkedMessageUnits(48, units * 2);
+}
+
+function defaultMessage(plan: ReplayPlan, reservation: MemoryReservation): string {
+  const sourceMessage = plan.sourceCommit.message;
+  let start = 0;
+  while (sourceMessage.charCodeAt(start) === 0x0a) start++;
+  const newline = sourceMessage.indexOf("\n", start);
+  const end = newline < 0 ? sourceMessage.length : newline;
+  const rawSubjectUnits = end - start;
+  const subjectUnits =
+    rawSubjectUnits > 0 && sourceMessage.charCodeAt(end - 1) === 0x0d
+      ? rawSubjectUnits - 1
+      : rawSubjectUnits;
+  let finalUnits = checkedMessageUnits('Revert ""'.length, subjectUnits);
+  finalUnits = checkedMessageUnits(finalUnits, "\n\nThis reverts commit ".length + 40);
+  if (plan.sourceCommit.parent.length > 1) {
+    finalUnits = checkedMessageUnits(
+      finalUnits,
+      ", reversing\nchanges made to ".length + 40 + ".\n".length,
+    );
+  } else {
+    finalUnits = checkedMessageUnits(finalUnits, ".\n".length);
+  }
+  const subjectBytes = checkedMessageUnits(
+    retainedMessageUnits(rawSubjectUnits),
+    retainedMessageUnits(subjectUnits),
+  );
+  reservation.set("other", retainedMessageUnits(finalUnits));
+  const subjectMemory = reservation.scope();
+  try {
+    subjectMemory.set("other", subjectBytes);
+    const subject = sourceSubject(plan.sourceCommit.message);
+    if (plan.sourceCommit.parent.length > 1) {
+      const selectedParent = plan.selectedParentOid;
+      if (selectedParent === null) {
+        throw new GitError("ECORRUPT", "revert merge plan has no selected parent");
+      }
+      return `Revert "${subject}"\n\nThis reverts commit ${plan.sourceOid}, reversing\nchanges made to ${selectedParent}.\n`;
+    }
+    return `Revert "${subject}"\n\nThis reverts commit ${plan.sourceOid}.\n`;
+  } finally {
+    subjectMemory.dispose();
+  }
 }
 
 const POLICY: ReplayPolicy = {

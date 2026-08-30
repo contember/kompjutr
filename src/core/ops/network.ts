@@ -38,7 +38,7 @@ import { retainedStringBytes } from "../retained.js";
 import { joinSorted } from "../streams.js";
 import { checkoutTree, matchesPaths, type TargetEntry } from "./checkout.js";
 import { isInitialCheckoutFallback, tryInitialCheckout } from "./initial-checkout.js";
-import { MAX_MERGE_BASE_RETAINED_BYTES, selectMergeBases } from "./merge-base.js";
+import { selectMergeBases } from "./merge-base.js";
 import { operationRefLogMetadata } from "./ref-log.js";
 import {
   compileFetchRefspecs,
@@ -58,7 +58,6 @@ const TAG_PEEL_HOPS = 16;
 const TAG_AUTH_BYTES = 64 * 1024 * 1024;
 const FETCH_OPTIONS_MEMORY_PART = "fetch-options";
 const FETCH_CHECKOUTS_MEMORY_PART = "fetch-checkouts";
-const FETCH_MERGE_BASE_MEMORY_PART = "fetch-merge-base";
 const FETCH_ROOT_AUTH_MEMORY_PART = "fetch-root-auth";
 const FETCH_ROOT_TYPES_MEMORY_PART = "fetch-root-types";
 const FETCH_TAG_AUTH_MEMORY_PART = "fetch-tag-auth";
@@ -984,13 +983,10 @@ function requireMappedUpdateRules(
         previous !== ref.oid &&
         !ref.force
       ) {
-        budget.setMemory(FETCH_MERGE_BASE_MEMORY_PART, MAX_MERGE_BASE_RETAINED_BYTES);
-        let selection: ReturnType<typeof selectMergeBases>;
-        try {
-          selection = selectMergeBases(repo, { currentOid: previous, incomingOid: ref.oid });
-        } finally {
-          budget.clearMemory(FETCH_MERGE_BASE_MEMORY_PART);
-        }
+        const selection = selectMergeBases(repo, {
+          currentOid: previous,
+          incomingOid: ref.oid,
+        });
         if (selection.kind !== "fast-forward") {
           throw new GitError("ENONFASTFORWARD", `fetch would not fast-forward ${ref.destination}`);
         }

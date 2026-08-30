@@ -2,10 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { hasErrorCode } from "../src/core/errors.js";
 import { serializeCommit, serializeTree } from "../src/core/objects.js";
-import {
-  MAX_MERGE_BASE_COMMITS,
-  MAX_MERGE_BASE_RETAINED_BYTES,
-} from "../src/core/ops/merge-base.js";
+import { MAX_MERGE_BASE_COMMITS } from "../src/core/ops/merge-base.js";
 import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
 import { planRebase } from "../src/core/ops/rebase-plan.js";
 import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/core/ops/replay.js";
@@ -169,7 +166,7 @@ describe("bounded rebase planner", () => {
     }
   });
 
-  it("accepts exact lower planner bounds and rejects the preceding boundary", () => {
+  it("accepts exact planner count and retained-plan bounds", () => {
     const { fixture, current, upstream } = divergentFixture();
     try {
       const { store, repo } = harness();
@@ -179,7 +176,6 @@ describe("bounded rebase planner", () => {
         maxSteps: measured.steps.length,
         maxRetainedBytes: measured.retainedBytes,
         maxGraphCommits: measured.graphCommits,
-        maxGraphRetainedBytes: measured.graphRetainedBytes,
       };
 
       expect(
@@ -217,18 +213,6 @@ describe("bounded rebase planner", () => {
           }),
         "E2BIG",
       );
-      expectCode(
-        () =>
-          planRebase(repo, {
-            upstream,
-            currentOid: current,
-            limits: {
-              ...exactLimits,
-              maxGraphRetainedBytes: measured.graphRetainedBytes - 1,
-            },
-          }),
-        "E2BIG",
-      );
     } finally {
       fixture.dispose();
     }
@@ -242,7 +226,6 @@ describe("bounded rebase planner", () => {
       { maxRetainedBytes: 0 },
       { maxRetainedBytes: Number.MAX_SAFE_INTEGER + 1 },
       { maxGraphCommits: MAX_MERGE_BASE_COMMITS + 1 },
-      { maxGraphRetainedBytes: MAX_MERGE_BASE_RETAINED_BYTES + 1 },
     ];
 
     for (const limits of invalidLimits) {

@@ -278,7 +278,7 @@ describe("bounded merge-base selection", () => {
     }
   });
 
-  it("accepts exact union graph bounds and rejects the preceding boundary", () => {
+  it("accepts the exact union graph commit bound and rejects the preceding boundary", () => {
     const { fixture, current, incoming } = divergentFixture();
     try {
       const { store, repo } = harness();
@@ -290,7 +290,7 @@ describe("bounded merge-base selection", () => {
         selectMergeBases(new Repository(store), {
           currentOid: current,
           incomingOid: incoming,
-          limits: { maxCommits: measured.commits, maxRetainedBytes: measured.retainedBytes },
+          limits: { maxCommits: measured.commits },
         }),
       ).toMatchObject({ commits: measured.commits, retainedBytes: measured.retainedBytes });
       expect(() =>
@@ -298,13 +298,6 @@ describe("bounded merge-base selection", () => {
           currentOid: current,
           incomingOid: incoming,
           limits: { maxCommits: measured.commits - 1 },
-        }),
-      ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(() =>
-        selectMergeBases(new Repository(store), {
-          currentOid: current,
-          incomingOid: incoming,
-          limits: { maxRetainedBytes: measured.retainedBytes - 1 },
         }),
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
       expect(store.objectCount()).toBe(before);

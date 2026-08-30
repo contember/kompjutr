@@ -11,9 +11,12 @@ import {
 import {
   MAX_REPLAY_REVISION_CODE_UNITS,
   MAX_REPLAY_REVISION_HOPS,
+  planFixedReplayStep,
   planReplay,
 } from "../src/core/ops/replay.js";
 import { Repository } from "../src/core/repository.js";
+import { retainedStringBytes } from "../src/core/retained.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 
@@ -83,6 +86,27 @@ function expectCode(action: () => unknown, code: string): void {
 
 function commitCacheRows(db: TestDatabase): number {
   return db.scalar<number>("SELECT COUNT(*) FROM git_commits") ?? -1;
+}
+
+function fixtureCommitRetainedBytes(
+  treeOid: string,
+  parents: readonly string[],
+  message: string,
+): number {
+  let bytes = 768;
+  for (const value of [
+    treeOid,
+    ...parents,
+    PERSON.name,
+    PERSON.email,
+    PERSON.name,
+    PERSON.email,
+    "",
+    message,
+  ]) {
+    bytes += retainedStringBytes(value);
+  }
+  return bytes;
 }
 
 describe("one-commit replay planner", () => {
@@ -611,5 +635,127 @@ describe("one-commit replay planner", () => {
     });
     expect(plan.integration.entries).toEqual([]);
     expect(plan.integration.sourceRows).toBe(0);
+    plan.integration.release();
+    store.shared.memory.assertIdle();
+  });
+
+  it("admits the exact first commit payload and rejects one excess byte before reading it", () => {
+    const { store, repo } = harness();
+    const unchanged = tree(store, "same\n");
+    const parent = commit(store, unchanged.tree, [], "parent");
+    const source = commit(store, unchanged.tree, [parent], "source");
+    const metadata = store.typeAndSize(parent);
+    if (metadata === null) throw new Error("current commit metadata is missing");
+    const exactCallerBytes = MAX_OPERATION_MEMORY_BYTES - 1_024 - (4_096 + metadata.size * 6);
+    const originalRead = repo.read.bind(repo);
+    let reads = 0;
+    repo.read = (oid) => {
+      reads++;
+      return originalRead(oid);
+    };
+
+    expectCode(
+      () =>
+        planReplay(repo, {
+          kind: "cherry-pick",
+          source,
+          currentOid: parent,
+          integrationCallerRetainedBytes: exactCallerBytes,
+        }),
+      "E2BIG",
+    );
+    expect(reads).toBe(1);
+    store.shared.memory.assertIdle();
+
+    reads = 0;
+    expectCode(
+      () =>
+        planReplay(repo, {
+          kind: "cherry-pick",
+          source,
+          currentOid: parent,
+          integrationCallerRetainedBytes: exactCallerBytes + 1,
+        }),
+      "E2BIG",
+    );
+    expect(reads).toBe(0);
+    store.shared.memory.assertIdle();
+  });
+
+  it("admits replay labels before construction and rejects the first excess byte", () => {
+    const { store, repo } = harness();
+    const unchanged = tree(store, "same\n");
+    const parent = commit(store, unchanged.tree, [], "parent");
+    const source = commit(store, unchanged.tree, [parent], "source");
+    const incoming = "x".repeat(1_000_000);
+    let incomingReads = 0;
+    const labels = {
+      get incoming(): string {
+        incomingReads++;
+        return incoming;
+      },
+    };
+    const retainedBytes =
+      1_024 +
+      fixtureCommitRetainedBytes(unchanged.tree, [], "parent\n") +
+      retainedStringBytes(source) +
+      fixtureCommitRetainedBytes(unchanged.tree, [parent], "source\n") +
+      retainedStringBytes(unchanged.tree) +
+      retainedStringBytes(parent) +
+      retainedStringBytes("HEAD") +
+      retainedStringBytes(parent.slice(0, 12)) +
+      retainedStringBytes(incoming);
+    const exactCallerBytes = MAX_OPERATION_MEMORY_BYTES - retainedBytes - 256;
+
+    expectCode(
+      () =>
+        planReplay(repo, {
+          kind: "cherry-pick",
+          source,
+          currentOid: parent,
+          integrationCallerRetainedBytes: exactCallerBytes,
+          text: { labels },
+        }),
+      "E2BIG",
+    );
+    expect(incomingReads).toBe(2);
+    store.shared.memory.assertIdle();
+
+    incomingReads = 0;
+    expectCode(
+      () =>
+        planReplay(repo, {
+          kind: "cherry-pick",
+          source,
+          currentOid: parent,
+          integrationCallerRetainedBytes: exactCallerBytes + 1,
+          text: { labels },
+        }),
+      "E2BIG",
+    );
+    expect(incomingReads).toBe(1);
+    store.shared.memory.assertIdle();
+  });
+
+  it("releases public replay and fixed-step metadata with their integration owner", () => {
+    const { store, repo } = harness();
+    const unchanged = tree(store, "same\n");
+    const parent = commit(store, unchanged.tree, [], "parent");
+    const source = commit(store, unchanged.tree, [parent], "source");
+
+    const replay = planReplay(repo, { kind: "cherry-pick", source, currentOid: parent });
+    expect(store.shared.memory.totalBytes).toBeGreaterThan(replay.integration.retainedBytes);
+    replay.integration.release();
+    replay.integration.release();
+    store.shared.memory.assertIdle();
+
+    const fixed = planFixedReplayStep(repo, {
+      sourceOid: source,
+      selectedParentOid: parent,
+      currentOid: parent,
+    });
+    expect(store.shared.memory.totalBytes).toBeGreaterThan(fixed.integration.retainedBytes);
+    fixed.integration.release();
+    store.shared.memory.assertIdle();
   });
 });

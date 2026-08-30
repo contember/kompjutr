@@ -246,6 +246,7 @@ describe("virtual-ancestor integration planning", () => {
           incoming: incoming.files.get("modeOnly"),
         },
       });
+      normal.release();
 
       const recursive = planVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
@@ -260,6 +261,7 @@ describe("virtual-ancestor integration planning", () => {
       expect(new TextDecoder().decode(recursiveItem.content)).toBe(
         `<<<<<<<<< ${currentLabel}\nleft\n=========\nright\n>>>>>>>>> ${incomingLabel}\n`,
       );
+      recursive.release();
 
       const virtual = planVirtualAncestorIntegration(repo, {
         baseTreeOid: base.tree,
@@ -269,6 +271,7 @@ describe("virtual-ancestor integration planning", () => {
         depth: 0,
       });
       expect(ordered(project(current.files, virtual.entries))).toEqual(ordered(expected));
+      virtual.release();
       assertCoordinatorIdle(store);
     } finally {
       git.fixture.dispose();
@@ -313,6 +316,7 @@ describe("virtual-ancestor integration planning", () => {
       });
       expect(plan.entries.every((entry) => entry.kind === "clean")).toBe(true);
       expect(ordered(project(current.files, plan.entries))).toEqual(ordered(expected));
+      plan.release();
       assertCoordinatorIdle(store);
     } finally {
       git.fixture.dispose();
@@ -348,6 +352,7 @@ describe("virtual-ancestor integration planning", () => {
         labels: { current: "current", incoming: "incoming" },
       });
       expect(ordered(project(current.files, plan.entries))).toEqual(ordered(expected));
+      plan.release();
       assertCoordinatorIdle(store);
     } finally {
       fixture.dispose();
@@ -389,13 +394,14 @@ describe("virtual-ancestor integration planning", () => {
       });
       expect(ordered(project(current.files, plan.entries))).toEqual(ordered(expected));
       expect(store.objectCount()).toBe(afterSetupObjects);
+      plan.release();
       assertCoordinatorIdle(store);
     } finally {
       git.fixture.dispose();
     }
   });
 
-  it("bounds every suffixed relocation path by its UTF-8 byte length", () => {
+  it("allows a long virtual relocation below the operation aggregate", () => {
     const path = "x".repeat(2_192);
     const { store, repo } = repoFixture();
     const base = writeState(repo, {});
@@ -407,14 +413,37 @@ describe("virtual-ancestor integration planning", () => {
       [`${path}/c`]: { mode: MODE_FILE, content: "child\n" },
     });
 
-    expect(() =>
-      planVirtualAncestorIntegration(repo, {
-        baseTreeOid: base.tree,
-        currentTreeOid: current.tree,
-        incomingTreeOid: incoming.tree,
-        labels: { current: "current", incoming: "incoming" },
-      }),
-    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    const plan = planVirtualAncestorIntegration(repo, {
+      baseTreeOid: base.tree,
+      currentTreeOid: current.tree,
+      incomingTreeOid: incoming.tree,
+      labels: { current: "current", incoming: "incoming" },
+    });
+    expect(plan.entries.some((entry) => entry.path === `${path}~current_0`)).toBe(true);
+    expect(new TextEncoder().encode(`${path}~current_0`).byteLength).toBeGreaterThan(2_200);
+    plan.release();
+    assertCoordinatorIdle(store);
+  });
+
+  it("charges a virtual label beyond the former 256-byte refusal", () => {
+    const label = "c".repeat(300);
+    const { store, repo } = repoFixture();
+    const base = writeState(repo, {});
+    const current = writeState(repo, {
+      node: { mode: MODE_FILE, content: "leaf\n" },
+    });
+    const incoming = writeState(repo, {
+      "node/child": { mode: MODE_FILE, content: "child\n" },
+    });
+
+    const plan = planVirtualAncestorIntegration(repo, {
+      baseTreeOid: base.tree,
+      currentTreeOid: current.tree,
+      incomingTreeOid: incoming.tree,
+      labels: { current: label, incoming: "incoming" },
+    });
+    expect(plan.entries.some((entry) => entry.path === `node~${label}`)).toBe(true);
+    plan.release();
     assertCoordinatorIdle(store);
   });
 
@@ -439,6 +468,7 @@ describe("virtual-ancestor integration planning", () => {
       labels: { current: "current", incoming: "incoming" },
     });
     expect(plan.entries.some((entry) => entry.path === "node~current_998")).toBe(true);
+    plan.release();
 
     currentState["node~current_998"] = { mode: MODE_FILE, content: "occupied\n" };
     const rejected = writeState(repo, currentState);

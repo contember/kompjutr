@@ -9,7 +9,10 @@ import { serializeCommit, serializeTree } from "../src/core/objects.js";
 import { checkoutTree } from "../src/core/ops/checkout.js";
 import { commit } from "../src/core/ops/commit.js";
 import { integrationIndexMatchesTree } from "../src/core/ops/integration-worktree.js";
-import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
+import {
+  MAX_OPERATION_STEPS,
+  type OperationStepMetadata,
+} from "../src/core/ops/operation-state.js";
 import {
   type RebaseLifecycleResult,
   rebase,
@@ -17,6 +20,8 @@ import {
   rebaseContinue,
   rebaseSkip,
 } from "../src/core/ops/rebase.js";
+import { preflightRebaseReplayObjects } from "../src/core/ops/rebase-lifecycle.js";
+import type { RebasePlan } from "../src/core/ops/rebase-plan.js";
 import { preflightReplayCommitObjects } from "../src/core/ops/replay.js";
 import { add } from "../src/core/ops/staging.js";
 import { status } from "../src/core/ops/status.js";
@@ -24,6 +29,7 @@ import { worktreeAdd } from "../src/core/ops/worktrees.js";
 import { Repository } from "../src/core/repository.js";
 import type { Worktree } from "../src/core/worktree.js";
 import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
+import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -230,11 +236,11 @@ async function suspendedMultiCheckout(): Promise<{
 }
 
 describe("rebase restart recovery", () => {
-  it("authenticates replay commits after more than eight progressing object reads", () => {
+  it("authenticates replay commits above the former cumulative byte barrier", () => {
     const workspace = makeRepo("/");
     const tree = workspace.repo.store.write("tree", serializeTree([]));
     const sourceOids: string[] = [];
-    const message = "x".repeat(900 * 1024);
+    const message = "x".repeat(1_000 * 1024);
     for (let ordinal = 0; ordinal < 33; ordinal++) {
       sourceOids.push(
         workspace.repo.store.write(
@@ -260,9 +266,83 @@ describe("rebase restart recovery", () => {
     const result = preflightReplayCommitObjects(workspace.repo, sourceOids);
 
     expect(readCalls).toBeGreaterThan(8);
-    expect(result.bytes).toBeGreaterThan(28 * 1024 * 1024);
+    expect(result.bytes).toBeGreaterThan(32 * 1024 * 1024);
     expect(workspace.repo.store.objectCount()).toBe(before);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("admits the replay OID vector before allocation and rejects one excess byte before objectInfo", () => {
+    const workspace = makeRepo("/");
+    const tree = workspace.repo.store.write("tree", serializeTree([]));
+    const oids = Array.from({ length: 9 }, (_, ordinal) =>
+      workspace.repo.store.write(
+        "commit",
+        serializeCommit({
+          tree,
+          parent: [],
+          author: PERSON,
+          committer: PERSON,
+          message: `vector ${ordinal}\n`,
+        }),
+      ),
+    );
+    const upstreamOid = oids[0];
+    const originalHeadOid = oids[1];
+    const baseOid = oids[2];
+    if (upstreamOid === undefined || originalHeadOid === undefined || baseOid === undefined) {
+      throw new Error("rebase vector fixture is incomplete");
+    }
+    const steps = Array.from({ length: 4 }, (_, ordinal): OperationStepMetadata => {
+      const sourceOid = oids[ordinal * 2 + 1];
+      const selectedParentOid = oids[ordinal * 2 + 2];
+      if (sourceOid === undefined || selectedParentOid === undefined) {
+        throw new Error("rebase vector step fixture is incomplete");
+      }
+      return {
+        sourceOid,
+        selectedParentOid,
+        mainline: null,
+        outcome: "pending",
+        resultOid: null,
+      };
+    });
+    const plan: RebasePlan = {
+      relation: "replay",
+      originalHeadOid,
+      upstreamOid,
+      baseOid,
+      steps,
+      retainedBytes: 0,
+      graphCommits: 0,
+      graphRetainedBytes: 0,
+    };
+    const inputCount = 1 + steps.length * 2;
+    const objectInfoBoundary = 640 + inputCount * 1_032;
+    const objectInfo = workspace.repo.store.objectInfo.bind(workspace.repo.store);
+    let objectInfoCalls = 0;
+    workspace.repo.store.objectInfo = (requested) => {
+      objectInfoCalls++;
+      return objectInfo(requested);
+    };
+
+    const exact = workspace.repo.store.reserveMemory();
+    exact.set("other", MAX_OPERATION_MEMORY_BYTES - objectInfoBoundary);
+    expect(() => preflightRebaseReplayObjects(workspace.repo, plan, exact)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(objectInfoCalls).toBe(1);
+    exact.dispose();
+
+    objectInfoCalls = 0;
+    const excess = workspace.repo.store.reserveMemory();
+    excess.set("other", MAX_OPERATION_MEMORY_BYTES - objectInfoBoundary + 1);
+    expect(() => preflightRebaseReplayObjects(workspace.repo, plan, excess)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    expect(objectInfoCalls).toBe(0);
+    excess.dispose();
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("completes an actual maximum-entry replay transition", async () => {
@@ -343,6 +423,7 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     source.write("conflict.txt", "base\n");
     const stableSizes = [
+      4 * 1024 * 1024,
       4 * 1024 * 1024,
       4 * 1024 * 1024,
       4 * 1024 * 1024,
@@ -461,36 +542,35 @@ describe("rebase restart recovery", () => {
       );
     }
     workspace.repo.store.setRef("refs/heads/main", current);
-    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
-      workspace.repo.checkout,
+    workspace.repo.store.db.run(
+      `CREATE TRIGGER fault_maximum_rebase_journal
+       BEFORE INSERT ON git_operation_steps
+       WHEN NEW.ordinal = ${MAX_OPERATION_STEPS - 1}
+       BEGIN
+         SELECT RAISE(ABORT, 'maximum replay journal seam');
+       END`,
     );
-    let reachedJournal = false;
-    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
-      expect(steps).toHaveLength(MAX_OPERATION_STEPS);
-      reachedJournal = true;
-      originalWrite(state, steps, touched);
-      throw new Error("maximum replay journal seam");
-    };
 
     expect(() =>
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
     ).toThrow("maximum replay journal seam");
-    expect(reachedJournal).toBe(true);
     expect(workspace.repo.head().oid).toBe(current);
     expect(workspace.repo.checkout.readOperationState()).toBeNull();
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls the upstream baseline back when initial journal creation fails", async () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
-      workspace.repo.checkout,
+    workspace.repo.store.db.run(
+      `CREATE TRIGGER fault_initial_rebase_journal
+       BEFORE INSERT ON git_operation_steps
+       WHEN NEW.ordinal = 1
+       BEGIN
+         SELECT RAISE(ABORT, 'initial journal fault');
+       END`,
     );
-    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
-      originalWrite(state, steps, touched);
-      throw new Error("initial journal fault");
-    };
 
     expect(() =>
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
@@ -500,6 +580,7 @@ describe("rebase restart recovery", () => {
     expect(
       integrationIndexMatchesTree(workspace.repo, workspace.repo.readCommit(original).tree),
     ).toBe(true);
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls a fast-forward checkout back when its expected-old ref update is stale", async () => {
@@ -533,13 +614,14 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source, true);
     const workspace = await imported(source);
-    const originalReplace = workspace.repo.checkout.replaceOperationJournal.bind(
-      workspace.repo.checkout,
+    workspace.repo.store.db.run(
+      `CREATE TRIGGER fault_rebase_conflict_journal
+       BEFORE INSERT ON git_operation_state
+       WHEN NEW.kind = 'rebase' AND NEW.phase = 'conflicted'
+       BEGIN
+         SELECT RAISE(ABORT, 'conflict journal fault');
+       END`,
     );
-    workspace.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
-      originalReplace(integrity, state, steps, touched);
-      if (state.phase === "conflicted") throw new Error("conflict journal fault");
-    };
 
     expect(() =>
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
@@ -562,13 +644,14 @@ describe("rebase restart recovery", () => {
     writeWorkFile(workspace, "/one.txt", "conflict-time staged edit\n");
     add(workspace.repo, workspace.worktree, { paths: ["one.txt"] });
     const before = workspace.repo.checkout.requireOperationState("rebase");
-    const originalReplace = workspace.repo.checkout.replaceOperationJournal.bind(
-      workspace.repo.checkout,
+    workspace.repo.store.db.run(
+      `CREATE TRIGGER fault_skip_cursor
+       BEFORE INSERT ON git_operation_state
+       WHEN NEW.kind = 'rebase' AND NEW.phase = 'running'
+       BEGIN
+         SELECT RAISE(ABORT, 'skip cursor fault');
+       END`,
     );
-    workspace.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
-      originalReplace(integrity, state, steps, touched);
-      if (state.phase === "running") throw new Error("skip cursor fault");
-    };
 
     expect(() => rebaseSkip(workspace.context, workspace.repo, workspace.worktree)).toThrow(
       "skip cursor fault",
@@ -583,6 +666,7 @@ describe("rebase restart recovery", () => {
     expect(workspace.worktree.readFile("/one.txt")).toEqual(
       new TextEncoder().encode("conflict-time staged edit\n"),
     );
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("rolls a hard abort checkout back when journal clearing fails", async () => {
@@ -615,15 +699,14 @@ describe("rebase restart recovery", () => {
     const { original, upstream } = history(source);
     const workspace = await imported(source);
     const projectionsBefore = objectProjectionCounts(workspace);
-    const originalReplace = workspace.repo.checkout.replaceOperationJournal.bind(
-      workspace.repo.checkout,
+    workspace.repo.store.db.run(
+      `CREATE TRIGGER fault_clean_cursor
+       BEFORE INSERT ON git_operation_state
+       WHEN NEW.kind = 'rebase' AND NEW.phase = 'running' AND NEW.current_step = 1
+       BEGIN
+         SELECT RAISE(ABORT, 'clean cursor fault');
+       END`,
     );
-    workspace.repo.checkout.replaceOperationJournal = (integrity, state, steps, touched) => {
-      originalReplace(integrity, state, steps, touched);
-      if (state.phase === "running" && state.currentStep === 1) {
-        throw new Error("clean cursor fault");
-      }
-    };
 
     expect(() =>
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),
@@ -641,24 +724,25 @@ describe("rebase restart recovery", () => {
       true,
     );
     expect(objectProjectionCounts(workspace)).toEqual(projectionsBefore);
+    workspace.repo.store.memory.assertIdle();
   });
 
   it("resumes after the initial upstream baseline and journal commit", async () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalRead = workspace.repo.checkout.readOperationState.bind(workspace.repo.checkout);
     let journalWritten = false;
-    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
-      workspace.repo.checkout,
-    );
-    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
-      originalWrite(state, steps, touched);
-      journalWritten = true;
+    const originalRun = workspace.repo.store.db.run.bind(workspace.repo.store.db);
+    workspace.repo.store.db.run = (query: string, ...bindings: unknown[]) => {
+      originalRun(query, ...bindings);
+      if (query.includes("INSERT INTO git_operation_state")) journalWritten = true;
     };
-    workspace.repo.checkout.readOperationState = () => {
-      if (journalWritten) throw new Error("restart after baseline");
-      return originalRead();
+    const originalOne = workspace.repo.store.db.one.bind(workspace.repo.store.db);
+    workspace.repo.store.db.one = <Row extends object>(query: string, ...bindings: unknown[]) => {
+      if (journalWritten && query.includes("FROM git_operation_state")) {
+        throw new Error("restart after baseline");
+      }
+      return originalOne<Row>(query, ...bindings);
     };
 
     expect(() =>
@@ -686,18 +770,18 @@ describe("rebase restart recovery", () => {
     const source = fixture();
     const { original, upstream } = history(source);
     const workspace = await imported(source);
-    const originalRead = workspace.repo.checkout.readOperationState.bind(workspace.repo.checkout);
     let journalWritten = false;
-    const originalWrite = workspace.repo.checkout.writeOperationJournal.bind(
-      workspace.repo.checkout,
-    );
-    workspace.repo.checkout.writeOperationJournal = (state, steps, touched) => {
-      originalWrite(state, steps, touched);
-      journalWritten = true;
+    const originalRun = workspace.repo.store.db.run.bind(workspace.repo.store.db);
+    workspace.repo.store.db.run = (query: string, ...bindings: unknown[]) => {
+      originalRun(query, ...bindings);
+      if (query.includes("INSERT INTO git_operation_state")) journalWritten = true;
     };
-    workspace.repo.checkout.readOperationState = () => {
-      if (journalWritten) throw new Error("restart at running baseline");
-      return originalRead();
+    const originalOne = workspace.repo.store.db.one.bind(workspace.repo.store.db);
+    workspace.repo.store.db.one = <Row extends object>(query: string, ...bindings: unknown[]) => {
+      if (journalWritten && query.includes("FROM git_operation_state")) {
+        throw new Error("restart at running baseline");
+      }
+      return originalOne<Row>(query, ...bindings);
     };
     expect(() =>
       rebase(workspace.context, workspace.repo, workspace.worktree, { upstream }),

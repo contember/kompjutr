@@ -4,8 +4,19 @@ import { concat } from "../src/core/bytes.js";
 import { DEFAULT_TEXT_MERGE_LIMITS } from "../src/core/diff/xmerge.js";
 import { hasErrorCode } from "../src/core/errors.js";
 import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
-import { type IntegrationEntry, planIntegration } from "../src/core/ops/integration.js";
-import { reserveIntegrationPlan } from "../src/core/ops/integration-worktree.js";
+import {
+  type IntegrationEntry,
+  type IntegrationPlan,
+  planIntegration,
+} from "../src/core/ops/integration.js";
+import {
+  projectedTouchedShape,
+  projectIntegrationWithCollisions,
+  requireCleanIntegrationWorktree,
+  requireSafeIntegrationWorktree,
+  reserveIntegrationPlan,
+} from "../src/core/ops/integration-worktree.js";
+import type { ProjectedMergeEntry } from "../src/core/ops/merge-projection.js";
 import { PackWriter } from "../src/core/pack/writer.js";
 import { Repository } from "../src/core/repository.js";
 import { comparePaths } from "../src/core/streams.js";
@@ -13,6 +24,8 @@ import { MAX_OPERATION_MEMORY_BYTES } from "../src/memory.js";
 import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
+import { makeRepo } from "./helpers/workspace.js";
+import { CountingWorktree } from "./helpers/worktree.js";
 
 interface FileValue {
   content: string | Uint8Array;
@@ -69,29 +82,89 @@ function assertCoordinatorIdle(store: CheckoutStore): void {
   }
 }
 
+function trackWorktreeFile(
+  workspace: ReturnType<typeof makeRepo>,
+  path: string,
+  content: Uint8Array,
+): void {
+  workspace.worktree.writeFile(`/${path}`, content);
+  workspace.repo.checkout.indexPut({
+    path,
+    stage: 0,
+    mode: 0o100644,
+    oid: hashObject("blob", content),
+    size: null,
+    mtime: null,
+    ino: null,
+  });
+}
+
+function trackStorageIterators(workspace: ReturnType<typeof makeRepo>): {
+  active: () => number;
+  closed: () => number;
+} {
+  const originalIterate = workspace.storage.iterate.bind(workspace.storage);
+  let active = 0;
+  let closed = 0;
+  workspace.storage.iterate = function* (query: string, ...bindings: unknown[]) {
+    active++;
+    try {
+      yield* originalIterate(query, ...bindings);
+    } finally {
+      active--;
+      closed++;
+    }
+  };
+  return { active: () => active, closed: () => closed };
+}
+
 describe("bounded three-way integration plan", () => {
-  it("rejects concurrent operation state before opening a tree cursor", () => {
+  it("charges the exact planning peak against concurrent operation state", () => {
     const db = new TestDatabase();
     const database = new SqliteGitDatabase(db);
     const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
     const base = writeTree(store, { file: { content: "base\n" } });
-    const current = writeTree(store, { file: { content: "current\n" } });
-    const incoming = writeTree(store, { file: { content: "incoming\n" } });
-    const blocker = store.reserveMemory();
-    blocker.set("other", 1);
-    db.storage.resetCounters();
+    const current = writeTree(store, { file: { content: "base\n" } });
+    const incoming = writeTree(store, {});
+    const repo = new Repository(store);
+    const measured = planIntegration(repo, {
+      baseTreeOid: base.tree,
+      currentTreeOid: current.tree,
+      incomingTreeOid: incoming.tree,
+    });
+    const peak = measured.memoryHighWaterBytes;
+    measured.release();
+
+    const exact = store.reserveMemory();
+    exact.set("other", MAX_OPERATION_MEMORY_BYTES - peak);
+    try {
+      const plan = planIntegration(repo, {
+        baseTreeOid: base.tree,
+        currentTreeOid: current.tree,
+        incomingTreeOid: incoming.tree,
+        reservation: exact,
+      });
+      expect(exact.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES - peak + plan.retainedBytes);
+      plan.release();
+      expect(exact.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES - peak);
+    } finally {
+      exact.dispose();
+    }
+
+    const excess = store.reserveMemory();
+    excess.set("other", MAX_OPERATION_MEMORY_BYTES - peak + 1);
     try {
       expect(() =>
-        planIntegration(new Repository(store), {
+        planIntegration(repo, {
           baseTreeOid: base.tree,
           currentTreeOid: current.tree,
           incomingTreeOid: incoming.tree,
+          reservation: excess,
         }),
       ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
-      expect(db.storage.statementCount).toBe(0);
-      expect(blocker.currentBytes).toBe(1);
+      expect(excess.currentBytes).toBe(MAX_OPERATION_MEMORY_BYTES - peak + 1);
     } finally {
-      blocker.dispose();
+      excess.dispose();
     }
     assertCoordinatorIdle(store);
   });
@@ -108,19 +181,318 @@ describe("bounded three-way integration plan", () => {
         baseTreeOid: tree.tree,
         currentTreeOid: tree.tree,
         incomingTreeOid: tree.tree,
-        callerRetainedBytes: journal.currentBytes,
+        reservation: journal,
       });
-      expect(plan.memoryHighWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES - journal.currentBytes);
-      const execution = reserveIntegrationPlan(
-        repo,
-        { ...plan, retainedBytes: 26 * 1024 * 1024 },
-        8 * 1024 * 1024,
-      );
+      expect(journal.currentBytes).toBe(4 * 1024 * 1024 + plan.retainedBytes);
+      expect(plan.memoryHighWaterBytes).toBeGreaterThanOrEqual(plan.retainedBytes);
+      const execution = reserveIntegrationPlan(repo, plan, 8 * 1024 * 1024);
+      expect(journal.currentBytes).toBe(4 * 1024 * 1024 + plan.retainedBytes + 8 * 1024 * 1024);
       execution.dispose();
+      plan.release();
+      expect(journal.currentBytes).toBe(4 * 1024 * 1024);
     } finally {
       journal.dispose();
     }
     assertCoordinatorIdle(store);
+  });
+
+  it("admits an exact projection vector and rejects one excess byte before projecting", () => {
+    const workspace = makeRepo("/");
+    const entry: IntegrationEntry = {
+      kind: "clean",
+      path: "a",
+      before: null,
+      result: null,
+      content: null,
+    };
+    const projectionAdmissionBytes = 64 + 512 + 2 + 2;
+    const projectedAccesses = (availableBytes: number): number => {
+      let accesses = 0;
+      const plan: IntegrationPlan = {
+        get entries() {
+          accesses++;
+          return [entry];
+        },
+        sourceRows: 1,
+        retainedBytes: 0,
+        memoryHighWaterBytes: 0,
+      };
+      const blocker = workspace.repo.store.reserveMemory();
+      blocker.set("other", MAX_OPERATION_MEMORY_BYTES - availableBytes);
+      try {
+        expect(() =>
+          projectIntegrationWithCollisions(
+            workspace.repo,
+            workspace.worktree,
+            null,
+            null,
+            plan,
+            "HEAD",
+            "topic",
+          ),
+        ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+      } finally {
+        blocker.dispose();
+      }
+      return accesses;
+    };
+
+    const exactAccesses = projectedAccesses(projectionAdmissionBytes);
+    const excessAccesses = projectedAccesses(projectionAdmissionBytes - 1);
+    expect(exactAccesses).toBeGreaterThan(excessAccesses);
+    expect(excessAccesses).toBe(3);
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("transfers the projected result without additive ownership", () => {
+    const workspace = makeRepo("/");
+    const entry: IntegrationEntry = {
+      kind: "clean",
+      path: "a",
+      before: null,
+      result: null,
+      content: null,
+    };
+    const retainedBytes = 64 + 512 + 2 + 2;
+    const plan: IntegrationPlan = {
+      entries: [entry],
+      sourceRows: 1,
+      retainedBytes: 0,
+      memoryHighWaterBytes: 0,
+    };
+    const owner = workspace.repo.store.reserveMemory();
+    const projected = projectIntegrationWithCollisions(
+      workspace.repo,
+      workspace.worktree,
+      null,
+      null,
+      plan,
+      "HEAD",
+      "topic",
+      undefined,
+      "merge",
+      owner,
+    );
+    expect(projected).toHaveLength(1);
+    expect(owner.currentBytes).toBe(retainedBytes);
+    const projectionPeak = retainedBytes * 2 + 3 * 128;
+    expect(owner.highWaterBytes).toBe(projectionPeak);
+    owner.dispose();
+
+    const exact = workspace.repo.store.reserveMemory();
+    exact.set("other", MAX_OPERATION_MEMORY_BYTES - projectionPeak);
+    expect(
+      projectIntegrationWithCollisions(
+        workspace.repo,
+        workspace.worktree,
+        null,
+        null,
+        plan,
+        "HEAD",
+        "topic",
+        undefined,
+        "merge",
+        exact,
+      ),
+    ).toHaveLength(1);
+    exact.dispose();
+
+    const excess = workspace.repo.store.reserveMemory();
+    excess.set("other", MAX_OPERATION_MEMORY_BYTES - projectionPeak + 1);
+    expect(() =>
+      projectIntegrationWithCollisions(
+        workspace.repo,
+        workspace.worktree,
+        null,
+        null,
+        plan,
+        "HEAD",
+        "topic",
+        undefined,
+        "merge",
+        excess,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    excess.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("admits touched shapes with duplicate ancestors at the exact aggregate boundary", () => {
+    const workspace = makeRepo("/");
+    const projected: ProjectedMergeEntry[] = [
+      {
+        path: "dir/sub/file~HEAD",
+        logicalPath: "dir/sub/file",
+        purpose: "current-relocation",
+        stageZero: null,
+        stages: null,
+        worktree: null,
+        content: null,
+      },
+      {
+        path: "dir/sub/file~topic",
+        logicalPath: "dir/sub/file",
+        purpose: "incoming-relocation",
+        stageZero: null,
+        stages: null,
+        worktree: null,
+        content: null,
+      },
+    ];
+    const measured = workspace.repo.store.reserveMemory();
+    expect(projectedTouchedShape(projected, measured).map((entry) => entry.path)).toEqual([
+      "dir",
+      "dir/sub",
+      "dir/sub/file",
+      "dir/sub/file~HEAD",
+      "dir/sub/file~topic",
+    ]);
+    expect(measured.currentBytes).toBe(924);
+    const peak = measured.highWaterBytes;
+    expect(peak).toBeGreaterThan(measured.currentBytes);
+    measured.dispose();
+
+    const exact = workspace.repo.store.reserveMemory();
+    exact.set("other", MAX_OPERATION_MEMORY_BYTES - peak);
+    const exactShape = exact.scope();
+    expect(projectedTouchedShape(projected, exactShape)).toHaveLength(5);
+    exactShape.dispose();
+    exact.dispose();
+
+    const excess = workspace.repo.store.reserveMemory();
+    excess.set("other", MAX_OPERATION_MEMORY_BYTES - peak + 1);
+    const excessShape = excess.scope();
+    expect(() => projectedTouchedShape(projected, excessShape)).toThrowError(
+      expect.objectContaining({ code: "E2BIG" }),
+    );
+    excessShape.dispose();
+    excess.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("admits the exact guard path vector and rejects one excess byte before the guard scan", () => {
+    const workspace = makeRepo("/");
+    let pathReads = 0;
+    const entries = [
+      {
+        get path(): string {
+          pathReads++;
+          return "guarded.txt";
+        },
+      },
+    ];
+    const pathVectorBytes = 128 + 8;
+    const exact = workspace.repo.store.reserveMemory();
+    exact.set("other", MAX_OPERATION_MEMORY_BYTES - pathVectorBytes);
+    expect(() =>
+      requireSafeIntegrationWorktree(
+        workspace.repo,
+        workspace.worktree,
+        null,
+        entries,
+        "merge",
+        undefined,
+        exact,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(pathReads).toBe(1);
+    exact.dispose();
+
+    pathReads = 0;
+    workspace.storage.resetCounters();
+    const excess = workspace.repo.store.reserveMemory();
+    excess.set("other", MAX_OPERATION_MEMORY_BYTES - pathVectorBytes + 1);
+    expect(() =>
+      requireSafeIntegrationWorktree(
+        workspace.repo,
+        workspace.worktree,
+        null,
+        entries,
+        "merge",
+        undefined,
+        excess,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "E2BIG" }));
+    expect(pathReads).toBe(0);
+    expect(workspace.storage.statementCount).toBe(0);
+    excess.dispose();
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("streams guard hashing beyond the former cumulative byte and range thresholds", () => {
+    const workspace = makeRepo("/");
+    const content = new Uint8Array(32 * 1024 * 1024 + 1).fill(0x69);
+    trackWorktreeFile(workspace, "large.bin", content);
+    const worktree = new CountingWorktree(workspace.worktree);
+
+    requireCleanIntegrationWorktree(workspace.repo, worktree, "merge");
+
+    expect(worktree.rangeReads).toBe(513);
+    expect(workspace.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("finishes more than ten progressing guard hash batches", () => {
+    const workspace = makeRepo("/");
+    for (let ordinal = 0; ordinal < 11; ordinal++) {
+      trackWorktreeFile(
+        workspace,
+        `batch-${ordinal.toString().padStart(2, "0")}.txt`,
+        bytes(`content-${ordinal}\n`),
+      );
+    }
+    class SingleFileBatchWorktree extends CountingWorktree {
+      override readFiles(paths: readonly string[], options?: { budget?: number }) {
+        const first = paths[0];
+        if (first === undefined) return super.readFiles(paths, options);
+        const batch = super.readFiles([first], options);
+        return { files: batch.files, remaining: [...batch.remaining, ...paths.slice(1)] };
+      }
+    }
+    const worktree = new SingleFileBatchWorktree(workspace.worktree);
+
+    requireCleanIntegrationWorktree(workspace.repo, worktree, "merge");
+
+    expect(worktree.bulkReadPaths).toHaveLength(11);
+    expect(workspace.repo.store.memory.totalBytes).toBe(0);
+  });
+
+  it("closes the dirty-path cursor after the first dirty result", () => {
+    const workspace = makeRepo("/");
+    trackWorktreeFile(workspace, "dirty.txt", bytes("indexed\n"));
+    workspace.worktree.writeFile("/dirty.txt", bytes("modified\n"));
+    const iterators = trackStorageIterators(workspace);
+
+    expect(() =>
+      requireCleanIntegrationWorktree(workspace.repo, workspace.worktree, "merge"),
+    ).toThrowError(expect.objectContaining({ code: "ECHECKOUTFAIL" }));
+    expect(iterators.closed()).toBeGreaterThan(0);
+    expect(iterators.active()).toBe(0);
+    workspace.repo.store.memory.assertIdle();
+  });
+
+  it("releases integration guard ownership after a ranged read failure", () => {
+    const workspace = makeRepo("/");
+    const content = new Uint8Array(4 * 1024 * 1024 + 1).fill(0x72);
+    trackWorktreeFile(workspace, "failure.bin", content);
+    class FailingRangeWorktree extends CountingWorktree {
+      override readRange(path: string, offset: number, length: number): Uint8Array {
+        if (this.rangeReads === 1) {
+          this.rangeReads++;
+          throw new Error("injected integration range failure");
+        }
+        return super.readRange(path, offset, length);
+      }
+    }
+    const worktree = new FailingRangeWorktree(workspace.worktree);
+    const iterators = trackStorageIterators(workspace);
+
+    expect(() => requireCleanIntegrationWorktree(workspace.repo, worktree, "merge")).toThrow(
+      "injected integration range failure",
+    );
+    expect(worktree.rangeReads).toBe(2);
+    expect(iterators.closed()).toBeGreaterThan(0);
+    expect(iterators.active()).toBe(0);
+    expect(workspace.repo.store.memory.totalBytes).toBe(0);
   });
 
   it("merges mixed loose and packed blobs without mutation or leaked reservations", async () => {
@@ -200,7 +572,8 @@ describe("bounded three-way integration plan", () => {
       text: { labels: { current: "HEAD", incoming: "topic" } },
     });
 
-    expect(plan.memoryHighWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(plan.memoryHighWaterBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+    expect(plan.memoryHighWaterBytes).toBeGreaterThanOrEqual(plan.retainedBytes);
 
     const clean = find(plan.entries, "clean.txt");
     expect(clean).toMatchObject({
@@ -237,6 +610,7 @@ describe("bounded three-way integration plan", () => {
       refs: coldStore.listRefs(),
       index: coldStore.indexEntries(),
     }).toEqual(before);
+    plan.release();
     assertCoordinatorIdle(coldStore);
   });
 
@@ -281,7 +655,8 @@ describe("bounded three-way integration plan", () => {
       "conflict.txt",
       "delete.txt",
     ]);
-    expect(plan.memoryHighWaterBytes).toBe(MAX_OPERATION_MEMORY_BYTES);
+    expect(plan.memoryHighWaterBytes).toBeLessThan(MAX_OPERATION_MEMORY_BYTES);
+    expect(plan.memoryHighWaterBytes).toBeGreaterThanOrEqual(plan.retainedBytes);
 
     const clean = find(plan.entries, "a.txt");
     expect(clean).toMatchObject({
@@ -336,6 +711,7 @@ describe("bounded three-way integration plan", () => {
       refs: store.listRefs(),
       index: store.indexEntries(),
     }).toEqual(before);
+    plan.release();
     assertCoordinatorIdle(store);
   });
 
@@ -408,6 +784,7 @@ describe("bounded three-way integration plan", () => {
       refs: store.listRefs(),
       index: store.indexEntries(),
     }).toEqual(before);
+    plan.release();
     assertCoordinatorIdle(store);
   });
 
