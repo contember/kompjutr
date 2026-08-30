@@ -50,21 +50,11 @@ per store carries the primary marker. `worktreeRemove` rejects that checkout wit
 is a separate internal operation that cascades every checkout and all store-owned
 state.
 
-Each store may have at most 1,024 live checkouts. A bounded listing retains at
-most 1,024 × (4,096-byte root + 1,024-byte raw `HEAD` + conservative 1 KiB
-JavaScript state per row), or 6 MiB before fixed headroom. At most 1,048,576
-checkout `HEAD` rows can be retained structurally: 1,024 checkouts times 1,024
-entries per checkout. That shape does not promise that root enumeration succeeds.
-Enumeration first obtains a bounded scalar count of combined retained direct-ref
-and checkout-`HEAD` rows. A count above `MAX_REFLOG_ROOT_SCAN_ENTRIES`, currently
-9,727, fails with `E2BIG` before allocation or yield and never returns partial
-roots. At or below the limit, enumeration streams and validates rows while
-retaining only the current row and shared caches under the existing sub-100-MiB
-derivation. This composes with current direct-ref semantics. WU5 must witness the
-exact accepted and first-rejected counts. The 1,024-checkout limit is based on
-lifecycle and listing memory, not on full-history root enumeration. WU4 must
-witness that limit, and the first creation above it fails with `EWORKTREELIMIT`
-before mutation.
+Each store may have at most 1,024 live checkouts; listing is bounded by that
+cap and the root/`HEAD` size limits. Reflog root enumeration is capped
+structurally (`MAX_REFLOG_ROOT_SCAN_ENTRIES`) and fails with `E2BIG` before
+yielding partial roots; below the cap it streams. The first checkout creation
+above the 1,024 limit fails with `EWORKTREELIMIT` before mutation.
 
 A checkout owns a branch only when its raw `HEAD` is exactly
 `ref: refs/heads/*`. Ownership includes an unborn or deleted target. Symbolic

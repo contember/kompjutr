@@ -37,8 +37,9 @@ defense in depth.
 
 Enabling the pragma governs subsequent writes and deletes. It does not validate
 or repair violations that already exist in a database. Opening a store does not
-run an unbounded `foreign_key_check`; persisted-row validation remains the
-responsibility of bounded migration and read paths.
+run an unbounded `foreign_key_check`; per ADR-0018, integrity of existing rows
+is the write path's guarantee and the opt-in audit's job, not a read-time
+concern.
 
 ## Consequences
 

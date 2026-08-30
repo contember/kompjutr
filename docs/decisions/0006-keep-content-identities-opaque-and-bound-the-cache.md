@@ -29,8 +29,8 @@ disposable per-repository cache. Git must never infer an object ID from the
 identity bytes.
 
 Each repository retains at most 65,536 mappings. A cacheable identity is at most
-256 bytes, which bounds stored identity payload at 16 MiB. Lookup and update
-callers each retain at most 16 MiB of accounted state. Writers publish each
+256 bytes, which bounds stored identity payload at 16 MiB. Lookups and updates
+run in bounded pages. Writers publish each
 bounded page as one generation and transactionally evict older generations. If
 an update contains more mappings than the cache can retain, its newest pages
 survive. Oversized identities and evicted mappings are cache misses; the caller

@@ -1,5 +1,11 @@
 # src/sqlite — the store
 
+> **Direction change (2026-08-30).** ADR-0018 replaced the untrusted-row
+> doctrine: validate at the boundary, trust stored rows; ADR-0017 (rewritten)
+> removes the memory-reservation ledger. The trust and reservation rules below
+> describe code the active sprint is deleting — where they conflict with the
+> ADRs or root `CLAUDE.md`, the ADRs win.
+
 Every table the Git side owns, plus the adapter under all of them. `src/fs/`
 keeps its own schema and shares only `Database`. `src/core/` reaches this layer
 through `SharedRepoStore`; the two direct `git_refs` existence checks in

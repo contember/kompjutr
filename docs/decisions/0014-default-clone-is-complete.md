@@ -33,7 +33,7 @@ depth-limited single-branch clone follows only tags reachable from that branch.
 Explicit all-branch coverage retains Git's normal complete tag coverage.
 
 The transfer and pack ingest remain bounded and streaming. Changing the default
-does not permit an operation to exceed its SQL or retained-memory limits.
+does not change the structural bounds of ingest (ADR-0017).
 
 ## Consequences
 

@@ -25,8 +25,8 @@ first-class API. Compatibility with `@cloudflare/computer` stays isolated in
 
 ## Consequences
 
-- Every accepted operation can enforce the 1,000-statement and retained-memory
-  ceilings before unbounded work begins.
+- Every operation can be built on bulk, paged primitives whose cost is
+  measured in `bench/` (ADR-0017) instead of degrading per path.
 - The runtime needs no `.git` directory or external filesystem implementation.
 - The project owns POSIX semantics, schema migration, pack storage, and the
   corresponding conformance burden.

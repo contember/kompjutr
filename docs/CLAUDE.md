@@ -24,7 +24,7 @@ is the public product overview; when it drifts, update it from current reference
 |---|---|---|
 | `reference/` | living knowledge: architecture, conventions, runbooks — "how it IS now" | edit in place when behaviour changes |
 | `ideas/` | research, proposals, half-formed thoughts — **no commitment** | graduate → `backlog/`/sprint, or delete |
-| `decisions/` | ADR — one significant decision each, the *why* | **immutable**; supersede, never rewrite |
+| `decisions/` | ADR — one significant decision each, the *why* | living record; rewrite in place when the decision changes (git holds history) |
 | `backlog/` | decided work items ("issues") not yet scheduled | delete on ship (or archive if reference-worthy) |
 | `sprints/` | active thematic work-plans being executed now | archive (with OUTCOME) on ship |
 | `archive/` | shipped sprints + reference-worthy shipped items | append-only graveyard-lite |
@@ -112,9 +112,10 @@ doesn't duplicate the durable doc.
 
 One file per significant decision: `decisions/NNNN-<slug>.md` (copy
 `decisions/_template.md`). Sections: Status · Context · Decision · Consequences ·
-(Alternatives). **Immutable**: once Accepted, never rewrite — to change a decision,
-write a *new* ADR and set the old one's status to `Superseded by NNNN`. Numbers
-are monotonic and never reused.
+(Alternatives). **Living records**: an ADR states the decision as it stands.
+When a decision changes, rewrite the ADR in place (git holds the history);
+delete one whose subject no longer exists. Numbers are monotonic, never reused,
+and stay stable because other docs reference them.
 
 **When to write one:** the choice (a) constrains future work, (b) rejected a real
 alternative, or (c) someone will later ask "why did we do it this way?". Otherwise
@@ -169,6 +170,7 @@ path (`git mv`); they are not edited afterward.
 - Don't add top-level meta files (`STATUS.md`, `PROGRESS.md`) — the structure
   encodes status. (One living `STATUS.md` *inside* a long-running subsystem folder
   is the only exception.)
-- Don't rewrite a decided ADR — supersede it.
+- Don't let an ADR drift from reality — rewrite it in place when the decision
+  changes.
 - Don't let the archive become a dump — delete by default.
 - Don't duplicate content across folders — link to the one canonical copy.

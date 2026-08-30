@@ -3,8 +3,10 @@
 One file per significant architectural/product decision: `NNNN-<slug>.md`
 (monotonic, never reused). Copy [`_template.md`](_template.md).
 
-**Immutable.** Once a decision is Accepted, don't rewrite it — to change course,
-write a *new* ADR and set the old one's status to `Superseded by NNNN`.
+**Living records.** An ADR describes the decision as it stands. When a decision
+changes, rewrite the ADR in place to the new truth (git holds the history);
+delete an ADR whose subject no longer exists. Keep numbers stable — other docs
+reference them.
 
 Write one when the choice (a) constrains future work, (b) rejected a real
 alternative, or (c) someone will later ask "why did we do it this way?". Otherwise
@@ -29,4 +31,6 @@ a commit message suffices.
 - [0014 — Make an optionless clone complete](0014-default-clone-is-complete.md) — accepted (2026-08-28)
 - [0015 — Route Git argv through one synchronous runner](0015-route-git-argv-through-one-synchronous-runner.md) — accepted (2026-08-28)
 - [0016 — Preflight mutating CLI output inside the transaction](0016-preflight-mutating-cli-output-inside-the-transaction.md) — accepted (2026-08-28)
-- [0017 — Measure query cost and bound real failures](0017-measure-query-cost-and-bound-real-failures.md) — accepted (2026-08-29)
+- [0017 — Measure cost in benchmarks and bound only real failures](0017-measure-query-cost-and-bound-real-failures.md) — accepted (2026-08-29, rewritten 2026-08-30)
+- [0018 — Trust stored rows and validate at the boundary](0018-trust-stored-rows-validate-at-the-boundary.md) — accepted (2026-08-30)
+- [0019 — Organize source by domain with bottom-up layers](0019-organize-source-by-domain-with-bottom-up-layers.md) — accepted (2026-08-30)

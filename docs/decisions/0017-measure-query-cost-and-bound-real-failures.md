@@ -1,86 +1,69 @@
 ---
 id: 0017
-title: Measure query cost and bound real failures
+title: Measure cost in benchmarks and bound only real failures
 status: accepted
 date: 2026-08-29
 ---
 
-# 0017 — Measure query cost and bound real failures
+# 0017 — Measure cost in benchmarks and bound only real failures
 
 ## Context
 
-The runtime adopted 1,000 SQL statements as an operation ceiling to stay clear
-of platform limits. Several implementations then projected a future statement
-count and rejected the call with `E2BIG` or `EFBIG` before SQLite ran it. Those
-checks do not prevent a platform failure. They manufacture an earlier failure
-for work that may complete successfully. The Next.js baseline also shows that a
-valid clone already uses a median of 1,586 statements, so statement count cannot
-serve as a truthful package-runtime admission rule.
-
-Byte limits have a different problem. Some protect a wire format, SQL binding,
-persisted schema, retained allocation, or structural algorithm. Others count
-streamed or paged work that is never live at once. The names and values alone do
-not distinguish those cases.
+The runtime originally adopted two invented currencies to stay clear of
+platform limits: a 1,000-SQL-statement operation ceiling and a hand-maintained
+retained-byte ledger (`MemoryCoordinator` reservations, scope trees, ownership
+checks, `TransportOperationBudget`). Both inverted their intent. Statement
+projections refused calls the platform would have served — a valid clone
+already uses a median of 1,586 statements. The byte ledger modeled JavaScript
+object sizes with hand-computed constants, threaded reservation parameters
+through most signatures, and repeatedly failed its own reviews
+(allocation-before-admission gaps), while the actual protection against
+Durable Object OOM came from streaming discipline and fixed caps, not from the
+ledger.
 
 ## Decision
 
-We will measure SQL statement count instead of using it for runtime admission.
-Production code will not project, reserve, charge, or refuse work from a
-statement count, and it will not assert a statement ceiling at module load.
-The same rule applies when the invented query currency is named pages, reads,
-or rows instead of statements.
+We will measure cost and bound only real failures.
 
-The benchmark harness will report a target status for every representative
-operation. A known target miss is evidence for optimization, not a runtime-like
-benchmark failure. The harness may fail for a missing row, an invalid end state,
-or a regression against a frozen baseline. Focused stress witnesses may exceed
-the target when they prove that runtime no longer manufactures an error.
-
-Vitest may retain exact zero- or one-statement assertions only when they prove a
-named semantic query shape. Operation-cost assertions use a coarse `<1,000`
-alarm; representative cost ownership lives in benchmarks.
-
-Runtime byte refusals will protect only a real platform or format bound, an
-untrusted persisted-schema invariant, an aggregate retained-memory/OOM model,
-or a structural or algorithmic limit. Batch sizes and fallback heuristics may
-shape work without refusing the whole operation. Streamed and paged work
-counters will not act as memory limits. Every retained byte refusal will name
-its owner, protected failure, evidence, and aggregate equation or structural
-invariant.
-
-A documented support target is not automatically an exact runtime boundary.
-When the platform does not define the first failing value, the package may use
-the target for non-refusing batching but must let the platform report its real
-failure and normalize that result.
+- **No invented runtime currency.** Production code does not project, reserve,
+  charge, or refuse work from a statement count or a byte ledger, whatever the
+  currency is called (statements, pages, reads, rows, retained bytes). The
+  dynamic memory-accounting system is removed.
+- **Memory safety is structural.** Peak memory stays bounded because every
+  seam is bounded by construction: streaming cursors, fixed batch sizes, fixed
+  cache capacities, bounded queues, single-value caps that name a real limit
+  (SQL binding size, wire format, algorithmic budget), and structural result
+  caps (`E2BIG`) on enumerations whose output is inherently caller-unbounded.
+  A cap survives only if it names the real failure it prevents.
+- **Benchmarks own the evidence.** Representative operations have
+  deterministic statement/row rows, and memory scenarios run under a leased
+  cgroup that measures the real composed peak. A target miss (≤1,000
+  statements, sub-100 MiB peak) is optimization evidence, never a runtime
+  refusal. Vitest keeps coarse `<1,000` alarms and exact zero/one assertions
+  only where they prove a named semantic query shape.
 
 ## Consequences
 
-- Calls that SQLite and the platform can execute are no longer rejected by an
-  invented SQL currency.
-- Query regressions remain visible as deterministic benchmark rows and coarse
-  unit alarms.
-- A benchmark target miss creates optimization evidence without changing
-  package behavior. The existing 1,586-statement clone median is such a miss.
-- Byte-limit changes require a complete inventory and evidence review. This is
-  more work than changing isolated constants, but it prevents arbitrary
-  removals from exposing a real OOM, corrupt-row, binding, or format failure.
-- Internal batching and fallback thresholds remain available because they do
-  not reject valid work.
+- Calls the platform can execute are never rejected by an invented currency,
+  and signatures stop carrying reservation plumbing.
+- A bug that accidentally materializes unbounded state now OOMs the isolate
+  instead of failing with a ledger error. The compensating controls are the
+  structural caps at the few genuinely unbounded seams, the leased cgroup
+  benchmark scenarios, and the layer rules that keep traversals on streaming
+  cursors.
+- Cost regressions surface as benchmark rows and coarse suite alarms, not as
+  unit-test diffs of exact counts.
+- Every surviving cap must name its owner and the real failure it prevents;
+  an unexplained threshold is deleted on sight.
 
 ## Alternatives considered
 
-### Keep the 1,000-statement runtime ceiling
-
-Rejected. The projection can be conservative, the platform limit is different,
-and the existing clone baseline already exceeds the ceiling while completing.
-
-### Remove statement counting entirely
-
-Rejected. Statement count is a useful deterministic cost signal and should
-remain in benchmarks and focused query-shape witnesses.
-
-### Remove every byte limit together with statement limits
-
-Rejected. Several byte limits protect real retained allocations, SQL bindings,
-wire formats, persisted rows, and structural algorithms. They need evidence-led
-classification, not blanket removal.
+- **Keep the statement ceiling.** Rejected: projections are conservative, the
+  platform limit is different, and real workloads already exceed the number
+  while completing.
+- **Keep the byte ledger.** Rejected: it is precision theater — hand-computed
+  constants standing in for real allocation — with a high plumbing and review
+  cost, and it never was the thing actually preventing OOM.
+- **Remove every limit.** Rejected: structural caps on binding sizes, wire
+  formats, queues, caches, and unbounded enumerations prevent real failures
+  and cost nothing to keep.

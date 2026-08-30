@@ -56,6 +56,10 @@ and `shell` never imports `git`.
 - Comments explain *why*, in a header block or above the subtle line. Match the
   existing density; do not exceed it.
 - No `any`, no `as` casts, no `@ts-expect-error`. `noUncheckedIndexedAccess` is on.
+- Source files stay at or under 2,000 lines; split along a seam before you get
+  there. The restructure sprint adds a suite witness for this.
+- Recurring checks and comparisons go through the shared guard/decoder and path
+  kits; do not hand-roll multi-operand `typeof` chains or local path helpers.
 
 ## Critical invariants
 
@@ -69,18 +73,23 @@ and `shell` never imports `git`.
 3. **Traversals use `db.iterate()`, never `db.all()`.** `all()` materialises the
    cursor and is for bounded result sets only. A traversal that materialises
    defeats the entire cost model.
-4. **Every SQL row is untrusted.** Validate numeric, text, BLOB, size, revision,
-   and ordinal fields before use. Derived tree and commit rows validate against
-   an authoritative loose object or a complete packed source.
-5. **Bound the cost; do not manufacture the failure.** Write operations whose
-   cost stays bounded — no unbounded traversal, no per-row statement in a loop.
-   ≤1,000 SQL statements and <100 MiB per operation is a *target*, measured in
-   `bench/`. It is not a runtime barrier: a refusal that fires below the
-   platform's own limit only turns a call that would have worked into an error.
-   Fail closed on a structural limit that protects against a real failure, and
-   never truncate silently — but never refuse on a projected statement count.
-   Removing the existing ones is
-   [backlog 60](docs/backlog/60-budget-targets-and-store-split.md).
+4. **Validate at the boundary; trust the store.** Caller input fails with
+   `GitError`; network bytes are validated at ingest; the schema is validated
+   at open; write paths and `CHECK` constraints guard what gets stored. Rows
+   the store wrote are trusted at read — no read-time re-authentication, no
+   SQL `typeof` witnesses, no two-phase preflights. Decode a row with the
+   shared guards only because the type system requires it; a failed guard is
+   `CorruptError` and that is the whole read-time check. Out-of-band database
+   mutation is undefined behavior
+   ([ADR-0018](docs/decisions/0018-trust-stored-rows-validate-at-the-boundary.md)).
+5. **Bound the cost structurally; do not manufacture the failure.** Stream
+   traversals, fix batch and cache sizes, cap caller-unbounded enumerations —
+   and never refuse work from an invented currency (projected statements or a
+   byte ledger). ≤1,000 SQL statements and <100 MiB per operation is a
+   *target*, measured in `bench/`
+   ([ADR-0017](docs/decisions/0017-measure-query-cost-and-bound-real-failures.md)).
+   A cap survives only if it names the real failure it prevents; never
+   truncate silently.
 
 ## Module context
 

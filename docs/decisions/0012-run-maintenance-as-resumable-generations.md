@@ -11,8 +11,8 @@ date: 2026-08-27
 
 Reachability spans refs, checkouts, retained reflogs, indexes, shallow
 boundaries, and active operation journals. Large repositories cannot snapshot,
-mark, repack, and sweep that state within one Durable Object invocation while
-staying below 1,000 SQL statements and 100 MiB retained memory.
+mark, repack, and sweep that state within one bounded Durable Object
+invocation.
 
 Maintenance also competes with normal repository mutations. A long write lock
 would make foreground Git operations unavailable, while sweeping against a

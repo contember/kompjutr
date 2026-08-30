@@ -1,5 +1,10 @@
 # src/core — the Git engine
 
+> **Direction change (2026-08-30).** ADR-0018 replaced the untrusted-row
+> doctrine and ADR-0017 (rewritten) removes the memory-reservation ledger; the
+> layout moves into `src/git/` per ADR-0019. Where the rules below conflict
+> with those ADRs or root `CLAUDE.md`, the ADRs win.
+
 Git operations and Smart HTTP over a `Repository` and a `Worktree`. Nothing here
 knows about Durable Objects or `@cloudflare/computer`; HTTP stays behind `GitHttpClient`.
 
