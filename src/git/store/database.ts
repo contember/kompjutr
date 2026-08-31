@@ -10,44 +10,43 @@ import {
 import { CorruptError, GitError, hasErrorCode } from "../common/errors.js";
 import { ByteLru } from "../common/lru.js";
 import type { RawObject } from "../common/objects.js";
-import type { StoredCheckoutLifecycle, StoredRepositoryLifecycle } from "./checkout.js";
+import { CheckoutStore, DEFAULT_OBJECT_CACHE_BYTES } from "./checkout.js";
+import type { CheckoutRow, ProvisionalCloneOwner, StoreOptions } from "./contracts.js";
+import { isThenableResult, utf8ByteLength } from "./json-pages.js";
 import {
   advanceCheckoutRevision,
   CHECKOUT_LIFECYCLE_CARDINALITY_SQL,
   CHECKOUT_LIST_ROW_FIXED_RETAINED_BYTES,
-  CheckoutStore,
   CheckoutStoreLifetime,
-  DEFAULT_OBJECT_CACHE_BYTES,
   enforceForeignKeys,
   isAttachedBranchUniqueConstraint,
   isCheckoutRootUniqueConstraint,
-  isThenableResult,
   nextIdentity,
   PROVISIONAL_CLONE_RENEW_WINDOW_MS,
   provisionalCloneExpiry,
-  readOperationStateOwned,
   requireCheckoutLifecycleCardinality,
   requireCheckoutRoot,
   requireCheckoutRootInput,
   requireIdentityCounter,
   requireMilliseconds,
   requireSafeId,
-  requireSafeRefLogInteger,
   requireStoredCheckoutLifecycle,
   requireStoredCheckoutRow,
   requireStoredIdentityMaximum,
   requireStoredRepositoryLifecycle,
-  utf8ByteLength,
-} from "./checkout.js";
-import type { CheckoutRow, ProvisionalCloneOwner, StoreOptions } from "./contracts.js";
+  type StoredCheckoutLifecycle,
+  type StoredRepositoryLifecycle,
+} from "./lifecycle.js";
 import { bumpMaintenanceRootEpoch } from "./maintenance/control.js";
 import {
   advanceMaintenanceRootSnapshot as advanceRootSnapshot,
   type MaintenanceRootSnapshotProgress,
   validatedOperationJournalRoots,
 } from "./maintenance/roots.js";
+import { readOperationStateOwned } from "./operation-journal.js";
 import { MAX_PACK_ROW_CACHE_BYTES } from "./packs.js";
 import { rawSymbolicTarget, requireRawRefTarget } from "./ref-validation.js";
+import { requireSafeRefLogInteger } from "./reflog.js";
 import { initializeGitSchema, MAX_CHECKOUTS_PER_REPOSITORY } from "./schema.js";
 import { SharedRepoStore } from "./shared.js";
 
@@ -311,6 +310,8 @@ export class SqliteGitDatabase {
       this.#nextStoreGeneration++,
       this.#objects,
       this.#packRows,
+      this.#options.now ?? Date.now,
+      this.#options,
     );
     const lifetime = new CheckoutStoreLifetime();
     const store = new CheckoutStore(
@@ -985,7 +986,7 @@ export class SqliteGitDatabase {
           }
         }
         bumpMaintenanceRootEpoch(this.#db, repoId);
-        return { row: initial, store, lifetime };
+        return { row: { ...initial, head: store.head() }, store, lifetime };
       });
     } catch (error) {
       lifetime.revoke();
@@ -1166,7 +1167,15 @@ export class SqliteGitDatabase {
       throw new GitError("E2BIG", "repository store generation is exhausted");
     }
     const generation = this.#nextStoreGeneration++;
-    const store = new SharedRepoStore(this.#db, repoId, generation, this.#objects, this.#packRows);
+    const store = new SharedRepoStore(
+      this.#db,
+      repoId,
+      generation,
+      this.#objects,
+      this.#packRows,
+      this.#options.now ?? Date.now,
+      this.#options,
+    );
     this.#sharedStores.set(repoId, store);
     const primaryRaw = this.#db.one<Record<string, unknown>>(
       `SELECT id AS checkout_id, repo_id, root, head, is_primary

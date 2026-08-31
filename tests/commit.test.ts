@@ -1022,7 +1022,7 @@ describe("bounded commit tree acceleration", () => {
         workspace.repo.resolveTreePath(workspace.repo.readCommit(oid).tree, "a.txt")?.oid,
       ).toBe(workspace.repo.checkout.indexGet("a.txt")?.oid);
       expect([...workspace.storage.histogram.keys()].join("\n")).toContain(
-        "SELECT checkout.repo_id, typeof(entry.path) AS path_type",
+        "SELECT entry.path, entry.stage, entry.mode, entry.oid, entry.size",
       );
     }
   });
@@ -1049,7 +1049,7 @@ describe("bounded commit tree acceleration", () => {
       }).oid,
     ).toBe(workspace.repo.head().oid);
     expect([...workspace.storage.histogram.keys()].join("\n")).toContain(
-      "SELECT checkout.repo_id, typeof(entry.path) AS path_type",
+      "SELECT entry.path, entry.stage, entry.mode, entry.oid, entry.size",
     );
   });
 

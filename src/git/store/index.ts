@@ -1,26 +1,15 @@
 // Compatibility facade for the SQLite repository store.
 
+export { contentIdKey } from "./blob-ids.js";
 export {
-  ancestors,
   CheckoutStore,
+  mutateRefsOwned,
+} from "./checkout.js";
+export {
   CONFIG_SECTION_MOVE_UPDATE_SQL,
   configGetOwned,
-  contentIdKey,
-  indexScanOwned,
   MAX_CONFIG_SECTION_MOVE_ROWS,
-  MAX_REFLOG_ROOT_SCAN_ENTRIES,
-  mutateRefsOwned,
-  normalizeRoot,
-  PROVISIONAL_CLONE_LEASE_MS,
-  readAuthenticatedObjectOwned,
-  readOperationStateOwned,
-  readShallowOwned,
-  replaceOperationJournalOwned,
-  replaceOperationStateOwned,
-  writeBatchOwned,
-  writeObjectsOwned,
-  writeOperationJournalOwned,
-} from "./checkout.js";
+} from "./config.js";
 export type {
   BlobIdMapping,
   BlobReadBatch,
@@ -56,7 +45,22 @@ export {
   listCheckoutsOwned,
   SqliteGitDatabase,
 } from "./database.js";
+export { indexScanOwned } from "./index-table.js";
+export { ancestors, normalizeRoot, PROVISIONAL_CLONE_LEASE_MS } from "./lifecycle.js";
+export {
+  readAuthenticatedObjectOwned,
+  writeBatchOwned,
+  writeObjectsOwned,
+} from "./objects.js";
+export {
+  readOperationStateOwned,
+  replaceOperationJournalOwned,
+  replaceOperationStateOwned,
+  writeOperationJournalOwned,
+} from "./operation-journal.js";
 export { PACK_BLOB_BATCH_TARGET_BYTES } from "./packs.js";
+export { MAX_REFLOG_ROOT_SCAN_ENTRIES } from "./reflog.js";
+export { readShallowOwned } from "./shallow.js";
 export { SharedRepoStore } from "./shared.js";
 export type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./tree-walk.js";
 export { WALK_TREE_SQL } from "./tree-walk.js";

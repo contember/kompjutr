@@ -5,17 +5,19 @@ import type { SqlDatabase } from "../../db/db.js";
 import { CorruptError, GitError } from "../common/errors.js";
 import type { ByteLru } from "../common/lru.js";
 import type { ObjectType, RawObject } from "../common/objects.js";
+import { BlobIdTable } from "./blob-ids.js";
+import type { CheckoutStore } from "./checkout.js";
 import {
-  type CheckoutStore,
-  isThenableResult,
-  OWNED_AUTHENTICATED_OBJECT_READERS,
-  OWNED_CONFIG_GETTERS,
-  OWNED_OBJECT_BATCHES,
-  requireBooleanProbe,
-  requireScratchIndexName,
-  ScratchIndexStore,
-} from "./checkout.js";
-import type { CommitCacheEntry, CommitCacheWriteResult, CommitGraphLimits } from "./commits.js";
+  type CommitCacheEntry,
+  type CommitCacheWriteResult,
+  type CommitGraphLimits,
+  indexCommitSource,
+  insertCommitCaches,
+  prepareCommitCache,
+  readCommitCache,
+  readCommitGraph,
+} from "./commits.js";
+import { ConfigTable } from "./config.js";
 import type {
   BlobIdMapping,
   BlobReadBatch,
@@ -34,17 +36,25 @@ import type {
   RefLogReadOptions,
   RefMutation,
   RefRow,
+  StoreOptions,
   TrackingRefPublicationToken,
 } from "./contracts.js";
-import type { PackStore } from "./packs.js";
+import { ScratchIndexStore } from "./index-table.js";
+import { isThenableResult, requireBooleanProbe } from "./json-pages.js";
+import { requireScratchIndexName } from "./lifecycle.js";
+import { ObjectTable } from "./objects.js";
+import { PackStore } from "./packs.js";
+import { activeRefLogOids, type Clock, readRefLog } from "./reflog.js";
 import { MAX_SCRATCH_INDEXES_PER_REPOSITORY } from "./schema.js";
-import type { WalkTreeDiffEntry, WalkTreeDiffObject, WalkTreeEntry } from "./tree-walk.js";
-
-export interface SharedRepoOwnedOperations {
-  objectBatch(options: ObjectBatchOptions): OwnedObjectBatch;
-  authenticatedObject(oid: string, expectedType: ObjectType): RawObject | null;
-  configValue(path: string): string | undefined;
-}
+import { ShallowTable } from "./shallow.js";
+import {
+  iterateTree,
+  iterateTreeDiff,
+  iterateTreeDiffObjects,
+  type WalkTreeDiffEntry,
+  type WalkTreeDiffObject,
+  type WalkTreeEntry,
+} from "./tree-walk.js";
 
 interface ScratchStorageCache {
   revalidateStorageCaches(): void;
@@ -115,10 +125,14 @@ export class SharedRepoStore {
   readonly objects: ByteLru<string, RawObject>;
   readonly packRows: ByteLru<string, Uint8Array>;
   readonly cacheNamespace: string;
+  readonly #clock: Clock;
+  readonly #config: ConfigTable;
+  readonly #blobIds: BlobIdTable;
+  readonly #shallowTable: ShallowTable;
   readonly #scratchTransactions: ScratchTransactionCoordinator;
-  #packs: PackStore | null = null;
+  readonly #packs: PackStore;
+  #objectTable: ObjectTable | null = null;
   #operations: CheckoutStore | null = null;
-  #ownedOperations: SharedRepoOwnedOperations | null = null;
   #cacheGeneration = 0;
   #hasLoose: boolean;
   #shallow: Set<string> | null = null;
@@ -129,13 +143,30 @@ export class SharedRepoStore {
     storeGeneration: number,
     objects: ByteLru<string, RawObject>,
     packRows: ByteLru<string, Uint8Array>,
+    clock: Clock,
+    options: StoreOptions,
   ) {
     this.db = db;
     this.repoId = repoId;
     this.objects = objects;
     this.packRows = packRows;
+    this.#clock = clock;
+    this.#config = new ConfigTable(db, repoId);
+    this.#blobIds = new BlobIdTable(db, repoId);
+    this.#shallowTable = new ShallowTable(db, repoId);
     this.#scratchTransactions = scratchTransactionsFor(db);
     this.cacheNamespace = `${repoId}:${storeGeneration}`;
+    this.#packs = new PackStore(
+      db,
+      repoId,
+      objects,
+      packRows,
+      this.cacheNamespace,
+      (oids: readonly string[]) => this.#objectOps().readLooseObjects(oids),
+      (oids) => this.#objectOps().looseObjectMetadata(oids),
+      options,
+    );
+    this.#objectTable = new ObjectTable(db, repoId, objects, this.#packs, this, clock);
     const availability = db.one<{ has_loose: unknown }>(
       `SELECT
          (SELECT COUNT(*) FROM (SELECT 1 FROM git_objects WHERE repo_id = ? LIMIT 1)) AS has_loose`,
@@ -148,19 +179,9 @@ export class SharedRepoStore {
       throw new CorruptError("shared store availability probe returned an invalid value");
     }
     this.#hasLoose = availability.has_loose === 1;
-    OWNED_OBJECT_BATCHES.set(this, (options) => this.#ownedOps().objectBatch(options));
-    OWNED_AUTHENTICATED_OBJECT_READERS.set(this, (oid, expectedType) =>
-      this.#ownedOps().authenticatedObject(oid, expectedType),
-    );
-    OWNED_CONFIG_GETTERS.set(this, (path) => this.#ownedOps().configValue(path));
   }
 
-  installPacks(packs: PackStore): PackStore {
-    if (this.#packs === null) this.#packs = packs;
-    return this.#packs;
-  }
-
-  installOperations(operations: CheckoutStore, ownedOperations: SharedRepoOwnedOperations): void {
+  bindCheckoutOperations(operations: CheckoutStore): void {
     if (operations.sharedRepoId !== this.repoId) {
       throw new CorruptError("shared operations facade belongs to another repository");
     }
@@ -169,7 +190,6 @@ export class SharedRepoStore {
         throw new CorruptError("shared operations facade must use the primary checkout");
       }
       this.#operations = operations;
-      this.#ownedOperations = ownedOperations;
     }
   }
 
@@ -275,17 +295,18 @@ export class SharedRepoStore {
     return this.#operations;
   }
 
-  #ownedOps(): SharedRepoOwnedOperations {
-    if (this.#ownedOperations === null) {
-      throw new CorruptError("shared repository owned operations are unavailable");
+  #objectOps(): ObjectTable {
+    if (this.#objectTable === null) {
+      throw new CorruptError("shared repository object table is unavailable");
     }
-    return this.#ownedOperations;
+    return this.#objectTable;
+  }
+
+  get objectTable(): ObjectTable {
+    return this.#objectOps();
   }
 
   get packs(): PackStore {
-    if (this.#packs === null) {
-      throw new CorruptError("shared pack facade is unavailable");
-    }
     return this.#packs;
   }
 
@@ -304,7 +325,7 @@ export class SharedRepoStore {
 
   clearCaches(): void {
     this.#cacheGeneration++;
-    this.#packs?.clearCaches();
+    this.#packs.clearCaches();
     this.#hasLoose = false;
     this.#shallow = null;
   }
@@ -312,7 +333,7 @@ export class SharedRepoStore {
   /** Invalidate storage caches and re-read current loose-object availability. */
   revalidateStorageCaches(): void {
     this.#cacheGeneration++;
-    this.#packs?.clearCaches();
+    this.#packs.clearCaches();
     this.#hasLoose = true;
     this.#shallow = null;
     let availability: boolean | undefined;
@@ -336,101 +357,109 @@ export class SharedRepoStore {
   }
 
   cacheBytes(): { objects: number; chunks: number } {
-    return this.#ops().cacheBytes();
+    return { objects: this.objects.bytes, chunks: this.#packs.cachedChunkBytes };
   }
 
   lookupBlobIds(contentIds: Iterable<Uint8Array>): Map<string, string> {
-    return this.#ops().lookupBlobIds(contentIds);
+    return this.#blobIds.lookup(contentIds);
   }
 
   blobIdMismatches(expected: Iterable<BlobIdMapping>): Map<number, string | null> {
-    return this.#ops().blobIdMismatches(expected);
+    return this.#blobIds.mismatches(expected);
   }
 
   upsertBlobIds(mappings: Iterable<BlobIdMapping>): void {
-    this.#ops().upsertBlobIds(mappings);
+    this.#blobIds.upsert(mappings);
   }
 
   has(oid: string): boolean {
-    return this.#ops().has(oid);
+    return this.#objectOps().has(oid);
   }
 
   hasAll(oids: Iterable<string>): Set<string> {
-    return this.#ops().hasAll(oids);
+    return this.#objectOps().hasAll(oids);
   }
 
   missing(oids: Iterable<string>): string[] {
-    return this.#ops().missing(oids);
+    return this.#objectOps().missing(oids);
   }
 
   typeAndSize(oid: string): { type: ObjectType; size: number } | null {
-    return this.#ops().typeAndSize(oid);
+    return this.#objectOps().typeAndSize(oid);
   }
 
   read(oid: string): RawObject | null {
-    return this.#ops().read(oid);
+    return this.#objectOps().read(oid);
   }
 
   readAuthenticatedObject(oid: string, expectedType: ObjectType): RawObject | null {
-    return this.#ops().readAuthenticatedObject(oid, expectedType);
+    return this.#objectOps().readAuthenticatedObject(oid, expectedType);
+  }
+
+  readAuthenticatedObjectOwned(oid: string, expectedType: ObjectType): RawObject | null {
+    return this.#objectOps().readAuthenticatedObjectOwned(oid, expectedType);
   }
 
   objectInfo(oids: readonly string[]): ObjectReadInfo[] {
-    return this.#ops().objectInfo(oids);
+    return this.#objectOps().objectInfo(oids);
   }
 
   readObjects(oids: readonly string[], options: { budgetBytes?: number } = {}): ObjectReadBatch {
-    return this.#ops().readObjects(oids, options);
+    return this.#objectOps().readObjects(oids, options);
   }
 
   readBlobs(oids: readonly string[], options: { budgetBytes?: number } = {}): BlobReadBatch {
-    return this.#ops().readBlobs(oids, options);
+    return this.#objectOps().readBlobs(oids, options);
   }
 
   *walkTree(treeOid: string): Generator<WalkTreeEntry> {
-    yield* this.#ops().walkTree(treeOid);
+    yield* iterateTree(this.db, this.repoId, treeOid);
   }
 
   *walkTreeDiff(
     beforeTreeOid: string | null,
     afterTreeOid: string | null,
   ): Generator<WalkTreeDiffEntry> {
-    yield* this.#ops().walkTreeDiff(beforeTreeOid, afterTreeOid);
+    yield* iterateTreeDiff(this.db, this.repoId, beforeTreeOid, afterTreeOid);
   }
 
   *walkTreeDiffObjects(
     beforeTreeOid: string | null,
     afterTreeOid: string,
   ): Generator<WalkTreeDiffObject> {
-    yield* this.#ops().walkTreeDiffObjects(beforeTreeOid, afterTreeOid);
+    yield* iterateTreeDiffObjects(this.db, this.repoId, beforeTreeOid, afterTreeOid);
   }
 
   write(type: ObjectType, data: Uint8Array): string {
-    return this.#ops().write(type, data);
+    return this.#objectOps().write(type, data);
   }
 
   writeStream(type: ObjectType, size: number, chunks: () => Iterable<Uint8Array>): string {
-    return this.#ops().writeStream(type, size, chunks);
+    return this.#objectOps().writeStream(type, size, chunks);
   }
 
   writeBatch(options: ObjectBatchOptions = {}): ObjectBatch {
-    return this.#ops().writeBatch(options);
+    return this.#objectOps().writeBatch(options);
+  }
+
+  writeBatchOwned(options: ObjectBatchOptions = {}): OwnedObjectBatch {
+    return this.#objectOps().writeBatchOwned(options);
   }
 
   writeObjects<T>(body: (batch: ObjectBatch) => T, options: ObjectBatchOptions = {}): T {
-    return this.#ops().writeObjects(body, options);
+    return this.#objectOps().writeObjects(body, options);
   }
 
   readChunks(oid: string): Iterable<Uint8Array> | null {
-    return this.#ops().readChunks(oid);
+    return this.#objectOps().readChunks(oid);
   }
 
   resolvePrefix(prefix: string): string | null {
-    return this.#ops().resolvePrefix(prefix);
+    return this.#objectOps().resolvePrefix(prefix);
   }
 
   objectCount(): number {
-    return this.#ops().objectCount();
+    return this.#objectOps().objectCount();
   }
 
   getRef(name: string): string | null {
@@ -502,76 +531,84 @@ export class SharedRepoStore {
 
   reflog(refName: string, options: RefLogReadOptions = {}): RefLogEntry[] {
     if (refName === "HEAD") throw new GitError("EINVAL", "HEAD belongs to a checkout");
-    return this.#ops().reflog(refName, options);
+    return readRefLog(this.db, this.repoId, this.#ops().checkoutId, this.#clock, refName, options);
   }
 
   activeRefLogOids(): Generator<string> {
-    return this.#ops().activeRefLogOids();
+    return activeRefLogOids(this.db, this.repoId, this.#ops().checkoutId, this.#clock);
   }
 
   configGetAll(path: string): string[] {
-    return this.#ops().configGetAll(path);
+    return this.#config.getAll(path);
   }
 
   configGet(path: string): string | undefined {
-    return this.#ops().configGet(path);
+    return this.#config.get(path);
+  }
+
+  configGetOwned(path: string): string | undefined {
+    return this.#config.getOwned(path);
   }
 
   configGetBounded(path: string, maxBytes?: number): string | undefined {
-    return this.#ops().configGetBounded(path, maxBytes);
+    return this.#config.getBounded(path, maxBytes);
   }
 
   configGetSingleBounded(path: string, maxBytes?: number): BoundedSingleConfigValue {
-    return this.#ops().configGetSingleBounded(path, maxBytes);
+    return this.#config.getSingleBounded(path, maxBytes);
   }
 
   configCardinality(path: string): ConfigValueCardinality {
-    return this.#ops().configCardinality(path);
+    return this.#config.cardinality(path);
   }
 
   configSet(path: string, value: string): void {
-    this.#ops().configSet(path, value);
+    this.#config.set(path, value);
   }
 
   configAdd(path: string, value: string): void {
-    this.#ops().configAdd(path, value);
+    this.#config.add(path, value);
   }
 
   configUnset(path: string): void {
-    this.#ops().configUnset(path);
+    this.#config.unset(path);
   }
 
   configPaths(prefix: string): string[] {
-    return this.#ops().configPaths(prefix);
+    return this.#config.paths(prefix);
   }
 
   configMoveSection(sourcePrefix: string, destinationPrefix: string): void {
-    this.#ops().configMoveSection(sourcePrefix, destinationPrefix);
+    this.#config.moveSection(sourcePrefix, destinationPrefix);
   }
 
   cachedCommit(oid: string): CommitCacheEntry | null {
-    return this.#ops().cachedCommit(oid);
+    return readCommitCache(this.db, this.repoId, oid);
   }
 
   prepareCommit(oid: string, data: Uint8Array): CommitCacheEntry {
-    return this.#ops().prepareCommit(oid, data);
+    return prepareCommitCache({ repoId: this.repoId, oid, data });
   }
 
   cacheCommit(oid: string, data: Uint8Array): CommitCacheEntry | null {
-    return this.#ops().cacheCommit(oid, data);
+    return indexCommitSource(this.db, { repoId: this.repoId, oid, data });
   }
 
   cacheCommits(entries: Iterable<CommitCacheEntry>): CommitCacheWriteResult {
-    return this.#ops().cacheCommits(entries);
+    return insertCommitCaches(this.db, entries);
   }
 
   commitGraph(rootOid: string, limits: CommitGraphLimits = {}): Iterable<CommitCacheEntry> {
-    return this.#ops().commitGraph(rootOid, limits);
+    return readCommitGraph(this.db, this.repoId, rootOid, limits);
   }
 
   shallow(): Set<string> {
-    if (this.#shallow === null) this.#shallow = this.#ops().shallow();
+    if (this.#shallow === null) this.#shallow = this.#shallowTable.read();
     return new Set(this.#shallow);
+  }
+
+  readShallowOwned(): Set<string> {
+    return this.#shallowTable.read();
   }
 
   invalidateShallow(): void {
@@ -579,7 +616,7 @@ export class SharedRepoStore {
   }
 
   setShallow(add: Iterable<string>, remove: Iterable<string> = []): void {
-    this.#ops().setShallow(add, remove);
+    this.#shallowTable.set(add, remove);
     this.#shallow = null;
   }
 

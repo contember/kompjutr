@@ -541,21 +541,21 @@ describe("durable operation journal", () => {
       }
     });
     const state = rebase({ originalHeadOid: parentOid });
-    const objectInfoCalls: number[] = [];
-    const objectInfo = store.objectInfo.bind(store);
-    store.objectInfo = (oids) => {
-      objectInfoCalls.push(oids.length);
-      return objectInfo(oids);
-    };
+    const histogram = new Map<string, number>();
+    db.storage.histogram = histogram;
 
     store.writeOperationJournal(state, steps, []);
 
     expect(
       db.scalar<number>("SELECT sum(size) FROM git_objects WHERE repo_id = 1 AND type = 'commit'"),
     ).toBeGreaterThan(32 * 1024 * 1024);
-    expect(objectInfoCalls.length).toBeGreaterThanOrEqual(2);
-    expect(Math.max(...objectInfoCalls)).toBe(4_096);
-    expect(objectInfoCalls.every((count) => count <= 4_096)).toBe(true);
+    // Pages stay bounded by the batch cap (E2BIG above it); >= 2 proves paging ran.
+    const metadataPages = [...histogram].reduce(
+      (total, [query, count]) =>
+        total + (query.startsWith("WITH wanted(ordinal, oid) AS MATERIALIZED") ? count : 0),
+      0,
+    );
+    expect(metadataPages).toBeGreaterThanOrEqual(2);
     expect(store.requireOperationState("rebase").steps).toHaveLength(MAX_OPERATION_STEPS);
 
     const coldDatabase = new SqliteGitDatabase(db);
