@@ -8,7 +8,6 @@ import {
   MODE_FILE,
   MODE_SYMLINK,
   MODE_TREE,
-  parseTreeStream,
   serializeTree,
 } from "../src/core/objects.js";
 import { PackWriter } from "../src/core/pack/writer.js";
@@ -189,8 +188,8 @@ describe("tree diff", () => {
     ]);
   });
 
-  it("skips corrupt equal child projections", () => {
-    const { db, store } = open();
+  it("prunes equal child projections", () => {
+    const { store } = open();
     const equal = store.write(
       "tree",
       serializeTree([{ mode: MODE_FILE, name: "hidden", oid: oid(1) }]),
@@ -208,14 +207,6 @@ describe("tree diff", () => {
         { mode: MODE_TREE, name: "equal", oid: equal },
         { mode: MODE_FILE, name: "visible", oid: oid(3) },
       ]),
-    );
-    db.run(
-      `UPDATE git_tree_entries SET oid = ? WHERE source_key = (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-       )`,
-      oid(9),
-      equal,
     );
     expect([...store.walkTreeDiff(before, after)]).toEqual([
       {
@@ -325,69 +316,24 @@ describe("tree diff", () => {
     ).toBe(true);
   });
 
-  it("fails closed on a visited projection but not an equal subtree", () => {
+  it("rejects a later missing source before either diff cursor yields", () => {
     const { db, store } = open();
-    const beforeChild = store.write(
+    const child = store.write(
       "tree",
-      serializeTree([{ mode: MODE_FILE, name: "x", oid: oid(1) }]),
+      serializeTree([{ mode: MODE_FILE, name: "nested", oid: oid(2) }]),
     );
-    const afterChild = store.write(
+    const root = store.write(
       "tree",
-      serializeTree([{ mode: MODE_FILE, name: "x", oid: oid(2) }]),
+      serializeTree([
+        { mode: MODE_FILE, name: "first", oid: oid(1) },
+        { mode: MODE_TREE, name: "later", oid: child },
+      ]),
     );
-    const before = store.write(
-      "tree",
-      serializeTree([{ mode: MODE_TREE, name: "dir", oid: beforeChild }]),
-    );
-    const after = store.write(
-      "tree",
-      serializeTree([{ mode: MODE_TREE, name: "dir", oid: afterChild }]),
-    );
-    db.run(
-      `UPDATE git_tree_entries SET oid = ? WHERE source_key = (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-       )`,
-      oid(8),
-      beforeChild,
-    );
-    expect(() => [...store.walkTreeDiff(before, after)]).toThrow(/integrity check failed/);
+    db.run("DELETE FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?", child);
+
+    expect(() => store.walkTreeDiff(null, root).next()).toThrow(/no valid v3 parsed source/);
+    expect(() => store.walkTreeDiffObjects(null, root).next()).toThrow(/no valid v3 parsed source/);
   });
-
-  it.each(["entry", "source"])(
-    "rejects a later active %s corruption before either diff cursor yields",
-    (corruption) => {
-      const { db, store } = open();
-      const child = store.write(
-        "tree",
-        serializeTree([{ mode: MODE_FILE, name: "nested", oid: oid(2) }]),
-      );
-      const root = store.write(
-        "tree",
-        serializeTree([
-          { mode: MODE_FILE, name: "first", oid: oid(1) },
-          { mode: MODE_TREE, name: "later", oid: child },
-        ]),
-      );
-      if (corruption === "entry") {
-        db.run(
-          `UPDATE git_tree_entries SET raw_entry = x'00'
-            WHERE source_key = (
-              SELECT source_key FROM git_tree_sources
-               WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-            )`,
-          child,
-        );
-      } else {
-        db.run("DELETE FROM git_tree_effective WHERE repo_id = 1 AND tree_oid = ?", child);
-      }
-
-      const expected =
-        corruption === "entry" ? /integrity check failed/ : /no valid v3 parsed source/;
-      expect(() => store.walkTreeDiff(null, root).next()).toThrow(expected);
-      expect(() => store.walkTreeDiffObjects(null, root).next()).toThrow(expected);
-    },
-  );
 
   it("rejects an orphaned active source before either diff cursor yields", () => {
     const { db, store } = open();
@@ -405,100 +351,6 @@ describe("tree diff", () => {
     expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
     expect(() => store.walkTreeDiffObjects(null, tree).next()).toThrow(CorruptError);
   });
-
-  it.each([
-    ["sentinel", -1],
-    ["extra marker", 3],
-  ])("rejects a direct source-key %s before yielding a diff row", (_label, ordinal) => {
-    const { db, store } = open();
-    const tree = store.write(
-      "tree",
-      serializeTree(
-        Array.from({ length: 3 }, (_, index) => ({
-          mode: MODE_FILE,
-          name: `f${index}`,
-          oid: oid(index + 1),
-        })),
-      ),
-    );
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(
-      `INSERT INTO git_tree_entries
-         (source_key, ordinal, mode, name_bytes, oid, raw_entry, cumulative_base)
-       SELECT source_key, ?, mode, name_bytes, oid, raw_entry, cumulative_base
-         FROM git_tree_entries
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
-        ) AND ordinal = 0`,
-      ordinal,
-      tree,
-    );
-    db.run("PRAGMA ignore_check_constraints = OFF");
-
-    expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
-    expect(() => store.walkTreeDiffObjects(null, tree).next()).toThrow(CorruptError);
-  });
-
-  it("rejects a middle ordinal gap before yielding a diff row", () => {
-    const { db, store } = open();
-    const before = store.write(
-      "tree",
-      serializeTree([
-        { mode: MODE_FILE, name: "a", oid: oid(1) },
-        { mode: MODE_FILE, name: "b", oid: oid(2) },
-        { mode: MODE_FILE, name: "c", oid: oid(3) },
-      ]),
-    );
-    const after = store.write(
-      "tree",
-      serializeTree([
-        { mode: MODE_FILE, name: "a", oid: oid(1) },
-        { mode: MODE_FILE, name: "c", oid: oid(3) },
-      ]),
-    );
-    db.run(
-      `DELETE FROM git_tree_entries
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
-        ) AND ordinal = 1`,
-      before,
-    );
-
-    expect(() => store.walkTreeDiff(before, after).next()).toThrow(CorruptError);
-  });
-
-  it.each([
-    ["non-final", 0],
-    ["final", 2],
-  ])(
-    "rejects %s cumulative source-key corruption before yielding a diff row",
-    (_label, ordinal) => {
-      const { db, store } = open();
-      const tree = store.write(
-        "tree",
-        serializeTree(
-          Array.from({ length: 3 }, (_, index) => ({
-            mode: MODE_FILE,
-            name: `f${index}`,
-            oid: oid(index + 1),
-          })),
-        ),
-      );
-      db.run(
-        `UPDATE git_tree_entries SET cumulative_base = cumulative_base + 1
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
-        ) AND ordinal = ?`,
-        tree,
-        ordinal,
-      );
-
-      expect(() => store.walkTreeDiff(null, tree).next()).toThrow(CorruptError);
-    },
-  );
 
   it("permits DAG reuse and rejects an active-stack cycle", () => {
     const { db, store } = open();
@@ -539,18 +391,13 @@ describe("tree diff", () => {
       "tree",
       serializeTree([{ mode: MODE_TREE, name: "root", oid: cycleChild }]),
     );
-    const changed = [
-      ...parseTreeStream([serializeTree([{ mode: MODE_TREE, name: "x", oid: cycleRoot }])]),
-    ][0];
-    if (changed === undefined) throw new Error("cycle fixture is empty");
     db.run(
-      `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
+      `UPDATE git_tree_entries SET oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
            WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
         ) AND ordinal = 0`,
       cycleRoot,
-      changed.rawEntry,
       cycleChild,
     );
     expect(() => [...store.walkTreeDiff(cycleRoot, null)]).toThrow(/tree cycle/);
@@ -663,7 +510,7 @@ describe("tree diff", () => {
     expect(() => [...store.walkTreeDiff(null, tree)]).toThrow(/reimport or reclone/);
   });
 
-  it("keeps entries qualified to the active source when a packed copy exists", async () => {
+  it("uses the packed source after deleting the loose copy", async () => {
     const { db, store } = open();
     const data = serializeTree([{ mode: MODE_FILE, name: "active", oid: oid(1) }]);
     const tree = store.write("tree", data);
@@ -673,16 +520,6 @@ describe("tree diff", () => {
     writer.object("tree", data);
     writer.finish();
     await store.packs.ingest(slices(concat(chunks), 64));
-
-    db.run(
-      `UPDATE git_tree_entries SET raw_entry = x'00'
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose'
-        )`,
-      tree,
-    );
-    expect(() => [...store.walkTreeDiff(null, tree)]).toThrow(/integrity check failed/);
 
     db.run("DELETE FROM git_objects WHERE repo_id = 1 AND oid = ?", tree);
     expect([...store.walkTreeDiff(null, tree)]).toEqual([

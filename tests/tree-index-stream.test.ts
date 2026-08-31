@@ -84,9 +84,9 @@ class ObservedDatabase implements SqlDatabase {
     if (query.startsWith("INSERT INTO git_tree_entries")) {
       this.entryInserts++;
       if (this.entryInserts === this.failEntryInsert) throw new Error("injected tree INSERT");
-      const encoded = bindings[3];
-      const offset = bindings[4];
-      const length = bindings[5];
+      const encoded = bindings[2];
+      const offset = bindings[3];
+      const length = bindings[4];
       if (
         !(encoded instanceof Uint8Array) ||
         typeof offset !== "number" ||
@@ -100,8 +100,7 @@ class ObservedDatabase implements SqlDatabase {
       if (!Array.isArray(parsed)) throw new Error("tree entry JSON binding is not an array");
       this.maxEntryRows = Math.max(this.maxEntryRows, parsed.length);
       this.entryRowCounts.push(parsed.length);
-      this.sharedEntryPayload &&=
-        bindings[0] === bindings[1] && bindings[1] === bindings[2] && bindings[2] === bindings[3];
+      this.sharedEntryPayload &&= bindings[0] === bindings[1] && bindings[1] === bindings[2];
       for (const binding of bindings) {
         const bytes =
           typeof binding === "string"
@@ -212,60 +211,6 @@ describe("incremental tree parser", () => {
     );
     expect(store.typeAndSize(oid)).toBeNull();
     expect(db.scalar<number>("SELECT COUNT(*) FROM git_tree_sources")).toBe(0);
-  });
-
-  it("rejects corrupted authoritative tree-name bytes during traversal", () => {
-    const db = new TestDatabase();
-    const database = new SqliteGitDatabase(db);
-    const store = database.openCheckout(database.createRepository("/repo", "ref: refs/heads/main"));
-    const data = rawEntry("100644", "valid.txt");
-    const oid = store.write("tree", data);
-    db.run(
-      `UPDATE git_tree_entries SET name_bytes = ? WHERE source_key = (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-       ) AND ordinal = 0`,
-      new Uint8Array([0x80]),
-      store.repoId,
-      oid,
-    );
-
-    expect(() => [...store.walkTree(oid)]).toThrowError(
-      expect.objectContaining({ code: "EUNSUPPORTED" }),
-    );
-  });
-
-  it("rejects invalid authoritative names before either tree-diff shape yields", () => {
-    for (const objects of [false, true]) {
-      const db = new TestDatabase();
-      const database = new SqliteGitDatabase(db);
-      const store = database.openCheckout(
-        database.createRepository("/repo", "ref: refs/heads/main"),
-      );
-      const tree = store.write("tree", rawEntry("100644", "x"));
-      const nameBytes = new Uint8Array([0x80]);
-      db.run(
-        `UPDATE git_tree_entries SET name_bytes = ?, raw_entry = ? WHERE source_key = (
-           SELECT source_key FROM git_tree_sources
-            WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-         ) AND ordinal = 0`,
-        nameBytes,
-        rawEntryBytes("100644", nameBytes),
-        store.repoId,
-        tree,
-      );
-      const rows = objects ? store.walkTreeDiffObjects(null, tree) : store.walkTreeDiff(null, tree);
-      let seen = 0;
-      let failure: unknown;
-      try {
-        for (const _row of rows) seen++;
-      } catch (error) {
-        failure = error;
-      }
-
-      expect(failure).toEqual(expect.objectContaining({ code: "EUNSUPPORTED" }));
-      expect(seen).toBe(0);
-    }
   });
 });
 

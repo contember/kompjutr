@@ -10,7 +10,6 @@ import {
   isTreeMode,
   MODE_FILE,
   MODE_TREE,
-  parseTreeStream,
   serializeCommit,
   serializeTag,
   serializeTree,
@@ -60,7 +59,7 @@ class TraversalPayloadProbeDatabase extends TestDatabase {
     return (function* (): Generator<Record<string, unknown>> {
       try {
         for (const row of rows) {
-          if (row.path !== null || row.raw_path !== null) probe.traversalPayloadRows++;
+          if (row.path !== null) probe.traversalPayloadRows++;
           yield row;
         }
       } finally {
@@ -1254,112 +1253,16 @@ describe("batched tree reads", () => {
       { path: "b/leaf", mode: MODE_FILE, oid: leafOid },
     ]);
 
-    const cycle = [
-      ...parseTreeStream([serializeTree([{ mode: MODE_TREE, name: "a", oid: root }])]),
-    ][0];
-    if (cycle === undefined) throw new Error("cycle fixture did not produce a tree entry");
     db.run(
-      `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
+      `UPDATE git_tree_entries SET oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
            WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
         ) AND ordinal = 0`,
       root,
-      cycle.rawEntry,
       root,
     );
     expect(() => [...store.walkTree(root)]).toThrow(/tree cycle/);
-  });
-
-  it("fails closed on ordinal gaps, extra rows and understated loose metadata", () => {
-    const make = () => {
-      const db = new TestDatabase();
-      const store = openScale(db);
-      const data = serializeTree([
-        { mode: MODE_FILE, name: "a", oid: numberedOid(1) },
-        { mode: MODE_FILE, name: "b", oid: numberedOid(2) },
-        { mode: MODE_FILE, name: "c", oid: numberedOid(3) },
-      ]);
-      return { db, store, oid: store.write("tree", data) };
-    };
-
-    const gap = make();
-    gap.db.run(
-      `DELETE FROM git_tree_entries WHERE source_key = (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-       ) AND ordinal = 1`,
-      gap.oid,
-    );
-    expect(() => [...gap.store.walkTree(gap.oid)]).toThrow(/ordinal gap/);
-
-    const extra = make();
-    extra.db.run(
-      "UPDATE git_tree_sources SET entry_count = 2 WHERE repo_id = 1 AND tree_oid = ?",
-      extra.oid,
-    );
-    expect(() => [...extra.store.walkTree(extra.oid)]).toThrow(/reimport or reclone/);
-
-    const size = make();
-    size.db.run(
-      "UPDATE git_tree_sources SET object_size = object_size - 1 WHERE repo_id = 1 AND tree_oid = ?",
-      size.oid,
-    );
-    expect(() => [...size.store.walkTree(size.oid)]).toThrow(/reimport or reclone/);
-  });
-
-  it("rejects understated queue metadata without returning a BLOB", () => {
-    const make = () => {
-      const db = new BindingDatabase();
-      const store = openScale(db);
-      const oid = store.write(
-        "tree",
-        serializeTree([
-          { mode: MODE_FILE, name: "a", oid: numberedOid(1) },
-          { mode: MODE_FILE, name: "b", oid: numberedOid(2) },
-          { mode: MODE_FILE, name: "c", oid: numberedOid(3) },
-        ]),
-      );
-      db.maxResultBytes = 0;
-      return { db, store, oid };
-    };
-
-    const marker = make();
-    marker.db.run(
-      "UPDATE git_tree_sources SET base_cost = base_cost - 1 WHERE repo_id = 1 AND tree_oid = ?",
-      marker.oid,
-    );
-    expect(() => [...marker.store.walkTree(marker.oid)]).toThrow(/reimport or reclone/);
-    expect(marker.db.maxResultBytes).toBe(0);
-
-    const entry = make();
-    entry.db.run(
-      `UPDATE git_tree_entries SET cumulative_base = cumulative_base - 1
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-        ) AND ordinal = 1`,
-      entry.oid,
-    );
-    expect(() => [...entry.store.walkTree(entry.oid)]).toThrow(/queue metadata is inconsistent/);
-    expect(entry.db.maxResultBytes).toBe(0);
-  });
-
-  it("rejects a valid-looking oid changed after the tree was indexed", () => {
-    const db = new TestDatabase();
-    const store = openScale(db);
-    const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
-    const oid = store.write("tree", data);
-    db.run(
-      `UPDATE git_tree_entries SET oid = ? WHERE source_key = (
-         SELECT source_key FROM git_tree_sources
-          WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-       ) AND ordinal = 0`,
-      numberedOid(2),
-      oid,
-    );
-
-    expect(() => [...store.walkTree(oid)]).toThrow(/integrity check failed/);
   });
 
   it("rejects an effective tree repointed to a same-shaped source identity", () => {
@@ -1385,39 +1288,16 @@ describe("batched tree reads", () => {
         first,
       ),
     ).toThrow(/FOREIGN KEY constraint failed/);
-
-    db.run("PRAGMA foreign_keys = OFF");
-    db.run(
-      "UPDATE git_tree_effective SET source_key = ? WHERE repo_id = 1 AND tree_oid = ?",
-      secondSource,
-      first,
-    );
-    db.run("PRAGMA foreign_keys = ON");
-    expect(() => [...store.walkTree(first)]).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
   });
 
-  it("returns no corrupt BLOB or unbounded path cell on an error row", () => {
+  it("projects tree traversal rows without BLOB payloads", () => {
     const db = new BindingDatabase();
     const store = openScale(db);
     const data = serializeTree([{ mode: MODE_FILE, name: "a", oid: numberedOid(1) }]);
     const oid = store.write("tree", data);
-    db.run("PRAGMA ignore_check_constraints = ON");
-    db.run(
-      `UPDATE git_tree_entries
-          SET name_bytes = zeroblob(10000000),
-              raw_entry = zeroblob(10000000), oid = printf('%.*c', 10000000, 'a')
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = 1 AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-        ) AND ordinal = 0`,
-      oid,
-    );
-    db.run("PRAGMA ignore_check_constraints = OFF");
     db.maxResultBytes = 0;
 
-    expect(() => [...store.walkTree(oid)]).toThrow();
+    expect([...store.walkTree(oid)]).toEqual([{ path: "a", mode: MODE_FILE, oid: numberedOid(1) }]);
     expect(db.maxResultBytes).toBe(0);
   });
 

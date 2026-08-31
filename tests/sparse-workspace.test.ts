@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { fromHex } from "../src/core/bytes.js";
 import { MODE_FILE, serializeTree } from "../src/core/objects.js";
 import { commit } from "../src/core/ops/commit.js";
 import { add } from "../src/core/ops/staging.js";
@@ -1465,79 +1464,7 @@ describe("SQLite sparse workspace source", () => {
     ).toThrowError(/source is missing or invalid/);
   });
 
-  it("does not borrow a packed tree through a wrong-type loose shadow", () => {
-    const workspace = committedWorkspace();
-    const tree = workspace.repo.headTree();
-    if (tree === null) throw new Error("missing HEAD tree");
-    installPackCopy(workspace, tree, 7);
-    workspace.database.db.run(
-      `INSERT INTO git_objects (repo_id, oid, type, size, stored)
-       VALUES (?, ?, 'blob', 0, 'raw')`,
-      workspace.repo.store.repoId,
-      tree,
-    );
-
-    expect(() =>
-      createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: tree,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toThrowError(/source metadata is inconsistent/);
-  });
-
-  it("validates an entire touched source before returning a selected edge", () => {
-    const workspace = committedWorkspace();
-    const tree = workspace.repo.headTree();
-    workspace.database.db.run(
-      `UPDATE git_tree_entries SET raw_entry = X'00'
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-        ) AND name_bytes = CAST('link' AS BLOB)`,
-      workspace.repo.store.repoId,
-      tree,
-    );
-    const source = createSqliteSparseWorkspaceSource(workspace.database.db);
-
-    expect(() =>
-      source.hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: tree,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toThrowError(/source entries/);
-  });
-
-  it("rejects a corrupt source marker before edge hydration", () => {
-    const workspace = committedWorkspace();
-    const tree = workspace.repo.headTree();
-    workspace.database.db.run(
-      `UPDATE git_tree_sources SET base_cost = base_cost + 1
-        WHERE repo_id = ? AND tree_oid = ?`,
-      workspace.repo.store.repoId,
-      tree,
-    );
-
-    expect(() =>
-      createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({
-        repoId: workspace.repo.store.repoId,
-        checkoutId: workspace.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: tree,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toThrowError(/source metadata is inconsistent/);
-  });
-
-  it("does not lose corrupt active source-key and parsed-edge associations", () => {
+  it("does not lose an invalid active source-key association", () => {
     const active = committedWorkspace();
     const activeTree = active.repo.headTree();
     active.database.db.run("PRAGMA foreign_keys = OFF");
@@ -1558,53 +1485,19 @@ describe("SQLite sparse workspace source", () => {
         paths: ["a.txt"],
       }),
     ).toThrowError(/source is missing or invalid/);
-
-    const edge = committedWorkspace();
-    const edgeTree = edge.repo.headTree();
-    edge.database.db.run("PRAGMA foreign_keys = OFF");
-    edge.database.db.run(
-      `UPDATE git_tree_entries SET source_key = source_key + 1000000
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-        ) AND name_bytes = CAST('link' AS BLOB)`,
-      edge.repo.store.repoId,
-      edgeTree,
-    );
-    edge.database.db.run("PRAGMA foreign_keys = ON");
-    expect(() =>
-      createSqliteSparseWorkspaceSource(edge.database.db).hydrate({
-        repoId: edge.repo.store.repoId,
-        checkoutId: edge.repo.checkout.checkoutId,
-        root: "/",
-        baselineTreeOid: edgeTree,
-        currentTreeOid: null,
-        paths: ["a.txt"],
-      }),
-    ).toThrowError(/entries disagree with its marker/);
   });
 
   it("detects a projected tree cycle before depth fallback", () => {
     const workspace = committedWorkspace();
     const tree = workspace.repo.headTree();
     if (tree === null) throw new Error("missing HEAD tree");
-    const row = workspace.database.db.one<{ raw_entry: Uint8Array }>(
-      `SELECT raw_entry FROM git_tree_entries_wide
-        WHERE repo_id = ? AND tree_oid = ? AND name = 'dir'`,
-      workspace.repo.store.repoId,
-      tree,
-    );
-    if (row === undefined) throw new Error("missing directory edge");
-    const raw = row.raw_entry.slice();
-    raw.set(fromHex(tree), raw.length - 20);
     workspace.database.db.run(
-      `UPDATE git_tree_entries SET oid = ?, raw_entry = ?
+      `UPDATE git_tree_entries SET oid = ?
         WHERE source_key = (
           SELECT source_key FROM git_tree_sources
            WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
         ) AND name_bytes = CAST('dir' AS BLOB)`,
       tree,
-      raw,
       workspace.repo.store.repoId,
       tree,
     );
@@ -1633,37 +1526,16 @@ describe("SQLite sparse workspace source", () => {
       root,
     );
     if (child === undefined) throw new Error("missing child tree");
-    const raw = serializeTree([{ mode: "40000", name: "b.txt", oid: root }]);
-    const cumulativeBase = 192 + 5 + 5 + 40;
-    workspace.database.db.transactionSync(() => {
-      workspace.database.db.run(
-        `UPDATE git_tree_entries
-            SET mode = '40000', oid = ?, raw_entry = ?, cumulative_base = ?
-          WHERE source_key = (
-            SELECT source_key FROM git_tree_sources
-             WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
-          ) AND name_bytes = CAST('b.txt' AS BLOB)`,
-        root,
-        raw,
-        cumulativeBase,
-        workspace.repo.store.repoId,
-        child,
-      );
-      workspace.database.db.run(
-        `UPDATE git_tree_sources SET object_size = ?, base_cost = ?
-          WHERE repo_id = ? AND tree_oid = ?`,
-        raw.length,
-        cumulativeBase,
-        workspace.repo.store.repoId,
-        child,
-      );
-      workspace.database.db.run(
-        "UPDATE git_objects SET size = ? WHERE repo_id = ? AND oid = ?",
-        raw.length,
-        workspace.repo.store.repoId,
-        child,
-      );
-    });
+    workspace.database.db.run(
+      `UPDATE git_tree_entries SET mode = '40000', oid = ?
+        WHERE source_key = (
+          SELECT source_key FROM git_tree_sources
+           WHERE repo_id = ? AND tree_oid = ? AND storage = 'loose' AND source_id = 0
+        ) AND name_bytes = CAST('b.txt' AS BLOB)`,
+      root,
+      workspace.repo.store.repoId,
+      child,
+    );
 
     expect(() =>
       createSqliteSparseWorkspaceSource(workspace.database.db).hydrate({

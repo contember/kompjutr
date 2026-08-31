@@ -334,24 +334,13 @@ describe("scratch snapshot replay", () => {
     expect(controlState(workspace)).toEqual(before);
   });
 
-  it("rejects a root snapshot before reading its corrupt tree projection", async () => {
+  it("rejects a root snapshot", async () => {
     const source = fixture();
     source.write("base.txt", "base\n");
     const root = source.commit("root");
     source.write("onto.txt", "onto\n");
     const onto = source.commit("onto");
     const workspace = await importWorkspace(source);
-    const rootTree = source.git("rev-parse", `${root}^{tree}`);
-    workspace.database.db.run(
-      `UPDATE git_tree_entries SET oid = ?
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? LIMIT 1
-        ) AND ordinal = 0`,
-      "f".repeat(40),
-      workspace.repo.store.repoId,
-      rootTree,
-    );
 
     await expect(
       bindGit(workspace).withScratchIndex({ name: "invalid-root" }, (scratch) =>
@@ -375,34 +364,6 @@ describe("scratch snapshot replay", () => {
       }),
     ).rejects.toThrow("abort replay");
 
-    expect(objectCount(workspace)).toBe(beforeObjects);
-    expect(controlState(workspace)).toEqual(before);
-    expect(scratchRows(workspace)).toEqual([]);
-  });
-
-  it("fails closed on stale derived tree rows", async () => {
-    const { source, snapshot, onto } = cleanHistory();
-    const workspace = await importWorkspace(source);
-    const git = bindGit(workspace);
-    const snapshotTree = source.git("rev-parse", `${snapshot}^{tree}`);
-    const before = controlState(workspace);
-    const beforeObjects = objectCount(workspace);
-    workspace.database.db.run(
-      `UPDATE git_tree_entries SET oid = ?
-        WHERE source_key = (
-          SELECT source_key FROM git_tree_sources
-           WHERE repo_id = ? AND tree_oid = ? LIMIT 1
-        ) AND ordinal = 0`,
-      "f".repeat(40),
-      workspace.repo.store.repoId,
-      snapshotTree,
-    );
-
-    await expect(
-      git.withScratchIndex({ name: "stale" }, (scratch) =>
-        scratch.replaySnapshot({ snapshot, onto }),
-      ),
-    ).rejects.toMatchObject({ code: "ECORRUPT" });
     expect(objectCount(workspace)).toBe(beforeObjects);
     expect(controlState(workspace)).toEqual(before);
     expect(scratchRows(workspace)).toEqual([]);

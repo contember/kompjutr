@@ -1,5 +1,6 @@
 import { isOid } from "../core/bytes.js";
 import { CorruptError, GitError, hasErrorCode } from "../core/errors.js";
+import { expectSafeInteger, expectText } from "../core/rows.js";
 import type {
   CommitTreeSnapshotDirectory,
   CommitTreeSnapshotRequest,
@@ -23,7 +24,6 @@ import type {
 import { comparePaths } from "../core/streams.js";
 import { readBlob, type SqlDatabase } from "./db.js";
 import { iterateIndexTrackerDirty, readIndexTrackerState } from "./index-tracker.js";
-import { TREE_QUEUE_ROW_FIXED_BYTES } from "./schema.js";
 import type { IndexEntry } from "./store.js";
 
 const MAX_PATHS = 1_000;
@@ -393,17 +393,7 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
              ORDER BY source_key ROWS UNBOUNDED PRECEDING
            ) AS cumulative_object_bytes
       FROM distinct_sources
-     WHERE typeof(tree_oid) = 'text' AND length(tree_oid) = 40
-       AND tree_oid NOT GLOB '*[^0-9a-f]*'
-       AND typeof(repo_id) = 'integer' AND repo_id >= 1
-       AND typeof(source_key) = 'integer' AND source_key >= 1
-       AND storage IN ('loose','pack')
-       AND typeof(source_id) = 'integer' AND source_id >= 0
-       AND typeof(object_size) = 'integer' AND object_size >= 0
-       AND typeof(entry_count) = 'integer' AND entry_count >= 0
-         AND entry_count <= ${MAX_SOURCE_ENTRIES}
-       AND typeof(base_cost) = 'integer'
-       AND base_cost = object_size + (${TREE_QUEUE_ROW_FIXED_BYTES} + 18) * entry_count
+     WHERE entry_count <= ${MAX_SOURCE_ENTRIES}
   ),
   preflight AS MATERIALIZED (
     SELECT source.*,
@@ -412,139 +402,45 @@ export const SPARSE_TREE_DEPTH_SQL = `WITH
                WHERE entry.source_key = source.source_key
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
             )) AS bounded_count,
-           (SELECT coalesce(sum(length(raw_entry)), 0) FROM (
-              SELECT entry.raw_entry FROM git_tree_entries entry
+           source.object_size + (SELECT coalesce(sum(length(name_bytes)), 0) FROM (
+              SELECT entry.name_bytes FROM git_tree_entries entry
                WHERE entry.source_key = source.source_key
                ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
-            )) AS raw_bytes,
-           (SELECT coalesce(sum(length(raw_entry) + length(name_bytes)), 0) FROM (
-              SELECT entry.raw_entry, entry.name_bytes FROM git_tree_entries entry
-               WHERE entry.source_key = source.source_key
-               ORDER BY entry.ordinal LIMIT ${MAX_SOURCE_ENTRIES + 1}
-            )) AS validation_bytes
+            )) AS source_bytes
       FROM metadata_budget source
      WHERE source.cumulative_entries <= ? AND source.cumulative_object_bytes <= ?
   ),
-  validation_budget AS MATERIALIZED (
+  source_budget AS MATERIALIZED (
     SELECT preflight.*,
-           sum(validation_bytes) OVER (
+           sum(source_bytes) OVER (
              ORDER BY source_key ROWS UNBOUNDED PRECEDING
-           ) AS cumulative_validation_bytes
+           ) AS cumulative_source_bytes
       FROM preflight
   ),
   admitted AS MATERIALIZED (
-    SELECT * FROM validation_budget
-     WHERE bounded_count = entry_count AND raw_bytes = object_size
-       AND cumulative_validation_bytes <= ?
-  ),
-  entry_checks AS MATERIALIZED (
-    SELECT source.source_key,
-           count(entry.ordinal) AS actual_count,
-           min(entry.ordinal) AS min_ordinal,
-           max(entry.ordinal) AS max_ordinal,
-           coalesce(sum(length(entry.raw_entry) + length(entry.name_bytes)), 0) AS validation_bytes,
-           coalesce(sum(CASE
-             WHEN entry.ordinal IS NULL THEN 0
-             WHEN typeof(entry.ordinal) <> 'integer'
-               OR entry.ordinal < 0 OR entry.ordinal >= source.entry_count
-               OR typeof(entry.mode) <> 'text'
-               OR entry.mode NOT IN ('40000','040000','100644','100755','120000','160000')
-               OR typeof(entry.name_bytes) <> 'blob'
-               OR length(entry.name_bytes) = 0
-               OR instr(entry.name_bytes, X'00') != 0
-               OR instr(CAST(entry.name_bytes AS TEXT), '/') != 0
-               OR CAST(CAST(entry.name_bytes AS TEXT) AS BLOB) != entry.name_bytes
-               OR EXISTS (
-                 SELECT 1 FROM git_tree_entries duplicate
-                  WHERE duplicate.source_key = entry.source_key
-                    AND duplicate.name_bytes = entry.name_bytes
-                    AND typeof(duplicate.name_bytes) = 'blob'
-                    AND duplicate.ordinal < entry.ordinal
-               )
-               OR typeof(entry.oid) <> 'text' OR length(entry.oid) != 40
-               OR entry.oid GLOB '*[^0-9a-f]*'
-               OR typeof(entry.raw_entry) <> 'blob'
-               OR length(entry.raw_entry) != length(CAST(entry.mode AS BLOB))
-                    + length(entry.name_bytes) + 22
-               OR CAST(substr(entry.raw_entry, 1, length(CAST(entry.mode AS BLOB))) AS BLOB)
-                    != CAST(entry.mode AS BLOB)
-               OR hex(substr(entry.raw_entry, length(CAST(entry.mode AS BLOB)) + 1, 1)) != '20'
-               OR CAST(substr(entry.raw_entry, length(CAST(entry.mode AS BLOB)) + 2,
-                    length(entry.name_bytes)) AS BLOB) != entry.name_bytes
-               OR hex(substr(entry.raw_entry, length(CAST(entry.mode AS BLOB))
-                    + length(entry.name_bytes) + 2, 1)) != '00'
-               OR lower(hex(substr(entry.raw_entry, -20))) != entry.oid
-               OR typeof(entry.cumulative_base) <> 'integer'
-               OR entry.cumulative_base != ${TREE_QUEUE_ROW_FIXED_BYTES}
-                    + length(entry.name_bytes) + length(CAST(entry.mode AS BLOB))
-                    + length(CAST(entry.oid AS BLOB)) + coalesce((
-                      SELECT previous.cumulative_base FROM git_tree_entries previous
-                       WHERE previous.source_key = entry.source_key
-                         AND previous.ordinal = entry.ordinal - 1
-                    ), 0)
-             THEN 1 ELSE 0 END), 0) AS invalid_entries
-      FROM admitted source
-      LEFT JOIN git_tree_entries entry ON entry.source_key = source.source_key
-     GROUP BY source.source_key
+    SELECT * FROM source_budget
+     WHERE bounded_count <= ${MAX_SOURCE_ENTRIES}
+       AND cumulative_source_bytes <= ?
   )
 SELECT selected.ordinal, selected.side, selected.final, selected.validated,
-       CASE WHEN selected.tree_oid IS NULL OR length(selected.tree_oid) > 40
-            THEN NULL ELSE selected.tree_oid END AS tree_oid,
-       CASE WHEN selected.storage IN ('loose','pack') THEN selected.storage END AS storage,
-       CASE WHEN typeof(selected.source_key) = 'integer' THEN selected.source_key END AS source_key,
-       CASE WHEN typeof(selected.source_id) = 'integer' THEN selected.source_id END AS source_id,
-       CASE WHEN typeof(selected.object_size) = 'integer' THEN selected.object_size END AS object_size,
-       CASE WHEN typeof(selected.entry_count) = 'integer' THEN selected.entry_count END AS entry_count,
-       CASE WHEN typeof(selected.base_cost) = 'integer' THEN selected.base_cost END AS base_cost,
-       CASE WHEN typeof(preflight.bounded_count) = 'integer'
-            THEN preflight.bounded_count END AS bounded_count,
-       CASE WHEN typeof(preflight.raw_bytes) = 'integer'
-            THEN preflight.raw_bytes END AS raw_bytes,
-       CASE WHEN typeof(preflight.validation_bytes) = 'integer'
-            THEN preflight.validation_bytes END AS preflight_validation_bytes,
+       selected.tree_oid, selected.storage, selected.source_key, selected.source_id,
+       selected.object_size, selected.entry_count, selected.base_cost,
+       preflight.bounded_count, preflight.source_bytes,
        CASE WHEN admitted.tree_oid IS NULL THEN 0 ELSE 1 END AS admitted,
-       coalesce(checks.actual_count, 0) AS actual_count,
-       CASE WHEN typeof(checks.min_ordinal) = 'integer' THEN checks.min_ordinal END AS min_ordinal,
-       CASE WHEN typeof(checks.max_ordinal) = 'integer' THEN checks.max_ordinal END AS max_ordinal,
-       typeof(checks.min_ordinal) AS min_ordinal_type,
-       typeof(checks.max_ordinal) AS max_ordinal_type,
-       coalesce(checks.validation_bytes, 0) AS validation_bytes,
-       coalesce(checks.invalid_entries, 0) AS invalid_entries,
-       CASE WHEN edge.mode IN ('40000','040000','100644','100755','120000','160000')
-            THEN edge.mode END AS edge_mode,
-       CASE WHEN typeof(edge.oid) = 'text' AND length(edge.oid) = 40 THEN edge.oid END AS edge_oid,
-       CASE WHEN typeof(edge.ordinal) = 'integer' THEN edge.ordinal END AS edge_ordinal,
-       CASE WHEN selected.storage = 'loose' THEN EXISTS (
-              SELECT 1 FROM git_objects object
-               WHERE object.repo_id = selected.repo_id AND object.oid = selected.tree_oid
-                 AND object.type = 'tree' AND object.size = selected.object_size)
-            WHEN selected.storage = 'pack' THEN EXISTS (
-              SELECT 1 FROM git_pack_objects object
-              JOIN git_pack_meta pack ON pack.repo_id = object.repo_id
-               AND pack.pack_id = object.pack_id AND pack.state = 'complete'
-               WHERE object.repo_id = selected.repo_id AND object.oid = selected.tree_oid
-                 AND object.pack_id = selected.source_id AND object.type = 'tree'
-                 AND object.size = selected.object_size)
-            ELSE 0 END AS authoritative,
-       EXISTS (SELECT 1 FROM git_objects loose
-                WHERE loose.repo_id = selected.repo_id AND loose.oid = selected.tree_oid) AS has_loose
+       edge.mode AS edge_mode, edge.oid AS edge_oid, edge.ordinal AS edge_ordinal
   FROM selected
   LEFT JOIN preflight
     ON preflight.source_key = selected.source_key
   LEFT JOIN admitted
     ON admitted.source_key = selected.source_key
-  LEFT JOIN entry_checks checks
-    ON checks.source_key = selected.source_key
   LEFT JOIN git_tree_entries edge
     ON edge.source_key = selected.source_key
    AND edge.name_bytes = CAST(selected.segment AS BLOB)
-   AND typeof(edge.name_bytes) = 'blob'
    AND edge.ordinal = (
      SELECT min(candidate.ordinal)
        FROM git_tree_entries candidate
       WHERE candidate.source_key = selected.source_key
         AND candidate.name_bytes = CAST(selected.segment AS BLOB)
-        AND typeof(candidate.name_bytes) = 'blob'
    )
  ORDER BY selected.ordinal, selected.side`;
 
@@ -558,20 +454,41 @@ function validateSourceRow(
   budget: SourceBudget,
   retainSource?: (treeOid: string) => boolean,
 ): "available" | "unavailable" {
-  if (
-    typeof row.tree_oid !== "string" ||
-    !isOid(row.tree_oid) ||
-    (row.storage !== "loose" && row.storage !== "pack")
-  ) {
+  const treeOid = expectText(row.tree_oid, "sparse tree oid");
+  if (row.storage !== "loose" && row.storage !== "pack") {
     throw new CorruptError("sparse tree source is missing or invalid");
   }
-  const treeOid = row.tree_oid;
   const storage = row.storage;
-  const sourceKey = numberField(row.source_key);
-  const sourceId = numberField(row.source_id);
-  const objectSize = numberField(row.object_size);
-  const entryCount = numberField(row.entry_count);
-  const baseCost = numberField(row.base_cost);
+  const sourceKey = expectSafeInteger(
+    row.source_key,
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "sparse tree source key",
+  );
+  const sourceId = expectSafeInteger(
+    row.source_id,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "sparse tree source id",
+  );
+  const objectSize = expectSafeInteger(
+    row.object_size,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "sparse tree object size",
+  );
+  const entryCount = expectSafeInteger(
+    row.entry_count,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "sparse tree entry count",
+  );
+  const baseCost = expectSafeInteger(
+    row.base_cost,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "sparse tree base cost",
+  );
   const cached = sources.get(treeOid);
   const validated = row.validated;
   if (validated !== 0 && validated !== 1) {
@@ -591,66 +508,27 @@ function validateSourceRow(
     }
     return "available";
   }
-  if (
-    sourceKey === null ||
-    sourceKey < 1 ||
-    sourceId === null ||
-    sourceId < 0 ||
-    objectSize === null ||
-    objectSize < 0 ||
-    entryCount === null ||
-    entryCount < 0 ||
-    baseCost === null ||
-    baseCost < 0 ||
-    row.authoritative !== 1 ||
-    (storage === "loose" && sourceId !== 0) ||
-    (storage === "pack" && row.has_loose !== 0) ||
-    baseCost !== objectSize + (TREE_QUEUE_ROW_FIXED_BYTES + 18) * entryCount
-  ) {
-    throw new CorruptError("sparse tree source metadata is inconsistent");
-  }
   if (entryCount > MAX_SOURCE_ENTRIES || objectSize > budget.limit) return "unavailable";
   const boundedCount = numberField(row.bounded_count);
-  const rawBytes = numberField(row.raw_bytes);
-  const preflightValidationBytes = numberField(row.preflight_validation_bytes);
-  if (boundedCount === null || rawBytes === null || preflightValidationBytes === null) {
-    return "unavailable";
-  }
-  if (boundedCount !== entryCount || rawBytes !== objectSize) {
-    throw new CorruptError("sparse tree source entries disagree with its marker");
-  }
-  if (row.admitted !== 1 || preflightValidationBytes > budget.limit - budget.bytes) {
-    return "unavailable";
-  }
-  const actualCount = numberField(row.actual_count);
-  const validationBytes = numberField(row.validation_bytes);
-  const invalidEntries = numberField(row.invalid_entries);
+  const sourceBytes = numberField(row.source_bytes);
+  if (boundedCount === null || sourceBytes === null) return "unavailable";
   if (
-    actualCount === null ||
-    validationBytes === null ||
-    invalidEntries === null ||
-    (entryCount === 0
-      ? row.min_ordinal_type !== "null" || row.max_ordinal_type !== "null"
-      : row.min_ordinal_type !== "integer" || row.max_ordinal_type !== "integer") ||
-    actualCount !== entryCount ||
-    invalidEntries !== 0 ||
-    (entryCount === 0
-      ? row.min_ordinal !== null || row.max_ordinal !== null
-      : row.min_ordinal !== 0 || row.max_ordinal !== entryCount - 1)
+    boundedCount > MAX_SOURCE_ENTRIES ||
+    row.admitted !== 1 ||
+    sourceBytes > budget.limit - budget.bytes
   ) {
-    throw new CorruptError("sparse tree source entries are inconsistent");
+    return "unavailable";
   }
-  if (validationBytes > budget.limit) return "unavailable";
   if (cached === undefined) {
     if (
       budget.entries > MAX_SOURCE_ENTRIES - entryCount ||
-      budget.bytes > budget.limit - validationBytes
+      budget.bytes > budget.limit - sourceBytes
     ) {
       return "unavailable";
     }
     if (retainSource !== undefined && !retainSource(treeOid)) return "unavailable";
     budget.entries += entryCount;
-    budget.bytes += validationBytes;
+    budget.bytes += sourceBytes;
   }
   sources.set(treeOid, { sourceKey, storage, sourceId, objectSize, entryCount, baseCost });
   return "available";
@@ -723,17 +601,8 @@ function treeDepth(
       resolutions.set(key, { leaf: null, treeOid: null });
       continue;
     }
-    const edgeOrdinal = numberField(row.edge_ordinal);
-    const mode = row.edge_mode;
-    const oid = row.edge_oid;
-    if (
-      edgeOrdinal === null ||
-      typeof mode !== "string" ||
-      typeof oid !== "string" ||
-      !isOid(oid)
-    ) {
-      throw new CorruptError("sparse tree lookup returned an invalid edge");
-    }
+    const mode = expectText(row.edge_mode, "sparse tree edge mode");
+    const oid = expectText(row.edge_oid, "sparse tree edge oid");
     const tree = mode === "40000" || mode === "040000";
     resolutions.set(key, {
       leaf: final === 1 && !tree ? { mode, oid } : null,

@@ -1,6 +1,5 @@
-import { fromHex, isOid } from "../core/bytes.js";
 import { CorruptError, GitError } from "../core/errors.js";
-import { decodeTreeName } from "../core/objects.js";
+import { expectNullable, expectText } from "../core/rows.js";
 import type { SqlDatabase } from "./db.js";
 import { TREE_QUEUE_ROW_FIXED_BYTES } from "./schema.js";
 
@@ -28,189 +27,52 @@ export interface WalkTreeDiffObject {
   type: "tree" | "blob";
 }
 
-function validateTraversalPath(row: Record<string, unknown>, label: string): void {
-  const rawPath = row.raw_path;
-  if (rawPath === null) {
-    if (row.error === null) throw new CorruptError(`${label} yielded no raw path`);
-    return;
-  }
-  if (typeof rawPath !== "string" || rawPath.length % 2 !== 0 || /[^0-9A-F]/.test(rawPath)) {
-    throw new CorruptError(`${label} yielded an invalid raw path`);
-  }
-  const stateBytes = row.state_bytes;
-  if (typeof stateBytes !== "number" || !Number.isSafeInteger(stateBytes) || stateBytes < 0) {
-    throw new CorruptError(`${label} yielded an invalid traversal state size`);
-  }
-  const rawBytes = fromHex(rawPath);
-  const path = decodeTreeName(rawBytes);
-  if (typeof row.path !== "string" || row.path !== path) {
-    throw new CorruptError(`${label} path does not match its authoritative bytes`);
-  }
-}
-
 function throwTraversalError(row: Record<string, unknown>, label: string): void {
   const error = row.error;
-  const errorCode = row.error_code;
-  if (error === null) {
-    if (errorCode !== "ECORRUPT" && errorCode !== "E2BIG") {
-      throw new CorruptError(`${label} yielded an invalid error code`);
-    }
-    return;
-  }
-  if (typeof error !== "string" || (errorCode !== "ECORRUPT" && errorCode !== "E2BIG")) {
-    throw new CorruptError(`${label} yielded invalid error fields`);
-  }
-  if (errorCode === "E2BIG") throw new GitError("E2BIG", error);
-  throw new CorruptError(error);
+  if (error === null) return;
+  const message = expectText(error, `${label} error`);
+  const errorCode = expectText(row.error_code, `${label} error code`);
+  if (errorCode === "E2BIG") throw new GitError("E2BIG", message);
+  throw new CorruptError(message);
 }
 
 function isTreeMode(mode: string): boolean {
   return mode === "40000" || mode === "040000";
 }
 
-function isLeafMode(mode: string): boolean {
-  return mode === "100644" || mode === "100755" || mode === "120000" || mode === "160000";
-}
-
-function validateNullableLeaf(mode: unknown, oid: unknown, label: string): void {
-  if (mode === null && oid === null) return;
-  if (typeof mode !== "string" || !isLeafMode(mode) || typeof oid !== "string" || !isOid(oid)) {
-    throw new CorruptError(`${label} yielded an invalid tree entry`);
-  }
-}
-
-function validateDiffProjection(row: Record<string, unknown>, label: string): void {
-  validateNullableLeaf(row.before_mode, row.before_oid, label);
-  validateNullableLeaf(row.after_mode, row.after_oid, label);
-  const mode = row.object_mode;
-  const oid = row.object_oid;
-  if (mode === null && oid === null) return;
-  if (
-    typeof mode !== "string" ||
-    (!isTreeMode(mode) && !isLeafMode(mode)) ||
-    typeof oid !== "string" ||
-    !isOid(oid)
-  ) {
-    throw new CorruptError(`${label} yielded an invalid object projection`);
-  }
-}
-
 export const WALK_TREE_SQL = `WITH RECURSIVE
   params(repo_id, root_oid, path_cap, state_cap, queue_cap, queue_fixed)
     AS (VALUES (?, ?, ?, ?, ?, ?)),
-  source_valid(repo_id, tree_oid, storage, source_id, object_size,
-               entry_count, base_cost) AS NOT MATERIALIZED (
-    SELECT x.repo_id, x.tree_oid, s.storage, s.source_id, s.object_size,
-           s.entry_count, s.base_cost
+  source_valid(repo_id, tree_oid, source_key, entry_count, base_cost) AS NOT MATERIALIZED (
+    SELECT x.repo_id, x.tree_oid, s.source_key, s.entry_count, s.base_cost
       FROM git_tree_effective x
       CROSS JOIN params p
       CROSS JOIN git_tree_sources s
      WHERE x.repo_id = p.repo_id
-       AND length(x.tree_oid) = 40 AND x.tree_oid NOT GLOB '*[^0-9a-f]*'
        AND s.source_key = x.source_key
        AND s.repo_id = x.repo_id AND s.tree_oid = x.tree_oid
        AND s.complete = 1
-       AND s.entry_count >= 0 AND s.object_size >= 0
-       AND s.base_cost = s.object_size + (p.queue_fixed + 18) * s.entry_count
-       AND (
-         (s.storage = 'loose' AND s.source_id = 0 AND EXISTS (
-           SELECT 1 FROM git_objects o
-            WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
-              AND o.type = 'tree' AND o.size = s.object_size
-         ))
-         OR
-         (s.storage = 'pack' AND EXISTS (
-           SELECT 1
-             FROM git_pack_objects o
-             JOIN git_pack_meta m
-               ON m.repo_id = o.repo_id AND m.pack_id = o.pack_id
-              AND m.state = 'complete'
-            WHERE o.repo_id = x.repo_id AND o.oid = x.tree_oid
-              AND o.pack_id = s.source_id AND o.type = 'tree'
-              AND o.size = s.object_size
-         ))
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM git_tree_entries_wide e
-          WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-            AND e.storage = s.storage AND e.source_id = s.source_id
-            AND e.ordinal IN (-1, s.entry_count)
-       )
-       AND (
-         (s.entry_count = 0 AND s.base_cost = 0)
-         OR EXISTS (
-           SELECT 1 FROM git_tree_entries_wide e
-            WHERE e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-              AND e.storage = s.storage AND e.source_id = s.source_id
-              AND e.ordinal = s.entry_count - 1
-              AND e.cumulative_base = s.base_cost
-         )
-       )
   ),
-  walk(path, raw_path, mode, oid, ancestry, sort_key, error, error_code,
+  walk(path, mode, oid, ancestry, sort_key, error, error_code,
        path_bytes, state_bytes, descend, reserved_bytes) AS (
     SELECT CASE
-             WHEN length(e.name_bytes) <= p.path_cap
-               AND length(CAST(e.name AS BLOB)) <= p.path_cap THEN e.name
+             WHEN length(e.name_bytes) <= p.path_cap THEN CAST(e.name_bytes AS TEXT)
              ELSE NULL
            END,
-           CASE WHEN length(e.name_bytes) <= p.path_cap THEN e.name_bytes ELSE NULL END,
-           CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
-           CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
+           e.mode, e.oid,
            '/' || p.root_oid || '/', printf('%08x', e.ordinal),
            CASE
-             WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
-               THEN 'tree entries do not match the parsed source marker'
-             WHEN e.ordinal > 0 AND NOT EXISTS (
-               SELECT 1 FROM git_tree_entries_wide previous
-                WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
-                  AND previous.storage = e.storage AND previous.source_id = e.source_id
-                  AND previous.ordinal = e.ordinal - 1
-             ) THEN 'tree entries contain an ordinal gap'
-             WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
-                    + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
-                    + COALESCE((
-                        SELECT previous.cumulative_base FROM git_tree_entries_wide previous
-                         WHERE previous.repo_id = e.repo_id
-                           AND previous.tree_oid = e.tree_oid
-                           AND previous.storage = e.storage
-                           AND previous.source_id = e.source_id
-                           AND previous.ordinal = e.ordinal - 1
-                      ), 0)
-               THEN 'tree queue metadata is inconsistent'
              WHEN length(e.name_bytes) > p.path_cap
-               OR length(CAST(e.name AS BLOB)) > p.path_cap
                THEN 'tree traversal row exceeds its fixed state capacity'
-             WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
-               THEN 'tree entry has an invalid mode'
-             WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
-               OR CAST(e.name_bytes AS TEXT) != e.name
-               THEN 'tree entry has an invalid name'
-             WHEN length(e.oid) != 40 OR e.oid GLOB '*[^0-9a-f]*'
-               THEN 'tree entry has an invalid oid'
-             WHEN length(e.raw_entry) != length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 22
-               OR CAST(substr(e.raw_entry, 1, length(CAST(e.mode AS BLOB))) AS BLOB)
-                    != CAST(e.mode AS BLOB)
-               OR hex(substr(e.raw_entry, length(CAST(e.mode AS BLOB)) + 1, 1)) != '20'
-               OR CAST(substr(
-                    e.raw_entry, length(CAST(e.mode AS BLOB)) + 2, length(e.name_bytes)
-                  ) AS BLOB) != e.name_bytes
-               OR hex(substr(
-                    e.raw_entry, length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 2, 1
-                  )) != '00'
-               OR lower(hex(substr(e.raw_entry, -20))) != e.oid
-               THEN 'tree entry integrity check failed'
              WHEN length(e.name_bytes) + 41 + 8 > p.state_cap
                THEN 'tree traversal row exceeds its fixed state capacity'
              ELSE NULL
            END,
            CASE WHEN length(e.name_bytes) > p.path_cap
-                  OR length(CAST(e.name AS BLOB)) > p.path_cap
                   OR length(e.name_bytes) + 41 + 8 > p.state_cap
                 THEN 'E2BIG' ELSE 'ECORRUPT' END,
            length(e.name_bytes), length(e.name_bytes) + 41 + 8,
            CASE WHEN e.mode IN ('40000', '040000')
-                  AND length(e.oid) = 40 AND e.oid NOT GLOB '*[^0-9a-f]*'
                   AND EXISTS (
                     SELECT 1 FROM source_valid child
                      WHERE child.repo_id = p.repo_id AND child.tree_oid = e.oid
@@ -230,19 +92,18 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              + (s.entry_count - e.ordinal - 1) * 50
       FROM params p
       CROSS JOIN source_valid s
-      CROSS JOIN git_tree_entries_wide e
+      CROSS JOIN git_tree_entries e
      WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
        AND s.base_cost + s.entry_count * 50 <= p.queue_cap
-       AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-       AND e.storage = s.storage AND e.source_id = s.source_id
+       AND e.source_key = s.source_key
     UNION ALL
-    SELECT NULL, NULL, NULL, NULL, '/', '',
+    SELECT NULL, NULL, NULL, '/', '',
            'tree traversal queue exceeds 16 MiB', 'E2BIG', 0, 0, 0, 0
       FROM params p CROSS JOIN source_valid s
      WHERE s.repo_id = p.repo_id AND s.tree_oid = p.root_oid
        AND s.base_cost + s.entry_count * 50 > p.queue_cap
     UNION ALL
-    SELECT NULL, NULL, NULL, NULL, '/', '',
+    SELECT NULL, NULL, NULL, '/', '',
            CASE WHEN length(p.root_oid) = 40 AND p.root_oid NOT GLOB '*[^0-9a-f]*'
                 THEN 'tree source is invalid; reimport or reclone'
                 ELSE 'tree oid is invalid'
@@ -256,59 +117,12 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
     UNION ALL
     SELECT CASE
              WHEN w.path_bytes + 1 + length(e.name_bytes) <= p.path_cap
-               AND length(CAST(w.path AS BLOB)) + 1 + length(CAST(e.name AS BLOB))
-                     <= p.path_cap
-               THEN w.path || '/' || e.name
+               THEN w.path || '/' || CAST(e.name_bytes AS TEXT)
              ELSE NULL
            END,
-           CASE WHEN w.path_bytes + 1 + length(e.name_bytes) <= p.path_cap
-                  THEN CAST(w.raw_path || x'2f' || e.name_bytes AS BLOB)
-                ELSE NULL END,
-           CASE WHEN length(e.mode) <= 6 THEN e.mode ELSE NULL END,
-           CASE WHEN length(e.oid) <= 40 THEN e.oid ELSE NULL END,
+           e.mode, e.oid,
            w.ancestry || w.oid || '/', w.sort_key || printf('%08x', e.ordinal),
            CASE
-             WHEN e.ordinal < 0 OR e.ordinal >= s.entry_count
-               THEN 'tree entries do not match the parsed source marker'
-             WHEN e.ordinal > 0 AND NOT EXISTS (
-               SELECT 1 FROM git_tree_entries_wide previous
-                WHERE previous.repo_id = e.repo_id AND previous.tree_oid = e.tree_oid
-                  AND previous.storage = e.storage AND previous.source_id = e.source_id
-                  AND previous.ordinal = e.ordinal - 1
-             ) THEN 'tree entries contain an ordinal gap'
-             WHEN e.cumulative_base != p.queue_fixed + length(e.name_bytes)
-                    + length(CAST(e.mode AS BLOB)) + length(CAST(e.oid AS BLOB))
-                    + COALESCE((
-                        SELECT previous.cumulative_base FROM git_tree_entries_wide previous
-                         WHERE previous.repo_id = e.repo_id
-                           AND previous.tree_oid = e.tree_oid
-                           AND previous.storage = e.storage
-                           AND previous.source_id = e.source_id
-                           AND previous.ordinal = e.ordinal - 1
-                      ), 0)
-               THEN 'tree queue metadata is inconsistent'
-             WHEN length(e.name_bytes) > p.path_cap
-               OR length(CAST(e.name AS BLOB)) > p.path_cap
-               THEN 'tree traversal row exceeds its fixed state capacity'
-             WHEN e.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
-               THEN 'tree entry has an invalid mode'
-             WHEN length(e.name_bytes) = 0 OR instr(CAST(e.name_bytes AS TEXT), '/') != 0
-               OR CAST(e.name_bytes AS TEXT) != e.name
-               THEN 'tree entry has an invalid name'
-             WHEN length(e.oid) != 40 OR e.oid GLOB '*[^0-9a-f]*'
-               THEN 'tree entry has an invalid oid'
-             WHEN length(e.raw_entry) != length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 22
-               OR CAST(substr(e.raw_entry, 1, length(CAST(e.mode AS BLOB))) AS BLOB)
-                    != CAST(e.mode AS BLOB)
-               OR hex(substr(e.raw_entry, length(CAST(e.mode AS BLOB)) + 1, 1)) != '20'
-               OR CAST(substr(
-                    e.raw_entry, length(CAST(e.mode AS BLOB)) + 2, length(e.name_bytes)
-                  ) AS BLOB) != e.name_bytes
-               OR hex(substr(
-                    e.raw_entry, length(CAST(e.mode AS BLOB)) + length(e.name_bytes) + 2, 1
-                  )) != '00'
-               OR lower(hex(substr(e.raw_entry, -20))) != e.oid
-               THEN 'tree entry integrity check failed'
              WHEN w.path_bytes + 1 + length(e.name_bytes) > p.path_cap
                THEN 'tree traversal row exceeds its fixed state capacity'
              WHEN w.state_bytes + 1 + length(e.name_bytes) + 41 + 8 > p.state_cap
@@ -316,14 +130,11 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
              ELSE NULL
            END,
            CASE WHEN w.path_bytes + 1 + length(e.name_bytes) > p.path_cap
-                  OR length(CAST(w.path AS BLOB)) + 1 + length(CAST(e.name AS BLOB))
-                       > p.path_cap
                   OR w.state_bytes + 1 + length(e.name_bytes) + 41 + 8 > p.state_cap
                 THEN 'E2BIG' ELSE 'ECORRUPT' END,
            w.path_bytes + 1 + length(e.name_bytes),
            w.state_bytes + 1 + length(e.name_bytes) + 41 + 8,
            CASE WHEN e.mode IN ('40000', '040000')
-                  AND length(e.oid) = 40 AND e.oid NOT GLOB '*[^0-9a-f]*'
                   AND EXISTS (
                     SELECT 1 FROM source_valid child
                      WHERE child.repo_id = p.repo_id AND child.tree_oid = e.oid
@@ -345,17 +156,14 @@ export const WALK_TREE_SQL = `WITH RECURSIVE
       FROM walk w
       CROSS JOIN params p
       CROSS JOIN source_valid s
-      CROSS JOIN git_tree_entries_wide e
+      CROSS JOIN git_tree_entries e
      WHERE w.error IS NULL AND w.descend = 1
        AND instr(w.ancestry, '/' || w.oid || '/') = 0
        AND s.repo_id = p.repo_id AND s.tree_oid = w.oid
-       AND e.repo_id = s.repo_id AND e.tree_oid = s.tree_oid
-       AND e.storage = s.storage AND e.source_id = s.source_id
-     ORDER BY 6
+       AND e.source_key = s.source_key
+     ORDER BY 5
   )
-SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_path,
-       state_bytes,
-       mode, oid,
+SELECT path, mode, oid,
        CASE
          WHEN error IS NOT NULL THEN error
          WHEN mode IN ('40000', '040000') AND instr(ancestry, '/' || oid || '/') != 0
@@ -374,116 +182,38 @@ SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_
     OR instr(ancestry, '/' || oid || '/') != 0
     OR (mode IN ('40000', '040000') AND descend != 1)`;
 
-function diffSourceValidSql(effective: string, source: string, oid: string): string {
+function diffSourceValidSql(effective: string, source: string): string {
   return `((${effective}.source_key IS NOT NULL
-    AND length(${effective}.tree_oid) = 40
-    AND ${effective}.tree_oid NOT GLOB '*[^0-9a-f]*'
     AND ${source}.source_key = ${effective}.source_key
     AND ${source}.repo_id = ${effective}.repo_id
     AND ${source}.tree_oid = ${effective}.tree_oid
-    AND ${source}.complete = 1
-    AND ${source}.entry_count >= 0
-    AND ${source}.object_size >= 0
-    AND ${source}.base_cost = ${source}.object_size
-      + (p.queue_fixed + 18) * ${source}.entry_count
-    AND (
-      (${source}.storage = 'loose' AND ${source}.source_id = 0 AND EXISTS (
-        SELECT 1 FROM git_objects object
-         WHERE object.repo_id = p.repo_id AND object.oid = ${oid}
-           AND object.type = 'tree' AND object.size = ${source}.object_size
-      ))
-      OR
-      (${source}.storage = 'pack' AND EXISTS (
-        SELECT 1 FROM git_pack_objects object
-          JOIN git_pack_meta pack
-            ON pack.repo_id = object.repo_id AND pack.pack_id = object.pack_id
-           AND pack.state = 'complete'
-         WHERE object.repo_id = p.repo_id AND object.oid = ${oid}
-           AND object.pack_id = ${source}.source_id AND object.type = 'tree'
-           AND object.size = ${source}.object_size
-      ))
-    )
-    AND NOT EXISTS (
-      SELECT 1 FROM git_tree_entries marker
-       WHERE marker.source_key = ${source}.source_key
-         AND marker.ordinal IN (-1, ${source}.entry_count)
-    )
-    AND (
-      (${source}.entry_count = 0 AND ${source}.base_cost = 0)
-      OR EXISTS (
-        SELECT 1 FROM git_tree_entries marker
-         WHERE marker.source_key = ${source}.source_key
-           AND marker.ordinal = ${source}.entry_count - 1
-           AND marker.cumulative_base = ${source}.base_cost
-      )
-    )) IS TRUE)`;
+    AND ${source}.complete = 1) IS TRUE)`;
 }
 
 function diffEntryNameSql(entry: string): string {
   return `CASE WHEN length(${entry}.name_bytes) <= p.path_cap
-                  AND length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) <= p.path_cap
                 THEN CAST(${entry}.name_bytes AS TEXT) ELSE NULL END`;
 }
 
 function diffEntryModeSql(entry: string): string {
-  return `CASE WHEN length(${entry}.mode) <= 6 THEN ${entry}.mode ELSE NULL END`;
+  return `${entry}.mode`;
 }
 
 function diffEntryOidSql(entry: string): string {
-  return `CASE WHEN length(${entry}.oid) <= 40 THEN ${entry}.oid ELSE NULL END`;
-}
-
-function diffEntryErrorSql(entry: string, previous: string, source: string): string {
-  return `CASE
-    WHEN ${entry}.ordinal < 0 OR ${entry}.ordinal >= ${source}.entry_count
-      THEN 'tree entries do not match the parsed source marker'
-    WHEN ${entry}.ordinal > 0 AND ${previous}.ordinal IS NULL
-      THEN 'tree entries contain an ordinal gap'
-    WHEN ${entry}.cumulative_base != p.queue_fixed + length(${entry}.name_bytes)
-           + length(CAST(${entry}.mode AS BLOB)) + length(CAST(${entry}.oid AS BLOB))
-           + COALESCE(${previous}.cumulative_base, 0)
-      THEN 'tree queue metadata is inconsistent'
-    WHEN length(${entry}.name_bytes) > p.path_cap
-      OR length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) > p.path_cap
-      THEN 'tree traversal row exceeds its fixed state capacity'
-    WHEN ${entry}.mode NOT IN ('40000', '040000', '100644', '100755', '120000', '160000')
-      THEN 'tree entry has an invalid mode'
-    WHEN length(${entry}.name_bytes) = 0
-      OR instr(CAST(${entry}.name_bytes AS TEXT), '/') != 0
-      THEN 'tree entry has an invalid name'
-    WHEN length(${entry}.oid) != 40 OR ${entry}.oid GLOB '*[^0-9a-f]*'
-      THEN 'tree entry has an invalid oid'
-    WHEN length(${entry}.raw_entry) != length(CAST(${entry}.mode AS BLOB))
-           + length(${entry}.name_bytes) + 22
-      OR CAST(substr(${entry}.raw_entry, 1, length(CAST(${entry}.mode AS BLOB))) AS BLOB)
-           != CAST(${entry}.mode AS BLOB)
-      OR hex(substr(${entry}.raw_entry, length(CAST(${entry}.mode AS BLOB)) + 1, 1)) != '20'
-      OR CAST(substr(
-           ${entry}.raw_entry, length(CAST(${entry}.mode AS BLOB)) + 2,
-           length(${entry}.name_bytes)
-         ) AS BLOB) != ${entry}.name_bytes
-      OR hex(substr(
-           ${entry}.raw_entry,
-           length(CAST(${entry}.mode AS BLOB)) + length(${entry}.name_bytes) + 2, 1
-         )) != '00'
-      OR lower(hex(substr(${entry}.raw_entry, -20))) != ${entry}.oid
-      THEN 'tree entry integrity check failed'
-    ELSE NULL
-  END`;
+  return `${entry}.oid`;
 }
 
 function diffEntryTooBigSql(entry: string): string {
-  return `(length(${entry}.name_bytes) > p.path_cap
-    OR length(CAST(CAST(${entry}.name_bytes AS TEXT) AS BLOB)) > p.path_cap)`;
+  return `length(${entry}.name_bytes) > p.path_cap`;
 }
 
 const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
   params(repo_id, before_root, after_root, path_cap, state_cap, queue_cap, queue_fixed,
          emit_objects)
     AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?)),
-  walk(path, raw_path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
+  walk(path, path_bytes, sort_key, before_mode, before_oid, after_mode, after_oid,
        before_ancestry, after_ancestry, state_bytes, reserved_bytes, error, error_code) AS (
-    SELECT '', CAST('' AS BLOB), 0, CAST('' AS BLOB),
+    SELECT '', 0, CAST('' AS BLOB),
            CASE WHEN p.before_root IS NULL THEN NULL ELSE '40000' END, p.before_root,
            CASE WHEN p.after_root IS NULL THEN NULL ELSE '40000' END, p.after_root,
            CASE WHEN p.before_root IS NULL THEN '/' ELSE '/' || p.before_root || '/' END,
@@ -510,21 +240,21 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
       FROM params p
      WHERE p.before_root IS NOT p.after_root
     UNION ALL
-    SELECT w.path, w.raw_path, w.path_bytes, w.sort_key,
+    SELECT w.path, w.path_bytes, w.sort_key,
            w.before_mode, w.before_oid, w.after_mode, w.after_oid,
            w.before_ancestry, w.after_ancestry, w.state_bytes, w.reserved_bytes,
            CASE
              WHEN w.before_mode IN ('40000', '040000')
                   AND NOT (COALESCE(w.after_mode IN ('40000', '040000'), 0)
                            AND w.before_oid = w.after_oid)
-                  AND NOT ${diffSourceValidSql("bx", "bps", "w.before_oid")}
+                  AND NOT ${diffSourceValidSql("bx", "bps")}
                THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
                          ELSE 'tree ' || w.before_oid
                            || ' has no valid v3 parsed source; reimport or reclone' END
              WHEN w.after_mode IN ('40000', '040000')
                   AND NOT (COALESCE(w.before_mode IN ('40000', '040000'), 0)
                            AND w.before_oid = w.after_oid)
-                  AND NOT ${diffSourceValidSql("ax", "aps", "w.after_oid")}
+                  AND NOT ${diffSourceValidSql("ax", "aps")}
                THEN CASE WHEN w.path = '' THEN 'tree source is invalid; reimport or reclone'
                          ELSE 'tree ' || w.after_oid
                            || ' has no valid v3 parsed source; reimport or reclone' END
@@ -543,7 +273,7 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
         ON aps.source_key = ax.source_key
      WHERE w.error IS NULL AND w.error_code = 'PENDING'
     UNION ALL
-    SELECT w.path, w.raw_path, w.path_bytes, w.sort_key,
+    SELECT w.path, w.path_bytes, w.sort_key,
            w.before_mode, w.before_oid, w.after_mode, w.after_oid,
            w.before_ancestry, w.after_ancestry, w.state_bytes, w.reserved_bytes,
            'tree traversal queue exceeds 16 MiB', 'E2BIG'
@@ -576,11 +306,6 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
     UNION ALL
     SELECT CASE WHEN w.path = '' THEN ${diffEntryNameSql("be")}
                 ELSE w.path || '/' || ${diffEntryNameSql("be")} END,
-           CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
-                          + length(be.name_bytes) <= p.path_cap
-                  THEN CASE WHEN w.path = '' THEN be.name_bytes
-                            ELSE CAST(w.raw_path || x'2f' || be.name_bytes AS BLOB) END
-                ELSE NULL END,
            w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END + length(be.name_bytes),
            CAST(CAST(CASE WHEN w.path = '' THEN ${diffEntryNameSql("be")}
                           ELSE w.path || '/' || ${diffEntryNameSql("be")} END AS BLOB)
@@ -616,28 +341,25 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                    + (aps.entry_count - ae.ordinal - 1)
                        * (w.state_bytes + 51 - p.queue_fixed - 18)
                END,
-           COALESCE(${diffEntryErrorSql("be", "bp", "bps")},
-             CASE WHEN ae.ordinal IS NULL THEN NULL
-                  ELSE ${diffEntryErrorSql("ae", "ap", "aps")} END,
-             CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
-                                + length(be.name_bytes) > p.path_cap
-                    THEN 'tree traversal row exceeds its fixed state capacity'
-                  WHEN w.state_bytes + 2 * (CASE WHEN w.path = '' THEN 0 ELSE 1 END
-                                + length(be.name_bytes)) + 100 > p.state_cap
-                    THEN 'tree traversal row exceeds its fixed state capacity'
-                  WHEN be.mode IN ('40000', '040000')
-                       AND instr(CASE WHEN w.path = '' THEN w.before_ancestry
-                                      ELSE w.before_ancestry || w.before_oid || '/' END,
-                                 '/' || ${diffEntryOidSql("be")} || '/') != 0
-                    THEN 'tree cycle at ' || ${diffEntryOidSql("be")}
-                  WHEN ae.mode IN ('40000', '040000')
-                       AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
-                                      WHEN w.after_mode IN ('40000', '040000')
-                                        THEN w.after_ancestry || w.after_oid || '/'
-                                      ELSE w.after_ancestry END,
-                                 '/' || ${diffEntryOidSql("ae")} || '/') != 0
-                    THEN 'tree cycle at ' || ${diffEntryOidSql("ae")}
-                  ELSE NULL END),
+           CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
+                              + length(be.name_bytes) > p.path_cap
+                  THEN 'tree traversal row exceeds its fixed state capacity'
+                WHEN w.state_bytes + 2 * (CASE WHEN w.path = '' THEN 0 ELSE 1 END
+                              + length(be.name_bytes)) + 100 > p.state_cap
+                  THEN 'tree traversal row exceeds its fixed state capacity'
+                WHEN be.mode IN ('40000', '040000')
+                     AND instr(CASE WHEN w.path = '' THEN w.before_ancestry
+                                    ELSE w.before_ancestry || w.before_oid || '/' END,
+                               '/' || ${diffEntryOidSql("be")} || '/') != 0
+                  THEN 'tree cycle at ' || ${diffEntryOidSql("be")}
+                WHEN ae.mode IN ('40000', '040000')
+                     AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
+                                    WHEN w.after_mode IN ('40000', '040000')
+                                      THEN w.after_ancestry || w.after_oid || '/'
+                                    ELSE w.after_ancestry END,
+                               '/' || ${diffEntryOidSql("ae")} || '/') != 0
+                  THEN 'tree cycle at ' || ${diffEntryOidSql("ae")}
+                ELSE NULL END,
            CASE WHEN ${diffEntryTooBigSql("be")}
                        OR (ae.ordinal IS NOT NULL AND ${diffEntryTooBigSql("ae")})
                        OR w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
@@ -658,18 +380,13 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
       CROSS JOIN git_tree_effective bx
       CROSS JOIN git_tree_sources bps
       CROSS JOIN git_tree_entries be
-      LEFT JOIN git_tree_entries bp
-        ON bp.source_key = be.source_key AND bp.ordinal = be.ordinal - 1
       LEFT JOIN git_tree_effective ax
         ON ax.repo_id = p.repo_id AND ax.tree_oid = w.after_oid
        AND w.after_mode IN ('40000', '040000')
       LEFT JOIN git_tree_sources aps ON aps.source_key = ax.source_key
       LEFT JOIN git_tree_entries ae
         ON ae.source_key = aps.source_key AND ae.name_bytes = be.name_bytes
-       AND typeof(ae.name_bytes) = 'blob'
        AND length(ae.name_bytes) <= p.path_cap
-      LEFT JOIN git_tree_entries ap
-        ON ap.source_key = ae.source_key AND ap.ordinal = ae.ordinal - 1
      WHERE w.error IS NULL
        AND w.error_code = 'ECORRUPT'
        AND (w.before_mode IN ('40000', '040000'))
@@ -686,11 +403,6 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
     UNION ALL
     SELECT CASE WHEN w.path = '' THEN ${diffEntryNameSql("ae")}
                 ELSE w.path || '/' || ${diffEntryNameSql("ae")} END,
-           CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
-                          + length(ae.name_bytes) <= p.path_cap
-                  THEN CASE WHEN w.path = '' THEN ae.name_bytes
-                            ELSE CAST(w.raw_path || x'2f' || ae.name_bytes AS BLOB) END
-                ELSE NULL END,
            w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END + length(ae.name_bytes),
            CAST(CAST(CASE WHEN w.path = '' THEN ${diffEntryNameSql("ae")}
                           ELSE w.path || '/' || ${diffEntryNameSql("ae")} END AS BLOB)
@@ -708,19 +420,18 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
                  * (w.state_bytes + 51 - p.queue_fixed - 18)
              + COALESCE(bps.base_cost + bps.object_size
                           + bps.entry_count * (w.state_bytes + 51), 0),
-           COALESCE(${diffEntryErrorSql("ae", "ap", "aps")},
-             CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
-                                + length(ae.name_bytes) > p.path_cap
-                    THEN 'tree traversal row exceeds its fixed state capacity'
-                  WHEN w.state_bytes + 2 * (CASE WHEN w.path = '' THEN 0 ELSE 1 END
-                                + length(ae.name_bytes)) + 55 > p.state_cap
-                    THEN 'tree traversal row exceeds its fixed state capacity'
-                  WHEN ae.mode IN ('40000', '040000')
-                       AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
-                                      ELSE w.after_ancestry || w.after_oid || '/' END,
-                                 '/' || ${diffEntryOidSql("ae")} || '/') != 0
-                    THEN 'tree cycle at ' || ${diffEntryOidSql("ae")}
-                  ELSE NULL END),
+           CASE WHEN w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
+                              + length(ae.name_bytes) > p.path_cap
+                  THEN 'tree traversal row exceeds its fixed state capacity'
+                WHEN w.state_bytes + 2 * (CASE WHEN w.path = '' THEN 0 ELSE 1 END
+                              + length(ae.name_bytes)) + 55 > p.state_cap
+                  THEN 'tree traversal row exceeds its fixed state capacity'
+                WHEN ae.mode IN ('40000', '040000')
+                     AND instr(CASE WHEN w.path = '' THEN w.after_ancestry
+                                    ELSE w.after_ancestry || w.after_oid || '/' END,
+                               '/' || ${diffEntryOidSql("ae")} || '/') != 0
+                  THEN 'tree cycle at ' || ${diffEntryOidSql("ae")}
+                ELSE NULL END,
            CASE WHEN ${diffEntryTooBigSql("ae")}
                        OR w.path_bytes + CASE WHEN w.path = '' THEN 0 ELSE 1 END
                             + length(ae.name_bytes) > p.path_cap
@@ -734,15 +445,12 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
       CROSS JOIN git_tree_effective ax
       CROSS JOIN git_tree_sources aps
       CROSS JOIN git_tree_entries ae
-      LEFT JOIN git_tree_entries ap
-        ON ap.source_key = ae.source_key AND ap.ordinal = ae.ordinal - 1
       LEFT JOIN git_tree_effective bx
         ON bx.repo_id = p.repo_id AND bx.tree_oid = w.before_oid
        AND w.before_mode IN ('40000', '040000')
       LEFT JOIN git_tree_sources bps ON bps.source_key = bx.source_key
       LEFT JOIN git_tree_entries be
         ON be.source_key = bps.source_key AND be.name_bytes = ae.name_bytes
-       AND typeof(be.name_bytes) = 'blob'
        AND length(be.name_bytes) <= p.path_cap
      WHERE w.error IS NULL
        AND w.error_code = 'ECORRUPT'
@@ -758,10 +466,9 @@ const WALK_TREE_DIFF_SQL = `WITH RECURSIVE
              + COALESCE(bps.base_cost + bps.object_size
                           + bps.entry_count * (w.state_bytes + 51), 0)
            <= p.queue_cap
-     ORDER BY 4
+     ORDER BY 3
   )
-SELECT path, CASE WHEN raw_path IS NULL THEN NULL ELSE hex(raw_path) END AS raw_path,
-       state_bytes,
+SELECT path,
        CASE WHEN before_mode IN ('40000', '040000') THEN NULL ELSE before_mode END AS before_mode,
        CASE WHEN before_mode IN ('40000', '040000') THEN NULL ELSE before_oid END AS before_oid,
        CASE WHEN after_mode IN ('40000', '040000') THEN NULL ELSE after_mode END AS after_mode,
@@ -795,20 +502,10 @@ export function* iterateTree(
     TREE_WALK_QUEUE_BYTES,
     TREE_QUEUE_ROW_FIXED_BYTES,
   )) {
-    validateTraversalPath(row, "tree traversal");
     throwTraversalError(row, "tree traversal");
-    const path = row.path;
-    const mode = row.mode;
-    const oid = row.oid;
-    if (
-      typeof path !== "string" ||
-      typeof mode !== "string" ||
-      !isLeafMode(mode) ||
-      typeof oid !== "string" ||
-      !isOid(oid)
-    ) {
-      throw new CorruptError("tree traversal yielded an invalid row");
-    }
+    const path = expectText(row.path, "tree traversal path");
+    const mode = expectText(row.mode, "tree traversal mode");
+    const oid = expectText(row.oid, "tree traversal oid");
     yield { path, mode, oid };
   }
 }
@@ -821,7 +518,6 @@ export function* iterateTreeDiffObjects(
   afterTreeOid: string,
 ): Generator<WalkTreeDiffObject> {
   if (beforeTreeOid === afterTreeOid) return;
-  let pendingRoot: WalkTreeDiffObject | null = null;
   for (const row of db.iterate(
     WALK_TREE_DIFF_SQL,
     repoId,
@@ -833,39 +529,13 @@ export function* iterateTreeDiffObjects(
     TREE_QUEUE_ROW_FIXED_BYTES,
     1,
   )) {
-    validateTraversalPath(row, "tree diff object traversal");
     throwTraversalError(row, "tree diff object traversal");
-    validateDiffProjection(row, "tree diff object traversal");
-    const path = row.path;
-    const mode = row.object_mode;
-    const oid = row.object_oid;
-    if (mode === null && oid === null) continue;
-    if (
-      typeof path !== "string" ||
-      typeof mode !== "string" ||
-      (!isTreeMode(mode) && !isLeafMode(mode)) ||
-      typeof oid !== "string" ||
-      !isOid(oid)
-    ) {
-      throw new CorruptError("tree diff object traversal yielded an invalid row");
-    }
+    if (row.object_mode === null && row.object_oid === null) continue;
+    const mode = expectText(row.object_mode, "tree diff object mode");
+    const oid = expectText(row.object_oid, "tree diff object oid");
     if (mode === "160000") continue;
-    const object: WalkTreeDiffObject = { oid, type: isTreeMode(mode) ? "tree" : "blob" };
-    if (path === "") {
-      if (pendingRoot !== null) {
-        throw new CorruptError("tree diff object traversal yielded duplicate roots");
-      }
-      pendingRoot = object;
-      continue;
-    }
-    // Validate the first edge before exposing its containing root object.
-    if (pendingRoot !== null) {
-      yield pendingRoot;
-      pendingRoot = null;
-    }
-    yield object;
+    yield { oid, type: isTreeMode(mode) ? "tree" : "blob" };
   }
-  if (pendingRoot !== null) yield pendingRoot;
 }
 
 /** Stream changed leaves between two trees while pruning equal subtrees. */
@@ -887,25 +557,20 @@ export function* iterateTreeDiff(
     TREE_QUEUE_ROW_FIXED_BYTES,
     0,
   )) {
-    validateTraversalPath(row, "tree diff traversal");
     throwTraversalError(row, "tree diff traversal");
-    validateDiffProjection(row, "tree diff traversal");
-    const path = row.path;
-    const beforeMode = row.before_mode;
-    const beforeOid = row.before_oid;
-    const afterMode = row.after_mode;
-    const afterOid = row.after_oid;
-    if (
-      typeof path !== "string" ||
-      (beforeMode !== null && (typeof beforeMode !== "string" || !isLeafMode(beforeMode))) ||
-      (beforeOid !== null && (typeof beforeOid !== "string" || !isOid(beforeOid))) ||
-      (afterMode !== null && (typeof afterMode !== "string" || !isLeafMode(afterMode))) ||
-      (afterOid !== null && (typeof afterOid !== "string" || !isOid(afterOid))) ||
-      (beforeMode === null) !== (beforeOid === null) ||
-      (afterMode === null) !== (afterOid === null)
-    ) {
-      throw new CorruptError("tree diff yielded an invalid row");
-    }
+    const path = expectText(row.path, "tree diff path");
+    const beforeMode = expectNullable(row.before_mode, (value) =>
+      expectText(value, "tree diff before mode"),
+    );
+    const beforeOid = expectNullable(row.before_oid, (value) =>
+      expectText(value, "tree diff before oid"),
+    );
+    const afterMode = expectNullable(row.after_mode, (value) =>
+      expectText(value, "tree diff after mode"),
+    );
+    const afterOid = expectNullable(row.after_oid, (value) =>
+      expectText(value, "tree diff after oid"),
+    );
     yield { path, beforeMode, beforeOid, afterMode, afterOid };
   }
 }

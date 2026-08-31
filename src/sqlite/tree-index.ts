@@ -1,6 +1,7 @@
-import { isOid, utf8 } from "../core/bytes.js";
+import { isOid } from "../core/bytes.js";
 import { CorruptError, hasErrorCode } from "../core/errors.js";
 import { type ParsedTreeEntry, type TreeParseResult, TreeParser } from "../core/objects.js";
+import { expectSafeInteger } from "../core/rows.js";
 import { blob, type SqlDatabase } from "./db.js";
 
 /** SQLite queue record, four integer fields, and bounded error fields. */
@@ -25,53 +26,20 @@ const TREE_INDEX_ENTRY_ARENA_BYTES = 704 * 1024;
 const TREE_INDEX_MARKER_JSON_BYTES = 192 * 1024;
 const TREE_MODE = /^(?:0?40000|100644|100755|120000|160000)$/;
 
-function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
-  if (left.length !== right.length) return false;
-  for (let at = 0; at < left.length; at++) {
-    if (left[at] !== right[at]) return false;
-  }
-  return true;
-}
-
 function validateParsedTreeEntry(parsed: ParsedTreeEntry): void {
-  const { entry, nameBytes, rawEntry } = parsed;
+  const { entry, nameBytes } = parsed;
   if (!TREE_MODE.test(entry.mode)) throw new CorruptError(`invalid tree mode ${entry.mode}`);
   if (entry.name === "" || entry.name.includes("/") || nameBytes.includes(0)) {
     throw new CorruptError("invalid tree entry name");
   }
   if (!isOid(entry.oid)) throw new CorruptError("invalid tree entry oid");
-  const modeBytes = utf8.encode(entry.mode);
-  const expectedLength = modeBytes.length + nameBytes.length + 22;
-  const modeEnd = modeBytes.length;
-  const nameAt = modeEnd + 1;
-  const oidAt = nameAt + nameBytes.length + 1;
-  if (
-    rawEntry.length !== expectedLength ||
-    !equalBytes(rawEntry.subarray(0, modeEnd), modeBytes) ||
-    rawEntry[modeEnd] !== 0x20 ||
-    !equalBytes(rawEntry.subarray(nameAt, oidAt - 1), nameBytes) ||
-    rawEntry[oidAt - 1] !== 0
-  ) {
-    throw new CorruptError("tree entry raw bytes disagree with parsed fields");
-  }
-  for (let at = 0; at < 20; at++) {
-    if (rawEntry[oidAt + at] !== Number.parseInt(entry.oid.slice(at * 2, at * 2 + 2), 16)) {
-      throw new CorruptError("tree entry raw bytes disagree with parsed fields");
-    }
-  }
 }
 
 function validateTreeSource(source: TreeSource): void {
-  if (
-    !Number.isSafeInteger(source.repoId) ||
-    source.repoId < 0 ||
-    !isOid(source.treeOid) ||
-    (source.storage !== "loose" && source.storage !== "pack") ||
-    !Number.isSafeInteger(source.sourceId) ||
-    source.sourceId < 0 ||
-    !Number.isSafeInteger(source.objectSize) ||
-    source.objectSize < 0
-  ) {
+  expectSafeInteger(source.repoId, 0, Number.MAX_SAFE_INTEGER, "tree source repository id");
+  expectSafeInteger(source.sourceId, 0, Number.MAX_SAFE_INTEGER, "tree source id");
+  expectSafeInteger(source.objectSize, 0, Number.MAX_SAFE_INTEGER, "tree source object size");
+  if (!isOid(source.treeOid) || (source.storage !== "loose" && source.storage !== "pack")) {
     throw new CorruptError("tree source has invalid metadata");
   }
 }
@@ -329,15 +297,12 @@ class TreeIndexBatch {
               json_extract(j.value, '$.o'),
               substr(?, json_extract(j.value, '$.r'), json_extract(j.value, '$.z')),
               json_extract(j.value, '$.c')
-         FROM (SELECT ? AS ignored) guard
-         CROSS JOIN json_each(CAST(substr(?, ?, ?) AS TEXT)) j
+         FROM json_each(CAST(substr(?, ?, ?) AS TEXT)) j
          JOIN git_tree_sources s
            ON s.repo_id = json_extract(j.value, '$.p')
           AND s.tree_oid = json_extract(j.value, '$.t')
           AND s.storage = json_extract(j.value, '$.s')
-          AND s.source_id = json_extract(j.value, '$.x')
-        WHERE typeof(guard.ignored) = 'blob'`,
-      blob(entries.bytes),
+          AND s.source_id = json_extract(j.value, '$.x')`,
       blob(entries.bytes),
       blob(entries.bytes),
       blob(entries.bytes),
@@ -354,7 +319,7 @@ class TreeIndexBatch {
     const jsonLength = markers.seal();
     if (this.requireSeededSources) {
       let returnedRows = 0;
-      for (const row of this.db.iterate(
+      for (const _row of this.db.iterate(
         `INSERT INTO git_tree_sources
                (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
              SELECT existing.repo_id, existing.tree_oid, existing.storage, existing.source_id,
@@ -375,12 +340,7 @@ class TreeIndexBatch {
         jsonLength,
       )) {
         returnedRows++;
-        if (
-          returnedRows > markerRows ||
-          typeof row.source_key !== "number" ||
-          !Number.isSafeInteger(row.source_key) ||
-          row.source_key < 1
-        ) {
+        if (returnedRows > markerRows) {
           throw new CorruptError("tree index source was not seeded");
         }
       }
@@ -436,9 +396,6 @@ function seedTreeSources(db: SqlDatabase, sources: readonly TreeSourceInput[]): 
     z: source.objectSize,
   }));
   const json = JSON.stringify(rows);
-  if (utf8.encode(json).length > TREE_INDEX_ENTRY_ARENA_BYTES) {
-    throw new CorruptError("tree source preflight exceeds the index buffer limit");
-  }
   db.run(
     `INSERT OR IGNORE INTO git_tree_sources
          (repo_id, tree_oid, storage, source_id, complete, object_size, entry_count, base_cost)
@@ -478,12 +435,6 @@ class TreeSourceIndexer {
   push(parsed: ParsedTreeEntry): void {
     if (this.#finished) throw new Error("tree index source is already finished");
     validateParsedTreeEntry(parsed);
-    if (
-      parsed.ordinal !== this.#count ||
-      parsed.observedSize !== this.#observedSize + parsed.rawEntry.length
-    ) {
-      throw new CorruptError("tree parser progress is inconsistent");
-    }
     this.#observedSize = parsed.observedSize;
     this.#baseCost +=
       TREE_QUEUE_ROW_FIXED_BYTES +
@@ -503,8 +454,6 @@ class TreeSourceIndexer {
     if (this.#finished) throw new Error("tree index source is already finished");
     this.#finished = true;
     if (
-      parsed.entryCount !== this.#count ||
-      parsed.observedSize !== this.#observedSize ||
       this.#receivedBytes !== parsed.observedSize ||
       this.#observedSize !== this.source.objectSize
     ) {
