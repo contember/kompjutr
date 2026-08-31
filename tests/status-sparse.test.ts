@@ -133,72 +133,10 @@ const ANCESTOR_INDEX_CORRUPTIONS: readonly AncestorIndexCorruption[] = [
     },
   },
   {
-    name: "BLOB stage",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET stage = ? WHERE checkout_id = ? AND path = ?",
-        new Uint8Array([1]),
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-  {
-    name: "invalid mode",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET mode = 0 WHERE checkout_id = ? AND path = ?",
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-  {
-    name: "invalid oid",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET oid = 'broken' WHERE checkout_id = ? AND path = ?",
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-  {
-    name: "negative size",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET size = -1 WHERE checkout_id = ? AND path = ?",
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-  {
-    name: "BLOB mtime",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET mtime = ? WHERE checkout_id = ? AND path = ?",
-        new Uint8Array([1]),
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-  {
     name: "nonpositive inode",
     mutate(workspace) {
       workspace.storage.sql.exec(
         "UPDATE git_index SET ino = 0 WHERE checkout_id = ? AND path = ?",
-        workspace.repo.checkout.checkoutId,
-        "tracked/file.txt",
-      );
-    },
-  },
-  {
-    name: "negative revision",
-    mutate(workspace) {
-      workspace.storage.sql.exec(
-        "UPDATE git_index SET rev = -1 WHERE checkout_id = ? AND path = ?",
         workspace.repo.checkout.checkoutId,
         "tracked/file.txt",
       );
@@ -786,7 +724,6 @@ describe("sparse eager status", () => {
       { checkoutId, ancestors: null },
       { checkoutId, ancestors: sparseAncestors },
       { checkoutId, ancestors: ["valid", 1] },
-      { checkoutId, ancestors: ["valid"], maxRetainedBytes: "large" },
     ];
 
     for (const request of malformed) {

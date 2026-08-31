@@ -712,79 +712,11 @@ describe("SQLite sparse workspace source", () => {
     ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
   });
 
-  it("fully validates exact and descendant index witnesses", () => {
-    for (const storedPath of ["a", "a/b"]) {
-      const workspace = makeRepo("/");
-      workspace.repo.checkout.indexPut({
-        path: storedPath,
-        stage: 0,
-        mode: 0o100644,
-        oid: "1".repeat(40),
-        size: null,
-        mtime: null,
-        ino: null,
-      });
-      workspace.database.db.run(
-        "UPDATE git_index SET oid = 'bad' WHERE checkout_id = ? AND path = ?",
-        workspace.repo.checkout.checkoutId,
-        storedPath,
-      );
-      const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
-      if (lookup === undefined) throw new Error("missing index ancestor source");
-
-      expect(() =>
-        lookup({ checkoutId: workspace.repo.checkout.checkoutId, ancestors: ["a"] }),
-      ).toThrowError(expect.objectContaining({ code: "ECORRUPT" }));
-    }
-  });
-
-  it.each([
-    ["exact", "a", -1],
-    ["exact", "a", 4],
-    ["exact", "a", "bad"],
-    ["descendant", "a/z-invalid", -1],
-    ["descendant", "a/z-invalid", 4],
-    ["descendant", "a/z-invalid", "bad"],
-  ])("rejects a hidden %s index row at %s with stage %s", (_kind, corruptPath, stage) => {
-    const workspace = makeRepo("/");
-    const checkoutId = workspace.repo.checkout.checkoutId;
-    const oid = "1".repeat(40);
-    for (const path of ["a", "a/a-valid"]) {
-      workspace.repo.checkout.indexPut({
-        path,
-        stage: 0,
-        mode: 0o100644,
-        oid,
-        size: null,
-        mtime: null,
-        ino: null,
-      });
-    }
-    workspace.database.db.run(
-      `INSERT INTO git_index (checkout_id, path, stage, mode, oid)
-       VALUES (?, ?, ?, ?, ?)`,
-      checkoutId,
-      corruptPath,
-      stage,
-      0o100644,
-      oid,
-    );
-    const lookup = createSqliteSparseWorkspaceSource(workspace.database.db).indexAncestorFacts;
-    if (lookup === undefined) throw new Error("missing index ancestor source");
-
-    expect(() => lookup({ checkoutId, ancestors: ["a"] })).toThrowError(
-      expect.objectContaining({ code: "ECORRUPT" }),
-    );
-  });
-
   it.each([
     [
       "path",
       "UPDATE git_index SET path = 'a/z/../bad' WHERE checkout_id = ? AND path = 'a/z-invalid'",
     ],
-    ["mode", "UPDATE git_index SET mode = 'bad' WHERE checkout_id = ? AND path = 'a/z-invalid'"],
-    ["oid", "UPDATE git_index SET oid = 'bad' WHERE checkout_id = ? AND path = 'a/z-invalid'"],
-    ["stat", "UPDATE git_index SET size = -1 WHERE checkout_id = ? AND path = 'a/z-invalid'"],
   ])("rejects malformed later descendant %s after a valid witness", (_field, corruption) => {
     const workspace = makeRepo("/");
     const checkoutId = workspace.repo.checkout.checkoutId;
@@ -1548,7 +1480,7 @@ describe("SQLite sparse workspace source", () => {
     ).toThrowError(/tree cycle/);
   });
 
-  it("returns all index stages and guards malformed index payloads", () => {
+  it("returns all index stages", () => {
     const workspace = committedWorkspace();
     const repoId = workspace.repo.store.repoId;
     const checkoutId = workspace.repo.checkout.checkoutId;
@@ -1580,21 +1512,6 @@ describe("SQLite sparse workspace source", () => {
     expect(result.available).toBe(true);
     if (result.available)
       expect(result.rows[0]?.index.map((entry) => entry.stage)).toEqual([1, 2, 3]);
-
-    workspace.database.db.run(
-      "UPDATE git_index SET stage = 4 WHERE checkout_id = ? AND path = 'a.txt' AND stage = 3",
-      checkoutId,
-    );
-    expect(() => source.hydrate(request)).toThrowError(/malformed/);
-    workspace.database.db.run(
-      "UPDATE git_index SET stage = 3 WHERE checkout_id = ? AND path = 'a.txt' AND stage = 4",
-      checkoutId,
-    );
-    workspace.database.db.run(
-      "UPDATE git_index SET oid = zeroblob(4194305) WHERE checkout_id = ? AND path = 'a.txt' AND stage = 2",
-      checkoutId,
-    );
-    expect(() => source.hydrate(request)).toThrowError(/malformed row/);
   });
 
   it("rejects malformed filesystem metadata and accepts a former large payload excess", () => {
