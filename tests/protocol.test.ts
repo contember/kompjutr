@@ -694,7 +694,8 @@ describe("upload-pack", () => {
       {
         url: "http://host/repo",
         wants: [OID],
-        advertised: new Set(["side-band-64k", "ofs-delta"]),
+        depth: 1,
+        advertised: new Set(["side-band-64k", "ofs-delta", "shallow"]),
         onProgress: (message) => progress.push(message),
       },
       {
@@ -810,6 +811,7 @@ describe("upload-pack", () => {
       {
         url: "http://host/repo",
         wants: [OID],
+        shallows: [other],
         depth: 1,
         advertised: new Set(["side-band-64k", "shallow"]),
       },
@@ -836,7 +838,8 @@ describe("upload-pack", () => {
     const request = {
       url: "http://host/repo",
       wants: [OID],
-      advertised: new Set(["side-band-64k"]),
+      depth: 1,
+      advertised: new Set(["side-band-64k", "shallow"]),
     };
 
     await expect(
@@ -929,6 +932,94 @@ describe("upload-pack", () => {
       ]),
     );
     expect(await collect(result.pack)).toEqual(PACK);
+  });
+
+  it("frames relative deepening and requires both shallow capabilities before POST", async () => {
+    const boundary = "6".repeat(40);
+    let sent: Uint8Array = new Uint8Array(0);
+    let calls = 0;
+    const responseBody = concat([pkt("NAK\n"), pkt(concat([new Uint8Array([1]), PACK])), FLUSH]);
+    const http: GitHttpClient = (request) => {
+      calls++;
+      sent = bufferedBody(request.body);
+      return Promise.resolve(respond(responseBody, "application/x-git-upload-pack-result"));
+    };
+    const request = {
+      url: "http://host/repo",
+      wants: [OID],
+      shallows: [boundary],
+      depth: 3,
+      deepenRelative: true,
+    };
+
+    await expect(
+      uploadPack({ ...request, advertised: new Set(["deepen-relative"]) }, { http }),
+    ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+    await expect(
+      uploadPack({ ...request, advertised: new Set(["shallow"]) }, { http }),
+    ).rejects.toMatchObject({ code: "EUNSUPPORTED" });
+    expect(calls).toBe(0);
+
+    const result = await uploadPack(
+      {
+        ...request,
+        advertised: new Set(["side-band-64k", "shallow", "deepen-relative"]),
+      },
+      { http },
+    );
+    expect(new TextDecoder().decode(sent)).toContain(
+      `want ${OID} side-band-64k shallow deepen-relative agent=${AGENT}\n`,
+    );
+    expect(new TextDecoder().decode(sent)).toContain(`shallow ${boundary}\n`);
+    expect(new TextDecoder().decode(sent)).toContain("deepen 3\n");
+    expect(await collect(result.pack)).toEqual(PACK);
+  });
+
+  it.each([
+    ["malformed shallow", `shallow not-an-oid\n`],
+    ["malformed unshallow", `unshallow not-an-oid\n`],
+    ["uncaptured unshallow", `unshallow ${"3".repeat(40)}\n`],
+  ])("rejects %s boundaries", async (_label, boundaryLine) => {
+    const body = concat([
+      pkt(boundaryLine),
+      pkt("NAK\n"),
+      pkt(concat([new Uint8Array([1]), PACK])),
+      FLUSH,
+    ]);
+    await expect(
+      uploadPack(
+        {
+          url: "http://host/repo",
+          wants: [OID],
+          shallows: [OID],
+          depth: 1,
+          advertised: new Set(["side-band-64k", "shallow"]),
+        },
+        { http: canned(() => respond(body, "application/x-git-upload-pack-result")) },
+      ),
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
+  });
+
+  it("rejects contradictory shallow declarations for one object", async () => {
+    const body = concat([
+      pkt(`shallow ${OID}\n`),
+      pkt(`unshallow ${OID}\n`),
+      pkt("NAK\n"),
+      pkt(concat([new Uint8Array([1]), PACK])),
+      FLUSH,
+    ]);
+    await expect(
+      uploadPack(
+        {
+          url: "http://host/repo",
+          wants: [OID],
+          shallows: [OID],
+          depth: 1,
+          advertised: new Set(["side-band-64k", "shallow"]),
+        },
+        { http: canned(() => respond(body, "application/x-git-upload-pack-result")) },
+      ),
+    ).rejects.toMatchObject({ code: "ECORRUPT" });
   });
 
   it("rejects unavailable and unsupported filters before POST", async () => {

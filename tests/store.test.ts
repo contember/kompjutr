@@ -1999,6 +1999,30 @@ describe("refs, config and index", () => {
     }
   });
 
+  it("rejects shallow deletions outside the captured set and contradictory deltas", () => {
+    const { store } = open();
+    const captured = "1".repeat(40);
+    const other = "2".repeat(40);
+    store.setShallow([captured]);
+
+    for (const plan of [
+      { shallowRemove: [other] },
+      { shallowAdd: [captured], shallowRemove: [captured] },
+      { shallowAdd: [other, other] },
+      { shallowRemove: [captured, captured] },
+    ]) {
+      const token = store.beginFetchPublication("refs/remotes/origin/");
+      try {
+        expect(() => store.publishFetchRefs(token, plan, fetchMetadata)).toThrowError(
+          expect.objectContaining({ code: "EINVAL" }),
+        );
+        expect(store.shallow()).toEqual(new Set([captured]));
+      } finally {
+        token.dispose();
+      }
+    }
+  });
+
   it("rejects disposed, consumed, and cross-repository publication tokens", () => {
     const { database, store } = open();
     const secondRepository = database.createRepository("/other", "ref: refs/heads/main");

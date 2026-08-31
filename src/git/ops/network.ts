@@ -61,6 +61,7 @@ const HAVE_BUDGET = 256;
 const TAG_OBJECT_PAGE = 4_096;
 const TAG_PEEL_HOPS = 16;
 const PROMISOR_LOOKUP_PAGE = 4_096;
+const PROTOCOL_UNSHALLOW_DEPTH = 0x7fffffff;
 const tagHeaderDecoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface RemoteAuthOptions {
@@ -115,6 +116,8 @@ export interface CloneOptions extends RemoteAuthOptions, AbortableNetworkOptions
 interface MappedFetchSelection {
   readonly refspecs: readonly [FetchRefspec, ...FetchRefspec[]];
   readonly depth?: never;
+  readonly deepen?: never;
+  readonly unshallow?: never;
   readonly ref?: never;
   readonly remoteRef?: never;
   readonly singleBranch?: never;
@@ -122,31 +125,39 @@ interface MappedFetchSelection {
   readonly tags?: never;
 }
 
-interface LegacyFetchSelection {
+interface LegacyFetchBaseSelection {
   readonly refspecs?: never;
   readonly ref?: string;
   readonly remoteRef?: string;
-  readonly depth?: number;
   readonly singleBranch?: boolean;
   readonly prune?: boolean;
   readonly tags?: boolean;
 }
 
-export type FetchOptions = RemoteAuthOptions & AbortableNetworkOptions & {
-  readonly dir?: string;
-  readonly filter?: UploadPackFilter;
-} & RemoteTarget &
+type LegacyFetchSelection = LegacyFetchBaseSelection &
+  (
+    | { readonly depth?: number; readonly deepen?: never; readonly unshallow?: never }
+    | { readonly depth?: never; readonly deepen: number; readonly unshallow?: never }
+    | { readonly depth?: never; readonly deepen?: never; readonly unshallow: boolean }
+  );
+
+export type FetchOptions = RemoteAuthOptions &
+  AbortableNetworkOptions & {
+    readonly dir?: string;
+    readonly filter?: UploadPackFilter;
+  } & RemoteTarget &
   (MappedFetchSelection | LegacyFetchSelection);
 
 export type FetchResult = StructuredFetchResult;
 
 /** Internal clone/concurrency callers may pin both the configured name and its observed URL. */
-type FetchOperationOptions = RemoteAuthOptions & AbortableNetworkOptions & {
-  readonly dir?: string;
-  readonly remote?: string;
-  readonly url?: string;
-  readonly filter?: UploadPackFilter;
-} & (MappedFetchSelection | LegacyFetchSelection);
+type FetchOperationOptions = RemoteAuthOptions &
+  AbortableNetworkOptions & {
+    readonly dir?: string;
+    readonly remote?: string;
+    readonly url?: string;
+    readonly filter?: UploadPackFilter;
+  } & (MappedFetchSelection | LegacyFetchSelection);
 
 function isMappedFetchOptions(
   options: FetchOperationOptions,
@@ -160,9 +171,7 @@ export function validateFetchOptions(options: unknown): void {
   }
   validateRemoteAuthOptions(options);
   validateAbortableNetworkOptions(options);
-  if (!("remote" in options) && !("url" in options) && !("refspecs" in options)) {
-    return;
-  }
+  validateLegacyDeepeningOptions(options);
   const remote = Reflect.get(options, "remote");
   const url = Reflect.get(options, "url");
   if (remote !== undefined && url !== undefined) {
@@ -181,11 +190,36 @@ export function validateFetchOptions(options: unknown): void {
   }
   if (refspecs !== undefined) {
     if (!Array.isArray(refspecs)) throw new GitError("EINVAL", "fetch refspecs must be an array");
-    for (const field of ["depth", "ref", "remoteRef", "singleBranch", "prune", "tags"]) {
+    for (const field of [
+      "depth",
+      "deepen",
+      "unshallow",
+      "ref",
+      "remoteRef",
+      "singleBranch",
+      "prune",
+      "tags",
+    ]) {
       if (Reflect.get(options, field) !== undefined) {
         throw new GitError("EINVAL", `mapped fetch cannot set ${field}`);
       }
     }
+  }
+}
+
+function validateLegacyDeepeningOptions(options: object): void {
+  const depth = Reflect.get(options, "depth");
+  const deepen = Reflect.get(options, "deepen");
+  const unshallow = Reflect.get(options, "unshallow");
+  const selected = [depth, deepen, unshallow].filter((value) => value !== undefined).length;
+  if (selected > 1) {
+    throw new GitError("EINVAL", "fetch depth, deepen, and unshallow are mutually exclusive");
+  }
+  if (deepen !== undefined && (!Number.isSafeInteger(deepen) || deepen <= 0)) {
+    throw new GitError("EINVAL", "fetch deepen must be a positive safe integer");
+  }
+  if (unshallow !== undefined && typeof unshallow !== "boolean") {
+    throw new GitError("EINVAL", "fetch unshallow must be a boolean");
   }
 }
 
@@ -570,6 +604,7 @@ async function transferPack(
     wants: string[];
     shallows: string[];
     depth?: number;
+    deepenRelative?: boolean;
     includeTag?: boolean;
     filter?: UploadPackFilter;
     thinPack?: boolean;
@@ -602,6 +637,7 @@ async function transferPack(
         shallows: request.shallows,
         advertised: request.advertised,
         ...(request.depth === undefined ? {} : { depth: request.depth }),
+        ...(request.deepenRelative === undefined ? {} : { deepenRelative: request.deepenRelative }),
         ...(request.includeTag === undefined ? {} : { includeTag: request.includeTag }),
         ...(request.filter === undefined ? {} : { filter: request.filter }),
         ...(request.thinPack === undefined ? {} : { thinPack: request.thinPack }),
@@ -650,28 +686,48 @@ async function* fetchPackStream(
   }
 }
 
-function accumulateShallow(
-  target: { add: Set<string>; remove: Set<string> },
+function applyShallowResponse(
+  boundary: Set<string>,
   source: { shallow: readonly string[]; unshallow: readonly string[] },
 ): void {
-  for (const oid of source.unshallow) {
-    target.add.delete(oid);
-    target.remove.add(oid);
-  }
-  for (const oid of source.shallow) {
-    target.remove.delete(oid);
-    target.add.add(oid);
-  }
+  for (const oid of source.unshallow) boundary.delete(oid);
+  for (const oid of source.shallow) boundary.add(oid);
 }
 
-function effectiveShallows(
+function shallowMutation(
   baseline: readonly string[],
-  mutation: { add: ReadonlySet<string>; remove: ReadonlySet<string> },
-): string[] {
-  const effective = new Set(baseline);
-  for (const oid of mutation.remove) effective.delete(oid);
-  for (const oid of mutation.add) effective.add(oid);
-  return [...effective];
+  proposed: ReadonlySet<string>,
+): { add: string[]; remove: string[] } {
+  const captured = new Set(baseline);
+  return {
+    add: [...proposed].filter((oid) => !captured.has(oid)),
+    remove: baseline.filter((oid) => !proposed.has(oid)),
+  };
+}
+
+function authenticateShallowTransition(
+  repo: Repository,
+  captured: readonly string[],
+  proposed: ReadonlySet<string>,
+  fetchedRoots: Iterable<string>,
+): void {
+  const capturedSet = new Set(captured);
+  const removed = captured.filter((oid) => !proposed.has(oid));
+  const roots = new Set([...fetchedRoots, ...removed]);
+  let reachable: Set<string>;
+  try {
+    reachable = repo.authenticateCommitGraphThroughBoundary(roots, proposed);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOTFOUND")) {
+      throw new CorruptError("shallow transition references a missing commit", { cause: error });
+    }
+    throw error;
+  }
+  for (const oid of proposed) {
+    if (!capturedSet.has(oid) && !reachable.has(oid)) {
+      throw new CorruptError(`shallow boundary ${oid} is not reachable from the fetched graph`);
+    }
+  }
 }
 
 function validateFetchHeaders(headers: unknown, code: "EAUTH" | "EINVAL"): void {
@@ -1137,8 +1193,12 @@ export async function fetchInto(
   else {
     validateRemoteAuthOptions(options);
     validateAbortableNetworkOptions(options);
+    validateLegacyDeepeningOptions(options);
   }
   throwIfAborted(options.signal);
+  if (!isMappedFetchOptions(options) && options.unshallow === true && repo.shallow().size === 0) {
+    throw new GitError("EINVAL", "cannot unshallow a complete repository");
+  }
   const compiler = isMappedFetchOptions(options)
     ? compileFetchRefspecs(options.refspecs)
     : undefined;
@@ -1326,14 +1386,18 @@ async function prepareLegacyFetchPublication(
       advertisedHeads.every((ref) => publishedShallow.has(ref.oid));
     // An unproven depth request must renegotiate shallow boundaries even when a prior
     // failed publication already left the advertised tip object complete.
+    const forceBoundaryNegotiation = options.deepen !== undefined || options.unshallow === true;
     const wants =
-      options.depth !== undefined && options.depth > 0 && !depthOneAlreadyPublished
+      forceBoundaryNegotiation ||
+      (options.depth !== undefined && options.depth > 0 && !depthOneAlreadyPublished)
         ? [...new Set(wantedOids)]
         : repo.store.missing(wantedOids);
     const shallows = [...publication.shallow];
-    const shallow = { add: new Set<string>(), remove: new Set<string>() };
-    accumulateShallow(
-      shallow,
+    const proposedShallow = new Set(publication.shallow);
+    const transferDepth =
+      options.deepen ?? (options.unshallow === true ? PROTOCOL_UNSHALLOW_DEPTH : options.depth);
+    applyShallowResponse(
+      proposedShallow,
       await transferPack(
         context,
         repo,
@@ -1342,7 +1406,8 @@ async function prepareLegacyFetchPublication(
           wants,
           shallows,
           advertised: advertisement.capabilities,
-          ...(options.depth === undefined ? {} : { depth: options.depth }),
+          ...(transferDepth === undefined ? {} : { depth: transferDepth }),
+          ...(options.deepen === undefined ? {} : { deepenRelative: true }),
           ...(autoTags ? { includeTag: true } : {}),
           ...(options.filter === undefined ? {} : { filter: options.filter }),
           ...(options.filter === undefined ? {} : { promisorRemote: remote }),
@@ -1359,15 +1424,15 @@ async function prepareLegacyFetchPublication(
       const eligible = eligibleAutoTags(repo, tags, publication);
       const fallbackWants = repo.store.missing(eligible.map((tag) => tag.ref.oid));
       const wanted = new Set(fallbackWants);
-      accumulateShallow(
-        shallow,
+      applyShallowResponse(
+        proposedShallow,
         await transferPack(
           context,
           repo,
           {
             url,
             wants: fallbackWants,
-            shallows: effectiveShallows(shallows, shallow),
+            shallows: [...proposedShallow],
             advertised: advertisement.capabilities,
             haves: eligible.filter((tag) => wanted.has(tag.ref.oid)).map((tag) => tag.peeledOid),
             ...(options.filter === undefined ? {} : { filter: options.filter }),
@@ -1384,6 +1449,26 @@ async function prepareLegacyFetchPublication(
       autoTags && tags.length > 0 ? eligibleAutoTags(repo, tags, publication) : [];
     const selectedTags = allTags ? tags : autoTags ? finalAutoTags : requiredTags;
     authenticateTags(repo, selectedTags);
+    const boundaryRequested =
+      (options.depth !== undefined && options.depth > 0) || forceBoundaryNegotiation;
+    const boundaryChanged =
+      proposedShallow.size !== publication.shallow.length ||
+      publication.shallow.some((oid) => !proposedShallow.has(oid));
+    if (boundaryRequested || boundaryChanged) {
+      const candidates = [
+        ...selection.coverage.map((ref) => ref.oid),
+        ...selectedTags.map((tag) => tag.peeledOid),
+      ];
+      const types = objectTypes(repo, candidates);
+      for (const ref of selection.coverage) {
+        if (ref.name.startsWith("refs/heads/") && types.get(ref.oid) !== "commit") {
+          throw new CorruptError(`fetched branch ${ref.name} does not point to a commit`);
+        }
+      }
+      const commitRoots = candidates.filter((oid) => types.get(oid) === "commit");
+      authenticateShallowTransition(repo, publication.shallow, proposedShallow, commitRoots);
+    }
+    const shallow = shallowMutation(publication.shallow, proposedShallow);
     const publishedRefs = selection.coverage.filter((ref) => !ref.name.startsWith("refs/tags/"));
 
     const trackingPuts = publishedRefs
@@ -1432,8 +1517,8 @@ async function prepareLegacyFetchPublication(
         name: tag.ref.name,
         target: tag.ref.oid,
       })),
-      shallowAdd: [...shallow.add],
-      shallowRemove: [...shallow.remove],
+      shallowAdd: shallow.add,
+      shallowRemove: shallow.remove,
     };
     return { publication, plan, result };
   } catch (error) {

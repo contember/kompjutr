@@ -1497,9 +1497,9 @@ describe("clone", () => {
   it("validates and honors a pre-aborted clone signal before reservation", async () => {
     const workspace = makeWorkspace();
     const invalid = { url: "http://host/repo", dir: "/invalid", signal: {} };
-    await expect(Reflect.apply(clone, undefined, [workspace.context, invalid])).rejects.toMatchObject(
-      { code: "EINVAL" },
-    );
+    await expect(
+      Reflect.apply(clone, undefined, [workspace.context, invalid]),
+    ).rejects.toMatchObject({ code: "EINVAL" });
 
     const controller = new AbortController();
     const reason = new Error("clone no longer wanted");
@@ -1816,6 +1816,128 @@ describe("fetch", () => {
         tableRows<{ pack_id: number }>(workspace, "SELECT pack_id FROM git_pack_meta").length,
       ).toBe(2);
       expect(repo.store.reflog("refs/remotes/origin/main")).toHaveLength(historyAfterUpdate);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("matches real Git across repeated relative deepening and full unshallow", async () => {
+    const fixture = new GitFixture().init();
+    const commits: string[] = [];
+    for (let index = 0; index < 7; index++) {
+      fixture.write(`commit-${index}.txt`, `${index}\n`);
+      commits.push(fixture.commit(`commit ${index}`));
+    }
+    const server = await startGitServer(fixture.dir);
+    const reference = new GitFixture();
+    const workspace = makeWorkspace();
+    try {
+      await nativeGit(reference.dir, "clone", "--quiet", "--depth", "1", server.url, ".");
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 1 });
+      const repo = openRepository(workspace.context, "/work");
+
+      for (const deepen of [2, 2]) {
+        await nativeGit(reference.dir, "fetch", "--quiet", "--deepen", String(deepen), "origin");
+        await fetchInto(workspace.context, repo, {
+          deepen,
+          singleBranch: true,
+          tags: false,
+        });
+        expect(log(repo, { ref: "HEAD" }).map((entry) => entry.oid)).toEqual(
+          outputLines(await nativeGit(reference.dir, "rev-list", "HEAD")),
+        );
+      }
+      expect(repo.shallow()).toEqual(new Set([commits[2]!]));
+
+      await nativeGit(reference.dir, "fetch", "--quiet", "--unshallow", "origin");
+      await fetchInto(workspace.context, repo, {
+        unshallow: true,
+        singleBranch: true,
+        tags: false,
+      });
+      expect(repo.shallow()).toEqual(new Set());
+      expect(log(repo, { ref: "HEAD" }).map((entry) => entry.oid)).toEqual(
+        outputLines(await nativeGit(reference.dir, "rev-list", "HEAD")),
+      );
+
+      await nativeGit(reference.dir, "fetch", "--quiet", "--deepen", "1", "origin");
+      const posts = server.requests.filter((request) => request.method === "POST").length;
+      await fetchInto(workspace.context, repo, { deepen: 1, singleBranch: true, tags: false });
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(
+        posts + 1,
+      );
+      expect(log(repo, { ref: "HEAD" }).map((entry) => entry.oid)).toEqual(
+        outputLines(await nativeGit(reference.dir, "rev-list", "HEAD")),
+      );
+    } finally {
+      await server.close();
+      reference.dispose();
+      fixture.dispose();
+    }
+  });
+
+  it("rejects invalid deepening options and complete unshallow before network", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("file.txt", "content\n");
+    fixture.commit("one");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    workspace.repo.store.configSet("remote.origin.url", server.url);
+    try {
+      const invalid = [
+        { deepen: 0 },
+        { deepen: Number.MAX_SAFE_INTEGER + 1 },
+        { unshallow: "yes" },
+        { depth: 1, deepen: 1 },
+        { deepen: 1, unshallow: true },
+      ];
+      for (const options of invalid) {
+        await expect(
+          Reflect.apply(fetchInto, undefined, [workspace.context, workspace.repo, options]),
+        ).rejects.toMatchObject({ code: "EINVAL" });
+      }
+      await expect(
+        fetchInto(workspace.context, workspace.repo, { unshallow: true }),
+      ).rejects.toMatchObject({ code: "EINVAL" });
+      expect(server.requests).toEqual([]);
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
+  it("does not move a boundary when the proposed graph cannot be authenticated", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("first.txt", "first\n");
+    fixture.commit("first");
+    fixture.write("second.txt", "second\n");
+    const second = fixture.commit("second");
+    fixture.write("third.txt", "third\n");
+    const head = fixture.commit("third");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const replacement = "f".repeat(40);
+    const http: GitHttpClient = async (request) => {
+      const response = await fetchHttpClient(request);
+      if (request.method !== "POST") return response;
+      return {
+        ...response,
+        body: replaceResponseText(response.body, `shallow ${second}`, `shallow ${replacement}`),
+      };
+    };
+    try {
+      await clone(workspace.context, { url: server.url, dir: "/work", depth: 1 });
+      const repo = openRepository(workspace.context, "/work");
+      await expect(
+        fetchInto({ ...workspace.context, http }, repo, {
+          deepen: 1,
+          singleBranch: true,
+          tags: false,
+        }),
+      ).rejects.toMatchObject({ code: "ECORRUPT" });
+      expect(repo.shallow()).toEqual(new Set([head]));
+      expect([...repo.walk(head)].map((entry) => entry.oid)).toEqual([head]);
     } finally {
       await server.close();
       fixture.dispose();

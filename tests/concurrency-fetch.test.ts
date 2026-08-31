@@ -555,6 +555,47 @@ describe("fetch publication concurrency", () => {
     }
   });
 
+  it("rejects relative deepening when its captured shallow revision becomes stale", async () => {
+    const fixture = new GitFixture().init();
+    fixture.write("first.txt", "first\n");
+    fixture.commit("first");
+    fixture.write("second.txt", "second\n");
+    const head = fixture.commit("second");
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeRepo("/work");
+    try {
+      await fetchInto(workspace.context, workspace.repo, {
+        remote: "origin",
+        url: server.url,
+        depth: 1,
+        singleBranch: true,
+        tags: false,
+      });
+      const paused = pauseAfterDiscovery("stale relative deepen");
+      const deepening = fetchInto(
+        workspace.context,
+        workspace.repo,
+        {
+          remote: "origin",
+          url: server.url,
+          deepen: 1,
+          singleBranch: true,
+          tags: false,
+        },
+        "fetch",
+        { checkpoint: paused.checkpoint },
+      );
+      await awaitBarrierEntry(paused.barrier, deepening);
+      workspace.repo.store.setShallow([head]);
+      paused.barrier.release();
+      await expect(deepening).rejects.toMatchObject({ code: "ESTALEFETCH" });
+      expect(workspace.repo.shallow()).toEqual(new Set([head]));
+    } finally {
+      await server.close();
+      fixture.dispose();
+    }
+  });
+
   it("commutes disjoint namespaces that publish the same tag target", async () => {
     await runPairInBothCompletionOrders(async (order) => {
       const { fixture, head } = commitFixture(`shared-tag-${order}`);

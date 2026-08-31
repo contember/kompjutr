@@ -347,6 +347,45 @@ export class Repository {
     return this.#readAuthenticatedCommitEntryOwned(oid).commit;
   }
 
+  /** Authenticate commit roots and every parent edge through an explicit boundary. */
+  authenticateCommitGraphThroughBoundary(
+    roots: Iterable<string>,
+    boundary: ReadonlySet<string>,
+  ): Set<string> {
+    const visited = new Set<string>();
+    const visiting = new Set<string>();
+    const commits = new Map<string, Commit>();
+    for (const root of roots) {
+      if (visited.has(root)) continue;
+      const stack: { oid: string; parent: number }[] = [{ oid: root, parent: 0 }];
+      visiting.add(root);
+      while (stack.length > 0) {
+        const frame = stack[stack.length - 1]!;
+        let commit = commits.get(frame.oid);
+        if (commit === undefined) {
+          if (commits.size >= MAX_LOG_COMMITS) {
+            throw new GitError("E2BIG", "commit graph exceeds the 50000 commit limit");
+          }
+          commit = this.readAuthenticatedCommitOwned(frame.oid);
+          commits.set(frame.oid, commit);
+        }
+        const parents = boundary.has(frame.oid) ? [] : commit.parent;
+        if (frame.parent >= parents.length) {
+          stack.pop();
+          visiting.delete(frame.oid);
+          visited.add(frame.oid);
+          continue;
+        }
+        const parent = parents[frame.parent++]!;
+        if (visiting.has(parent)) throw new CorruptError("commit graph contains a cycle");
+        if (visited.has(parent)) continue;
+        visiting.add(parent);
+        stack.push({ oid: parent, parent: 0 });
+      }
+    }
+    return visited;
+  }
+
   #readAuthenticatedCommitEntryOwned(oid: string): CommitCacheEntry {
     const metadata = this.store.typeAndSize(oid);
     if (metadata === null) throw new ObjectNotFoundError(oid);

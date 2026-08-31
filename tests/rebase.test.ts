@@ -3,7 +3,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import { hasErrorCode } from "../src/git/common/errors.js";
 import { checkoutTree } from "../src/git/ops/checkout.js";
+import { openRepository } from "../src/git/ops/context.js";
 import { integrationIndexMatchesTree } from "../src/git/ops/integration-worktree.js";
+import { clone, fetchInto } from "../src/git/ops/network.js";
 import {
   rebase,
   rebaseAbort,
@@ -16,8 +18,14 @@ import { add, rm } from "../src/git/ops/staging.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
+import { startGitServer } from "./helpers/http-backend.js";
 import { importFixture } from "./helpers/import.js";
-import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
+import {
+  makeRepo,
+  makeWorkspace,
+  type TestRepository,
+  writeWorkFile,
+} from "./helpers/workspace.js";
 
 const fixtures: GitFixture[] = [];
 
@@ -108,6 +116,52 @@ function divergent(
 }
 
 describe("rebase lifecycle", () => {
+  it("fails closed before deepening and rebases after the boundary moves", async () => {
+    const source = fixture();
+    source.write("base.txt", "base\n");
+    const base = source.commit("base");
+    source.git("checkout", "-q", "-b", "upstream", base);
+    source.write("upstream.txt", "upstream\n");
+    const upstream = source.commit("upstream");
+    source.git("checkout", "-q", "-b", "current", base);
+    source.write("current.txt", "current\n");
+    source.commit("current");
+    const server = await startGitServer(source.dir);
+    const workspace = makeWorkspace();
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        ref: "current",
+        depth: 1,
+      });
+      const repo = openRepository(workspace.context, "/work");
+      await fetchInto(workspace.context, repo, {
+        ref: "upstream",
+        depth: 1,
+        singleBranch: true,
+        tags: false,
+      });
+
+      expectCode(
+        () => rebase(workspace.context, repo, workspace.worktree, { upstream }),
+        "ESHALLOW",
+      );
+      await fetchInto(workspace.context, repo, {
+        deepen: 1,
+        singleBranch: false,
+        tags: false,
+      });
+      expect(repo.shallow()).toEqual(new Set());
+      expect(rebase(workspace.context, repo, workspace.worktree, { upstream })).toMatchObject({
+        outcome: "completed",
+        replayed: 1,
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("matches real Git for several clean commits and publishes the branch once", async () => {
     const source = fixture();
     const { original, upstream } = divergent(source);

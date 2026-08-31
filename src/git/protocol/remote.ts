@@ -191,10 +191,7 @@ export async function discover(
   }
 }
 
-export async function drain(
-  body: AsyncIterable<Uint8Array>,
-  signal?: AbortSignal,
-): Promise<void> {
+export async function drain(body: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<void> {
   const reader = new ByteReader(body, signal);
   try {
     for await (const _chunk of reader.rest()) {
@@ -339,6 +336,8 @@ export interface UploadPackRequest {
   /** Shallow boundary commits this client already has. */
   shallows?: string[];
   depth?: number;
+  /** Interpret `depth` relative to the client's existing shallow boundary. */
+  deepenRelative?: boolean;
   /** Ask for tags pointing at fetched objects. */
   includeTag?: boolean;
   /** Limit the server response to objects allowed by this partial-clone filter. */
@@ -382,7 +381,24 @@ export async function uploadPack(
   wanted.push("ofs-delta", "no-done");
   if (request.includeTag === true) wanted.push("include-tag");
   const shallows = request.shallows ?? [];
-  if (request.depth !== undefined || shallows.length > 0) wanted.push("shallow");
+  const shallowRequested = request.depth !== undefined || shallows.length > 0;
+  if (shallowRequested) {
+    if (!request.advertised.has("shallow")) {
+      throw new GitError("EUNSUPPORTED", "remote does not support shallow fetches");
+    }
+    wanted.push("shallow");
+  }
+  if (request.deepenRelative === true) {
+    if (request.depth === undefined) {
+      throw new GitError("EINVAL", "relative deepening requires an upload-pack depth");
+    }
+    if (!request.advertised.has("deepen-relative")) {
+      throw new GitError("EUNSUPPORTED", "remote does not support relative deepening");
+    }
+    wanted.push("deepen-relative");
+  } else if (request.deepenRelative !== undefined && request.deepenRelative !== false) {
+    throw new GitError("EINVAL", "upload-pack deepenRelative must be a boolean");
+  }
   if (request.onProgress === undefined) wanted.push("no-progress");
   if (filter !== undefined) wanted.push("filter");
   const capabilities = negotiate(request.advertised, wanted);
@@ -455,10 +471,12 @@ export async function uploadPack(
   const reader = new ByteReader(response.body, options.signal);
   const shallow: string[] = [];
   const unshallow: string[] = [];
+  const shallowSet = new Set<string>();
+  const unshallowSet = new Set<string>();
+  const requestedShallows = new Set(shallows);
   const useSideband = capabilities.includes("side-band-64k");
 
   try {
-
     // Acknowledgement and shallow sections, then the pack. `done` was sent,
     // so the server answers in one shot and the ack details do not change
     // what arrives.
@@ -483,12 +501,26 @@ export async function uploadPack(
       if (text.startsWith("shallow ")) {
         budget.countEntry();
         const oid = text.slice(8);
+        if (!isOid(oid)) throw new CorruptError(`invalid shallow object id ${oid}`);
+        if (!shallowRequested) throw new CorruptError("unsolicited shallow response");
+        if (unshallowSet.has(oid)) {
+          throw new CorruptError(`upload-pack both shallowed and unshallowed ${oid}`);
+        }
+        shallowSet.add(oid);
         shallow.push(oid);
         continue;
       }
       if (text.startsWith("unshallow ")) {
         budget.countEntry();
         const oid = text.slice(10);
+        if (!isOid(oid)) throw new CorruptError(`invalid unshallow object id ${oid}`);
+        if (!requestedShallows.has(oid)) {
+          throw new CorruptError(`upload-pack unshallowed an uncaptured object id ${oid}`);
+        }
+        if (shallowSet.has(oid)) {
+          throw new CorruptError(`upload-pack both shallowed and unshallowed ${oid}`);
+        }
+        unshallowSet.add(oid);
         unshallow.push(oid);
         continue;
       }

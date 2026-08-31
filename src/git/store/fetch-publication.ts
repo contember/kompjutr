@@ -32,6 +32,7 @@ export interface FetchPublicationState {
   readonly trackingPrefix: string;
   readonly namespaceRevision: number;
   readonly shallowRevision: number;
+  readonly shallow: readonly string[];
   readonly trackingRefs: ReadonlyMap<string, string>;
   readonly exactRefs: ReadonlyMap<string, string | null>;
   readonly checkoutRevision: number;
@@ -184,9 +185,28 @@ export function normalizeFetchPublication(
     countInput(value, label);
     return value;
   };
-  for (const value of plan.shallowAdd ?? []) shallowAdd.add(shallowOid(value, "shallow addition"));
+  for (const value of plan.shallowAdd ?? []) {
+    const oid = shallowOid(value, "shallow addition");
+    if (shallowAdd.has(oid)) {
+      throw new GitError("EINVAL", `duplicate shallow addition ${oid}`);
+    }
+    shallowAdd.add(oid);
+  }
   for (const value of plan.shallowRemove ?? []) {
-    shallowRemove.add(shallowOid(value, "shallow deletion"));
+    const oid = shallowOid(value, "shallow deletion");
+    if (shallowRemove.has(oid)) {
+      throw new GitError("EINVAL", `duplicate shallow deletion ${oid}`);
+    }
+    if (!state.shallow.includes(oid)) {
+      throw new GitError(
+        "EINVAL",
+        `shallow deletion ${oid} was not included in the issued snapshot`,
+      );
+    }
+    if (shallowAdd.has(oid)) {
+      throw new GitError("EINVAL", `fetch publication both adds and deletes shallow ${oid}`);
+    }
+    shallowRemove.add(oid);
   }
 
   return {
@@ -572,6 +592,7 @@ export class FetchPublicationTable implements RefMutationRevisions {
         trackingPrefix: prefix,
         namespaceRevision,
         shallowRevision,
+        shallow: shallowRows,
         trackingRefs: tracking,
         exactRefs: candidates,
         checkoutRevision,
