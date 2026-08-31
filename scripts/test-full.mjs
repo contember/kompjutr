@@ -22,7 +22,9 @@ const packSlices = [
 const slices = [
   ...Array.from({ length: rootShardCount }, (_, index) => ({
     name: `root ${index + 1}/${rootShardCount}`,
-    args: [...rootExcludes, `--shard=${index + 1}/${rootShardCount}`],
+    // threads pool: the forks pool trips vitest's fixed 60 s onTaskUpdate RPC
+    // timeout after long store batches even when every test passes.
+    args: [...rootExcludes, "--pool=threads", `--shard=${index + 1}/${rootShardCount}`],
   })),
   {
     name: "protocol",
