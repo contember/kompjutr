@@ -20,7 +20,3 @@ Lifecycle (full detail in [`../CLAUDE.md`](../CLAUDE.md)):
 
 ## Active
 
-- [Trusted store and domain restructure](sprint-2026-08-30-trusted-store-and-domain-restructure.md)
-  — trusted stored rows, no memory ledger, `fs`/`shell`/`git` domain layout
-  with bottom-up layers, shared kits, and the finished store split; tests are
-  the only gate.

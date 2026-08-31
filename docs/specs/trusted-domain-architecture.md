@@ -1,7 +1,7 @@
 # Trusted-store domain architecture
 
 Accepted 2026-08-30. The authoritative target for the restructure sprint
-([`../sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](../sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md)).
+([`../archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](../archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md), shipped).
 Decisions behind it: [ADR-0018](../decisions/0018-trust-stored-rows-validate-at-the-boundary.md)
 (trust model) and [ADR-0019](../decisions/0019-organize-source-by-domain-with-bottom-up-layers.md)
 (layout). By user direction this design is not subject to architecture review;

@@ -1,3 +1,40 @@
+> **OUTCOME (2026-08-31).** Shipped in full, executed as six waves of parallel
+> subagents in one orchestrated session. **Net −27,528 lines** against the
+> baseline with every closure gate green: `src/` 96,781 → 80,414 (git side
+> 80,621 → 65,374), `tests/` 102,939 → 91,778; whole-diff 344 files,
+> +34,104/−62,091 across 29 commits.
+>
+> Commit map: WU2 `45b7c5b` (eviction fix) · WU3 `8007dfe` (row/options/path
+> kits) · WU4 `1d1e335` (memory ledger deleted; fanned over four agents) ·
+> WU5 `47316e8` (trusted row reads + `CHECK`s on refs/shallow/config/index) ·
+> WU6 `956525d`+`b7ef540` (trusted projections; two-phase commit read → one
+> PK SELECT) · WU7 `40ab7fc`+`c058bb6` (packs publish from parse-time
+> digests; one maintenance run-row reader) · WU8 `7c23c50` (fs/shell/git
+> domains over the `src/db/` kernel; import-graph witness) · WU9
+> `5bb31fb`+`8999691` (pack + sparse splits) · WU10 `79d59da`+`ea9c2cc`
+> (store families extracted; `checkout.ts` 12,971 → 787-line composition
+> root) · WU11 `dffcd5f` (docs) · witnesses `tests/import-graph.test.ts`,
+> `tests/file-ceiling.test.ts` (`52c21e4`); long-tail test retirements and
+> two restored write-time checks in `a212078`/`8bb7848`/`982f766`/`7e2455b`/
+> `e09386c`/`f437d17`/`9e71059` and the refspec/maintenance-roots fixes.
+>
+> Closure gates: typecheck 0 · biome clean · build ✔ · `npm test` 161/161 ·
+> `test:full` 17 slices / 2,973 tests exit 0 (root shards moved to the vitest
+> thread pool, `272aee6`) · Git parity 4/4 · fs conformance 188/188 ·
+> `package:smoke` ✔. Benchmarks (informative, leased): 12/12 cgroup memory
+> scenarios, max transient 54.4 MiB under the 512 MiB cap; `bench:nextjs`
+> clone 9,933 ms / 1,613 statements vs the pre-sprint 11,629 ms / 824 — wall
+> −15 %, statement growth filed as backlog 65.
+>
+> Public surface: package-entrypoint exports byte-stable; removed
+> ledger-only members/params on exported classes are listed in the wave-2
+> run-log entry; blob-id caller misuse now fails `EINVAL` (was `ECORRUPT`);
+> reading an out-of-band-corrupted database is undefined behavior per
+> ADR-0018 (the corruption-injection suites went with it). Deferred:
+> backlog 65 (clone statement profile + benchmark-current refresh), the
+> vestigial `RefValueSource` parameter, and dead read-time grammar calls in
+> `maintenance/roots.ts`.
+
 # Sprint — Trusted store and domain restructure (2026-08-30)
 
 **Goal.** Adopt the trusted-store contract (ADR-0018), remove the dynamic

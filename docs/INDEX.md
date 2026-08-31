@@ -16,10 +16,7 @@ decisions → reference → archive.
 
 ## Active sprints
 
-- [`sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md)
-  — trusted stored rows (ADR-0018), no memory ledger (ADR-0017), domain layout
-  with bottom-up layers (ADR-0019), shared guard/path kits, and the finished
-  store split; tests are the only gate.
+None right now.
 
 ## Specs
 
@@ -33,10 +30,11 @@ decisions → reference → archive.
 
 <!-- hand-maintained, keep short: the few things actually in motion + what's next.
      If everything is "hot", nothing is. -->
-- Active: adopt the trusted-store contract, delete the distrust and ledger
-  machinery, restructure `src/` into `fs`/`shell`/`git` domains, finish the
-  store split —
-  [`sprint plan`](sprints/sprint-2026-08-30-trusted-store-and-domain-restructure.md).
+- Shipped: the trusted-store restructure — trusted rows, no memory ledger,
+  `fs`/`shell`/`git` domains over the `src/db/` kernel, store families split
+  ([`archived sprint`](archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md)).
+  Next: [backlog 65](backlog/65-clone-statement-profile-after-trusted-store.md)
+  profiles the clone statement growth and refreshes the benchmark snapshot.
 - The external consumer adapter remains an integration gate outside this public
   repository; its provider lacks the bulk worktree scan needed for an efficient
   implementation without crossing private storage boundaries.
@@ -75,6 +73,9 @@ decisions → reference → archive.
 
 ## Historical records
 
+- [`archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md`](archive/sprint-2026-08-30-trusted-store-and-domain-restructure.md)
+  — trusted stored rows, the deleted memory ledger, the fs/shell/git domain
+  restructure over a shared storage kernel, and the finished store split.
 - [`archive/sprint-2026-08-29-budget-targets-and-store-split.md`](archive/sprint-2026-08-29-budget-targets-and-store-split.md)
   — measured statement targets, the byte-limit evidence ledger, operation-owned
   memory ceilings, and the store-split start superseded by the restructure

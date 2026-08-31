@@ -142,3 +142,4 @@ units over the same files, and a long sprint does not make that safe.
 - [59 — Add byte-preserving Git paths](59-byte-preserving-git-paths.md)
 - [62 — Classify status renames over the sparse candidates, not the whole repository](62-sparse-status-rename-classification.md)
 - [63 — Bound packed dependency graph traversal](63-bound-packed-dependency-graph-traversal.md)
+- [65 — Profile the clone statement growth after the trusted-store rewrite](65-clone-statement-profile-after-trusted-store.md)
