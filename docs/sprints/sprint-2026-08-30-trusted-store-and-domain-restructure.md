@@ -371,3 +371,22 @@ spec and this plan are authoritative; tests are the only gate.
   config-read counter re-anchored to the single-read shape (`a212078`); one
   out-of-band config-corruption block in `tests/client.test.ts` deleted per
   ADR-0018.
+- 2026-08-31 — WU8 landed (`7c23c50`): `src/` is now `fs`/`shell`/`git` over a
+  shared storage kernel `src/db/` (adapter + shared routing limits) — an
+  amendment to the spec's mapping forced by real dependencies: `fs` sits on
+  the same Durable Object database and must not import `git`, so the adapter
+  lives below both domains (docs update at closure). `GitError`'s base
+  definition originates in `db/db.ts` (SQLite error normalization) and is
+  re-exported by `git/common/errors.ts`. The store↔ops cycle is broken via
+  `git/store/operations.ts`; `tests/import-graph.test.ts` enforces the layer
+  order. 1,236 import specifiers rewritten across 237 files; package exports
+  byte-stable.
+- 2026-08-31 — WU9 splits landed: `packs.ts` → 222-line facade over
+  `pack/{shared,read,ingest,lifecycle}.ts` (`5bb31fb`); `sparse-workspace.ts`
+  → 15-line facade over `sparse/*` (`8999691`). WU9b surfaced 18 stale
+  corruption blocks whose setups the new `git_index` CHECKs reject — deleted
+  per ADR-0018 (`8bb7848`). WU10a landed (`79d59da`): nine family modules
+  extracted, `checkout.ts` 6,770 → 2,039 lines, the repo-scoped
+  `SharedRepoOwnedOperations` WeakMap seam deleted outright; `createCheckout`
+  now returns the initializer-written HEAD; two SQL fingerprints and the
+  journal paging witness re-anchored on the new query shapes.
