@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
+import { hashObject, MODE_FILE, serializeTree } from "../src/git/common/objects.js";
+import type { CommitTreeSnapshotResult } from "../src/git/ops/sparse-workspace.js";
 import {
   planSparseTreeBuild,
   preflightTreeBuild,
   type TreeBuildPreflightLimits,
-} from "../src/core/ops/tree-build.js";
-import type { CommitTreeSnapshotResult } from "../src/core/sparse-workspace.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+} from "../src/git/ops/tree-build.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 
 const OID = "1".repeat(40);
 const LIMITS: TreeBuildPreflightLimits = {

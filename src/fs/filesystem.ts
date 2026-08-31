@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 import { filesystemError } from "./errors.js";
 import { assertComputerImportCurrent } from "./import.js";
 import { createFilesystemOps } from "./ops.js";

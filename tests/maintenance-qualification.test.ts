@@ -1,16 +1,15 @@
 import { describe, expect, it } from "vitest";
-
-import { utf8 } from "../src/core/bytes.js";
-import { type ObjectType, serializeCommit } from "../src/core/objects.js";
-import type { MergeStateMetadata, MergeTouchedPath } from "../src/core/ops/merge-state.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { fetchHttpClient } from "../src/core/protocol/transport.js";
+import type { SqlDatabase } from "../src/db/db.js";
 import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { type ObjectType, serializeCommit } from "../src/git/common/objects.js";
+import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge-state.js";
+import { fetchHttpClient } from "../src/git/protocol/transport.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { advanceMaintenanceRepack } from "../src/git/store/maintenance/repack.js";
+import { advanceMaintenanceSweep, GC_GRACE_MS } from "../src/git/store/maintenance/sweep.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import { Workspace } from "../src/runtime/workspace.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
-import { advanceMaintenanceRepack } from "../src/sqlite/maintenance/repack.js";
-import { advanceMaintenanceSweep, GC_GRACE_MS } from "../src/sqlite/maintenance/sweep.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

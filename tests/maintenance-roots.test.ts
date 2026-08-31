@@ -1,23 +1,22 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-
-import { utf8 } from "../src/core/bytes.js";
-import { hashObject, serializeCommit, serializeTree } from "../src/core/objects.js";
-import type { MergeStateMetadata, MergeTouchedPath } from "../src/core/ops/merge-state.js";
-import { mergeOperationState } from "../src/core/ops/operation-state.js";
+import { Database } from "../src/db/db.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
-import { Database } from "../src/sqlite/db.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
+import type { MergeStateMetadata, MergeTouchedPath } from "../src/git/ops/merge-state.js";
+import { mergeOperationState } from "../src/git/ops/operation-state.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   initializeIndexTracker,
   invalidateIndexTracker,
   resealIndexTracker,
-} from "../src/sqlite/index-tracker.js";
+} from "../src/git/store/index-tracker.js";
 import {
   MAINTENANCE_ROOT_EPOCH_EXHAUSTED,
   readMaintenanceRootEpoch,
-} from "../src/sqlite/maintenance/control.js";
-import type { MaintenanceRootSource } from "../src/sqlite/maintenance/roots.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/maintenance/control.js";
+import type { MaintenanceRootSource } from "../src/git/store/maintenance/roots.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const NOW = 1_800_000_000_123;

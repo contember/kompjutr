@@ -7,8 +7,8 @@
 // so the physical scan order IS the output order and `ORDER BY path` costs
 // nothing.
 
-import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
-import { MAX_ROUTING_CHECKOUTS, MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../sqlite/schema.js";
+import { readBlob, type SqlDatabase } from "../../db/db.js";
+import { MAX_ROUTING_CHECKOUTS, MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../db/routing.js";
 import { comparePaths, dirname, normalize, subtreeSuccessor } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import {

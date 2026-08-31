@@ -1,12 +1,4 @@
 import { createHash } from "node:crypto";
-import { fromHex, utf8 } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { type Commit, hashObject, serializeCommit, serializeTree } from "../src/core/objects.js";
-import { requireCleanIntegrationWorktree } from "../src/core/ops/integration-worktree.js";
-import { type RebaseLifecycleResult, rebase } from "../src/core/ops/rebase.js";
-import { add } from "../src/core/ops/staging.js";
-import { Repository } from "../src/core/repository.js";
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../src/core/worktree.js";
 import { CHUNK_SIZE } from "../src/fs/schema.js";
 import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
 import type {
@@ -23,8 +15,25 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../src/fs/types.js";
-import { advanceMaintenanceReachability } from "../src/sqlite/maintenance/reachability.js";
-import { type CheckoutRow, type SharedRepoStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { fromHex, utf8 } from "../src/git/common/bytes.js";
+import {
+  type Commit,
+  hashObject,
+  serializeCommit,
+  serializeTree,
+} from "../src/git/common/objects.js";
+import type { GitContext } from "../src/git/ops/context.js";
+import { requireCleanIntegrationWorktree } from "../src/git/ops/integration-worktree.js";
+import { type RebaseLifecycleResult, rebase } from "../src/git/ops/rebase.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { add } from "../src/git/ops/staging.js";
+import type { Worktree, WorktreeDirent, WorktreeStat } from "../src/git/ops/worktree.js";
+import {
+  type CheckoutRow,
+  type SharedRepoStore,
+  SqliteGitDatabase,
+} from "../src/git/store/index.js";
+import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
 import { commitGraphBytes } from "./commit-graph-bytes.js";
 import type { Harness, Scenario } from "./harness.js";
 import {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-
+import { readBlob, type SqlDatabase } from "../../src/db/db.js";
 import { hasErrorCode } from "../../src/fs/errors.js";
 import { initializeFsSchema } from "../../src/fs/schema.js";
 import {
@@ -7,7 +7,6 @@ import {
   type InitialWorktreeSession,
 } from "../../src/fs/store/initial-write.js";
 import { writeFiles } from "../../src/fs/store/write.js";
-import { readBlob, type SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
 interface EntryRow {

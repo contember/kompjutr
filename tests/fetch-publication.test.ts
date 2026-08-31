@@ -5,8 +5,8 @@ import {
   type DurableObjectStorageLike,
   type SQLCursorLike,
   type SQLStorageLike,
-} from "../src/sqlite/db.js";
-import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
+} from "../src/db/db.js";
+import { SqliteGitDatabase, type StoreOptions } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 

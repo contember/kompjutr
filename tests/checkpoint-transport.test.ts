@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, it } from "vitest";
 
-import { openRepository } from "../src/core/context.js";
-import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
+import { openRepository } from "../src/git/ops/context.js";
+import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { createGit, type Git } from "../src/index.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import { makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";

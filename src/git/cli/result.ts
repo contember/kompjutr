@@ -1,4 +1,4 @@
-import { GitError } from "../../core/errors.js";
+import { GitError } from "../common/errors.js";
 import {
   GIT_CLI_MAX_COMBINED_OUTPUT_BYTES,
   GIT_CLI_MAX_LOG_COUNT,

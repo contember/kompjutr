@@ -1,7 +1,7 @@
 // Set-based copies stay inside SQLite: JS plans bounded metadata pages, while
 // content moves with INSERT ... SELECT and never enters the isolate.
 
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { comparePaths, dirname, normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";

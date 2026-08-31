@@ -1,24 +1,23 @@
 import { describe, expect, it } from "vitest";
-
-import { concat, utf8 } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { nestedRoots, openRepository } from "../src/core/context.js";
-import { hashObject, serializeTree } from "../src/core/objects.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import { initRepository } from "../src/core/ops/init.js";
-import { clone } from "../src/core/ops/network.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { Repository } from "../src/core/repository.js";
-import type { Worktree } from "../src/core/worktree.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createGit } from "../src/git/client.js";
-import { Workspace } from "../src/runtime/workspace.js";
-import { initializeIndexTracker } from "../src/sqlite/index-tracker.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
+import { hashObject, serializeTree } from "../src/git/common/objects.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import type { GitContext } from "../src/git/ops/context.js";
+import { nestedRoots, openRepository } from "../src/git/ops/context.js";
+import { initRepository } from "../src/git/ops/init.js";
+import { clone } from "../src/git/ops/network.js";
+import { Repository } from "../src/git/ops/repository.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
 import {
   type CheckoutStore,
   PROVISIONAL_CLONE_LEASE_MS,
   SqliteGitDatabase,
-} from "../src/sqlite/store.js";
+} from "../src/git/store/index.js";
+import { initializeIndexTracker } from "../src/git/store/index-tracker.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
+import { Workspace } from "../src/runtime/workspace.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

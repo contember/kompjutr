@@ -1,20 +1,19 @@
 import { describe, expect, it } from "vitest";
-
-import { recoverRef } from "../src/core/ops/ref-log.js";
-import { Repository } from "../src/core/repository.js";
-import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
 import {
   Database,
   type DurableObjectStorageLike,
   type SQLCursorLike,
   type SQLStorageLike,
   type SqlDatabase,
-} from "../src/sqlite/db.js";
+} from "../src/db/db.js";
+import { createGit, type Git, type GitRecoverRefOptions } from "../src/git/client.js";
+import { recoverRef } from "../src/git/ops/ref-log.js";
+import { Repository } from "../src/git/ops/repository.js";
 import {
   MAX_REFLOG_ROOT_SCAN_ENTRIES,
   type RefLogMetadata,
   SqliteGitDatabase,
-} from "../src/sqlite/store.js";
+} from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

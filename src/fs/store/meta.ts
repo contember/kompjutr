@@ -1,6 +1,6 @@
 // `fs_meta` accessors: the revision counter and the inode allocator.
 
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 
 /**
  * The current revision. Bumped once per mutating *call*, not per row, so a

@@ -2,23 +2,22 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import { commit } from "../src/core/ops/commit.js";
+import { runGitCli } from "../src/git/cli/index.js";
+import { createGitCliReadHandlers } from "../src/git/cli/read.js";
+import type { GitCliResult } from "../src/git/cli/types.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import { commit } from "../src/git/ops/commit.js";
 import {
   diff as coreDiff,
   DIFF_COMBINED_MAX_LINES,
   DIFF_COMBINED_MAX_MEMORY_BYTES,
   DIFF_MAX_OUTPUT_BYTES,
   diffHeaderPath,
-} from "../src/core/ops/diff.js";
-import { rebase } from "../src/core/ops/rebase.js";
-import { add } from "../src/core/ops/staging.js";
-import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
-import { runGitCli } from "../src/git/cli/index.js";
-import { createGitCliReadHandlers } from "../src/git/cli/read.js";
-import type { GitCliResult } from "../src/git/cli/types.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+} from "../src/git/ops/diff.js";
+import { rebase } from "../src/git/ops/rebase.js";
+import { add } from "../src/git/ops/staging.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

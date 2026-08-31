@@ -1,16 +1,12 @@
-import { type GitContext, nestedRoots, openRepository } from "../../core/context.js";
-import { GitError, hasErrorCode } from "../../core/errors.js";
-import { diff } from "../../core/ops/diff.js";
-import type { StatusEntry } from "../../core/ops/kinds.js";
-import { divergence } from "../../core/ops/merge-base.js";
-import { readRef } from "../../core/ops/plumbing.js";
-import { type CommitView, linearLogRange, log } from "../../core/ops/reads.js";
-import { eagerStatus } from "../../core/ops/status.js";
-import {
-  formatPorcelainV1,
-  formatShort,
-  statusFormatOptions,
-} from "../../core/ops/status-format.js";
+import { GitError, hasErrorCode } from "../common/errors.js";
+import { type GitContext, nestedRoots, openRepository } from "../ops/context.js";
+import { diff } from "../ops/diff.js";
+import type { StatusEntry } from "../ops/kinds.js";
+import { divergence } from "../ops/merge-base.js";
+import { readRef } from "../ops/plumbing.js";
+import { type CommitView, linearLogRange, log } from "../ops/reads.js";
+import { eagerStatus } from "../ops/status.js";
+import { formatPorcelainV1, formatShort, statusFormatOptions } from "../ops/status-format.js";
 import {
   type GitCliOutputContext,
   gitCliDiagnosticResult,

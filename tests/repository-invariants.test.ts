@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { utf8 } from "../src/core/bytes.js";
+import { utf8 } from "../src/git/common/bytes.js";
 import { assertRepositoryReadable, reopenTestRepository } from "./helpers/repository-invariants.js";
 import { makeRepo } from "./helpers/workspace.js";
 

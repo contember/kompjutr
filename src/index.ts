@@ -1,120 +1,14 @@
 // kompjutr — a SQLite-native filesystem and git backend for Cloudflare Workers.
 //
 // The filesystem and git database share one Durable Object SQLite database.
-export type { GitContext, GitIdentity } from "./core/context.js";
-export { findRepository, nestedRoots, openRepository } from "./core/context.js";
+
 export {
-  AlreadyInitializedError,
-  CorruptError,
-  GitError,
-  MissingIdentityError,
-  NotARepositoryError,
-  ObjectNotFoundError,
-  PathOutsideRepoError,
-  PathspecNotFoundError,
-  RefNotFoundError,
-  UnsupportedOperationError,
-} from "./core/errors.js";
-export type {
-  CommitResult,
-  DiffSummaryEntry,
-  MergeResult,
-  RebaseResult,
-  RemoteView,
-  ReplayEmptyReason,
-  ReplayResult,
-  StatusEntry,
-  StatusRow,
-} from "./core/ops/kinds.js";
-export {
-  MAX_LS_REMOTE_PATTERNS,
-  MAX_LS_REMOTE_REFS,
-} from "./core/ops/ls-remote.js";
-export {
-  type DivergenceOptions,
-  type DivergenceRelationship,
-  type DivergenceResult,
-  divergence,
-  type MergeBaseKind,
-  type MergeBaseOptions,
-  type MergeBaseResult,
-  mergeBase,
-} from "./core/ops/merge-base.js";
-export {
-  type CommitTreeOptions,
-  commitTree,
-  type RawRefTarget,
-  type ReadRefOptions,
-  type ReadTreeOptions,
-  readRef,
-  readTree,
-  type UpdateRefDeleteOptions,
-  type UpdateRefGuardedOptions,
-  type UpdateRefOptions,
-  type UpdateRefWriteOptions,
-  updateRef,
-  writeTree,
-} from "./core/ops/plumbing.js";
-export type { CommitView, LsTreeOptions, TreeEntryView } from "./core/ops/reads.js";
-export {
-  type RecoverRefOptions,
-  type RefLogEndpoint,
-  type RefLogEntry,
-  type RefLogReadOptions,
-  type RefLogRecoverySource,
-  recoverRef,
-  reflog,
-} from "./core/ops/ref-log.js";
-export {
-  type FetchRefspec,
-  type FetchRefUpdate,
-  type FetchResult,
-  type LsRemoteResult,
-  MAX_REFSPEC_EXPANDED_DESTINATIONS,
-  MAX_REFSPEC_MAPPINGS,
-  type PushRefStatus,
-  type PushRefspec,
-  type PushResult,
-  type PushTrackingResult,
-  type RemoteRefView,
-  type RemoteTarget,
-} from "./core/ops/refspec.js";
-export {
-  type ReplaySnapshotConflict,
-  type ReplaySnapshotConflictStage,
-  type ReplaySnapshotOptions,
-  type ReplaySnapshotResult,
-  replaySnapshot,
-} from "./core/ops/replay.js";
-export {
-  formatPorcelainV1,
-  formatPorcelainV2,
-  formatShort,
-  type StatusBranch,
-  type StatusDetail,
-  type StatusOptions,
-  type StatusReport,
-  type StatusReportOptions,
-  status,
-  statusReport,
-  statusStream,
-} from "./core/ops/status.js";
-export {
-  type StatusFormatOptions,
-  statusFormatOptions,
-} from "./core/ops/status-format.js";
-export {
-  type WorktreeAddOptions,
-  type WorktreeAddTarget,
-  type WorktreeInfo,
-  type WorktreeRemoveOptions,
-  worktreeAdd,
-  worktreeList,
-  worktreePrune,
-  worktreeRemove,
-} from "./core/ops/worktrees.js";
-export { Repository, type RevisionResolution } from "./core/repository.js";
-export type { Worktree, WorktreeDirent, WorktreeStat } from "./core/worktree.js";
+  Database,
+  type DurableObjectStorageLike,
+  type SQLCursorLike,
+  type SQLStorageLike,
+  type SqlDatabase,
+} from "./db/db.js";
 export { NodeFsCompat } from "./fs/compat/node.js";
 export { createFilesystem } from "./fs/filesystem.js";
 export { FS_SCHEMA_VERSION, initializeFsSchema } from "./fs/schema.js";
@@ -190,6 +84,130 @@ export {
   type GitWriteTreeOptions,
 } from "./git/client.js";
 export {
+  AlreadyInitializedError,
+  CorruptError,
+  GitError,
+  MissingIdentityError,
+  NotARepositoryError,
+  ObjectNotFoundError,
+  PathOutsideRepoError,
+  PathspecNotFoundError,
+  RefNotFoundError,
+  UnsupportedOperationError,
+} from "./git/common/errors.js";
+export type { GitContext, GitIdentity } from "./git/ops/context.js";
+export { findRepository, nestedRoots, openRepository } from "./git/ops/context.js";
+export type {
+  CommitResult,
+  DiffSummaryEntry,
+  MergeResult,
+  RebaseResult,
+  RemoteView,
+  ReplayEmptyReason,
+  ReplayResult,
+  StatusEntry,
+  StatusRow,
+} from "./git/ops/kinds.js";
+export {
+  MAX_LS_REMOTE_PATTERNS,
+  MAX_LS_REMOTE_REFS,
+} from "./git/ops/ls-remote.js";
+export {
+  type DivergenceOptions,
+  type DivergenceRelationship,
+  type DivergenceResult,
+  divergence,
+  type MergeBaseKind,
+  type MergeBaseOptions,
+  type MergeBaseResult,
+  mergeBase,
+} from "./git/ops/merge-base.js";
+export {
+  type CommitTreeOptions,
+  commitTree,
+  type RawRefTarget,
+  type ReadRefOptions,
+  type ReadTreeOptions,
+  readRef,
+  readTree,
+  type UpdateRefDeleteOptions,
+  type UpdateRefGuardedOptions,
+  type UpdateRefOptions,
+  type UpdateRefWriteOptions,
+  updateRef,
+  writeTree,
+} from "./git/ops/plumbing.js";
+export type { CommitView, LsTreeOptions, TreeEntryView } from "./git/ops/reads.js";
+export {
+  type RecoverRefOptions,
+  type RefLogEndpoint,
+  type RefLogEntry,
+  type RefLogReadOptions,
+  type RefLogRecoverySource,
+  recoverRef,
+  reflog,
+} from "./git/ops/ref-log.js";
+export {
+  type FetchRefspec,
+  type FetchRefUpdate,
+  type FetchResult,
+  type LsRemoteResult,
+  MAX_REFSPEC_EXPANDED_DESTINATIONS,
+  MAX_REFSPEC_MAPPINGS,
+  type PushRefStatus,
+  type PushRefspec,
+  type PushResult,
+  type PushTrackingResult,
+  type RemoteRefView,
+  type RemoteTarget,
+} from "./git/ops/refspec.js";
+export {
+  type ReplaySnapshotConflict,
+  type ReplaySnapshotConflictStage,
+  type ReplaySnapshotOptions,
+  type ReplaySnapshotResult,
+  replaySnapshot,
+} from "./git/ops/replay.js";
+export { Repository, type RevisionResolution } from "./git/ops/repository.js";
+export {
+  formatPorcelainV1,
+  formatPorcelainV2,
+  formatShort,
+  type StatusBranch,
+  type StatusDetail,
+  type StatusOptions,
+  type StatusReport,
+  type StatusReportOptions,
+  status,
+  statusReport,
+  statusStream,
+} from "./git/ops/status.js";
+export {
+  type StatusFormatOptions,
+  statusFormatOptions,
+} from "./git/ops/status-format.js";
+export type { Worktree, WorktreeDirent, WorktreeStat } from "./git/ops/worktree.js";
+export {
+  type WorktreeAddOptions,
+  type WorktreeAddTarget,
+  type WorktreeInfo,
+  type WorktreeRemoveOptions,
+  worktreeAdd,
+  worktreeList,
+  worktreePrune,
+  worktreeRemove,
+} from "./git/ops/worktrees.js";
+export {
+  type CheckoutRow,
+  CheckoutStore,
+  type IndexEntry,
+  type IndexStore,
+  SharedRepoStore,
+  SqliteGitDatabase,
+  type StoreOptions,
+} from "./git/store/index.js";
+export { initializeGitSchema, SCHEMA_VERSION } from "./git/store/schema.js";
+export {
   type Async,
   type AsyncFilesystem,
   type ExitStatus,
@@ -202,20 +220,3 @@ export {
   Workspace,
   type WorkspaceOptions,
 } from "./runtime/index.js";
-export {
-  Database,
-  type DurableObjectStorageLike,
-  type SQLCursorLike,
-  type SQLStorageLike,
-  type SqlDatabase,
-} from "./sqlite/db.js";
-export { initializeGitSchema, SCHEMA_VERSION } from "./sqlite/schema.js";
-export {
-  type CheckoutRow,
-  CheckoutStore,
-  type IndexEntry,
-  type IndexStore,
-  SharedRepoStore,
-  SqliteGitDatabase,
-  type StoreOptions,
-} from "./sqlite/store.js";

@@ -1,18 +1,18 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { utf8Decoder } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
+import { utf8Decoder } from "../src/git/common/bytes.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
 import {
   cherryPick,
   cherryPickAbort,
   cherryPickContinue,
   cherryPickSkip,
-} from "../src/core/ops/cherry-pick.js";
-import { restoreProjectedOperation } from "../src/core/ops/merge-apply.js";
-import { add, rm } from "../src/core/ops/staging.js";
-import { Repository } from "../src/core/repository.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/ops/cherry-pick.js";
+import type { GitContext } from "../src/git/ops/context.js";
+import { restoreProjectedOperation } from "../src/git/ops/merge-apply.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { add, rm } from "../src/git/ops/staging.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

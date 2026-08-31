@@ -1,24 +1,23 @@
 import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-
-import { equalBytes, fromHex, utf8Decoder } from "../src/core/bytes.js";
-import type { GitContext, InitialWorktreeWriter } from "../src/core/context.js";
-import { GitError } from "../src/core/errors.js";
-import { initRepository } from "../src/core/ops/init.js";
-import { checkout } from "../src/core/ops/refs.js";
-import type { Repository } from "../src/core/repository.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
 import type { Filesystem } from "../src/fs/types.js";
+import { equalBytes, fromHex, utf8Decoder } from "../src/git/common/bytes.js";
+import { GitError } from "../src/git/common/errors.js";
+import type { GitContext, InitialWorktreeWriter } from "../src/git/ops/context.js";
+import { initRepository } from "../src/git/ops/init.js";
+import { checkout } from "../src/git/ops/refs.js";
+import type { Repository } from "../src/git/ops/repository.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   INDEX_DIRTY,
   initializeIndexTracker,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/sqlite/index-tracker.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES, SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/index-tracker.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

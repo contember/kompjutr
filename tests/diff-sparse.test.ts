@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { utf8 } from "../src/core/bytes.js";
-import { CorruptError } from "../src/core/errors.js";
-import { MODE_COMMIT, serializeTree } from "../src/core/objects.js";
-import { commit } from "../src/core/ops/commit.js";
-import { diff, diffSummary } from "../src/core/ops/diff.js";
-import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { CorruptError } from "../src/git/common/errors.js";
+import { MODE_COMMIT, serializeTree } from "../src/git/common/objects.js";
+import { commit } from "../src/git/ops/commit.js";
+import { diff, diffSummary } from "../src/git/ops/diff.js";
+import type { SparseWorkspaceSource } from "../src/git/ops/sparse-workspace.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 import {
   configureFixtureIdentity,
   requireSparseWorkspace,

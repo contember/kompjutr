@@ -1,4 +1,4 @@
-import type { GitContext } from "../../core/context.js";
+import type { GitContext } from "../ops/context.js";
 import { parseGitCliInput } from "./parse.js";
 import { createGitCliReadHandlers } from "./read.js";
 import { boundedGitCliResult, resolveGitCliRunOptions } from "./result.js";

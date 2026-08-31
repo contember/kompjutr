@@ -1,6 +1,5 @@
 // Worktree decorators shared by the op tests.
 
-import type { Worktree, WorktreeDirent, WorktreeStat } from "../../src/core/worktree.js";
 import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -14,6 +13,7 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../../src/fs/types.js";
+import type { Worktree, WorktreeDirent, WorktreeStat } from "../../src/git/ops/worktree.js";
 
 /** Counts the calls that would mean a file was read to be hashed. */
 export class CountingWorktree implements Worktree {

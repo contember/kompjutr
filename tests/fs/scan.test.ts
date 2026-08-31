@@ -8,7 +8,8 @@
 // being written in parallel with this file and cannot be imported.
 
 import { describe, expect, it } from "vitest";
-
+import type { SqlDatabase } from "../../src/db/db.js";
+import { MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../src/db/routing.js";
 import { comparePaths, subtreeSuccessor } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { allocateInodes } from "../../src/fs/store/meta.js";
@@ -40,8 +41,6 @@ import {
   S_IFREG,
   type ScanEntry,
 } from "../../src/fs/types.js";
-import type { SqlDatabase } from "../../src/sqlite/db.js";
-import { MAX_ROUTING_ROOTS_UTF8_BYTES } from "../../src/sqlite/schema.js";
 import { TestDatabase } from "../helpers/db.js";
 
 const MTIME_BASE = 1_700_000_000_000;

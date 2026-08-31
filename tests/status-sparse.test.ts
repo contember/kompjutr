@@ -1,26 +1,26 @@
 import { describe, expect, it } from "vitest";
-import type { GitContext, IndexTrackerSeedEntry } from "../src/core/context.js";
-import { openRepository } from "../src/core/context.js";
-import { CorruptError, GitError } from "../src/core/errors.js";
-import { commit } from "../src/core/ops/commit.js";
-import { eagerStatus, type StatusOptions, status, statusStream } from "../src/core/ops/status.js";
-import { sparseStatus } from "../src/core/ops/status-sparse.js";
-import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
-import type { SparseWorkspaceSource } from "../src/core/sparse-workspace.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
+import type { SqlDatabase } from "../src/db/db.js";
+import { CorruptError, GitError } from "../src/git/common/errors.js";
+import { commit } from "../src/git/ops/commit.js";
+import type { GitContext, IndexTrackerSeedEntry } from "../src/git/ops/context.js";
+import { openRepository } from "../src/git/ops/context.js";
+import type { SparseWorkspaceSource } from "../src/git/ops/sparse-workspace.js";
+import { eagerStatus, type StatusOptions, status, statusStream } from "../src/git/ops/status.js";
+import { sparseStatus } from "../src/git/ops/status-sparse.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/sqlite/index-tracker.js";
-import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../src/sqlite/maintenance/control.js";
+} from "../src/git/store/index-tracker.js";
+import { MAINTENANCE_ROOT_EPOCH_EXHAUSTED } from "../src/git/store/maintenance/control.js";
 import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSparseWorkspaceSource,
-} from "../src/sqlite/sparse-workspace.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+} from "../src/git/store/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import {
   configureFixtureIdentity,

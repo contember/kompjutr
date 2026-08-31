@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-
-import { concat } from "../src/core/bytes.js";
-import { CorruptError, GitError } from "../src/core/errors.js";
+import type { SqlDatabase } from "../src/db/db.js";
+import { concat } from "../src/git/common/bytes.js";
+import { CorruptError, GitError } from "../src/git/common/errors.js";
 import {
   MODE_COMMIT,
   MODE_EXECUTABLE,
@@ -9,12 +9,11 @@ import {
   MODE_SYMLINK,
   MODE_TREE,
   serializeTree,
-} from "../src/core/objects.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { Repository } from "../src/core/repository.js";
-import { joinSorted } from "../src/core/streams.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/common/objects.js";
+import { joinSorted } from "../src/git/common/streams.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 

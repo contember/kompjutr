@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
-
+import type { SqlDatabase } from "../../src/db/db.js";
 import { createExactPathStateSource } from "../../src/fs/exact-path-states.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
-import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
 class RecordingDatabase implements SqlDatabase {

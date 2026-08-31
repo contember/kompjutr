@@ -19,7 +19,7 @@
 // `WHERE true` before `ON CONFLICT` is mandatory, not decorative: SQLite
 // cannot parse an upsert on a SELECT-fed INSERT without it.
 
-import { blob, type SqlDatabase } from "../../sqlite/db.js";
+import { blob, type SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";

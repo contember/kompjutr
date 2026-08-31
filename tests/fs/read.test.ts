@@ -6,7 +6,7 @@
 // any single statement carried rather than trusting `remaining` to appear.
 
 import { describe, expect, it } from "vitest";
-
+import type { SqlDatabase } from "../../src/db/db.js";
 import { normalize } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import {
@@ -20,7 +20,6 @@ import {
 import { realpath } from "../../src/fs/store/resolve.js";
 import { discoverFiles } from "../../src/fs/store/scan.js";
 import { writeFiles } from "../../src/fs/store/write.js";
-import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 import { SqliteTestStorage } from "../helpers/storage.js";
 

@@ -1,18 +1,17 @@
 import { describe, expect, it } from "vitest";
-
-import { fromHex, utf8, utf8Decoder } from "../src/core/bytes.js";
-import { hashObject } from "../src/core/objects.js";
+import type { ScanEntry } from "../src/fs/types.js";
+import { fromHex, utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { hashObject } from "../src/git/common/objects.js";
 import {
   abortProjectedMerge,
   applyProjectedMerge,
   type MergeApplyMetadata,
-} from "../src/core/ops/merge-apply.js";
-import type { ProjectedMergeEntry } from "../src/core/ops/merge-projection.js";
-import type { MergeJournal, MergeTouchedPath } from "../src/core/ops/merge-state.js";
-import type { Repository } from "../src/core/repository.js";
-import type { Worktree } from "../src/core/worktree.js";
-import type { ScanEntry } from "../src/fs/types.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/store.js";
+} from "../src/git/ops/merge-apply.js";
+import type { ProjectedMergeEntry } from "../src/git/ops/merge-projection.js";
+import type { MergeJournal, MergeTouchedPath } from "../src/git/ops/merge-state.js";
+import type { Repository } from "../src/git/ops/repository.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/index.js";
 import { makeRepo, type TestRepository } from "./helpers/workspace.js";
 
 function commit(repo: Repository, digit: string): string {

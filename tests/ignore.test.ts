@@ -2,25 +2,25 @@ import { spawnSync } from "node:child_process";
 
 import { afterAll, describe, expect, it } from "vitest";
 import type {
-  IgnoreLimitResource,
-  IgnorePattern,
-  IgnoreSourceHashStep,
-} from "../src/core/ignore/index.js";
-import {
-  IGNORE_LIMITS,
-  IgnoreLimitError,
-  loadIgnoreMatcher,
-  WorktreeIgnoreMatcher,
-} from "../src/core/ignore/index.js";
-import { compilePattern } from "../src/core/ignore/pattern.js";
-import type { Worktree } from "../src/core/worktree.js";
-import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
   HandleReadBatch,
   RealPath,
   RegularFileHandle,
 } from "../src/fs/types.js";
+import type {
+  IgnoreLimitResource,
+  IgnorePattern,
+  IgnoreSourceHashStep,
+} from "../src/git/ignore/index.js";
+import {
+  IGNORE_LIMITS,
+  IgnoreLimitError,
+  loadIgnoreMatcher,
+  WorktreeIgnoreMatcher,
+} from "../src/git/ignore/index.js";
+import { compilePattern } from "../src/git/ignore/pattern.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
 import { GitFixture } from "./helpers/git.js";
 import type { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, type TestWorkspace, writeWorkFile } from "./helpers/workspace.js";

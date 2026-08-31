@@ -1,20 +1,20 @@
-import { isOid } from "../../src/core/bytes.js";
-import type { GitContext } from "../../src/core/context.js";
-import { openRepository } from "../../src/core/context.js";
-import { CorruptError, GitError } from "../../src/core/errors.js";
-import type { Repository } from "../../src/core/repository.js";
 import { createExactPathStateSource } from "../../src/fs/exact-path-states.js";
 import { createFilesystem } from "../../src/fs/filesystem.js";
 import type { Filesystem } from "../../src/fs/types.js";
+import { isOid } from "../../src/git/common/bytes.js";
+import { CorruptError, GitError } from "../../src/git/common/errors.js";
+import type { GitContext } from "../../src/git/ops/context.js";
+import { openRepository } from "../../src/git/ops/context.js";
+import type { Repository } from "../../src/git/ops/repository.js";
+import { SqliteGitDatabase, type StoreOptions } from "../../src/git/store/index.js";
 import {
   initializeIndexTracker,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
-} from "../../src/sqlite/index-tracker.js";
-import { readMaintenanceRunView } from "../../src/sqlite/maintenance/state.js";
-import { requireRawRefTarget, requireRefName } from "../../src/sqlite/ref-validation.js";
-import { createSqliteSparseWorkspaceSource } from "../../src/sqlite/sparse-workspace.js";
-import { SqliteGitDatabase, type StoreOptions } from "../../src/sqlite/store.js";
+} from "../../src/git/store/index-tracker.js";
+import { readMaintenanceRunView } from "../../src/git/store/maintenance/state.js";
+import { requireRawRefTarget, requireRefName } from "../../src/git/store/ref-validation.js";
+import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse-workspace.js";
 import { TestDatabase } from "./db.js";
 import type { TestWorkspace } from "./workspace.js";
 

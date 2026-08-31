@@ -14,19 +14,18 @@ import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, rmSync 
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { expect } from "vitest";
-
-import type { GitContext } from "../../src/core/context.js";
-import { openRepository } from "../../src/core/context.js";
-import type { StatusBranch } from "../../src/core/ops/status.js";
-import { formatPorcelainV2, statusReport } from "../../src/core/ops/status.js";
-import type { WorktreeAddTarget } from "../../src/core/ops/worktrees.js";
-import { comparePaths } from "../../src/core/streams.js";
+import { Database } from "../../src/db/db.js";
 import type { Git } from "../../src/git/client.js";
 import { createGit } from "../../src/git/client.js";
+import { comparePaths } from "../../src/git/common/streams.js";
+import type { GitContext } from "../../src/git/ops/context.js";
+import { openRepository } from "../../src/git/ops/context.js";
+import type { StatusBranch } from "../../src/git/ops/status.js";
+import { formatPorcelainV2, statusReport } from "../../src/git/ops/status.js";
+import type { WorktreeAddTarget } from "../../src/git/ops/worktrees.js";
+import { SqliteGitDatabase } from "../../src/git/store/index.js";
+import { createSqliteSparseWorkspaceSource } from "../../src/git/store/sparse-workspace.js";
 import { Workspace } from "../../src/runtime/workspace.js";
-import { Database } from "../../src/sqlite/db.js";
-import { createSqliteSparseWorkspaceSource } from "../../src/sqlite/sparse-workspace.js";
-import { SqliteGitDatabase } from "../../src/sqlite/store.js";
 import { GitFixture } from "./git.js";
 import type { GitServer } from "./http-backend.js";
 import { startGitServer } from "./http-backend.js";

@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { utf8 } from "../src/core/bytes.js";
-import { hasErrorCode } from "../src/core/errors.js";
-import { hashObject, serializeCommit, serializeTree } from "../src/core/objects.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { hasErrorCode } from "../src/git/common/errors.js";
+import { hashObject, serializeCommit, serializeTree } from "../src/git/common/objects.js";
 import {
   MAX_MERGE_MESSAGE_BYTES,
   MAX_MERGE_TOUCHED_PATHS,
   type MergeStateMetadata,
   type MergeTouchedPath,
-} from "../src/core/ops/merge-state.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/ops/merge-state.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const TREE_BYTES = serializeTree([]);

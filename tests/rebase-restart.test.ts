@@ -2,29 +2,28 @@ import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-
-import { fromHex } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { serializeCommit, serializeTree } from "../src/core/objects.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import { commit } from "../src/core/ops/commit.js";
-import { integrationIndexMatchesTree } from "../src/core/ops/integration-worktree.js";
-import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
+import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
+import { fromHex } from "../src/git/common/bytes.js";
+import { serializeCommit, serializeTree } from "../src/git/common/objects.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import { commit } from "../src/git/ops/commit.js";
+import type { GitContext } from "../src/git/ops/context.js";
+import { integrationIndexMatchesTree } from "../src/git/ops/integration-worktree.js";
+import { MAX_OPERATION_STEPS } from "../src/git/ops/operation-state.js";
 import {
   type RebaseLifecycleResult,
   rebase,
   rebaseAbort,
   rebaseContinue,
   rebaseSkip,
-} from "../src/core/ops/rebase.js";
-import { preflightReplayCommitObjects } from "../src/core/ops/replay.js";
-import { add } from "../src/core/ops/staging.js";
-import { status } from "../src/core/ops/status.js";
-import { worktreeAdd } from "../src/core/ops/worktrees.js";
-import { Repository } from "../src/core/repository.js";
-import type { Worktree } from "../src/core/worktree.js";
-import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/ops/rebase.js";
+import { preflightReplayCommitObjects } from "../src/git/ops/replay.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { add } from "../src/git/ops/staging.js";
+import { status } from "../src/git/ops/status.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
+import { worktreeAdd } from "../src/git/ops/worktrees.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

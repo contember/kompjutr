@@ -1,6 +1,6 @@
 // Path primitives for the filesystem layer. Pure functions, no SQL.
 //
-// `src/core/paths.ts` carries near-identical helpers for the git core. The
+// `src/git/common/paths.ts` carries near-identical helpers for the git core. The
 // two are not merged here because the filesystem must not depend on the git
 // layer and wave B is additive only; they collapse in the integration wave.
 

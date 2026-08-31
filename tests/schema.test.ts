@@ -2,10 +2,10 @@
 // match it exactly or fail before initialization creates anything.
 
 import { describe, expect, it } from "vitest";
+import type { SqlDatabase } from "../src/db/db.js";
 import { initializeFsSchema, ROOT_INODE } from "../src/fs/schema.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
-import { initializeGitSchema, SCHEMA_VERSION } from "../src/sqlite/schema.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { initializeGitSchema, SCHEMA_VERSION } from "../src/git/store/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 
 interface SchemaObject {

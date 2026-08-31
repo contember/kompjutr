@@ -3,7 +3,7 @@
 // This is deliberately the only production module that reads `vfs_*`.
 // Git state already lives in `git_*`; only the working tree moves.
 
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 
 export const COMPUTER_IMPORT_ACKNOWLEDGEMENT =
   "computer-is-quiescent-and-provider-is-unused-in-this-isolate";

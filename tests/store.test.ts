@@ -1,22 +1,22 @@
 import { randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
-
-import { concat, utf8 } from "../src/core/bytes.js";
-import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
-import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { deflate } from "../src/core/zlib.js";
-import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/sqlite/blob-id-cache.js";
-import { blob, readBlob } from "../src/sqlite/db.js";
+import { blob, readBlob } from "../src/db/db.js";
 import {
-  MAX_BLOB_ID_CACHE_ROWS,
-  MAX_INDEX_PATH_BYTES,
   MAX_ROUTING_CHECKOUTS,
   MAX_ROUTING_CHECKOUTS_RETAINED_BYTES,
   MAX_ROUTING_ROOTS_UTF8_BYTES,
-  MAX_TRACKING_REF_REVISIONS,
-} from "../src/sqlite/schema.js";
+} from "../src/db/routing.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
+import {
+  hashObject,
+  MODE_FILE,
+  serializeCommit,
+  serializeTree,
+} from "../src/git/common/objects.js";
+import { deflate } from "../src/git/common/zlib.js";
+import type { ReplayStateMetadata } from "../src/git/ops/operation-state.js";
+import { BLOB_ID_CACHE_ELIGIBILITY_BYTES } from "../src/git/store/blob-id-cache.js";
 import {
   ancestors,
   CONFIG_SECTION_MOVE_UPDATE_SQL,
@@ -25,7 +25,13 @@ import {
   PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
   type StoreOptions,
-} from "../src/sqlite/store.js";
+} from "../src/git/store/index.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
+import {
+  MAX_BLOB_ID_CACHE_ROWS,
+  MAX_INDEX_PATH_BYTES,
+  MAX_TRACKING_REF_REVISIONS,
+} from "../src/git/store/schema.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 

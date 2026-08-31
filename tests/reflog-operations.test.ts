@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { utf8Decoder } from "../src/core/bytes.js";
-import { commit } from "../src/core/ops/commit.js";
-import { updateRef } from "../src/core/ops/plumbing.js";
-import { operationRefLogMetadata } from "../src/core/ops/ref-log.js";
+import { utf8Decoder } from "../src/git/common/bytes.js";
+import { commit } from "../src/git/ops/commit.js";
+import { updateRef } from "../src/git/ops/plumbing.js";
+import { operationRefLogMetadata } from "../src/git/ops/ref-log.js";
 import {
   branch,
   branchDelete,
@@ -10,9 +10,9 @@ import {
   switchBranch,
   tag,
   tagDelete,
-} from "../src/core/ops/refs.js";
-import { add, reset } from "../src/core/ops/staging.js";
-import { Repository } from "../src/core/repository.js";
+} from "../src/git/ops/refs.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { add, reset } from "../src/git/ops/staging.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

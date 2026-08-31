@@ -1,21 +1,5 @@
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import {
-  type CompiledReadPathspec,
-  compileReadPathspec,
-  type LsFilesOptions,
-} from "../src/core/ops/pathspec.js";
-import { lsFilesAtRef } from "../src/core/ops/reads.js";
-import {
-  lsFiles,
-  lsFilesWithWorktree,
-  MAX_LS_FILES_EXCLUDE_ROOTS,
-} from "../src/core/ops/staging.js";
-import { WORKTREE_SCAN_PAGE } from "../src/core/ops/worktree-io.js";
-import { comparePaths } from "../src/core/streams.js";
-import type { Worktree } from "../src/core/worktree.js";
 import type {
   DiscoverFilesOptions,
   DiscoverFilesPage,
@@ -25,7 +9,22 @@ import type {
   ScanEntry,
   ScanOptions,
 } from "../src/fs/types.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+import { comparePaths } from "../src/git/common/streams.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import {
+  type CompiledReadPathspec,
+  compileReadPathspec,
+  type LsFilesOptions,
+} from "../src/git/ops/pathspec.js";
+import { lsFilesAtRef } from "../src/git/ops/reads.js";
+import {
+  lsFiles,
+  lsFilesWithWorktree,
+  MAX_LS_FILES_EXCLUDE_ROOTS,
+} from "../src/git/ops/staging.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
+import { WORKTREE_SCAN_PAGE } from "../src/git/ops/worktree-io.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import type { SqliteTestStorage } from "./helpers/storage.js";

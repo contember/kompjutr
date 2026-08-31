@@ -1,18 +1,17 @@
 import { afterAll, describe, expect, it } from "vitest";
-
-import { openRepository } from "../src/core/context.js";
-import { GitError } from "../src/core/errors.js";
-import { maintenance } from "../src/core/ops/maintenance.js";
-import type { MergeStateMetadata } from "../src/core/ops/merge-state.js";
-import { clone, fetchInto } from "../src/core/ops/network.js";
-import { push } from "../src/core/ops/push.js";
+import { createGit, type Git } from "../src/git/client.js";
+import { GitError } from "../src/git/common/errors.js";
+import { openRepository } from "../src/git/ops/context.js";
+import { maintenance } from "../src/git/ops/maintenance.js";
+import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
+import { clone, fetchInto } from "../src/git/ops/network.js";
+import { push } from "../src/git/ops/push.js";
+import type { Repository } from "../src/git/ops/repository.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpRequest,
-} from "../src/core/protocol/transport.js";
-import type { Repository } from "../src/core/repository.js";
-import { createGit, type Git } from "../src/git/client.js";
+} from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 import {

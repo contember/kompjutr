@@ -3,7 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
 import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServerOptions, startGitServer } from "./helpers/http-backend.js";

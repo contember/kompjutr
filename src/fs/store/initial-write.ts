@@ -2,7 +2,7 @@
 // gets no overwrite semantics: eligibility is settled before the body runs,
 // and every row written by the session is a plain INSERT.
 
-import { blob, type SqlDatabase } from "../../sqlite/db.js";
+import { blob, type SqlDatabase } from "../../db/db.js";
 import { filesystemError } from "../errors.js";
 import { comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";

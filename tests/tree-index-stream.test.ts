@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
+import { Database, readBlob, type SqlDatabase } from "../src/db/db.js";
+import { concat, utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import {
   hashObject,
   parseTree,
@@ -7,9 +8,9 @@ import {
   serializeTree,
   type TreeEntry,
   TreeParser,
-} from "../src/core/objects.js";
-import { Database, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
-import { PackTreeIndex } from "../src/sqlite/pack-ingest-index.js";
+} from "../src/git/common/objects.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { PackTreeIndex } from "../src/git/store/pack-ingest-index.js";
 import {
   createTreeIndexSink,
   indexTreeSource,
@@ -17,13 +18,12 @@ import {
   initializeGitSchema,
   TREE_QUEUE_ROW_FIXED_BYTES,
   type TreeSource,
-} from "../src/sqlite/schema.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/schema.js";
 import {
   indexSeededTreeSource,
   indexSeededTreeSources,
   type TreeSourceInput,
-} from "../src/sqlite/tree-index.js";
+} from "../src/git/store/tree-index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 const OID = "11".repeat(20);

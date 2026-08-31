@@ -1,17 +1,21 @@
 import { describe, expect, it } from "vitest";
-
-import { concat, utf8 } from "../src/core/bytes.js";
-import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
-import { encodeDeltaHeader } from "../src/core/pack/delta.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
+import { blob, readBlob, type SqlDatabase } from "../src/db/db.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
+import {
+  hashObject,
+  MODE_FILE,
+  serializeCommit,
+  serializeTree,
+} from "../src/git/common/objects.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceMaintenanceRepack,
   type MaintenanceRepackOptions,
   settleMaintenanceRepackForRestart,
-} from "../src/sqlite/maintenance/repack.js";
-import { type CompletePackObject, PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/packs.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/maintenance/repack.js";
+import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
+import { type CompletePackObject, PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/packs.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { awaitBarrierEntry, checkpointBarrier } from "./helpers/interleaving.js";

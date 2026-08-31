@@ -2,12 +2,13 @@ import { lstatSync, readdirSync, readFileSync, readlinkSync, unlinkSync } from "
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-
-import { utf8, utf8Decoder } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { GitError } from "../src/core/errors.js";
-import { MODE_FILE, serializeTree } from "../src/core/objects.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
+import type { ScanEntry } from "../src/fs/types.js";
+import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { GitError } from "../src/git/common/errors.js";
+import { MODE_FILE, serializeTree } from "../src/git/common/objects.js";
+import { comparePaths } from "../src/git/common/streams.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import type { GitContext } from "../src/git/ops/context.js";
 import {
   commitTree,
   MAX_COMMIT_TREE_PARENTS,
@@ -15,21 +16,19 @@ import {
   readTree,
   updateRef,
   writeTree,
-} from "../src/core/ops/plumbing.js";
-import { add } from "../src/core/ops/staging.js";
-import { MAX_TREE_BUILD_LEAF_ENTRIES, MAX_TREE_BUILD_OBJECTS } from "../src/core/ops/tree-build.js";
-import { comparePaths } from "../src/core/streams.js";
-import type { Worktree } from "../src/core/worktree.js";
-import type { ScanEntry } from "../src/fs/types.js";
+} from "../src/git/ops/plumbing.js";
+import { add } from "../src/git/ops/staging.js";
+import { MAX_TREE_BUILD_LEAF_ENTRIES, MAX_TREE_BUILD_OBJECTS } from "../src/git/ops/tree-build.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
+import type { IndexEntry, IndexStore } from "../src/git/store/index.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/sqlite/index-tracker.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/sqlite/packs.js";
-import type { IndexEntry, IndexStore } from "../src/sqlite/store.js";
+} from "../src/git/store/index-tracker.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES } from "../src/git/store/packs.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

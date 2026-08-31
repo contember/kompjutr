@@ -1,7 +1,7 @@
 // Raw single-path storage operations. Callers resolve lexical paths and apply
 // POSIX validation; this layer owns the bounded SQL mutations.
 
-import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
+import { readBlob, type SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { codePointLength, dirname, subtreeSuccessor } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";

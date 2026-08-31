@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { fetchHttpClient, type GitHttpClient } from "../src/core/protocol/transport.js";
+import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
 import { createGit, type Git, type GitLsRemoteOptions, type LsRemoteResult } from "../src/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServer, type RequestRecord, startGitServer } from "./helpers/http-backend.js";

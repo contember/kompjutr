@@ -2,8 +2,8 @@ import { randomBytes } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-
-import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
+import { iterateSqlCursor, readBlob, type SqlDatabase } from "../src/db/db.js";
+import { concat, utf8, utf8Decoder } from "../src/git/common/bytes.js";
 import {
   type Commit,
   hashObject,
@@ -13,7 +13,7 @@ import {
   serializeCommit,
   serializeTag,
   serializeTree,
-} from "../src/core/objects.js";
+} from "../src/git/common/objects.js";
 import {
   catFile,
   collectDirectTreeEntries,
@@ -23,19 +23,18 @@ import {
   lsTree,
   MAX_LS_TREE_ENTRIES,
   show,
-} from "../src/core/ops/reads.js";
-import { treeStream } from "../src/core/ops/tree-stream.js";
-import { encodeDeltaHeader } from "../src/core/pack/delta.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { Repository } from "../src/core/repository.js";
-import { commitCacheBytes } from "../src/sqlite/commits.js";
-import { iterateSqlCursor, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
+} from "../src/git/ops/reads.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { treeStream } from "../src/git/ops/tree-stream.js";
+import { commitCacheBytes } from "../src/git/store/commits.js";
 import {
   readAuthenticatedObjectOwned,
   SqliteGitDatabase,
   WALK_TREE_SQL,
-} from "../src/sqlite/store.js";
-import { TREE_WALK_PATH_BYTES, TREE_WALK_STATE_BYTES } from "../src/sqlite/tree-walk.js";
+} from "../src/git/store/index.js";
+import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
+import { TREE_WALK_PATH_BYTES, TREE_WALK_STATE_BYTES } from "../src/git/store/tree-walk.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";

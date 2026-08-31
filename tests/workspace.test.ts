@@ -1,19 +1,18 @@
 import { describe, expect, it } from "vitest";
-
-import { utf8Decoder } from "../src/core/bytes.js";
-import { nestedRoots, openRepository } from "../src/core/context.js";
-import { initRepository } from "../src/core/ops/init.js";
-import { walkWorktree } from "../src/core/ops/worktree-io.js";
 import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
 import { createGit, type GitWorkspaceBinding } from "../src/git/client.js";
-import { Workspace as RuntimeWorkspace } from "../src/runtime/workspace.js";
+import { utf8Decoder } from "../src/git/common/bytes.js";
+import { nestedRoots, openRepository } from "../src/git/ops/context.js";
+import { initRepository } from "../src/git/ops/init.js";
+import { walkWorktree } from "../src/git/ops/worktree-io.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   INDEX_DIRTY,
   iterateIndexTrackerDirty,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/sqlite/index-tracker.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/index-tracker.js";
+import { Workspace as RuntimeWorkspace } from "../src/runtime/workspace.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import { makeRepo, makeWorkspace, writeWorkFile } from "./helpers/workspace.js";
 

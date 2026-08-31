@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { hasErrorCode } from "../src/core/errors.js";
-import { serializeCommit, serializeTree } from "../src/core/objects.js";
-import { MAX_MERGE_BASE_COMMITS } from "../src/core/ops/merge-base.js";
-import { MAX_OPERATION_STEPS } from "../src/core/ops/operation-state.js";
-import { planRebase } from "../src/core/ops/rebase-plan.js";
-import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/core/ops/replay.js";
-import { Repository } from "../src/core/repository.js";
-import { commitCacheBytes } from "../src/sqlite/commits.js";
-import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+import { hasErrorCode } from "../src/git/common/errors.js";
+import { serializeCommit, serializeTree } from "../src/git/common/objects.js";
+import { MAX_MERGE_BASE_COMMITS } from "../src/git/ops/merge-base.js";
+import { MAX_OPERATION_STEPS } from "../src/git/ops/operation-state.js";
+import { planRebase } from "../src/git/ops/rebase-plan.js";
+import { MAX_REPLAY_REVISION_CODE_UNITS } from "../src/git/ops/replay.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { commitCacheBytes } from "../src/git/store/commits.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 

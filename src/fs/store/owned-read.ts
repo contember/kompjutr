@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import type { RealPath, ScanEntry, ScanOptions } from "../types.js";
 import { realpathOwned } from "./resolve.js";
 import { scanOwned } from "./scan.js";

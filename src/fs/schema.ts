@@ -1,11 +1,11 @@
 // The filesystem's tables. Everything under `fs_`; nothing here is shared
-// with the git schema, which lives in `src/sqlite/schema.ts`.
+// with the git schema, which lives in `src/git/store/schema.ts`.
 //
 // The shape that matters: `fs_paths` is keyed on the whole path under
 // BINARY collation, so the physical storage order IS git's tree order and
 // a working-tree walk is an indexed range scan rather than a traversal.
 
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 
 export const FS_SCHEMA_VERSION = 1;
 

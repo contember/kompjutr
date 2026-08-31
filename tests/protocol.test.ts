@@ -1,17 +1,17 @@
 import { describe, expect, it } from "vitest";
 
-import { concat, utf8 } from "../src/core/bytes.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   FLUSH,
   MAX_PKT_FRAME_BYTES,
   MAX_PKT_PAYLOAD_BYTES,
   pkt,
   pktLines,
-} from "../src/core/protocol/pktline.js";
-import { receivePack } from "../src/core/protocol/receive-pack.js";
-import { discover, normalizeRemoteUrl, uploadPack } from "../src/core/protocol/remote.js";
-import { ByteReader, pktText } from "../src/core/protocol/stream.js";
-import type { GitHttpClient, GitHttpResponse } from "../src/core/protocol/transport.js";
+} from "../src/git/protocol/pktline.js";
+import { receivePack } from "../src/git/protocol/receive-pack.js";
+import { discover, normalizeRemoteUrl, uploadPack } from "../src/git/protocol/remote.js";
+import { ByteReader, pktText } from "../src/git/protocol/stream.js";
+import type { GitHttpClient, GitHttpResponse } from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";
 

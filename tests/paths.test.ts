@@ -9,7 +9,7 @@ import {
   joinPath,
   normalizePath,
   splitPath,
-} from "../src/core/paths.js";
+} from "../src/git/common/paths.js";
 
 describe("git path kit", () => {
   it("normalizes, joins, splits, and walks ancestors", () => {

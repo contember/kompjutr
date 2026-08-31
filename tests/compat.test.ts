@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
 import { createGit } from "../src/git/client.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 

@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "../../src/sqlite/db.js";
+import type { SqlDatabase } from "../../src/db/db.js";
 import { SqliteTestStorage } from "./storage.js";
 
 /**

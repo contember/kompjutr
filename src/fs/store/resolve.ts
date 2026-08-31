@@ -6,7 +6,7 @@
 // shadow its own target and diverge from every POSIX filesystem. Every path
 // entering the store passes through here first.
 
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import type { RealPath } from "../types.js";
 
 /** POSIX's own guidance; dofs counts follows the same way. */

@@ -9,7 +9,7 @@
 // Neither function resolves symlinks. `fs_paths.path` is always a real path
 // (§3.6), so callers pass paths that already came through `realpath`.
 
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { codePointLength, dirname, normalize, subtreeSuccessor } from "../path.js";
 import type { RemoveOptions } from "../types.js";

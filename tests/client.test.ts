@@ -8,18 +8,18 @@ import { Workspace } from "@cloudflare/computer";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
-import { Repository } from "../src/core/repository.js";
-import type { Worktree } from "../src/core/worktree.js";
-import type { ScanEntry } from "../src/fs/types.js";
-import { createGit, type Git, type GitScratchIndex } from "../src/git/client.js";
 import {
   Database,
   type DurableObjectStorageLike,
   type SQLCursorLike,
   type SQLStorageLike,
-} from "../src/sqlite/db.js";
-import { iterateIndexTrackerDirty, readIndexTrackerState } from "../src/sqlite/index-tracker.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/db/db.js";
+import type { ScanEntry } from "../src/fs/types.js";
+import { createGit, type Git, type GitScratchIndex } from "../src/git/client.js";
+import { Repository } from "../src/git/ops/repository.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { iterateIndexTrackerDirty, readIndexTrackerState } from "../src/git/store/index-tracker.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 import { startGitServer } from "./helpers/http-backend.js";

@@ -1,11 +1,10 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
-
-import { utf8 } from "../src/core/bytes.js";
 import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { readMaintenanceRunView } from "../src/git/store/maintenance/state.js";
+import { GC_GRACE_MS } from "../src/git/store/maintenance/sweep.js";
 import { Workspace } from "../src/runtime/workspace.js";
-import { readMaintenanceRunView } from "../src/sqlite/maintenance/state.js";
-import { GC_GRACE_MS } from "../src/sqlite/maintenance/sweep.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 

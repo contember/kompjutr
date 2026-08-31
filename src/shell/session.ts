@@ -10,7 +10,7 @@
 // cached for the isolate's lifetime, which is exactly the lifetime eviction
 // invalidates anyway; an exec that does not `cd` pays nothing.
 
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 
 export const SHELL_SCHEMA_VERSION = 1;
 

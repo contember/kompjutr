@@ -5,19 +5,18 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
-
-import { openRepository } from "../src/core/context.js";
-import { GitError } from "../src/core/errors.js";
-import { divergence, mergeBase } from "../src/core/ops/merge-base.js";
-import { clone, fetchInto, remoteUrlFor } from "../src/core/ops/network.js";
-import { log, lsTree } from "../src/core/ops/reads.js";
+import { GitError } from "../src/git/common/errors.js";
+import { openRepository } from "../src/git/ops/context.js";
+import { divergence, mergeBase } from "../src/git/ops/merge-base.js";
+import { clone, fetchInto, remoteUrlFor } from "../src/git/ops/network.js";
+import { log, lsTree } from "../src/git/ops/reads.js";
+import type { Repository } from "../src/git/ops/repository.js";
+import { gitModeFor, type Worktree } from "../src/git/ops/worktree.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpRequest,
-} from "../src/core/protocol/transport.js";
-import type { Repository } from "../src/core/repository.js";
-import { gitModeFor, type Worktree } from "../src/core/worktree.js";
+} from "../src/git/protocol/transport.js";
 import { GitFixture } from "./helpers/git.js";
 import { type GitServerOptions, startGitServer, startStubServer } from "./helpers/http-backend.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { concat, utf8 } from "../src/core/bytes.js";
+import type { SqlDatabase } from "../src/db/db.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   hashObject,
   MODE_COMMIT,
@@ -9,13 +9,12 @@ import {
   serializeCommit,
   serializeTag,
   serializeTree,
-} from "../src/core/objects.js";
-import { encodeDeltaHeader } from "../src/core/pack/delta.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { deflate } from "../src/core/zlib.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
-import { advanceMaintenanceReachability } from "../src/sqlite/maintenance/reachability.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/common/objects.js";
+import { deflate } from "../src/git/common/zlib.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { advanceMaintenanceReachability } from "../src/git/store/maintenance/reachability.js";
+import { encodeDeltaHeader } from "../src/git/store/pack/delta.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 

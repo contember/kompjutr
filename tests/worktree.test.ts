@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
-
-import { fromHex } from "../src/core/bytes.js";
-import { hashObject } from "../src/core/objects.js";
-import { matchesPaths } from "../src/core/ops/checkout.js";
-import { initRepository } from "../src/core/ops/init.js";
+import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
+import { fromHex } from "../src/git/common/bytes.js";
+import { hashObject } from "../src/git/common/objects.js";
+import { comparePaths } from "../src/git/common/streams.js";
+import { matchesPaths } from "../src/git/ops/checkout.js";
+import { initRepository } from "../src/git/ops/init.js";
+import type { Worktree } from "../src/git/ops/worktree.js";
 import {
   compilePathspecs,
   dirtyPaths,
@@ -16,10 +18,7 @@ import {
   walkWorktreeEntriesStream,
   walkWorktreeEntriesStreamOwned,
   walkWorktreeStream,
-} from "../src/core/ops/worktree-io.js";
-import { comparePaths } from "../src/core/streams.js";
-import type { Worktree } from "../src/core/worktree.js";
-import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
+} from "../src/git/ops/worktree-io.js";
 import { makeRepo, makeWorkspace, type TestWorkspace } from "./helpers/workspace.js";
 import { CountingWorktree } from "./helpers/worktree.js";
 

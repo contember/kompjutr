@@ -10,13 +10,12 @@
 // non-ASCII path shows the mis-sliced boundaries.
 
 import { describe, expect, it } from "vitest";
-
+import { readBlob, type SqlDatabase } from "../../src/db/db.js";
 import { comparePaths } from "../../src/fs/path.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { currentRev } from "../../src/fs/store/meta.js";
 import { makeDirectories, writeFiles } from "../../src/fs/store/write.js";
 import type { WriteEntry } from "../../src/fs/types.js";
-import { readBlob, type SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
 // -- harness ---------------------------------------------------------

@@ -2,20 +2,21 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
-import { fromHex, utf8, utf8Decoder } from "../src/core/bytes.js";
-import { serializeCommit } from "../src/core/objects.js";
-import { commit } from "../src/core/ops/commit.js";
+import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
+import { fromHex, utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { serializeCommit } from "../src/git/common/objects.js";
+import { joinPath } from "../src/git/common/paths.js";
+import { commit } from "../src/git/ops/commit.js";
 import {
   configGet,
   configSet,
   remoteAdd,
   remoteList,
   remoteRemove,
-} from "../src/core/ops/config.js";
-import { initRepository } from "../src/core/ops/init.js";
-import type { RemoteView } from "../src/core/ops/kinds.js";
-import type { MergeStateMetadata } from "../src/core/ops/merge-state.js";
+} from "../src/git/ops/config.js";
+import { initRepository } from "../src/git/ops/init.js";
+import type { RemoteView } from "../src/git/ops/kinds.js";
+import type { MergeStateMetadata } from "../src/git/ops/merge-state.js";
 import {
   catFile,
   hashObject,
@@ -24,7 +25,7 @@ import {
   repoRoot,
   symbolicRef,
   updateRef,
-} from "../src/core/ops/plumbing.js";
+} from "../src/git/ops/plumbing.js";
 import {
   branch,
   branchDelete,
@@ -37,12 +38,10 @@ import {
   tag,
   tagDelete,
   tagList,
-} from "../src/core/ops/refs.js";
-import { walkWorktree } from "../src/core/ops/worktree-io.js";
-import { joinPath } from "../src/core/paths.js";
-import { Repository } from "../src/core/repository.js";
-import type { RemoveOptions, WriteEntry, WriteOptions } from "../src/fs/types.js";
-import { type IndexEntry, SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/ops/refs.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { walkWorktree } from "../src/git/ops/worktree-io.js";
+import { type IndexEntry, SqliteGitDatabase } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import {

@@ -1,14 +1,13 @@
 import { describe, expect, it } from "vitest";
-
-import { initializeFsSchema } from "../src/fs/schema.js";
 import {
   Database,
   type DurableObjectStorageLike,
   iterateSqlCursor,
   type SQLCursorLike,
   type SQLStorageLike,
-} from "../src/sqlite/db.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/db/db.js";
+import { initializeFsSchema } from "../src/fs/schema.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 
 function objectRow<Row extends object>(value: unknown): value is Row {

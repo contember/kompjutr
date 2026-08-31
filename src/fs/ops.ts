@@ -1,7 +1,7 @@
 // Single-path filesystem operations. Bulk storage stays in `store/`; these
 // functions add POSIX path resolution, error mapping, and metadata semantics.
 
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 import { filesystemError as fsError, hasErrorCode } from "./errors.js";
 import { basename, dirname, join, normalize } from "./path.js";
 import {

@@ -7,13 +7,7 @@
 import { Buffer } from "node:buffer";
 
 import type { SQLiteWorkspaceProvider } from "@cloudflare/computer";
-import { dirnameOf } from "../../core/paths.js";
-import type {
-  Worktree,
-  WorktreeDirent,
-  WorktreeEntryType,
-  WorktreeStat,
-} from "../../core/worktree.js";
+import type { SqlDatabase } from "../../db/db.js";
 import { comparePaths, normalize, subtreeSuccessor } from "../../fs/path.js";
 import { CHUNK_SIZE } from "../../fs/schema.js";
 import { MAX_HANDLE_MATERIALIZE_BYTES } from "../../fs/store/read.js";
@@ -35,7 +29,13 @@ import type {
   WriteEntry,
   WriteOptions,
 } from "../../fs/types.js";
-import type { SqlDatabase } from "../../sqlite/db.js";
+import { dirnameOf } from "../../git/common/paths.js";
+import type {
+  Worktree,
+  WorktreeDirent,
+  WorktreeEntryType,
+  WorktreeStat,
+} from "../../git/ops/worktree.js";
 
 const MAX_HANDLE_COUNT = 5_000;
 

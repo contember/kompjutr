@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-
+import type { SqlDatabase } from "../../src/db/db.js";
 import { CHUNK_SIZE, initializeFsSchema } from "../../src/fs/schema.js";
 import { currentRev } from "../../src/fs/store/meta.js";
 import {
@@ -15,7 +15,6 @@ import { readFile } from "../../src/fs/store/read.js";
 import { realpath, realpathNoFollow } from "../../src/fs/store/resolve.js";
 import { writeFiles } from "../../src/fs/store/write.js";
 import { S_IFDIR, S_IFREG } from "../../src/fs/types.js";
-import type { SqlDatabase } from "../../src/sqlite/db.js";
 import { TestDatabase } from "../helpers/db.js";
 
 class MeasuringDatabase implements SqlDatabase {

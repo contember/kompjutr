@@ -4,7 +4,7 @@
 //
 // Nothing here knows about git. The dependency runs one way.
 
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 
 export type EntryType = "file" | "dir" | "symlink";
 

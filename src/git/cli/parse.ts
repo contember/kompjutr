@@ -1,4 +1,4 @@
-import { GitError } from "../../core/errors.js";
+import { GitError } from "../common/errors.js";
 import {
   type GitCliOutputContext,
   gitCliCommitMessageRequired,

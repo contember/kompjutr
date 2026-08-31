@@ -16,7 +16,7 @@
 // `undecided` rather than being dropped: a false negative here would be a
 // search that silently misses a file, which is worse than a slow one.
 
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import { comparePaths } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type {

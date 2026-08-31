@@ -1,23 +1,22 @@
 import { afterEach, describe, expect, it } from "vitest";
-
-import { utf8, utf8Decoder } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { GitError, PathspecNotFoundError } from "../src/core/errors.js";
-import { IGNORE_LIMITS } from "../src/core/ignore/index.js";
-import { hashObject } from "../src/core/objects.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import { add, lsFiles, reset, rm } from "../src/core/ops/staging.js";
-import type { Repository } from "../src/core/repository.js";
+import type { SqlDatabase } from "../src/db/db.js";
+import type { ScanEntry } from "../src/fs/types.js";
+import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { GitError, PathspecNotFoundError } from "../src/git/common/errors.js";
+import { hashObject } from "../src/git/common/objects.js";
+import { IGNORE_LIMITS } from "../src/git/ignore/index.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import type { GitContext } from "../src/git/ops/context.js";
+import type { Repository } from "../src/git/ops/repository.js";
 import type {
   SelectedPathResult,
   SparseIndexAncestorResult,
-} from "../src/core/sparse-workspace.js";
-import type { ScanEntry } from "../src/fs/types.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
+} from "../src/git/ops/sparse-workspace.js";
+import { add, lsFiles, reset, rm } from "../src/git/ops/staging.js";
 import {
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-} from "../src/sqlite/sparse-workspace.js";
+} from "../src/git/store/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

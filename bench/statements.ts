@@ -1,31 +1,34 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
-import { concat, utf8 } from "../src/core/bytes.js";
-import { loadIgnoreMatcher } from "../src/core/ignore/index.js";
-import { hashObject, MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import { cherryPick, cherryPickContinue } from "../src/core/ops/cherry-pick.js";
-import { commit } from "../src/core/ops/commit.js";
-import { diff as diffIndexWorktree } from "../src/core/ops/diff.js";
-import { tryInitialCheckout } from "../src/core/ops/initial-checkout.js";
-import { merge, mergeAbort, mergeContinue } from "../src/core/ops/merge.js";
-import { selectMergeBases } from "../src/core/ops/merge-base.js";
-import { rebase } from "../src/core/ops/rebase.js";
-import { planRebase } from "../src/core/ops/rebase-plan.js";
-import { checkout } from "../src/core/ops/refs.js";
-import { planReplay, preflightReplayCommitObjects } from "../src/core/ops/replay.js";
-import { add, lsFiles, lsFilesWithWorktree, rm } from "../src/core/ops/staging.js";
-import { eagerStatus } from "../src/core/ops/status.js";
-import { dirtyPaths } from "../src/core/ops/worktree-io.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { Repository } from "../src/core/repository.js";
 import { createFilesystem } from "../src/fs/filesystem.js";
 import { CHUNK_SIZE } from "../src/fs/schema.js";
 import { createInitialWorktreeWriter } from "../src/fs/store/initial-write.js";
 import { createGit } from "../src/git/client.js";
-import { Workspace } from "../src/runtime/workspace.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
+import {
+  hashObject,
+  MODE_FILE,
+  serializeCommit,
+  serializeTree,
+} from "../src/git/common/objects.js";
+import { loadIgnoreMatcher } from "../src/git/ignore/index.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import { cherryPick, cherryPickContinue } from "../src/git/ops/cherry-pick.js";
+import { commit } from "../src/git/ops/commit.js";
+import { diff as diffIndexWorktree } from "../src/git/ops/diff.js";
+import { tryInitialCheckout } from "../src/git/ops/initial-checkout.js";
+import { merge, mergeAbort, mergeContinue } from "../src/git/ops/merge.js";
+import { selectMergeBases } from "../src/git/ops/merge-base.js";
+import { rebase } from "../src/git/ops/rebase.js";
+import { planRebase } from "../src/git/ops/rebase-plan.js";
+import { checkout } from "../src/git/ops/refs.js";
+import { planReplay, preflightReplayCommitObjects } from "../src/git/ops/replay.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { add, lsFiles, lsFilesWithWorktree, rm } from "../src/git/ops/staging.js";
+import { eagerStatus } from "../src/git/ops/status.js";
+import { dirtyPaths } from "../src/git/ops/worktree-io.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   INDEX_DIRTY,
@@ -33,10 +36,11 @@ import {
   readIndexTrackerState,
   resealIndexTracker,
   WORKTREE_DIRTY,
-} from "../src/sqlite/index-tracker.js";
-import { advanceMaintenanceRepack } from "../src/sqlite/maintenance/repack.js";
-import { createSqliteCommitTreeSnapshotSource } from "../src/sqlite/sparse-workspace.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/index-tracker.js";
+import { advanceMaintenanceRepack } from "../src/git/store/maintenance/repack.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse-workspace.js";
+import { Workspace } from "../src/runtime/workspace.js";
 import { TestDatabase } from "../tests/helpers/db.js";
 import { GitFixture, slices } from "../tests/helpers/git.js";
 import { startGitServer } from "../tests/helpers/http-backend.js";

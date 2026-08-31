@@ -1,22 +1,21 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-
-import { utf8 } from "../src/core/bytes.js";
-import { MODE_FILE, serializeCommit, serializeTree } from "../src/core/objects.js";
-import type { ReplayStateMetadata } from "../src/core/ops/operation-state.js";
-import { operationRefLogMetadata } from "../src/core/ops/ref-log.js";
-import { branchDelete } from "../src/core/ops/refs.js";
+import { createGit, type Git } from "../src/git/client.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { MODE_FILE, serializeCommit, serializeTree } from "../src/git/common/objects.js";
+import type { ReplayStateMetadata } from "../src/git/ops/operation-state.js";
+import { operationRefLogMetadata } from "../src/git/ops/ref-log.js";
+import { branchDelete } from "../src/git/ops/refs.js";
+import { Repository } from "../src/git/ops/repository.js";
 import {
   worktreeAdd,
   worktreeList,
   worktreePrune,
   worktreeRemove,
-} from "../src/core/ops/worktrees.js";
-import { Repository } from "../src/core/repository.js";
-import { createGit, type Git } from "../src/git/client.js";
+} from "../src/git/ops/worktrees.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { Workspace } from "../src/runtime/workspace.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { GitFixture } from "./helpers/git.js";
 import { SqliteTestStorage } from "./helpers/storage.js";
 import {

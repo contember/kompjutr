@@ -1,23 +1,23 @@
-import type { GitIdentity, IndexTrackerWriter } from "../core/context.js";
-import type { GitHttpClient } from "../core/protocol/transport.js";
+import { Database, type DurableObjectStorageLike } from "../db/db.js";
 import { NodeFsCompat } from "../fs/compat/node.js";
 import { createExactPathStateSource } from "../fs/exact-path-states.js";
 import { createFilesystem } from "../fs/filesystem.js";
 import { createInitialWorktreeWriter } from "../fs/store/initial-write.js";
 import type { Filesystem } from "../fs/types.js";
 import type { Git, GitFactory } from "../git/client.js";
-import { Database, type DurableObjectStorageLike } from "../sqlite/db.js";
+import type { GitIdentity, IndexTrackerWriter } from "../git/ops/context.js";
+import type { GitHttpClient } from "../git/protocol/transport.js";
+import { SqliteGitDatabase, type StoreOptions } from "../git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   initializeIndexTracker,
   resealIndexTracker,
-} from "../sqlite/index-tracker.js";
+} from "../git/store/index-tracker.js";
 import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSelectedPathSource,
   createSqliteSparseWorkspaceSource,
-} from "../sqlite/sparse-workspace.js";
-import { SqliteGitDatabase, type StoreOptions } from "../sqlite/store.js";
+} from "../git/store/sparse-workspace.js";
 import type { ProcessExecOptions, ProcessHandle, ProcessHost } from "./types.js";
 
 export interface WorkspaceOptions extends StoreOptions {

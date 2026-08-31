@@ -4,7 +4,7 @@ export {
   type SQLCursorLike,
   type SQLStorageLike,
   type SqlDatabase,
-} from "../sqlite/db.js";
+} from "../db/db.js";
 export type {
   CompatWriteFilesEntry,
   CompatWriteFilesOptions,

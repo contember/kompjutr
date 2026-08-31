@@ -5,9 +5,9 @@ import {
   MAX_MERGE_BASES,
   mergeBase,
   selectMergeBases,
-} from "../src/core/ops/merge-base.js";
-import { Repository } from "../src/core/repository.js";
-import { type CheckoutStore, SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/ops/merge-base.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { type CheckoutStore, SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
 

@@ -1,9 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest";
-
-import { fromHex, utf8 } from "../src/core/bytes.js";
-import type { IgnoreMatcher } from "../src/core/ignore/index.js";
-import { checkoutTree } from "../src/core/ops/checkout.js";
-import { commit } from "../src/core/ops/commit.js";
+import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
+import { fromHex, utf8 } from "../src/git/common/bytes.js";
+import { comparePaths } from "../src/git/common/streams.js";
+import type { IgnoreMatcher } from "../src/git/ignore/index.js";
+import { checkoutTree } from "../src/git/ops/checkout.js";
+import { commit } from "../src/git/ops/commit.js";
 import {
   clean,
   formatPorcelainV1,
@@ -16,11 +17,9 @@ import {
   statusMatrix,
   statusReport,
   statusStream,
-} from "../src/core/ops/status.js";
-import { hashWorktreePath, indexEntryFor } from "../src/core/ops/worktree-io.js";
-import { comparePaths } from "../src/core/streams.js";
-import type { ScanEntry, ScanOptions } from "../src/fs/types.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+} from "../src/git/ops/status.js";
+import { hashWorktreePath, indexEntryFor } from "../src/git/ops/worktree-io.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 import { GitFixture } from "./helpers/git.js";
 import { importFixture } from "./helpers/import.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";

@@ -5,29 +5,34 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { utf8, utf8Decoder } from "../src/core/bytes.js";
-import type { GitContext } from "../src/core/context.js";
-import { GitError } from "../src/core/errors.js";
-import { hashObject, type Person, serializeCommit, serializeTree } from "../src/core/objects.js";
+import { utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { GitError } from "../src/git/common/errors.js";
+import {
+  hashObject,
+  type Person,
+  serializeCommit,
+  serializeTree,
+} from "../src/git/common/objects.js";
 import {
   commit,
   commitIndex,
   resolveIdentity,
   writeUnpublishedCommit,
-} from "../src/core/ops/commit.js";
-import { log } from "../src/core/ops/reads.js";
-import { eagerStatus } from "../src/core/ops/status.js";
-import { buildTree } from "../src/core/ops/tree-build.js";
-import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/core/ops/worktree-io.js";
-import type { CommitTreeSnapshotSource } from "../src/core/sparse-workspace.js";
+} from "../src/git/ops/commit.js";
+import type { GitContext } from "../src/git/ops/context.js";
+import { log } from "../src/git/ops/reads.js";
+import type { CommitTreeSnapshotSource } from "../src/git/ops/sparse-workspace.js";
+import { eagerStatus } from "../src/git/ops/status.js";
+import { buildTree } from "../src/git/ops/tree-build.js";
+import { hashWorktreePath, indexEntryFor, walkWorktree } from "../src/git/ops/worktree-io.js";
+import type { IndexEntry } from "../src/git/store/index.js";
 import {
   advanceIndexTrackerBaseline,
   invalidateIndexTracker,
   readIndexTrackerState,
   resealIndexTracker,
-} from "../src/sqlite/index-tracker.js";
-import { createSqliteCommitTreeSnapshotSource } from "../src/sqlite/sparse-workspace.js";
-import type { IndexEntry } from "../src/sqlite/store.js";
+} from "../src/git/store/index-tracker.js";
+import { createSqliteCommitTreeSnapshotSource } from "../src/git/store/sparse-workspace.js";
 import { GitFixture } from "./helpers/git.js";
 import { makeRepo, type TestRepository, writeWorkFile } from "./helpers/workspace.js";
 

@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
-import { comparePaths, joinSorted, joinSorted3, peekable } from "../src/core/streams.js";
+import { comparePaths, joinSorted, joinSorted3, peekable } from "../src/git/common/streams.js";
 
 /**
  * `comparePaths` claims to be SQLite's BINARY collation. That claim is not

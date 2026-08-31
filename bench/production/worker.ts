@@ -1,18 +1,14 @@
-import { concat, utf8, utf8Decoder } from "../../src/core/bytes.js";
-import { FLUSH, pkt } from "../../src/core/protocol/pktline.js";
+import type { DurableObjectStorageLike, SQLCursorLike, SQLStorageLike } from "../../src/db/db.js";
+import { createGit } from "../../src/git/client.js";
+import { concat, utf8, utf8Decoder } from "../../src/git/common/bytes.js";
+import { FLUSH, pkt } from "../../src/git/protocol/pktline.js";
 import {
   fetchHttpClient,
   type GitHttpClient,
   type GitHttpRequest,
   type GitHttpResponse,
-} from "../../src/core/protocol/transport.js";
-import { createGit } from "../../src/git/client.js";
+} from "../../src/git/protocol/transport.js";
 import { Workspace } from "../../src/runtime/workspace.js";
-import type {
-  DurableObjectStorageLike,
-  SQLCursorLike,
-  SQLStorageLike,
-} from "../../src/sqlite/db.js";
 import {
   PROBE_FIXTURE_BRANCH,
   PROBE_FIXTURE_FETCH_BRANCH,

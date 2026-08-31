@@ -1,4 +1,4 @@
-import type { SqlDatabase } from "../sqlite/db.js";
+import type { SqlDatabase } from "../db/db.js";
 import { filesystemError } from "./errors.js";
 
 export type ExactPathState = "present" | "missing";

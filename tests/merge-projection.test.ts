@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import type { IntegrationConflictKind, IntegrationPlan } from "../src/core/ops/integration.js";
-import type { IntegrationIdentity } from "../src/core/ops/integration-structure.js";
-import { projectMergePlan } from "../src/core/ops/merge-projection.js";
+import type { IntegrationConflictKind, IntegrationPlan } from "../src/git/ops/integration.js";
+import type { IntegrationIdentity } from "../src/git/ops/integration-structure.js";
+import { projectMergePlan } from "../src/git/ops/merge-projection.js";
 
 function identity(digit: string, mode = "100644"): IntegrationIdentity {
   return { mode, oid: digit.repeat(40) };

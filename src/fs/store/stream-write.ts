@@ -1,7 +1,7 @@
 // Atomic streamed writes for shell redirects. Content stays in bounded chunks;
 // an upstream exception rolls the complete transaction back.
 
-import { blob, type SqlDatabase } from "../../sqlite/db.js";
+import { blob, type SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { dirname, normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";

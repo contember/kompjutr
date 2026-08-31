@@ -1,7 +1,7 @@
 // Bulk timestamp updates preserve content and preflight the complete set before
 // one revision bump. Missing targets become empty regular files.
 
-import type { SqlDatabase } from "../../sqlite/db.js";
+import type { SqlDatabase } from "../../db/db.js";
 import { filesystemError as fsError } from "../errors.js";
 import { comparePaths, dirname, normalize } from "../path.js";
 import type { EntryType, RealPath } from "../types.js";

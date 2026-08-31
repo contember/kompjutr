@@ -1,13 +1,4 @@
-import {
-  type ExactRootStateSource,
-  type GitContext,
-  type GitIdentity,
-  type IndexTrackerWriter,
-  type InitialWorktreeWriter,
-  nestedRoots,
-  openRepository,
-} from "../core/context.js";
-import { GitError, UnsupportedOperationError } from "../core/errors.js";
+import { GitError, UnsupportedOperationError } from "./common/errors.js";
 import {
   type CherryPickContinueOptions,
   type CherryPickOptions,
@@ -15,8 +6,8 @@ import {
   cherryPickContinue as cherryPickContinueOp,
   cherryPick as cherryPickOp,
   cherryPickSkip as cherryPickSkipOp,
-} from "../core/ops/cherry-pick.js";
-import { type CommitOptions, commit as commitOp } from "../core/ops/commit.js";
+} from "./ops/cherry-pick.js";
+import { type CommitOptions, commit as commitOp } from "./ops/commit.js";
 import {
   type ConfigGetOptions,
   type ConfigSetOptions,
@@ -31,13 +22,18 @@ import {
   remoteList,
   remoteRemove,
   remoteSetUrl,
-} from "../core/ops/config.js";
+} from "./ops/config.js";
 import {
-  type DiffOptions,
-  diff as diffOp,
-  diffSummary as diffSummaryOp,
-} from "../core/ops/diff.js";
-import { type InitOptions, initRepository } from "../core/ops/init.js";
+  type ExactRootStateSource,
+  type GitContext,
+  type GitIdentity,
+  type IndexTrackerWriter,
+  type InitialWorktreeWriter,
+  nestedRoots,
+  openRepository,
+} from "./ops/context.js";
+import { type DiffOptions, diff as diffOp, diffSummary as diffSummaryOp } from "./ops/diff.js";
+import { type InitOptions, initRepository } from "./ops/init.js";
 import type {
   CommitResult,
   DiffSummaryEntry,
@@ -46,16 +42,16 @@ import type {
   RemoteView,
   ReplayResult,
   StatusEntry,
-} from "../core/ops/kinds.js";
-import { type LsRemoteOptions, lsRemote as lsRemoteOp } from "../core/ops/ls-remote.js";
-import { type MaintenanceResult, maintenance as maintenanceOp } from "../core/ops/maintenance.js";
+} from "./ops/kinds.js";
+import { type LsRemoteOptions, lsRemote as lsRemoteOp } from "./ops/ls-remote.js";
+import { type MaintenanceResult, maintenance as maintenanceOp } from "./ops/maintenance.js";
 import {
   type MergeContinueOptions,
   type MergeOptions,
   mergeAbort as mergeAbortOp,
   mergeContinue as mergeContinueOp,
   merge as mergeOp,
-} from "../core/ops/merge.js";
+} from "./ops/merge.js";
 import {
   type DivergenceOptions,
   type DivergenceResult,
@@ -63,19 +59,19 @@ import {
   type MergeBaseOptions,
   type MergeBaseResult,
   mergeBase as mergeBaseOp,
-} from "../core/ops/merge-base.js";
+} from "./ops/merge-base.js";
 import {
   type CloneOptions,
   clone as cloneOp,
   type FetchOptions,
   fetchInto,
   validateFetchOptions,
-} from "../core/ops/network.js";
+} from "./ops/network.js";
 import type {
   FetchResult as StructuredFetchResult,
   LsRemoteResult as StructuredLsRemoteResult,
   PushResult as StructuredPushResult,
-} from "../core/ops/refspec.js";
+} from "./ops/refspec.js";
 
 export type {
   FetchRefspec,
@@ -88,8 +84,10 @@ export type {
   PushTrackingResult,
   RemoteRefView,
   RemoteTarget,
-} from "../core/ops/refspec.js";
+} from "./ops/refspec.js";
 
+import { createContextGitCliRunner } from "./cli/index.js";
+import type { GitCliInput, GitCliResult, GitCliRunner, GitCliRunOptions } from "./cli/types.js";
 import {
   type CatFileOptions,
   type CommitTreeOptions,
@@ -106,9 +104,9 @@ import {
   type UpdateRefOptions,
   updateRef as updateRefOp,
   writeTree as writeTreeOp,
-} from "../core/ops/plumbing.js";
-import { type PullOptions, pull as pullOp } from "../core/ops/pull.js";
-import { type PushOptions, push as pushOp } from "../core/ops/push.js";
+} from "./ops/plumbing.js";
+import { type PullOptions, pull as pullOp } from "./ops/pull.js";
+import { type PushOptions, push as pushOp } from "./ops/push.js";
 import {
   type CommitView,
   catFile as catFileRead,
@@ -118,7 +116,7 @@ import {
   lsTree as lsTreeOp,
   show as showOp,
   type TreeEntryView,
-} from "../core/ops/reads.js";
+} from "./ops/reads.js";
 import {
   type RebaseContinueOptions,
   type RebaseStartOptions,
@@ -126,14 +124,14 @@ import {
   rebaseContinue as rebaseContinueOp,
   rebase as rebaseOp,
   rebaseSkip as rebaseSkipOp,
-} from "../core/ops/rebase.js";
+} from "./ops/rebase.js";
 import {
   type RecoverRefOptions,
   type RefLogEntry,
   type RefLogReadOptions,
   recoverRef as recoverRefOp,
   reflog as reflogOp,
-} from "../core/ops/ref-log.js";
+} from "./ops/ref-log.js";
 import {
   type BranchDeleteOptions,
   type BranchOptions,
@@ -151,12 +149,13 @@ import {
   tagDelete as tagDeleteOp,
   tagList as tagListOp,
   tag as tagOp,
-} from "../core/ops/refs.js";
+} from "./ops/refs.js";
 import {
   type ReplaySnapshotOptions,
   type ReplaySnapshotResult,
   replaySnapshot as replaySnapshotOp,
-} from "../core/ops/replay.js";
+} from "./ops/replay.js";
+import type { Repository } from "./ops/repository.js";
 import {
   type RevertContinueOptions,
   type RevertOptions,
@@ -164,7 +163,12 @@ import {
   revertContinue as revertContinueOp,
   revert as revertOp,
   revertSkip as revertSkipOp,
-} from "../core/ops/revert.js";
+} from "./ops/revert.js";
+import type {
+  CommitTreeSnapshotSource,
+  SelectedPathSource,
+  SparseWorkspaceSource,
+} from "./ops/sparse-workspace.js";
 import {
   type AddOptions,
   add as addOp,
@@ -174,7 +178,7 @@ import {
   type RmOptions,
   reset as resetOp,
   rm as rmOp,
-} from "../core/ops/staging.js";
+} from "./ops/staging.js";
 import {
   type CleanOptions,
   clean as cleanOp,
@@ -184,7 +188,8 @@ import {
   type StatusOptions,
   type StatusReportOptions,
   statusBranch,
-} from "../core/ops/status.js";
+} from "./ops/status.js";
+import type { Worktree } from "./ops/worktree.js";
 import {
   type WorktreeAddOptions,
   type WorktreeInfo,
@@ -193,18 +198,9 @@ import {
   worktreeList as worktreeListOp,
   worktreePrune as worktreePruneOp,
   worktreeRemove as worktreeRemoveOp,
-} from "../core/ops/worktrees.js";
-import type { GitHttpClient } from "../core/protocol/transport.js";
-import type { Repository } from "../core/repository.js";
-import type {
-  CommitTreeSnapshotSource,
-  SelectedPathSource,
-  SparseWorkspaceSource,
-} from "../core/sparse-workspace.js";
-import type { Worktree } from "../core/worktree.js";
-import type { SqliteGitDatabase } from "../sqlite/store.js";
-import { createContextGitCliRunner } from "./cli/index.js";
-import type { GitCliInput, GitCliResult, GitCliRunner, GitCliRunOptions } from "./cli/types.js";
+} from "./ops/worktrees.js";
+import type { GitHttpClient } from "./protocol/transport.js";
+import type { SqliteGitDatabase } from "./store/index.js";
 
 export interface GitDirOptions {
   dir?: string;

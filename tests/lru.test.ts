@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { ByteLru } from "../src/core/lru.js";
+import { ByteLru } from "../src/git/common/lru.js";
 
 describe("ByteLru", () => {
   it("bounds zero-payload entries by their fixed retained cost", () => {

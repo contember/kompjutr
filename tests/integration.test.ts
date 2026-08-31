@@ -1,23 +1,23 @@
 import { describe, expect, it } from "vitest";
 
-import { concat } from "../src/core/bytes.js";
-import { DEFAULT_TEXT_MERGE_LIMITS } from "../src/core/diff/xmerge.js";
-import { hasErrorCode } from "../src/core/errors.js";
-import { hashObject, MODE_FILE, serializeTree } from "../src/core/objects.js";
-import { type IntegrationEntry, planIntegration } from "../src/core/ops/integration.js";
+import { concat } from "../src/git/common/bytes.js";
+import { hasErrorCode } from "../src/git/common/errors.js";
+import { hashObject, MODE_FILE, serializeTree } from "../src/git/common/objects.js";
+import { comparePaths } from "../src/git/common/streams.js";
+import { DEFAULT_TEXT_MERGE_LIMITS } from "../src/git/diff/xmerge.js";
+import { type IntegrationEntry, planIntegration } from "../src/git/ops/integration.js";
 import {
   projectedTouchedShape,
   requireCleanIntegrationWorktree,
-} from "../src/core/ops/integration-worktree.js";
-import type { ProjectedMergeEntry } from "../src/core/ops/merge-projection.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { Repository } from "../src/core/repository.js";
-import { comparePaths } from "../src/core/streams.js";
+} from "../src/git/ops/integration-worktree.js";
+import type { ProjectedMergeEntry } from "../src/git/ops/merge-projection.js";
+import { Repository } from "../src/git/ops/repository.js";
 import {
   type CheckoutStore,
   PACK_BLOB_BATCH_TARGET_BYTES,
   SqliteGitDatabase,
-} from "../src/sqlite/store.js";
+} from "../src/git/store/index.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { makeRepo } from "./helpers/workspace.js";

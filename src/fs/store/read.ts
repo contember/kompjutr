@@ -8,7 +8,7 @@
 // either reported in `remaining` or assembled from bounded pages — never
 // pulled across the wire in one result set.
 
-import { readBlob, type SqlDatabase } from "../../sqlite/db.js";
+import { readBlob, type SqlDatabase } from "../../db/db.js";
 import { normalize } from "../path.js";
 import { CHUNK_SIZE } from "../schema.js";
 import type {

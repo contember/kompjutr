@@ -1,19 +1,19 @@
-import { utf8Decoder } from "../../core/bytes.js";
-import { type GitContext, nestedRoots, openRepository } from "../../core/context.js";
-import { diffText } from "../../core/diff/index.js";
-import { isBinary } from "../../core/diff/lines.js";
-import { GitError, hasErrorCode } from "../../core/errors.js";
-import { commit as commitOp } from "../../core/ops/commit.js";
-import { diffHeaderPath, diffSummaryBounded } from "../../core/ops/diff.js";
-import type { DiffSummaryEntry, RebaseResult } from "../../core/ops/kinds.js";
-import type { RebaseJournal } from "../../core/ops/operation-state.js";
-import { rebaseAbortExcluding, rebaseContinueExcluding } from "../../core/ops/rebase.js";
-import { type AddLiteralPathsResult, addLiteralPaths } from "../../core/ops/staging.js";
-import { eagerStatus } from "../../core/ops/status.js";
-import { formatCommitRefusalStatus, statusFormatOptions } from "../../core/ops/status-format.js";
-import { joinPath, normalizePath, relativeTo } from "../../core/paths.js";
-import type { Repository, ResolvedHead } from "../../core/repository.js";
-import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../../sqlite/store.js";
+import { utf8Decoder } from "../common/bytes.js";
+import { GitError, hasErrorCode } from "../common/errors.js";
+import { joinPath, normalizePath, relativeTo } from "../common/paths.js";
+import { diffText } from "../diff/index.js";
+import { isBinary } from "../diff/lines.js";
+import { commit as commitOp } from "../ops/commit.js";
+import { type GitContext, nestedRoots, openRepository } from "../ops/context.js";
+import { diffHeaderPath, diffSummaryBounded } from "../ops/diff.js";
+import type { DiffSummaryEntry, RebaseResult } from "../ops/kinds.js";
+import type { RebaseJournal } from "../ops/operation-state.js";
+import { rebaseAbortExcluding, rebaseContinueExcluding } from "../ops/rebase.js";
+import type { Repository, ResolvedHead } from "../ops/repository.js";
+import { type AddLiteralPathsResult, addLiteralPaths } from "../ops/staging.js";
+import { eagerStatus } from "../ops/status.js";
+import { formatCommitRefusalStatus, statusFormatOptions } from "../ops/status-format.js";
+import { PACK_BLOB_BATCH_TARGET_BYTES, type WalkTreeDiffEntry } from "../store/index.js";
 import {
   boundedGitCliResult,
   type GitCliOutputContext,

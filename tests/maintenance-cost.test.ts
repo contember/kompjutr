@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-
-import { concat, utf8 } from "../src/core/bytes.js";
+import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   hashObject,
   MODE_FILE,
@@ -8,12 +8,11 @@ import {
   serializeCommit,
   serializeTree,
   type TreeEntry,
-} from "../src/core/objects.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { createGit, type GitMaintenanceResult } from "../src/git/client.js";
+} from "../src/git/common/objects.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
+import { GC_GRACE_MS } from "../src/git/store/maintenance/sweep.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import { Workspace } from "../src/runtime/workspace.js";
-import { GC_GRACE_MS } from "../src/sqlite/maintenance/sweep.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 import { SqliteTestStorage } from "./helpers/storage.js";

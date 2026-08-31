@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import { afterAll, describe, expect, it } from "vitest";
-import { concat, utf8, utf8Decoder } from "../src/core/bytes.js";
-import { GitError } from "../src/core/errors.js";
+import { blob, readBlob, type SqlDatabase } from "../src/db/db.js";
+import { concat, utf8, utf8Decoder } from "../src/git/common/bytes.js";
+import { GitError } from "../src/git/common/errors.js";
 import {
   hashObject,
   MODE_FILE,
@@ -12,15 +13,15 @@ import {
   type RawObject,
   serializeCommit,
   serializeTree,
-} from "../src/core/objects.js";
-import { applyDelta, encodeDeltaHeader } from "../src/core/pack/delta.js";
+} from "../src/git/common/objects.js";
+import { COMMIT_CACHE_FLUSH_BYTES } from "../src/git/store/commits.js";
+import { SqliteGitDatabase, type StoreOptions } from "../src/git/store/index.js";
+import { applyDelta, encodeDeltaHeader } from "../src/git/store/pack/delta.js";
 import {
   type FullObjectPackInput,
   streamFullObjectPack,
-} from "../src/core/pack/full-object-stream.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { COMMIT_CACHE_FLUSH_BYTES } from "../src/sqlite/commits.js";
-import { blob, readBlob, type SqlDatabase } from "../src/sqlite/db.js";
+} from "../src/git/store/pack/full-object-stream.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import {
   type CompletePackObject,
   MAX_DELTA_DEPTH,
@@ -28,8 +29,7 @@ import {
   MAX_PACK_DELTA_WORKING_BYTES,
   PACK_BLOB_BATCH_TARGET_BYTES,
   PACK_CHUNK,
-} from "../src/sqlite/packs.js";
-import { SqliteGitDatabase, type StoreOptions } from "../src/sqlite/store.js";
+} from "../src/git/store/packs.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture, slices } from "./helpers/git.js";
 

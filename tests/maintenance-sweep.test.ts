@@ -1,21 +1,20 @@
 import { describe, expect, it } from "vitest";
-
-import { concat, utf8 } from "../src/core/bytes.js";
+import { blob, type SqlDatabase } from "../src/db/db.js";
+import { concat, utf8 } from "../src/git/common/bytes.js";
 import {
   hashObject,
   MODE_FILE,
   type ObjectType,
   serializeCommit,
   serializeTree,
-} from "../src/core/objects.js";
-import { PackWriter } from "../src/core/pack/writer.js";
-import { blob, type SqlDatabase } from "../src/sqlite/db.js";
+} from "../src/git/common/objects.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import {
   advanceMaintenanceSweep,
   GC_GRACE_MS,
   type MaintenanceSweepProgress,
-} from "../src/sqlite/maintenance/sweep.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+} from "../src/git/store/maintenance/sweep.js";
+import { PackWriter } from "../src/git/store/pack/writer.js";
 import { TestDatabase } from "./helpers/db.js";
 import { slices } from "./helpers/git.js";
 

@@ -1,10 +1,9 @@
 import { describe, expect, it } from "vitest";
-
-import { utf8 } from "../src/core/bytes.js";
-import { commitIndex } from "../src/core/ops/commit.js";
-import { Repository } from "../src/core/repository.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
-import { SqliteGitDatabase } from "../src/sqlite/store.js";
+import type { SqlDatabase } from "../src/db/db.js";
+import { utf8 } from "../src/git/common/bytes.js";
+import { commitIndex } from "../src/git/ops/commit.js";
+import { Repository } from "../src/git/ops/repository.js";
+import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 
 class RefWriteFailureDatabase implements SqlDatabase {

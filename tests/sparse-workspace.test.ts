@@ -1,15 +1,14 @@
 import { describe, expect, it } from "vitest";
-
-import { MODE_FILE, serializeTree } from "../src/core/objects.js";
-import { commit } from "../src/core/ops/commit.js";
-import { add } from "../src/core/ops/staging.js";
-import { comparePaths } from "../src/core/streams.js";
-import type { SqlDatabase } from "../src/sqlite/db.js";
+import type { SqlDatabase } from "../src/db/db.js";
+import { MODE_FILE, serializeTree } from "../src/git/common/objects.js";
+import { comparePaths } from "../src/git/common/streams.js";
+import { commit } from "../src/git/ops/commit.js";
+import { add } from "../src/git/ops/staging.js";
 import {
   INDEX_DIRTY,
   invalidateIndexTracker,
   resealIndexTracker,
-} from "../src/sqlite/index-tracker.js";
+} from "../src/git/store/index-tracker.js";
 import {
   createSqliteCommitTreeSnapshotSource,
   createSqliteSelectedPathSource,
@@ -19,7 +18,7 @@ import {
   selectSparsePathsOwned,
   snapshotCommitTreeOwned,
   sparseIndexAncestorFactsOwned,
-} from "../src/sqlite/sparse-workspace.js";
+} from "../src/git/store/sparse-workspace.js";
 import { makeRepo, writeWorkFile } from "./helpers/workspace.js";
 
 class ExplainSelectedDatabase implements SqlDatabase {
