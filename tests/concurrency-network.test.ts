@@ -133,6 +133,92 @@ async function settlePushFetch(
 }
 
 describe("push and pull concurrency", () => {
+  it("returns EABORTED when discovery cancellation settles immediately before POST", async () => {
+    const { fixture, initial } = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const controller = new AbortController();
+    const reason = new Error("cancel after push discovery");
+    let pushDiscoveries = 0;
+    const http: GitHttpClient = async (request) => {
+      const response = await fetchHttpClient(request);
+      if (request.method !== "GET") return response;
+      pushDiscoveries++;
+      const body = async function* (): AsyncGenerator<Uint8Array> {
+        try {
+          yield* response.body;
+        } finally {
+          controller.abort(reason);
+        }
+      };
+      return { ...response, body: body() };
+    };
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 0,
+        noTags: true,
+      });
+      const repo = openRepository(workspace.context, "/work");
+      await localCommit(gitFor(workspace), workspace, "cancel before POST\n");
+      const posts = server.requests.filter((request) => request.method === "POST").length;
+
+      await expect(
+        push({ ...workspace.context, http }, repo, { signal: controller.signal }),
+      ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+
+      expect(pushDiscoveries).toBe(1);
+      expect(server.requests.filter((request) => request.method === "POST")).toHaveLength(posts);
+      expect(fixture.git("rev-parse", "main")).toBe(initial);
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
+      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns EPUSHUNCERTAIN after a consumed POST abort and leaves tracking unchanged", async () => {
+    const { fixture, initial } = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    const workspace = makeWorkspace();
+    const response = bufferedHttpResponseBarrier(fetchHttpClient, {
+      name: "abort after consumed push POST",
+      select: (request) => request.method === "POST",
+    });
+    const controller = new AbortController();
+    const reason = new Error("cancel after remote consumed POST");
+    let pushing: Promise<unknown> | null = null;
+    try {
+      await clone(workspace.context, {
+        url: server.url,
+        dir: "/work",
+        depth: 0,
+        noTags: true,
+      });
+      const repo = openRepository(workspace.context, "/work");
+      const pushed = await localCommit(gitFor(workspace), workspace, "consumed before abort\n");
+
+      pushing = push({ ...workspace.context, http: response.http }, repo, {
+        signal: controller.signal,
+      });
+      await awaitBarrierEntry(response, pushing);
+      expect(fixture.git("rev-parse", "main")).toBe(pushed);
+      controller.abort(reason);
+      await expect(pushing).rejects.toMatchObject({
+        code: "EPUSHUNCERTAIN",
+        cause: { code: "EABORTED", cause: reason },
+      });
+
+      expect(repo.store.getRef("refs/remotes/origin/main")).toBe(initial);
+      assertRepositoryReadable(reopenTestRepository(workspace, "/work").repo);
+    } finally {
+      response.release();
+      await Promise.allSettled([pushing].filter((value) => value !== null));
+      await server.close();
+    }
+  });
+
   it.each(COMPLETION_ORDERS)(
     "does not let delayed push tracking regress a newer fetch in %s order",
     async (order) => {

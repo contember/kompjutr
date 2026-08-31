@@ -11,8 +11,14 @@ import {
   type ProtocolMemoryLimits,
   type ProtocolRequestOptions,
 } from "./remote.js";
-import { ByteReader, type Pkt } from "./stream.js";
-import { type GitAuth, type GitHttpResponse, HttpError, requestWithAuth } from "./transport.js";
+import { ByteReader, type Pkt, throwIfAborted } from "./stream.js";
+import {
+  fetchHttpClient,
+  type GitAuth,
+  type GitHttpResponse,
+  HttpError,
+  requestWithAuth,
+} from "./transport.js";
 
 export const MAX_RECEIVE_PACK_COMMANDS = 1_024;
 export const MAX_PUSH_OPTIONS = 64;
@@ -79,6 +85,11 @@ interface ResolvedStatusLimits {
 
 interface LocalPackFailure {
   readonly cause: unknown;
+}
+
+interface PostCertainty {
+  invoked: boolean;
+  safeAbort: boolean;
 }
 
 type ParsedStatusLine =
@@ -418,8 +429,9 @@ async function* sidebandBody(
   limits: ResolvedStatusLimits,
   onProgress: ((message: string) => void) | undefined,
   onMessage: ((message: string) => void) | undefined,
+  signal: AbortSignal | undefined,
 ): AsyncGenerator<Uint8Array> {
-  const reader = new ByteReader(source);
+  const reader = new ByteReader(source, signal);
   const budget = new StatusWireBudget(limits);
   let flushed = false;
   try {
@@ -473,8 +485,9 @@ async function parseStatus(
   commands: readonly ReceivePackCommand[],
   atomic: boolean,
   limits: ResolvedStatusLimits,
+  signal: AbortSignal | undefined,
 ): Promise<ReceivePackStatus> {
-  const reader = new ByteReader(body);
+  const reader = new ByteReader(body, signal);
   const wireBudget = new StatusWireBudget(limits);
   const resultBudget = new ResultBudget(limits.retainedBytes);
   const expected = new Set<string>();
@@ -605,6 +618,46 @@ function authOptions(options: ReceivePackOptions): ReceivePackOptions {
   };
 }
 
+async function* tracked401Body(
+  body: AsyncIterable<Uint8Array>,
+  certainty: PostCertainty,
+): AsyncGenerator<Uint8Array> {
+  const iterator = body[Symbol.asyncIterator]();
+  let complete = false;
+  try {
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done === true) {
+        complete = true;
+        return;
+      }
+      yield next.value;
+    }
+  } finally {
+    if (!complete) await iterator.return?.();
+    certainty.safeAbort = true;
+  }
+}
+
+function certaintyOptions(
+  options: ReceivePackOptions,
+  certainty: PostCertainty,
+): ReceivePackOptions {
+  const authenticated = authOptions(options);
+  const upstream = authenticated.http ?? fetchHttpClient;
+  return {
+    ...authenticated,
+    http: async (request) => {
+      certainty.invoked = true;
+      certainty.safeAbort = false;
+      const response = await upstream(request);
+      return response.status === 401
+        ? { ...response, body: tracked401Body(response.body, certainty) }
+        : response;
+    },
+  };
+}
+
 function findLocalPackFailure(error: unknown): LocalPackFailure | null {
   const seen = new Set<object>();
   let current = error;
@@ -631,19 +684,25 @@ function uncertain(message: string, cause: unknown): GitError {
 async function readResponsePrefix(
   body: AsyncIterable<Uint8Array>,
   inputLimit: number | undefined,
+  signal: AbortSignal | undefined,
 ): Promise<string> {
   const prefix = new Uint8Array(ERROR_PREFIX_BYTES);
   let retained = 0;
   let input = 0;
-  for await (const chunk of body) {
-    if (inputLimit !== undefined && chunk.length > inputLimit - input) {
-      throw new GitError("E2BIG", "receive-pack error response exceeds its bounded input limit");
+  const reader = new ByteReader(body, signal);
+  try {
+    for await (const chunk of reader.rest()) {
+      if (inputLimit !== undefined && chunk.length > inputLimit - input) {
+        throw new GitError("E2BIG", "receive-pack error response exceeds its bounded input limit");
+      }
+      if (inputLimit !== undefined) input += chunk.length;
+      if (retained >= prefix.length) continue;
+      const take = Math.min(chunk.length, prefix.length - retained);
+      prefix.set(chunk.subarray(0, take), retained);
+      retained += take;
     }
-    if (inputLimit !== undefined) input += chunk.length;
-    if (retained >= prefix.length) continue;
-    const take = Math.min(chunk.length, prefix.length - retained);
-    prefix.set(chunk.subarray(0, take), retained);
-    retained += take;
+  } finally {
+    await reader.release();
   }
   return lossyUtf8Decoder.decode(prefix.subarray(0, retained)).slice(0, ERROR_PREFIX_CHARACTERS);
 }
@@ -655,6 +714,7 @@ export async function receivePack(
   const limits = resolvedStatusLimits(options.protocolLimits);
   const prepared = prepareRequest(request);
   const base = normalizeRemoteUrl(request.url);
+  const certainty: PostCertainty = { invoked: false, safeAbort: false };
   let response: GitHttpResponse;
   try {
     response = await requestWithAuth(
@@ -668,7 +728,7 @@ export async function receivePack(
         },
         body: requestBody(prepared, prepared.pack),
       }),
-      authOptions(options),
+      certaintyOptions(options, certainty),
       options.authSession,
     );
   } catch (error) {
@@ -679,14 +739,19 @@ export async function receivePack(
       throw new GitError("EPUSHLOCAL", "local receive-pack body generation failed", { cause });
     }
     if (hasErrorCode(error, "EAUTH")) throw error;
+    if (hasErrorCode(error, "EABORTED") && (!certainty.invoked || certainty.safeAbort)) {
+      throw error;
+    }
     throw uncertain("receive-pack POST failed after the request may have been consumed", error);
   }
 
   if (response.status === 401) {
     let text = "";
     try {
-      text = await readResponsePrefix(response.body, limits.inputBytes);
+      text = await readResponsePrefix(response.body, limits.inputBytes, options.signal);
+      throwIfAborted(options.signal);
     } catch (cause) {
+      if (hasErrorCode(cause, "EABORTED")) throw cause;
       throw new GitError("EHTTP", "git-receive-pack authentication failed", { cause });
     }
     throw new HttpError(
@@ -697,7 +762,7 @@ export async function receivePack(
   if (response.status !== 200) {
     let text: string;
     try {
-      text = await readResponsePrefix(response.body, limits.inputBytes);
+      text = await readResponsePrefix(response.body, limits.inputBytes, options.signal);
     } catch (cause) {
       throw uncertain("receive-pack returned an uncertain HTTP response", cause);
     }
@@ -711,7 +776,7 @@ export async function receivePack(
   const mediaType = contentType.split(";")[0]?.trim() ?? "";
   if (mediaType !== "application/x-git-receive-pack-result") {
     try {
-      await readResponsePrefix(response.body, limits.inputBytes);
+      await readResponsePrefix(response.body, limits.inputBytes, options.signal);
     } catch (cause) {
       throw uncertain("receive-pack returned an uncertain malformed response", cause);
     }
@@ -723,11 +788,17 @@ export async function receivePack(
     );
   }
   const sideband = prepared.sideband
-    ? sidebandBody(response.body, limits, prepared.onProgress, prepared.onMessage)
+    ? sidebandBody(response.body, limits, prepared.onProgress, prepared.onMessage, options.signal)
     : null;
   const statusBody = sideband ?? response.body;
   try {
-    return await parseStatus(statusBody, prepared.commands, prepared.atomic, limits);
+    return await parseStatus(
+      statusBody,
+      prepared.commands,
+      prepared.atomic,
+      limits,
+      options.signal,
+    );
   } catch (cause) {
     throw uncertain("receive-pack returned an incomplete or invalid status", cause);
   } finally {

@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 
 import { ComputerWorktree, createSqliteGitClient } from "../src/compat/computer.js";
 import { createGit, type Git, type PushRefspec } from "../src/git/client.js";
+import { fetchHttpClient, type GitHttpClient } from "../src/git/protocol/transport.js";
 import { SqliteGitDatabase } from "../src/git/store/index.js";
 import { TestDatabase } from "./helpers/db.js";
 import { GitFixture } from "./helpers/git.js";
@@ -34,13 +35,14 @@ function workspace(storage = new SqliteTestStorage()): Workspace {
   });
 }
 
-function nativeGit(ws: Workspace, storage: SqliteTestStorage): Git {
+function nativeGit(ws: Workspace, storage: SqliteTestStorage, http?: GitHttpClient): Git {
   return createGit()({
     database: new SqliteGitDatabase(new TestDatabase(storage)),
     worktree: new ComputerWorktree(ws.provider()),
     now: () => 1_600_000_000_000,
     timezoneOffset: () => 0,
     defaultIdentity: IDENTITY,
+    ...(http === undefined ? {} : { http }),
   });
 }
 
@@ -73,6 +75,83 @@ async function localCommit(ws: Workspace, content: string, message: string): Pro
 }
 
 describe("push", () => {
+  it("validates the signal and rejects a pre-aborted push before HTTP", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const git = nativeGit(ws, storage);
+      const requests = server.requests.length;
+      const malformed = { signal: new AbortController().signal };
+      Object.defineProperty(malformed, "signal", { value: {} });
+      await expect(git.push(malformed)).rejects.toMatchObject({ code: "EINVAL" });
+      expect(server.requests).toHaveLength(requests);
+
+      const controller = new AbortController();
+      const reason = new Error("cancel push before discovery");
+      controller.abort(reason);
+      const beforeAbort = server.requests.length;
+      await expect(git.push({ signal: controller.signal })).rejects.toMatchObject({
+        code: "EABORTED",
+        cause: reason,
+      });
+      expect(server.requests).toHaveLength(beforeAbort);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns confirmed remote success with failed EABORTED tracking", async () => {
+    const fixture = remoteFixture();
+    const server = await startGitServer(fixture.dir);
+    try {
+      const storage = new SqliteTestStorage();
+      const ws = workspace(storage);
+      await ws.git.clone({ url: server.url, dir: "/" });
+      const tracked = await ws.git.revParse({ ref: "refs/remotes/origin/main" });
+      const pushed = await localCommit(ws, "confirmed before tracking abort\n", "confirmed");
+      const trackingEntries = reflog(storage, "refs/remotes/origin/main").length;
+      const controller = new AbortController();
+      const reason = new Error("cancel tracking reconciliation");
+      let discoveries = 0;
+      const http: GitHttpClient = async (request) => {
+        if (request.method === "GET") {
+          discoveries++;
+          if (discoveries === 2) {
+            controller.abort(reason);
+            return {
+              status: 500,
+              statusText: "Cancelled",
+              headers: { "content-type": "text/plain" },
+              body: (async function* (): AsyncGenerator<Uint8Array> {})(),
+            };
+          }
+        }
+        return fetchHttpClient(request);
+      };
+
+      await expect(
+        nativeGit(ws, storage, http).push({ signal: controller.signal }),
+      ).resolves.toMatchObject({
+        ok: true,
+        refs: [{ ref: "refs/heads/main", ok: true, error: null }],
+        tracking: {
+          outcome: "failed",
+          code: "EABORTED",
+          message: "network operation aborted",
+        },
+      });
+      expect(discoveries).toBe(2);
+      expect(fixture.git("rev-parse", "main")).toBe(pushed);
+      expect(await ws.git.revParse({ ref: "refs/remotes/origin/main" })).toBe(tracked);
+      expect(reflog(storage, "refs/remotes/origin/main")).toHaveLength(trackingEntries);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("updates a branch, records its tracking ref and makes the retry a no-op", async () => {
     const fixture = remoteFixture();
     const initial = fixture.git("rev-parse", "main");

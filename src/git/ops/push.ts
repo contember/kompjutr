@@ -13,6 +13,7 @@ import {
   ZERO_OID,
 } from "../protocol/receive-pack.js";
 import { type Advertisement, discover } from "../protocol/remote.js";
+import { throwIfAborted } from "../protocol/stream.js";
 import type { FetchPublicationToken, RefRow } from "../store/index.js";
 import type { GitContext } from "./context.js";
 import {
@@ -314,6 +315,19 @@ function stableTrackingFailure(error: unknown): PushTrackingResult {
   return { outcome: "failed", code, message };
 }
 
+async function* pushPackBody(
+  repo: Repository,
+  plan: PushPlan,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array> {
+  throwIfAborted(signal);
+  for await (const chunk of openPushPack(repo, plan)) {
+    throwIfAborted(signal);
+    yield chunk;
+  }
+  throwIfAborted(signal);
+}
+
 async function reconcileTracking(
   context: GitContext,
   repo: Repository,
@@ -323,9 +337,11 @@ async function reconcileTracking(
   auth: ReturnType<typeof createRemoteAuth>,
   sentCommands: boolean,
   publication: FetchPublicationToken | null,
+  signal: AbortSignal | undefined,
 ): Promise<PushTrackingResult> {
   if (publication === null) return { outcome: "not-applicable" };
   try {
+    throwIfAborted(signal);
     const successful: { readonly update: JoinedPushUpdate; readonly confirmedOid: string }[] = [];
     for (let index = 0; index < updates.length; index++) {
       const update = updates[index];
@@ -347,10 +363,12 @@ async function reconcileTracking(
     if (sentCommands) {
       try {
         rediscovered = await discover(url, "git-receive-pack", auth);
-      } catch {
+      } catch (error) {
+        if (hasErrorCode(error, "EABORTED")) throw error;
         rediscovered = null;
       }
     }
+    throwIfAborted(signal);
     const targets: { readonly update: JoinedPushUpdate; readonly oid: string }[] = [];
     const noops: string[] = [];
     const changed: string[] = [];
@@ -364,9 +382,11 @@ async function reconcileTracking(
       else if (oid !== ZERO_OID && item.update.noop) noops.push(oid);
     }
     if (noops.length > 0) {
+      throwIfAborted(signal);
       authenticatePushBranchTargets(repo, noops);
     }
     if (changed.length > 0) {
+      throwIfAborted(signal);
       try {
         authenticatePushBranchTargets(repo, changed);
       } catch (error) {
@@ -389,6 +409,7 @@ async function reconcileTracking(
       if (ref.name === `${publication.trackingPrefix}HEAD` || selected.has(ref.name)) continue;
       keep.push(ref.name);
     }
+    throwIfAborted(signal);
     try {
       const changedRefs = repo.store.publishFetchRefs(
         publication,
@@ -416,6 +437,7 @@ export async function push(
   let publication: FetchPublicationToken | null = null;
   try {
     validatePushOperationOptions(options);
+    throwIfAborted(options.signal);
     const remote = options.remote ?? "origin";
     const refspecs =
       options.refspecs === undefined ? legacyRefspecs(repo, options, remote) : options.refspecs;
@@ -426,15 +448,26 @@ export async function push(
     if (mappings.length === 0) return emptyPushResult();
 
     const target = pushTarget(repo, options);
-    const auth = createRemoteAuth(context, options);
+    const auth = createRemoteAuth(context, options, options.signal);
     let advertisement: Advertisement | null = await discover(target.url, "git-receive-pack", auth);
+    throwIfAborted(options.signal);
     const joined = joinAdvertisement(mappings, advertisement);
     const activeUpdates = activePlanningUpdates(joined.updates);
     if (activeUpdates.length === 0) {
       plan = null;
     } else {
-      plan = await withPromisorHydration(context, repo, () =>
-        planPushUpdates(repo, activeUpdates, { remoteOids: joined.remoteOids }),
+      plan = await withPromisorHydration(
+        context,
+        repo,
+        () => {
+          throwIfAborted(options.signal);
+          const planned = planPushUpdates(repo, activeUpdates, {
+            remoteOids: joined.remoteOids,
+          });
+          throwIfAborted(options.signal);
+          return planned;
+        },
+        { signal: options.signal },
       );
     }
     activeUpdates.length = 0;
@@ -465,7 +498,7 @@ export async function push(
           ...(options.atomic === undefined ? {} : { atomic: options.atomic }),
           ...(options.pushOptions === undefined ? {} : { pushOptions: options.pushOptions }),
           ...(hasNonDeletion && packPlan !== null
-            ? { pack: () => openPushPack(repo, packPlan) }
+            ? { pack: () => pushPackBody(repo, packPlan, options.signal) }
             : {}),
           ...(say === undefined ? {} : { onProgress: say }),
         },
@@ -493,6 +526,7 @@ export async function push(
       auth,
       commands.length > 0,
       publication,
+      options.signal,
     );
     return { ...confirmed, tracking };
   } finally {

@@ -432,6 +432,137 @@ describe("receive-pack request validation", () => {
 });
 
 describe("receive-pack replay and certainty", () => {
+  it("keeps a pre-invocation abort safe and does not open the POST body", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancel before POST");
+    controller.abort(reason);
+    let attempts = 0;
+    let opens = 0;
+
+    await expect(
+      receivePack(
+        baseRequest([command()], {
+          pack: () => {
+            opens++;
+            return once(utf8.encode("PACKbody"));
+          },
+        }),
+        {
+          signal: controller.signal,
+          http: async () => {
+            attempts++;
+            return response(report([command()]));
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+    expect(attempts).toBe(0);
+    expect(opens).toBe(0);
+  });
+
+  it("makes an abort after POST consumption uncertain without replay", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancel consumed POST");
+    let attempts = 0;
+    let opens = 0;
+    const http: GitHttpClient = async (request) => {
+      attempts++;
+      await collectBody(request.body);
+      controller.abort(reason);
+      throw new Error("cancelled transport continued");
+    };
+
+    await expect(
+      receivePack(
+        baseRequest([command()], {
+          pack: () => {
+            opens++;
+            return once(utf8.encode("PACKbody"));
+          },
+        }),
+        { http, signal: controller.signal, onAuth: () => ({ username: "unused" }) },
+      ),
+    ).rejects.toMatchObject({
+      code: "EPUSHUNCERTAIN",
+      cause: { code: "EABORTED", cause: reason },
+    });
+    expect(attempts).toBe(1);
+    expect(opens).toBe(1);
+  });
+
+  it("closes a confirmed 401 and returns a safe abort before retry", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancel before authenticated retry");
+    let attempts = 0;
+    let opens = 0;
+    let bodyClosed = false;
+    const authBody = async function* (): AsyncGenerator<Uint8Array> {
+      try {
+        yield utf8.encode("authentication required");
+      } finally {
+        bodyClosed = true;
+      }
+    };
+
+    await expect(
+      receivePack(
+        baseRequest([command()], {
+          pack: () => {
+            opens++;
+            return once(utf8.encode("PACKbody"));
+          },
+        }),
+        {
+          signal: controller.signal,
+          http: async (request) => {
+            attempts++;
+            await collectBody(request.body);
+            return {
+              ...response(new Uint8Array(0), 401, "text/plain"),
+              body: authBody(),
+            };
+          },
+          onAuth: () => {
+            expect(bodyClosed).toBe(true);
+            controller.abort(reason);
+            return { username: "unused" };
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "EABORTED", cause: reason });
+    expect(bodyClosed).toBe(true);
+    expect(attempts).toBe(1);
+    expect(opens).toBe(1);
+  });
+
+  it("closes an aborted status body and keeps the consumed POST uncertain", async () => {
+    const controller = new AbortController();
+    const reason = new Error("cancel incomplete report-status");
+    const update = command();
+    let bodyClosed = false;
+    const statusBody = async function* (): AsyncGenerator<Uint8Array> {
+      try {
+        yield pkt("unpack ok\n");
+        yield pkt(`ok ${update.ref}\n`);
+        controller.abort(reason);
+        yield FLUSH;
+      } finally {
+        bodyClosed = true;
+      }
+    };
+
+    await expect(
+      receivePack(baseRequest([update]), {
+        signal: controller.signal,
+        http: async () => ({ ...response(new Uint8Array(0)), body: statusBody() }),
+      }),
+    ).rejects.toMatchObject({
+      code: "EPUSHUNCERTAIN",
+      cause: { code: "EABORTED", cause: reason },
+    });
+    expect(bodyClosed).toBe(true);
+  });
+
   it("replays byte-identical bodies once after 401 and opens the pack twice", async () => {
     const bodies: Uint8Array[] = [];
     let opens = 0;
